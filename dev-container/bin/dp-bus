@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# dp-bus — the ticket-bus client (FR-WORK-2). GitHub issues and pull requests are the
+# first-class bus; the dev-container never touches the host directly — it instructs the
+# host's agent through tickets. Thin by design: the grammars do the governing
+# (shared/contracts), gh does the transport, the pair's own App identity does the auth
+# (provisioned by the entrypoint; FR-WORK-6).
+#
+# Verbs:
+#   dp-bus list <owner/repo>                         open tickets
+#   dp-bus claim <owner/repo#n> <pair> <session> <owner/repo>...
+#        post a ticket-envelope (kind: work) binding this ticket to the session and scope
+#   dp-bus report <owner/repo#n> <verdict.json>
+#        validate the verdict against the vendored grammar (fail-closed), then post it
+set -uo pipefail
+
+die() { echo "dp-bus: $*" >&2; exit 1; }
+command -v gh >/dev/null 2>&1 || die "gh not found"
+gh auth status >/dev/null 2>&1 || die "no GitHub credential — the entrypoint provisions the pair's App identity (or 'gh auth login' interactively)"
+
+split_id() { # <owner/repo#n> -> "owner/repo n"
+    case "$1" in
+        *'#'*) printf '%s %s' "${1%%#*}" "${1##*#}" ;;
+        *) return 1 ;;
+    esac
+}
+
+cmd_list() { # <owner/repo>
+    gh issue list --repo "$1" --state open --limit 100
+}
+
+cmd_claim() { # <owner/repo#n> <pair> <session> <scope...>
+    local id="$1" pair="$2" session="$3"; shift 3
+    [ $# -ge 1 ] || die "claim needs at least one scope repo"
+    local ref n envelope
+    ref="$(split_id "$id")" || die "invalid ticket id '$id' (want owner/repo#n)"
+    n="${ref##* }"; ref="${ref% *}"
+    # Build the envelope, VALIDATE against the vendored grammar, then post (P7).
+    envelope="$(mktemp --suffix=.json)"
+    trap 'rm -f "$envelope"' EXIT
+    python3 - "$pair" "$session" "$id" "$@" > "$envelope" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+pair, session, tid = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({
+    "grammar": "ticket-envelope", "v": 1,
+    "id": tid, "kind": "work", "pair": pair, "session": session,
+    "scope": sys.argv[4:],
+    "created": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+}, indent=2))
+PY
+    dp-validate ticket-envelope "$envelope" >/dev/null || die "envelope failed grammar validation — refusing to post"
+    { echo '```json'; cat "$envelope"; echo '```'; } | gh issue comment "$n" --repo "$ref" --body-file - >/dev/null
+    echo "dp-bus: claimed $id for pair '$pair' session '$session' (scope: $*)"
+}
+
+cmd_report() { # <owner/repo#n> <verdict.json>
+    local id="$1" verdict="$2" ref n
+    [ -f "$verdict" ] || die "verdict file '$verdict' not found"
+    ref="$(split_id "$id")" || die "invalid ticket id '$id' (want owner/repo#n)"
+    n="${ref##* }"; ref="${ref% *}"
+    # Fail-closed: an invalid verdict NEVER reaches the bus. A verdict without evidence
+    # or unbound from its sha is testimony, and testimony is refused.
+    dp-validate verdict "$verdict" >/dev/null || die "verdict failed grammar validation — refusing to post"
+    { echo '```json'; cat "$verdict"; echo '```'; } | gh issue comment "$n" --repo "$ref" --body-file - >/dev/null
+    echo "dp-bus: verdict posted to $id"
+}
+
+case "${1:-}" in
+    list)   shift; [ $# = 1 ] || die "usage: dp-bus list <owner/repo>"; cmd_list "$@" ;;
+    claim)  shift; [ $# -ge 4 ] || die "usage: dp-bus claim <owner/repo#n> <pair> <session> <scope...>"; cmd_claim "$@" ;;
+    report) shift; [ $# = 2 ] || die "usage: dp-bus report <owner/repo#n> <verdict.json>"; cmd_report "$@" ;;
+    *)      die "usage: dp-bus list|claim|report ..." ;;
+esac

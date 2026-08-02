@@ -3,6 +3,34 @@
 Incident narrative and activation-proofs live here — memoir is not specification (P9).
 Newest first.
 
+## 2026-08-03 — Increment 3: dev-container/ image + harness
+
+Build-order step 3 landed: the dev-container image (`Containerfile` + `install.sh` +
+`entrypoint.sh`), the harness (`dp-session`, `dp-bus`, `dp-validate`, `gh-app-auth.sh`),
+and the host-side Quadlet. Mined from the fleet's fedora-dev and pruned under P3: the
+poller/deadman/dev-loop services, the fitness-token ferry, and the live-spec clone all
+dropped — the loop services return as increments 5–6 by design, and the harness is
+image-baked and versioned (no live-clone duality to skew). The tailscale.repo pin was
+independently live re-checked (P2): content unchanged since the fleet's pin; the pin now
+lives in the Containerfile ARG, bumped there only. `dp-session new` takes an optional
+clone source — a genuine local-mirror feature that also lets the suite drive real git
+without network (the test caught the hardcoded GitHub URL on its first run; fixed in the
+tool, not the test).
+
+**Activation-proof (P3/P8):** `test_session.sh` — 11 rows pass with real git in
+throwaway tmpdirs: namespaced tree creation on `session/<session>/main`, the
+fail-closed `verify` guard accepting own-tree/own-branch and refusing non-namespaced
+branches, out-of-namespace paths, another session's tree, and traversal-shaped session
+names. `dp-validate` exercised both directions against the vendored contracts (accepts
+conforming, refuses with named violations, exit 1). The image built for real
+(`podman build`, genuine 121-ish package install) and its contents verified: all 10
+harness/tools present, 4 contracts vendored, sshd drop-in live, `core` user, uid-map
+caps, jsonschema importable. An unplanned live boot of the entrypoint (invoked by a
+mis-formed verify command — kept, it's honest evidence) generated persistent host keys
+and synced the 3 real trust-root keys from GitHub. Not yet proven (recorded): the
+tailnet join and the published-port door activate on first host run; the Quadlet's
+Secret/env wiring activates with the refresh verb (increment 6).
+
 ## 2026-08-03 — Increment 2: host/ Fedora core + cloud adapter
 
 Build-order step 2 landed: `host/core/converge.sh` (the CONVERGE verb — root idempotent

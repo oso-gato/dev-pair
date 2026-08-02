@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# dp-session — session isolation, code-enforced (FR-WORK-1, P6).
+#
+# Every session works in its OWN namespaced tree:
+#   ~/.local/share/devpair/sessions/<session>/<owner>__<repo>/
+# with its OWN branch namespace session/<session>/*. No session reads, touches, or
+# iterates another session's work — the check is mechanical, and it runs BEFORE every
+# commit and every push (the harness's own commit/push sites being the most important).
+# A mutating action outside the isolated tree, or without branch re-verification, is
+# UNSAFE and refused.
+#
+# Verbs:
+#   dp-session new <session> <owner/repo>     clone into the namespace on a session branch
+#   dp-session path <session> <owner/repo>    print the tree path (fail if absent)
+#   dp-session verify <session> <path>        fail-closed pre-commit/pre-push guard:
+#                                             path inside the namespace AND branch in it
+set -uo pipefail
+
+dp_die() { echo "dp-session: $*" >&2; exit 1; }
+
+dp_session_root() { printf '%s/.local/share/devpair/sessions' "$HOME"; }
+
+# dp_session_repo_dir <owner/repo> -> the namespaced dir name (owner__repo).
+dp_session_repo_dir() {
+    case "$1" in
+        */*) printf '%s__%s' "${1%%/*}" "${1#*/}" ;;
+        *)   return 1 ;;
+    esac
+}
+
+dp_session_path() { # <session> <owner/repo>
+    local d; d="$(dp_session_repo_dir "$2")" || return 1
+    printf '%s/%s/%s' "$(dp_session_root)" "$1" "$d"
+}
+
+# dp_session_branch_ok <session> <branch> — the branch namespace check (pure).
+dp_session_branch_ok() {
+    case "$2" in
+        "session/$1/"?*) return 0 ;;
+        *)               return 1 ;;
+    esac
+}
+
+# dp_session_name_ok <session> — session names are path segments: refuse traversal-shaped
+# and shell-hostile names before they touch the filesystem.
+dp_session_name_ok() {
+    case "$1" in (''|.|..|*/*|*[!A-Za-z0-9._-]*) return 1 ;; esac
+    return 0
+}
+
+cmd_new() { # <session> <owner/repo> [source]
+    local session="$1" repo="$2" source="${3:-https://github.com/$2}" path branch
+    dp_session_name_ok "$session" || dp_die "invalid session name '$1'"
+    path="$(dp_session_path "$session" "$repo")" || dp_die "invalid repo '$repo' (want owner/repo)"
+    branch="session/$session/main"
+    if [ -d "$path/.git" ]; then
+        echo "dp-session: tree exists at $path"
+    else
+        mkdir -p "$(dirname "$path")"
+        # Clone from GitHub through the standing credential (gh-app-auth wiring) by
+        # default; an explicit source (a local mirror/cache, tests) is honored verbatim.
+        # Never a shared clone: isolation is by tree, and a shared clone is a shared
+        # mutation point.
+        git clone --quiet "$source" "$path" || dp_die "clone of $repo from $source failed"
+        git -C "$path" checkout -q -b "$branch" || dp_die "could not create $branch"
+        echo "dp-session: created $path on branch $branch"
+    fi
+}
+
+cmd_path() { # <session> <owner/repo>
+    local path
+    dp_session_name_ok "$1" || dp_die "invalid session name '$1'"
+    path="$(dp_session_path "$1" "$2")" || dp_die "invalid repo '$2'"
+    [ -d "$path/.git" ] || dp_die "no tree for session '$1' repo '$2' — run: dp-session new '$1' '$2'"
+    printf '%s\n' "$path"
+}
+
+cmd_verify() { # <session> <path>
+    local session="$1" path="$2" root branch
+    dp_session_name_ok "$session" || dp_die "invalid session name '$session'"
+    root="$(dp_session_root)/$session/"
+    case "$path" in
+        "$root"*) : ;;
+        *) dp_die "UNSAFE: '$path' is OUTSIDE session '$session's namespace ($root*)" ;;
+    esac
+    [ -d "$path/.git" ] || dp_die "UNSAFE: '$path' is not a git worktree"
+    branch="$(git -C "$path" rev-parse --abbrev-ref HEAD 2>/dev/null)" \
+        || dp_die "UNSAFE: cannot resolve branch in '$path'"
+    dp_session_branch_ok "$session" "$branch" \
+        || dp_die "UNSAFE: branch '$branch' is OUTSIDE the 'session/$session/' namespace — commit/push REFUSED"
+    echo "dp-session: verified — $path on $branch (inside session '$session' namespace)"
+}
+
+case "${1:-}" in
+    new)    shift; [ $# -ge 2 ] && [ $# -le 3 ] || dp_die "usage: dp-session new <session> <owner/repo> [source]"; cmd_new "$@" ;;
+    path)   shift; [ $# = 2 ] || dp_die "usage: dp-session path <session> <owner/repo>";   cmd_path "$@" ;;
+    verify) shift; [ $# = 2 ] || dp_die "usage: dp-session verify <session> <path>";       cmd_verify "$@" ;;
+    *)      dp_die "usage: dp-session new|path|verify ..." ;;
+esac
