@@ -41,6 +41,10 @@ else
     bad "new: no tree created at $tree"
 fi
 tree="$($DP_SESSION path alpha "$REPO")"
+# Guard: every git -C below must have a real target. An empty $tree makes `git -C ""`
+# operate on the CURRENT directory — which is how a throwaway branch once landed on the
+# platform repo itself. Fail the row instead of touching anything outside the tmpdir.
+[ -n "$tree" ] && [ -d "$tree/.git" ] || { bad "path: no usable tree for alpha — aborting"; echo "SESSION TESTS FAILED"; exit 1; }
 
 # --- verify: the pre-commit/pre-push guard (the load-bearing check) ---
 $DP_SESSION verify alpha "$tree" >/dev/null \
