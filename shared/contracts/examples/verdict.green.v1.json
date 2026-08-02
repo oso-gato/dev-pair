@@ -1,0 +1,14 @@
+{
+  "grammar": "verdict",
+  "v": 1,
+  "request": "oso-gato/dev-pair#12",
+  "subject": "live host sshd configuration at merge-sha",
+  "sha": "cd8aeb8000000000000000000000000000000001",
+  "result": "GREEN",
+  "evidence": [
+    { "kind": "command-output", "ref": "sshd -T | grep -E 'passwordauthentication|pubkeyauthentication' (attached to ticket)" },
+    { "kind": "hash", "ref": "sha256:/etc/ssh/sshd_config.d/50-devpair.conf" }
+  ],
+  "by": "host/box validator",
+  "at": "2026-08-03T02:40:00Z"
+}

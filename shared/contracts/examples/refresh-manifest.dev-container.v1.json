@@ -1,0 +1,18 @@
+{
+  "grammar": "refresh-manifest",
+  "v": 1,
+  "merge-sha": "cd8aeb8000000000000000000000000000000001",
+  "target": "dev-container",
+  "image": "ghcr.io/oso-gato/dev-container@sha256:0000000000000000000000000000000000000000000000000000000000000001",
+  "rollback": {
+    "kind": "image",
+    "ref": "ghcr.io/oso-gato/dev-container@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "session-policy": "resume",
+  "verify": [
+    { "kind": "command", "ref": "podman inspect dev-container --format '{{.Image}}'", "expect": "sha256:0000000000000000000000000000000000000000000000000000000000000001" },
+    { "kind": "service-state", "ref": "container:dev-container", "expect": "running" }
+  ],
+  "armed-by": "watcher:image-clock",
+  "armed-at": "2026-08-03T02:45:00Z"
+}
