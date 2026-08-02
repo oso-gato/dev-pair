@@ -3,6 +3,33 @@
 Incident narrative and activation-proofs live here — memoir is not specification (P9).
 Newest first.
 
+## 2026-08-03 — Increment 2: host/ Fedora core + cloud adapter
+
+Build-order step 2 landed: `host/core/converge.sh` (the CONVERGE verb — root idempotent
+applier), `converge-user.sh` (rootless layer), `validate.sh` (the VALIDATE verb v1, the
+G2 host seam), `lib.sh` (pure functions, one home), the two installed helpers, and
+`host/cloud/genesis.sh` (cloud adapter). Rebuilt from the fleet's setup-host.sh under
+P1–P11: the tailscale.repo fetch is now structurally verified against the live vendor
+file (fact-checked 2026-08-03: `gpgcheck=1` AND `repo_gpgcheck=1`, vendor key on the
+vendor host); the footprint is pruned (flatpak-session-helper, fastfetch,
+cockpit-networkmanager/selinux dropped — recorded trade-offs); the scoped agent sudoers
+defers to increment 6 with the verb that needs it (P3: no unproven gating); fail2ban
+stays out (key-only door). One production hardening added by the test: the converger
+generates sshd host keys on demand and creates `/etc/sysctl.d` when missing — a minimal
+image must never wedge it.
+
+**Activation-proof (P3/P8):** `test_lib.sh` — 25 rows pass (vendor-repo accept +
+mutation-refuse rows; mutation-proven in fact: dropping the `repo_gpgcheck` requirement
+turned exactly its row red). `test_converge_container.sh` — the REAL converger ran twice
+in a real Fedora 44 systemd container (121 genuine packages, genuine units, genuine
+`sshd -t`): first run applied, second run was a safe no-op, and the REAL validate passed
+all 19 live read-back checks (2 warnings naming legitimate states: tailnet join pending
+genesis, no SELinux in a container). The authorized-keys trust root synced 3 real keys
+from the maintainer's GitHub account inside the test. Container-inherent chown/socket
+warnings degraded exactly as designed (fail-LOUD, never fatal). Remaining for first VPS
+genesis (recorded, not hidden): the tailnet join, the SELinux relabel path, and
+multi-client tmux geometry activate there.
+
 ## 2026-08-03 — Increment 1: shared/ grammars v1
 
 Build-order step 1 of `DESIGN.md` Part C landed: the four bus grammars —
