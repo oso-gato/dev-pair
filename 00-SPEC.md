@@ -347,16 +347,7 @@ Minimality is **capability-relative** — between equal-capability options prefe
 higher-provenance one; **dropping a capability to shrink the footprint is a recorded
 capability trade-off, never a minimalism win.**
 
-**Gates are features.** The same discipline binds every gate, check, watcher, and probe the
-platform builds — security machinery is not exempt from justification. A mechanism is
-warranted only if it **(a) guards a real trust boundary, (b) reads an artifact rather than
-an opinion, and (c) is wired to a decision it can change.** A check that can change no
-outcome is telemetry and lives in the log, not in a gate. Machinery exists to move the
-objective's artifacts — **never to manage other machinery**: a component whose only consumer
-is another component's failure mode is the same component. **Activation-proof:** no
-actuator is declared built until its **first measured live success** is recorded — a merged,
-unproven mechanism is scaffolding, and a permanently-red probe is deleted or fixed, never
-tolerated (a standing red trains the loop to ignore alarms, which is worse than no alarm).
+Minimalism binds machinery as well as packages — see **PU8**.
 
 ### PU4 — ISOLATED WORKING TREE
 
@@ -408,6 +399,19 @@ and the objective's single-interaction law forbids those. Every autonomous mutat
 reversible — merge (revert), deploy (rollback), refresh (re-converge), closure (reopen) —
 and each recovery path is proven by a test (PU5), not by a standing drill framework that
 itself needs managing.
+
+### PU8 — GATES ARE FEATURES
+
+Every gate, check, watcher and probe the platform builds **is itself a feature, and is justified
+like one** — security machinery is not exempt. A mechanism is
+warranted only if it **(a) guards a real trust boundary, (b) reads an artifact rather than
+an opinion, and (c) is wired to a decision it can change.** A check that can change no
+outcome is telemetry and lives in the log, not in a gate. Machinery exists to move the
+objective's artifacts — **never to manage other machinery**: a component whose only consumer
+is another component's failure mode is the same component. **Activation-proof:** no
+actuator is declared built until its **first measured live success** is recorded — a merged,
+unproven mechanism is scaffolding, and a permanently-red probe is deleted or fixed, never
+tolerated (a standing red trains the loop to ignore alarms, which is worse than no alarm).
 
 ## PR — Repo-specific principles (bind this repository's own platform)
 
