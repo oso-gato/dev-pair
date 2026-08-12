@@ -6,8 +6,8 @@
 > **THE ARRANGEMENT** — the functional requirements derived from the objective, and the
 > architecture that serves them.
 >
-> **Status: dev-owned, mutable-on-fact.** This document serves `00-OBJECTIVES.md` and is
-> built under `00-BUILDPRINCIPLE.md`. It is **never a conformance target**: it changes when
+> **Status: dev-owned, mutable-on-fact.** This document serves `00-SPEC.md` Part O and is
+> built under `00-SPEC.md` Part P. It is **never a conformance target**: it changes when
 > facts change, by the loop's own merge path, without maintainer re-confirmation. It is not
 > part of the authoritative document spine (objective, principles, runtime law, changelog);
 > it is the working map from one to the other. If this document and the objective disagree,

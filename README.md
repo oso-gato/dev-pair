@@ -4,8 +4,8 @@ The autonomous dev pair: a Fedora host and a dev container, built and run as one
 
 Two documents govern everything in this repository:
 
-- [00-OBJECTIVES.md](00-OBJECTIVES.md) — why the pair exists and what it must achieve.
-- [00-BUILDPRINCIPLE.md](00-BUILDPRINCIPLE.md) — how anything in this repository may be built.
+- [00-SPEC.md](00-SPEC.md) — why the pair exists and what it must achieve.
+- [00-SPEC.md](00-SPEC.md) — how anything in this repository may be built.
 
 The working map from those two to the code is [DESIGN.md](DESIGN.md) — dev-owned,
 mutable-on-fact, never a conformance target.
