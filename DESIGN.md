@@ -158,7 +158,7 @@ serves, so both directions are checkable by script.
 - **Every R traces to at least one O** — 28 of 28 do.
 - **Every O is discharged by an R, or by a P where the clause is a construction constraint.**
   23 of 35 O-clauses are cited by a requirement. Of the remaining 12:
-  - **Discharged by a principle, no R expected:** O-LOOP-4 (P5), O-MECH-1 (P4), O-MECH-7 (P3).
+  (coverage recomputed against O1-O35 when the functional requirements are written)
   - **Structural clauses of the document itself, no R expected:** O-PRIME-1, O-PLAT-4,
     O-DOC-1, O-DOC-2.
   - **OPEN GAPS — no requirement and no principle discharges these:** O-BND-4 (the
