@@ -6,10 +6,10 @@
 > confirmation, never a silent edit, and MAINTAINER-MERGE-ONLY. The design (`DESIGN.md`) is
 > dev-owned and mutable-on-fact; it serves this spec and is never a conformance target.
 >
-> **Identifiers.** **O-<area>-<n>** objective clauses · **P<n>** build principles ·
+> **Identifiers.** **O-<area>-<n>** objective clauses · **PU<n>** universal build principles · **PR<n>** repo-specific build principles ·
 > **R-<area>-<n>** requirements and **D<n>** design decisions (both in `DESIGN.md`).
 > Every R cites the O it serves; an O cited by no R and discharged by no P is a gap.
-> P-numbers are stable and never reused — the tiers below group them, they do not renumber them.
+> PU and PR are separate sequences, deliberately distinct from **FR** (functional requirements).
 >
 > **What belongs where.** Part O is the WHY and the WHAT: intent, outcomes, and boundaries.
 > Part P is the HOW WE BUILD: construction constraints. How this system is *arranged* is the
@@ -295,18 +295,14 @@ nothing assumed.
 > judgment is required. A principle that cannot be checked cannot bind: each must be
 > enforceable in fact, or it is defective.
 >
-> Consolidated from the fleet's `fedora-dev/00-SPEC.md` (BP1–BP9), the host-side
-> instantiation drafted for `fedora-bootstrap`, the zero-base architectural review of the
-> pair, and the twofold-objective restatement (2026-08-02). A mapping note closes this
-> document.
 
-## Universal principles — bind every project the pair develops
+## PU — Universal principles (bind every project the pair develops)
 
 > These govern anything the pair builds, on the platform's standing substrate (Fedora,
 > containerised). A project's initiation session applies them **by reference**, never by
 > re-dictation, and adds only its own project-specific constraints.
 
-### P1 — PROVENANCE
+### PU1 — PROVENANCE
 
 Every artifact entering **any** tree the platform builds — host, dev-container, workloads,
 and every throwaway alike — is admitted **fail-closed and version-pinned at the strongest
@@ -323,7 +319,7 @@ strength; provenance is a platform constant, never a per-component achievement. 
 definition fetched unverified on the most privileged component while pinned on another is
 the canonical violation.)
 
-### P2 — VERIFY-BEFORE-ADOPT
+### PU2 — VERIFY-BEFORE-ADOPT
 
 Before adopting or bumping **any** source, version, or artifact, its existence and identity
 are **fact-checked against the live upstream** — not asserted from memory or a stale pin —
@@ -339,7 +335,7 @@ bare-metal machine — is onboarded by **verifying its facts**, never by assumin
 never by forking the platform. A source adopted without a live fact-check, or a risky
 install wired in unproven, is a reviewable defect.
 
-### P3 — CAPABILITY-RELATIVE MINIMALISM
+### PU3 — CAPABILITY-RELATIVE MINIMALISM
 
 Every package and artifact is installed at the **minimal leaf footprint for its decided
 capability**: nothing enters any built tree without a **recorded justification**;
@@ -362,7 +358,7 @@ actuator is declared built until its **first measured live success** is recorded
 unproven mechanism is scaffolding, and a permanently-red probe is deleted or fixed, never
 tolerated (a standing red trains the loop to ignore alarms, which is worse than no alarm).
 
-### P6 — ISOLATED WORKING TREE
+### PU4 — ISOLATED WORKING TREE
 
 Every authoring or build action runs in a **fresh, per-session-namespaced working tree that
 never mutates the immutable live tree, a shared clone, or another session's tree**. All
@@ -374,7 +370,7 @@ sites alike, the harness being the most important case. The `cd` into an isolate
 directory. A mutating action outside an isolated tree, or a commit/push without branch
 re-verification, is UNSAFE.
 
-### P8 — TEST-QUALITY / MUTATION-PROVEN
+### PU5 — TEST-QUALITY / MUTATION-PROVEN
 
 Every behavioral change ships a test that **drives the real execution boundary** (the actual
 engine, git, kernel, or process semantics under test — not a stub asserting what a mock was
@@ -388,9 +384,9 @@ scale). Where the behavior under test needs full
 virtualization or a GPU, it runs on the **bare-metal capability track** — validation
 never simulates on the VPS track what the bare-metal track can prove. **The suite gates**: tests run at the merge boundary bound to the exact head sha — a
 test culture that cannot stop a merge is decoration, not proof. A permanently-failing test
-or probe is fixed or removed, never tolerated (P3's no-standing-red).
+or probe is fixed or removed, never tolerated (PU3's no-standing-red).
 
-### P9 — DOCUMENTATION-DRY
+### PU6 — DOCUMENTATION-DRY
 
 **One authoritative home per concept; every other mention is a one-line pointer or
 deleted.** The document spine is the objective, these principles, the runtime law, and the
@@ -401,7 +397,7 @@ checker. Evidence and benchmarks live only in the principle they prove. Incident
 belongs to the changelog: **memoir is not specification**. A document asserting behavior the
 code does not have is UNTRUE and a blocking finding.
 
-### P10 — RECOVERY-BEFORE-POWER
+### PU7 — RECOVERY-BEFORE-POWER
 
 **No mechanism may block the loop without carrying a bounded, automatic recovery.** A gate
 that is unavailable, stalled, or erroring must retry, fail over, or degrade under a recorded
@@ -410,15 +406,15 @@ only be added together with recovery**: a change introducing a blocking gate wit
 self-heal path is UNSAFE, because a fail-closed gate with no recovery is a human summons,
 and the objective's single-interaction law forbids those. Every autonomous mutation is
 reversible — merge (revert), deploy (rollback), refresh (re-converge), closure (reopen) —
-and each recovery path is proven by a test (P8), not by a standing drill framework that
+and each recovery path is proven by a test (PU5), not by a standing drill framework that
 itself needs managing.
 
-## Apparatus principles — bind the dev pair itself
+## PR — Repo-specific principles (bind this repository's own platform)
 
-> These govern the host, the dev-container and the agent layer — the machinery the pair *is*,
-> not the artifacts it builds for a project. A project does not inherit them.
+> These govern this repository's own platform — the host, the dev-container and the agent
+> layer. A project the pair develops does not inherit them.
 
-### P4 — IMMUTABLE HOST / CONTAINERISE-EVERYTHING
+### PR1 — IMMUTABLE HOST / CONTAINERISE-EVERYTHING
 
 The platform runs as an immutable host with **every application in a container** (and,
 where a workload genuinely requires it, in a virtual machine — a recorded capability
@@ -440,7 +436,7 @@ with the machine's permanent data preserved across reinstalls; onboarding a new
 environment is an **adapter addition, never a fork**. A mechanical check fails any change
 that mutates the live host outside the merge-and-deploy path.
 
-### P5 — THE THROWAWAY PRINCIPLE & CHURN
+### PR2 — THE THROWAWAY PRINCIPLE & CHURN
 
 Every build a throwaway, and the tree it built from a
 throwaway with it. Teardown (EXIT-trap, including
@@ -454,7 +450,7 @@ ceilings are design facts owned per component, recorded in the design, not here.
 Containerfiles are structured **heavy/stable-early, churn-late**; `--no-cache`/prune is
 reserved for the periodic clean rebuild, never used during churn.
 
-### P7 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
+### PR3 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
 
 This repository holds **both sides of every contract** the platform uses — the ticket-bus
 grammar, the verdict formats, the refresh manifests — so a contract change lands
@@ -467,11 +463,11 @@ producer emission is **gated off until the consumer that understands it is confi
 live**. A producer-first emission that can strand or wedge a not-yet-upgraded counterpart
 is UNSAFE.
 
-### P11 — DISPOSABLE AGENT LAYER (REBUILD, NEVER UPDATE)
+### PR4 — DISPOSABLE AGENT LAYER (REBUILD, NEVER UPDATE)
 
 The agent tooling lives in a **disposable layer — an agent box** — that is **rebuilt,
 never updated in place**: currency flows only through a rebuild from the official
-channel, admitted per P1. The tool's **own self-update is disabled** by construction — a
+channel, admitted per PU1. The tool's **own self-update is disabled** by construction — a
 self-installed binary would shadow the managed one, survive the rebuild on a persistent
 volume, and strand the layer stale while appearing current. The rebuild cadence is
 **fast** (daily, tracking the vendor's releases) and **never costs live work**: the
@@ -488,13 +484,13 @@ precisely because the layer above absorbs the churn.
 lineages** — the claudebox (Claude Code) and the kimibox (Kimi Code) — and **admits anything
 further** (DeepSeek, Codex, Gemini, GLM, and their successors) when — and only when — it
 satisfies the contract: **official provenance at the strongest level the vendor admits**
-(P1; a lineage whose only source is a forbidden channel is inadmissible until a
+(PU1; a lineage whose only source is a forbidden channel is inadmissible until a
 compliant one exists), **headless non-interactive autonomous operation**, **self-update
 disabled by construction**, **state held outside the layer**, and the loop's
 **policy/permissions interface**. Each admitted lineage is recorded as a **lineage
 manifest**; a lineage that fails the contract is a recorded non-admission, never a
 silent waiver. **One box instance runs one lineage**, chosen at provisioning; a box never
-carries more than one lineage (P3).
+carries more than one lineage (PU3).
 
 **Resume is part of the refresh, not an afterthought.** A layer rebuild or a component
 refresh **captures the live session set before it tears anything down and restores every
