@@ -11,7 +11,7 @@ boundary — if only one side uses it, it belongs to that side.
 
 The machine-readable grammars of the ticket bus, one file per grammar per
 version (`<name>.v<N>.schema.json`), with one valid instance each in
-`examples/`. The law (P7, stated once in `00-OBJECTIVE.md`):
+`examples/`. The law (P7, stated once in `00-BUILDPRINCIPLE.md`):
 
 - A consumer **fail-safe refuses** an unknown grammar, version, or field —
   it never mis-parses.

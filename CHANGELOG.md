@@ -74,7 +74,7 @@ kimibox (admitted, L3 c2); one example non-admission recorded with its reason.
 
 ## 2026-08-02 — Repository founded
 
-`00-OBJECTIVE.md` and `00-OBJECTIVE.md` committed as the governing pair;
+`00-OBJECTIVES.md` and `00-BUILDPRINCIPLE.md` committed as the governing pair;
 layout law (`host/` · `dev-container/` · `shared/`) established with scoping
 READMEs. Loop steps (a) and (b) landed as `DESIGN.md` (dev-owned): functional
 requirements traced per objective clause, the zero-base architecture (one loop,
