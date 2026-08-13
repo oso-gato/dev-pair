@@ -60,13 +60,50 @@ is retained in the objective as OB-12.)*
 ## Parked — provisioning classes
 
 - **Cloud genesis:** remote, channel-proof, no local act, converging a stock Fedora cloud
-  image via an idempotent converger.
+  image via an idempotent converger — every mutation declared in the repository, re-run-safe
+  from any historical version, ad-hoc drift vanishing on the next apply by design.
 - **Local genesis:** a custom **bootc** image — container-first, CoreOS-style, layered —
   built from the repository and deployed to the machine, kept current by image rebase with
   atomic rollback, permanent data preserved across reinstalls. Working lineage: the
   maintainer's `strix` bootc build (`strix-ms-s1-bootc`), succeeding the earlier declarative
   Fedora CoreOS era.
+- Moving an environment from converger to image-rebase is a design decision, not a
+  conformance gap.
 - The genesis path is a **Fedora core plus a per-environment provisioning adapter**;
   onboarding a new environment is an adapter addition, never a fork.
+- A mechanical check fails any change that mutates the live host outside the
+  merge-and-deploy path.
 - The first host, named **box**, is the **genesis agent**: first a member of the dev pair,
   second a spinner-up of future containers as apps and services.
+
+## Parked — throwaway-build mechanics
+
+OB-16 keeps the *constraint* — every build a throwaway, every tree a throwaway with it,
+caches holding re-downloadable inputs only under a hard bounded ceiling. The *technique*
+that realises it has no home until `02-DESIGN.md` exists:
+
+- **Teardown covers every path.** An EXIT trap — **including signal paths** — tears down
+  every throwaway tree, image, and run container.
+- **Orphan sweeper.** Crash and kill leaks escape the trap, so a sweeper reaps them; the
+  sweeper is **itself scheduled and proven**, never assumed to be running.
+- **Containerfile ordering.** Structured **heavy/stable-early, churn-late**, so iteration
+  invalidates the least possible cache.
+- **Cache discipline during churn.** `--no-cache` and prune are reserved for the periodic
+  clean rebuild and **never used during churn** — the standard is zero-byte re-download
+  across iterations.
+- **Ceilings are per-component design facts.** The eviction policy and the numeric ceilings
+  belong in the design, recorded per component, not in the objective. The objective binds
+  only that a ceiling exists and that a scheduled, self-verifying actuator enforces it.
+
+## Parked — agent-layer mechanics
+
+OB-18 keeps the constraint. The mechanism behind it:
+
+- **Resume is possible by construction** because the work's durable state is the ticket
+  bus: sessions re-derive from what is co-written to GitHub, never from container or layer
+  state. This is *why* a rebuild can be non-destructive, and it is a design fact, not a
+  rule.
+- **An on-demand rebuild path is always available**, alongside the scheduled cadence.
+- The refresh **captures the live session set before it tears anything down** and restores
+  every session afterwards — all tenants — verifying each against its **first post-resume
+  action on an artifact**, never against presence.
