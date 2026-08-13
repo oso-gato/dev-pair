@@ -413,6 +413,20 @@ actuator is declared built until its **first measured live success** is recorded
 unproven mechanism is scaffolding, and a permanently-red probe is deleted or fixed, never
 tolerated (a standing red trains the loop to ignore alarms, which is worse than no alarm).
 
+### PU9 — LANGUAGE-ECOSYSTEM TOOLS
+
+A tool the platform needs that exists **only** in a language ecosystem (npm, PyPI, crates,
+gems) is admitted by exactly two routes. **Preferred — run it as a container pinned by
+digest:** the tool and its whole dependency tree live inside an image, never on a component,
+disposable per run, and verified **once, by digest** — one artifact to trust instead of
+hundreds of unrelated authors. **Otherwise — project-local with a committed lockfile**
+carrying per-package integrity hashes, resolved offline from that lock at build time,
+invoked from the project directory and deleted with it. **Never onto PATH, on any
+component, by any route:** a global language-manager install is unmanaged by the system
+package manager, invisible to it, can shadow a managed binary, and survives outside the
+merge-and-deploy path — that is the only form of this that pollutes. Before either route,
+re-check for an official standalone binary: that is PU1's L3 and it outranks both.
+
 ## PR — Repo-specific principles (bind this repository's own platform)
 
 > These govern this repository's own platform — the host, the dev-container and the agent
