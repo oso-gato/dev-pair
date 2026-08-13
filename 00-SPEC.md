@@ -6,10 +6,10 @@
 > confirmation, never a silent edit, and MAINTAINER-MERGE-ONLY. The design (`DESIGN.md`) is
 > dev-owned and mutable-on-fact; it serves this spec and is never a conformance target.
 >
-> **Identifiers.** **O<n>** objective clauses · **PU<n>** universal build principles · **PP<n>** platform build principles ·
+> **Identifiers.** **O<n>** objective clauses · **PU<n>** universal build principles · **PR<n>** repo-specific build principles ·
 > **FR<n>** functional requirements and **D<n>** design decisions (both in `DESIGN.md`).
 > Every R cites the O it serves; an O cited by no R and discharged by no P is a gap.
-> PU and PP are separate sequences, deliberately distinct from **FR** (functional requirements).
+> PU and PR are separate sequences, deliberately distinct from **FR** (functional requirements).
 >
 > **What belongs where.** Part O is the WHY and the WHAT: intent, outcomes, and boundaries.
 > Part P is the HOW WE BUILD: construction constraints. How this system is *arranged* is the
@@ -427,15 +427,15 @@ merge-and-deploy path; that is the only form of this that pollutes. Before adopt
 route at all, re-check for an official standalone binary: that is PU1's **L3**, and it
 outranks this. Where a tool cannot work this way — it needs a build toolchain the component
 must not carry, or a runtime that conflicts with the component's — **it is not a tool, it is
-a workload**, and runs as a container like any other workload (PP1).
+a workload**, and runs as a container like any other workload (PR1).
 
 
-## PP — Platform principles (bind this repository's own platform)
+## PR — Repo-specific principles (bind this repository's own platform)
 
 > These govern this repository's own platform — the host, the dev-container and the agent
 > layer. A project the pair develops does not inherit them.
 
-### PP1 — IMMUTABLE HOST / CONTAINERISE-EVERYTHING
+### PR1 — IMMUTABLE HOST / CONTAINERISE-EVERYTHING
 
 The platform runs as an immutable host with **every application in a container** (and,
 where a workload genuinely requires it, in a virtual machine — a recorded capability
@@ -457,7 +457,7 @@ with the machine's permanent data preserved across reinstalls; onboarding a new
 environment is an **adapter addition, never a fork**. A mechanical check fails any change
 that mutates the live host outside the merge-and-deploy path.
 
-### PP2 — THE THROWAWAY PRINCIPLE & CHURN
+### PR2 — THE THROWAWAY PRINCIPLE & CHURN
 
 Every build a throwaway, and the tree it built from a
 throwaway with it. Teardown (EXIT-trap, including
@@ -471,7 +471,7 @@ ceilings are design facts owned per component, recorded in the design, not here.
 Containerfiles are structured **heavy/stable-early, churn-late**; `--no-cache`/prune is
 reserved for the periodic clean rebuild, never used during churn.
 
-### PP3 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
+### PR3 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
 
 This repository holds **both sides of every contract** the platform uses — the ticket-bus
 grammar, the verdict formats, the refresh manifests — so a contract change lands
@@ -484,7 +484,7 @@ producer emission is **gated off until the consumer that understands it is confi
 live**. A producer-first emission that can strand or wedge a not-yet-upgraded counterpart
 is UNSAFE.
 
-### PP4 — DISPOSABLE AGENT LAYER (REBUILD, NEVER UPDATE)
+### PR4 — DISPOSABLE AGENT LAYER (REBUILD, NEVER UPDATE)
 
 The agent tooling lives in a **disposable layer — an agent box** — that is **rebuilt,
 never updated in place**: currency flows only through a rebuild from the official
