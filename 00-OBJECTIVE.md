@@ -15,6 +15,10 @@
 > builds must be *made* belongs to the build principles. How *this system* is arranged
 > belongs to `02-DESIGN.md`, and why it is arranged that way to `docs/adr/`.
 >
+> **Never instance facts either.** Which provider, which machine, which release — those
+> expire (UNI-P2) and belong to the environment adapter that verifies them, never to a
+> document that is fixed until re-confirmed.
+>
 > **Identifiers.** `OB-<n>`, flat and contiguous. Every `01-SPEC.md` clause cites the
 > `OB-n` it serves; an `OB-n` with no requirement is a gap.
 
@@ -76,6 +80,8 @@ repository's genesis path into an immutable, container-as-app mother platform,
 hosted bare-metal machine. The only constants are Fedora and headlessness.
 Provisioning-environment facts — provider consoles, cloud images, hardware, virtualization
 capability, GPU availability, network shape — are inputs, never baked-in assumptions.
+The live inventory of which providers and machines a pair actually runs on is an
+**adapter fact**, verified and dated per UNI-P2, and is never recorded here.
 
 **OB-8 · The dev-container** — a containerised development environment running on that
 host. It is **highly stable by design**: it changes deliberately, through this
@@ -86,10 +92,12 @@ work, credentials, and sessions across every refresh.
 layer**; the component and its layer together form that component's **agent box**. The
 layer is what lets the components stay **relatively stable** while the agent stays
 **always current**. Everything durable — credentials, transcripts, configuration — lives
-outside it, so a rebuild loses nothing. Two lineages are built now, the **claudebox**
-(Claude Code) and the **kimibox** (Kimi Code), with the provision that the layer can carry
-anything admitted under the lineage contract of OB-18. Lineage is a provisioning parameter
-of a component, **never a fork of the platform**.
+outside it, so a rebuild loses nothing. **Two lineages are built now** — the **claudebox**
+(Claude Code) and the **kimibox** (Kimi Code) — with the **provision that the layer can
+carry anything**: further lineages (DeepSeek, Codex, Gemini, GLM, and their successors)
+are admitted as each meets the lineage contract of OB-18. **One box instance runs one
+lineage, chosen at provisioning** (default: claudebox) — lineage is a provisioning
+parameter of a component, **never a fork of the platform.**
 
 **OB-10 · One system, one repository.** The two components are one lifecycle, one
 specification, one repository, organised as **`host/`** (the mother platform),
@@ -141,7 +149,8 @@ application — the dev-container, the agent tooling, all workloads — runs in 
 or, where a workload genuinely requires it, in a virtual machine as a recorded capability
 decision. The invariant: **no mutable out-of-band host change; every host change is
 reproducible from this repository and flows the merge-and-deploy path.** The host artifact
-is environment-agnostic — onboarding a new environment is an **adapter addition, never a
+is environment-agnostic — the genesis path is a **Fedora core plus a per-environment
+provisioning adapter**, and onboarding a new environment is an **adapter addition, never a
 fork.**
 
 **OB-16 · Throwaway builds and throwaway trees.** Every build is a throwaway and the tree
@@ -159,15 +168,18 @@ consumer that understands it is confirmed live.**
 
 **OB-18 · Disposable agent layer — rebuild, never update.** The agent layer is **rebuilt,
 never updated in place**; currency flows only through a rebuild from the official channel.
-The tool's own self-update is **disabled by construction**. The cadence is **fast**, and a
-rebuild **never costs live work**: the standing rule is **interrupt → rebuild → restart →
-resume** — every session **resumed to active work and verified**, never merely present. A
-refresh that cannot resume its sessions **does not fire**; deferral is the fallback for an
-unproven resume class, never the steady state. A lineage is admitted only on the
-**contract**: official provenance at the strongest level the vendor admits, headless
-autonomous operation, self-update disabled by construction, state held outside the layer,
-and the loop's policy/permissions interface. Each admission or non-admission is recorded;
-a silent waiver is a defect. **One box instance runs one lineage.**
+The tool's **own self-update is disabled by construction** — a self-installed binary would
+shadow the managed one and strand the layer stale while appearing current. The cadence is
+**fast: daily, tracking the vendor's releases**, and a rebuild **never costs live work**:
+the standing rule is **interrupt → rebuild → restart → resume** — every session **resumed
+to active work and verified**, never merely present. A refresh that cannot resume its
+sessions **does not fire**; deferral is the fallback for an unproven resume class, never
+the steady state, and an on-demand path is always available. A lineage is admitted only on
+the **contract**: official provenance at the strongest level the vendor admits, headless
+non-interactive autonomous operation, self-update disabled by construction, state held
+outside the layer, and the loop's policy/permissions interface. Each admitted lineage is
+recorded as a **lineage manifest**; a lineage that fails the contract is a **recorded
+non-admission, never a silent waiver.**
 
 ---
 
@@ -219,8 +231,8 @@ amending this document.
   **independent, adversarial review** verifies the built product against the confirmed
   spec — this document first, then the specification, then the build principles — with
   reviewer and author drawn from **different agent lineages** where the platform's
-  lineages allow. If the review does not pass, the product goes back into the loop, not
-  out the door.
+  lineages allow, so independence means a different checker, not just a different context.
+  If the review does not pass, the product goes back into the loop, not out the door.
 - **OB-30** — **No standing human tap.** A gate that can only stall is a human summons,
   which this objective forbids. Every blocking mechanism carries a bounded, automatic
   recovery and surfaces to the maintainer only after its bounded attempts fail.
