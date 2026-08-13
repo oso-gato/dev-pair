@@ -1,0 +1,11 @@
+# Ownership of the fixed documents.
+#
+# These files are maintainer-merge-only. This file plus branch protection is what makes
+# that true — the objective asserts it, CODEOWNERS enforces it.
+#
+# Requires on the protected branch: "Require a pull request before merging" and
+# "Require review from Code Owners".
+
+/00-OBJECTIVE.md          @oso-gato
+/00-BUILDPRINCIPLE.md     @oso-gato
+/.github/CODEOWNERS       @oso-gato

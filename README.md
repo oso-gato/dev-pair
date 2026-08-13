@@ -1,23 +1,29 @@
 # dev-pair
 
-The autonomous dev pair: a Fedora host and a dev container, built and run as one system.
+The autonomous dev pair: a Fedora host and its dev-container, governed by one objective
+and one set of build principles.
 
-Two documents govern everything in this repository:
+A maintainer states an objective in a single session and confirms it. From there the pair
+derives the requirements, architects the design, builds, validates against a live
+environment, and ships — with no second human act.
 
-- [00-OBJECTIVE.md](00-OBJECTIVE.md) — why the pair exists and what it must achieve.
-- [00-OBJECTIVE.md](00-OBJECTIVE.md) — how anything in this repository may be built.
+## Where things are
 
-The working map from those two to the code is [DESIGN.md](DESIGN.md) — dev-owned,
-mutable-on-fact, never a conformance target.
+Start at [`AGENTS.md`](AGENTS.md) — it routes to everything and states which document
+governs what.
 
-If code and these documents disagree, the documents win — or the documents are changed deliberately, in the open, never silently.
+| | |
+|---|---|
+| [`00-OBJECTIVE.md`](00-OBJECTIVE.md) | Why this exists, and its boundaries |
+| [`00-BUILDPRINCIPLE.md`](00-BUILDPRINCIPLE.md) | How anything gets built, universally |
+| [`01-SPEC.md`](01-SPEC.md) | What the platform must do |
+| [`02-DESIGN.md`](02-DESIGN.md) | How it is arranged |
+| [`docs/adr/`](docs/adr/) | Why it is arranged that way |
 
-## Layout law
+This file is orientation only. It carries no law — if it disagrees with a governing
+document, the governing document wins and this file is defective.
 
-Ruthless path-level modularity. Every file belongs unambiguously to exactly one artifact:
+## Status
 
-- `host/` — everything that provisions, converges, or operates the Fedora host (VPS or bare metal).
-- `dev-container/` — everything that builds or operates the dev container.
-- `shared/` — versioned atomic contracts and anything both artifacts genuinely share. Nothing lands here to escape a boundary.
-
-There is no fourth place. A file that fits nowhere is a design smell; fix the design, not the filing.
+Rebuilding. The document architecture is being established first; the source trees are
+slated for throwaway and restart under the confirmed objective.
