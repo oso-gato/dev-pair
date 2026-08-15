@@ -34,59 +34,33 @@
 
 ## P1 — PROVENANCE
 
-Every artifact entering **any** tree the platform builds — host, dev-container, workloads,
-and every throwaway alike — is admitted **fail-closed and version-pinned at the strongest
-level it admits** of a three-level hierarchy: **L1** Fedora's own dnf repos; **L2** the
-vendor's own RPM or dnf `.repo` with `gpgcheck=1` (and repo-metadata signatures where the
-vendor publishes them); **L3** last-resort official-upstream binary, provenance-graded
-(**c1** GPG signature > **c2** published checksum > **c3** resolve-log) and disclosed per
-artifact. Descending to a lower level a higher one would satisfy is a defect. Forbidden
-outright and enforced by mechanical scan: COPR/third-party repos, language package managers
-onto PATH, tarballs onto PATH, curl-pipe-sh, mirror/aggregator binaries, flatpak, snap.
-Disposability grants no exemption. **One pinned-fetch contract serves the whole platform** —
-host and dev-container fetch pinned artifacts through the same mechanism with the same
-strength; provenance is a platform constant, never a per-component achievement. (A repo
-definition fetched unverified on the most privileged component while pinned on another is
-the canonical violation.)
+Every artifact entering any tree the platform builds — host, dev-container, workload, and every throwaway alike — is admitted **fail-closed and version-pinned at the strongest provenance its source admits**. Settling for a lower level when a higher one is available is a defect. Disposability grants no exemption.
+
+**One pinned-fetch contract serves the whole platform.** Host and dev-container fetch pinned artifacts through the same mechanism at the same strength. Provenance is a platform constant, never a per-component achievement — a repo definition fetched unverified on the most privileged component while pinned on another is the canonical violation.
+
+The OS-level instantiation is a three-level ladder: **L1** Fedora's own dnf repos; **L2** the vendor's own RPM or dnf `.repo` with `gpgcheck=1`, plus repo-metadata signatures where the vendor publishes them; **L3** last-resort official-upstream binary, provenance-graded — **c1** GPG signature over **c2** published checksum over **c3** resolve-log — and disclosed per artifact.
+
+Forbidden outright, enforced by mechanical scan: COPR and third-party repos, language package managers onto PATH, tarballs onto PATH, curl-pipe-sh, mirror and aggregator binaries, flatpak, snap.
 
 ## P2 — VERIFY-BEFORE-ADOPT
 
-Before adopting or bumping **any** source, version, or artifact, its existence and identity
-are **fact-checked against the live upstream** — not asserted from memory or a stale pin —
-and a **risky install** (a version-mismatched vendor RPM, a new `.repo`, an L3 binary) is
-**exercised in a scratch throwaway before it is wired into a real build file**. Every
-adoption leaves a recorded trail: artifact, level/grade, pin, adoption date, last
-live-check date. **Provisioning-environment and release-specific facts** (provider console
-behavior, cloud-image vintage, hardware, virtualization capability, GPU availability,
-network shape, package splits) expire: they are re-verified against the live environment
-**per provisioning environment and per Fedora release**, because the host is
-environment-agnostic by objective. A new environment — a new cloud provider, a local
-bare-metal machine — is onboarded by **verifying its facts**, never by assuming them, and
-never by forking the platform. A source adopted without a live fact-check, or a risky
-install wired in unproven, is a reviewable defect.
+Before any source, version, or artifact is adopted or bumped, its existence and identity are **fact-checked against the live upstream** — never asserted from memory or a stale pin. A risky install — a version-mismatched vendor RPM, a new `.repo`, an L3 binary — is **exercised in a scratch throwaway before it is wired into a real build file**.
+
+Every adoption leaves a **recorded trail**: artifact, level and grade, pin, adoption date, last live-check date. The vendoring trail in the repo-genesis template set is the standing exemplar.
+
+**Environment facts expire.** Provider console behaviour, cloud-image vintage, hardware, virtualization capability, GPU availability, network shape, package splits — all are re-verified against the live environment, per environment and per Fedora release. Their one home is the estate's environment registry. A new environment is onboarded by **verifying its facts, never by assuming them** — and never by forking the platform.
+
+A source adopted without a live fact-check, or a risky install wired in unproven, is a reviewable defect.
 
 ## P3 — CAPABILITY-RELATIVE MINIMALISM
 
-Every package and artifact is installed at the **minimal leaf footprint for its decided
-capability**: nothing enters any built tree without a **recorded justification**;
-`install_weak_deps=False` applies to **every** package installation on the platform,
-including bootstrap paths that would otherwise inherit an upstream default; the most
-specific leaf package is chosen over any convenience metapackage; the irreducible
-hard-dependency closure of a chosen capability is accepted and disclosed, not fought.
-Minimality is **capability-relative** — between equal-capability options prefer the smaller,
-higher-provenance one; **dropping a capability to shrink the footprint is a recorded
-capability trade-off, never a minimalism win.**
+Every package and artifact enters at the **minimal leaf footprint for its decided capability**, and nothing enters any built tree without a **recorded justification**. The most specific leaf package wins over any convenience metapackage. The irreducible hard-dependency closure of a chosen capability is accepted and disclosed, not fought. (OS instantiation: `install_weak_deps=False` on every package installation, bootstrap paths included.)
 
-**Gates are features.** The same discipline binds every gate, check, watcher, and probe the
-platform builds — security machinery is not exempt from justification. A mechanism is
-warranted only if it **(a) guards a real trust boundary, (b) reads an artifact rather than
-an opinion, and (c) is wired to a decision it can change.** A check that can change no
-outcome is telemetry and lives in the log, not in a gate. Machinery exists to move the
-objective's artifacts — **never to manage other machinery**: a component whose only consumer
-is another component's failure mode is the same component. **Activation-proof:** no
-actuator is declared built until its **first measured live success** is recorded — a merged,
-unproven mechanism is scaffolding, and a permanently-red probe is deleted or fixed, never
-tolerated (a standing red trains the loop to ignore alarms, which is worse than no alarm).
+Minimality is **capability-relative**. Between equal-capability options, prefer the smaller, higher-provenance one. **Dropping a capability to shrink the footprint is a recorded capability trade-off, never a minimalism win.**
+
+**Gates are features.** Every gate, check, watcher, and probe is bound by the same justification — security machinery is not exempt. A mechanism is warranted only if it guards a real trust boundary, reads an artifact rather than an opinion, and is wired to a decision it can change. A check that can change no outcome is telemetry; it lives in the log, not in a gate. Machinery exists to move the objective's artifacts, **never to manage other machinery** — a component whose only consumer is another component's failure mode is the same component.
+
+**Activation-proof.** No actuator is declared built until its first measured live success is recorded — a merged, unproven mechanism is scaffolding. A permanently red probe is deleted or fixed, never tolerated: a standing red trains the loop to ignore alarms, which is worse than no alarm.
 
 ## P4 — IMMUTABLE HOST / CONTAINERISE-EVERYTHING
 
