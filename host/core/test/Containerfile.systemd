@@ -1,8 +1,0 @@
-# Test harness image for host/core/test_converge_container.sh.
-# NOT a platform artifact: the stock fedora:44 image ships without systemd, and the
-# converge test must drive the REAL execution boundary (dnf, systemctl, sshd) — so this
-# image adds exactly systemd and nothing else. The converger under test is bind-mounted
-# from the repository at run time; nothing under test is baked in.
-FROM registry.fedoraproject.org/fedora:44
-RUN dnf -y --setopt=install_weak_deps=False install systemd dbus-broker && dnf clean all
-CMD ["/usr/sbin/init"]
