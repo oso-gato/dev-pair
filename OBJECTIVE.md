@@ -1,4 +1,4 @@
-# The Dev Pair — SPEC (spec of record)
+# The Dev Pair — OBJECTIVE (spec of record)
 
 **The foremost objective is autonomous development**: a host and its dev-container — one **dev pair** — running an autonomous development-loop workflow, with exactly one human interaction per project, then shipping on its own. **The second objective: the host is a mother platform**, hosting containers as apps and services for whatever the maintainer needs. Everything below serves those two.
 
@@ -34,8 +34,8 @@ workflow is:
   the **one and only** human act the
   workflow requires.
 - **Execution — then autonomous, to ship.** The confirmed objective is **locked as
-  `spec.md` at the root of the repository being worked on** (the per-project spec
-  of record, distinct from this platform spec), and from it the dev pair
+  `OBJECTIVE.md` at the root of the repository being worked on** (the per-project spec
+  of record, distinct from this platform objective), and from it the dev pair
   autonomously: **(a)** builds the functional requirements, **(b)** architects the
   design that serves them, **(c)** builds, validates, and iterates in a live environment —
   recovering automatically from failure, until the product ships. Humans approve goals,
@@ -43,8 +43,8 @@ workflow is:
 - **Immutability — the throwaway principle.** The workflow operates on **throwaway builds
   and the throwaway trees they build from**. This *is* the immutability principle of the
   host and the dev-container for the life of the work: every build is thrown away, every tree it
-  built from is thrown away with it, and nothing durable accumulates except what the
-  confirmed objective names — until the product is shipped.
+  built from is thrown away with it, and nothing durable accumulates on the pair's
+  components except what the confirmed objective names — until the product is shipped.
 
 ### 2. The host as mother platform
 
@@ -229,6 +229,6 @@ platform's own loop. The loop's mechanics:
 
 ## Document authority
 
-This spec and the constitution are **confirmed once and fixed**; amendment is a new maintainer confirmation, maintainer-merge-only. The architecture map is agent-owned and mutable-on-fact. The documentation surfaces of this repository are exactly: **the README, this spec, the constitution, `AGENTS.md`, `ARCHITECTURE.md`, the decision record (`decisions/`), and the changelog** — one authoritative home per concept; every other mention points or is deleted. Memoir is not specification.
+This objective and the constitution are **confirmed once and fixed**; amendment is a new maintainer confirmation, maintainer-merge-only. The architecture map is agent-owned and mutable-on-fact. The documentation surfaces of this repository are exactly: **the README, this objective, the constitution, `AGENTS.md`, `ARCHITECTURE.md`, the decision record (`decisions/`), the per-ticket work record (`specs/`), and the changelog** — one authoritative home per concept; every other mention points or is deleted. Memoir is not specification.
 
-**Why spec and constitution are two documents.** The objective is **scoped** — this platform spec here, and each project's locked `spec.md` in its own repository — while the build principles are **universal**, binding everything the platform builds. They are confirmed **together, once, in a single session**; thereafter a project's one initiation session **co-creates that project's spec AND explicitly captures the build principles that govern the work** — the platform's principles applied by reference, plus any project-specific construction constraint decided in that session — so nothing about how the work will be built is left implicit or assumed. The principles are **captured, never re-dictated** — a re-dictation is a fork. One session, two documents, nothing assumed.
+**Why objective and constitution are two documents.** The objective is **scoped** — this platform objective here, and each project's locked `OBJECTIVE.md` in its own repository — while the build principles are **universal**, binding everything the platform builds. They are confirmed **together, once, in a single session**; thereafter a project's one initiation session **co-creates that project's objective AND explicitly captures the build principles that govern the work** — the platform's principles applied by reference, plus any project-specific construction constraint decided in that session — so nothing about how the work will be built is left implicit or assumed. The principles are **captured, never re-dictated** — a re-dictation is a fork. One session, two documents, nothing assumed.

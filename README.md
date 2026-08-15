@@ -4,7 +4,7 @@ The autonomous dev pair: a Fedora host and a dev container, built and run as one
 
 Two documents govern everything in this repository:
 
-- [spec.md](spec.md) — why the pair exists and what it must achieve.
+- [OBJECTIVE.md](OBJECTIVE.md) — why the pair exists and what it must achieve.
 - [constitution.md](constitution.md) — how anything in this repository may be built.
 
 Agents start at [AGENTS.md](AGENTS.md) — the session-loaded operating manual. The working map from spec to code is [ARCHITECTURE.md](ARCHITECTURE.md) — agent-owned, mutable-on-fact, never a conformance target. Decisions are recorded in [decisions/](decisions/); notable changes in [CHANGELOG.md](CHANGELOG.md).

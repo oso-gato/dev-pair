@@ -2,8 +2,8 @@
 
 > **THE HOW WE BUILD** — how every artifact is constructed, whatever it does.
 >
-> **Status: DRAFT — pending maintainer confirmation.** Confirmed with the spec
-> (`spec.md`) and sharing its authority: fixed thereafter, amendment is a new
+> **Status: DRAFT — pending maintainer confirmation.** Confirmed with the objective
+> (`OBJECTIVE.md`) and sharing its authority: fixed thereafter, amendment is a new
 > maintainer confirmation, MAINTAINER-MERGE-ONLY. These principles serve the twofold
 > objective — the autonomous dev-pair loop workflow first, the mother platform second —
 > and must never contradict it. They are **capabilities, not implementations**: a
@@ -107,6 +107,8 @@ Onboarding a new environment is an **adapter addition, never a fork**: a small p
 
 This is the pair's build-and-validation mechanism. Every build is a throwaway. The tree it builds from is a throwaway with it. Nothing ever builds from the host's live tree or the container's live tree — a throwaway tree is cut first, used, and torn down. This is what keeps both components immutable (P4) while the pair builds and validates work for any repository.
 
+Scope. The throwaway principle governs build state on the pair's components — trees, images, run containers, caches. It never governs repository content: what lands on main through the merge path is the durable record, governed by P9 and P13. A shipped ticket's `specs/` folder accumulating on main is record, not drift.
+
 Validation follows the objective's two tiers. A build validates inside the dev-container where possible. Only what the container cannot validate — PID 1 and boot-level behaviour, for example — runs on the host.
 
 Teardown is total. An EXIT-trap, covering signal paths, removes every throwaway tree, image, and run container. An orphan sweeper reaps crash and kill leaks; the sweeper itself is scheduled and proven.
@@ -147,7 +149,7 @@ Tests gate the merge, bound to the exact head sha — the objective's distrust-m
 
 ## P9 — ONE HOME, DECISIONS ON RECORD
 
-One authoritative home per concept; every other mention is a one-line pointer or deleted. The repository's documentation surfaces are exactly: the README, the spec, this constitution, `AGENTS.md` (the session-loaded operating manual), `ARCHITECTURE.md` (the current-state map, agent-owned, mutable-on-fact, never a conformance target), the decision record (`decisions/`), and the changelog — nothing else accretes. A document asserting behaviour the code does not have is UNTRUE and a blocking finding.
+One authoritative home per concept; every other mention is a one-line pointer or deleted. The repository's documentation surfaces are exactly: the README, the objective (`OBJECTIVE.md`), this constitution, `AGENTS.md` (the session-loaded operating manual), `ARCHITECTURE.md` (the current-state map, agent-owned, mutable-on-fact, never a conformance target), the decision record (`decisions/`), the per-ticket work record (`specs/<NNN-slug>/` — Spec Kit verbatim, frozen at ship), and the changelog — nothing else accretes. A document asserting behaviour the code does not have is UNTRUE and a blocking finding.
 
 The decision record is the loop's memory of its own reasoning. Every non-obvious decision is recorded as it is made: the problem, the options considered, the choice and why, and its fate — adopted, discarded, reversed, superseded. The road not travelled and the reversal are recorded with the same care as the road taken. Records are append-only: a reversed decision is closed by a superseding record, never erased. (This is the industry's Architecture Decision Record practice, adopted as standing law.)
 
@@ -187,17 +189,18 @@ Every repository the platform builds carries the same skeleton, known before the
 
 ```
 <repo>/
-├── spec.md           the locked objective — WHY (maintainer-merge-only)
+├── OBJECTIVE.md      the locked objective — WHY (maintainer-merge-only)
 ├── constitution.md   the build principles — HOW (maintainer-merge-only)
 ├── AGENTS.md         session-loaded operating manual for agents
 ├── ARCHITECTURE.md   current-state map — agent-owned, mutable-on-fact, never a conformance target
 ├── CHANGELOG.md      curated notable changes + incident narrative
 ├── README.md         human orientation
 ├── decisions/        ADRs — 0001-<slug>.md, append-only, status-tracked
+├── specs/            per-ticket work record — <NNN-slug>/spec.md, plan.md, tasks.md (Spec Kit verbatim; NNN = issue number; frozen at ship)
 └── <component tree — by runtime shape>
 ```
 
-Filenames are contracts. Where a tool consumes the file, the name and case are the tool's: `spec.md` and `constitution.md` per GitHub Spec Kit, `AGENTS.md` per the agents.md standard — the hosts' filesystems are case-sensitive, so a wrong-case name is an undiscovered file. Where no tool consumes the file (README, ARCHITECTURE, CHANGELOG), the classic uppercase root convention holds.
+Filenames are contracts. Where a tool consumes the file, the name and case are the tool's: `constitution.md` and the per-ticket `spec.md` / `plan.md` / `tasks.md` per GitHub Spec Kit, `AGENTS.md` per the agents.md standard — the hosts' filesystems are case-sensitive, so a wrong-case name is an undiscovered file. Where no tool consumes the file (OBJECTIVE, README, ARCHITECTURE, CHANGELOG), the classic uppercase root convention holds. "Spec" means only what the kit means by it: a per-ticket specification; the repo-level lock is the objective.
 
 The component tree adapts to the runtime shape — and only to the runtime shape:
 
