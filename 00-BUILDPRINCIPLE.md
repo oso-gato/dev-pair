@@ -25,6 +25,8 @@
 > judgment is required. A principle that cannot be checked cannot bind: each must be
 > enforceable in fact, or it is defective.
 >
+> **No theatrical machinery — the standing rationale.** The platform's measured failure mode is scaffolding that looks like rigour: gates with nothing to gate, hooks and watchdogs watching each other, dead-man switches nobody would miss, tests asserting what a mock was told. Three principles are one immune response to it: a gate must be wired to a decision it can change (P3), a test must drive the real execution boundary (P8), and detection may only exist together with recovery (P10). The test for any new mechanism is always the same: name the outcome it changes, or don't build it.
+>
 > Consolidated from the fleet's `fedora-dev/00-BUILDPRINCIPLE.md` (BP1–BP9), the host-side
 > instantiation drafted for `fedora-bootstrap`, the zero-base architectural review of the
 > pair, and the twofold-objective restatement (2026-08-02). A mapping note closes this
@@ -125,32 +127,23 @@ A mutating action outside an isolated tree, or a commit or push without branch r
 
 ## P7 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
 
-This repository holds **both sides of every contract** the platform uses — the ticket-bus
-grammar, the verdict formats, the refresh manifests — so a contract change lands
-**atomically, producer and consumer in one change**, and every machine-readable grammar is
-**defined once, in `shared/`, and versioned** — one home per contract, per the
-repository's `host/` · `dev-container/` · `shared/` layout. What remains is the **runtime
-stagger**: components run mixed versions across a refresh window, so every consumer
-**fail-safe refuses an unrecognized shape** rather than mis-parsing it, and every new
-producer emission is **gated off until the consumer that understands it is confirmed
-live**. A producer-first emission that can strand or wedge a not-yet-upgraded counterpart
-is UNSAFE.
+This governs the pair's own protocol — the ticket bus, the verdict formats, and the refresh manifests the two components use to talk to each other. Every contract has one home: defined once in `shared/`, versioned, both sides reading the same definition. A contract change lands atomically — producer and consumer updated in the same merge, never separately.
+
+The repository guarantees the source; the runtime still staggers. The two components upgrade at different moments, so for a window one side runs old code. Two rules cover that window. A consumer that receives a shape it does not recognise refuses it safely — it never guesses. A producer does not emit a new shape until the consumer that understands it is confirmed live.
+
+A producer-first emission that can strand or wedge a not-yet-upgraded counterpart is UNSAFE.
 
 ## P8 — TEST-QUALITY / MUTATION-PROVEN
 
-Every behavioral change ships a test that **drives the real execution boundary** (the actual
-engine, git, kernel, or process semantics under test — not a stub asserting what a mock was
-told) and is **proven to fail against the pre-change code**; a test that passes against the
-unfixed code is a defect. Guards are **mutation-checked in-suite**: the pre-fix behavior is
-mechanically restored on a copy and the row must fail. **Production-only lines** — the paths
-no test seam substitutes — must be covered by a real-body test or by the live acceptance
-gate, and the suite must contain **no line whose production invocation has never been
-executed** (the measured lesson: an untested production invocation fails silently at
-scale). Where the behavior under test needs full
-virtualization or a GPU, it runs on the **bare-metal capability track** — validation
-never simulates on the VPS track what the bare-metal track can prove. **The suite gates**: tests run at the merge boundary bound to the exact head sha — a
-test culture that cannot stop a merge is decoration, not proof. A permanently-failing test
-or probe is fixed or removed, never tolerated (P3's no-standing-red).
+Every behavioural change ships a test, and the test drives the real execution boundary — the actual engine, git, kernel, or process semantics under test. A stub asserting what a mock was told proves nothing.
+
+Every test is proven to fail against the pre-change code. A test that passes against the unfixed code is a defect, not a test. Guards are mutation-checked in-suite: the pre-fix behaviour is mechanically restored on a copy, and the guard's test must fail.
+
+Production-only lines — the paths no test seam substitutes — are covered by a real-body test or by the live acceptance gate. The suite contains no line whose production invocation has never been executed; the measured lesson is that an untested production invocation fails silently at scale.
+
+Validation that needs full virtualization or a GPU runs on the bare-metal track; the VPS track never simulates what it cannot run.
+
+Tests gate the merge, bound to the exact head sha — the objective's distrust-made-structural, applied at the merge boundary. A test culture that cannot stop a merge is decoration. A permanently failing test or probe is fixed or removed, never tolerated (P3: no standing red).
 
 ## P9 — DOCUMENTATION-DRY
 
