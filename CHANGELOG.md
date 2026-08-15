@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-16
 
+- Repo-genesis template set shipped (ticket #6, the method's first exercise): `shared/templates/repo-genesis/` — standing-surface templates, the three-shape manual, Spec Kit ticket templates vendored at v0.16.4. See decisions/0004.
 - Spec Kit per-ticket method adopted (specify → plan → tasks → analyze → implement; `specs/<NNN-slug>/`, kept on main, frozen at ship); root lock renamed `spec.md` → `OBJECTIVE.md` to end the name collision; P5 scoped to build state; clarify folded into the initiation session. See decisions/0003.
 - P13 added: the standing repo structure (skeleton tree, shape adaptation, filename-casing contracts) made law; README layout law now points at it. See decisions/0002.
 - Governing documents renamed to Spec Kit convention: `spec.md` (was `00-OBJECTIVES.md`), `constitution.md` (was `00-BUILDPRINCIPLE.md`). Spec now opens with the twofold objective.
