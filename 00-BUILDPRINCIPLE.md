@@ -103,29 +103,25 @@ Onboarding a new environment is an **adapter addition, never a fork**: a small p
 
 ## P5 — THE THROWAWAY PRINCIPLE & CHURN
 
-Every build a throwaway, and the tree it built from a
-throwaway with it. Teardown (EXIT-trap, including
-signal paths) covers every throwaway tree, image, and run container; an orphan sweeper
-reaps crash/kill leaks and is itself scheduled and proven. The durable inputs — a small,
-**declared registry** of caches — hold **re-downloadable inputs only, never build output,
-never an image layer** (the zero-byte re-download standard across iterations). The
-invariant on every cache: **bounded by a hard ceiling under a scheduled, self-verifying
-actuator**, so storage can never grow without limit; the eviction policy and numeric
-ceilings are design facts owned per component, recorded in the design, not here.
-Containerfiles are structured **heavy/stable-early, churn-late**; `--no-cache`/prune is
-reserved for the periodic clean rebuild, never used during churn.
+This is the pair's build-and-validation mechanism. Every build is a throwaway. The tree it builds from is a throwaway with it. Nothing ever builds from the host's live tree or the container's live tree — a throwaway tree is cut first, used, and torn down. This is what keeps both components immutable (P4) while the pair builds and validates work for any repository.
+
+Validation follows the objective's two tiers. A build validates inside the dev-container where possible. Only what the container cannot validate — PID 1 and boot-level behaviour, for example — runs on the host.
+
+Teardown is total. An EXIT-trap, covering signal paths, removes every throwaway tree, image, and run container. An orphan sweeper reaps crash and kill leaks; the sweeper itself is scheduled and proven.
+
+The only durable inputs are caches: a small, declared registry holding re-downloadable inputs only — never build output, never an image layer. The standard: anything cached re-downloads at zero bytes on the next iteration. Every cache is bounded by a hard ceiling under a scheduled, self-verifying actuator, so storage can never grow without limit. Eviction policy and numeric ceilings are design facts; they live in the design, not here.
+
+Churn discipline for images: heavy, stable layers early; churning layers late. Iterative rebuilds ride the layer cache. A full clean rebuild is a periodic, deliberate event — never part of churn.
 
 ## P6 — ISOLATED WORKING TREE
 
-Every authoring or build action runs in a **fresh, per-session-namespaced working tree that
-never mutates the immutable live tree, a shared clone, or another session's tree**. All
-mutable local state (worktree roots, locks, markers, scratch) is namespaced per session.
-The checked-out branch is **re-verified to belong to the session's own namespace before
-EVERY commit and EVERY push** — at the authoring sites and at the harness's own commit/push
-sites alike, the harness being the most important case. The `cd` into an isolated tree is a
-**fail-closed guard**, never a prefix: a failed enter runs no mutating step in the caller's
-directory. A mutating action outside an isolated tree, or a commit/push without branch
-re-verification, is UNSAFE.
+P5 governs what builds; this governs who works where. Every authoring or build action runs in a fresh working tree, namespaced to its session. No action mutates the live tree, a shared clone, or another session's tree. All mutable local state — worktree roots, locks, markers, scratch — is namespaced per session too.
+
+Before every commit and every push, the checked-out branch is re-verified to belong to the session's own namespace. This holds at the authoring sites and at the harness's own commit and push sites alike — the harness being the most important case.
+
+The `cd` into an isolated tree is a fail-closed guard, never a prefix. If the enter fails, no mutating step runs in the caller's directory.
+
+A mutating action outside an isolated tree, or a commit or push without branch re-verification, is UNSAFE.
 
 ## P7 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
 
