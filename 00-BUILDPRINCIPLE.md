@@ -88,25 +88,18 @@ tolerated (a standing red trains the loop to ignore alarms, which is worse than 
 
 ## P4 — IMMUTABLE HOST / CONTAINERISE-EVERYTHING
 
-The platform runs as an immutable host with **every application in a container** (and,
-where a workload genuinely requires it, in a virtual machine — a recorded capability
-decision per the objective). The invariant: **no mutable out-of-band host change; every
-host change is reproducible from this repository and flows the merge-and-deploy path.**
-Two deploy mechanisms are sanctioned, chosen per provisioning class: the **idempotent
-converger** (cloud genesis — applied autonomously by the self-refresh actuators or
-manually by the operator, every mutation declared in the repository, re-run-safe from any
-historical version, ad-hoc drift vanishing on the next apply by design) and the **bootc
-image build/rebase** (local genesis — a container-first, CoreOS-style layered image built
-from this repository, rebased onto the machine with atomic rollback). Moving any
-environment from converger to image-rebase is a design decision, not a conformance gap.
-**The host artifact is environment-agnostic**: the genesis path is structured as a
-**Fedora core plus a per-environment provisioning adapter** — the **cloud adapter**
-converges a stock Fedora cloud image via the idempotent converger; the **local adapter**
-builds a custom bootc image **and its installer media** from this repository, installs the
-machine from the image, and keeps it current by **image rebase with atomic rollback**,
-with the machine's permanent data preserved across reinstalls; onboarding a new
-environment is an **adapter addition, never a fork**. A mechanical check fails any change
-that mutates the live host outside the merge-and-deploy path.
+The platform is container-first and Fedora CoreOS-style throughout. The host is immutable. Every application runs in a container. A virtual machine is allowed only where a workload genuinely requires one — a recorded capability decision per the objective.
+
+Containers are immutable the same way. The **image is the artifact**; the running container is disposable. Durable state lives only in declared volumes. Change is rebuild-and-redeploy, never a live patch.
+
+One invariant binds host and containers alike: **no mutable out-of-band change to any deployed artifact**. Every change is reproducible from its owning repository and flows the merge-and-deploy path. A mechanical check fails any change that violates this.
+
+The host has two lineages, each with one sanctioned deploy mechanism:
+
+- **VPS (cloud genesis).** A virtualised remote host running stock Fedora Cloud. Not a true CoreOS environment, but held to the same standard: host-immutable, everything in containers. Deployed by the **idempotent converger** — a re-run-safe converge script, run by the self-refresh actuators or the operator. Every mutation is declared in the repository. Any historical version re-runs safely. Ad-hoc drift vanishes on the next apply.
+- **Bare metal (local genesis).** A local machine — currently the Minisforum MS-01 — running a custom **bootc image** built, with its installer media, from this repository. Kept current by **image rebase with atomic rollback**. Permanent data survives reinstalls.
+
+Onboarding a new environment is an **adapter addition, never a fork**: a small per-environment piece added to this repository, never a copy of it. Moving an environment from converger to image-rebase is a design decision, not a conformance gap.
 
 ## P5 — THE THROWAWAY PRINCIPLE & CHURN
 
