@@ -1,9 +1,9 @@
-# The Dev Pair — BUILD PRINCIPLES (construction spec of record)
+# The Dev Pair — CONSTITUTION (the build principles)
 
 > **THE HOW WE BUILD** — how every artifact is constructed, whatever it does.
 >
-> **Status: DRAFT — pending maintainer confirmation.** Confirmed with the objective
-> (`00-OBJECTIVES.md`) and sharing its authority: fixed thereafter, amendment is a new
+> **Status: DRAFT — pending maintainer confirmation.** Confirmed with the spec
+> (`spec.md`) and sharing its authority: fixed thereafter, amendment is a new
 > maintainer confirmation, MAINTAINER-MERGE-ONLY. These principles serve the twofold
 > objective — the autonomous dev-pair loop workflow first, the mother platform second —
 > and must never contradict it. They are **capabilities, not implementations**: a
@@ -111,7 +111,7 @@ Validation follows the objective's two tiers. A build validates inside the dev-c
 
 Teardown is total. An EXIT-trap, covering signal paths, removes every throwaway tree, image, and run container. An orphan sweeper reaps crash and kill leaks; the sweeper itself is scheduled and proven.
 
-The only durable inputs are caches: a small, declared registry holding re-downloadable inputs only — never build output, never an image layer. The standard: anything cached re-downloads at zero bytes on the next iteration. Every cache is bounded by a hard ceiling under a scheduled, self-verifying actuator, so storage can never grow without limit. Eviction policy and numeric ceilings are design facts; they live in the design, not here.
+The only durable inputs are caches: a small, declared registry holding re-downloadable inputs only — never build output, never an image layer. The standard: anything cached re-downloads at zero bytes on the next iteration. Every cache is bounded by a hard ceiling under a scheduled, self-verifying actuator, so storage can never grow without limit. Eviction policy and numeric ceilings are architecture facts; they live in `ARCHITECTURE.md`, not here.
 
 Churn discipline for images: heavy, stable layers early; churning layers late. Iterative rebuilds ride the layer cache. A full clean rebuild is a periodic, deliberate event — never part of churn.
 
@@ -145,84 +145,44 @@ Validation that needs full virtualization or a GPU runs on the bare-metal track;
 
 Tests gate the merge, bound to the exact head sha — the objective's distrust-made-structural, applied at the merge boundary. A test culture that cannot stop a merge is decoration. A permanently failing test or probe is fixed or removed, never tolerated (P3: no standing red).
 
-## P9 — DOCUMENTATION-DRY
+## P9 — ONE HOME, DECISIONS ON RECORD
 
-**One authoritative home per concept; every other mention is a one-line pointer or
-deleted.** The document spine is the objective, these principles, the runtime law, and the
-changelog — nothing else accretes. Shared content between components is **vendored from one
-home** (`shared/`), never copied by hand; where bytes must be identical, a mechanical check
-enforces identity — and the preferred fix for duplication is de-duplication, not another
-checker. Evidence and benchmarks live only in the principle they prove. Incident narrative
-belongs to the changelog: **memoir is not specification**. A document asserting behavior the
-code does not have is UNTRUE and a blocking finding.
+One authoritative home per concept; every other mention is a one-line pointer or deleted. The repository's documentation surfaces are exactly: the README, the spec, this constitution, `AGENTS.md` (the session-loaded operating manual), `ARCHITECTURE.md` (the current-state map, agent-owned, mutable-on-fact, never a conformance target), the decision record (`decisions/`), and the changelog — nothing else accretes. A document asserting behaviour the code does not have is UNTRUE and a blocking finding.
+
+The decision record is the loop's memory of its own reasoning. Every non-obvious decision is recorded as it is made: the problem, the options considered, the choice and why, and its fate — adopted, discarded, reversed, superseded. The road not travelled and the reversal are recorded with the same care as the road taken. Records are append-only: a reversed decision is closed by a superseding record, never erased. (This is the industry's Architecture Decision Record practice, adopted as standing law.)
+
+Evidence and benchmarks live in the principle they prove. Incident narrative belongs to the changelog; reasoning belongs to the decision record. Memoir is not specification.
 
 ## P10 — RECOVERY-BEFORE-POWER
 
-**No mechanism may block the loop without carrying a bounded, automatic recovery.** A gate
-that is unavailable, stalled, or erroring must retry, fail over, or degrade under a recorded
-policy — and surface to the maintainer only after its bounded attempts fail. **Detection may
-only be added together with recovery**: a change introducing a blocking gate with no
-self-heal path is UNSAFE, because a fail-closed gate with no recovery is a human summons,
-and the objective's single-interaction law forbids those. Every autonomous mutation is
-reversible — merge (revert), deploy (rollback), refresh (re-converge), closure (reopen) —
-and each recovery path is proven by a test (P8), not by a standing drill framework that
-itself needs managing.
+No mechanism may block the loop without carrying a bounded, automatic recovery. A gate that is unavailable, stalled, or erroring retries, fails over, or degrades under a recorded policy — and surfaces to the maintainer only after its bounded attempts fail.
+
+Detection is only added together with recovery. A blocking gate with no self-heal path is UNSAFE: a fail-closed gate with no recovery is a human summons, and the objective's single-interaction law forbids those.
+
+Every autonomous mutation is reversible — merge by revert, deploy by rollback, refresh by re-converge, closure by reopen. Each recovery path is proven by a test (P8), never by a standing drill framework that itself needs managing.
 
 ## P11 — DISPOSABLE AGENT LAYER (REBUILD, NEVER UPDATE)
 
-The agent tooling lives in a **disposable layer — an agent box** — that is **rebuilt,
-never updated in place**: currency flows only through a rebuild from the official
-channel, admitted per P1. The tool's **own self-update is disabled** by construction — a
-self-installed binary would shadow the managed one, survive the rebuild on a persistent
-volume, and strand the layer stale while appearing current. The rebuild cadence is
-**fast** (daily, tracking the vendor's releases) and **never costs live work**: the
-standing rule is **interrupt → rebuild → restart → resume** — every session **resumed to
-active work and verified** — and where a refresh class cannot yet resume reliably,
-**live sessions block it until all sessions have quit**; deferral is the fallback for
-unproven resume, never the steady state, and an on-demand path is always available.
-**Everything durable** — credentials, transcripts, configuration —
-lives on persistent volumes **outside the disposable layer**, never in it, so a rebuild
-loses nothing and a stale layer never accumulates. The component beneath stays stable
-precisely because the layer above absorbs the churn.
+The agent is a special class. Everything else is stable and immutable (P4); agent tooling moves too fast for that. So agents always run inside an **agent box** — a disposable distrobox layer on top of the immutable component — and the box absorbs the churn the component refuses.
 
-**Lineage admission is a contract, not a name.** The layer carries **two built
-lineages** — the claudebox (Claude Code) and the kimibox (Kimi Code) — and **admits anything
-further** (DeepSeek, Codex, Gemini, GLM, and their successors) when — and only when — it
-satisfies the contract: **official provenance at the strongest level the vendor admits**
-(P1; a lineage whose only source is a forbidden channel is inadmissible until a
-compliant one exists), **headless non-interactive autonomous operation**, **self-update
-disabled by construction**, **state held outside the layer**, and the loop's
-**policy/permissions interface**. Each admitted lineage is recorded as a **lineage
-manifest**; a lineage that fails the contract is a recorded non-admission, never a
-silent waiver. **One box instance runs one lineage**, chosen at provisioning; a box never
-carries more than one lineage (P3).
+Each box runs **one agent**: the **claudebox** runs Claude Code, the **kimibox** runs Kimi Code. A component may run **several boxes in parallel, one per agent**, because the agent landscape shifts faster than pairs can be provisioned. Boxes pair by agent across the two components: an agent present on the dev-container is present on its host. Every ticket is **stamped with its pair and its agent** — the strix pair's claudebox work is picked up only by the strix host's claudebox: never by another pair's claudebox (erebus), never by another agent on the same pair (the kimibox). Agents meet only at the ship gate's adversarial review, where reviewer and author are different agents — which running several agents on one pair is precisely what makes possible.
 
-**Resume is part of the refresh, not an afterthought.** A layer rebuild or a component
-refresh **captures the live session set before it tears anything down and restores every
-session afterwards** — all of them, every tenant — and the resume is **verified against
-work, not presence**: each restored session **actively working again** — a session that
-comes back and sits idle, waiting for a nudge, is **not resumed**; it is a stalled
-session and the refresh is not done. A refresh that cannot resume
-its sessions **does not fire**. Resume is possible by construction because the work's
-durable state is the ticket bus: sessions re-derive from what is co-written to GitHub,
-never from container or layer state.
+An agent box is pinned to the latest official release of its agent and **rebuilt nightly, never updated in place**; an on-demand rebuild is always available. The agent's own self-update is disabled by construction — a self-installed binary would shadow the managed one, survive the rebuild, and strand the layer stale while appearing current. Everything durable — credentials, transcripts, configuration — lives outside the layer, so a rebuild loses nothing.
+
+Two rebuild modes exist. The **automatic nightly rebuild never interrupts a live session** — where it cannot yet resume reliably, live sessions block it until they quit; deferral is the fallback, never the steady state. The **maintainer's manual rebuild may interrupt**: on command it rebuilds, ends the running sessions, and restores the full multi-tenant session set. In both modes the standing rule is interrupt → rebuild → restart → resume: the live session set is captured before teardown — for a layer rebuild or a component refresh alike — and every session is restored to active work, working again, not merely present, and verified. Resume is possible by construction because the work's durable state is the ticket bus — sessions re-derive from what is co-written to GitHub, never from layer state.
+
+Admission is a contract, not a name. Any agent — DeepSeek, Codex, Gemini, GPT, their successors — is admitted as a new box when it meets the contract: official provenance at the strongest level the vendor admits (P1), headless autonomous operation, self-update disabled, state outside the layer, and the loop's policy interface. Each admitted agent is recorded as an **admission manifest**; a failed one is a recorded non-admission.
+
+## P12 — SELF-RENEWAL
+
+The pair is three parts, always: **the GitHub ticket bus, the host, and the dev-container**. Self-renewal is those three making the pair's own improvement live with no human step.
+
+The chain: a maintainer-instructed improvement merges; the host brings itself to the merged state via its deploy mechanism (P4); the host rebuilds and relaunches the dev-container from outside; the full multi-tenant session set is restored (P11). The dev-container never rebuilds itself — it requests its own renewal, and the host's, through the ticket bus. Each link is verified by reading the live artifact back, fail-closed.
+
+Neither component rebuilds the agent doing the work. A renewal that cannot restore its sessions does not fire. A failed link recovers under P10 and surfaces to the maintainer only after bounded attempts fail.
 
 ---
 
 ## Mapping to the fleet's BP1–BP9 (provenance note)
 
-P1=BP1 (strengthened: one fetch contract; repo-metadata signatures) · P2=BP2 (strengthened:
-environment/release re-verification incl. virtualization + GPU availability; adoption
-trail) · P3=BP3 (extended: gates-are-features, activation-proof, no-standing-red — the
-zero-base minimalism doctrine) · P4=BP4 (amended: two sanctioned mechanisms per
-provisioning class — cloud converger, local bootc image; environment-adapter genesis;
-VM-as-recorded-capability) · P5=BP5 (amended and renamed to the objective's throwaway
-principle: cache invariant; bounded input registry) · P6=BP6 (strengthened: harness sites
-named) · P7=BP7 (rescoped: atomic contracts in one repo + runtime stagger; versioning made
-standing) · P8=BP8 (extended: the suite gates; production-only-line rule; the bare-metal capability
-track for full-virtualization/GPU validation) · P9=BP9 (extended: vendoring
-preferred over parity checkers; memoir-is-not-specification) · P10=new (codified from the
-measured gate-without-recovery incidents) · P11=new (the agent-layer discipline —
-rebuild-not-update, auto-resume with deferral as fallback, state-outside-layer,
-multi-lineage admission contract — codified from the fleet's daily-rebuild
-implementation).
+P1=BP1 (strengthened: one fetch contract; repo-metadata signatures) · P2=BP2 (strengthened: environment/release re-verification; adoption trail) · P3=BP3 (extended: gates-are-features, activation-proof, no-standing-red) · P4=BP4 (amended 2026-08-15: container immutability made explicit; two host lineages named) · P5=BP5 (recast as the pair's build-and-validation mechanism) · P6=BP6 (strengthened: harness sites named) · P7=BP7 (rescoped as the pair's own protocol) · P8=BP8 (extended: mutation-proven; merge gate anchored to the objective) · P9=BP9 (recast: one home + decision record; vendoring clause re-homed to the layout law) · P10=new (codified from the measured gate-without-recovery incidents) · P11=new (agent layer: one agent per box, many boxes per pair, two rebuild modes, admission contract) · P12=new (self-renewal, codified from the measured forgetting failures).

@@ -1,17 +1,19 @@
-# The Dev Pair — OBJECTIVE (spec of record)
+# The Dev Pair — SPEC (spec of record)
+
+**The foremost objective is autonomous development**: a host and its dev-container — one **dev pair** — running an autonomous development-loop workflow, with exactly one human interaction per project, then shipping on its own. **The second objective: the host is a mother platform**, hosting containers as apps and services for whatever the maintainer needs. Everything below serves those two.
 
 > **THE WHY** — the highest objective of the host + dev-container pair, stated once, durable.
 >
 > **Status: DRAFT — pending maintainer confirmation.** Once confirmed, this document is fixed:
 > amendment is a new maintainer confirmation, never a silent edit, and any change to it is
-> MAINTAINER-MERGE-ONLY. The build principles (`00-BUILDPRINCIPLE.md`) share that authority.
-> The design is dev-owned and mutable-on-fact; it serves this objective and is never a
-> conformance target.
+> MAINTAINER-MERGE-ONLY. The constitution (`constitution.md`) shares that authority.
+> The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves
+> this objective and is never a conformance target.
 >
 > **What belongs in this document:** the WHY and the WHAT — the intent, the outcomes the
 > platform must produce, and the boundaries it must never cross. Never the HOW: how
-> anything is built belongs to the build principles; how this system is arranged belongs
-> to the design.
+> anything is built belongs to the constitution; how this system is arranged belongs
+> to the architecture.
 
 ## The highest objective — twofold
 
@@ -32,8 +34,8 @@ workflow is:
   the **one and only** human act the
   workflow requires.
 - **Execution — then autonomous, to ship.** The confirmed objective is **locked as
-  `00-OBJECTIVE.md` at the root of the repository being worked on** (the per-project spec
-  of record, distinct from this platform objective), and from it the dev pair
+  `spec.md` at the root of the repository being worked on** (the per-project spec
+  of record, distinct from this platform spec), and from it the dev pair
   autonomously: **(a)** builds the functional requirements, **(b)** architects the
   design that serves them, **(c)** builds, validates, and iterates in a live environment —
   recovering automatically from failure, until the product ships. Humans approve goals,
@@ -75,27 +77,7 @@ two components, specified, versioned, and evolved together in this single source
   It is **highly stable by design**: it changes deliberately — through this repository's
   merge-and-deploy path — never incidentally, and it carries the maintainer's work,
   credentials, and sessions across every refresh.
-- **The agent layer — the claudebox and its lineages.** On both the host and the
-  dev-container, the agent runs inside a **disposable Distrobox layer**; the component
-  and its box together form that component's **agent box**. **Two lineages are built
-  now** — the **claudebox** (Claude Code) and the **kimibox** (Kimi Code) — with the
-  **provision that the layer can carry anything**: further lineages (DeepSeek, Codex,
-  Gemini, GLM, and their successors) are admitted as each meets the platform's lineage
-  contract (official provenance, headless autonomous operation, rebuild-not-update,
-  state outside the layer). **One box instance runs one
-  lineage, chosen at provisioning** (default: claudebox) — the lineage is a provisioning
-  parameter of the component, never a fork of the platform. This layering is what lets the host and the
-  dev-container stay **relatively stable** while the agent stays **always current**: each
-  box tracks its vendor's releases on a **daily refresh cycle**, and a refresh **never
-  costs live work**: the standing rule is **interrupt → rebuild → restart → resume** —
-  every session **resumed to active work: kick-started and working, never merely present,
-  never waiting for a nudge — and verified** — and where a refresh class cannot yet resume
-  reliably, **live sessions block it until they quit**; deferral is the fallback for
-  unproven resume, never the steady state. Everything durable — credentials, transcripts,
-  configuration — lives outside the disposable layer, so a rebuild loses nothing. And when
-  either **component** refreshes to match the merged repository, its agent boxes **resume
-  every session to active work** — all of them, every tenant — because the sessions' work
-  is co-written to GitHub and never lives only in the layer.
+- **The agent layer — the agent boxes.** On both the host and the dev-container, every agent runs inside a **disposable Distrobox layer** — an **agent box**. Each box runs **one agent**: the **claudebox** runs Claude Code, the **kimibox** runs Kimi Code; further agents (DeepSeek, Codex, Gemini, GLM, and their successors) are admitted as each meets the platform's admission contract (official provenance, headless autonomous operation, rebuild-not-update, state outside the layer). A component may run **several boxes in parallel, one per agent**; boxes pair by agent across host and dev-container, and every ticket is **stamped with its pair and its agent**, so work is only ever picked up by the matching agent of the matching pair. This layering is what lets the host and the dev-container stay **relatively stable** while every agent stays **always current**: each box tracks its vendor's releases on a **daily refresh cycle**, and a refresh **never costs live work**. Two rebuild modes exist. The **automatic nightly rebuild never interrupts a live session** — where it cannot yet resume reliably, live sessions block it until they quit; deferral is the fallback for unproven resume, never the steady state. The **maintainer's manual rebuild may interrupt**: on command it rebuilds, ends the running sessions, and **restores the full multi-tenant session set** — every session resumed to active work: kick-started and working, never merely present, never waiting for a nudge — and verified. Everything durable — credentials, transcripts, configuration — lives outside the disposable layer, so a rebuild loses nothing. And when either **component** refreshes to match the merged repository, its agent boxes **resume every session to active work** — all of them, every tenant — because the sessions' work is co-written to GitHub and never lives only in the layer.
 
 The two components are **one system**: one lifecycle, one specification, one repository,
 organised as **`host/`** (the mother platform), **`dev-container/`** (the development container),
@@ -107,13 +89,13 @@ instance-agnostic, and each deployment of it is one **pair** — one host plus i
 Provisioning has two classes: **cloud genesis** (remote, channel-proof, no local act) and
 **local genesis** (a custom **bootc** image — container-first, CoreOS-style, layered —
 built from this repository and deployed to the machine; after first boot, convergence is
-identical; its working lineage is the maintainer's **`strix` bootc build**
+identical; its working build is the maintainer's **`strix` bootc build**
 (`strix-ms-s1-bootc`), succeeding the earlier declarative Fedora CoreOS era). After
 genesis, every pair is managed the same way, by the same loop, against this same
 specification; instance-specific facts are inputs to a pair, never branches of it.
 **A host is always deployed as a dev pair foremost and first**: whatever else a host will
 eventually do, it comes up first as a pair — host plus dev-container — and only then takes on
-application workloads. The first host, named **box**, is the **genesis agent**: its first
+application workloads. The first host, named **erebus**, is the **genesis agent**: its first
 function is as a member of the dev pair; its second is to spin up any future containers
 as apps and services. **Authority is per-pair**: each pair's dev-container is the sole merger of
 its own work, and each pair's host is the single shared validator of its own sessions.
@@ -203,7 +185,7 @@ platform's own loop. The loop's mechanics:
 - **The ship gate.** Nothing ships on its builder's own word. A product ships only after an
   **independent, adversarial review** verifies the built product against the confirmed
   spec — the objective first, then the requirements, then the build principles; reviewer
-  and author are drawn from **different agent lineages** where the platform's lineages
+  and author are drawn from **different agents** where the pair's agents
   allow, so independence means a different checker, not just a different context. If the
   review does not pass, the product goes back into the loop, not out the door.
 
@@ -226,7 +208,7 @@ platform's own loop. The loop's mechanics:
    disconnections** — network roams, device sleeps, client restarts — and **persist
    long-term**: a session left running for weeks is resumed exactly where it was, from any
    authorized device, with no loss of running state, transcript, or work context. This
-   objective names the **outcome only**; the mechanism is chosen by the design against
+   objective names the **outcome only**; the mechanism is chosen in the architecture against
    current best practice and may change without amending this document.
 
 ## Boundaries
@@ -247,19 +229,6 @@ platform's own loop. The loop's mechanics:
 
 ## Document authority
 
-This objective and the build principles are **confirmed once and fixed**; amendment is a new
-maintainer confirmation, maintainer-merge-only. The design is dev-owned and
-mutable-on-fact. The document spine of this repository is exactly: **the objective, the
-build principles, the runtime law, and the changelog** — one authoritative home per
-concept; every other mention points or is deleted. Memoir is not specification.
+This spec and the constitution are **confirmed once and fixed**; amendment is a new maintainer confirmation, maintainer-merge-only. The architecture map is agent-owned and mutable-on-fact. The documentation surfaces of this repository are exactly: **the README, this spec, the constitution, `AGENTS.md`, `ARCHITECTURE.md`, the decision record (`decisions/`), and the changelog** — one authoritative home per concept; every other mention points or is deleted. Memoir is not specification.
 
-**Why objective and principles are two documents.** The objective is **scoped** — this
-platform objective here, and each project's locked `00-OBJECTIVE.md` in its own
-repository — while the build principles are **universal**, binding everything the platform
-builds. They are confirmed **together, once, in a single session**; thereafter a project's
-one initiation session **co-creates that project's objective AND explicitly captures the
-build principles that govern the work** — the platform's principles applied by reference,
-plus any project-specific construction constraint decided in that session — so nothing
-about how the work will be built is left implicit or assumed. The principles are
-**captured, never re-dictated** — a re-dictation is a fork. One session, two documents,
-nothing assumed.
+**Why spec and constitution are two documents.** The objective is **scoped** — this platform spec here, and each project's locked `spec.md` in its own repository — while the build principles are **universal**, binding everything the platform builds. They are confirmed **together, once, in a single session**; thereafter a project's one initiation session **co-creates that project's spec AND explicitly captures the build principles that govern the work** — the platform's principles applied by reference, plus any project-specific construction constraint decided in that session — so nothing about how the work will be built is left implicit or assumed. The principles are **captured, never re-dictated** — a re-dictation is a fork. One session, two documents, nothing assumed.
