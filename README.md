@@ -13,10 +13,10 @@ If code and these documents disagree, the documents win — or the documents are
 
 ## Layout law
 
-Ruthless path-level modularity. Every file belongs unambiguously to exactly one artifact:
+The standing skeleton is law — constitution [P13](constitution.md). This repository is the host + container shape:
 
 - `host/` — everything that provisions, converges, or operates the Fedora host (VPS or bare metal).
 - `dev-container/` — everything that builds or operates the dev container.
 - `shared/` — versioned atomic contracts and anything both artifacts genuinely share. Nothing lands here to escape a boundary.
 
-There is no fourth place. A file that fits nowhere is a design smell; fix the design, not the filing.
+There is no fourth place. A file that fits nowhere is an architecture smell; fix the architecture, not the filing.

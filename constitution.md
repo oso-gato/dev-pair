@@ -181,8 +181,34 @@ The chain: a maintainer-instructed improvement merges; the host brings itself to
 
 Neither component rebuilds the agent doing the work. A renewal that cannot restore its sessions does not fire. A failed link recovers under P10 and surfaces to the maintainer only after bounded attempts fail.
 
+## P13 — STANDING REPO STRUCTURE
+
+Every repository the platform builds carries the same skeleton, known before the first line of code:
+
+```
+<repo>/
+├── spec.md           the locked objective — WHY (maintainer-merge-only)
+├── constitution.md   the build principles — HOW (maintainer-merge-only)
+├── AGENTS.md         session-loaded operating manual for agents
+├── ARCHITECTURE.md   current-state map — agent-owned, mutable-on-fact, never a conformance target
+├── CHANGELOG.md      curated notable changes + incident narrative
+├── README.md         human orientation
+├── decisions/        ADRs — 0001-<slug>.md, append-only, status-tracked
+└── <component tree — by runtime shape>
+```
+
+Filenames are contracts. Where a tool consumes the file, the name and case are the tool's: `spec.md` and `constitution.md` per GitHub Spec Kit, `AGENTS.md` per the agents.md standard — the hosts' filesystems are case-sensitive, so a wrong-case name is an undiscovered file. Where no tool consumes the file (README, ARCHITECTURE, CHANGELOG), the classic uppercase root convention holds.
+
+The component tree adapts to the runtime shape — and only to the runtime shape:
+
+- **Single artifact** (one container, one program): one source tree at root; no component split.
+- **Host + container** (a dev pair): `host/`, `dev-container/`, `shared/`.
+- **Container swarm** (containers working together): one folder per container, plus `shared/`.
+
+`shared/` exists only where two or more components genuinely share code — nothing lands there to escape a boundary. Every file belongs unambiguously to exactly one component; there is no fourth place. A file that fits nowhere is an architecture smell: fix the architecture, not the filing.
+
 ---
 
 ## Mapping to the fleet's BP1–BP9 (provenance note)
 
-P1=BP1 (strengthened: one fetch contract; repo-metadata signatures) · P2=BP2 (strengthened: environment/release re-verification; adoption trail) · P3=BP3 (extended: gates-are-features, activation-proof, no-standing-red) · P4=BP4 (amended 2026-08-15: container immutability made explicit; two host lineages named) · P5=BP5 (recast as the pair's build-and-validation mechanism) · P6=BP6 (strengthened: harness sites named) · P7=BP7 (rescoped as the pair's own protocol) · P8=BP8 (extended: mutation-proven; merge gate anchored to the objective) · P9=BP9 (recast: one home + decision record; vendoring clause re-homed to the layout law) · P10=new (codified from the measured gate-without-recovery incidents) · P11=new (agent layer: one agent per box, many boxes per pair, two rebuild modes, admission contract) · P12=new (self-renewal, codified from the measured forgetting failures).
+P1=BP1 (strengthened: one fetch contract; repo-metadata signatures) · P2=BP2 (strengthened: environment/release re-verification; adoption trail) · P3=BP3 (extended: gates-are-features, activation-proof, no-standing-red) · P4=BP4 (amended 2026-08-15: container immutability made explicit; two host lineages named) · P5=BP5 (recast as the pair's build-and-validation mechanism) · P6=BP6 (strengthened: harness sites named) · P7=BP7 (rescoped as the pair's own protocol) · P8=BP8 (extended: mutation-proven; merge gate anchored to the objective) · P9=BP9 (recast: one home + decision record; vendoring clause re-homed to the layout law) · P10=new (codified from the measured gate-without-recovery incidents) · P11=new (agent layer: one agent per box, many boxes per pair, two rebuild modes, admission contract) · P12=new (self-renewal, codified from the measured forgetting failures) · P13=new (standing repo structure and filename contracts).
