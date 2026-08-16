@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-16
 
+- Universal constitution shortened ~25%, expression-only (fifth amendment): the P1/P2 surface duplication removed, the stale vendoring-trail pointer fixed to the Provenance note, the amendment trail compacted; no rule changed.
 - Genesis kit restructured to a literal `skeleton/` mirror (per-repo ADR and ticket templates included — every repo born self-sufficient) and re-homed to the estate root's `genesis/` as master; no repo keeps a committed copy — throwaway fetch at each genesis. See docs/decisions/0010.
 - Genesis kit moved `shared/templates/` → `docs/repo-genesis/`; component folders now hold code and scripts only, with P1's docs/ asset valve admitting repo-owned documentation. See docs/decisions/0009.
 - `00-` initiation prefix adopted: `00-OBJECTIVE.md` and `00-BYLAW.md` — the two artifacts co-created with the maintainer in the initiation session — sort first and wear their provenance; constitution stays pulled, the rest agent-generated. See docs/decisions/0008.
