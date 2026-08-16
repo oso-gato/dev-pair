@@ -14,7 +14,7 @@ Read this first, every session.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the current-state map. Update it in the same change that alters a fact; a stale map is a blocking finding (P1).
 - [docs/decisions/](docs/decisions/) — record every non-obvious decision as an ADR: problem, options, choice, fate. Reverse by superseding record, never by edit.
 - [CHANGELOG.md](CHANGELOG.md) — notable changes and incident narrative.
-- New repository: after its initiation session, instantiate [docs/repo-genesis/](docs/repo-genesis/README.md) — the genesis manual owns the procedure and the three shapes.
+- New repository: after its initiation session, fetch the genesis kit fresh from `oso-gato/homelab-root` → `genesis/` into a throwaway working tree, instantiate from its `skeleton/` per its manual, tear the tree down. Never keep a committed copy of the kit.
 
 ## Self-renewal — never forget this
 

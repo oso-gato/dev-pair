@@ -17,4 +17,4 @@ This repository holds the governing documents, the documentation surfaces, and t
 
 ## Documentation assets (per universal P1's docs/ valve)
 
-- `docs/repo-genesis/` — the genesis kit: the three-shape manual, standing-surface templates, and the vendored per-ticket templates (trail in its `VENDORED.md`). Shipped as ticket #6; moved from `shared/templates/` per docs/decisions/0009.
+- (none — the genesis kit's master lives in the estate root at `genesis/`; consumed by throwaway fetch, per docs/decisions/0010)
