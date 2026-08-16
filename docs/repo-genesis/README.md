@@ -38,7 +38,7 @@ The documentation surfaces above are invariant (universal constitution P2). Only
 ├── <standing surfaces>
 ├── host/                everything that provisions, converges, or operates the host
 ├── dev-container/       everything that builds or operates the dev container
-└── shared/              contracts and templates both sides genuinely use
+└── shared/              contracts and code both sides genuinely use
 ```
 
 ### 3. Container swarm (containers working together)

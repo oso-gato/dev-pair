@@ -13,4 +13,8 @@ This repository holds the governing documents, the documentation surfaces, and t
 
 ## Components
 
-- `shared/templates/repo-genesis/` — the genesis template set: standing-surface templates, the three-shape manual, and Spec Kit's per-ticket templates vendored at v0.16.4 (trail in its `VENDORED.md`). First shipped component (ticket #6).
+- (none built yet — the component tree returns as code lands; component folders hold code and scripts only)
+
+## Documentation assets (per universal P1's docs/ valve)
+
+- `docs/repo-genesis/` — the genesis kit: the three-shape manual, standing-surface templates, and the vendored per-ticket templates (trail in its `VENDORED.md`). Shipped as ticket #6; moved from `shared/templates/` per docs/decisions/0009.

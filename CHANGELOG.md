@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-16
 
+- Genesis kit moved `shared/templates/` → `docs/repo-genesis/`; component folders now hold code and scripts only, with P1's docs/ asset valve admitting repo-owned documentation. See docs/decisions/0009.
 - `00-` initiation prefix adopted: `00-OBJECTIVE.md` and `00-BYLAW.md` — the two artifacts co-created with the maintainer in the initiation session — sort first and wear their provenance; constitution stays pulled, the rest agent-generated. See docs/decisions/0008.
 - Casing grammar adopted (root files uppercase, directories lowercase): `CONSTITUTION.md` everywhere including the universal home; records moved under `docs/` (`docs/decisions/`, `docs/specs/`); Spec Kit demoted from consumer to donor — the maintainer does not drive CLIs. See docs/decisions/0007.
 - BYLAW.md introduced: repo-specific principles (R1–R4) and instantiations moved out of constitution.md, which is now purely the universal law's by-reference presence with a session-start fetch line. "Constitution" is univocal estate-wide. First post-confirmation amendment of the universal constitution (surface admitted). See decisions/0006.
