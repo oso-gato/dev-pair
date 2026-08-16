@@ -2,7 +2,7 @@
 
 ## Authority
 
-Status: CONFIRMED {{YYYY-MM-DD}}, with the objective (`OBJECTIVE.md`), sharing its authority. Fixed: amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY. Subordinate to the universal constitution ([constitution.md](constitution.md)): valid only where it does not conflict. Bare P-numbers refer to the universal constitution.
+Status: CONFIRMED {{YYYY-MM-DD}}, with the objective (`OBJECTIVE.md`), sharing its authority. Fixed: amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY. Subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)): valid only where it does not conflict. Bare P-numbers refer to the universal constitution.
 
 ## Runtime shape
 

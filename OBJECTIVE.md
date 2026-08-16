@@ -6,7 +6,7 @@ The why: the highest objective of the host + dev-container pair, stated once, du
 
 ## Authority
 
-Status: CONFIRMED 2026-08-16. This document is fixed: amendment is a new maintainer confirmation, never a silent edit, and any change to it is MAINTAINER-MERGE-ONLY. The constitution (`constitution.md`) shares that authority. The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves this objective and is never a conformance target.
+Status: CONFIRMED 2026-08-16. This document is fixed: amendment is a new maintainer confirmation, never a silent edit, and any change to it is MAINTAINER-MERGE-ONLY. The constitution (`CONSTITUTION.md`) and bylaw (`BYLAW.md`) share that authority. The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves this objective and is never a conformance target.
 
 ## Scope
 
