@@ -5,10 +5,10 @@ The autonomous dev pair: a Fedora host and a dev container, built and run as one
 Three documents govern everything in this repository:
 
 - [OBJECTIVE.md](OBJECTIVE.md) — why the pair exists and what it must achieve.
-- [constitution.md](constitution.md) — the estate's universal build principles, applied by reference.
+- [CONSTITUTION.md](CONSTITUTION.md) — the estate's universal build principles, applied by reference.
 - [BYLAW.md](BYLAW.md) — this repository's own build principles, subordinate to the constitution.
 
-Agents start at [AGENTS.md](AGENTS.md) — the session-loaded operating manual. The working map from spec to code is [ARCHITECTURE.md](ARCHITECTURE.md) — agent-owned, mutable-on-fact, never a conformance target. Decisions are recorded in [decisions/](decisions/); notable changes in [CHANGELOG.md](CHANGELOG.md).
+Agents start at [AGENTS.md](AGENTS.md) — the session-loaded operating manual. The working map from spec to code is [ARCHITECTURE.md](ARCHITECTURE.md) — agent-owned, mutable-on-fact, never a conformance target. Decisions are recorded in [docs/decisions/](docs/decisions/); notable changes in [CHANGELOG.md](CHANGELOG.md).
 
 If code and these documents disagree, the documents win — or the documents are changed deliberately, in the open, never silently.
 

@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-16
 
+- Casing grammar adopted (root files uppercase, directories lowercase): `CONSTITUTION.md` everywhere including the universal home; records moved under `docs/` (`docs/decisions/`, `docs/specs/`); Spec Kit demoted from consumer to donor — the maintainer does not drive CLIs. See docs/decisions/0007.
 - BYLAW.md introduced: repo-specific principles (R1–R4) and instantiations moved out of constitution.md, which is now purely the universal law's by-reference presence with a session-start fetch line. "Constitution" is univocal estate-wide. First post-confirmation amendment of the universal constitution (surface admitted). See decisions/0006.
 - Maintainer confirmation: the three governing documents (universal constitution, this repo's constitution, the objective) moved DRAFT → CONFIRMED 2026-08-16; preambles restructured from blockquotes into Authority / Conformance / Scope sections, with no-theatrical-machinery's standing made explicit.
 - Constitution split: universal P1–P11 moved to the estate root's `principles/constitution.md`, merit-ordered zero-base, with two audited additions (P6 least-privilege, P10 distrust) and the restore-proven clause; this repo's constitution reduced to the pull + R1–R4 + instantiations. See decisions/0005 for the full number mapping.
