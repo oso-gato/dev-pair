@@ -1,8 +1,12 @@
 # The Dev Pair — CONSTITUTION (repo-specific build principles)
 
-> **Status: DRAFT — pending maintainer confirmation.** Confirmed with the objective (`OBJECTIVE.md`) and sharing its authority: fixed thereafter, amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY.
->
-> **Universal law, applied by reference.** The estate's universal constitution — `principles/constitution.md` in the estate's root repository (private; resolvable by the pair's agents), P1–P11 — governs all work here. It is never re-dictated; a re-dictation is a fork. Bare P-numbers below refer to it. This document adds only what is this repository's own: four repo-specific principles (R1–R4) and the instantiations of universal law this repository owns.
+## Authority
+
+Status: CONFIRMED 2026-08-16, with the objective (`OBJECTIVE.md`), sharing its authority. Fixed: amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY.
+
+## Universal law, applied by reference
+
+The estate's universal constitution — `principles/constitution.md` in the estate's root repository (private; resolvable by the pair's agents), P1–P11 — governs all work here. It is never re-dictated; a re-dictation is a fork. Bare P-numbers below refer to it. This document adds only what is this repository's own: four repo-specific principles (R1–R4) and the instantiations of universal law this repository owns.
 
 ## R1 — THE THROWAWAY PRINCIPLE & CHURN
 

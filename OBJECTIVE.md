@@ -2,18 +2,15 @@
 
 **The foremost objective is autonomous development**: a host and its dev-container — one **dev pair** — running an autonomous development-loop workflow, with exactly one human interaction per project, then shipping on its own. **The second objective: the host is a mother platform**, hosting containers as apps and services for whatever the maintainer needs. Everything below serves those two.
 
-> **THE WHY** — the highest objective of the host + dev-container pair, stated once, durable.
->
-> **Status: DRAFT — pending maintainer confirmation.** Once confirmed, this document is fixed:
-> amendment is a new maintainer confirmation, never a silent edit, and any change to it is
-> MAINTAINER-MERGE-ONLY. The constitution (`constitution.md`) shares that authority.
-> The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves
-> this objective and is never a conformance target.
->
-> **What belongs in this document:** the WHY and the WHAT — the intent, the outcomes the
-> platform must produce, and the boundaries it must never cross. Never the HOW: how
-> anything is built belongs to the constitution; how this system is arranged belongs
-> to the architecture.
+The why: the highest objective of the host + dev-container pair, stated once, durable.
+
+## Authority
+
+Status: CONFIRMED 2026-08-16. This document is fixed: amendment is a new maintainer confirmation, never a silent edit, and any change to it is MAINTAINER-MERGE-ONLY. The constitution (`constitution.md`) shares that authority. The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves this objective and is never a conformance target.
+
+## Scope
+
+The WHY and the WHAT — the intent, the outcomes the platform must produce, and the boundaries it must never cross. Never the HOW: how anything is built belongs to the constitution; how this system is arranged belongs to the architecture.
 
 ## The highest objective — twofold
 
