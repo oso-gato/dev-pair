@@ -15,6 +15,14 @@ This repository holds the governing documents and the documentation surfaces. Th
 
 - (none built yet — the component tree returns as code lands; component folders hold code and scripts only)
 
+## Promised by law, not yet built
+
+The law names these mechanisms in normative present tense; none exists yet, so today every rule binds by agent discipline alone — do not rely on a gate to catch a violation:
+
+- the CI merge gate (P9: specs-completeness, frozen-at-ship, P2 surface check)
+- the ticket-envelope contract with pair + agent + stage stamps (R3, P8)
+- the mechanical scans (P2 casing/structure, P4 forbidden channels, P7 out-of-band mutation)
+
 ## Documentation assets (per universal P1's docs/ valve)
 
 - (none — the genesis kit's master lives in the estate root at `genesis/`; consumed by throwaway fetch, per docs/decisions/0010)
