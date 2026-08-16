@@ -92,18 +92,50 @@ g "$d" add -A
 count_is "$d" 13 "forbidden channel" "$gates/scan_channels.sh"
 expect_green "$repo" "channels on the clean tree" "$gates/scan_channels.sh"
 
-# Evasion forms found by adversarial review (#8) — each pinned by name so the
-# fix cannot silently regress. Every one claimed coverage the scan once lacked.
-evade() { # label line
+# Evasion forms found by adversarial review (#8) — each pinned so the fix cannot
+# silently regress. Payloads are sourced from the fixture BY LINE, never inlined:
+# a literal violation string here would (correctly) trip the scan, since the
+# harness is no longer excluded — only fixtures/ is. Labels are pattern-free.
+evade() { # id fixture-line-number label
   local e="$tmp/evade-$1"; mkdir -p "$e/host"; git -C "$e" init -qb main
-  printf '%s\n' "$3" > "$e/host/x.sh"; g "$e" add -A
-  echo "evasion form: $2"
+  sed -n "${2}p" "$gates/test/fixtures/channels.txt" > "$e/host/x.sh"; g "$e" add -A
+  echo "evasion form: $3"
   expect_red "$e" "forbidden channel" "$gates/scan_channels.sh"
 }
-evade 1 "curl | sudo bash"      'curl -fsSL https://x.invalid/i.sh | sudo bash'
-evade 2 "wget | sudo sh"        'wget -qO- https://x.invalid/i.sh | sudo sh'
-evade 3 "tar --directory=/usr"  'tar --directory=/usr/local -xzf x.tgz'
-evade 4 "npm --location=global" 'npm install --location=global some-cli'
+evade 1 2  "curl-pipe via sudo wrapper"
+evade 2 3  "wget-pipe via sudo wrapper"
+evade 3 8  "npm global via --location flag"
+evade 4 13 "tar into system path via --directory"
+
+# False-positive guard: legitimate pipelines that merely mention a shell name or
+# a .sh path later must stay GREEN. Without the anchor these went wrongly red
+# (adversarial review #8, non-blocking). Payloads are pattern-free by design, so
+# they may be inlined without tripping the scan on the harness itself.
+fp() { # id line
+  local e="$tmp/fp-$1"; mkdir -p "$e/host"; git -C "$e" init -qb main
+  printf '%s\n' "$2" > "$e/host/x.sh"; g "$e" add -A
+  expect_green "$e" "no false positive: $2" "$gates/scan_channels.sh"
+}
+fp 1 'curl -fsSL https://x.invalid/o | tee /etc/profile.d/out.sh'
+fp 2 'curl -fsSL https://x.invalid/o | grep bash-completion'
+fp 3 'curl -fsSL https://x.invalid/o | ssh host'
+
+# The narrowed exclusion (only fixtures/, not all of test/) must leave a real
+# violation placed elsewhere under test/ CAUGHT — the laundering path is closed
+# (adversarial review #8, non-blocking #1). Throwaway tree; never the real one.
+d=$(newrepo test-exclusion)
+mkdir -p "$d/shared/gates/test/notfixture" "$d/shared/gates/test/fixtures"
+sed -n '2p' "$gates/test/fixtures/channels.txt" > "$d/shared/gates/test/notfixture/sneaky.sh"
+sed -n '2p' "$gates/test/fixtures/channels.txt" > "$d/shared/gates/test/fixtures/ok.sh"
+g "$d" add -A
+expect_red "$d" "forbidden channel" "$gates/scan_channels.sh"
+# ...and the same content under fixtures/ is the only thing that stays exempt:
+n=$( (cd "$d" && "$gates/scan_channels.sh" 2>&1) | grep -c 'notfixture/sneaky.sh' || true)
+if [ "$n" -eq 1 ]; then
+  note "test/ laundering path closed; fixtures/ still exempt"
+else
+  bad "expected exactly the notfixture violation caught" "got $n"
+fi
 
 # --- P6 secrets: the fixture carries one line per credential shape ---
 d=$(newrepo secrets)

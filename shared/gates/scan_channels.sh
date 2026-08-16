@@ -5,9 +5,11 @@
 # npm (-g, --global, --location=global), pip, gem, cargo installs; tar
 # extraction into a system path (-C or --directory into /usr /bin /lib /opt
 # /etc /sbin). Excludes exactly two paths, stated here: this file (its pattern
-# list would match itself) and the whole test tree `shared/gates/test/` (the
-# fixtures and the harness both embed violation strings by design, proven by
-# the tests instead).
+# list would match itself) and `shared/gates/test/fixtures/` (violation strings
+# by design, proven by the tests instead). The test harness itself is NOT
+# excluded — it holds no literal violation string, sourcing its payloads from
+# the fixtures — so a real violation added anywhere under test/ outside
+# fixtures/ is still caught.
 # Not covered (adversarial review): mirror and aggregator binaries, obfuscated
 # fetch-and-execute, case-variant CLI names, provenance grades within
 # sanctioned channels.
@@ -15,10 +17,14 @@ set -euo pipefail
 cd "${1:-.}"
 
 self="shared/gates/scan_channels.sh"
-testdir="shared/gates/test/"
+fixtures="shared/gates/test/fixtures/"
 
 patterns=(
-  '(curl|wget)[^|;&]*\|.*\b(ba|z|da|k)?sh\b'
+  # curl/wget piped to a shell that is the command immediately after the pipe,
+  # optionally behind wrappers (sudo, env, …). Anchored so a benign pipeline
+  # that merely mentions a shell name or a .sh path later (| tee x.sh,
+  # | grep bash-completion, | ssh host) does not false-positive.
+  '(curl|wget)[^|;&]*\|[[:space:]]*((sudo|env|command|exec|nice|nohup|time)[[:space:]]+([A-Za-z0-9_=/.:-]+[[:space:]]+)*)*\b(ba|z|da|k)?sh\b'
   '\bcopr\b'
   '\bflatpak\b'
   '\bsnap[[:space:]]+install\b'
@@ -32,7 +38,7 @@ patterns=(
 fail=0
 while IFS= read -r file; do
   [ "$file" = "$self" ] && continue
-  case "$file" in "$testdir"*) continue ;; esac
+  case "$file" in "$fixtures"*) continue ;; esac
   for p in "${patterns[@]}"; do
     while IFS= read -r m; do
       echo "channels: forbidden channel in $file: $m" >&2

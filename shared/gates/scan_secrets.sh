@@ -2,15 +2,16 @@
 # P6 secret scan: credential shapes, mechanically, over the whole tracked tree.
 # Fails on: private-key blocks, GitHub tokens, refresh tokens, and PATs, tailnet
 # keys, AWS access keys (permanent AKIA and temporary ASIA), sha512crypt hashes.
-# The pattern texts cannot match themselves, so this
-# file needs no exclusion; the whole test tree `shared/gates/test/` is excluded
-# (real-shaped dummy credentials, proven by the tests instead).
+# The pattern texts cannot match themselves, so this file needs no exclusion;
+# only `shared/gates/test/fixtures/` is excluded (real-shaped dummy credentials,
+# proven by the tests instead). The harness holds no literal credential, so a
+# real secret added anywhere else under test/ is still caught.
 # Not covered (adversarial review): high-entropy strings without a known shape,
 # secrets in binary blobs, credentials named innocently in prose.
 set -euo pipefail
 cd "${1:-.}"
 
-testdir="shared/gates/test/"
+fixtures="shared/gates/test/fixtures/"
 
 # The single quotes are the point: literal regex text, never expanded.
 # shellcheck disable=SC2016
@@ -26,7 +27,7 @@ patterns=(
 
 fail=0
 while IFS= read -r file; do
-  case "$file" in "$testdir"*) continue ;; esac
+  case "$file" in "$fixtures"*) continue ;; esac
   for p in "${patterns[@]}"; do
     # Report file and line only — never echo the matched content, so a real
     # secret is not re-leaked into the CI log by the scan that caught it.
