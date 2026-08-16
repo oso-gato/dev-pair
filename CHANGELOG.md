@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-16
 
+- AGENTS.md restructured zero-base into session-lifecycle order (load → orient → work → route → renew → charter → record → write → conduct → build); the silence policy added to the working method, Build & test added honestly empty; the genesis AGENTS template aligned, with the pair-only sections (self-renewal, chartering) deliberately absent.
 - Objective amended: the **00-charter** coined (the two initiation artifacts as one term); Delivery added to the workflow (a report, never a request); the silence and halt policies stated; the After-ship rule added (in-scope tickets flow, scope changes amend the 00-charter first); "no second interaction" sharpened to "no second approval".
 - Objective rewritten under maintainer confirmation, ~45% shorter: post-split re-dictation of P3/P7/P8/P10 removed, environment facts moved to registry pointers, the pair aligned to three parts, both `00-` initiation artifacts named in the workflow, meta-sections merged into one Authority. No outcome dropped.
 - Universal constitution shortened ~25%, expression-only (fifth amendment): the P1/P2 surface duplication removed, the stale vendoring-trail pointer fixed to the Provenance note, the amendment trail compacted; no rule changed.
