@@ -4,7 +4,7 @@
 
 ## Universal principles — applied by reference
 
-The estate's universal constitution governs all work in this repository: `principles/constitution.md` in the estate's root repository, P1–P11. Applied by reference, never re-dictated — a re-dictation is a fork. Bare P-numbers in this repository refer to it.
+The estate's universal constitution governs all work in this repository: `oso-gato/homelab-root` → `principles/constitution.md`. Applied by reference, never re-dictated — a re-dictation is a fork. Bare P-numbers in this repository refer to it.
 
 ## Runtime shape
 
