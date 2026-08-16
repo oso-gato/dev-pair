@@ -36,6 +36,10 @@ Clarification happens once, in the project's initiation session — never as a m
 
 Every ticket carries two stamps: its **pair** (the lineage, named by host: `erebus`, `strix`) and its **agent** (`claudebox` = Claude Code, `kimibox` = Kimi Code). Pick up a ticket only when both stamps match your box. (P8.)
 
+## Writing style
+
+Every document here is written one way, for humans and agents alike. Full prose sentences that happen to be short — one subject per sentence, one line per paragraph, no hard wraps. State the rule, then the reason. Name a thing once and reuse the name; coin a new term with a plain gloss at first use; bold only load-bearing anchors. The label-colon register ("Status: X. Fixed: Y.") never appears in prose — it belongs only to functional forms. Functional forms keep their native shape: task lists stay checklists, registries stay fact lists, ADR metadata stays a header, tables stay tables — prose never invades them either. Frozen records are never restyled.
+
 ## Session conduct
 
 - Author and build only in your session's isolated, namespaced worktree; re-verify branch ownership before every commit and push (R2).
