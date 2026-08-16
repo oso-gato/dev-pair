@@ -8,4 +8,4 @@ Load it at session start:
 gh api repos/oso-gato/homelab-root/contents/principles/CONSTITUTION.md --jq .content | base64 -d
 ```
 
-Repo-specific law, subordinate to it: [BYLAW.md](BYLAW.md).
+Repo-specific law, subordinate to it: [00-BYLAW.md](00-BYLAW.md).

@@ -6,11 +6,11 @@ Read this first, every session.
 
 1. **The GitHub ticket bus** — issues and PRs. Every hand-off between components travels here; nothing durable lives only in a container or a layer.
 2. **The host** — operates the platform, validates what the container cannot (tier-2), opens PRs only. It never merges.
-3. **The dev-container** — develops and validates (tier-1); the sole merge authority — except `OBJECTIVE.md`, `CONSTITUTION.md`, and `BYLAW.md`, which are maintainer-merge-only.
+3. **The dev-container** — develops and validates (tier-1); the sole merge authority — except `00-OBJECTIVE.md`, `CONSTITUTION.md`, and `00-BYLAW.md`, which are maintainer-merge-only.
 
 ## Standing law
 
-- [OBJECTIVE.md](OBJECTIVE.md) — WHY, locked. [CONSTITUTION.md](CONSTITUTION.md) — the universal law, by reference; load it at session start via its fetch line. [BYLAW.md](BYLAW.md) — this repo's build principles (R-numbered) and instantiations, locked, subordinate to the constitution. Read all three before structural work.
+- [00-OBJECTIVE.md](00-OBJECTIVE.md) — WHY, locked. [CONSTITUTION.md](CONSTITUTION.md) — the universal law, by reference; load it at session start via its fetch line. [00-BYLAW.md](00-BYLAW.md) — this repo's build principles (R-numbered) and instantiations, locked, subordinate to the constitution. Read all three before structural work.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the current-state map. Update it in the same change that alters a fact; a stale map is a blocking finding (P1).
 - [docs/decisions/](docs/decisions/) — record every non-obvious decision as an ADR: problem, options, choice, fate. Reverse by superseding record, never by edit.
 - [CHANGELOG.md](CHANGELOG.md) — notable changes and incident narrative.
@@ -24,7 +24,7 @@ A maintainer-instructed improvement merges → the host brings itself to the mer
 
 Per work unit (one ticket), the loop runs **specify → plan → tasks → analyze → implement**:
 
-1. `docs/specs/<NNN-slug>/spec.md` — what this ticket must do; NNN is the GitHub issue number. (For a whole project, the locked `OBJECTIVE.md` plays this role.)
+1. `docs/specs/<NNN-slug>/spec.md` — what this ticket must do; NNN is the GitHub issue number. (For a whole project, the locked `00-OBJECTIVE.md` plays this role.)
 2. `docs/specs/<NNN-slug>/plan.md` — the design that serves it.
 3. `docs/specs/<NNN-slug>/tasks.md` — the decomposition to iterate through.
 4. Analyze — a read-only consistency check across spec, plan, and tasks before implementing.

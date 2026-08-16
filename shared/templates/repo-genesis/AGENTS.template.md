@@ -4,9 +4,9 @@ Read this first, every session.
 
 ## Governance
 
-- [OBJECTIVE.md](OBJECTIVE.md) — WHY, locked, maintainer-merge-only.
+- [00-OBJECTIVE.md](00-OBJECTIVE.md) — WHY, locked, maintainer-merge-only.
 - [CONSTITUTION.md](CONSTITUTION.md) — the universal law, by reference; load it at session start via its fetch line.
-- [BYLAW.md](BYLAW.md) — this repo's build principles and instantiations, locked, subordinate to the constitution.
+- [00-BYLAW.md](00-BYLAW.md) — this repo's build principles and instantiations, locked, subordinate to the constitution.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — current-state map; update it in the same change that alters a fact.
 - [docs/decisions/](docs/decisions/) — ADRs for decisions that bind beyond one ticket; append-only, superseded not edited.
 - [CHANGELOG.md](CHANGELOG.md) — notable changes and incidents.

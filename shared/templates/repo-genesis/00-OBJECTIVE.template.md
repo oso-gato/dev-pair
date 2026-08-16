@@ -2,7 +2,7 @@
 
 **The objective**: {{one paragraph — WHY this exists and WHAT it must achieve, exactly as co-created and confirmed in the initiation session}}.
 
-> **Status: CONFIRMED {{YYYY-MM-DD}} — fixed.** Amendment is a new maintainer confirmation, never a silent edit; every change is MAINTAINER-MERGE-ONLY. HOW anything is built belongs to `CONSTITUTION.md` and `BYLAW.md`; how the system is arranged belongs to `ARCHITECTURE.md`.
+> **Status: CONFIRMED {{YYYY-MM-DD}} — fixed.** Amendment is a new maintainer confirmation, never a silent edit; every change is MAINTAINER-MERGE-ONLY. HOW anything is built belongs to `CONSTITUTION.md` and `00-BYLAW.md`; how the system is arranged belongs to `ARCHITECTURE.md`.
 
 ## Outcomes
 

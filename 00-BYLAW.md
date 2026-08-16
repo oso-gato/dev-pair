@@ -2,7 +2,7 @@
 
 ## Authority
 
-Status: CONFIRMED 2026-08-16, with the objective (`OBJECTIVE.md`), sharing its authority. Fixed: amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY. Subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)): valid only where it does not conflict. Bare P-numbers below refer to the universal constitution.
+Status: CONFIRMED 2026-08-16, with the objective (`00-OBJECTIVE.md`), sharing its authority. Fixed: amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY. Subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)): valid only where it does not conflict. Bare P-numbers below refer to the universal constitution.
 
 ## R1 — THE THROWAWAY PRINCIPLE & CHURN
 

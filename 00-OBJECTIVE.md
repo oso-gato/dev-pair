@@ -6,7 +6,7 @@ The why: the highest objective of the host + dev-container pair, stated once, du
 
 ## Authority
 
-Status: CONFIRMED 2026-08-16. This document is fixed: amendment is a new maintainer confirmation, never a silent edit, and any change to it is MAINTAINER-MERGE-ONLY. The constitution (`CONSTITUTION.md`) and bylaw (`BYLAW.md`) share that authority. The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves this objective and is never a conformance target.
+Status: CONFIRMED 2026-08-16. This document is fixed: amendment is a new maintainer confirmation, never a silent edit, and any change to it is MAINTAINER-MERGE-ONLY. The constitution (`CONSTITUTION.md`) and bylaw (`00-BYLAW.md`) share that authority. The architecture map (`ARCHITECTURE.md`) is agent-owned and mutable-on-fact; it serves this objective and is never a conformance target.
 
 ## Scope
 
@@ -31,7 +31,7 @@ workflow is:
   the **one and only** human act the
   workflow requires.
 - **Execution — then autonomous, to ship.** The confirmed objective is **locked as
-  `OBJECTIVE.md` at the root of the repository being worked on** (the per-project spec
+  `00-OBJECTIVE.md` at the root of the repository being worked on** (the per-project spec
   of record, distinct from this platform objective), and from it the dev pair
   autonomously: **(a)** builds the functional requirements, **(b)** architects the
   design that serves them, **(c)** builds, validates, and iterates in a live environment —
@@ -226,6 +226,6 @@ platform's own loop. The loop's mechanics:
 
 ## Document authority
 
-This objective, the constitution, and the bylaw are **confirmed once and fixed**; amendment is a new maintainer confirmation, maintainer-merge-only. The architecture map is agent-owned and mutable-on-fact. The documentation surfaces of this repository are exactly those of universal P1: **the README, this objective (`OBJECTIVE.md`), the constitution (`CONSTITUTION.md`), the bylaw (`BYLAW.md`), `AGENTS.md`, `ARCHITECTURE.md`, the decision record (`docs/decisions/`), the per-ticket work record (`docs/specs/`), and the changelog** — one authoritative home per concept; every other mention points or is deleted. Memoir is not specification.
+This objective, the constitution, and the bylaw are **confirmed once and fixed**; amendment is a new maintainer confirmation, maintainer-merge-only. The architecture map is agent-owned and mutable-on-fact. The documentation surfaces of this repository are exactly those of universal P1: **the README, this objective (`00-OBJECTIVE.md`), the constitution (`CONSTITUTION.md`), the bylaw (`00-BYLAW.md`), `AGENTS.md`, `ARCHITECTURE.md`, the decision record (`docs/decisions/`), the per-ticket work record (`docs/specs/`), and the changelog** — one authoritative home per concept; every other mention points or is deleted. Memoir is not specification.
 
-**Why objective and constitution are two documents.** The objective is **scoped** — this platform objective here, and each project's locked `OBJECTIVE.md` in its own repository — while the build principles are **universal**, binding everything the platform builds. They are confirmed **together, once, in a single session**; thereafter a project's one initiation session **co-creates that project's objective AND explicitly captures the build principles that govern the work** — the platform's principles applied by reference, plus any project-specific construction constraint decided in that session — so nothing about how the work will be built is left implicit or assumed. The principles are **captured, never re-dictated** — a re-dictation is a fork. One session, two documents, nothing assumed.
+**Why objective and constitution are two documents.** The objective is **scoped** — this platform objective here, and each project's locked `00-OBJECTIVE.md` in its own repository — while the build principles are **universal**, binding everything the platform builds. They are confirmed **together, once, in a single session**; thereafter a project's one initiation session **co-creates that project's objective AND explicitly captures the build principles that govern the work** — the platform's principles applied by reference, plus any project-specific construction constraint decided in that session — so nothing about how the work will be built is left implicit or assumed. The principles are **captured, never re-dictated** — a re-dictation is a fork. One session, two documents, nothing assumed.
