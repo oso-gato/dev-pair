@@ -1,15 +1,11 @@
-# {{Project}} — CONSTITUTION (the build principles)
+# {{Project}} — CONSTITUTION (universal law, applied by reference)
 
-> Confirmed with the objective in the same initiation session; same authority: fixed, MAINTAINER-MERGE-ONLY.
+The estate's universal constitution — `oso-gato/homelab-root` → `principles/constitution.md` (private; resolvable by the pair's agents) — governs all work in this repository. It is never re-dictated; a re-dictation is a fork. Bare P-numbers in this repository refer to it.
 
-## Universal principles — applied by reference
+Load it at session start:
 
-The estate's universal constitution governs all work in this repository: `oso-gato/homelab-root` → `principles/constitution.md`. Applied by reference, never re-dictated — a re-dictation is a fork. Bare P-numbers in this repository refer to it.
+```
+gh api repos/oso-gato/homelab-root/contents/principles/constitution.md --jq .content | base64 -d
+```
 
-## Runtime shape
-
-{{single artifact | host + container | container swarm}} — the component tree follows P2 for this shape.
-
-## Project-specific constraints
-
-{{constraints decided in the initiation session, one per paragraph, each enforceable. "None" is a valid entry and is stated, not left blank.}}
+Repo-specific law, subordinate to it: [BYLAW.md](BYLAW.md).

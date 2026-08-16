@@ -6,11 +6,11 @@ Read this first, every session.
 
 1. **The GitHub ticket bus** — issues and PRs. Every hand-off between components travels here; nothing durable lives only in a container or a layer.
 2. **The host** — operates the platform, validates what the container cannot (tier-2), opens PRs only. It never merges.
-3. **The dev-container** — develops and validates (tier-1); the sole merge authority — except `OBJECTIVE.md` and `constitution.md`, which are maintainer-merge-only.
+3. **The dev-container** — develops and validates (tier-1); the sole merge authority — except `OBJECTIVE.md`, `constitution.md`, and `BYLAW.md`, which are maintainer-merge-only.
 
 ## Standing law
 
-- [OBJECTIVE.md](OBJECTIVE.md) — WHY, locked. [constitution.md](constitution.md) — HOW, locked. Read both before structural work.
+- [OBJECTIVE.md](OBJECTIVE.md) — WHY, locked. [constitution.md](constitution.md) — the universal law, by reference; load it at session start via its fetch line. [BYLAW.md](BYLAW.md) — this repo's build principles (R-numbered) and instantiations, locked, subordinate to the constitution. Read all three before structural work.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — the current-state map. Update it in the same change that alters a fact; a stale map is a blocking finding (P1).
 - [decisions/](decisions/) — record every non-obvious decision as an ADR: problem, options, choice, fate. Reverse by superseding record, never by edit.
 - [CHANGELOG.md](CHANGELOG.md) — notable changes and incident narrative.
@@ -18,7 +18,7 @@ Read this first, every session.
 
 ## Self-renewal — never forget this
 
-A maintainer-instructed improvement merges → the host brings itself to the merged state → the host rebuilds and relaunches the dev-container from outside → every session is restored. The dev-container never rebuilds itself — it requests renewal, its own or the host's, through the ticket bus. (constitution R4.)
+A maintainer-instructed improvement merges → the host brings itself to the merged state → the host rebuilds and relaunches the dev-container from outside → every session is restored. The dev-container never rebuilds itself — it requests renewal, its own or the host's, through the ticket bus. (BYLAW R4.)
 
 ## Working method
 

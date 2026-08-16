@@ -4,7 +4,7 @@ Agent-owned map of the system as built. Mutable-on-fact: updated in the same cha
 
 ## Current state (2026-08-16)
 
-This repository holds the governing documents, the documentation surfaces, and the first component content: the repo-genesis template set. The universal principles live in `oso-gato/homelab-root` under `principles/`; this repository's constitution carries the pull, the R-numbered principles, and the instantiations it owns. The rest of the component tree (`host/`, `dev-container/`, the remainder of `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
+This repository holds the governing documents, the documentation surfaces, and the first component content: the repo-genesis template set. The universal principles live in `oso-gato/homelab-root` under `principles/`; `constitution.md` here carries only the pull, and `BYLAW.md` carries the R-numbered principles and the instantiations this repository owns. The rest of the component tree (`host/`, `dev-container/`, the remainder of `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
 
 ## Pairs
 
