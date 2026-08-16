@@ -2,6 +2,10 @@
 
 Curated notable changes and incident narrative. Newest first.
 
+## 2026-08-17
+
+- 00-charter amended: the no-root outcome added to Security outcome 2 (the admin is `core`, sudo-by-password, root never authenticates remotely after genesis); both lineages gained their day-zero contracts in the bylaw — the VPS's one pasted script that builds and retires root, bare metal's activation-only act injecting just the live credentials.
+
 ## 2026-08-16
 
 - AGENTS.md restructured zero-base into session-lifecycle order (load → orient → work → route → renew → charter → record → write → conduct → build); the silence policy added to the working method, Build & test added honestly empty; the genesis AGENTS template aligned, with the pair-only sections (self-renewal, chartering) deliberately absent.
