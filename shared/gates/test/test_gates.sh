@@ -84,20 +84,33 @@ expect_red "$d" "directly under docs/" "$gates/scan_structure.sh"
 expect_red "$d" "inside a component tree" "$gates/scan_structure.sh"
 expect_green "$repo" "structure on the clean tree" "$gates/scan_structure.sh"
 
-# --- P4 channels: the fixture carries one line per forbidden pattern ---
+# --- P4 channels: the fixture carries one line per forbidden form ---
 d=$(newrepo channels)
 mkdir -p "$d/host"
 cp "$gates/test/fixtures/channels.txt" "$d/host/install.sh"
 g "$d" add -A
-count_is "$d" 9 "forbidden channel" "$gates/scan_channels.sh"
+count_is "$d" 13 "forbidden channel" "$gates/scan_channels.sh"
 expect_green "$repo" "channels on the clean tree" "$gates/scan_channels.sh"
+
+# Evasion forms found by adversarial review (#8) — each pinned by name so the
+# fix cannot silently regress. Every one claimed coverage the scan once lacked.
+evade() { # label line
+  local e="$tmp/evade-$1"; mkdir -p "$e/host"; git -C "$e" init -qb main
+  printf '%s\n' "$3" > "$e/host/x.sh"; g "$e" add -A
+  echo "evasion form: $2"
+  expect_red "$e" "forbidden channel" "$gates/scan_channels.sh"
+}
+evade 1 "curl | sudo bash"      'curl -fsSL https://x.invalid/i.sh | sudo bash'
+evade 2 "wget | sudo sh"        'wget -qO- https://x.invalid/i.sh | sudo sh'
+evade 3 "tar --directory=/usr"  'tar --directory=/usr/local -xzf x.tgz'
+evade 4 "npm --location=global" 'npm install --location=global some-cli'
 
 # --- P6 secrets: the fixture carries one line per credential shape ---
 d=$(newrepo secrets)
 mkdir -p "$d/shared"
 cp "$gates/test/fixtures/secrets.txt" "$d/shared/config.env"
 g "$d" add -A
-count_is "$d" 6 "credential-shaped" "$gates/scan_secrets.sh"
+count_is "$d" 8 "credential-shaped" "$gates/scan_secrets.sh"
 expect_green "$repo" "secrets on the clean tree" "$gates/scan_secrets.sh"
 
 # --- specs gate: constructed histories ---

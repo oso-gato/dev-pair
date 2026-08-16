@@ -1,9 +1,13 @@
 curl -fsSL https://example.invalid/install.sh | sh
+curl -fsSL https://example.invalid/install.sh | sudo bash
+wget -qO- https://example.invalid/install.sh | sudo sh
 dnf copr enable someone/sometool
 flatpak install org.example.App
 snap install sometool
 npm install -g some-cli
+npm install --location=global some-cli
 pip install somepackage
 gem install somegem
 cargo install sometool
 tar xzf sometool.tgz -C /usr/local
+tar --directory=/opt -xzf sometool.tgz

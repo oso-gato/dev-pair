@@ -1,39 +1,43 @@
 #!/usr/bin/env bash
 # P4 channel scan: the bylaw's forbidden channels, mechanically, over the
-# component trees and .github. Fails on: curl/wget piped to a shell; COPR;
-# flatpak; snap install; global npm/pip/gem/cargo installs; tar extraction
-# into system paths. Excludes exactly two paths, stated here: this file (its
-# pattern list would match itself) and the test fixtures (violations by design,
-# proven by the tests instead).
+# component trees and .github. Fails on: curl/wget piped to a shell — directly
+# or through a wrapper like sudo or env; COPR; flatpak; snap install; global
+# npm (-g, --global, --location=global), pip, gem, cargo installs; tar
+# extraction into a system path (-C or --directory into /usr /bin /lib /opt
+# /etc /sbin). Excludes exactly two paths, stated here: this file (its pattern
+# list would match itself) and the whole test tree `shared/gates/test/` (the
+# fixtures and the harness both embed violation strings by design, proven by
+# the tests instead).
 # Not covered (adversarial review): mirror and aggregator binaries, obfuscated
-# fetch-and-execute, provenance grades within sanctioned channels.
+# fetch-and-execute, case-variant CLI names, provenance grades within
+# sanctioned channels.
 set -euo pipefail
 cd "${1:-.}"
 
 self="shared/gates/scan_channels.sh"
-fixtures="shared/gates/test/fixtures/"
+testdir="shared/gates/test/"
 
 patterns=(
-  '(curl|wget)[^|;&]*\|[[:space:]]*(ba|z|da)?sh'
+  '(curl|wget)[^|;&]*\|.*\b(ba|z|da|k)?sh\b'
   '\bcopr\b'
   '\bflatpak\b'
   '\bsnap[[:space:]]+install\b'
-  '\bnpm[[:space:]]+(install|i)[[:space:]]+.*(-g\b|--global\b)'
+  '\bnpm[[:space:]]+(install|i)\b[^;|&]*(-g\b|--global\b|--location[= ]global\b)'
   '\bpip3?[[:space:]]+install\b'
   '\bgem[[:space:]]+install\b'
   '\bcargo[[:space:]]+install\b'
-  '\btar[[:space:]]+[^;|&]*-C[[:space:]]*/usr'
+  '\btar[[:space:]]+[^;|&]*(-C[[:space:]]*|--directory[= ])/(usr|bin|lib|opt|etc|sbin)'
 )
 
 fail=0
 while IFS= read -r file; do
   [ "$file" = "$self" ] && continue
-  case "$file" in "$fixtures"*) continue ;; esac
+  case "$file" in "$testdir"*) continue ;; esac
   for p in "${patterns[@]}"; do
-    if grep -nE "$p" "$file" /dev/null; then
-      echo "channels: forbidden channel in '$file' (pattern: $p)" >&2
+    while IFS= read -r m; do
+      echo "channels: forbidden channel in $file: $m" >&2
       fail=1
-    fi
+    done < <(grep -nE "$p" "$file" 2>/dev/null)
   done
 done < <(git ls-files host dev-container shared .github)
 
