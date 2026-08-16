@@ -2,7 +2,7 @@
 
 ## Authority
 
-Status: CONFIRMED 2026-08-16, with the objective (`00-OBJECTIVE.md`), sharing its authority. Fixed: amendment is a new maintainer confirmation, MAINTAINER-MERGE-ONLY. Subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)): valid only where it does not conflict. Bare P-numbers below refer to the universal constitution.
+Confirmed 2026-08-16 with the objective, sharing its authority, and fixed: amendment is a new maintainer confirmation, never a silent edit, and only the maintainer merges it. This is one of the two initiation artifacts (P2), co-created with the maintainer in the initiation session. It is subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)) — valid only where it does not conflict — and bare P-numbers below refer to it.
 
 ## R1 — THE THROWAWAY PRINCIPLE & CHURN
 
@@ -38,7 +38,7 @@ A producer-first emission that can strand or wedge a not-yet-upgraded counterpar
 
 ## R4 — SELF-RENEWAL
 
-The pair is three parts, always: **the GitHub ticket bus, the host, and the dev-container**. Self-renewal is those three making the pair's own improvement live with no human step.
+Self-renewal is the pair's three parts — **the GitHub ticket bus, the host, and the dev-container** (the objective's definition) — making the pair's own improvement live with no human step.
 
 The chain: a maintainer-instructed improvement merges; the host brings itself to the merged state via its deploy mechanism (P7, instantiated below); the host rebuilds and relaunches the dev-container from outside; the full multi-tenant session set is restored (P8). The dev-container never rebuilds itself — it requests its own renewal, and the host's, through the ticket bus. Each link is verified by reading the live artifact back, fail-closed.
 
