@@ -51,4 +51,6 @@ Every document here is written one way, for humans and agents alike. Full prose 
 
 ## Build & test
 
-Nothing to build yet — the component tree is unbuilt; the honest inventory is [ARCHITECTURE.md](ARCHITECTURE.md)'s. Fill this section as commands come into existence, in the same change that creates them.
+- `shared/gates/gate.sh` — every repo-state scan (P2 structure, P4 channels, P6 secrets, shellcheck), exactly what CI runs on a PR. Run it before pushing.
+- `shared/gates/gate_specs.sh <base> <head> <branch>` — the PR-context checks: locked documents untouched, specs-completeness, frozen-at-ship.
+- `shared/gates/test/test_gates.sh` — the fixture proof that every scanner fails on its violation. Run it before changing any gate.

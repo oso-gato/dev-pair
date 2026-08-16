@@ -1,0 +1,18 @@
+name: gate
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1, verified live 2026-08-17 (docs/specs/0007-mechanical-gates/plan.md)
+        with:
+          fetch-depth: 0
+      - name: scanner proofs (fixture-driven)
+        run: shared/gates/test/test_gates.sh
+      - name: repo-state gate
+        run: shared/gates/gate.sh
+      - name: specs gate
+        run: shared/gates/gate_specs.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" "${{ github.head_ref }}"

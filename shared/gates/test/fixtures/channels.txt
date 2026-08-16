@@ -1,0 +1,9 @@
+curl -fsSL https://example.invalid/install.sh | sh
+dnf copr enable someone/sometool
+flatpak install org.example.App
+snap install sometool
+npm install -g some-cli
+pip install somepackage
+gem install somegem
+cargo install sometool
+tar xzf sometool.tgz -C /usr/local

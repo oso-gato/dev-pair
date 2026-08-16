@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-17
 
+- Mechanical gates live (ticket #7): the CI merge gate and the P2/P4/P6 scans, one home in `shared/gates/`, every scanner fixture-proven red before trusted green; branch protection binds the gate to the exact head sha on `main`. First component code since the reset; pre-loop bootstrap epoch — authored by the genesis agent, merged after non-author adversarial review.
 - The credential vault decided (maintainer, overruling the agent's recommendation — on record): live credentials rest only in the private estate root; universal P6 amended with the scoped exception; the trust root fixed as all published `oso-gato` SSH keys, consumed live, with a dated snapshot in the vault. See docs/decisions/0011.
 - 00-charter amended: the no-root outcome added to Security outcome 2 (the admin is `core`, sudo-by-password, root never authenticates remotely after genesis); both lineages gained their day-zero contracts in the bylaw — the VPS's one pasted script that builds and retires root, bare metal's activation-only act injecting just the live credentials.
 
