@@ -17,7 +17,7 @@ Every template here is `*.template.md`: copy, drop the `.template`, fill the `{{
 
 ## The three shapes
 
-The documentation surfaces above are invariant (constitution P13). Only the component tree varies:
+The documentation surfaces above are invariant (universal constitution P2). Only the component tree varies:
 
 ### 1. Single artifact (one container, one program)
 

@@ -4,11 +4,11 @@
 
 ## Universal principles — applied by reference
 
-The platform's build principles govern all work in this repository: {{link to the universal principles' home}}. Applied by reference, never re-dictated — a re-dictation is a fork.
+The estate's universal constitution governs all work in this repository: `principles/constitution.md` in the estate's root repository, P1–P11. Applied by reference, never re-dictated — a re-dictation is a fork. Bare P-numbers in this repository refer to it.
 
 ## Runtime shape
 
-{{single artifact | host + container | container swarm}} — the component tree follows P13 for this shape.
+{{single artifact | host + container | container swarm}} — the component tree follows P2 for this shape.
 
 ## Project-specific constraints
 

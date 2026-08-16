@@ -172,7 +172,7 @@ platform's own loop. The loop's mechanics:
   rebuilds the agent doing the work), and every refresh is **confirmed by reading the live
   artifact back against merged source, fail-closed** — not done until verified live on the
   target.
-- **Distrust, made structural.** No outcome is accepted on testimony — not an agent's word,
+- **Distrust, made structural (universal P10).** No outcome is accepted on testimony — not an agent's word,
   not a reviewer persuaded by prose, not a proxy mistaken for the artifact. Each gating
   outcome is **proven against the live artifact at check-time, by a non-author**. Liveness is
   monitored by freshness, never assumed; the **absence of a completion signal is a failure
@@ -182,7 +182,7 @@ platform's own loop. The loop's mechanics:
   objective. A feature — **including any gate, check, or watcher** — is built only if it
   advances the objective; where a mechanism helps one clause while hurting another, the
   trade-off is **evaluated and recorded**, never defaulted.
-- **The ship gate.** Nothing ships on its builder's own word. A product ships only after an
+- **The ship gate (universal P10).** Nothing ships on its builder's own word. A product ships only after an
   **independent, adversarial review** verifies the built product against the confirmed
   spec — the objective first, then the requirements, then the build principles; reviewer
   and author are drawn from **different agents** where the pair's agents
@@ -221,7 +221,7 @@ platform's own loop. The loop's mechanics:
 - The platform operates on **the repositories its GitHub App is installed on** — the
   maintainer's live install choice, private repositories included — and **never widens its
   own reach**.
-- No secrets in the repository or in image layers; credentials enter at runtime only.
+- No secrets in the repository or in image layers; credentials enter at runtime only (universal P6).
 - **Headless is binding.** Nothing in the platform may assume a physical display or a
   local seat — on any host, cloud or bare-metal, after genesis. A host's GPU or
   virtualization capability, where it exists, may be used; no platform function may

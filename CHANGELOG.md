@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-16
 
+- Constitution split: universal P1–P11 moved to the estate root's `principles/constitution.md`, merit-ordered zero-base, with two audited additions (P6 least-privilege, P10 distrust) and the restore-proven clause; this repo's constitution reduced to the pull + R1–R4 + instantiations. See decisions/0005 for the full number mapping.
 - P1–P3 rewritten under maintainer review, completing the P1–P13 pass: kernels separated from OS instantiations (P1 ladder, P3 weak-deps flag); P2 now names its live exemplars (the vendoring trail, the environment registry).
 - Repo-genesis template set shipped (ticket #6, the method's first exercise): `shared/templates/repo-genesis/` — standing-surface templates, the three-shape manual, Spec Kit ticket templates vendored at v0.16.4. See decisions/0004.
 - Spec Kit per-ticket method adopted (specify → plan → tasks → analyze → implement; `specs/<NNN-slug>/`, kept on main, frozen at ship); root lock renamed `spec.md` → `OBJECTIVE.md` to end the name collision; P5 scoped to build state; clarify folded into the initiation session. See decisions/0003.
