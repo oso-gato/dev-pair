@@ -12,8 +12,15 @@ Why objective and constitution are separate documents: the objective is **scoped
 
 - **Initiation.** Exactly one interactive session at the very beginning: the maintainer states the objective, the intended outcome, the scope and the boundaries.
 - **Confirmation.** The pair co-creates the **confirmed objective and the bylaw** with the maintainer in that session — sharpening and expanding his statement, settling both together: the objective's outcomes and boundaries; the bylaw's runtime shape, repo-specific principles, and instantiations, with the constitution applied by reference, never re-dictated. The maintainer confirms. That confirmation is the one and only human act the workflow requires.
-- **Execution.** The confirmed objective and bylaw are locked as **`00-OBJECTIVE.md` and `00-BYLAW.md`** at the new repository's root — the two initiation artifacts (P2) — and from the objective the pair autonomously builds the functional requirements, architects the design that serves them, then builds, validates, and iterates in a live environment — recovering from failure automatically, until the product ships. Humans approve goals, never deployments; there is no second interaction.
+- **Execution.** The **00-charter** — the confirmed objective and bylaw, locked as `00-OBJECTIVE.md` and `00-BYLAW.md` at the new repository's root, the two initiation artifacts (P2) — is the pair's whole instruction. From it the pair autonomously builds the functional requirements, architects the design that serves them, and then builds, validates, and iterates in a live environment, recovering from failure automatically, until the product ships. Humans approve goals, never deployments; there is no second approval.
 - **Ship.** Nothing ships on its builder's own word — the ship gate is universal P10. If review fails, the product goes back into the loop, not out the door.
+- **Delivery.** Shipping ends with the pair handing the maintainer the live outcome — the running service, where to find it, how to use it — together with an account of what was decided along the way. Delivery is a report, not a request: the one interaction this workflow counts is an approval, and delivery asks for none.
+
+Between confirmation and delivery, two policies stand. Where the 00-charter is silent, the pair decides for itself — taking the smallest footprint that serves the objective, recording the decision, and reporting it at delivery; if the choice was wrong, the maintainer amends the 00-charter afterward. And a project that cannot meet its objective within its boundaries halts and says so, naming the contradiction and proposing an amendment — it never loops indefinitely, and it never quietly ships a compromise.
+
+## After ship
+
+New work arrives as tickets. A ticket that fits within the 00-charter's scope proceeds autonomously under the standing law. A ticket that would exceed the objective or the bylaw is a scope change, and a scope change amends the 00-charter first — a new maintainer confirmation — before the work proceeds.
 
 ## The pair — three parts, one system
 
