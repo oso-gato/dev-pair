@@ -8,8 +8,8 @@ This repository holds the governing documents and the documentation surfaces. Th
 
 ## Pairs
 
-- `erebus` — VPS pair (Hostinger KVM 4, stock Fedora Cloud, idempotent converger). Facts: homelab-root `environments/erebus.md`.
-- `strix` — bare-metal pair (Minisforum MS-S1 MAX, `strix-ms-s1-bootc` image, rebase with rollback). Facts: homelab-root `environments/strix.md`.
+- `erebus` (host) + `nox` (dev-container) — the VPS pair (Hostinger KVM 4, stock Fedora Cloud, idempotent converger). Facts: homelab-root `environments/erebus.md`.
+- `strix` (host) + `moros` (dev-container) — the bare-metal pair (Minisforum MS-S1 MAX, `strix-ms-s1-bootc` image, rebase with rollback). Facts: homelab-root `environments/strix.md`.
 
 ## Components
 
