@@ -22,6 +22,8 @@ Per ticket, the loop runs **specify → plan → tasks → analyze → implement
 
 Clarification happens once, at initiation — never a mid-loop human summons (C11). Where the 00-charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
 
+Execution is parallel where independent and sequential only where dependent: `tasks.md` marks which tasks depend on which, independent tasks fan out concurrently, and dependencies alone impose order. Parallelism never trades away quality or accuracy — every parallel result passes the same gates as if it had run alone (C12).
+
 ## Ticket routing
 
 Every ticket carries two stamps: its **pair** (the lineage: `erebus`, `strix`) and its **agent** (`claudebox` = Claude Code, `kimibox` = Kimi Code). Pick up a ticket only when both stamps match your box (C8).
