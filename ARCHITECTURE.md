@@ -4,7 +4,7 @@ Agent-owned map of the system as built. Mutable-on-fact: updated in the same cha
 
 ## Current state (2026-08-16)
 
-This repository holds the governing documents and the documentation surfaces. The confirmed pre-build baseline is the protected tag `chartered` (epoch `chartered-2026-08-17`, wrapped in a GitHub Release); two active tag rulesets armour it — epochs immutable to everyone, the floating name maintainer-movable. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries only the pull, and `00-BYLAW.md` carries the B-numbered principles and the instantiations this repository owns. The component tree (`host/`, `dev-container/`, `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
+This repository holds the governing documents and the documentation surfaces. The confirmed pre-build baseline is the protected tag `chartered` (epochs `chartered-2026-08-17` and `chartered-2026-08-17-2`, each wrapped in a GitHub Release; the floating name at the latest); two active tag rulesets armour it — epochs immutable to everyone, the floating name maintainer-movable. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries only the pull, and `00-BYLAW.md` carries the B-numbered principles and the instantiations this repository owns. The component tree (`host/`, `dev-container/`, `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
 
 ## Pairs
 
