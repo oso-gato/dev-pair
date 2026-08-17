@@ -16,9 +16,17 @@
 # middle. Before it, everything is public and needs no authority. After it, the
 # vault opens and the run completes on its own. There is no second prompt.
 #
-# HOW TO USE IT. Paste this into the console's root shell:
+# HOW TO USE IT. Paste this file's contents into the console's root shell, which
+# is what the bylaw's day-zero contract describes — one pasted script.
 #
-#   curl -fsSL https://raw.githubusercontent.com/oso-gato/dev-pair/main/host/day-zero.sh | bash
+# Fetching it instead is fine, but never down a pipe into a shell. C4 forbids
+# fetch-piped-to-shell estate-wide, and this is the most privileged execution
+# on the host's whole life, so it is the last place to make an exception. Fetch,
+# look at what arrived, then run it:
+#
+#   curl -fsSLo day-zero.sh https://raw.githubusercontent.com/oso-gato/dev-pair/main/host/day-zero.sh
+#   sha256sum day-zero.sh          # compare against the commit you mean to run
+#   bash day-zero.sh
 #
 # It is safe to re-run. Every step reads live state first, and the converger it
 # hands off to is idempotent by construction.
