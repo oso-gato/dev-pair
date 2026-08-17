@@ -54,4 +54,6 @@ Every document here is written one way, for humans and agents alike. Full prose 
 
 ## Build & test
 
-Nothing to build yet — the component tree is unbuilt; the honest inventory is [ARCHITECTURE.md](ARCHITECTURE.md)'s. Fill this section as commands come into existence, in the same change that creates them.
+While `host/` and `dev-container/` are absent, building them is the whole of the work: day zero, the idempotent converger, the `nox` image, and an agent box on each side. Nothing else is on the critical path.
+
+The change that lands a component replaces its line above with that component's real commands, in the same change — this section is mutable-on-fact like the map, and retires the paragraph above itself once both components run. The rule that outlives it: a mechanism that observes, gates, or validates is built only after the thing it serves runs, and only when an observed failure demands it — the estate's measured failure mode is scaffolding that arrives first and then outgrows the product (C3).

@@ -1,8 +1,8 @@
 # ARCHITECTURE.md — current state
 
-Agent-owned map of the system as built. Mutable-on-fact: updated in the same change that alters a fact. Never a conformance target — this map chases the code, not the reverse.
+Agent-owned map of the system as built. Mutable-on-fact: updated in the same change that alters a fact. Never a conformance target — this map chases the code, not the reverse. It records only what exists: unbuilt work lives in issues, never here, because a list of absent mechanisms sitting in the current-state map reads as a build queue and gets built.
 
-## Current state (2026-08-16)
+## Current state (2026-08-17)
 
 This repository holds the governing documents and the documentation surfaces. The confirmed pre-build baseline is the protected tag `chartered` (epochs timestamped per C11 — latest `chartered-2026-08-17-1109` (Hong Kong time), where the floating tag points; earlier same-day names grandfathered; each epoch wrapped in a Release; two rulesets armour them); two active tag rulesets armour it — epochs immutable to everyone, the floating name maintainer-movable. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries only the pull, and `00-BYLAW.md` carries the B-numbered principles and the instantiations this repository owns. The component tree (`host/`, `dev-container/`, `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
 
@@ -14,14 +14,6 @@ This repository holds the governing documents and the documentation surfaces. Th
 ## Components
 
 - (none built yet — the component tree returns as code lands; component folders hold code and scripts only)
-
-## Promised by law, not yet built
-
-The law names these mechanisms in normative present tense; none exists yet, so today every rule binds by agent discipline alone — do not rely on a gate to catch a violation:
-
-- the CI merge gate (C9: specs-completeness, frozen-at-ship, C2 surface check)
-- the ticket-envelope contract with pair + agent + stage stamps (B3, C8)
-- the mechanical scans (C2 casing/structure, C4 forbidden channels, C7 out-of-band mutation)
 
 ## Documentation assets (per universal C1's docs/ valve)
 

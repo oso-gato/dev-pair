@@ -48,7 +48,7 @@ Neither component rebuilds the agent doing the work. A renewal that cannot resto
 
 This repository owns three instantiations — the estate's live implementations of universal principles, recorded here as fact.
 
-**Provenance ladder (instantiates C4).** The OS-level hierarchy: **L1** Fedora's own dnf repos; **L2** the vendor's own RPM or dnf `.repo` with `gpgcheck=1`, plus repo-metadata signatures where the vendor publishes them; **L3** last-resort official-upstream binary, provenance-graded — **c1** GPG signature over **c2** published checksum over **c3** resolve-log — and disclosed per artifact. Forbidden outright, enforced by mechanical scan: COPR and third-party repos, language package managers onto PATH, tarballs onto PATH, curl-pipe-sh, mirror and aggregator binaries, flatpak, snap.
+**Provenance ladder — Fedora naming (instantiates C4).** C4 owns the ladder's shape, its grading, and the estate-wide forbidden categories; this repository names only the Fedora instances, so a repository on another platform inherits the law and writes only its own names. **L1** is Fedora's own dnf repositories. **L2** is the vendor's own RPM or dnf `.repo` with `gpgcheck=1`, and `repo_gpgcheck=1` where the vendor signs its metadata. **L3** is an official-upstream binary, graded and disclosed per C4. C4's forbidden categories take these local instances: COPR for community rebuild repositories; pip, npm, cargo, gem and brew for language package managers onto PATH; flatpak and snap for self-bundling formats.
 
 **Minimalism flag (instantiates C3).** `install_weak_deps=False` on every package installation, bootstrap paths included.
 
