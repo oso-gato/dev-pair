@@ -21,7 +21,7 @@ REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 KEEP=0
 [ "${1:-}" = "--keep" ] && KEEP=1
 
-TAG="nox-validation:$(date -u +%Y%m%d-%H%M%S)-$$"
+TAG="dev-container-validation:$(date -u +%Y%m%d-%H%M%S)-$$"
 TREE=""
 
 # ── Teardown, registered before anything is created ──────────────────────────
@@ -43,7 +43,7 @@ command -v git    >/dev/null 2>&1 || { echo "build: git is required" >&2; exit 1
 # ── The throwaway tree ───────────────────────────────────────────────────────
 # Cut from the repository's committed state rather than the working tree, so a
 # validation candidate always corresponds to something that exists in git.
-TREE=$(mktemp -d -t nox-build-XXXXXXXX)
+TREE=$(mktemp -d -t dev-container-build-XXXXXXXX)
 echo ">> cutting a throwaway tree at $TREE"
 git -C "$REPO_ROOT" archive --format=tar HEAD | tar -x -C "$TREE" \
     || { echo "build: cannot cut a tree from HEAD" >&2; exit 1; }
@@ -71,7 +71,7 @@ for c in git gh tmux podman distrobox python3 openssl; do
 done
 [ -f /usr/share/dev-pair/claudebox/distrobox.ini ] || { echo "missing the box manifest"; exit 1; }
 [ -x /usr/bin/pair-gh-app-token ] || { echo "the App-token minter is not executable"; exit 1; }
-[ -x /usr/bin/nox-session ] || { echo "the entrypoint is not executable"; exit 1; }
+[ -x /usr/bin/pair-session ] || { echo "the entrypoint is not executable"; exit 1; }
 id core >/dev/null || { echo "no session user"; exit 1; }
 echo "tier-1: working set present, box manifest present, entrypoint executable"
 ' || { echo "build: tier-1 checks failed" >&2; exit 1; }

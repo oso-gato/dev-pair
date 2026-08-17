@@ -36,7 +36,7 @@ else
     log_warn "host App credentials absent — day zero installs them from the vault; the box will have no GitHub authority until it does"
 fi
 
-if [ -f "$PAIR_DEV_SECRETS_DIR/nox-github-app/private-key.pem" ]; then
+if [ -f "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-github-app/private-key.pem" ]; then
     log_ok "dev-container App credentials present (${DEV_APP_NAME}, App ${DEV_APP_ID})"
 else
     log_warn "dev-container App credentials absent — day zero installs them from the vault"

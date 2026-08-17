@@ -50,17 +50,27 @@ ENV_FILE="$CONVERGE_DIR/environments/${ENVIRONMENT}.env"
 
 printf '%s\n\n' "converge: ${PAIR_NAME} (${PAIR_TRACK} track) from ${REPO_ROOT}"
 
-prov_bootstrap
+# The preamble belongs to the track whose deploy mechanism this is. On the VPS
+# track the converger owns the host's OS state, so it installs its own fetch
+# tooling and the trust-root sync ahead of the ordered units. On the bare-metal
+# track the image owns all of that and arrives by rebase, so touching it here
+# would put two mechanisms in charge of one fact — and installing a package on
+# an image-immutable host is the out-of-band change C7 forbids outright.
+if [ -z "${CONVERGE_UNITS:-}" ]; then
+    prov_bootstrap
 
-# The trust-root sync script has to exist before the identity unit runs it, and
-# it is the one file installed ahead of the ordered units for that reason.
-fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-keys-sync" /usr/bin/pair-keys-sync 0755
-fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-keys-sync.service" \
-           /usr/lib/systemd/system/pair-keys-sync.service 0644
-fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-keys-sync.timer" \
-           /usr/lib/systemd/system/pair-keys-sync.timer 0644
-systemctl daemon-reload
-fs_enable_unit pair-keys-sync.timer
+    # The trust-root sync has to exist before the identity unit runs it, and it
+    # is the one file installed ahead of the ordered units for that reason.
+    fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-keys-sync" /usr/bin/pair-keys-sync 0755
+    fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-keys-sync.service" \
+               /usr/lib/systemd/system/pair-keys-sync.service 0644
+    fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-keys-sync.timer" \
+               /usr/lib/systemd/system/pair-keys-sync.timer 0644
+    systemctl daemon-reload
+    fs_enable_unit pair-keys-sync.timer
+else
+    log_ok "preamble skipped — ${PAIR_TRACK} track: the image owns the host's OS state"
+fi
 
 # Units run in filename order, and the numbering IS the dependency declaration:
 # identity before packages because a host with no administrator is not one we
@@ -68,9 +78,21 @@ fs_enable_unit pair-keys-sync.timer
 # repository needs the fetch tooling, podman before the box and the box before
 # the dev-container. Nothing here is parallel, because every step genuinely
 # depends on the one above it (C12: order only by dependency).
+#
+# Which units apply is a track fact the adapter declares. The VPS track's
+# sanctioned deploy mechanism is this converger, so it runs all of them; the
+# bare-metal track's is image rebase, so it runs only what the image does not
+# already carry. An unset list means every unit.
 for unit in "$CONVERGE_DIR"/units/*.sh; do
     name=$(basename "$unit" .sh)
-    [ -n "$ONLY" ] && [ "$ONLY" != "$name" ] && continue
+    if [ -n "$ONLY" ]; then
+        [ "$ONLY" = "$name" ] || continue
+    elif [ -n "${CONVERGE_UNITS:-}" ]; then
+        case " $CONVERGE_UNITS " in
+            *" $name "*) : ;;
+            *) continue ;;
+        esac
+    fi
     echo
     # shellcheck source=/dev/null
     . "$unit"

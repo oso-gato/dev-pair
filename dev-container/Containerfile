@@ -1,9 +1,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Containerfile — nox, the erebus pair's dev-container.
+# Containerfile — the pair's dev-container. One image, every lineage.
 #
 # Built by CI and never by a component: neither the host nor the container
 # builds production images (00-OBJECTIVE.md, Boundaries). CI publishes to
-# ghcr.io/oso-gato/nox and the host pulls what CI published, so the image is
+# ghcr.io/oso-gato/dev-container and the host pulls what CI published, so the image is
 # the artifact and the running container is disposable (C7).
 #
 # What this component is, per the objective: it develops and validates at
@@ -62,7 +62,7 @@ RUN chmod 0755 /usr/share/dev-pair/claudebox/claudebox-init.sh \
                /usr/share/dev-pair/claudebox/claudebox-rebuild \
                /usr/share/dev-pair/claudebox/claudebox-daily \
                /usr/bin/pair-gh-app-token \
-               /usr/bin/nox-session \
+               /usr/bin/pair-session \
     && ln -sf /usr/share/dev-pair/claudebox/claude            /usr/local/bin/claude \
     && ln -sf /usr/share/dev-pair/claudebox/claudebox-rebuild /usr/local/bin/claudebox-rebuild \
     && ln -sf /usr/share/dev-pair/claudebox/claudebox-daily   /usr/local/bin/claudebox-daily
@@ -88,4 +88,4 @@ ENV PAIR_APP_DIR=/run/secrets/github-app \
 
 # PID 1 is a session multiplexer rather than a shell: the container's whole
 # purpose is that sessions outlive the client that started them.
-ENTRYPOINT ["/usr/bin/nox-session"]
+ENTRYPOINT ["/usr/bin/pair-session"]

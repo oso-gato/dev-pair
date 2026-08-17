@@ -214,6 +214,62 @@ else
     fail "a package installation omits install_weak_deps=False"
 fi
 
+# ── 7. The adapters are additions, not forks ─────────────────────────────────
+# Issue #11's acceptance 2 in testable form. Every environment must render the
+# one shared template into a complete unit, and no unit may branch on which
+# pair is converging — the moment a unit says "if strix", the adapter rule has
+# stopped holding and the second lineage has become a fork.
+head_ "adapters"
+for env_file in "$REPO_ROOT"/host/converge/environments/*.env; do
+    env_name=$(basename "$env_file" .env)
+    if (
+        CONVERGE_CHANGED=0
+        # shellcheck source=/dev/null
+        . "$env_file"
+        out="$TESTROOT/render-$env_name.container"
+        fs_render "$REPO_ROOT/host/sysroot/etc/containers/systemd/users/dev-container.container.tpl" \
+                  "$out" 0644 PAIR_NAME DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE >/dev/null 2>&1
+        grep -q "ContainerName=${DEV_CONTAINER_NAME}$" "$out" || exit 1
+        grep -q "Image=${DEV_CONTAINER_IMAGE}$" "$out" || exit 1
+        grep -q '@@' "$out" && exit 1
+        exit 0
+    ); then
+        pass "${env_name}: renders a complete dev-container unit from the shared template"
+    else
+        fail "${env_name}: the shared template did not render cleanly for this adapter"
+    fi
+done
+
+# Every adapter must set the variables the units read unconditionally. A
+# missing one is a converge that dies partway rather than at the first line.
+for env_file in "$REPO_ROOT"/host/converge/environments/*.env; do
+    env_name=$(basename "$env_file" .env)
+    missing=""
+    for v in PAIR_NAME PAIR_TRACK DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE \
+             TRUST_ROOT_USER ADMIN_USER TAILNET_HOSTNAME VAULT_REPO \
+             PAIR_STATE_DIR PAIR_SECRETS_DIR PAIR_ADMIN_STATE \
+             PAIR_DEV_SECRETS_DIR PAIR_WORK_DIR; do
+        grep -qE "^${v}=" "$env_file" || missing="$missing $v"
+    done
+    if [ -z "$missing" ]; then
+        pass "${env_name}: declares every variable the units read"
+    else
+        fail "${env_name}: missing${missing}"
+    fi
+done
+
+# Code lines only, and whole words — an earlier version of this check matched
+# the "if" inside "verify" and fired on a comment.
+BRANCH_RE='^[^#]*\b(if|case)\b.*\b(erebus|strix|nox|moros)\b'
+if git -C "$REPO_ROOT" grep -nIE "$BRANCH_RE" \
+     -- 'host/converge/units/**' 'host/converge/lib/**' >/dev/null 2>&1; then
+    fail "a unit or library branches on the pair — the adapter rule has stopped holding"
+    git -C "$REPO_ROOT" grep -nIE "$BRANCH_RE" \
+        -- 'host/converge/units/**' 'host/converge/lib/**' | sed 's/^/        /'
+else
+    pass "no unit or library branches on which pair is converging"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 printf '\n\033[1mselftest: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 if [ "$FAIL" -gt 0 ]; then

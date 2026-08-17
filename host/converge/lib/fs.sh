@@ -39,6 +39,37 @@ fs_install() {
     fi
 }
 
+# fs_render <template> <dest> <mode> <VAR>...
+# Install a declared template with @@VAR@@ placeholders replaced by the named
+# adapter variables. Rendering happens before the comparison, so a template
+# whose substituted output is unchanged is still a no-op — which is what keeps
+# a per-pair definition from making every converge run report a change.
+#
+# An unset variable is fatal rather than substituted empty: a Quadlet with a
+# blank image name would start nothing and say nothing.
+fs_render() {
+    local tpl="$1" dest="$2" mode="$3"; shift 3
+    [ -f "$tpl" ] || log_die "declared template missing from the repository: $tpl"
+    local rendered; rendered=$(cat "$tpl")
+    local v
+    for v in "$@"; do
+        [ -n "${!v:-}" ] || log_die "cannot render $(basename "$tpl"): the adapter does not set $v"
+        rendered=${rendered//@@${v}@@/${!v}}
+    done
+    case "$rendered" in
+        *@@*) log_die "cannot render $(basename "$tpl"): an @@placeholder@@ was left unsubstituted" ;;
+    esac
+
+    if [ -f "$dest" ] && [ "$(cat "$dest")" = "$rendered" ]; then
+        log_ok "$dest current"
+    else
+        install -d -m 0755 "$(dirname "$dest")"
+        printf '%s\n' "$rendered" > "$dest"
+        chmod "$mode" "$dest"
+        log_changed "rendered $dest"
+    fi
+}
+
 # fs_install_tree <src-dir> <dest-root> <mode>
 # Install every regular file under a declared tree, preserving relative paths.
 fs_install_tree() {

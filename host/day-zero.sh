@@ -276,7 +276,7 @@ Reach it as ${ADMIN_USER}, by key, over the tailnet:
 
 Then:
     claude          a session in the host's agent box
-    nox             a session in the dev-container, resumable after any drop
+    ${DEV_CONTAINER_NAME}             a session in the dev-container, resumable after any drop
     sudo /var/lib/dev-pair/src/host/converge/converge.sh    re-converge
 
 Root is retired. This console will not authenticate it again, and no password

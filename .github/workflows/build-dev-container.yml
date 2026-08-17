@@ -4,7 +4,7 @@
 # The image is the artifact and the running container is disposable (C7), so
 # the tag moves only through this workflow and never through a live patch on a
 # host.
-name: build nox
+name: build the dev-container image
 
 on:
   push:
@@ -12,11 +12,11 @@ on:
     paths:
       - 'dev-container/**'
       - 'shared/**'
-      - '.github/workflows/build-nox.yml'
+      - '.github/workflows/build-dev-container.yml'
   workflow_dispatch:
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/nox
+  IMAGE: ghcr.io/${{ github.repository_owner }}/dev-container
 
 jobs:
   build:
@@ -51,7 +51,7 @@ jobs:
             done
             [ -f /usr/share/dev-pair/claudebox/distrobox.ini ] || exit 1
             [ -x /usr/bin/pair-gh-app-token ] || exit 1
-            [ -x /usr/bin/nox-session ] || exit 1
+            [ -x /usr/bin/pair-session ] || exit 1
             id core >/dev/null
             echo "verified"
           '

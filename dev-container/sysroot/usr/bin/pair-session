@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# nox-session — PID 1 of the dev-container.
+# pair-session — PID 1 of the dev-container, whichever lineage it serves.
 #
 # The container's whole purpose is that sessions outlive the client that
 # started them, so PID 1 is a supervisor rather than a shell: it holds the
@@ -7,7 +7,7 @@
 # underneath it. A dropped connection reaches no further than the tmux client.
 #
 # Sessions attach with `podman exec ... tmux new-session -A -s <name>`, which is
-# what the host's `nox` command does. Multi-tenancy is by named session, and
+# what the host's enter command does. Multi-tenancy is by named session, and
 # isolation is by scope rather than by identity — no session reads or touches
 # another's work, because each is entered against its own declared repository
 # set under /work.
@@ -15,7 +15,7 @@ set -uo pipefail
 
 TOKEN_REFRESH_SECONDS=${TOKEN_REFRESH_SECONDS:-3000}   # ~50 min; tokens live ~1 h
 
-log() { printf '[nox] %s\n' "$*"; }
+log() { printf '[%s] %s\n' "${DEV_CONTAINER_NAME:-dev-container}" "$*"; }
 
 # Durable work lives on the mounted volume, so this is the one directory that
 # has to exist before anything else runs.
@@ -58,7 +58,7 @@ shutdown() {
 }
 trap shutdown TERM INT
 
-log "ready — attach with: nox [session-name]"
+log "ready — attach with: ${DEV_CONTAINER_NAME:-the dev-container} [session-name]"
 
 # Hold the container up. `wait` rather than `sleep infinity` so the trap fires
 # promptly on the stop signal instead of after a timeout.

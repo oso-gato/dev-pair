@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# pair-enter — enter this pair's dev-container.
+#
+# Installed under the dev-container's own name, so it is `nox` on erebus and
+# `moros` on strix, and it takes the container it drives from how it was
+# invoked. One script, one home, no per-pair copy — the same rule the adapter
+# follows.
+#
+# Sessions are multi-tenant and each is isolated by scope, so this attaches to
+# a NAMED tmux session rather than a shared shell: bare, it attaches to the
+# default session; with an argument, to that one, creating it if absent. The
+# session lives inside the container and its work lives on the durable volume,
+# so a dropped connection loses neither.
+set -uo pipefail
+
+CONTAINER=$(basename "$0")
+if [ "$CONTAINER" = "pair-enter" ]; then
+    CONTAINER="${DEV_CONTAINER_NAME:-}"
+    if [ -z "$CONTAINER" ]; then
+        echo "pair-enter: install me under the dev-container name, or set DEV_CONTAINER_NAME" >&2
+        exit 2
+    fi
+fi
+SESSION="${1:-main}"
+
+if ! podman container exists "$CONTAINER" 2>/dev/null; then
+    echo "$CONTAINER: the container does not exist — the host has not launched it yet." >&2
+    echo "    start it with: systemctl --user start $CONTAINER" >&2
+    exit 1
+fi
+
+state=$(podman inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo unknown)
+if [ "$state" != "running" ]; then
+    echo "$CONTAINER: $state — starting it…" >&2
+    systemctl --user start "$CONTAINER" || {
+        echo "$CONTAINER: could not start — inspect: journalctl --user -u $CONTAINER" >&2
+        exit 1
+    }
+fi
+
+# -A creates the session when it is absent and attaches when it is present, so
+# one command covers the first connection and every reconnection after a roam,
+# a sleep, or a client restart.
+exec podman exec -it "$CONTAINER" tmux new-session -A -s "$SESSION"
