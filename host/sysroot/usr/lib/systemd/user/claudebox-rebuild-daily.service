@@ -1,0 +1,9 @@
+# The daily refresh decision. Deliberately separate from the rebuild itself:
+# this one only decides whether to start now or defer to the end of a live
+# session, and holds no lock of its own.
+[Unit]
+Description=Daily claudebox refresh decision
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/claudebox-daily

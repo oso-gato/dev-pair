@@ -1,0 +1,22 @@
+# The claudebox rebuild itself: destroy and recreate from the pinned manifest,
+# then re-apply the bridges and managed settings.
+#
+# Detached user service, so it outlives the box it recreates and any terminal
+# that started it. It runs under an EXCLUSIVE flock on the session lock, which
+# a live session holds SHARED for its whole lifetime — so the destroy can never
+# fire mid-session. The rebuild waits instead, with a note in the journal
+# saying why. That is C8's "never interrupts a live session", enforced by the
+# lock rather than by timing.
+[Unit]
+Description=Rebuild the claudebox (destroy and recreate from the shared manifest)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=45min
+Environment=CLAUDEBOX_SHARE=/usr/share/dev-pair/claudebox
+ExecStart=/bin/sh -c 'mkdir -p "$HOME/.local/state/claudebox"; \
+  echo "waiting for the exclusive session lock (any live session defers us)…"; \
+  exec flock -x "$HOME/.local/state/claudebox/session.lock" /bin/sh -c \
+    "distrobox rm -f claudebox 2>/dev/null || true; \
+     distrobox assemble create --file /usr/share/dev-pair/claudebox/distrobox.ini && \
+     /usr/share/dev-pair/claudebox/claudebox-init.sh"'

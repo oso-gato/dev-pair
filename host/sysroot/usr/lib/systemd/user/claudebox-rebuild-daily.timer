@@ -1,0 +1,17 @@
+# Daily cadence: the box carries the current Claude Code because it is rebuilt
+# nightly, never because it updated itself (C8).
+#
+# OnStartupSec also creates the box on the first boot after a converge, so the
+# operator does nothing to get a working box. The randomised delay keeps a
+# fleet of pairs from rebuilding in lockstep.
+[Unit]
+Description=Daily claudebox refresh schedule
+
+[Timer]
+OnStartupSec=10min
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

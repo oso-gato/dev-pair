@@ -1,0 +1,82 @@
+#!/bin/bash
+# pair-gh-app-token — mint a short-lived GitHub App installation token.
+#
+# This is what gives a claudebox its GitHub authority. The App identity is per
+# pair-component per agent and is never shared and never a personal token
+# (C6, ADR 000012): the host component's App carries no merge permission and
+# the dev-container's does, which is the host-never-merges boundary enforced by
+# GitHub itself rather than by our own good behaviour.
+#
+# The token is short-lived and lives only on tmpfs, never on disk. The private
+# key is read here and nowhere else, and its contents never reach stdout.
+#
+# Parameterised so the host and the dev-container run the same script against
+# their own App:
+#   PAIR_APP_DIR    directory holding app-id, installation-id, private-key.pem
+#   PAIR_TOKEN_PATH where the minted token is published
+#   PAIR_TOKEN_GROUP  group granted read on the token file
+#
+# No-ops cleanly when the App is not configured, so a component without GitHub
+# authority simply has no token rather than a failed boot. Idempotent.
+set -euo pipefail
+export LC_ALL=C
+
+# --report prints the granted permissions and expiry after minting; the timer
+# calls with no arguments and stays silent.
+REPORT=0; [ "${1:-}" = "--report" ] && REPORT=1
+
+APP_DIR="${PAIR_APP_DIR:-/var/lib/dev-pair/secrets/github-app}"
+KEY="$APP_DIR/private-key.pem"
+APP_ID_FILE="$APP_DIR/app-id"
+INST_ID_FILE="$APP_DIR/installation-id"
+OUT="${PAIR_TOKEN_PATH:-/run/dev-pair/gh-token}"
+OUT_DIR=$(dirname "$OUT")
+TOKEN_GROUP="${PAIR_TOKEN_GROUP:-core}"
+API=https://api.github.com
+
+# Optional capability: not configured means nothing to do.
+[ -f "$KEY" ] && [ -f "$APP_ID_FILE" ] && [ -f "$INST_ID_FILE" ] || exit 0
+
+APP_ID=$(cat "$APP_ID_FILE"); INST_ID=$(cat "$INST_ID_FILE")
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+now=$(date +%s)
+# iat backdated 60 s for clock skew; exp at 9 min, under GitHub's 10-minute cap.
+header='{"alg":"RS256","typ":"JWT"}'
+payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$((now-60))" "$((now+540))" "$APP_ID")
+h=$(printf '%s' "$header"  | b64url)
+p=$(printf '%s' "$payload" | b64url)
+sig=$(printf '%s' "$h.$p" | openssl dgst -sha256 -sign "$KEY" -binary | b64url)
+jwt="$h.$p.$sig"
+
+resp=$(curl -fsSL --retry 2 --proto '=https' --tlsv1.2 -X POST \
+  -H "Authorization: Bearer $jwt" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "$API/app/installations/$INST_ID/access_tokens") || {
+    logger -t pair-gh-app-token -p err "installation-token request failed (App $APP_ID / installation $INST_ID)"; exit 1; }
+
+token=$(printf '%s' "$resp" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("token",""))')
+[ -n "$token" ] || { logger -t pair-gh-app-token -p err "no token in the installation-token response"; exit 1; }
+
+# Publish to a group-readable tmpfs file by atomic rename, so a reader never
+# sees a half-written token.
+install -d -m 0755 "$OUT_DIR"
+umask 077
+printf '%s\n' "$token" > "$OUT.tmp"
+chown "root:$TOKEN_GROUP" "$OUT.tmp"
+chmod 0640 "$OUT.tmp"
+mv -f "$OUT.tmp" "$OUT"
+logger -t pair-gh-app-token -p info "minted GitHub App installation token at $OUT (~1 h)"
+
+if [ "$REPORT" = 1 ]; then
+  printf '%s' "$resp" | python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+print("GitHub App token renewed.")
+print("  expires_at:  ", d.get("expires_at", "?"))
+print("  repositories:", d.get("repository_selection", "?"))
+p = d.get("permissions", {})
+print("  permissions: ", ", ".join(f"{k}={v}" for k, v in sorted(p.items())) or "(none)")'
+fi

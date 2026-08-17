@@ -1,0 +1,67 @@
+# CI builds the production dev-container image, because neither component may
+# (00-OBJECTIVE.md, Boundaries). The host pulls what this publishes.
+#
+# The image is the artifact and the running container is disposable (C7), so
+# the tag moves only through this workflow and never through a live patch on a
+# host.
+name: build nox
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dev-container/**'
+      - 'shared/**'
+      - '.github/workflows/build-nox.yml'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nox
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the exact commit being built
+        uses: actions/checkout@v4
+
+      # Build from the repository root: the Containerfile copies from both
+      # dev-container/ and shared/, and a narrower context would not see the
+      # latter.
+      - name: Build
+        run: |
+          podman build \
+            --file dev-container/Containerfile \
+            --tag "${IMAGE}:44" \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            .
+
+      # What the image can prove about itself, before it is published. A tag
+      # that reached the registry unverified would be an artifact the host
+      # trusts on CI's word alone, and C10 accepts no outcome on testimony.
+      - name: Verify the image before publishing
+        run: |
+          podman run --rm --entrypoint /bin/bash "${IMAGE}:44" -c '
+            set -e
+            for c in git gh tmux podman distrobox python3 openssl; do
+              command -v "$c" >/dev/null || { echo "missing: $c"; exit 1; }
+            done
+            [ -f /usr/share/dev-pair/claudebox/distrobox.ini ] || exit 1
+            [ -x /usr/bin/pair-gh-app-token ] || exit 1
+            [ -x /usr/bin/nox-session ] || exit 1
+            id core >/dev/null
+            echo "verified"
+          '
+
+      - name: Log in to the registry
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish
+        run: |
+          podman push "${IMAGE}:44"
+          podman push "${IMAGE}:${GITHUB_SHA}"

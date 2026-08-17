@@ -1,0 +1,13 @@
+#!/bin/bash
+# pair-gh-renew — force an immediate re-mint of the component's GitHub App
+# installation token.
+#
+# Run this after changing the App's permissions on github.com AND approving the
+# change in the installation settings, so the new scope takes effect at once
+# instead of at the next timer tick. Because the minter re-reads its credential
+# files every run, this also picks up a ROTATED private key once the replacement
+# PEM is in place. Prints the resulting token's granted permissions and expiry,
+# so a scope change can be confirmed rather than assumed.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] || { echo "run as root: sudo pair-gh-renew" >&2; exit 1; }
+exec /usr/bin/pair-gh-app-token --report

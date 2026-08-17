@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# claude — the component's wrapper: every session runs INSIDE the claudebox.
+#
+# No component ever runs the agent directly (C8). This wrapper is the only
+# entry point, and it holds the session lock SHARED for the whole session, so
+# the daily rebuild — which takes the same lock exclusive — can never destroy
+# the box out from under live work.
+#
+# Recovery is built in rather than bolted on (C11): a rebuild found failed is
+# retried once in full before the wrapper refuses, because box state is
+# unpoliced after a partial removal.
+#
+# One script, both components. Where there is no systemd user manager the
+# rebuild phases simply collapse to "build it if it is missing", because
+# claudebox-rebuild runs inline there.
+set -uo pipefail
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+state="$HOME/.local/state/claudebox"; mkdir -p "$state"
+run=claudebox-rebuild-run.service
+
+have_user_systemd() { systemctl --user show -p Version >/dev/null 2>&1; }
+rebuild_state() { systemctl --user show -p ActiveState --value "$run" 2>/dev/null; }
+
+# ── Phase 1: rebuilds. No lock held here — the rebuild takes it exclusive, so
+# holding it shared would deadlock the very rebuild we are waiting on. ────────
+if have_user_systemd; then
+    case "$(rebuild_state)" in
+      activating|active)
+        if ! claudebox-rebuild --watch-only; then
+            echo ">> in-progress rebuild failed — retrying one full rebuild…"
+            claudebox-rebuild || {
+                echo ">> claudebox unusable — inspect: journalctl --user -u $run" >&2
+                exit 1
+            }
+        fi
+        ;;
+    esac
+fi
+if ! podman container exists claudebox 2>/dev/null; then
+    echo ">> claudebox does not exist yet — building it (first run, ~2-5 min)…"
+    claudebox-rebuild || exit 1
+fi
+
+# ── Phase 2: the session, under the shared lock for its entire lifetime. ─────
+exec 8>"$state/session.lock"
+flock -s 8
+run_session() {
+    local tries=0 rc
+    while :; do
+        distrobox enter claudebox -- bash -lc \
+            'exec /usr/bin/claude --model default "$@"' bash "$@"
+        rc=$?
+        # Retry ONLY OCI exec-setup failures (125/126), which are the transient
+        # post-rebuild /dev/pts race. Real exit codes pass straight through.
+        if [ "$rc" -ne 125 ] && [ "$rc" -ne 126 ]; then
+            return "$rc"
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -ge 3 ] && return "$rc"
+        sleep 2
+    done
+}
+run_session "$@"
+rc=$?
+exec 8>&-   # release before probing, or the probe below sees our own lock
+
+# ── Phase 3: a refresh that came due mid-session fires now. ──────────────────
+if have_user_systemd && [ -e "$state/rebuild.pending" ] \
+   && flock -n -x "$state/session.lock" -c true 2>/dev/null; then
+    rm -f "$state/rebuild.pending"
+    echo ">> a daily claudebox refresh came due while you were working — rebuilding now…"
+    systemctl --user start --no-block "$run"
+fi
+exit $rc

@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# pair-keys-sync — authorize the maintainer's published SSH keys for the
+# running user.
+#
+# The maintainer's published key set is the single trust root (C6): access is
+# granted and revoked by managing keys on the account, never by distributing
+# credentials. Rotating a key there propagates here on the next tick, with no
+# reinstall and no converge run.
+#
+# Defensive by design. A failed fetch, an empty response, or a response with no
+# well-formed key leaves the existing authorized_keys untouched — losing shell
+# access to a transient network failure would be a human summons, and C11
+# forbids those.
+set -euo pipefail
+
+GH_USER="${TRUST_ROOT_USER:-oso-gato}"
+SSH_DIR="$HOME/.ssh"
+AK="$SSH_DIR/authorized_keys"
+NEW="$SSH_DIR/.authorized_keys.new"
+
+install -d -m 700 "$SSH_DIR"
+raw="$(mktemp)"; trap 'rm -f "$raw" "$NEW"' EXIT
+
+if ! curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "https://github.com/${GH_USER}.keys" -o "$raw" || [ ! -s "$raw" ]; then
+    echo "WARN: fetch of github.com/${GH_USER}.keys failed or empty — authorized_keys left unchanged" >&2
+    exit 0
+fi
+
+# Keep only well-formed public-key lines; ssh-keygen validates each one.
+: > "$NEW"; chmod 600 "$NEW"
+n=0
+while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    printf '%s\n' "$key" | ssh-keygen -lf /dev/stdin >/dev/null 2>&1 || continue
+    printf '%s\n' "$key" >> "$NEW"
+    n=$((n + 1))
+done < "$raw"
+
+if [ "$n" -lt 1 ]; then
+    echo "WARN: no valid keys at github.com/${GH_USER}.keys — authorized_keys left unchanged" >&2
+    exit 0
+fi
+
+# Nothing to do when the set already matches — keeps a converged host quiet.
+if [ -f "$AK" ] && cmp -s "$NEW" "$AK"; then
+    echo "ssh keys: already current ($n key(s) from github.com/${GH_USER}.keys)"
+    exit 0
+fi
+
+mv -f "$NEW" "$AK"   # rename WITHIN ~/.ssh so the ssh_home_t SELinux label survives
+command -v restorecon >/dev/null 2>&1 && restorecon -F "$AK" 2>/dev/null || true
+echo "ssh keys: authorized $n key(s) from github.com/${GH_USER}.keys"
+logger -t pair-keys-sync -p info "authorized $n key(s) from github.com/${GH_USER}.keys"

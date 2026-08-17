@@ -1,0 +1,13 @@
+# GitHub installation tokens live about an hour, so re-mint at ~50 minutes and
+# shortly after boot. The box then always sees a valid token without ever
+# holding a long-lived one.
+[Unit]
+Description=dev-pair: refresh the host claudebox GitHub App token
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=50min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

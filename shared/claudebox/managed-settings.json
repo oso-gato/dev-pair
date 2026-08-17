@@ -1,0 +1,34 @@
+{
+    "comment": "claudebox managed settings, shared by both components of a pair (C8). Self-update is off by construction: currency comes from the daily box rebuild, never from the agent updating itself, because a self-installed binary would shadow the managed one and survive the rebuild. The deny list is a best-effort guardrail against casual package-discipline drift, not enforcement — the in-box user has sudo and prefix rules are reorderable. The real mechanism is the disposable box plus the daily rebuild: anything installed ad hoc dies within 24 hours. It encodes the bylaw's forbidden categories (COPR, language package managers onto PATH, self-bundling formats) so drift is at least noisy.",
+    "effortLevel": "xhigh",
+    "env": {
+        "DISABLE_UPDATES": "1",
+        "DISABLE_AUTOUPDATER": "1"
+    },
+    "permissions": {
+        "defaultMode": "auto",
+        "deny": [
+            "Bash(dnf copr:*)",
+            "Bash(distrobox-host-exec sudo dnf install:*)",
+            "Bash(distrobox-host-exec sudo dnf -y install:*)",
+            "Bash(distrobox-host-exec sudo rpm -i:*)",
+            "Bash(pip install --user:*)",
+            "Bash(pip3 install --user:*)",
+            "Bash(pipx install:*)",
+            "Bash(npm install -g:*)",
+            "Bash(npm i -g:*)",
+            "Bash(yarn global add:*)",
+            "Bash(pnpm add -g:*)",
+            "Bash(cargo install:*)",
+            "Bash(go install:*)",
+            "Bash(gem install:*)",
+            "Bash(brew install:*)",
+            "Bash(flatpak install:*)",
+            "Bash(snap install:*)",
+            "Bash(sudo dnf install:*)",
+            "Bash(sudo dnf -y install:*)",
+            "Bash(sudo rpm -i:*)",
+            "Bash(sudo rpm -U:*)"
+        ]
+    }
+}

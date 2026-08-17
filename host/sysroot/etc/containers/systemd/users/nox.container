@@ -1,0 +1,41 @@
+# nox — the erebus pair's dev-container, as a rootless Quadlet unit.
+#
+# The host builds nothing here: CI builds the production image and the host
+# pulls it (00-OBJECTIVE.md, Boundaries). The host launches and relaunches this
+# container from outside, and the dev-container never rebuilds itself (B4).
+#
+# Deliberately NO AutoUpdate=. An image that replaced itself from the registry
+# would be a mutable out-of-band change to a deployed artifact, which C7
+# forbids outright; renewal flows the merge-and-deploy path instead.
+#
+# Rootless, under the administrative user, so the container holds the minimal
+# authority its capability requires (C6).
+[Unit]
+Description=nox — the erebus pair's dev-container
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/oso-gato/nox:44
+ContainerName=nox
+# Durable state lives outside every layer (C8), so a relaunch loses no work.
+Volume=%h/dev-pair/work:/work:Z
+# The dev-container's own App identity — separate from the host's, and the one
+# that carries merge permission. Read-only, and never baked into the image.
+Volume=%h/.dev-pair/secrets/nox-github-app:/run/secrets/github-app:ro,Z
+# Sessions survive disconnection because tmux runs inside and the work volume
+# is durable; nothing here depends on the client staying connected.
+Environment=PAIR_APP_DIR=/run/secrets/github-app
+Environment=PAIR_TOKEN_PATH=/run/dev-pair/gh-token
+Environment=PAIR_NAME=erebus
+Environment=DEV_CONTAINER_NAME=nox
+# No published ports: the dev-container is reachable over the tailnet through
+# the host, never from the public internet (00-OBJECTIVE.md, Security 1).
+Timezone=local
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

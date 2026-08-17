@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# provenance.sh — the one pinned-fetch contract (C4).
+#
+# C4 asks for one fetch mechanism per system, at one strength: "a definition
+# fetched unverified on the most privileged component while pinned on another
+# is the canonical violation." Day zero and every converger unit therefore
+# admit artifacts through these functions and through nothing else.
+#
+# The ladder, as this repository instantiates it (00-BYLAW.md):
+#   L1  Fedora's own dnf repositories.
+#   L2  the vendor's own dnf .repo, gpgcheck=1, repo_gpgcheck=1 where the
+#       vendor signs its metadata.
+#   L3  an official-upstream binary, graded and disclosed. Nothing on erebus
+#       needs L3, and prov_l3_fetch exists so that if something ever does, it
+#       cannot be admitted without a checksum.
+#
+# Admission is enforced at the fetch: on a mismatch or an absent signature
+# nothing installs and the run stops. Every admitted artifact is disclosed to
+# ${PAIR_STATE_DIR}/provenance.tsv, which is the host's own record of what it
+# is made of.
+#
+# Sourced, never executed. Requires log.sh.
+
+PROV_DISCLOSURE="${PAIR_STATE_DIR:-/var/lib/dev-pair}/provenance.tsv"
+
+# ── Disclosure ───────────────────────────────────────────────────────────────
+# Every admitted artifact carries its disclosure (C4). Rewriting an existing
+# row rather than appending keeps the record a current-state fact list, so a
+# re-run does not grow it — which is what lets acceptance 3 read zero changes.
+prov_disclose() {
+    local artifact="$1" level="$2" source="$3" note="${4:-}"
+    local dir; dir=$(dirname "$PROV_DISCLOSURE")
+    install -d -m 0755 "$dir"
+    [ -f "$PROV_DISCLOSURE" ] || {
+        printf 'artifact\tlevel\tsource\tadmitted\tnote\n' > "$PROV_DISCLOSURE"
+        chmod 0644 "$PROV_DISCLOSURE"
+    }
+    local today; today=$(date -u +%Y-%m-%d)
+    local tmp; tmp=$(mktemp)
+    awk -F'\t' -v a="$artifact" 'NR==1 || $1 != a' "$PROV_DISCLOSURE" > "$tmp"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$artifact" "$level" "$source" "$today" "$note" >> "$tmp"
+    mv -f "$tmp" "$PROV_DISCLOSURE"
+    chmod 0644 "$PROV_DISCLOSURE"
+}
+
+# ── Bootstrap ────────────────────────────────────────────────────────────────
+# The contract needs a fetcher and a verifier before it can verify anything.
+# Both come from Fedora's own repositories, so this is L1 all the way down and
+# there is no unverified step ahead of the verifier.
+prov_bootstrap() {
+    local need=()
+    command -v curl >/dev/null 2>&1 || need+=(curl)
+    command -v gpg  >/dev/null 2>&1 || need+=(gnupg2)
+    if [ ${#need[@]} -gt 0 ]; then
+        dnf -y --setopt=install_weak_deps=False install "${need[@]}" \
+            || log_die "cannot install the fetch contract's own tools (${need[*]}) from Fedora's repositories"
+        log_changed "provenance: installed fetch tooling (${need[*]}, L1)"
+    fi
+    prov_disclose "curl" "L1" "fedora" "fetch contract"
+    prov_disclose "gnupg2" "L1" "fedora" "fetch contract, signature verification"
+}
+
+# ── L1 ───────────────────────────────────────────────────────────────────────
+# Fedora's own repositories. install_weak_deps=False on every installation,
+# bootstrap paths included (00-BYLAW.md, minimalism flag).
+#
+# Idempotent by reading live state: already-present packages are never passed
+# to dnf, so a converged host performs no transaction and reports no change.
+prov_l1_install() {
+    local why="$1"; shift
+    [ $# -gt 0 ] || return 0
+    local missing=() p
+    for p in "$@"; do
+        rpm -q --whatprovides "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        log_ok "packages present (${*})"
+    else
+        dnf -y --setopt=install_weak_deps=False install "${missing[@]}" \
+            || log_die "L1 install failed: ${missing[*]}"
+        log_changed "installed ${missing[*]} — $why"
+    fi
+    for p in "$@"; do prov_disclose "$p" "L1" "fedora" "$why"; done
+}
+
+# ── L2 ───────────────────────────────────────────────────────────────────────
+# A vendor's own dnf repository. The signing key is fetched over TLS and, when
+# a fingerprint is declared, pinned to it before anything is installed — so a
+# substituted key fails the run rather than being auto-imported by `dnf -y`.
+#
+# An undeclared fingerprint is a real gap and says so in the disclosure rather
+# than passing silently. It is still fail-closed against tampering after first
+# import, because gpgcheck and repo_gpgcheck verify every later fetch against
+# the key that was pinned on disk.
+#
+#   prov_l2_repo <id> <name> <baseurl> <gpgkey-url> <repo_gpgcheck 0|1> [fpr]
+prov_l2_repo() {
+    local id="$1" name="$2" baseurl="$3" keyurl="$4" repo_gpgcheck="$5" want_fpr="${6:-}"
+    local keyring="/etc/pki/rpm-gpg/RPM-GPG-KEY-${id}"
+    local repofile="/etc/yum.repos.d/${id}.repo"
+
+    # Fetch and pin the key before the repository can be used for anything.
+    if [ ! -s "$keyring" ]; then
+        local tmpkey; tmpkey=$(mktemp)
+        # shellcheck disable=SC2064
+        trap "rm -f '$tmpkey'" RETURN
+        curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$keyurl" -o "$tmpkey" \
+            || log_die "L2 ${id}: signing key unreachable at ${keyurl} — nothing installed"
+        [ -s "$tmpkey" ] || log_die "L2 ${id}: signing key empty — nothing installed"
+
+        if [ -n "$want_fpr" ]; then
+            local got
+            got=$(gpg --show-keys --with-colons "$tmpkey" 2>/dev/null \
+                  | awk -F: '$1=="fpr"{print $10; exit}')
+            local want_norm; want_norm=$(printf '%s' "$want_fpr" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
+            [ -n "$got" ] || log_die "L2 ${id}: signing key unreadable — nothing installed"
+            [ "$got" = "$want_norm" ] \
+                || log_die "L2 ${id}: key fingerprint ${got} does not match the pinned ${want_norm} — nothing installed"
+        fi
+
+        install -D -m 0644 "$tmpkey" "$keyring"
+        rpm --import "$keyring" || log_die "L2 ${id}: rpm refused the signing key — nothing installed"
+        log_changed "L2 ${id}: signing key pinned at ${keyring}"
+    else
+        log_ok "L2 ${id}: signing key already pinned"
+    fi
+
+    # Write the repository against the pinned local key, never the remote URL,
+    # so later fetches verify against what was checked here.
+    local desired
+    desired=$(printf '[%s]\nname=%s\nbaseurl=%s\nenabled=1\ntype=rpm\ngpgcheck=1\nrepo_gpgcheck=%s\ngpgkey=file://%s\n' \
+              "$id" "$name" "$baseurl" "$repo_gpgcheck" "$keyring")
+    if [ -f "$repofile" ] && [ "$(cat "$repofile")" = "$desired" ]; then
+        log_ok "L2 ${id}: repository definition current"
+    else
+        printf '%s' "$desired" > "$repofile"
+        chmod 0644 "$repofile"
+        log_changed "L2 ${id}: repository definition written"
+    fi
+
+    if [ -n "$want_fpr" ]; then
+        prov_disclose "repo:${id}" "L2" "$baseurl" "key pinned to ${want_fpr}"
+    else
+        prov_disclose "repo:${id}" "L2" "$baseurl" "gpgcheck=1 repo_gpgcheck=${repo_gpgcheck}; FINGERPRINT NOT PINNED"
+        log_warn "L2 ${id}: no fingerprint declared — pin one when a session can verify it upstream"
+    fi
+}
+
+# prov_l2_install — install from a repository admitted by prov_l2_repo.
+prov_l2_install() {
+    local repoid="$1" why="$2"; shift 2
+    local missing=() p
+    for p in "$@"; do
+        rpm -q --whatprovides "$p" >/dev/null 2>&1 || missing+=("$p")
+    done
+    if [ ${#missing[@]} -eq 0 ]; then
+        log_ok "packages present (${*})"
+    else
+        dnf -y --setopt=install_weak_deps=False install "${missing[@]}" \
+            || log_die "L2 install from ${repoid} failed: ${missing[*]}"
+        log_changed "installed ${missing[*]} from ${repoid} — $why"
+    fi
+    for p in "$@"; do prov_disclose "$p" "L2" "$repoid" "$why"; done
+}
+
+# ── L3 ───────────────────────────────────────────────────────────────────────
+# Last resort, admitted only where no L1 or L2 source exists, and never without
+# a checksum to verify against. Nothing on erebus uses this today; it exists so
+# that the first thing that needs it cannot be admitted ungraded.
+prov_l3_fetch() {
+    local url="$1" dest="$2" sha256="$3" why="$4"
+    [ -n "$sha256" ] || log_die "L3 ${url}: refused — an L3 artifact without a checksum is not admissible (C4)"
+    local tmp; tmp=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
+    curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$url" -o "$tmp" \
+        || log_die "L3 ${url}: unreachable — nothing installed"
+    local got; got=$(sha256sum "$tmp" | awk '{print $1}')
+    [ "$got" = "$sha256" ] \
+        || log_die "L3 ${url}: sha256 ${got} does not match the pinned ${sha256} — nothing installed"
+    install -D -m 0755 "$tmp" "$dest"
+    log_changed "L3 ${url} admitted to ${dest} (c2, checksum-verified)"
+    prov_disclose "$(basename "$dest")" "L3-c2" "$url" "$why; sha256 ${sha256}"
+}

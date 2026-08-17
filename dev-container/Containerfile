@@ -1,0 +1,91 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Containerfile — nox, the erebus pair's dev-container.
+#
+# Built by CI and never by a component: neither the host nor the container
+# builds production images (00-OBJECTIVE.md, Boundaries). CI publishes to
+# ghcr.io/oso-gato/nox and the host pulls what CI published, so the image is
+# the artifact and the running container is disposable (C7).
+#
+# What this component is, per the objective: it develops and validates at
+# tier 1, it is home to the multi-tenant sessions, and it is the platform's
+# sole merge authority under its empirical gates. The host refreshes it from
+# outside, and it never rebuilds itself (B4).
+#
+# Base pinned to :44, never :latest — :latest would rebase to the next Fedora
+# silently at release, which is exactly the mutable out-of-band change C7
+# forbids.
+#
+# Layering discipline (B1): heavy and stable layers early, churning layers
+# late, so iterative rebuilds ride the layer cache.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM quay.io/fedora/fedora:44
+
+# ─── Packages ────────────────────────────────────────────────────────────────
+# L1 throughout, install_weak_deps=False per the bylaw's minimalism flag, and
+# the most specific leaf package rather than any convenience metapackage (C3).
+# Each group carries the justification C3 requires:
+#   git, gh            the ticket bus is the durable hand-off, and this
+#                      component is the one that merges
+#   tmux               sessions survive disconnection because the session
+#                      lives here, not in the client
+#   podman, distrobox  this component runs its own claudebox (C8: an agent
+#                      present on the dev-container is present on its host)
+#   python3            the App-token minter parses JSON
+#   openssl            the same minter signs the App JWT with it
+#   shadow-utils       subordinate id ranges for the in-container rootless user
+#   ca-certificates    every fetch above is https and fails closed without it
+#   procps-ng, less,   the irreducible working set of an interactive session
+#   findutils, diffutils, tar, gzip, which
+RUN dnf -y --setopt=install_weak_deps=False install \
+        git gh tmux \
+        podman distrobox \
+        python3 openssl \
+        shadow-utils ca-certificates \
+        procps-ng less findutils diffutils tar gzip which \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf /var/log/dnf*
+
+# ─── The shared surfaces (C8) ────────────────────────────────────────────────
+# The same box manifest and the same App-token minter the host uses. They are
+# in shared/ precisely because both components use them, and copying them here
+# rather than forking them is what keeps that true.
+COPY shared/claudebox/ /usr/share/dev-pair/claudebox/
+COPY shared/bin/       /usr/bin/
+
+# ─── The component's own scripts ─────────────────────────────────────────────
+COPY dev-container/sysroot/ /
+
+# The box commands live in shared/ but belong on PATH, so they are linked
+# rather than copied — one home, reachable from where it is used (C1).
+RUN chmod 0755 /usr/share/dev-pair/claudebox/claudebox-init.sh \
+               /usr/share/dev-pair/claudebox/claude \
+               /usr/share/dev-pair/claudebox/claudebox-rebuild \
+               /usr/share/dev-pair/claudebox/claudebox-daily \
+               /usr/bin/pair-gh-app-token \
+               /usr/bin/nox-session \
+    && ln -sf /usr/share/dev-pair/claudebox/claude            /usr/local/bin/claude \
+    && ln -sf /usr/share/dev-pair/claudebox/claudebox-rebuild /usr/local/bin/claudebox-rebuild \
+    && ln -sf /usr/share/dev-pair/claudebox/claudebox-daily   /usr/local/bin/claudebox-daily
+
+# ─── The session user ────────────────────────────────────────────────────────
+# Sessions do not run as root. `core` is the estate's administrative identity
+# on every host it operates (C7), and carrying the same name into the
+# dev-container keeps one name for one thing (C1).
+RUN useradd --create-home --shell /bin/bash core \
+    && install -d -m 0755 -o core -g core /work \
+    && printf 'core:100000:65536\n' > /etc/subuid \
+    && printf 'core:100000:65536\n' > /etc/subgid
+
+# Durable state lives on the mounted volume, never in this layer (C8), so a
+# relaunch loses no work and no transcript.
+VOLUME /work
+WORKDIR /work
+USER core
+
+ENV PAIR_APP_DIR=/run/secrets/github-app \
+    PAIR_TOKEN_PATH=/run/dev-pair/gh-token \
+    CLAUDEBOX_SHARE=/usr/share/dev-pair/claudebox
+
+# PID 1 is a session multiplexer rather than a shell: the container's whole
+# purpose is that sessions outlive the client that started them.
+ENTRYPOINT ["/usr/bin/nox-session"]

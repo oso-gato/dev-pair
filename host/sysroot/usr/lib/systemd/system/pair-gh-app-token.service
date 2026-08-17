@@ -1,0 +1,17 @@
+# Mint the host claudebox's short-lived GitHub App installation token (C6).
+#
+# Reads the host component's own App credentials from the durable secrets
+# directory and writes a ~1 h token to tmpfs, readable by the administrative
+# user's group and nobody else. No-ops when the App is not configured, so a
+# component without GitHub authority boots clean rather than failing.
+[Unit]
+Description=dev-pair: mint the host claudebox's GitHub App token
+Wants=network-online.target
+After=network-online.target nss-lookup.target
+
+[Service]
+Type=oneshot
+Environment=PAIR_APP_DIR=/var/lib/dev-pair/secrets/github-app
+Environment=PAIR_TOKEN_PATH=/run/dev-pair/gh-token
+Environment=PAIR_TOKEN_GROUP=core
+ExecStart=/usr/bin/pair-gh-app-token

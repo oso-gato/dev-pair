@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# claudebox-rebuild — destroy and recreate the agent box from its manifest.
+#
+# Rebuild, never update (C8). The box is pinned to its agent's current release
+# and recreated wholesale; nothing is ever upgraded in place, because a
+# self-installed binary would shadow the managed one, survive the rebuild, and
+# strand the layer stale while appearing current.
+#
+# One script, both components. The host has a systemd user manager, so the
+# rebuild runs there as a DETACHED service that outlives the box it recreates
+# and the terminal that started it — Ctrl-C is safe. The dev-container has no
+# user manager, so the same rebuild runs inline under the same lock. The lock
+# is what matters in both cases: a live session holds it SHARED for its whole
+# lifetime, so a destroy can never fire mid-session (C8's "never interrupts a
+# live session", enforced by the lock rather than by timing).
+#
+#   claudebox-rebuild              rebuild, and follow it to completion
+#   claudebox-rebuild --watch-only follow a rebuild already in flight
+set -uo pipefail
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+SHARE="${CLAUDEBOX_SHARE:-/usr/share/dev-pair/claudebox}"
+state="$HOME/.local/state/claudebox"; mkdir -p "$state"
+run=claudebox-rebuild-run.service
+
+have_user_systemd() { systemctl --user show -p Version >/dev/null 2>&1; }
+state_of() { systemctl --user show -p ActiveState --value "$run" 2>/dev/null; }
+
+# The rebuild itself, identical wherever it runs.
+do_rebuild() {
+    distrobox rm -f claudebox 2>/dev/null || true
+    distrobox assemble create --file "$SHARE/distrobox.ini" || return 1
+    CLAUDEBOX_SHARE="$SHARE" "$SHARE/claudebox-init.sh" || return 1
+}
+
+# ── Without a user manager: inline, under the exclusive lock. ────────────────
+if ! have_user_systemd; then
+    if [ "${1:-}" = "--watch-only" ]; then
+        echo ">> no user manager here — rebuilds run inline, so there is none to watch."
+        exit 0
+    fi
+    echo ">> claudebox: rebuilding inline — fresh image + current Claude Code (~2-5 min)…"
+    echo ">> waiting for the exclusive session lock (any live session defers us)…"
+    if flock -x "$state/session.lock" bash -c "$(declare -f do_rebuild); CLAUDEBOX_SHARE='$SHARE' SHARE='$SHARE' do_rebuild"; then
+        echo ">> claudebox rebuild complete."
+        exit 0
+    fi
+    echo ">> claudebox rebuild FAILED." >&2
+    exit 1
+fi
+
+# ── With a user manager: detached service, followed from here. ───────────────
+if [ "${1:-}" = "--watch-only" ]; then
+    # Only meaningful while a rebuild is actually running. Never report
+    # "complete" for a rebuild that never ran, and never swallow a failed one.
+    case "$(state_of)" in
+        activating|active) : ;;
+        *)
+            if systemctl --user is-failed --quiet "$run"; then
+                echo ">> last claudebox rebuild FAILED — inspect: journalctl --user -u $run" >&2
+                exit 1
+            fi
+            echo ">> no claudebox rebuild in progress."
+            exit 0
+            ;;
+    esac
+else
+    systemctl --user reset-failed "$run" 2>/dev/null || true
+    echo ">> claudebox: starting rebuild — fresh image + current Claude Code (~2-5 min)…"
+    systemctl --user start --no-block "$run"
+    # Let the start job materialise before polling, or the first poll races it.
+    for _ in $(seq 1 20); do
+        case "$(state_of)" in activating|active) break ;; esac
+        sleep 0.5
+    done
+fi
+
+journalctl --user -u "$run" -f --no-pager &
+follower=$!
+trap 'kill "$follower" 2>/dev/null' EXIT INT TERM
+
+# A Type=oneshot service in flight reports 'activating' and never 'active', so
+# poll ActiveState directly — `is-active` would call success while the
+# destroy-and-recreate is still running.
+while :; do
+    case "$(state_of)" in
+        activating|active|reloading|deactivating) sleep 2 ;;
+        *) break ;;
+    esac
+done
+kill "$follower" 2>/dev/null || true
+
+if systemctl --user is-failed --quiet "$run"; then
+    echo ">> claudebox rebuild FAILED — inspect: journalctl --user -u $run" >&2
+    exit 1
+fi
+echo ">> claudebox rebuild complete."

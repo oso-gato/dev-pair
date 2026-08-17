@@ -1,0 +1,12 @@
+# Shortly after boot, then daily. Monotonic timers only, so Persistent= is
+# deliberately absent — it applies to OnCalendar= timers alone and would be a
+# no-op here.
+[Unit]
+Description=dev-pair authorized_keys sync schedule
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=24h
+
+[Install]
+WantedBy=timers.target
