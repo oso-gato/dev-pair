@@ -4,7 +4,7 @@ Read this first, every session.
 
 ## Load the law
 
-Fetch the universal constitution at session start — the fetch line is in [CONSTITUTION.md](CONSTITUTION.md). For structural work, also read the 00-charter: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY, and [00-BYLAW.md](00-BYLAW.md), this repository's own law. All three are locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
+Fetch the universal constitution at session start — the fetch line is in [CONSTITUTION.md](CONSTITUTION.md). For structural work, also read the charter: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY, and [00-BYLAW.md](00-BYLAW.md), this repository's own law. All three are locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
 
 ## What this repository is
 
@@ -20,7 +20,7 @@ Per ticket, the loop runs **specify → plan → tasks → analyze → implement
 4. Analyze — a read-only consistency check across the three before implementing.
 5. Implement, validate, iterate — two tiers, per the objective.
 
-Clarification happens once, at initiation — never a mid-loop human summons (C11). Where the 00-charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
+Clarification happens once, at initiation — never a mid-loop human summons (C11). Where the charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
 
 Execution is parallel where independent and sequential only where dependent: `tasks.md` marks which tasks depend on which, independent tasks fan out concurrently, and dependencies alone impose order. Parallelism never trades away quality or accuracy — every parallel result passes the same gates as if it had run alone (C12).
 

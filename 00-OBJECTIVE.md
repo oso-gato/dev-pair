@@ -12,22 +12,22 @@ Why objective and constitution are separate documents: the objective is **scoped
 
 - **Initiation.** Exactly one interactive session at the very beginning: the maintainer states the objective, the intended outcome, the scope and the boundaries.
 - **Confirmation.** The pair co-creates the **confirmed objective and the bylaw** with the maintainer in that session — sharpening and expanding his statement, settling both together: the objective's outcomes and boundaries; the bylaw's runtime shape, repo-specific principles, and instantiations, with the constitution applied by reference, never re-dictated. The maintainer confirms. That confirmation is the one and only human act the workflow requires.
-- **Execution.** The **00-charter** — the confirmed objective and bylaw, locked as `00-OBJECTIVE.md` and `00-BYLAW.md` at the new repository's root, the two initiation artifacts (C2) — is the pair's whole instruction. From it the pair autonomously builds the functional requirements, architects the design that serves them, and then builds, validates, and iterates in a live environment, recovering from failure automatically, until the product ships. Humans approve goals, never deployments; there is no second approval.
+- **Execution.** The **charter** — the confirmed objective and bylaw, locked as `00-OBJECTIVE.md` and `00-BYLAW.md` at the new repository's root, the two initiation artifacts (C2) — is the pair's whole instruction. From it the pair autonomously builds the functional requirements, architects the design that serves them, and then builds, validates, and iterates in a live environment, recovering from failure automatically, until the product ships. Humans approve goals, never deployments; there is no second approval.
 - **Ship.** Nothing ships on its builder's own word — the ship gate is universal C10. If review fails, the product goes back into the loop, not out the door.
 - **Delivery.** Shipping ends with the pair handing the maintainer the live outcome — the running service, where to find it, how to use it — together with an account of what was decided along the way. Delivery is a report, not a request: the one interaction this workflow counts is an approval, and delivery asks for none.
 
-Between confirmation and delivery, two policies stand. Where the 00-charter is silent, the pair decides for itself — taking the smallest footprint that serves the objective, recording the decision, and reporting it at delivery; if the choice was wrong, the maintainer amends the 00-charter afterward. And a project that cannot meet its objective within its boundaries halts and says so, naming the contradiction and proposing an amendment — it never loops indefinitely, and it never quietly ships a compromise.
+Between confirmation and delivery, two policies stand. Where the charter is silent, the pair decides for itself — taking the smallest footprint that serves the objective, recording the decision, and reporting it at delivery; if the choice was wrong, the maintainer amends the charter afterward. And a project that cannot meet its objective within its boundaries halts and says so, naming the contradiction and proposing an amendment — it never loops indefinitely, and it never quietly ships a compromise.
 
 ## After ship
 
-New work arrives as tickets. A ticket that fits within the 00-charter's scope proceeds autonomously under the standing law. A ticket that would exceed the objective or the bylaw is a scope change, and a scope change amends the 00-charter first — a new maintainer confirmation — before the work proceeds.
+New work arrives as tickets. A ticket that fits within the charter's scope proceeds autonomously under the standing law. A ticket that would exceed the objective or the bylaw is a scope change, and a scope change amends the charter first — a new maintainer confirmation — before the work proceeds.
 
 ## The pair — three parts, one system
 
 The pair is three parts, always: **the GitHub ticket bus, the host, and the dev-container** — one lifecycle, one specification, one repository. Tickets and PRs are the first-class hand-off; the dev-container never touches the host directly. The host is Fedora and environment-agnostic by construction — the only constants are Fedora and headlessness; provisioning facts are registry inputs, never baked-in assumptions. The runtime boundary between host and dev-container is real; no other boundary is manufactured.
 
 - **The host** — genesis per its lineage's deploy mechanism (bylaw-instantiated); operate and maintain the platform: deploy, refresh, roll back, create and remove containers, keep itself sound; host applications per the second objective, each its own container from a registry, a VM only as C7 allows; live-diagnose and develop fixes — **PRs only, never merges**; never builds production images (CI does); never applies an unmerged change. On merge it renews itself, no standing human tap (B4).
-- **The dev-container** — develop and validate (tier-1); the platform's **sole merge authority** under its empirical gates — except the `00-` artifacts and constitution, maintainer-merge-only; home of the multi-tenant sessions; refreshed from outside, by the host.
+- **The dev-container** — develop and validate (tier-1); the platform's **sole merge authority** under its empirical gates — except the charter and constitution, maintainer-merge-only; home of the multi-tenant sessions; refreshed from outside, by the host.
 - **The agent layer** — every agent in a disposable box per universal C8, so the components stay relatively stable while every agent stays always current, and no rebuild costs live work.
 
 **One repository, many pairs.** The platform is replicable: each deployment is one pair — a **lineage, named by its host**. `erebus`, the first, is also the **genesis agent** that spins up all future containers; `strix` is the bare-metal pair. Instance facts live in the estate's environment registry, never here. Each pair works under its own dedicated GitHub App identities, never shared. Authority is per-pair: each dev-container is the sole merger of its own work; each host the single shared validator of its own sessions. A host is always deployed as a dev pair foremost and first — application workloads come after.
@@ -51,7 +51,7 @@ Built by dogfooding: every change to this repository lands through the platform'
 
 ## Boundaries
 
-- The host never merges; the dev-container merges — except the confirmed `00-` artifacts and constitution, which only the maintainer merges.
+- The host never merges; the dev-container merges — except the confirmed charter and constitution, which only the maintainer merges.
 - Neither component builds production images; CI builds them. The host builds only throwaway validation candidates.
 - No unmerged change is ever applied to either component. Proposing is never applying.
 - The platform operates only on the repositories its GitHub App is installed on — the maintainer's live install choice, private repositories included — and never widens its own reach.
