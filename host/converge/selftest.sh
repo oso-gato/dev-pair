@@ -248,7 +248,7 @@ for env_file in "$REPO_ROOT"/host/converge/environments/*.env; do
     for v in PAIR_NAME PAIR_TRACK DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE \
              TRUST_ROOT_USER ADMIN_USER TAILNET_HOSTNAME VAULT_REPO \
              PAIR_STATE_DIR PAIR_SECRETS_DIR PAIR_ADMIN_STATE \
-             PAIR_DEV_SECRETS_DIR PAIR_WORK_DIR; do
+             PAIR_DEV_SECRETS_DIR PAIR_WORK_DIR BIN_DIR UNIT_DIR; do
         grep -qE "^${v}=" "$env_file" || missing="$missing $v"
     done
     if [ -z "$missing" ]; then

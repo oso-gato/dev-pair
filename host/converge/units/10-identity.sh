@@ -32,13 +32,16 @@ fi
 
 # ── The trust root ───────────────────────────────────────────────────────────
 # Run the sync as the user itself, so the keys land in its own authorized_keys
-# with its own ownership. The script is failure-safe and reports its own state.
-if runuser -u "$ADMIN_USER" -- env "TRUST_ROOT_USER=$TRUST_ROOT_USER" \
-        /usr/bin/pair-keys-sync 2>&1 | grep -q 'already current'; then
-    log_ok "authorized_keys current from the trust root"
-else
-    log_changed "synced authorized_keys from github.com/${TRUST_ROOT_USER}.keys"
-fi
+# with its own ownership. It is failure-safe by design: a failed or empty fetch
+# leaves the existing keys alone and says so. Read its actual output rather than
+# assuming success, or a converge run would report a change that never happened.
+_sync_out=$(runuser -u "$ADMIN_USER" -- env "TRUST_ROOT_USER=$TRUST_ROOT_USER" \
+            "$BIN_DIR/pair-keys-sync" 2>&1) || true
+case "$_sync_out" in
+    *"already current"*) log_ok "authorized_keys current from the trust root" ;;
+    *"authorized "*)     log_changed "synced authorized_keys from github.com/${TRUST_ROOT_USER}.keys" ;;
+    *)                   log_warn "trust-root sync did not complete; existing keys left untouched — ${_sync_out}" ;;
+esac
 
 # ── Shell access policy ──────────────────────────────────────────────────────
 _sshd_before=$(sha256sum /etc/ssh/sshd_config.d/40-dev-pair.conf 2>/dev/null | awk '{print $1}')

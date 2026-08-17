@@ -12,7 +12,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=core
-Group=core
-Environment=TRUST_ROOT_USER=oso-gato
-ExecStart=/usr/bin/pair-keys-sync
+User=@@ADMIN_USER@@
+Group=@@ADMIN_USER@@
+Environment=TRUST_ROOT_USER=@@TRUST_ROOT_USER@@
+ExecStart=@@BIN_DIR@@/pair-keys-sync

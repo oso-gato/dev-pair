@@ -11,7 +11,7 @@ After=network-online.target nss-lookup.target
 
 [Service]
 Type=oneshot
-Environment=PAIR_APP_DIR=/var/lib/dev-pair/secrets/github-app
+Environment=PAIR_APP_DIR=@@PAIR_SECRETS_DIR@@/github-app
 Environment=PAIR_TOKEN_PATH=/run/dev-pair/gh-token
-Environment=PAIR_TOKEN_GROUP=core
-ExecStart=/usr/bin/pair-gh-app-token
+Environment=PAIR_TOKEN_GROUP=@@ADMIN_USER@@
+ExecStart=@@BIN_DIR@@/pair-gh-app-token

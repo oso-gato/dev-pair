@@ -16,13 +16,16 @@ log_unit "github app"
 
 # The minter is shared: both components mint their own token from their own
 # App, so it lives in shared/ and neither component owns a copy.
-fs_install "$REPO_ROOT/shared/bin/pair-gh-app-token"       /usr/bin/pair-gh-app-token 0755
-fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-gh-renew" /usr/bin/pair-gh-renew     0755
+# BIN_DIR and UNIT_DIR are adapter facts because /usr is read-only on the
+# bare-metal track's bootc host — the image owns it and it changes only by
+# rebase. This unit runs on both tracks, so it must not assume it can write there.
+fs_install "$REPO_ROOT/shared/bin/pair-gh-app-token"       "$BIN_DIR/pair-gh-app-token" 0755
+fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-gh-renew" "$BIN_DIR/pair-gh-renew"     0755
 
-fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-gh-app-token.service" \
-           /usr/lib/systemd/system/pair-gh-app-token.service 0644
+fs_render "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-gh-app-token.service.tpl" \
+          "$UNIT_DIR/pair-gh-app-token.service" 0644 BIN_DIR PAIR_SECRETS_DIR ADMIN_USER
 fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-gh-app-token.timer" \
-           /usr/lib/systemd/system/pair-gh-app-token.timer 0644
+           "$UNIT_DIR/pair-gh-app-token.timer" 0644
 
 systemctl daemon-reload
 fs_enable_unit pair-gh-app-token.timer

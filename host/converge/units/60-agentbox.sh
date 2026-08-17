@@ -25,9 +25,9 @@ fs_install "$REPO_ROOT/shared/claudebox/claudebox-init.sh" \
 
 # The operator commands, shared with the dev-container for the same reason the
 # manifest is: both components run a box and drive it the same way.
-fs_install "$REPO_ROOT/shared/claudebox/claude"            /usr/bin/claude            0755
-fs_install "$REPO_ROOT/shared/claudebox/claudebox-rebuild" /usr/bin/claudebox-rebuild 0755
-fs_install "$REPO_ROOT/shared/claudebox/claudebox-daily"   /usr/bin/claudebox-daily   0755
+fs_install "$REPO_ROOT/shared/claudebox/claude"            "$BIN_DIR/claude"            0755
+fs_install "$REPO_ROOT/shared/claudebox/claudebox-rebuild" "$BIN_DIR/claudebox-rebuild" 0755
+fs_install "$REPO_ROOT/shared/claudebox/claudebox-daily"   "$BIN_DIR/claudebox-daily"   0755
 
 # The rebuild machinery, in the user manager because the box is the user's.
 fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/user/claudebox-rebuild-run.service" \

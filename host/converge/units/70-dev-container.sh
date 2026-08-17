@@ -22,7 +22,7 @@ fs_render "$REPO_ROOT/host/sysroot/etc/containers/systemd/users/dev-container.co
 
 # The enter command takes its container from its own invocation name, so it is
 # installed as `nox` on erebus and `moros` on strix from the same source file.
-fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-enter" "/usr/bin/${DEV_CONTAINER_NAME}" 0755
+fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-enter" "$BIN_DIR/${DEV_CONTAINER_NAME}" 0755
 
 # Pull what CI built. An image already present at the same digest is not pulled
 # again, so a converged host reports no change here.
