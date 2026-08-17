@@ -34,15 +34,17 @@ C8 pairs boxes by agent across a pair's components, so `claudebox` exists on the
 
 Host-side operator scripts are pair-neutral and prefixed `pair-`, because `host/` serves both tracks and a per-pair copy would be the fork the bylaw forbids. Box scripts keep the `claudebox-` name C8 gives them.
 
-### `nox` is built and launched from outside
+### `nox` is built by CI and launched from outside
 
-The host builds the `nox` image from `dev-container/Containerfile` and runs it. The dev-container never rebuilds itself, which is B4's rule holding even before the self-renewal chain exists. Sessions survive disconnection because the durable state is the ticket bus and the mounted work volume, never the layer.
+CI builds the `nox` image from `dev-container/Containerfile` and publishes it to `ghcr.io`; the host pulls that image and launches it. Neither component builds production images, which is the objective's own boundary, so `dev-container/build.sh` produces a throwaway validation candidate and nothing else.
+
+The host launches and relaunches the container from outside, and the dev-container never rebuilds itself — B4's rule holding even before the self-renewal chain exists. Sessions survive disconnection because the durable state is the ticket bus and the mounted work volume, never the layer.
 
 ## Provenance, as adopted
 
 | artifact | level | source | pinned | verified |
 | --- | --- | --- | --- | --- |
-| base OS | L1 | Hostinger stock `Fedora Cloud 44` | template, as provisioned | maintainer 2026-08-17, registry |
+| base OS | provider template, upstream unverified | Hostinger stock `Fedora Cloud 44` | template, as provisioned | maintainer 2026-08-17, registry |
 | host packages | L1 | Fedora 44 repositories | release-pinned | at fetch, on the host |
 | `tailscale` | L2 | `pkgs.tailscale.com/stable/fedora` | `gpgcheck=1` + `repo_gpgcheck=1` | donor trail 2026-07-11; not re-checkable this session |
 | `claude-code` | L2 | `downloads.claude.ai/claude-code/rpm/latest` | `gpgcheck=1`, key `31DD DE24 DDFA B679 F42D 7BD2 BAA9 29FF 1A7E CACE` | donor trail; not re-checkable this session |

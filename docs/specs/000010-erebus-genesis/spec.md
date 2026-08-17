@@ -21,7 +21,7 @@ Erebus is lineage 1 and is built first because the VPS is the more stable surfac
 5. **The converger is the host's only deploy mechanism, and it is idempotent.** Every mutation the host carries is declared in this repository, applies re-run-safe, and erases ad-hoc drift on the next apply. Any historical version re-runs safely.
 6. **Every package admission walks the ladder and discloses where it landed.** Fedora's own repositories first, the vendor's signed repository second, an official upstream artifact only where neither exists. No forbidden channel appears anywhere in the tree.
 7. **The agent box is disposable and cannot self-update.** `claudebox` is a distrobox layer on the host, rebuilt rather than updated, with every durable thing — credentials, transcripts, configuration — outside the layer.
-8. **`nox` is the second component and is built by the host, from outside.** It carries its own agent box, hosts the multi-tenant sessions, and holds the merge authority the host does not.
+8. **`nox` is the second component, built by CI and launched by the host from outside.** Neither component builds production images, so the host pulls what CI published and never builds it locally. It carries its own agent box, hosts the multi-tenant sessions, and holds the merge authority the host does not.
 9. **Sessions survive disconnection.** A session left running survives a network roam, a device sleep, and a client restart, and resumes from any authorised device with its work intact.
 
 ## Acceptance

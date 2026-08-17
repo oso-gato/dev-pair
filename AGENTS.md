@@ -58,6 +58,12 @@ Every document here is written one way, for humans and agents alike. Full prose 
 
 ## Build & test
 
-While `host/` and `dev-container/` are absent, building them is the whole of the work: day zero, the idempotent converger, the `nox` image, and an agent box on each side. Nothing else is on the critical path.
+The erebus lineage's genesis path is built and unapplied; `moros` and the strix pair's activation are the remaining build. What runs today:
+
+- `bash host/converge/selftest.sh` — everything the container can prove without a host: every delivered script parses, shellcheck is clean at style level, the idempotence primitives are exercised against a real filesystem and mutation-checked, and the tree carries no credential, no forbidden channel, and no installation missing `install_weak_deps=False`. This is the tier-1 gate and it must be green before a ticket is offered as done.
+- `sudo host/converge/converge.sh --env <name>` — converge a host. `--list` shows the units, `--only <unit>` runs one. Re-running is the normal case, and a converged host reports zero changes.
+- `bash dev-container/build.sh` — a throwaway validation candidate of the `nox` image, torn down with its tree on every exit path (B1). Never a production image: CI builds those.
+
+Tier 2 is the maintainer's apply. A full converge on a live Fedora Cloud host, and the second apply that proves the converger re-run-safe end to end, need a host and are never simulated here (C9).
 
 The change that lands a component replaces its line above with that component's real commands, in the same change — this section is mutable-on-fact like the map, and retires the paragraph above itself once both components run. The rule that outlives it: a mechanism that observes, gates, or validates is built only after the thing it serves runs, and only when an observed failure demands it — the estate's measured failure mode is scaffolding that arrives first and then outgrows the product (C3).
