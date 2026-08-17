@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-17
 
+- Epoch names timestamped to the minute, UTC (chartered-YYYY-MM-DD-HHMM); pre-grammar names grandfathered. See docs/decisions/000016.
 - C12 (parallel by independence) added to the universal constitution, with the session-loaded echo in AGENTS.md and the genesis template: independent tasks fan out, dependencies alone impose order, parallel results pass the same gates. See docs/decisions/000015.
 - Chartered epochs adopted (C11 amendment): the confirmed pre-build state locked as the protected dated epoch `chartered-2026-08-17` with the floating `chartered` atop it — restore by name, never by number; revert default, reset maintainer-only; every future repo born with its anchor via the genesis step. See docs/decisions/000014.
 - Citation letters renamed: P→C and R→B, numerals unchanged (P≡C, R≡B); record numbering widened to six digits for decisions and specs, existing files renamed with contents untouched — the measured burn rate on the prior fleet justified the width. See docs/decisions/000013.
