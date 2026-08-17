@@ -2,7 +2,7 @@
 
 The autonomous dev pair: a Fedora host and a dev container, built and run as one system.
 
-Three documents govern everything in this repository:
+The **charter** governs everything in this repository — three documents, maintainer-merge-only:
 
 - [00-OBJECTIVE.md](00-OBJECTIVE.md) — why the pair exists and what it must achieve.
 - [CONSTITUTION.md](CONSTITUTION.md) — the estate's universal build principles, applied by reference.

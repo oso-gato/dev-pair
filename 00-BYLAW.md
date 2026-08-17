@@ -2,7 +2,7 @@
 
 ## Authority
 
-Confirmed 2026-08-16 with the objective, sharing its authority, and fixed: amendment is a new maintainer confirmation, never a silent edit, and only the maintainer merges it. This is one of the two initiation artifacts (C2) — with the objective, the charter — co-created with the maintainer in the initiation session. It is subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)) — valid only where it does not conflict — and bare C-numbers below refer to it.
+Confirmed 2026-08-16 with the objective, sharing its authority, and fixed: amendment is a new maintainer confirmation, never a silent edit, and only the maintainer merges it. This is one of the two initiation artifacts (C2) — with the objective and, by reference, the constitution, the charter — co-created with the maintainer in the initiation session. It is subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)) — valid only where it does not conflict — and bare C-numbers below refer to it.
 
 ## B1 — THE THROWAWAY PRINCIPLE & CHURN
 

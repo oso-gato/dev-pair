@@ -1,6 +1,6 @@
 # The Dev Pair — CONSTITUTION (universal law, applied by reference)
 
-The estate's universal constitution — `oso-gato/homelab-root` → `principles/CONSTITUTION.md` (private; resolvable by the pair's agents) — governs all work in this repository. It is never re-dictated; a re-dictation is a fork. Bare C-numbers estate-wide refer to it.
+The estate's universal constitution — `oso-gato/homelab-root` → `principles/CONSTITUTION.md` (private; resolvable by the pair's agents) — governs all work in this repository. It is never re-dictated; a re-dictation is a fork. Bare C-numbers estate-wide refer to it. This file is the charter's third member (C2): the reference is what this repository holds and what its epoch locks, while the law's own text stays live at its one home.
 
 Load it at session start:
 

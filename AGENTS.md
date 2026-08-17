@@ -4,7 +4,7 @@ Read this first, every session.
 
 ## Load the law
 
-Fetch the universal constitution at session start — the fetch line is in [CONSTITUTION.md](CONSTITUTION.md). For structural work, also read the charter: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY, and [00-BYLAW.md](00-BYLAW.md), this repository's own law. All three are locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
+Read the charter, the three law files that govern here: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY; [00-BYLAW.md](00-BYLAW.md), this repository's own law; and [CONSTITUTION.md](CONSTITUTION.md), the universal law by reference — fetch it at session start, the fetch line is in that file. The charter is locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
 
 The pair's identities — GitHub App, tailnet, `core` — rest in the estate vault at homelab-root `identity/`; [ARCHITECTURE.md](ARCHITECTURE.md) § Pairs carries the exact pointers. The vault discipline in homelab-root's AGENTS.md binds here too: credential files are never read, operations on them are content-blind.
 
