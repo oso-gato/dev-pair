@@ -48,6 +48,7 @@ Every document here is written one way, for humans and agents alike. Full prose 
 - Builds are throwaways cut from throwaway trees — never from a live tree (B1).
 - No mutable out-of-band change to any deployed artifact (C7).
 - No mechanism without an outcome it changes; no test asserting a mock; no gate without recovery (C3, C9, C11).
+- The confirmed baseline is the protected tag `chartered`, with dated epochs `chartered-YYYY-MM-DD` beneath it. Never move or delete an epoch tag. After a bad run, restore by reverting main to `chartered` — a recorded act; reset is maintainer-only (C11).
 
 ## Build & test
 

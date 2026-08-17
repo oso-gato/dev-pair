@@ -4,6 +4,7 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-08-17
 
+- Chartered epochs adopted (C11 amendment): the confirmed pre-build state locked as the protected dated epoch `chartered-2026-08-17` with the floating `chartered` atop it — restore by name, never by number; revert default, reset maintainer-only; every future repo born with its anchor via the genesis step. See docs/decisions/000014.
 - Citation letters renamed: P→C and R→B, numerals unchanged (P≡C, R≡B); record numbering widened to six digits for decisions and specs, existing files renamed with contents untouched — the measured burn rate on the prior fleet justified the width. See docs/decisions/000013.
 - The credential vault decided (maintainer, overruling the agent's recommendation — on record): live credentials rest only in the private estate root; universal P6 amended with the scoped exception; the trust root fixed as all published `oso-gato` SSH keys, consumed live, with a dated snapshot in the vault. See docs/decisions/0011.
 - 00-charter amended: the no-root outcome added to Security outcome 2 (the admin is `core`, sudo-by-password, root never authenticates remotely after genesis); both lineages gained their day-zero contracts in the bylaw — the VPS's one pasted script that builds and retires root, bare metal's activation-only act injecting just the live credentials.
