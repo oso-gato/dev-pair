@@ -4,7 +4,7 @@ Read this first, every session.
 
 ## Load the law
 
-Fetch the universal constitution at session start — the fetch line is in [CONSTITUTION.md](CONSTITUTION.md). For structural work, also read the 00-charter: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY, and [00-BYLAW.md](00-BYLAW.md), this repository's own law. All three are locked, maintainer-merge-only. Bare P-numbers mean the universal constitution; R-numbers mean the bylaw.
+Fetch the universal constitution at session start — the fetch line is in [CONSTITUTION.md](CONSTITUTION.md). For structural work, also read the 00-charter: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY, and [00-BYLAW.md](00-BYLAW.md), this repository's own law. All three are locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
 
 ## What this repository is
 
@@ -14,21 +14,21 @@ The dev pair: three parts, always. The **GitHub ticket bus** — issues and PRs 
 
 Per ticket, the loop runs **specify → plan → tasks → analyze → implement**:
 
-1. `docs/specs/<NNN-slug>/spec.md` — what this ticket must do; NNN is the issue number.
-2. `docs/specs/<NNN-slug>/plan.md` — the design that serves it.
-3. `docs/specs/<NNN-slug>/tasks.md` — the decomposition to iterate through.
+1. `docs/specs/<NNNNNN-slug>/spec.md` — what this ticket must do; NNNNNN is the issue number, zero-padded to six digits.
+2. `docs/specs/<NNNNNN-slug>/plan.md` — the design that serves it.
+3. `docs/specs/<NNNNNN-slug>/tasks.md` — the decomposition to iterate through.
 4. Analyze — a read-only consistency check across the three before implementing.
 5. Implement, validate, iterate — two tiers, per the objective.
 
-Clarification happens once, at initiation — never a mid-loop human summons (P11). Where the 00-charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
+Clarification happens once, at initiation — never a mid-loop human summons (C11). Where the 00-charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
 
 ## Ticket routing
 
-Every ticket carries two stamps: its **pair** (the lineage: `erebus`, `strix`) and its **agent** (`claudebox` = Claude Code, `kimibox` = Kimi Code). Pick up a ticket only when both stamps match your box (P8).
+Every ticket carries two stamps: its **pair** (the lineage: `erebus`, `strix`) and its **agent** (`claudebox` = Claude Code, `kimibox` = Kimi Code). Pick up a ticket only when both stamps match your box (C8).
 
 ## Self-renewal — never forget this
 
-A maintainer-instructed improvement merges → the host brings itself to the merged state → the host rebuilds and relaunches the dev-container from outside → every session is restored. The dev-container never rebuilds itself — it requests renewal, its own or the host's, through the ticket bus (R4).
+A maintainer-instructed improvement merges → the host brings itself to the merged state → the host rebuilds and relaunches the dev-container from outside → every session is restored. The dev-container never rebuilds itself — it requests renewal, its own or the host's, through the ticket bus (B4).
 
 ## Chartering a new repository
 
@@ -36,7 +36,7 @@ After its initiation session, fetch the genesis kit fresh from `oso-gato/homelab
 
 ## Records
 
-[ARCHITECTURE.md](ARCHITECTURE.md) is the current-state map — update it in the same change that alters a fact; a stale map is a blocking finding (P1). [docs/decisions/](docs/decisions/) holds the ADRs — problem, options, choice, fate; reverse by superseding record, never by edit. [CHANGELOG.md](CHANGELOG.md) carries notable changes and incidents.
+[ARCHITECTURE.md](ARCHITECTURE.md) is the current-state map — update it in the same change that alters a fact; a stale map is a blocking finding (C1). [docs/decisions/](docs/decisions/) holds the ADRs — problem, options, choice, fate; reverse by superseding record, never by edit. [CHANGELOG.md](CHANGELOG.md) carries notable changes and incidents.
 
 ## Writing style
 
@@ -44,10 +44,10 @@ Every document here is written one way, for humans and agents alike. Full prose 
 
 ## Session conduct
 
-- Author and build only in your session's isolated, namespaced worktree; re-verify branch ownership before every commit and push (R2).
-- Builds are throwaways cut from throwaway trees — never from a live tree (R1).
-- No mutable out-of-band change to any deployed artifact (P7).
-- No mechanism without an outcome it changes; no test asserting a mock; no gate without recovery (P3, P9, P11).
+- Author and build only in your session's isolated, namespaced worktree; re-verify branch ownership before every commit and push (B2).
+- Builds are throwaways cut from throwaway trees — never from a live tree (B1).
+- No mutable out-of-band change to any deployed artifact (C7).
+- No mechanism without an outcome it changes; no test asserting a mock; no gate without recovery (C3, C9, C11).
 
 ## Build & test
 

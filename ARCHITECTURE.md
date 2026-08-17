@@ -4,7 +4,7 @@ Agent-owned map of the system as built. Mutable-on-fact: updated in the same cha
 
 ## Current state (2026-08-16)
 
-This repository holds the governing documents and the documentation surfaces. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries only the pull, and `00-BYLAW.md` carries the R-numbered principles and the instantiations this repository owns. The component tree (`host/`, `dev-container/`, `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
+This repository holds the governing documents and the documentation surfaces. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries only the pull, and `00-BYLAW.md` carries the B-numbered principles and the instantiations this repository owns. The component tree (`host/`, `dev-container/`, `shared/`) is not yet rebuilt; it returns as code lands under the constitution.
 
 ## Pairs
 
@@ -19,10 +19,10 @@ This repository holds the governing documents and the documentation surfaces. Th
 
 The law names these mechanisms in normative present tense; none exists yet, so today every rule binds by agent discipline alone — do not rely on a gate to catch a violation:
 
-- the CI merge gate (P9: specs-completeness, frozen-at-ship, P2 surface check)
-- the ticket-envelope contract with pair + agent + stage stamps (R3, P8)
-- the mechanical scans (P2 casing/structure, P4 forbidden channels, P7 out-of-band mutation)
+- the CI merge gate (C9: specs-completeness, frozen-at-ship, C2 surface check)
+- the ticket-envelope contract with pair + agent + stage stamps (B3, C8)
+- the mechanical scans (C2 casing/structure, C4 forbidden channels, C7 out-of-band mutation)
 
-## Documentation assets (per universal P1's docs/ valve)
+## Documentation assets (per universal C1's docs/ valve)
 
-- (none — the genesis kit's master lives in the estate root at `genesis/`; consumed by throwaway fetch, per docs/decisions/0010)
+- (none — the genesis kit's master lives in the estate root at `genesis/`; consumed by throwaway fetch, per docs/decisions/000010)

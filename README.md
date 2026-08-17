@@ -14,7 +14,7 @@ If code and these documents disagree, the documents win — or the documents are
 
 ## Layout law
 
-The standing skeleton is law — universal constitution P2, instantiated for this repository's shape in [00-BYLAW.md](00-BYLAW.md). This repository is the host + container shape:
+The standing skeleton is law — universal constitution C2, instantiated for this repository's shape in [00-BYLAW.md](00-BYLAW.md). This repository is the host + container shape:
 
 - `host/` — everything that provisions, converges, or operates the Fedora host (VPS or bare metal).
 - `dev-container/` — everything that builds or operates the dev container.
