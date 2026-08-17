@@ -8,7 +8,7 @@ This repository holds the governing documents and the documentation surfaces. Th
 
 ## Pairs
 
-- `erebus` (host) + `nox` (dev-container) — the VPS pair (Hostinger KVM 4, stock Fedora Cloud, idempotent converger). Facts: homelab-root `environments/erebus.md`.
+- `erebus` (host) + `nox` (dev-container) — the VPS pair (Hostinger KVM 4); neither component is built, and the host sits at its as-provisioned template. Facts: homelab-root `environments/erebus.md`; the lineage's sanctioned deploy mechanism is law, not built state, and lives in `00-BYLAW.md`.
 - `strix` (host) + `moros` (dev-container) — the bare-metal pair (Minisforum MS-S1 MAX, `strix-ms-s1-bootc` image, rebase with rollback). Facts: homelab-root `environments/strix.md`.
 - Identities for every pair rest in the estate vault, homelab-root `identity/`: the App registry `github-apps.md` (App and installation IDs, each PEM beside it), the tailnet auth key `tskey-auth-oso-2026-09-26-expiry.key` (tailnet `oso`, expiry in the name), and the `core` declaration `core-user.md` (userid; sudo hashes, main and alternative). Credential files are never read — homelab-root's `AGENTS.md` carries the vault discipline, and it binds this repository's agents too.
 
