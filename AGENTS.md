@@ -42,6 +42,8 @@ After its initiation session, fetch the genesis kit fresh from `oso-gato/homelab
 
 [ARCHITECTURE.md](ARCHITECTURE.md) is the current-state map — update it in the same change that alters a fact; a stale map is a blocking finding (C1). [docs/decisions/](docs/decisions/) holds the ADRs — problem, options, choice, fate; reverse by superseding record, never by edit. [CHANGELOG.md](CHANGELOG.md) carries notable changes and incidents.
 
+A surface improvement that is universal rather than pair-specific updates the surface's genesis template (homelab-root `genesis/`) in the same change, or records why it is pair-only — facts (lineage names, expiry-dated filenames) never mirror.
+
 ## Writing style
 
 Every document here is written one way, for humans and agents alike. Full prose sentences that happen to be short — one subject per sentence, one line per paragraph, no hard wraps. State the rule, then the reason. Name a thing once and reuse the name; coin a new term with a plain gloss at first use; bold only load-bearing anchors. The label-colon register ("Status: X. Fixed: Y.") never appears in prose — it belongs only to functional forms. Functional forms keep their native shape: task lists stay checklists, registries stay fact lists, ADR metadata stays a header, tables stay tables — prose never invades them either. Frozen records are never restyled.
