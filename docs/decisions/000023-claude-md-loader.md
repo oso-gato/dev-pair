@@ -21,7 +21,7 @@ The import form was chosen over the symlink the same documentation offers. A sym
 
 - **A symlink, `ln -s AGENTS.md CLAUDE.md`** — rejected for the portability and record reasons above. It is otherwise equivalent and remains a fallback.
 - **Move the manual into `CLAUDE.md` and drop `AGENTS.md`** — rejected. Kimi Code loads `AGENTS.md` automatically, into its system prompt, verified by running it at 0.35.0; Codex reads `AGENTS.md` before doing any work and never reads `CLAUDE.md`. Renaming would break two boxes to fix one and would abandon the cross-agent name C8's admission contract depends on.
-- **Inline the charter or the constitution into the loaded file** — rejected on measurement. `AGENTS.md` is 6,128 bytes and sits comfortably everywhere, but the charter and constitution together are 43.8 KiB, past Codex's 32 KiB `project_doc_max_bytes` ceiling by roughly a quarter, and Kimi truncates as well, visibly since 0.20.0 and against no published limit. What auto-loads stays lean; the charter is opened when a session needs it.
+- **Inline the charter or the constitution into the loaded file** — rejected on measurement. `AGENTS.md` is 6,128 bytes and sits comfortably everywhere, but the charter and constitution together are 39.0 KiB — 10,261 plus 8,017 plus 712 plus 20,923 bytes — past Codex's 32 KiB `project_doc_max_bytes` ceiling by roughly a quarter, and Kimi truncates as well, visibly since 0.20.0 and against no published limit. What auto-loads stays lean; the charter is opened when a session needs it.
 - **Do nothing and rely on agents opening the file** — rejected. That is the condition this record was written to end, and 000018 already found that a rule which must be volunteered loses to anything that loads.
 
 ## Consequences
