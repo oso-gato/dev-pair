@@ -18,11 +18,19 @@ log_unit "dev-container"
 # Rendered per pair from the one template.
 fs_render "$REPO_ROOT/host/sysroot/etc/containers/systemd/users/dev-container.container.tpl" \
           "/etc/containers/systemd/users/${DEV_CONTAINER_NAME}.container" 0644 \
-          PAIR_NAME DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE
+          PAIR_NAME DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE \
+          DEV_SSH_PORT DEV_MOSH_PORTS DEV_TAILNET_HOSTNAME TRUST_ROOT_USER
 
 # The enter command takes its container from its own invocation name, so it is
 # installed as `nox` on erebus and `moros` on strix from the same source file.
 fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-enter" "$BIN_DIR/${DEV_CONTAINER_NAME}" 0755
+
+# The volumes the Quadlet mounts have to exist and be owned before the unit
+# starts, or podman creates them root-owned and the rootless container cannot
+# write its host keys or its tailnet state.
+fs_ensure_dir "$PAIR_ADMIN_STATE/${DEV_CONTAINER_NAME}-sshd-keys"      0700 "${ADMIN_USER}:${ADMIN_USER}"
+fs_ensure_dir "$PAIR_ADMIN_STATE/${DEV_CONTAINER_NAME}-tailscale-state" 0700 "${ADMIN_USER}:${ADMIN_USER}"
+fs_ensure_dir "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-tailscale"   0700 "${ADMIN_USER}:${ADMIN_USER}"
 
 # Pull what CI built. An image already present at the same digest is not pulled
 # again, so a converged host reports no change here.

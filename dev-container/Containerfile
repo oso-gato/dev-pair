@@ -20,6 +20,22 @@
 # ─────────────────────────────────────────────────────────────────────────────
 FROM quay.io/fedora/fedora:44
 
+# ─── PINNED VENDOR ASSET: Tailscale's own repository definition ──────────────
+# This component joins the tailnet as its own node, so it needs the client.
+# The definition is the VENDOR'S file, pinned by checksum and verified
+# fail-closed — a changed upstream stops the build instead of silently
+# redefining where packages come from. The pin lives here and is bumped here
+# only, after a live re-check (C5):
+#   curl -fsSL https://pkgs.tailscale.com/stable/fedora/tailscale.repo | sha256sum
+ARG TAILSCALE_REPO_URL=https://pkgs.tailscale.com/stable/fedora/tailscale.repo
+ARG TAILSCALE_REPO_SHA256=87206259fb7032fb4147eabccf4ffdb0b4d850d0519ef4c6991cf8c4d100ac13
+RUN set -eu; \
+    curl -fsSL --proto '=https' --tlsv1.2 "$TAILSCALE_REPO_URL" -o /tmp/tailscale.repo; \
+    echo "${TAILSCALE_REPO_SHA256}  /tmp/tailscale.repo" | sha256sum -c - \
+      || { echo "tailscale.repo checksum mismatch — re-verify upstream and re-pin (C5)"; exit 1; }; \
+    install -m 0644 /tmp/tailscale.repo /etc/yum.repos.d/tailscale.repo; \
+    rm -f /tmp/tailscale.repo
+
 # ─── Packages ────────────────────────────────────────────────────────────────
 # L1 throughout, install_weak_deps=False per the bylaw's minimalism flag, and
 # the most specific leaf package rather than any convenience metapackage (C3).
@@ -35,6 +51,12 @@ FROM quay.io/fedora/fedora:44
 #                      bootstraps itself over that same sshd, so it inherits
 #                      the keys-only policy rather than adding a second one.
 #   curl               the trust-root key sync fetches over https
+#   tailscale          this component is its own tailnet node with its own
+#                      Tailscale SSH door, not a service behind the host's
+#                      (docs/decisions/000030). L2, vendor definition pinned
+#                      by checksum above.
+#   libcap             setcap/getcap for the newuidmap capabilities the nested
+#                      agent box depends on (docs/decisions/000029)
 #   podman, distrobox  this component runs its own claudebox (C8: an agent
 #                      present on the dev-container is present on its host)
 #   python3            the App-token minter parses JSON
@@ -46,9 +68,10 @@ FROM quay.io/fedora/fedora:44
 RUN dnf -y --setopt=install_weak_deps=False install \
         git gh tmux \
         openssh-server mosh curl \
+        tailscale \
         podman distrobox \
         python3 openssl \
-        shadow-utils ca-certificates \
+        shadow-utils ca-certificates libcap \
         procps-ng less findutils diffutils tar gzip which \
     && dnf clean all \
     && rm -rf /var/cache/dnf /var/log/dnf*
@@ -88,8 +111,22 @@ RUN chmod 0755 /usr/share/dev-pair/claudebox/claudebox-init.sh \
 RUN useradd --create-home --shell /bin/bash core \
     && install -d -m 0755 -o core -g core /work \
     && install -d -m 0700 /etc/ssh/keys \
-    && printf 'core:100000:65536\n' > /etc/subuid \
-    && printf 'core:100000:65536\n' > /etc/subgid
+    && printf 'core:10000:55000\n' > /etc/subuid \
+    && printf 'core:10000:55000\n' > /etc/subgid
+
+# ─── Nested user namespaces for the agent box (docs/decisions/000029) ────────
+# The subordinate ranges above are sized to fit INSIDE the outer rootless map,
+# not to the usual host-side defaults: core=1000 plus 10000..64999 stays under
+# 65536. A range that overflows the outer map cannot be written at all, and the
+# first box assemble fails.
+#
+# shadow-utils' RPM scriptlet sets these file capabilities, but the
+# security.capability xattr does not reliably survive layer commits in every
+# podman storage configuration. Without them, nested userns setup fails with
+# "newuidmap: write to uid_map failed: Operation not permitted". Set explicitly
+# here, and verified again at boot by pair-session as a second defence.
+RUN setcap cap_setuid+ep /usr/bin/newuidmap \
+    && setcap cap_setgid+ep /usr/bin/newgidmap
 
 # Durable state lives on the mounted volume, never in this layer (C8), so a
 # relaunch loses no work and no transcript.

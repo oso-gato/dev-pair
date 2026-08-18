@@ -22,7 +22,23 @@ KEYDIR=/etc/ssh/keys
 
 log() { printf '[%s] %s\n' "${DEV_CONTAINER_NAME:-dev-container}" "$*"; }
 
-mkdir -p /work "$KEYDIR" /run/dev-pair 2>/dev/null || true
+mkdir -p /work "$KEYDIR" /run/dev-pair /run/tailscale /var/lib/tailscale 2>/dev/null || true
+
+# ── Nested user namespaces for the agent box (docs/decisions/000029) ─────────
+# Build-time setcap does not survive every podman storage configuration: the
+# security.capability xattr can be lost on a layer commit. Verify and restore
+# at boot, or the first `distrobox assemble` dies with "newuidmap: write to
+# uid_map failed: Operation not permitted" and the failure reads as a podman
+# bug rather than a missing capability. Idempotent — a no-op when already set.
+for bin in /usr/bin/newuidmap /usr/bin/newgidmap; do
+    [ -x "$bin" ] || continue
+    if ! getcap "$bin" 2>/dev/null | grep -q cap_set; then
+        case "$bin" in
+            */newuidmap) setcap cap_setuid+ep "$bin" && log "restored capabilities on $bin" ;;
+            */newgidmap) setcap cap_setgid+ep "$bin" && log "restored capabilities on $bin" ;;
+        esac
+    fi
+done
 
 # ── The public door ──────────────────────────────────────────────────────────
 # Host keys live on a mounted volume rather than in the image. An image-baked
@@ -61,6 +77,38 @@ else
     sshd_pid=""
     log "ERROR: sshd configuration does not parse — no public door on this component"
     /usr/sbin/sshd -t
+fi
+
+# ── The tailnet ──────────────────────────────────────────────────────────────
+# This component is its own tailnet node with its own Tailscale SSH door, not a
+# service reachable only behind the host's (docs/decisions/000030). Two doors,
+# two identities: the tailnet ACL can grant reach to the dev-container without
+# granting reach to the host that operates it.
+#
+# State persists on a mounted volume, so a relaunch rejoins as the same node
+# rather than burning a fresh machine entry on every restart.
+if command -v tailscaled >/dev/null 2>&1; then
+    tailscaled --state=/var/lib/tailscale/tailscaled.state \
+               --socket=/run/tailscale/tailscaled.sock >/dev/null 2>&1 &
+    tailscaled_pid=$!
+    sleep 2
+
+    if tailscale --socket=/run/tailscale/tailscaled.sock status >/dev/null 2>&1; then
+        log "already joined the tailnet as ${TAILNET_HOSTNAME:-$HOSTNAME}"
+    elif [ -r "${PAIR_TSKEY_PATH:-/run/secrets/tailscale/authkey}" ]; then
+        if tailscale --socket=/run/tailscale/tailscaled.sock up \
+                --hostname="${TAILNET_HOSTNAME:-$HOSTNAME}" --ssh \
+                --authkey="$(cat "${PAIR_TSKEY_PATH:-/run/secrets/tailscale/authkey}")" >/dev/null 2>&1; then
+            log "joined the tailnet as ${TAILNET_HOSTNAME:-$HOSTNAME}, Tailscale SSH on"
+        else
+            log "tailnet join failed — the auth key may be expired; reachable on the public door meanwhile"
+        fi
+    else
+        log "no tailnet auth key mounted — this component is reachable on its public door only"
+    fi
+else
+    tailscaled_pid=""
+    log "tailscaled absent from this image — no tailnet door on this component"
 fi
 
 # ── The GitHub App token ─────────────────────────────────────────────────────
@@ -103,12 +151,13 @@ shutdown() {
     log "shutting down"
     kill "$refresher" 2>/dev/null || true
     [ -n "$sshd_pid" ] && kill "$sshd_pid" 2>/dev/null
+    [ -n "$tailscaled_pid" ] && kill "$tailscaled_pid" 2>/dev/null
     runuser -u core -- tmux kill-server 2>/dev/null || true
     exit 0
 }
 trap shutdown TERM INT
 
-log "ready — mosh or ssh to this component directly, or attach from the host"
+log "ready — ssh/mosh to this component directly on its published ports, over the tailnet, or attach from the host"
 
 # Hold the container up. `wait` rather than a sleep loop so the trap fires
 # promptly on the stop signal instead of after a timeout.

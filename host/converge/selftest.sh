@@ -180,6 +180,10 @@ fi
 
 # ── 6. No forbidden channel ──────────────────────────────────────────────────
 # The bylaw's own instances of C4's forbidden categories. Scoped to the code,
+# and word-boundaried on the fetch-pipe case: an earlier version matched the
+# `| sh` inside `| sha256sum` and reported a checksum verification as a
+# fetch-piped-to-shell. Second time a guard here fired on a substring — the
+# pattern-scan failure mode the constitution's preamble names.
 # because the deny list in managed-settings.json and the prose in docs/ name
 # these deliberately and naming a thing is not using it.
 head_ "provenance"
@@ -188,7 +192,7 @@ while IFS= read -r hit; do
     forbidden_hit=1
     printf '        %s\n' "$hit"
 done < <(git -C "$REPO_ROOT" grep -nIE \
-    '(dnf +copr|copr +enable|pip3? +install|pipx +install|npm +install +-g|npm +i +-g|cargo +install|go +install|gem +install|brew +install|flatpak +install|snap +install|curl[^|]*\| *(ba)?sh)' \
+    '(dnf +copr|copr +enable|pip3? +install|pipx +install|npm +install +-g|npm +i +-g|cargo +install|go +install|gem +install|brew +install|flatpak +install|snap +install|curl[^|]*\| *(ba)?sh([[:space:]]|$))' \
     -- 'host/**' 'dev-container/**' 'shared/**' \
        ':!shared/claudebox/managed-settings.json' 2>/dev/null)
 if [ "$forbidden_hit" = 0 ]; then
@@ -228,7 +232,8 @@ for env_file in "$REPO_ROOT"/host/converge/environments/*.env; do
         . "$env_file"
         out="$TESTROOT/render-$env_name.container"
         fs_render "$REPO_ROOT/host/sysroot/etc/containers/systemd/users/dev-container.container.tpl" \
-                  "$out" 0644 PAIR_NAME DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE >/dev/null 2>&1
+                  "$out" 0644 PAIR_NAME DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE \
+                  DEV_SSH_PORT DEV_MOSH_PORTS DEV_TAILNET_HOSTNAME TRUST_ROOT_USER >/dev/null 2>&1
         grep -q "ContainerName=${DEV_CONTAINER_NAME}$" "$out" || exit 1
         grep -q "Image=${DEV_CONTAINER_IMAGE}$" "$out" || exit 1
         grep -q '@@' "$out" && exit 1
@@ -248,7 +253,8 @@ for env_file in "$REPO_ROOT"/host/converge/environments/*.env; do
     for v in PAIR_NAME PAIR_TRACK DEV_CONTAINER_NAME DEV_CONTAINER_IMAGE \
              TRUST_ROOT_USER ADMIN_USER TAILNET_HOSTNAME VAULT_REPO \
              PAIR_STATE_DIR PAIR_SECRETS_DIR PAIR_ADMIN_STATE \
-             PAIR_DEV_SECRETS_DIR PAIR_WORK_DIR BIN_DIR UNIT_DIR; do
+             PAIR_DEV_SECRETS_DIR PAIR_WORK_DIR BIN_DIR UNIT_DIR \
+             DEV_SSH_PORT DEV_MOSH_PORTS DEV_TAILNET_HOSTNAME; do
         grep -qE "^${v}=" "$env_file" || missing="$missing $v"
     done
     if [ -z "$missing" ]; then

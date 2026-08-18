@@ -146,6 +146,43 @@ prov_l2_repo() {
     fi
 }
 
+# prov_l2_vendor_repo — admit the vendor's OWN .repo file, pinned by checksum.
+#
+# Stronger than authoring our own definition against the vendor's baseurl, and
+# adopted from the estate's own measured practice (docs/decisions/000031). Two
+# things it buys: the definition is the vendor's rather than our transcription
+# of it, and a changed upstream file stops the run instead of silently
+# redefining where packages come from — a swapped baseurl or gpgkey URL is
+# exactly the substitution a hand-written .repo cannot detect.
+#
+# Fail-closed on every path, cache hits included: on a checksum mismatch
+# nothing is written and nothing installs. Re-pin deliberately, after a live
+# re-check (C5), never by relaxing the comparison.
+#
+#   prov_l2_vendor_repo <id> <repo-file-url> <sha256>
+prov_l2_vendor_repo() {
+    local id="$1" url="$2" want="$3"
+    local repofile="/etc/yum.repos.d/${id}.repo"
+
+    local tmp; tmp=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp'" RETURN
+    curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$url" -o "$tmp" \
+        || log_die "L2 ${id}: vendor repository definition unreachable at ${url} — nothing installed"
+
+    local got; got=$(sha256sum "$tmp" | awk '"'"'{print $1}'"'"')
+    [ "$got" = "$want" ] \
+        || log_die "L2 ${id}: the vendor definition at ${url} has sha256 ${got}, not the pinned ${want}. Nothing installed. Re-verify upstream and re-pin deliberately (C5) — never relax this comparison."
+
+    if [ -f "$repofile" ] && cmp -s "$tmp" "$repofile"; then
+        log_ok "L2 ${id}: vendor repository definition current (sha256 pinned)"
+    else
+        install -m 0644 "$tmp" "$repofile"
+        log_changed "L2 ${id}: vendor repository definition admitted (sha256 ${want})"
+    fi
+    prov_disclose "repo:${id}" "L2" "$url" "vendor definition, sha256-pinned ${want}"
+}
+
 # prov_l2_install — install from a repository admitted by prov_l2_repo.
 prov_l2_install() {
     local repoid="$1" why="$2"; shift 2

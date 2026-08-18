@@ -162,6 +162,15 @@ else
     vault_get "$TSKEY_PATH" "$WORKDIR/tskey" || die "cannot read the tailnet auth key from the vault"
     chmod 600 "$WORKDIR/tskey"
     ok "tailnet auth key retrieved ($(basename "$TSKEY_PATH"))"
+    # The dev-container is its own tailnet node (docs/decisions/000030), so it
+    # needs the key too. Written where its Quadlet mounts it read-only; the
+    # container reads it once at join and its tailnet state persists after, so
+    # the key is not needed again.
+    install -d -m 0700 -o "$ADMIN_USER" -g "$ADMIN_USER" \
+        "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-tailscale"
+    install -m 0600 -o "$ADMIN_USER" -g "$ADMIN_USER" "$WORKDIR/tskey" \
+        "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-tailscale/authkey"
+    ok "tailnet auth key placed for ${DEV_CONTAINER_NAME}"
     join_interactive=0
 fi
 

@@ -10,20 +10,27 @@
 
 log_unit "tailnet"
 
-# L2: the vendor's own repository, both signature checks on. Tailscale signs
-# its metadata, so repo_gpgcheck is 1 rather than 0.
+# L2, admitted as the vendor's OWN definition pinned by checksum.
 #
-# The fingerprint is deliberately not pinned here, and that is a recorded gap
-# rather than an oversight: this repository's last verified position on
-# Tailscale is the donor's own .repo file (trail 2026-07-11), which pins no
-# fingerprint either, and inventing one would be worse than declaring none.
-# prov_l2_repo pins whatever key it first fetches to disk and verifies every
-# later fetch against it, so tampering after admission fails closed. Pin the
-# fingerprint here the first time a session with upstream reach can verify it.
-prov_l2_repo tailscale-stable "Tailscale stable" \
-    "https://pkgs.tailscale.com/stable/fedora/\$basearch" \
-    "https://pkgs.tailscale.com/stable/fedora/repo.gpg" \
-    1
+# PINNED VENDOR ASSET. The pin lives HERE and is bumped here only, after a live
+# re-check against upstream (C5):
+#   curl -fsSL https://pkgs.tailscale.com/stable/fedora/tailscale.repo | sha256sum
+#
+# This supersedes the hand-written definition this unit carried first, and it
+# closes most of the gap recorded in docs/decisions/000027: a transcribed .repo
+# cannot detect a changed upstream definition, while this stops the run on one.
+# The value is the estate's own, verified by fedora-dev and carried forward with
+# its provenance rather than re-derived from memory (docs/decisions/000031).
+#
+# It is not a signing-key fingerprint pin, and the disclosure says so. What it
+# guarantees is that the definition — its baseurl and its gpgkey URL — is the
+# vendor's own and unchanged since the pin. A substituted key served at that URL
+# is a narrower residual gap, still bounded by TLS and by gpgcheck on every
+# package fetch thereafter.
+TAILSCALE_REPO_URL=https://pkgs.tailscale.com/stable/fedora/tailscale.repo
+TAILSCALE_REPO_SHA256=87206259fb7032fb4147eabccf4ffdb0b4d850d0519ef4c6991cf8c4d100ac13
+
+prov_l2_vendor_repo tailscale-stable "$TAILSCALE_REPO_URL" "$TAILSCALE_REPO_SHA256"
 
 prov_l2_install tailscale-stable "the tailnet is the private network boundary (objective, Security 1)" \
     tailscale
