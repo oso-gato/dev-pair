@@ -101,7 +101,7 @@ fi
 # The trust root is public, so the keys land now rather than after the
 # authorization — which means a locked-out operator can already get back in by
 # SSH before this script has finished.
-install -D -m 0755 "$SRC/host/sysroot/usr/bin/pair-keys-sync" "$BIN_DIR/pair-keys-sync"
+install -D -m 0755 "$SRC/shared/bin/pair-keys-sync" "$BIN_DIR/pair-keys-sync"
 runuser -u "$ADMIN_USER" -- env "TRUST_ROOT_USER=$TRUST_ROOT_USER" "$BIN_DIR/pair-keys-sync" \
     || die "cannot authorize the maintainer's keys from the trust root"
 

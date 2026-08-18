@@ -28,6 +28,13 @@ FROM quay.io/fedora/fedora:44
 #                      component is the one that merges
 #   tmux               sessions survive disconnection because the session
 #                      lives here, not in the client
+#   openssh-server,    this component's own public door. The objective names
+#   mosh               hardened SSH/MOSH on BOTH components of every pair as
+#                      the only public doors, so reaching this container by way
+#                      of the host would leave one of the two unbuilt. mosh
+#                      bootstraps itself over that same sshd, so it inherits
+#                      the keys-only policy rather than adding a second one.
+#   curl               the trust-root key sync fetches over https
 #   podman, distrobox  this component runs its own claudebox (C8: an agent
 #                      present on the dev-container is present on its host)
 #   python3            the App-token minter parses JSON
@@ -38,6 +45,7 @@ FROM quay.io/fedora/fedora:44
 #   findutils, diffutils, tar, gzip, which
 RUN dnf -y --setopt=install_weak_deps=False install \
         git gh tmux \
+        openssh-server mosh curl \
         podman distrobox \
         python3 openssl \
         shadow-utils ca-certificates \
@@ -62,6 +70,7 @@ RUN chmod 0755 /usr/share/dev-pair/claudebox/claudebox-init.sh \
                /usr/share/dev-pair/claudebox/claudebox-rebuild \
                /usr/share/dev-pair/claudebox/claudebox-daily \
                /usr/bin/pair-gh-app-token \
+               /usr/bin/pair-keys-sync \
                /usr/bin/pair-session \
     && ln -sf /usr/share/dev-pair/claudebox/claude            /usr/local/bin/claude \
     && ln -sf /usr/share/dev-pair/claudebox/claudebox-rebuild /usr/local/bin/claudebox-rebuild \
@@ -70,9 +79,15 @@ RUN chmod 0755 /usr/share/dev-pair/claudebox/claudebox-init.sh \
 # ─── The session user ────────────────────────────────────────────────────────
 # Sessions do not run as root. `core` is the estate's administrative identity
 # on every host it operates (C7), and carrying the same name into the
-# dev-container keeps one name for one thing (C1).
+# dev-container keeps one name for one thing (C1). Logins land as `core`; the
+# container's own init runs as root so sshd can accept them and drop.
+#
+# That root is not privilege: this container is launched rootless, so container
+# root maps to the unprivileged host user that owns it. Least privilege is held
+# by the user namespace rather than by refusing an in-container uid (C6).
 RUN useradd --create-home --shell /bin/bash core \
     && install -d -m 0755 -o core -g core /work \
+    && install -d -m 0700 /etc/ssh/keys \
     && printf 'core:100000:65536\n' > /etc/subuid \
     && printf 'core:100000:65536\n' > /etc/subgid
 
@@ -80,7 +95,6 @@ RUN useradd --create-home --shell /bin/bash core \
 # relaunch loses no work and no transcript.
 VOLUME /work
 WORKDIR /work
-USER core
 
 ENV PAIR_APP_DIR=/run/secrets/github-app \
     PAIR_TOKEN_PATH=/run/dev-pair/gh-token \

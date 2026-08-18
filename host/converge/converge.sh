@@ -61,7 +61,7 @@ if [ -z "${CONVERGE_UNITS:-}" ]; then
 
     # The trust-root sync has to exist before the identity unit runs it, and it
     # is the one file installed ahead of the ordered units for that reason.
-    fs_install "$REPO_ROOT/host/sysroot/usr/bin/pair-keys-sync" "$BIN_DIR/pair-keys-sync" 0755
+    fs_install "$REPO_ROOT/shared/bin/pair-keys-sync" "$BIN_DIR/pair-keys-sync" 0755
     fs_render "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-keys-sync.service.tpl" \
               "$UNIT_DIR/pair-keys-sync.service" 0644 BIN_DIR ADMIN_USER TRUST_ROOT_USER
     fs_install "$REPO_ROOT/host/sysroot/usr/lib/systemd/system/pair-keys-sync.timer" \

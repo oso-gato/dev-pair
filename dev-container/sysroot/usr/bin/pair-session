@@ -1,25 +1,67 @@
 #!/usr/bin/env bash
-# pair-session — PID 1 of the dev-container, whichever lineage it serves.
+# pair-session — PID 1 of the dev-container.
 #
 # The container's whole purpose is that sessions outlive the client that
-# started them, so PID 1 is a supervisor rather than a shell: it holds the
-# container up, keeps the GitHub App token fresh, and lets sessions come and go
-# underneath it. A dropped connection reaches no further than the tmux client.
+# started them, so PID 1 is a supervisor rather than a shell: it opens this
+# component's own public door, keeps the GitHub App token fresh, and lets
+# sessions come and go underneath it.
 #
-# Sessions attach with `podman exec ... tmux new-session -A -s <name>`, which is
-# what the host's enter command does. Multi-tenancy is by named session, and
-# isolation is by scope rather than by identity — no session reads or touches
-# another's work, because each is entered against its own declared repository
-# set under /work.
+# This component has its own door rather than sitting behind the host's. The
+# objective's Security outcome 1 names hardened SSH/MOSH on BOTH components of
+# every pair as the only public doors, so reaching this container by way of the
+# host would leave one of the two the objective requires unbuilt.
+#
+# Multi-tenancy is by named tmux session, and isolation is by scope rather than
+# by identity — no session reads or touches another's work, because each is
+# entered against its own declared repository set under /work.
 set -uo pipefail
 
 TOKEN_REFRESH_SECONDS=${TOKEN_REFRESH_SECONDS:-3000}   # ~50 min; tokens live ~1 h
+KEYS_REFRESH_SECONDS=${KEYS_REFRESH_SECONDS:-86400}    # daily, like the host's timer
+KEYDIR=/etc/ssh/keys
 
 log() { printf '[%s] %s\n' "${DEV_CONTAINER_NAME:-dev-container}" "$*"; }
 
-# Durable work lives on the mounted volume, so this is the one directory that
-# has to exist before anything else runs.
-mkdir -p /work "$HOME/.local/state/claudebox" 2>/dev/null || true
+mkdir -p /work "$KEYDIR" /run/dev-pair 2>/dev/null || true
+
+# ── The public door ──────────────────────────────────────────────────────────
+# Host keys live on a mounted volume rather than in the image. An image-baked
+# key would be identical on every pair running this image — the shared-credential
+# case C6 forbids — and a key regenerated per start would trip every client's
+# host-key check on each relaunch, training you to type "yes" to a changed key.
+for type in ed25519 rsa; do
+    if [ ! -s "$KEYDIR/ssh_host_${type}_key" ]; then
+        ssh-keygen -q -t "$type" -N '' -f "$KEYDIR/ssh_host_${type}_key" \
+            && log "generated a persistent ${type} host key"
+    fi
+done
+chmod 0600 "$KEYDIR"/ssh_host_*_key 2>/dev/null || true
+
+# Who may come through it. The maintainer's published key set is the single
+# trust root (C6); rotating a key there closes this door too, on the next tick.
+sync_keys() {
+    if runuser -u core -- env "TRUST_ROOT_USER=${TRUST_ROOT_USER:-oso-gato}" \
+            /usr/bin/pair-keys-sync >/dev/null 2>&1; then
+        log "authorized_keys synced from the trust root"
+    else
+        log "trust-root sync did not complete; existing keys left untouched"
+    fi
+}
+sync_keys
+
+if [ ! -s /var/home/core/.ssh/authorized_keys ] && [ ! -s /home/core/.ssh/authorized_keys ]; then
+    log "WARNING: no authorized key for core — the public door will refuse every login"
+fi
+
+if /usr/sbin/sshd -t 2>/dev/null; then
+    /usr/sbin/sshd -D -e &
+    sshd_pid=$!
+    log "sshd listening on 2222; mosh bootstraps over it and inherits keys-only"
+else
+    sshd_pid=""
+    log "ERROR: sshd configuration does not parse — no public door on this component"
+    /usr/sbin/sshd -t
+fi
 
 # ── The GitHub App token ─────────────────────────────────────────────────────
 # This component mints its OWN token from its OWN App — the one that carries
@@ -35,34 +77,42 @@ mint() {
         fi
     fi
 }
-
 mint
+
 (
+    elapsed=0
     while :; do
         sleep "$TOKEN_REFRESH_SECONDS"
         mint
+        elapsed=$((elapsed + TOKEN_REFRESH_SECONDS))
+        if [ "$elapsed" -ge "$KEYS_REFRESH_SECONDS" ]; then
+            sync_keys
+            elapsed=0
+        fi
     done
 ) &
 refresher=$!
 
 # ── The tmux server ──────────────────────────────────────────────────────────
-# Start it up front so the first `podman exec` attach is instant and so a
-# session's death never takes the server, and the container, down with it.
-tmux start-server 2>/dev/null || log "tmux server did not start; sessions will start it on demand"
+# Start it up front so the first login attaches instantly and so one session's
+# death never takes the server, and the container, down with it.
+runuser -u core -- tmux start-server 2>/dev/null \
+    || log "tmux server did not start; sessions will start it on demand"
 
 shutdown() {
     log "shutting down"
     kill "$refresher" 2>/dev/null || true
-    tmux kill-server 2>/dev/null || true
+    [ -n "$sshd_pid" ] && kill "$sshd_pid" 2>/dev/null
+    runuser -u core -- tmux kill-server 2>/dev/null || true
     exit 0
 }
 trap shutdown TERM INT
 
-log "ready — attach with: ${DEV_CONTAINER_NAME:-the dev-container} [session-name]"
+log "ready — mosh or ssh to this component directly, or attach from the host"
 
-# Hold the container up. `wait` rather than `sleep infinity` so the trap fires
+# Hold the container up. `wait` rather than a sleep loop so the trap fires
 # promptly on the stop signal instead of after a timeout.
 while :; do
-    wait "$refresher" 2>/dev/null || true
+    wait -n 2>/dev/null || true
     sleep 5
 done
