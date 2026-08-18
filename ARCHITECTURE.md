@@ -28,6 +28,8 @@ The component tree exists in all three parts. Nothing here has been applied to a
 
 The host's own record is `/var/lib/dev-pair/provenance.tsv`, written at apply time. What the repository declares: everything on the host is L1 from Fedora's own repositories except `tailscale`, which is L2 admitted as the vendor's own `.repo` file pinned by sha256 and verified fail-closed, and `claude-code`, which is L2 inside the agent box only and never on a component. There is no L3 artifact anywhere; `prov_l3_fetch` exists so the first one that needs it cannot be admitted without a checksum.
 
+There is one L2 admission mechanism in the converger and it takes the vendor's own definition: `prov_l2_vendor_repo`. Where a vendor publishes no such file, as with `claude-code`, the definition is written here and its `gpgkey` must name a local file installed only after the signing key matched a pinned fingerprint — `shared/claudebox/claudebox-agent-repo.sh` is the one instance, and it is the only place that fingerprint lives. A remote `gpgkey` anywhere under `host/`, `dev-container/` or `shared/` fails the self-test, because `dnf -y` imports one unchecked. The open residue is that the claude-code definition is this repository's transcription rather than Anthropic's file, so a substituted baseurl would not be detected; the first session that can reach `downloads.claude.ai` closes it or records that no vendor file exists (docs/decisions/000032).
+
 One narrower gap remains and is recorded: the checksum pins the vendor's definition, not its signing key, so a key substituted at the pinned URL is still possible — bounded by TLS and by `gpgcheck` on every package fetch thereafter (docs/decisions/000031).
 
 ## Documentation assets (per universal C1's docs/ valve)

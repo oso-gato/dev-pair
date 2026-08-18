@@ -22,6 +22,12 @@ fs_install "$REPO_ROOT/shared/claudebox/managed-settings.json" \
            /usr/share/dev-pair/claudebox/managed-settings.json 0644
 fs_install "$REPO_ROOT/shared/claudebox/claudebox-init.sh" \
            /usr/share/dev-pair/claudebox/claudebox-init.sh 0755
+# Piped into the box by claudebox-init.sh and run there, so it needs no execute
+# bit here — but it does need to be present, and this list is the one place on
+# the host where a shared box file can go missing. The self-test holds the list
+# against the directory for exactly that reason.
+fs_install "$REPO_ROOT/shared/claudebox/claudebox-agent-repo.sh" \
+           /usr/share/dev-pair/claudebox/claudebox-agent-repo.sh 0644
 
 # The operator commands, shared with the dev-container for the same reason the
 # manifest is: both components run a box and drive it the same way.

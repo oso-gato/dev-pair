@@ -8,8 +8,9 @@
 #
 # The ladder, as this repository instantiates it (00-BYLAW.md):
 #   L1  Fedora's own dnf repositories.
-#   L2  the vendor's own dnf .repo, gpgcheck=1, repo_gpgcheck=1 where the
-#       vendor signs its metadata.
+#   L2  the vendor's OWN dnf .repo file, fetched and pinned by checksum. Not
+#       a definition we compose against the vendor's baseurl: the point is
+#       that the vendor's file is the thing verified.
 #   L3  an official-upstream binary, graded and disclosed. Nothing on erebus
 #       needs L3, and prov_l3_fetch exists so that if something ever does, it
 #       cannot be admitted without a checksum.
@@ -95,67 +96,22 @@ prov_l1_install() {
 }
 
 # ── L2 ───────────────────────────────────────────────────────────────────────
-# A vendor's own dnf repository. The signing key is fetched over TLS and, when
-# a fingerprint is declared, pinned to it before anything is installed — so a
-# substituted key fails the run rather than being auto-imported by `dnf -y`.
+# A vendor's own dnf repository, and only ever the vendor's own definition of
+# it. There is one function for this and it is prov_l2_vendor_repo below.
 #
-# An undeclared fingerprint is a real gap and says so in the disclosure rather
-# than passing silently. It is still fail-closed against tampering after first
-# import, because gpgcheck and repo_gpgcheck verify every later fetch against
-# the key that was pinned on disk.
+# This section used to carry a second function, prov_l2_repo, which composed a
+# repository definition from arguments — an id, a name, a baseurl, a key URL —
+# and wrote our transcription of the vendor's file rather than the file. That
+# is the weaker mechanism, and C4 asks for one fetch mechanism per system at
+# one strength precisely so the weaker one is not available to reach for. It
+# was also unreachable in practice: nothing on either lineage ever called it.
+# A transcription cannot detect a substituted baseurl or a moved gpgkey URL,
+# because the transcription is the thing being compared against. So it is
+# gone, and its absence is what the self-test guards.
 #
-#   prov_l2_repo <id> <name> <baseurl> <gpgkey-url> <repo_gpgcheck 0|1> [fpr]
-prov_l2_repo() {
-    local id="$1" name="$2" baseurl="$3" keyurl="$4" repo_gpgcheck="$5" want_fpr="${6:-}"
-    local keyring="/etc/pki/rpm-gpg/RPM-GPG-KEY-${id}"
-    local repofile="/etc/yum.repos.d/${id}.repo"
-
-    # Fetch and pin the key before the repository can be used for anything.
-    if [ ! -s "$keyring" ]; then
-        local tmpkey; tmpkey=$(mktemp)
-        # shellcheck disable=SC2064
-        trap "rm -f '$tmpkey'" RETURN
-        curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$keyurl" -o "$tmpkey" \
-            || log_die "L2 ${id}: signing key unreachable at ${keyurl} — nothing installed"
-        [ -s "$tmpkey" ] || log_die "L2 ${id}: signing key empty — nothing installed"
-
-        if [ -n "$want_fpr" ]; then
-            local got
-            got=$(gpg --show-keys --with-colons "$tmpkey" 2>/dev/null \
-                  | awk -F: '$1=="fpr"{print $10; exit}')
-            local want_norm; want_norm=$(printf '%s' "$want_fpr" | tr -d ' ' | tr '[:lower:]' '[:upper:]')
-            [ -n "$got" ] || log_die "L2 ${id}: signing key unreadable — nothing installed"
-            [ "$got" = "$want_norm" ] \
-                || log_die "L2 ${id}: key fingerprint ${got} does not match the pinned ${want_norm} — nothing installed"
-        fi
-
-        install -D -m 0644 "$tmpkey" "$keyring"
-        rpm --import "$keyring" || log_die "L2 ${id}: rpm refused the signing key — nothing installed"
-        log_changed "L2 ${id}: signing key pinned at ${keyring}"
-    else
-        log_ok "L2 ${id}: signing key already pinned"
-    fi
-
-    # Write the repository against the pinned local key, never the remote URL,
-    # so later fetches verify against what was checked here.
-    local desired
-    desired=$(printf '[%s]\nname=%s\nbaseurl=%s\nenabled=1\ntype=rpm\ngpgcheck=1\nrepo_gpgcheck=%s\ngpgkey=file://%s\n' \
-              "$id" "$name" "$baseurl" "$repo_gpgcheck" "$keyring")
-    if [ -f "$repofile" ] && [ "$(cat "$repofile")" = "$desired" ]; then
-        log_ok "L2 ${id}: repository definition current"
-    else
-        printf '%s' "$desired" > "$repofile"
-        chmod 0644 "$repofile"
-        log_changed "L2 ${id}: repository definition written"
-    fi
-
-    if [ -n "$want_fpr" ]; then
-        prov_disclose "repo:${id}" "L2" "$baseurl" "key pinned to ${want_fpr}"
-    else
-        prov_disclose "repo:${id}" "L2" "$baseurl" "gpgcheck=1 repo_gpgcheck=${repo_gpgcheck}; FINGERPRINT NOT PINNED"
-        log_warn "L2 ${id}: no fingerprint declared — pin one when a session can verify it upstream"
-    fi
-}
+# When a vendor publishes no .repo file of its own, that is a new case to be
+# graded against a real vendor at the time it arrives, not scaffolding kept
+# warm against a need nobody has yet had.
 
 # prov_l2_vendor_repo — admit the vendor's OWN .repo file, pinned by checksum.
 #
@@ -194,7 +150,7 @@ prov_l2_vendor_repo() {
     prov_disclose "repo:${id}" "L2" "$url" "vendor definition, sha256-pinned ${want}"
 }
 
-# prov_l2_install — install from a repository admitted by prov_l2_repo.
+# prov_l2_install — install from a repository admitted by prov_l2_vendor_repo.
 prov_l2_install() {
     local repoid="$1" why="$2"; shift 2
     local missing=() p

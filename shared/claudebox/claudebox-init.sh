@@ -6,7 +6,9 @@
 # quotes and redirections detonate there. Everything here goes over the
 # quote-safe `distrobox enter -- sudo` channel instead.
 #
-# Three bridges, in order:
+# The agent's own installation comes first, then three bridges:
+#   0. the agent itself, from Anthropic's repository, admitted only after its
+#      signing key matches a pinned fingerprint;
 #   1. the host's rootless podman socket, so in-box podman drives the
 #      component's own containers rather than a nested runtime;
 #   2. the managed settings, read-only to the in-box user;
@@ -22,6 +24,18 @@ SRC="${CLAUDEBOX_SHARE:-/usr/share/dev-pair/claudebox}"
 TOKEN_PATH="${PAIR_TOKEN_PATH:-/run/dev-pair/gh-token}"
 
 [ -d "$SRC" ] || { echo "claudebox-init: $SRC not found" >&2; exit 1; }
+
+# ── (0) The agent itself ─────────────────────────────────────────────────────
+# This used to be a distrobox.ini pre_init hook whose repository definition
+# named a REMOTE gpgkey, which `dnf -y` auto-imports — so the fingerprint in
+# the manifest was a comment rather than a control. The work moved here, where
+# a comparison can be written, and the script is piped in over the same
+# stdin channel the managed settings use. A key that does not match the pin
+# stops the box build rather than producing a box that looks finished.
+distrobox enter "$BOX" -- sudo sh -c 'cat > /tmp/claudebox-agent-repo.sh' \
+    < "$SRC/claudebox-agent-repo.sh"
+distrobox enter "$BOX" -- sudo sh /tmp/claudebox-agent-repo.sh
+distrobox enter "$BOX" -- sudo rm -f /tmp/claudebox-agent-repo.sh
 
 # ── (1) Host podman bridge ───────────────────────────────────────────────────
 # The box's /run/user/<uid> IS the host's, bind-mounted by distrobox with
@@ -60,4 +74,4 @@ unset _t
 EOF
 distrobox enter "$BOX" -- sudo chmod 0644 /etc/profile.d/dev-pair-gh-token.sh
 
-echo "claudebox-init: podman bridge, managed settings and GitHub App token applied."
+echo "claudebox-init: agent installed, podman bridge, managed settings and GitHub App token applied."

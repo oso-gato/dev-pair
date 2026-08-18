@@ -208,6 +208,27 @@ else
     fail "the dev-container publishes to container port [${_published}] but its sshd listens on [${_listening}] — the public door opens onto nothing"
 fi
 
+# ── 4c. Every shared box file reaches both components ────────────────────────
+# The dev-container image copies shared/claudebox/ wholesale; the host unit
+# names each file. That asymmetry means a file added to the directory arrives
+# in the container and is silently absent on the host, where claudebox-init.sh
+# would then fail mid-rebuild on a path that exists everywhere it was tested.
+# It happened the first time a file was added. Bounded and closed, so it is a
+# check rather than a paragraph.
+head_ "shared box"
+missing_shared=0
+for f in "$REPO_ROOT"/shared/claudebox/*; do
+    base=$(basename "$f")
+    grep -q "shared/claudebox/${base}" "$REPO_ROOT/host/converge/units/60-agentbox.sh" && continue
+    printf '        %s is not installed by 60-agentbox.sh\n' "$base"
+    missing_shared=1
+done
+if [ "$missing_shared" = 0 ]; then
+    pass "every file in shared/claudebox/ is installed on the host as well as in the image"
+else
+    fail "a shared box file reaches the dev-container image but never the host"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
@@ -246,6 +267,54 @@ if [ "$forbidden_hit" = 0 ]; then
     pass "no forbidden channel in host/, dev-container/ or shared/"
 else
     fail "a forbidden channel appears in the code"
+fi
+
+# Every repository definition verifies against a key that was checked.
+#
+# C4 asks for one fetch mechanism per system at one strength. At L2 the
+# strongest available form is prov_l2_vendor_repo: fetch the VENDOR'S own .repo
+# file and pin the whole file by checksum, so a moved baseurl or a swapped
+# gpgkey URL stops the run. Where a vendor publishes no such file, a definition
+# written here is the only option left — and then the load-bearing property is
+# that its gpgkey names a LOCAL file installed after a fingerprint check, never
+# a remote URL. A remote gpgkey under `dnf -y` auto-imports whatever is served
+# at that moment, which makes any fingerprint recorded nearby a decoration.
+#
+# Both failures were live in this tree when this check was written: the
+# converger carried an unused prov_l2_repo that composed definitions, and the
+# claudebox manifest wrote a definition with a remote gpgkey under a comment
+# stating the fingerprint it never enforced. This check is why they are gone.
+remote_key_hit=0
+while IFS= read -r hit; do
+    remote_key_hit=1
+    printf '        %s\n' "$hit"
+done < <(git -C "$REPO_ROOT" grep -nIE 'gpgkey=(https?|ftp)://' \
+    -- 'host/**' 'dev-container/**' 'shared/**' \
+       ':!host/converge/selftest.sh' 2>/dev/null)
+if [ "$remote_key_hit" = 0 ]; then
+    pass "no repository definition trusts a remote signing key"
+else
+    fail "a repository definition names a remote gpgkey, which dnf -y imports unchecked"
+fi
+
+# The converger's own L2 path admits vendor files and nothing weaker. Scoped to
+# the fetch contract, where the vendor-file rule is the stated contract: a
+# definition composed inside provenance.sh would be prov_l2_repo returning.
+if git -C "$REPO_ROOT" grep -qIE '(baseurl|gpgkey)=' -- 'host/converge/lib/**' 2>/dev/null; then
+    fail "the fetch contract composes a repository definition rather than admitting the vendor's own"
+else
+    pass "the fetch contract admits the vendor's own definition, pinned by checksum"
+fi
+
+# Both patterns must be able to see the thing they forbid. Reproduce each on a
+# copy outside the scanned tree and require the pattern to match, so a green
+# result above means absence rather than a pattern that matches nothing.
+COMPOSED="$TESTROOT/composed.repo"
+printf '[vendor]\nbaseurl=https://example.invalid/rpm\ngpgkey=https://example.invalid/key.asc\n' > "$COMPOSED"
+if grep -qE 'gpgkey=(https?|ftp)://' "$COMPOSED" && grep -qE '(baseurl|gpgkey)=' "$COMPOSED"; then
+    pass "both repository patterns match a definition of the kind they forbid, so the checks above can fail"
+else
+    fail "a repository pattern did not match the definition it exists to catch — the checks above prove nothing"
 fi
 
 # Every dnf install in the tree carries the minimalism flag.
