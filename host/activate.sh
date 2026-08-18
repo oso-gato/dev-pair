@@ -126,10 +126,58 @@ ok "authorized"
 say "phase 2: credentials from the vault"
 
 vault_get() {
-    local path="$1" dest="$2"
-    gh api "repos/${VAULT_REPO}/contents/${path}" \
-        -H "Accept: application/vnd.github.raw" > "$dest" 2>/dev/null || return 1
-    [ -s "$dest" ] || return 1
+    # Fetch a vault file's raw bytes to a destination path, never to stdout.
+    #
+    # Staged INSIDE the destination directory and renamed into place. Never
+    # written onto the destination, and never staged in $WORKDIR. Both rules
+    # were learned rather than reasoned. A redirection onto the destination
+    # truncates the incumbent before the fetch has run, so a network blip on a
+    # re-run destroyed a working App key and left a zero-byte file that later
+    # units reported as present. And a rename across filesystems carries the
+    # source's SELinux label, which is why the estate's key sync renames within
+    # ~/.ssh rather than in from /tmp.
+    #
+    # The optional validator is handed the staged file and decides whether it
+    # may land. Exit status alone does not decide it: gh writes error bodies to
+    # stdout, so a 404 page arrives non-empty, and a path that resolves to a
+    # directory arrives as a JSON array with status 0.
+    #
+    # On any failure the incumbent is untouched and vault_why carries the
+    # reason, so a caller can say what went wrong instead of guessing.
+    local path="$1" dest="$2" validate="${3:-}"
+    local tmp="${dest}.new" err rc=0
+    vault_why=""
+
+    install -m 0600 /dev/null "$tmp" 2>/dev/null \
+        || { vault_why="cannot stage a file beside ${dest}"; return 1; }
+
+    # stderr to the capture, stdout to the file — the order of the two
+    # redirections is what separates them.
+    err=$(gh api "repos/${VAULT_REPO}/contents/${path}" \
+              -H "Accept: application/vnd.github.raw" 2>&1 >"$tmp") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"; vault_why="${err:-gh reported no reason}"; return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; vault_why="the vault returned an empty file"; return 1
+    fi
+    if [ -n "$validate" ] && ! "$validate" "$tmp"; then
+        rm -f "$tmp"; vault_why="the bytes returned for ${path} are not what it should hold"; return 1
+    fi
+    mv -f "$tmp" "$dest" \
+        || { rm -f "$tmp"; vault_why="cannot place the fetched file at ${dest}"; return 1; }
+}
+
+# Validators. The PEM one asserts positively, because openssl can prove it. The
+# other only refuses what a failed fetch looks like — a JSON error body or a
+# directory listing — rather than asserting a format no session has verified.
+vault_is_pem() {
+    grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$1" 2>/dev/null \
+        && openssl pkey -in "$1" -noout 2>/dev/null
+}
+
+vault_not_json() {
+    ! head -c 1 "$1" 2>/dev/null | grep -q '[{[]'
 }
 
 # No password is set here. On this track the sudo hash is baked at image build
@@ -159,7 +207,8 @@ if [ -z "$TSKEY_PATH" ]; then
     warn "no unexpired tailnet auth key in the vault — falling back to browser authentication"
     join_interactive=1
 else
-    vault_get "$TSKEY_PATH" "$WORKDIR/tskey" || die "cannot read the tailnet auth key from the vault"
+    vault_get "$TSKEY_PATH" "$WORKDIR/tskey" vault_not_json \
+        || die "cannot read the tailnet auth key from the vault — ${vault_why}"
     chmod 600 "$WORKDIR/tskey"
     ok "tailnet auth key retrieved ($(basename "$TSKEY_PATH"))"
     # The dev-container is its own tailnet node (docs/decisions/000030), so it
@@ -192,11 +241,13 @@ install_app() {
         return 0
     fi
     install -d -m 0700 -o "${owner%%:*}" -g "${owner##*:}" "$dir"
-    vault_get "$vault_key" "$dir/private-key.pem" \
-        || { warn "${label}: no App key in the vault — no GitHub authority for it yet"; return 0; }
-    # Validate by exit code alone: the key's contents never reach a terminal.
-    openssl pkey -in "$dir/private-key.pem" -noout 2>/dev/null \
-        || { rm -f "$dir/private-key.pem"; die "${label}'s App key is not a valid private key"; }
+    # Tolerant here and fatal on the VPS track, and the difference is a fact
+    # rather than an accident: this pair's Apps are not created yet, so a
+    # missing key is the expected state until the maintainer creates them.
+    # Validated before it lands either way, so a failed fetch never replaces a
+    # working key.
+    vault_get "$vault_key" "$dir/private-key.pem" vault_is_pem \
+        || { warn "${label}: no usable App key in the vault — no GitHub authority for it yet (${vault_why})"; return 0; }
     printf '%s\n' "$app_id"  > "$dir/app-id"
     printf '%s\n' "$inst_id" > "$dir/installation-id"
     chmod 0600 "$dir"/*

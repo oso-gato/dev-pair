@@ -147,11 +147,57 @@ say "phase 2: identity from the vault"
 
 vault_get() {
     # Fetch a vault file's raw bytes to a destination path, never to stdout.
-    local path="$1" dest="$2"
-    gh api "repos/${VAULT_REPO}/contents/${path}" \
-        -H "Accept: application/vnd.github.raw" > "$dest" 2>/dev/null \
-        || return 1
-    [ -s "$dest" ] || return 1
+    #
+    # Staged INSIDE the destination directory and renamed into place. Never
+    # written onto the destination, and never staged in $WORKDIR. Both rules
+    # were learned rather than reasoned. A redirection onto the destination
+    # truncates the incumbent before the fetch has run, so a network blip on a
+    # re-run destroyed a working App key and left a zero-byte file that later
+    # units reported as present. And a rename across filesystems carries the
+    # source's SELinux label, which is why the estate's key sync renames within
+    # ~/.ssh rather than in from /tmp.
+    #
+    # The optional validator is handed the staged file and decides whether it
+    # may land. Exit status alone does not decide it: gh writes error bodies to
+    # stdout, so a 404 page arrives non-empty, and a path that resolves to a
+    # directory arrives as a JSON array with status 0.
+    #
+    # On any failure the incumbent is untouched and vault_why carries the
+    # reason, so a caller can say what went wrong instead of guessing.
+    local path="$1" dest="$2" validate="${3:-}"
+    local tmp="${dest}.new" err rc=0
+    vault_why=""
+
+    install -m 0600 /dev/null "$tmp" 2>/dev/null \
+        || { vault_why="cannot stage a file beside ${dest}"; return 1; }
+
+    # stderr to the capture, stdout to the file — the order of the two
+    # redirections is what separates them.
+    err=$(gh api "repos/${VAULT_REPO}/contents/${path}" \
+              -H "Accept: application/vnd.github.raw" 2>&1 >"$tmp") || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        rm -f "$tmp"; vault_why="${err:-gh reported no reason}"; return 1
+    fi
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"; vault_why="the vault returned an empty file"; return 1
+    fi
+    if [ -n "$validate" ] && ! "$validate" "$tmp"; then
+        rm -f "$tmp"; vault_why="the bytes returned for ${path} are not what it should hold"; return 1
+    fi
+    mv -f "$tmp" "$dest" \
+        || { rm -f "$tmp"; vault_why="cannot place the fetched file at ${dest}"; return 1; }
+}
+
+# Validators. The PEM one asserts positively, because openssl can prove it. The
+# other only refuses what a failed fetch looks like — a JSON error body or a
+# directory listing — rather than asserting a format no session has verified.
+vault_is_pem() {
+    grep -q -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$1" 2>/dev/null \
+        && openssl pkey -in "$1" -noout 2>/dev/null
+}
+
+vault_not_json() {
+    ! head -c 1 "$1" 2>/dev/null | grep -q '[{[]'
 }
 
 # ── The administrative password ──────────────────────────────────────────────
@@ -159,8 +205,8 @@ vault_get() {
 # something a public repository may carry, so it comes from the vault like the
 # rest. It gates sudo and nothing else: no password authenticates a remote
 # shell anywhere in the platform.
-vault_get "$VAULT_CORE_DECLARATION" "$WORKDIR/core-user.md" \
-    || die "cannot read the core declaration from the vault"
+vault_get "$VAULT_CORE_DECLARATION" "$WORKDIR/core-user.md" vault_not_json \
+    || die "cannot read the core declaration from the vault — ${vault_why}"
 
 CORE_HASH=$(python3 - "$WORKDIR/core-user.md" <<'PY'
 import re, sys
@@ -203,7 +249,8 @@ if [ -z "$TSKEY_PATH" ]; then
     warn "no unexpired tailnet auth key in the vault — falling back to browser authentication"
     tailscale_join_interactive=1
 else
-    vault_get "$TSKEY_PATH" "$WORKDIR/tskey" || die "cannot read the tailnet auth key from the vault"
+    vault_get "$TSKEY_PATH" "$WORKDIR/tskey" vault_not_json \
+        || die "cannot read the tailnet auth key from the vault — ${vault_why}"
     chmod 600 "$WORKDIR/tskey"
     ok "tailnet auth key retrieved ($(basename "$TSKEY_PATH"))"
     # The dev-container is its own tailnet node (docs/decisions/000030), so it
@@ -230,10 +277,11 @@ install -d -m 0700 -o "$ADMIN_USER" -g "$ADMIN_USER" "$PAIR_DEV_SECRETS_DIR"
 install_app() {
     local vault_key="$1" dir="$2" app_id="$3" inst_id="$4" owner="$5" label="$6"
     install -d -m 0700 -o "${owner%%:*}" -g "${owner##*:}" "$dir"
-    vault_get "$vault_key" "$dir/private-key.pem" || { warn "cannot read ${label}'s App key from the vault — that component will have no GitHub authority"; return 1; }
-    # Validate by exit code alone: the key's contents never reach a terminal.
-    openssl pkey -in "$dir/private-key.pem" -noout 2>/dev/null \
-        || { rm -f "$dir/private-key.pem"; die "${label}'s App key is not a valid private key"; }
+    # Validated before it lands, so a failed or wrong fetch never replaces a
+    # working key. The key's contents never reach a terminal — the validator
+    # decides by exit code alone.
+    vault_get "$vault_key" "$dir/private-key.pem" vault_is_pem \
+        || die "cannot install ${label}'s App key — ${vault_why}"
     printf '%s\n' "$app_id"  > "$dir/app-id"
     printf '%s\n' "$inst_id" > "$dir/installation-id"
     chmod 0600 "$dir"/*
@@ -241,10 +289,16 @@ install_app() {
     ok "${label} App identity installed (App ${app_id})"
 }
 
+# Fatal on this track, deliberately, and unlike the bare-metal one. Both of
+# erebus's Apps exist and are declared in the adapter, so a failed fetch means
+# something is actually wrong — the wrong account authorized, a moved vault
+# path, a network fault — and continuing would hand back a host that looks
+# converged and holds no GitHub identity. Day zero is re-runnable, so stopping
+# here costs a re-run and buys the end of green-while-broken.
 install_app "$VAULT_HOST_APP_KEY" "$PAIR_SECRETS_DIR/github-app" \
-    "$HOST_APP_ID" "$HOST_APP_INSTALLATION_ID" "root:root" "host" || true
+    "$HOST_APP_ID" "$HOST_APP_INSTALLATION_ID" "root:root" "host"
 install_app "$VAULT_DEV_APP_KEY" "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-github-app" \
-    "$DEV_APP_ID" "$DEV_APP_INSTALLATION_ID" "${ADMIN_USER}:${ADMIN_USER}" "$DEV_CONTAINER_NAME" || true
+    "$DEV_APP_ID" "$DEV_APP_INSTALLATION_ID" "${ADMIN_USER}:${ADMIN_USER}" "$DEV_CONTAINER_NAME"
 
 # The authorization has done its whole job. Destroy the token now rather than
 # at exit, so it does not outlive its purpose by the length of a converge run.

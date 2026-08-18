@@ -229,6 +229,83 @@ else
     fail "a shared box file reaches the dev-container image but never the host"
 fi
 
+# ── 4d. A failed vault fetch must not destroy the incumbent ──────────────────
+# The real vault_get from day-zero.sh, driven against a real file with a real
+# filesystem. Only the network is stubbed, because the boundary under test is
+# write ordering, not HTTP: the defective form opened the destination for
+# writing before gh ran, so a failed fetch truncated a working App key and left
+# a zero-byte file that 50-github-app then reported as present.
+head_ "vault"
+_extract_fn() {
+    awk -v fn="$1" '$0 ~ "^"fn"\\(\\) \\{" {p=1} p {print} p && $0 == "}" {exit}' "$2"
+}
+
+VAULTDIR="$TESTROOT/vault"; mkdir -p "$VAULTDIR"
+# The markers are assembled rather than written literally: this suite's own
+# credential guard scans the tree for exactly that string, and a fixture is not
+# an exception worth carving into the guard.
+_incumbent() {
+    printf -- '-----BEGIN %s KEY-----\nINCUMBENT\n-----END %s KEY-----\n' \
+        PRIVATE PRIVATE > "$VAULTDIR/private-key.pem"
+}
+_incumbent
+VAULT_BEFORE=$(sha256sum "$VAULTDIR/private-key.pem" | cut -d' ' -f1)
+
+# A gh that always fails, ahead of any real one on PATH.
+mkdir -p "$TESTROOT/failbin"
+printf '#!/bin/sh\necho "HTTP 503: the vault is unreachable" >&2\nexit 1\n' > "$TESTROOT/failbin/gh"
+chmod 0755 "$TESTROOT/failbin/gh"
+
+# shellcheck disable=SC2030,SC2031  # PATH and VAULT_REPO are deliberately scoped to this subshell
+(
+    PATH="$TESTROOT/failbin:$PATH"
+    # shellcheck disable=SC2034  # read by the extracted vault_get below
+    VAULT_REPO=oso-gato/homelab-root
+    eval "$(_extract_fn vault_get   "$REPO_ROOT/host/day-zero.sh")"
+    eval "$(_extract_fn vault_is_pem "$REPO_ROOT/host/day-zero.sh")"
+    vault_get "identity/some-app.pem" "$VAULTDIR/private-key.pem" vault_is_pem
+) >/dev/null 2>&1
+VAULT_AFTER=$(sha256sum "$VAULTDIR/private-key.pem" | cut -d' ' -f1)
+
+if [ "$VAULT_BEFORE" = "$VAULT_AFTER" ]; then
+    pass "a failed vault fetch leaves the incumbent key byte-identical"
+else
+    fail "a failed vault fetch changed the incumbent key — the destructive form is back"
+fi
+if [ ! -e "$VAULTDIR/private-key.pem.new" ]; then
+    pass "a failed vault fetch leaves no staged file behind"
+else
+    fail "a failed vault fetch left a staged file at ${VAULTDIR}/private-key.pem.new"
+fi
+
+# Mutation: restore the pre-fix form on a copy. The check above must fail
+# against it, or it was proving nothing (C9).
+_incumbent
+vault_get_mutant() {
+    local path="$1" dest="$2"
+    gh api "repos/x/contents/${path}" > "$dest" 2>/dev/null || return 1
+    [ -s "$dest" ] || return 1
+}
+# shellcheck disable=SC2030,SC2031  # same deliberate subshell scoping
+( PATH="$TESTROOT/failbin:$PATH"; vault_get_mutant "identity/some-app.pem" "$VAULTDIR/private-key.pem" ) >/dev/null 2>&1
+VAULT_MUT=$(sha256sum "$VAULTDIR/private-key.pem" | cut -d' ' -f1)
+if [ "$VAULT_BEFORE" != "$VAULT_MUT" ]; then
+    pass "the pre-fix form does destroy the incumbent, so the check above can fail"
+else
+    fail "the pre-fix form left the incumbent intact — the check above proves nothing"
+fi
+
+# The two scripts carry vault_get separately, deliberately: day zero is one
+# pasted artifact whose integrity story is the operator's own sha256sum, so it
+# sources nothing. That makes drift the risk, and this is the guard for it.
+_DZ_FN=$(_extract_fn vault_get "$REPO_ROOT/host/day-zero.sh")
+_AC_FN=$(_extract_fn vault_get "$REPO_ROOT/host/activate.sh")
+if [ -n "$_DZ_FN" ] && [ "$_DZ_FN" = "$_AC_FN" ]; then
+    pass "both day-zero scripts carry a byte-identical vault_get"
+else
+    fail "day-zero.sh and activate.sh have drifted apart on vault_get"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
