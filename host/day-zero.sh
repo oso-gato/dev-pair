@@ -134,9 +134,29 @@ A code is about to be printed. Approve it at github.com/login/device from your
 phone or your laptop, signed in as the maintainer. Nothing else will be asked.
 EOF
 
-gh auth login --hostname github.com --git-protocol https --scopes repo --web \
+# stdin is closed here, deliberately, and it is load-bearing. This script's
+# contract is one pasted block (see the header), and a command that reads stdin
+# from inside a paste consumes the NEXT pasted lines as its answer — bash never
+# executes them. gh asks twice when it believes it has a terminal: a
+# git-credential question, and "press Enter to open your browser". With stdin
+# closed it prints the URL and the one-time code and waits for the approval
+# rather than for a keystroke. --git-protocol is gone for the same reason: it
+# is what arms the first of those two prompts, and nothing here moves git over
+# the token, so it bought nothing and cost a prompt.
+gh auth login --hostname github.com --scopes repo --web </dev/null \
     || die "authorization did not complete — nothing secret has been written, and re-running day zero is safe"
-ok "authorized"
+
+# Who approved it, and can they actually open the vault? Without this an
+# operator signed in as the wrong account passes straight through, every vault
+# fetch fails one at a time, and the run ends on a host that looks finished and
+# holds no identity. Ask once, here, while saying so is still cheap.
+GH_LOGIN=$(gh api user --jq .login 2>/dev/null) \
+    || die "authorization produced no usable token — re-run day zero"
+[ "$GH_LOGIN" = "$TRUST_ROOT_USER" ] \
+    || die "authorized as ${GH_LOGIN}, but this estate's trust root is ${TRUST_ROOT_USER}. Sign in as the maintainer and re-run."
+gh api "repos/${VAULT_REPO}" >/dev/null 2>&1 \
+    || die "authorized as ${GH_LOGIN}, which cannot read ${VAULT_REPO}. The vault is private and this account has no access to it."
+ok "authorized as ${GH_LOGIN}; the vault is readable"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — the vault. Everything below is a credential and none of it is

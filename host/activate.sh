@@ -115,9 +115,23 @@ A code is about to be printed. Approve it at github.com/login/device from your
 phone or your laptop, signed in as the maintainer. Nothing else will be asked.
 EOF
 
-gh auth login --hostname github.com --git-protocol https --scopes repo --web \
+# stdin closed, and --git-protocol dropped. Both for the same reason as on the
+# VPS track: a command that reads stdin from inside a pasted block eats the
+# next pasted lines, and gh prompts twice when it believes it has a terminal.
+# With stdin closed it prints the URL and the one-time code instead.
+gh auth login --hostname github.com --scopes repo --web </dev/null \
     || die "authorization did not complete — nothing secret has been written, and re-running is safe"
-ok "authorized"
+
+# Who approved it, and can they open the vault. An operator signed in as the
+# wrong account would otherwise pass through and leave a host that looks
+# activated and holds no identity.
+GH_LOGIN=$(gh api user --jq .login 2>/dev/null) \
+    || die "authorization produced no usable token — re-run activation"
+[ "$GH_LOGIN" = "$TRUST_ROOT_USER" ] \
+    || die "authorized as ${GH_LOGIN}, but this estate's trust root is ${TRUST_ROOT_USER}. Sign in as the maintainer and re-run."
+gh api "repos/${VAULT_REPO}" >/dev/null 2>&1 \
+    || die "authorized as ${GH_LOGIN}, which cannot read ${VAULT_REPO}. The vault is private and this account has no access to it."
+ok "authorized as ${GH_LOGIN}; the vault is readable"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PHASE 2 — the vault.

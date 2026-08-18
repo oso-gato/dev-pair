@@ -306,6 +306,37 @@ else
     fail "day-zero.sh and activate.sh have drifted apart on vault_get"
 fi
 
+# ── 4e. Nothing inside a pasted script may read the terminal ─────────────────
+# Both day-zero scripts are contracted to be pasted whole into a console. A
+# command that reads stdin from inside a paste consumes the NEXT pasted lines
+# as its answer and bash never runs them, which is how an interactive prompt in
+# the middle of a paste silently truncates the script. gh prompts twice when it
+# believes it has a terminal, so every gh auth login here must close stdin.
+# Bounded, closed, over two declared artifacts.
+head_ "paste safety"
+_bad_login=0
+while IFS= read -r hit; do
+    printf '%s' "$hit" | grep -q '</dev/null' && continue
+    printf '        %s\n' "$hit"
+    _bad_login=1
+done < <(git -C "$REPO_ROOT" grep -nI 'gh auth login' \
+    -- 'host/**' 'dev-container/**' 'shared/**' ':!host/converge/selftest.sh' 2>/dev/null)
+if [ "$_bad_login" = 0 ]; then
+    pass "every gh auth login closes stdin, so a pasted script cannot eat itself"
+else
+    fail "a gh auth login can read the terminal from inside a pasted script"
+fi
+
+# The check must be able to see one. Reproduce the unguarded form on a copy
+# outside the scanned tree and require the same test to catch it.
+_PASTE_MUTANT="$TESTROOT/paste-mutant.sh"
+printf 'gh auth login --hostname github.com --web\n' > "$_PASTE_MUTANT"
+if grep -q 'gh auth login' "$_PASTE_MUTANT" && ! grep -q '</dev/null' "$_PASTE_MUTANT"; then
+    pass "the unguarded form is detected, so the check above can fail"
+else
+    fail "the unguarded form was not detected — the check above proves nothing"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
