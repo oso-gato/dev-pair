@@ -141,24 +141,71 @@ else
     fail "prov_disclose grew from $lines_first to $lines_second lines (want 3 and 3)"
 fi
 
-# ── 4. Mutation check: break the guard, the check must fail ──────────────────
-# A test that passes against broken code proves nothing (C9). fs_install's
-# idempotence rests entirely on the content comparison, so removing it is the
-# mutation, and the no-op assertion above must fail against this copy.
+# ── 4. Mutation checks: break the guard, the check must fail ─────────────────
+# C9 asks for the pre-fix behaviour RESTORED ON A COPY, and the guard's test
+# must then fail. An earlier version of this section hand-wrote a stand-in that
+# called log_changed unconditionally, so its assertion was true by construction
+# and could not have detected a broken guard — the "test asserting what a mock
+# was told" the constitution names, inside the mechanism built to prevent it.
+# These mutate the REAL functions' own source instead.
 head_ "mutation"
-fs_install_mutated() {
-    local src="$1" dest="$2" mode="$3"
-    install -D -m "$mode" "$src" "$dest"     # the cmp -s guard removed
-    log_changed "installed $dest"
-}
-CONVERGE_CHANGED=0
-fs_install_mutated "$SRCFILE" "$TESTROOT/mut/file.txt" 0644 >/dev/null 2>&1
-CONVERGE_CHANGED=0
-fs_install_mutated "$SRCFILE" "$TESTROOT/mut/file.txt" 0644 >/dev/null 2>&1
-if [ "$CONVERGE_CHANGED" -eq 0 ]; then
-    fail "the mutated fs_install still reported no change — the idempotence check cannot detect a broken guard"
+
+# fs_install's idempotence rests entirely on the content comparison. Take the
+# live function's source, delete that comparison, and the no-op assertion above
+# must fail against the result.
+# shellcheck disable=SC2016  # sed patterns match the function's literal text
+eval "$(declare -f fs_install | sed \
+    -e 's/^fs_install ()/fs_install_mutant ()/' \
+    -e 's/if \[ ! -f "\$dest" \] || ! cmp -s "\$src" "\$dest"; then/if true; then/')"
+if declare -f fs_install_mutant >/dev/null 2>&1 \
+   && ! declare -f fs_install_mutant | grep -q 'cmp -s'; then
+    CONVERGE_CHANGED=0
+    fs_install_mutant "$SRCFILE" "$TESTROOT/mut/file.txt" 0644 >/dev/null 2>&1
+    CONVERGE_CHANGED=0
+    fs_install_mutant "$SRCFILE" "$TESTROOT/mut/file.txt" 0644 >/dev/null 2>&1
+    if [ "$CONVERGE_CHANGED" -eq 0 ]; then
+        fail "fs_install with its comparison removed still reported no change — the idempotence check cannot detect a broken guard"
+    else
+        pass "fs_install mutated (comparison removed) reports a change on re-apply, so the check above can fail"
+    fi
 else
-    pass "the mutated fs_install reports a change on re-apply, so the check above can fail"
+    fail "could not build the fs_install mutant — the mutation check did not run, which is not the same as passing"
+fi
+
+# prov_sha256 must yield a BARE hash. The pre-fix source used an awk program
+# whose nested quoting yielded "<hash>  <path>", which parsed cleanly and made
+# every checksum comparison fail closed on a correct file. Restore that form on
+# a copy and require the check to catch it.
+KNOWNFILE="$TESTROOT/known.txt"
+printf 'provenance probe\n' > "$KNOWNFILE"
+EXPECTED=$(sha256sum "$KNOWNFILE" | cut -d' ' -f1)
+if [ "$(prov_sha256 "$KNOWNFILE")" = "$EXPECTED" ]; then
+    pass "prov_sha256 returns a bare hash, so a checksum comparison can match"
+else
+    fail "prov_sha256 returned [$(prov_sha256 "$KNOWNFILE")], wanted the bare hash [$EXPECTED]"
+fi
+# shellcheck disable=SC2016  # the mutant reproduces the defective awk program verbatim
+prov_sha256_mutant() { sha256sum "$1" | awk '"'"'{print $1}'"'"'; }
+if [ "$(prov_sha256_mutant "$KNOWNFILE")" = "$EXPECTED" ]; then
+    fail "the defective checksum form still returned a bare hash — this check cannot detect the defect it exists for"
+else
+    pass "the defective checksum form is caught, so the check above can fail"
+fi
+
+# ── 4b. The published door has to reach a listening port ─────────────────────
+# A bounded, closed question over two declared artifacts, which is what C3
+# admits as a mechanical check. It exists because the two disagreed: the
+# Quadlet published the host port onto container 22 while the container's sshd
+# bound 2222, so the dev-container's public door opened onto nothing.
+head_ "doors"
+_tpl="$REPO_ROOT/host/sysroot/etc/containers/systemd/users/dev-container.container.tpl"
+_sshd="$REPO_ROOT/dev-container/sysroot/etc/ssh/sshd_config.d/40-dev-pair.conf"
+_published=$(grep -oE '^PublishPort=@@DEV_SSH_PORT@@:[0-9]+' "$_tpl" | cut -d: -f2)
+_listening=$(grep -oE '^Port[[:space:]]+[0-9]+' "$_sshd" | grep -oE '[0-9]+')
+if [ -n "$_published" ] && [ "$_published" = "$_listening" ]; then
+    pass "the dev-container publishes to ${_published} and its sshd listens on ${_listening}"
+else
+    fail "the dev-container publishes to container port [${_published}] but its sshd listens on [${_listening}] — the public door opens onto nothing"
 fi
 
 # ── 5. No credential in the tree ─────────────────────────────────────────────

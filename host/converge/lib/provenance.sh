@@ -21,6 +21,17 @@
 #
 # Sourced, never executed. Requires log.sh.
 
+# prov_sha256 — the bare sha256 of a file.
+#
+# Deliberately `cut` rather than an awk program. The awk form carried nested
+# quoting that survived `bash -n` and shellcheck while silently yielding
+# "<hash>  <path>" instead of the hash, so every checksum comparison failed and
+# every admission died closed on a correct file. One home, no quoting hazard,
+# and exercised directly by the self-test.
+prov_sha256() {
+    sha256sum "$1" | cut -d' ' -f1
+}
+
 PROV_DISCLOSURE="${PAIR_STATE_DIR:-/var/lib/dev-pair}/provenance.tsv"
 
 # ── Disclosure ───────────────────────────────────────────────────────────────
@@ -170,7 +181,7 @@ prov_l2_vendor_repo() {
     curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$url" -o "$tmp" \
         || log_die "L2 ${id}: vendor repository definition unreachable at ${url} — nothing installed"
 
-    local got; got=$(sha256sum "$tmp" | awk '"'"'{print $1}'"'"')
+    local got; got=$(prov_sha256 "$tmp")
     [ "$got" = "$want" ] \
         || log_die "L2 ${id}: the vendor definition at ${url} has sha256 ${got}, not the pinned ${want}. Nothing installed. Re-verify upstream and re-pin deliberately (C5) — never relax this comparison."
 
@@ -212,7 +223,7 @@ prov_l3_fetch() {
     trap "rm -f '$tmp'" RETURN
     curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "$url" -o "$tmp" \
         || log_die "L3 ${url}: unreachable — nothing installed"
-    local got; got=$(sha256sum "$tmp" | awk '{print $1}')
+    local got; got=$(prov_sha256 "$tmp")
     [ "$got" = "$sha256" ] \
         || log_die "L3 ${url}: sha256 ${got} does not match the pinned ${sha256} — nothing installed"
     install -D -m 0755 "$tmp" "$dest"

@@ -72,7 +72,7 @@ fi
 if /usr/sbin/sshd -t 2>/dev/null; then
     /usr/sbin/sshd -D -e &
     sshd_pid=$!
-    log "sshd listening on 2222; mosh bootstraps over it and inherits keys-only"
+    log "sshd listening on 22 (published by the host); mosh bootstraps over it and inherits keys-only"
 else
     sshd_pid=""
     log "ERROR: sshd configuration does not parse — no public door on this component"
