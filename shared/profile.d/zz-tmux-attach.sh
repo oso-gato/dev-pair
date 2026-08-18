@@ -1,5 +1,10 @@
 # shellcheck shell=sh  # sourced by the login shell, never executed — no shebang by design
-# Land in the durable session on login.
+# Land in the durable session on login. Shared by both components.
+#
+# The host and the dev-container are both reached by ssh and by mosh, and on
+# both the work must outlive the connection. So both attach to tmux on an
+# interactive login rather than handing over a bare shell that dies with the
+# socket.
 #
 # The whole point of this component is that work outlives the connection, so an
 # interactive login attaches to tmux rather than to a bare shell that dies with

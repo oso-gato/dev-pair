@@ -55,6 +55,12 @@ if [ "$_sshd_before" != "$_sshd_after" ]; then
     log_changed "sshd reloaded under the keys-only policy"
 fi
 
+# Land an interactive login in the durable session, on this component as well
+# as in the dev-container. Both are reached by ssh and by mosh, and on both the
+# work has to outlive the connection.
+fs_install "$REPO_ROOT/shared/profile.d/zz-tmux-attach.sh" \
+           /etc/profile.d/zz-tmux-attach.sh 0644
+
 # ── Root retires, but only once someone else can get in ──────────────────────
 # Remote root is already refused by the sshd policy above. Locking the password
 # closes the console path day zero itself came in through, which is the whole

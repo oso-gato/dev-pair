@@ -82,6 +82,7 @@ RUN dnf -y --setopt=install_weak_deps=False install \
 # rather than forking them is what keeps that true.
 COPY shared/claudebox/ /usr/share/dev-pair/claudebox/
 COPY shared/bin/       /usr/bin/
+COPY shared/profile.d/  /etc/profile.d/
 
 # ─── The component's own scripts ─────────────────────────────────────────────
 COPY dev-container/sysroot/ /
