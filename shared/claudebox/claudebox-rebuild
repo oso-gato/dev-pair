@@ -27,10 +27,14 @@ have_user_systemd() { systemctl --user show -p Version >/dev/null 2>&1; }
 state_of() { systemctl --user show -p ActiveState --value "$run" 2>/dev/null; }
 
 # The rebuild itself, identical wherever it runs.
+# Every distrobox call closes the lock fd explicitly (9>&-), even though the
+# caller already runs this in a subshell with it closed. Closing an fd that is
+# already closed costs nothing, and the safety is then visible at the site
+# rather than inherited from somewhere else in the file.
 do_rebuild() {
-    distrobox rm -f claudebox 2>/dev/null || true
-    distrobox assemble create --file "$SHARE/distrobox.ini" || return 1
-    CLAUDEBOX_SHARE="$SHARE" "$SHARE/claudebox-init.sh" || return 1
+    distrobox rm -f claudebox 9>&- 2>/dev/null || true
+    distrobox assemble create --file "$SHARE/distrobox.ini" 9>&- || return 1
+    CLAUDEBOX_SHARE="$SHARE" "$SHARE/claudebox-init.sh" 9>&- || return 1
 }
 
 # ── Without a user manager: inline, under the exclusive lock. ────────────────
@@ -41,7 +45,14 @@ if ! have_user_systemd; then
     fi
     echo ">> claudebox: rebuilding inline — fresh image + current Claude Code (~2-5 min)…"
     echo ">> waiting for the exclusive session lock (any live session defers us)…"
-    if flock -x "$state/session.lock" bash -c "$(declare -f do_rebuild); CLAUDEBOX_SHARE='$SHARE' SHARE='$SHARE' do_rebuild"; then
+    # The lock is taken on an explicit fd and CLOSED to the child that
+    # rebuilds. `flock -x <file> <cmd>` would pass its own fd straight into
+    # distrobox, and the container it creates would then hold the EXCLUSIVE
+    # lock for its whole lifetime — every later `claude` blocking at flock
+    # forever, with no way back but killing the box. This shell keeps the fd
+    # and releases it by exiting.
+    exec 9>"$state/session.lock"
+    if flock -x 9 && ( do_rebuild ) 9>&-; then
         echo ">> claudebox rebuild complete."
         exit 0
     fi

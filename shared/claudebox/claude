@@ -47,8 +47,15 @@ flock -s 8
 run_session() {
     local tries=0 rc
     while :; do
+        # fd 8 is CLOSED to the child. A distrobox container started under an
+        # inherited lock fd keeps that lock for the box's whole lifetime, so
+        # the shared lock would outlive the session: claudebox-daily's
+        # `flock -n -x` probe would read "session active" forever and the
+        # nightly rebuild would defer permanently, silently. This shell keeps
+        # fd 8 and releases it by exiting, which is what still serialises us
+        # against the rebuild.
         distrobox enter claudebox -- bash -lc \
-            'exec /usr/bin/claude --model default "$@"' bash "$@"
+            'exec /usr/bin/claude --model default "$@"' bash "$@" 8>&-
         rc=$?
         # Retry ONLY OCI exec-setup failures (125/126), which are the transient
         # post-rebuild /dev/pts race. Real exit codes pass straight through.

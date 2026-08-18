@@ -7,6 +7,10 @@
 # fire mid-session. The rebuild waits instead, with a note in the journal
 # saying why. That is C8's "never interrupts a live session", enforced by the
 # lock rather than by timing.
+#
+# The lock fd is closed to every distrobox child (9>&-). A container started
+# with the lock fd open inherits it and holds the lock for its whole lifetime,
+# which would make this exclusive lock permanent and hang every later session.
 [Unit]
 Description=Rebuild the claudebox (destroy and recreate from the shared manifest)
 
@@ -16,7 +20,8 @@ TimeoutStartSec=45min
 Environment=CLAUDEBOX_SHARE=/usr/share/dev-pair/claudebox
 ExecStart=/bin/sh -c 'mkdir -p "$HOME/.local/state/claudebox"; \
   echo "waiting for the exclusive session lock (any live session defers us)…"; \
-  exec flock -x "$HOME/.local/state/claudebox/session.lock" /bin/sh -c \
-    "distrobox rm -f claudebox 2>/dev/null || true; \
-     distrobox assemble create --file /usr/share/dev-pair/claudebox/distrobox.ini && \
-     /usr/share/dev-pair/claudebox/claudebox-init.sh"'
+  exec 9>"$HOME/.local/state/claudebox/session.lock"; \
+  flock -x 9 || exit 1; \
+  distrobox rm -f claudebox 9>&- 2>/dev/null || true; \
+  distrobox assemble create --file /usr/share/dev-pair/claudebox/distrobox.ini 9>&- && \
+  /usr/share/dev-pair/claudebox/claudebox-init.sh 9>&-'

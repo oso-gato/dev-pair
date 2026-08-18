@@ -337,6 +337,55 @@ else
     fail "the unguarded form was not detected — the check above proves nothing"
 fi
 
+# ── 4f. A lock fd never reaches a container ──────────────────────────────────
+# C8 makes the session lock the thing that stops a rebuild firing mid-session.
+# A container started with the lock fd still open INHERITS it and holds the
+# lock for the box's whole lifetime, which breaks that guarantee in both
+# directions: an inherited shared lock makes the nightly rebuild defer forever
+# and silently, and an inherited exclusive lock hangs every later session at
+# flock with no way out but killing the box. The estate's predecessor measured
+# this and recorded the verdict; every file here that takes a lock on an
+# explicit fd must close it to each distrobox child.
+head_ "session lock"
+_lock_files="$REPO_ROOT/shared/claudebox/claude
+$REPO_ROOT/shared/claudebox/claudebox-rebuild
+$REPO_ROOT/host/sysroot/usr/lib/systemd/user/claudebox-rebuild-run.service"
+
+_lock_check() {   # _lock_check <file> -> prints offending lines, returns 1 if any
+    local f="$1" fd bad=0 line
+    fd=$(grep -oE 'flock +(-[a-zA-Z]+ +)*[0-9]+' "$f" | grep -oE '[0-9]+$' | head -1)
+    if [ -z "$fd" ]; then
+        printf '        %s takes no lock on an explicit fd\n' "$(basename "$f")"
+        return 1
+    fi
+    while IFS= read -r line; do
+        printf '%s' "$line" | grep -q "${fd}>&-" && continue
+        printf '        %s: %s\n' "$(basename "$f")" "$(printf '%s' "$line" | cut -c1-64)"
+        bad=1
+    done < <(sed -e :a -e '/\\$/N; s/\\\n//; ta' "$f" | grep -E '^[^#]*distrobox ')
+    return "$bad"
+}
+
+_lock_bad=0
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    _lock_check "$f" || _lock_bad=1
+done <<< "$_lock_files"
+if [ "$_lock_bad" = 0 ]; then
+    pass "no distrobox child inherits the session lock fd"
+else
+    fail "a distrobox child inherits the session lock fd — the lock outlives its holder"
+fi
+
+# Mutation: strip the fd-close on a copy and require the check to catch it.
+_LOCK_MUTANT="$TESTROOT/lock-mutant.sh"
+sed 's/ 9>&-//g' "$REPO_ROOT/shared/claudebox/claudebox-rebuild" > "$_LOCK_MUTANT"
+if _lock_check "$_LOCK_MUTANT" >/dev/null 2>&1; then
+    fail "the check passed a file whose fd-close was removed — it proves nothing"
+else
+    pass "removing the fd-close is caught, so the check above can fail"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
