@@ -6,7 +6,7 @@
 # is the canonical violation." Day zero and every converger unit therefore
 # admit artifacts through these functions and through nothing else.
 #
-# The ladder, as this repository instantiates it (00-BYLAW.md):
+# The ladder, as C4 names it for Fedora (the estate's default platform):
 #   L1  Fedora's own dnf repositories.
 #   L2  the vendor's OWN dnf .repo file, fetched and pinned by checksum. Not
 #       a definition we compose against the vendor's baseurl: the point is
@@ -74,7 +74,7 @@ prov_bootstrap() {
 
 # ── L1 ───────────────────────────────────────────────────────────────────────
 # Fedora's own repositories. install_weak_deps=False on every installation,
-# bootstrap paths included (00-BYLAW.md, minimalism flag).
+# bootstrap paths included (C4, minimal installation).
 #
 # Idempotent by reading live state: already-present packages are never passed
 # to dnf, so a converged host performs no transaction and reports no change.

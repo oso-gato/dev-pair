@@ -61,7 +61,7 @@ trap cleanup EXIT INT TERM
 say "phase 1: the host, from public sources only"
 
 # L1 throughout, with weak dependencies off from the very first transaction —
-# the bylaw's minimalism flag binds bootstrap paths too, which is exactly the
+# C4's minimal installation rule binds bootstrap paths too, which is exactly the
 # path most likely to be exempted by habit.
 dnf -y --setopt=install_weak_deps=False install git gh curl gnupg2 python3 \
     || die "cannot install the bootstrap set from Fedora's own repositories"

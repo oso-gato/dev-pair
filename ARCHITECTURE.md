@@ -4,7 +4,7 @@ Agent-owned map of the system as built. Mutable-on-fact: updated in the same cha
 
 ## Current state (2026-08-18)
 
-This repository holds the governing documents, the documentation surfaces, and both lineages' genesis paths as code. The confirmed baseline is the protected tag `chartered` (epochs timestamped per C11 — the only epoch is `chartered-2026-08-18-0159` (Hong Kong time), where the floating tag points, wrapped in a Release); two active tag rulesets armour them — epochs immutable to everyone, the floating name maintainer-movable. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries the pull and its charter membership, and `00-BYLAW.md` carries the B-numbered principles and the instantiations this repository owns.
+This repository holds the governing documents, the documentation surfaces, and both lineages' genesis paths as code. The confirmed baseline is the protected tag `chartered` (epochs timestamped per C11 — the only epoch is `chartered-2026-08-18-0159` (Hong Kong time), where the floating tag points, wrapped in a Release); two active tag rulesets armour them — epochs immutable to everyone, the floating name maintainer-movable. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries the pull and its charter membership, and `00-BYLAW.md` carries the B-numbered principles, this repository's platform declaration, and the one instantiation it owns.
 
 The component tree exists in all three parts. Nothing here has been applied to a live host: the delivery boundary for issues #10 and #11 alike is the artifact the maintainer consumes, and the apply is his act.
 

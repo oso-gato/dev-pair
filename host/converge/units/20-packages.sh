@@ -4,7 +4,7 @@
 # Everything here is L1: Fedora's own repositories, which is the strongest
 # provenance any of these artifacts admits, so settling lower would be the
 # defect C4 names. `install_weak_deps=False` rides on every installation
-# through prov_l1_install, per the bylaw's minimalism flag.
+# through prov_l1_install, per C4's minimal installation rule.
 #
 # Each group carries the justification C3 requires — nothing enters a built
 # tree without one — and the most specific leaf package beats any convenience
