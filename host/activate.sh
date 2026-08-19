@@ -303,32 +303,42 @@ shred -u "$WORKDIR/tskey" 2>/dev/null || rm -f "$WORKDIR/tskey"
 
 say "root retires"
 
-# The donor image ships a bootstrap window of passwordless sudo so an operator
-# can reach setup over key-authenticated SSH before a password exists. On this
-# track the password is baked, so the window was never needed and closing it is
-# unconditional. Named explicitly because it is a donor artifact, not ours.
-for stale in /etc/sudoers.d/strix-bootstrap /etc/sudoers.d/90-cloud-init-users; do
-    if [ -f "$stale" ]; then
-        rm -f "$stale"
-        ok "closed the bootstrap sudo window ($stale)"
-    fi
-done
-
-# Recovery before power (C11): root is locked only once core is provably usable.
-# Locking it first would strand a machine whose only other door is a key we have
-# not confirmed works with a password we have not confirmed exists.
+# Recovery before power (C11): every door closes only once core is provably
+# usable. This test used to run AFTER the bootstrap sudo window was already
+# deleted, and the deletion called itself unconditional because "the password
+# is baked at image build" — which is the very thing the test below exists to
+# doubt. On an image where the bake did not happen, root was correctly left
+# unlocked and core could still reach the host by key, but could no longer
+# escalate at all: an administrator-less bootc host, recoverable only by a
+# rebase. The order is inverted, and both acts now sit behind one gate.
 admin_ready=1
 id -nG core 2>/dev/null | tr ' ' '\n' | grep -qx wheel || admin_ready=0
 [ -s "$ADMIN_HOME_ACTUAL/.ssh/authorized_keys" ] || admin_ready=0
 passwd -S core 2>/dev/null | awk '{print $2}' | grep -qx 'P' || admin_ready=0
 
 if [ "$admin_ready" = 0 ]; then
-    warn "root NOT retired — core is not provably usable (needs wheel, an authorized key, and the baked password). Fix the image, then re-run."
-elif passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
-    ok "root already retired"
+    if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
+        warn "root is ALREADY locked and core is not provably usable (needs wheel, an authorized key, and the baked password). The bootstrap sudo window is left OPEN on purpose — it is the only escalation path left. Fix the image, then re-run."
+    else
+        warn "root NOT retired — core is not provably usable (needs wheel, an authorized key, and the baked password). The bootstrap sudo window is left open on purpose. Fix the image, then re-run."
+    fi
 else
-    passwd -l root >/dev/null 2>&1 || die "cannot lock the root password"
-    ok "root retired — core verified usable first"
+    # The donor image ships a bootstrap window of passwordless sudo so an
+    # operator can reach setup over key-authenticated SSH before a password
+    # exists. Named explicitly because it is a donor artifact, not ours.
+    for stale in /etc/sudoers.d/strix-bootstrap /etc/sudoers.d/90-cloud-init-users; do
+        if [ -f "$stale" ]; then
+            rm -f "$stale"
+            ok "closed the bootstrap sudo window ($stale)"
+        fi
+    done
+
+    if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
+        ok "root already retired"
+    else
+        passwd -l root >/dev/null 2>&1 || die "cannot lock the root password"
+        ok "root retired — core verified usable first"
+    fi
 fi
 
 say "done"

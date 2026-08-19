@@ -81,7 +81,15 @@ id -nG "$ADMIN_USER" 2>/dev/null | tr ' ' '\n' | grep -qx wheel || _admin_ready=
 passwd -S "$ADMIN_USER" 2>/dev/null | awk '{print $2}' | grep -qx 'P' || _admin_ready=0
 
 if [ "$_admin_ready" = 0 ]; then
-    log_warn "root NOT retired — ${ADMIN_USER} is not yet usable (needs wheel, an authorized key, and a password). Day zero completes this; re-run converge afterwards."
+    # Say which situation this actually is. "Root is not retired" was printed
+    # without reading root's state, and on a host converged once and later
+    # degraded it was simply false — root was locked and the operator was told
+    # otherwise. Which of the two it is decides whether there is still a way in.
+    if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
+        log_warn "root is ALREADY locked and ${ADMIN_USER} is not usable (needs wheel, an authorized key, and a password) — the provider's console is the only way in. Day zero completes this; re-run converge afterwards."
+    else
+        log_warn "root NOT retired — ${ADMIN_USER} is not yet usable (needs wheel, an authorized key, and a password). Day zero completes this; re-run converge afterwards."
+    fi
 elif passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
     log_ok "root password locked"
 else
@@ -89,49 +97,64 @@ else
     log_changed "root password locked — ${ADMIN_USER} verified usable first"
 fi
 
-if [ -s /root/.ssh/authorized_keys ]; then
-    : > /root/.ssh/authorized_keys
-    log_changed "cleared root's authorized_keys"
+# ── Closing every other door ─────────────────────────────────────────────────
+# Everything below removes a way in, and all of it is now gated on the same
+# proof that gates root's retirement. The gate used to cover the root lock
+# alone: on a host where `core` was NOT usable, this unit printed that core
+# could not escalate and then cleared root's authorized_keys, deleted the
+# provider's sudo rule, locked its users and stripped any remaining NOPASSWD
+# rule — narrating the lockout while causing it. That is the human summons C11
+# forbids, produced by the unit whose own comment claims to avoid it.
+#
+# A converged host takes the else branch every time, so this costs nothing in
+# the steady state and only holds the doors open while something is wrong.
+if [ "$_admin_ready" = 0 ]; then
+    log_warn "every other way in is left alone until ${ADMIN_USER} is usable — root's keys, the provider's users and its sudo rules are untouched on purpose"
 else
-    log_ok "root holds no authorized keys"
-fi
-
-# ── No second administrator ──────────────────────────────────────────────────
-# The provider's template leaves its own cloud-init user with passwordless
-# sudo. That is a second administrative identity, which C7 does not allow, and
-# a NOPASSWD rule for it would also defeat the sudo-by-password rule the
-# objective's Security outcome 2 states. Lock the account rather than delete
-# it — a delete with live processes is messy, and locked is sufficient.
-for stale in /etc/sudoers.d/90-cloud-init-users /etc/sudoers.d/90-cloud-init; do
-    if [ -f "$stale" ]; then
-        rm -f "$stale"
-        log_changed "removed the provider's passwordless sudo rule ($stale)"
-    fi
-done
-
-for other in fedora cloud-user ec2-user admin; do
-    id -u "$other" >/dev/null 2>&1 || continue
-    [ "$other" = "$ADMIN_USER" ] && continue
-    if passwd -S "$other" 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
-        log_ok "provider user ${other} already locked"
+    if [ -s /root/.ssh/authorized_keys ]; then
+        : > /root/.ssh/authorized_keys
+        log_changed "cleared root's authorized_keys"
     else
-        passwd -l "$other" >/dev/null 2>&1 || log_warn "cannot lock ${other}"
-        log_changed "locked the provider's user ${other} — ${ADMIN_USER} is the one administrator (C7)"
+        log_ok "root holds no authorized keys"
     fi
-    if id -nG "$other" | tr ' ' '\n' | grep -qx wheel; then
-        gpasswd -d "$other" wheel >/dev/null 2>&1 || log_warn "cannot remove ${other} from wheel"
-        log_changed "removed ${other} from wheel"
-    fi
-done
 
-# ── Sudo requires the password ───────────────────────────────────────────────
-# Steady state is stock %wheel with a password. Anything granting NOPASSWD to
-# wheel would silently undo the objective's Security outcome 2, so it goes.
-if grep -rlsE '^[^#]*%wheel.*NOPASSWD' /etc/sudoers.d/ >/dev/null 2>&1; then
-    while IFS= read -r f; do
-        rm -f "$f"
-        log_changed "removed a passwordless sudo rule for wheel ($f)"
-    done < <(grep -rlsE '^[^#]*%wheel.*NOPASSWD' /etc/sudoers.d/)
-else
-    log_ok "sudo requires a password for wheel"
+    # ── No second administrator ──────────────────────────────────────────────────
+    # The provider's template leaves its own cloud-init user with passwordless
+    # sudo. That is a second administrative identity, which C7 does not allow, and
+    # a NOPASSWD rule for it would also defeat the sudo-by-password rule the
+    # objective's Security outcome 2 states. Lock the account rather than delete
+    # it — a delete with live processes is messy, and locked is sufficient.
+    for stale in /etc/sudoers.d/90-cloud-init-users /etc/sudoers.d/90-cloud-init; do
+        if [ -f "$stale" ]; then
+            rm -f "$stale"
+            log_changed "removed the provider's passwordless sudo rule ($stale)"
+        fi
+    done
+
+    for other in fedora cloud-user ec2-user admin; do
+        id -u "$other" >/dev/null 2>&1 || continue
+        [ "$other" = "$ADMIN_USER" ] && continue
+        if passwd -S "$other" 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
+            log_ok "provider user ${other} already locked"
+        else
+            passwd -l "$other" >/dev/null 2>&1 || log_warn "cannot lock ${other}"
+            log_changed "locked the provider's user ${other} — ${ADMIN_USER} is the one administrator (C7)"
+        fi
+        if id -nG "$other" | tr ' ' '\n' | grep -qx wheel; then
+            gpasswd -d "$other" wheel >/dev/null 2>&1 || log_warn "cannot remove ${other} from wheel"
+            log_changed "removed ${other} from wheel"
+        fi
+    done
+
+    # ── Sudo requires the password ───────────────────────────────────────────────
+    # Steady state is stock %wheel with a password. Anything granting NOPASSWD to
+    # wheel would silently undo the objective's Security outcome 2, so it goes.
+    if grep -rlsE '^[^#]*%wheel.*NOPASSWD' /etc/sudoers.d/ >/dev/null 2>&1; then
+        while IFS= read -r f; do
+            rm -f "$f"
+            log_changed "removed a passwordless sudo rule for wheel ($f)"
+        done < <(grep -rlsE '^[^#]*%wheel.*NOPASSWD' /etc/sudoers.d/)
+    else
+        log_ok "sudo requires a password for wheel"
+    fi
 fi

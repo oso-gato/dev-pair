@@ -386,6 +386,52 @@ else
     pass "removing the fd-close is caught, so the check above can fail"
 fi
 
+# ── 4g. Nothing closes a door before the gate is computed ────────────────────
+# C11 forbids a mechanism that blocks the loop with no way back. Both identity
+# paths test whether the administrative user is provably usable before they
+# retire root — but the acts that remove every OTHER way in used to run outside
+# that test. activate.sh deleted the bootstrap sudo window before the test was
+# even computed, so an image whose password bake failed produced a host with no
+# administrator at all, recoverable only by a rebase.
+#
+# The bounded, closed form of that rule: in each file the gate must be assigned
+# before the first door-closing command appears. Line order over two declared
+# artifacts — not a scan for whether each act is nested correctly, which would
+# be a pattern-scan over open-ended input and is checked by review instead.
+head_ "door order"
+_door_re='passwd -l |gpasswd -d |rm -f /etc/sudoers.d/|> /root/.ssh/authorized_keys'
+
+_door_order() {   # _door_order <file> <gate-var> -> 0 if the gate comes first
+    local f="$1" var="$2" gate first
+    gate=$(grep -nE "^[[:space:]]*${var}=1" "$f" | head -1 | cut -d: -f1)
+    first=$(grep -nE "$_door_re" "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | head -1 | cut -d: -f1)
+    [ -n "$gate" ] || return 1
+    [ -n "$first" ] || return 0
+    [ "$gate" -lt "$first" ]
+}
+
+for _spec in "host/converge/units/10-identity.sh:_admin_ready" "host/activate.sh:admin_ready"; do
+    _f="${_spec%%:*}"; _v="${_spec##*:}"
+    if _door_order "$REPO_ROOT/$_f" "$_v"; then
+        pass "${_f##*/}: the usability gate is computed before anything closes a door"
+    else
+        fail "${_f##*/}: something closes a door before ${_v} is computed"
+    fi
+done
+
+# Mutation: hoist a door-closing command above the gate on a copy, and require
+# the check to catch it.
+_DOOR_MUTANT="$TESTROOT/door-mutant.sh"
+{
+    printf 'rm -f /etc/sudoers.d/strix-bootstrap\n'
+    cat "$REPO_ROOT/host/activate.sh"
+} > "$_DOOR_MUTANT"
+if _door_order "$_DOOR_MUTANT" admin_ready; then
+    fail "the check passed a file that closes a door first — it proves nothing"
+else
+    pass "a door closed before the gate is caught, so the checks above can fail"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
