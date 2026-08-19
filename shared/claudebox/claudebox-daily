@@ -3,22 +3,56 @@
 #
 # C8 gives the automatic nightly rebuild one hard constraint: it never
 # interrupts a live session. This makes that call and nothing else.
-#   no session active -> start the detached rebuild now.
+#   no session active -> rebuild now.
 #   session active    -> leave a marker; the `claude` wrapper rebuilds the
 #                        moment the session exits.
 #
 # Deferral is the fallback and never the steady state: a box that defers every
 # night is a box whose sessions never end, and that is worth noticing.
+#
+# One script, both components, exactly as claudebox-rebuild is. The host has a
+# systemd user manager, so the rebuild it decides on runs as a detached service
+# there. The dev-container has none, so the same rebuild runs inline. A single
+# `systemctl --user start` here would have been a command that can only fail in
+# the container, which is to say the component that does the developing would
+# have had no nightly rebuild at all — a mechanism with no outcome it changes
+# (C3) standing in for one C8 requires.
 set -uo pipefail
-XDG_RUNTIME_DIR="/run/user/$(id -u)"
-export XDG_RUNTIME_DIR
+# An inherited value wins, exactly as it does in claudebox-rebuild. This script
+# now execs into that one, so overriding a runtime directory the caller already
+# set correctly would follow the rebuild all the way into podman.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
 state="$HOME/.local/state/claudebox"; mkdir -p "$state"
 
+# The rebuild command is a sibling of this one wherever this one was reached
+# from — beside it in the shared directory in the container image, beside it in
+# the component's bin directory on the host, and beside its own symlink on the
+# PATH of either. CLAUDEBOX_SHARE is the wrong answer here even though it names
+# the right directory in the container: the host installs the box MANIFEST
+# under it and the operator COMMANDS somewhere else, and that bin directory
+# differs per pair. PATH is the fallback for anything that installs neither way.
+here=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+rebuild="claudebox-rebuild"
+[ -n "$here" ] && [ -x "$here/claudebox-rebuild" ] && rebuild="$here/claudebox-rebuild"
+
+have_user_systemd() { systemctl --user show -p Version >/dev/null 2>&1; }
+
 # Probe the session lock. Taking it exclusive means nobody holds it shared,
-# which means no session is live.
+# which means no session is live. The probe releases the lock as it returns:
+# it is a question about the box, not a claim on it, and the rebuild below
+# takes the lock itself for as long as it actually needs it.
 if flock -n -x "$state/session.lock" -c true 2>/dev/null; then
     echo "claudebox daily refresh: idle -> rebuilding now."
-    exec systemctl --user start --no-block claudebox-rebuild-run.service
+    if have_user_systemd; then
+        exec systemctl --user start --no-block claudebox-rebuild-run.service
+    fi
+    # No user manager, so hand off to claudebox-rebuild's inline path rather
+    # than opening the lock here. That path already takes the lock on an
+    # explicit fd and closes it to every distrobox child, which is what stops
+    # the new box inheriting the lock and holding it for its whole lifetime.
+    # Reaching it by exec keeps that single implementation the only one.
+    exec "$rebuild"
 fi
 echo "claudebox daily refresh: session active -> deferring; rebuilds on exit."
 : > "$state/rebuild.pending"

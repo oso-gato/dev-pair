@@ -84,7 +84,10 @@ COPY shared/claudebox/ /usr/share/dev-pair/claudebox/
 COPY shared/bin/       /usr/bin/
 COPY shared/profile.d/  /etc/profile.d/
 
-# ─── The component's own scripts ─────────────────────────────────────────────
+# ─── The component's own sysroot ─────────────────────────────────────────────
+# Copied wholesale, so a file added under dev-container/sysroot/ arrives in the
+# image by being written and needs no line here. That is how this component's
+# init, its sshd policy and its tmux geometry policy all land.
 COPY dev-container/sysroot/ /
 
 # The box commands live in shared/ but belong on PATH, so they are linked

@@ -33,14 +33,29 @@ fs_enable_unit pair-gh-app-token.timer
 # Report whether the capability is actually armed. C3's activation-proof is the
 # standard here: an installed minter with no credentials is not a working
 # GitHub authority, and saying so beats reporting green.
-if [ -f "$PAIR_SECRETS_DIR/github-app/private-key.pem" ]; then
-    log_ok "host App credentials present (${HOST_APP_NAME}, App ${HOST_APP_ID})"
+#
+# Presence alone was never that proof. A zero-byte or truncated key satisfies a
+# file test, so this unit reported credentials in green while the minter died
+# on the very same file at the next timer fire — the activation-proof above was
+# aspiration rather than fact. The probe therefore asks openssl whether the
+# file is a usable private key, which is the question the minter asks of it.
+#
+# Only the exit status is read and both streams go to /dev/null, because a
+# credential's own bytes must never reach a terminal or the journal (C6). An
+# absent openssl fails the probe and is reported the same way, and that is
+# correct rather than a false alarm: the minter cannot mint without it either.
+_app_key_usable() {
+    [ -s "$1" ] && openssl pkey -in "$1" -noout >/dev/null 2>&1
+}
+
+if _app_key_usable "$PAIR_SECRETS_DIR/github-app/private-key.pem"; then
+    log_ok "host App credentials present and usable (${HOST_APP_NAME}, App ${HOST_APP_ID})"
 else
-    log_warn "host App credentials absent — day zero installs them from the vault; the box will have no GitHub authority until it does"
+    log_warn "host App credentials absent or unusable — day zero installs them from the vault; the box will have no GitHub authority until it does"
 fi
 
-if [ -f "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-github-app/private-key.pem" ]; then
-    log_ok "dev-container App credentials present (${DEV_APP_NAME}, App ${DEV_APP_ID})"
+if _app_key_usable "$PAIR_DEV_SECRETS_DIR/${DEV_CONTAINER_NAME}-github-app/private-key.pem"; then
+    log_ok "dev-container App credentials present and usable (${DEV_APP_NAME}, App ${DEV_APP_ID})"
 else
-    log_warn "dev-container App credentials absent — day zero installs them from the vault"
+    log_warn "dev-container App credentials absent or unusable — day zero installs them from the vault"
 fi

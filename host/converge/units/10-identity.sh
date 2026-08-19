@@ -44,15 +44,55 @@ case "$_sync_out" in
 esac
 
 # ── Shell access policy ──────────────────────────────────────────────────────
-_sshd_before=$(sha256sum /etc/ssh/sshd_config.d/40-dev-pair.conf 2>/dev/null | awk '{print $1}')
+# The test has to come after the install and the install has to be reversible,
+# because sshd includes every drop-in in this directory the instant it lands.
+# Validating the repository's copy first would prove nothing about what sshd
+# will actually read, and an invalid drop-in left on disk survives the running
+# daemon and takes the next reboot's sshd down with it — a host that comes back
+# with no public door. So the incumbent is kept aside, the new file is
+# installed, the live configuration is tested, and a failure puts the incumbent
+# back before this unit dies. That restoration is the C11 recovery, and dying
+# without it would be the human summons C11 forbids.
+#
+# The copy is kept outside sshd_config.d, because a spare copy inside it would
+# itself be a live drop-in. Both the incumbent's hash and its copy are taken
+# inside one existence test, because the converger runs under pipefail and a
+# sha256sum of a file that is not there yet fails the whole pipeline — which on
+# a first apply aborted converge here rather than installing anything.
+_sshd_conf=/etc/ssh/sshd_config.d/40-dev-pair.conf
+_sshd_before=""
+_sshd_backup=""
+if [ -f "$_sshd_conf" ]; then
+    _sshd_before=$(sha256sum "$_sshd_conf" | awk '{print $1}')
+    _sshd_backup=$(mktemp) || log_die "cannot stage a copy of ${_sshd_conf}"
+    cp -p "$_sshd_conf" "$_sshd_backup" || log_die "cannot copy ${_sshd_conf} aside"
+fi
+
 fs_install "$REPO_ROOT/host/sysroot/etc/ssh/sshd_config.d/40-dev-pair.conf" \
-           /etc/ssh/sshd_config.d/40-dev-pair.conf 0644
-_sshd_after=$(sha256sum /etc/ssh/sshd_config.d/40-dev-pair.conf | awk '{print $1}')
+           "$_sshd_conf" 0644
+_sshd_after=$(sha256sum "$_sshd_conf" | awk '{print $1}')
+
 if [ "$_sshd_before" != "$_sshd_after" ]; then
-    sshd -t || log_die "the new sshd configuration does not parse — nothing reloaded"
-    systemctl reload sshd 2>/dev/null || systemctl restart sshd \
-        || log_die "cannot reload sshd"
-    log_changed "sshd reloaded under the keys-only policy"
+    if sshd -t; then
+        systemctl reload sshd 2>/dev/null || systemctl restart sshd \
+            || log_die "cannot reload sshd"
+        log_changed "sshd reloaded under the keys-only policy"
+    else
+        if [ -n "$_sshd_backup" ]; then
+            install -m 0644 -o root -g root "$_sshd_backup" "$_sshd_conf" \
+                || log_die "the new sshd configuration does not parse AND the previous one cannot be put back — ${_sshd_conf} is invalid on disk and must be repaired from the provider's console before this host reboots; the previous drop-in is still readable at ${_sshd_backup}"
+            _sshd_restored="the previous drop-in is back in place"
+        else
+            rm -f "$_sshd_conf"
+            _sshd_restored="the new drop-in was removed and there was no previous one"
+        fi
+        rm -f "$_sshd_backup"
+        sshd -t || log_die "the new sshd configuration does not parse, and the configuration restored under it does not parse either — sshd is broken beyond this unit's recovery and must be repaired from the provider's console before this host reboots"
+        log_die "the new sshd configuration does not parse — nothing reloaded, ${_sshd_restored}"
+    fi
+fi
+if [ -n "$_sshd_backup" ]; then
+    rm -f "$_sshd_backup"
 fi
 
 # Land an interactive login in the durable session, on this component as well
@@ -60,6 +100,14 @@ fi
 # work has to outlive the connection.
 fs_install "$REPO_ROOT/shared/profile.d/zz-tmux-attach.sh" \
            /etc/profile.d/zz-tmux-attach.sh 0644
+
+# The geometry half of the same answer. The profile above puts each login in
+# its own client-scoped session so windows are shared and size is not; this
+# settles what happens when two devices do land on the same window. It is
+# byte-identical to the dev-container's copy because the rule belongs to the
+# platform rather than to either component, and the self-test holds the two
+# together so a difference reads as drift instead of as a decision.
+fs_install "$REPO_ROOT/host/sysroot/etc/tmux.conf" /etc/tmux.conf 0644
 
 # ── Root retires, but only once someone else can get in ──────────────────────
 # Remote root is already refused by the sshd policy above. Locking the password

@@ -475,6 +475,28 @@ else
     fail "only ${_argv_seen} of 3 argv forms were detected — the check above is partly blind"
 fi
 
+# ── 4i. One tmux policy, not two ─────────────────────────────────────────────
+# The geometry rules belong to the platform rather than to either component, so
+# the host's copy and the dev-container's are the same file. Two copies of one
+# rule is what C1 forbids, and the only thing keeping them one rule is this
+# check — without it a fix lands on whichever component the session happened to
+# be looking at, and the other silently keeps the old behaviour.
+head_ "tmux policy"
+_tmux_host="$REPO_ROOT/host/sysroot/etc/tmux.conf"
+_tmux_dev="$REPO_ROOT/dev-container/sysroot/etc/tmux.conf"
+if [ -f "$_tmux_host" ] && [ -f "$_tmux_dev" ] && cmp -s "$_tmux_host" "$_tmux_dev"; then
+    pass "both components carry a byte-identical tmux policy"
+else
+    fail "the host and dev-container tmux policies differ, or one is missing"
+fi
+
+# The host's copy only reaches the host if a unit installs it.
+if grep -q 'host/sysroot/etc/tmux.conf' "$REPO_ROOT/host/converge/units/10-identity.sh"; then
+    pass "the host's tmux policy is installed by the identity unit"
+else
+    fail "the host's tmux policy is never installed — it would exist only in the repository"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \

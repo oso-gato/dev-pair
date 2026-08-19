@@ -6,10 +6,20 @@
 # interactive login rather than handing over a bare shell that dies with the
 # socket.
 #
-# The whole point of this component is that work outlives the connection, so an
-# interactive login attaches to tmux rather than to a bare shell that dies with
-# the socket. -A attaches if the session exists and creates it if not, so the
-# first login and every reconnection after a roam take the same path.
+# Each login joins the shared work as its own client-scoped session inside a
+# session GROUP rather than attaching to one session directly. Sessions in a
+# group share their windows, so every device sees the same work, while each
+# device keeps its own current window and its own attachment. Attaching every
+# client to a single session instead would make every client share one
+# geometry, and a second device of a different size would repaint every other
+# device onto a foreign grid — the objective's "from any authorized device"
+# broken by the second device. The geometry rules for the case two devices do
+# land on the same window live in /etc/tmux.conf.
+#
+# The group's first session is created detached and is never attached to. It is
+# what owns the windows, so the work survives every client leaving; the
+# per-login sessions carry destroy-unattached so a disconnected device leaves
+# no session behind to collect.
 #
 # Guarded three ways, because this file runs for more than interactive humans:
 # a non-interactive shell (scp, `ssh nox <command>`, rsync) must not be hijacked,
@@ -22,4 +32,9 @@ esac
 [ -n "${DEV_PAIR_NO_TMUX:-}" ] && return
 command -v tmux >/dev/null 2>&1 || return
 
-exec tmux new-session -A -s "${DEV_PAIR_SESSION:-main}"
+_pair_group="${DEV_PAIR_SESSION:-main}"
+tmux has-session -t "$_pair_group" 2>/dev/null \
+    || tmux new-session -d -s "$_pair_group" 2>/dev/null \
+    || true
+exec tmux new-session -t "$_pair_group" -s "${_pair_group}-$$" \
+     \; set-option destroy-unattached on
