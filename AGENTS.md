@@ -4,13 +4,22 @@ Read this first, every session.
 
 ## Load the law
 
-Fetch the universal constitution at session start — the fetch line is in [CONSTITUTION.md](CONSTITUTION.md), the charter's third file. For structural work, also read the other two: [00-OBJECTIVE.md](00-OBJECTIVE.md), the WHY, and [00-BYLAW.md](00-BYLAW.md), this repository's own law. The charter is locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
+The charter is loaded, not consulted. This repository's two law files are imported immediately below, so both stand in context before the session's first tool call and are re-injected after every compaction.
+
+@00-OBJECTIVE.md
+@00-BYLAW.md
+
+They are read end to end and never in excerpt. An agent working from a quoted fragment contradicts the clause the fragment came from while believing it obeys it, and this repository has done exactly that — the dev-container was once built with no public door at all, citing the outcome that requires one.
+
+The universal constitution is the charter's third file and it cannot be imported, because its text lives at its one home in another repository and a copy here would be the fork it forbids. Fetch it at session start; the line is in [CONSTITUTION.md](CONSTITUTION.md). Fetch it again after a compaction, because an imported file survives one and a fetched document does not.
+
+Cite no C-number a session has not loaded. A rule recalled from memory and a citation attached to a rule that does not contain it are the same defect, and this estate has already built a merge gate citing a C9 requirement C9 does not contain ([000018](docs/decisions/000018-no-sieves-and-product-before-mechanism.md)).
+
+`/context` lists what a session actually holds. Read it rather than assume the load worked.
+
+The charter is locked, maintainer-merge-only. Bare C-numbers mean the universal constitution; B-numbers mean the bylaw.
 
 The pair's identities — GitHub App, tailnet, `core` — rest in the estate vault at homelab-root `identity/`; [ARCHITECTURE.md](ARCHITECTURE.md) § Pairs carries the exact pointers. The vault discipline in homelab-root's AGENTS.md binds here too: credential files are never read, operations on them are content-blind.
-
-## What this repository is
-
-The dev pair: three parts, always. The **GitHub ticket bus** — issues and PRs — carries every hand-off; nothing durable lives only in a container or a layer. The **host** operates the platform and validates what the container cannot (tier-2); it opens PRs and never merges. The **dev-container** develops, validates (tier-1), and holds sole merge authority — except the locked documents above.
 
 ## Working method
 
@@ -22,17 +31,27 @@ Per ticket, the loop runs **specify → plan → tasks → analyze → implement
 4. Analyze — a read-only consistency check across the three before implementing.
 5. Implement, validate, iterate — two tiers, per the objective.
 
-Clarification happens once, at initiation — never a mid-loop human summons (C11). Where the charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
+Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
 
 Execution is parallel where independent and sequential only where dependent: `tasks.md` marks which tasks depend on which, independent tasks fan out concurrently, and dependencies alone impose order. Parallelism never trades away quality or accuracy — every parallel result passes the same gates as if it had run alone (C12).
+
+## Decide, or halt
+
+The pair answers the questions its own work raises. A session reaches the maintainer three ways and no others.
+
+**Delivery**, where the objective is shipped and the outcome is handed over with an account of what was decided along the way. Delivery is a report and asks for no approval.
+
+**A halt**, where the objective cannot be met within its boundaries. The session names the contradiction and proposes an amendment, rather than looping indefinitely or quietly shipping a compromise.
+
+**A scope change**, where a ticket would exceed the objective or the bylaw. The charter is amended first, and only then does the work proceed.
+
+Everything else is decided here. Where the charter is silent, take the smallest footprint that serves the objective, record the decision, and report it at delivery; a wrong choice is amended afterwards and that costs less than a summons. Where the charter speaks, it has already decided, and asking is evidence it was not read.
+
+These never reach the maintainer: which of two designs to take, whether a reading is right, confirmation that a step is correct, a status check, or permission to continue. Build the candidates, test them, discard what fails, and record why — the objective counts one human interaction per project, and an unnecessary escalation is the human summons C11 forbids.
 
 ## Ticket routing
 
 Every ticket carries two stamps: its **pair** (the lineage: `erebus`, `strix`) and its **agent** (`claudebox` = Claude Code, `kimibox` = Kimi Code). Pick up a ticket only when both stamps match your box (C8).
-
-## Self-renewal — never forget this
-
-A maintainer-instructed improvement merges → the host brings itself to the merged state → the host rebuilds and relaunches the dev-container from outside → every session is restored. The dev-container never rebuilds itself — it requests renewal, its own or the host's, through the ticket bus (B4).
 
 ## Chartering a new repository
 

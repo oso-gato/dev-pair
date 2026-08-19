@@ -497,6 +497,47 @@ else
     fail "the host's tmux policy is never installed — it would exist only in the repository"
 fi
 
+# ── 4j. The charter is wired into every session ──────────────────────────────
+# The charter is the pair's whole instruction, and an instruction to READ it can
+# be skipped with no trace — which is how a session once worked a whole day from
+# fragments and built against a Security outcome while citing it. An import
+# cannot be skipped: the bytes are in the window or they are not. This checks
+# the wiring that puts them there, and it never checks the agent, because what
+# an agent read is not observable from outside the session.
+#
+# Total rather than a sieve: a file either carries the import line or it does
+# not. There is nothing to evade and no next evasion to chase.
+head_ "charter loading"
+_load_bad=0
+_want_import() {   # _want_import <file> <imported-path>
+    grep -qE "^@${2}\$" "$REPO_ROOT/$1" && return 0
+    printf '        %s does not import %s\n' "$1" "$2"
+    return 1
+}
+_want_import CLAUDE.md AGENTS.md            || _load_bad=1
+_want_import AGENTS.md 00-OBJECTIVE.md      || _load_bad=1
+_want_import AGENTS.md 00-BYLAW.md          || _load_bad=1
+for _f in CLAUDE.md AGENTS.md 00-OBJECTIVE.md 00-BYLAW.md CONSTITUTION.md; do
+    [ -s "$REPO_ROOT/$_f" ] && continue
+    printf '        %s is missing or empty\n' "$_f"
+    _load_bad=1
+done
+if [ "$_load_bad" = 0 ]; then
+    pass "the charter is imported into every session, not left to be read"
+else
+    fail "the charter is not wired into the session load"
+fi
+
+# Mutation: strip an import on a copy and require the check to catch it.
+_LOAD_MUTANT_DIR="$TESTROOT/loadmutant"
+mkdir -p "$_LOAD_MUTANT_DIR"
+grep -v '^@00-OBJECTIVE.md$' "$REPO_ROOT/AGENTS.md" > "$_LOAD_MUTANT_DIR/AGENTS.md"
+if grep -qE '^@00-OBJECTIVE\.md$' "$_LOAD_MUTANT_DIR/AGENTS.md"; then
+    fail "the mutant still carries the import — the check above proves nothing"
+else
+    pass "a stripped import is detectable, so the check above can fail"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \
