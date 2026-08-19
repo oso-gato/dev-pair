@@ -48,7 +48,12 @@ prov_disclose() {
         chmod 0644 "$PROV_DISCLOSURE"
     }
     local today; today=$(date -u +%Y-%m-%d)
-    local tmp; tmp=$(mktemp)
+    # Staged beside the record and renamed within its own directory, never from
+    # a temp directory. A rename across filesystems carries the source's
+    # SELinux label, so a file staged under /tmp arrives labelled tmp_t. It is
+    # harmless while the host is not enforcing and wrong the moment it is, and
+    # this is the same rule vault_get and the key sync already follow.
+    local tmp="${PROV_DISCLOSURE}.new"
     awk -F'\t' -v a="$artifact" 'NR==1 || $1 != a' "$PROV_DISCLOSURE" > "$tmp"
     printf '%s\t%s\t%s\t%s\t%s\n' "$artifact" "$level" "$source" "$today" "$note" >> "$tmp"
     mv -f "$tmp" "$PROV_DISCLOSURE"

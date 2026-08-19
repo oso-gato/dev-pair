@@ -96,9 +96,19 @@ if command -v tailscaled >/dev/null 2>&1; then
     if tailscale --socket=/run/tailscale/tailscaled.sock status >/dev/null 2>&1; then
         log "already joined the tailnet as ${TAILNET_HOSTNAME:-$HOSTNAME}"
     elif [ -r "${PAIR_TSKEY_PATH:-/run/secrets/tailscale/authkey}" ]; then
+        # The key reaches tailscale as a path rather than as a value.
+        # /proc/<pid>/cmdline is world-readable regardless of who owns the
+        # process, so `--authkey="$(cat …)"` published a live tailnet auth key
+        # to every account in this container for the length of the join. The
+        # `file:` prefix is tailscale's own form for this and has been stable
+        # since 1.38; we use tailscale's own canonical spelling rather than the
+        # legacy `--authkey` alias, so no flag rewriting is relied on. The key file is already mounted
+        # read-only, so nothing new lands on disk. The substitution form also
+        # depended, silently, on `$(…)` stripping the file's trailing newline —
+        # tailscale trims the file's contents itself, so the dependency goes.
         if tailscale --socket=/run/tailscale/tailscaled.sock up \
                 --hostname="${TAILNET_HOSTNAME:-$HOSTNAME}" --ssh \
-                --authkey="$(cat "${PAIR_TSKEY_PATH:-/run/secrets/tailscale/authkey}")" >/dev/null 2>&1; then
+                --auth-key="file:${PAIR_TSKEY_PATH:-/run/secrets/tailscale/authkey}" >/dev/null 2>&1; then
             log "joined the tailnet as ${TAILNET_HOSTNAME:-$HOSTNAME}, Tailscale SSH on"
         else
             log "tailnet join failed — the auth key may be expired; reachable on the public door meanwhile"

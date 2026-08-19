@@ -432,6 +432,49 @@ else
     pass "a door closed before the gate is caught, so the checks above can fail"
 fi
 
+# ── 4h. No credential reaches a process argument ─────────────────────────────
+# /proc/<pid>/cmdline is world-readable whoever owns the process, so anything
+# on argv is readable by every local account for the life of the call. Three
+# forms existed here: a tailnet auth key inlined into `tailscale up`, an App
+# JWT inlined as a curl header — renewed roughly every 50 minutes on both
+# components, for the App that carries merge permission — and the crypt hash
+# handed to `usermod -p`, which usermod's own manual page tells you not to use
+# for exactly this reason. Each has a stdin or file form and this holds them to
+# it. Bounded, closed, over declared artifacts.
+head_ "credentials on argv"
+_argv_bad=0
+while IFS= read -r hit; do
+    # A comment that QUOTES a forbidden form is documenting why it was removed,
+    # and naming a thing is not using it — the same distinction the
+    # forbidden-channel check above already draws. Drop comment lines.
+    case "${hit#*:*:}" in [[:space:]]*\#*|\#*) continue ;; esac
+    _argv_bad=1
+    printf '        %s\n' "$(printf '%s' "$hit" | cut -c1-84)"
+done < <(git -C "$REPO_ROOT" grep -nIE \
+    '(usermod +(-[a-zA-Z]+ +)*-p |--auth-?key=(")?[^f"]|-H +"Authorization: *Bearer )' \
+    -- 'host/**' 'dev-container/**' 'shared/**' ':!host/converge/selftest.sh' 2>/dev/null)
+if [ "$_argv_bad" = 0 ]; then
+    pass "no auth key, App JWT or password hash is passed as a process argument"
+else
+    fail "a credential is passed as a process argument"
+fi
+
+# Each forbidden form must be visible to the pattern. Reproduce all three on a
+# copy outside the scanned tree and require every one to match.
+_ARGV_MUTANT="$TESTROOT/argv-mutant.sh"
+# shellcheck disable=SC2016  # the mutant reproduces the forbidden forms verbatim
+{
+    printf 'usermod -p "$HASH" core\n'
+    printf 'tailscale up --auth-key="$(cat /tmp/k)"\n'
+    printf 'curl -H "Authorization: Bearer $jwt" https://example.invalid/\n'
+} > "$_ARGV_MUTANT"
+_argv_seen=$(grep -cE '(usermod +(-[a-zA-Z]+ +)*-p |--auth-?key=(")?[^f"]|-H +"Authorization: *Bearer )' "$_ARGV_MUTANT")
+if [ "$_argv_seen" -eq 3 ]; then
+    pass "all three argv forms are detected, so the check above can fail"
+else
+    fail "only ${_argv_seen} of 3 argv forms were detected — the check above is partly blind"
+fi
+
 # ── 5. No credential in the tree ─────────────────────────────────────────────
 head_ "credentials"
 if git -C "$REPO_ROOT" grep -nIE '(-----BEGIN [A-Z ]*PRIVATE KEY|tskey-[a-zA-Z0-9]{10,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})' \

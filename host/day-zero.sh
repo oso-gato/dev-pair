@@ -48,9 +48,38 @@ die()  { printf '\033[31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 # power loss mid-run strands no token on disk.
 WORKDIR=$(mktemp -d); chmod 700 "$WORKDIR"
 export GH_CONFIG_DIR="$WORKDIR/gh"
+# One handler, extended and never joined. Bash keeps a single handler per
+# signal, so a second `trap ... EXIT` anywhere below would replace this one
+# rather than run beside it, leaving the device-flow token logged in and
+# $WORKDIR — which holds the tailnet key — on disk. Everything that must
+# happen at exit is added here.
 cleanup() {
+    local rc=$?
     gh auth logout --hostname github.com >/dev/null 2>&1 || true
     rm -rf "$WORKDIR"
+
+    # A failing run says how the host was left, because the operator is about
+    # to decide whether the console in front of them is still a door.
+    if [ "$rc" -ne 0 ]; then
+        # Root's state is read rather than asserted. 10-identity.sh is the
+        # first converger unit and it locks root, so any failure from the
+        # phase 3 handoff onwards leaves root already retired — the opposite
+        # of what this script used to tell the operator. The idiom is that
+        # unit's, so the two never disagree about what `passwd -S` means.
+        if passwd -S root 2>/dev/null | awk '{print $2}' | grep -qE '^(L|LK)$'; then
+            warn "root is LOCKED — this console will not authenticate it again, and ssh as ${ADMIN_USER:-the administrative user} is the only door left."
+        else
+            warn "root is NOT locked — it still authenticates at this console."
+        fi
+        # The public address, never the tailnet. Every failure point above is
+        # before phase 3, which is where `tailscale up` runs, so at the moment
+        # this prints the tailnet node does not exist yet and naming it would
+        # send the operator to an address that answers nothing.
+        if [ -n "${HOST_IP:-}" ]; then
+            printf 'The way back in, by key:\n\n    ssh %s@%s\n\n' "${ADMIN_USER:-}" "$HOST_IP" >&2
+        fi
+    fi
+    return 0
 }
 trap cleanup EXIT INT TERM
 
@@ -109,12 +138,60 @@ AK="$(getent passwd "$ADMIN_USER" | cut -d: -f6)/.ssh/authorized_keys"
 [ -s "$AK" ] || die "no key was authorized for ${ADMIN_USER} — refusing to continue, because the next phase closes the console path"
 ok "authorized $(wc -l < "$AK") key(s) for ${ADMIN_USER} from github.com/${TRUST_ROOT_USER}.keys"
 
+# The way back in, named the moment it becomes true. From here on the
+# maintainer's keys authenticate ${ADMIN_USER}, so a run that dies below is
+# recoverable by SSH rather than by the provider's rescue path — but only if
+# the operator was told the address before the console closed.
+#
+# The address is read from the host's own routing table. C4 forbids asking a
+# third-party echo service what this machine's address is, and the machine
+# already knows.
+HOST_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+[ -n "$HOST_IP" ] || HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[ -n "$HOST_IP" ] || HOST_IP="<this host's public address>"
+
+say "the way back in"
+cat <<EOF
+${ADMIN_USER} now authenticates by key over SSH, so this console is no longer
+the only door. If it closes, or anything below fails, get back in with:
+
+    ssh ${ADMIN_USER}@${HOST_IP}
+
+That is the public address. The tailnet does not exist yet — phase 3 joins it —
+so it is the only address that answers until this run finishes.
+EOF
+
 # Keys-only SSH, applied now rather than at the end. Password authentication is
 # open on the stock template, and leaving it open for the length of this run
 # would be a window nobody declared.
-install -D -m 0644 "$SRC/host/sysroot/etc/ssh/sshd_config.d/40-dev-pair.conf" \
-    /etc/ssh/sshd_config.d/40-dev-pair.conf
-sshd -t || die "the keys-only sshd configuration does not parse — nothing reloaded"
+#
+# The incumbent is kept, the new file is tested where it will actually live,
+# and a failure puts the previous state back. A drop-in under sshd_config.d is
+# included the moment it lands, so testing a copy somewhere else proves only
+# that the file parses alone and not that it agrees with the main config —
+# the honest test is the file in place. That test has to be able to undo
+# itself: without the restore below an invalid drop-in simply stayed on disk,
+# the running daemon survived on the config it had already loaded, and the
+# next reboot came up with no public door at all. The restore is the recovery
+# C11 asks for, and the previous code had none.
+SSHD_DROPIN=/etc/ssh/sshd_config.d/40-dev-pair.conf
+SSHD_INCUMBENT=""
+if [ -f "$SSHD_DROPIN" ]; then
+    SSHD_INCUMBENT="$WORKDIR/40-dev-pair.conf.incumbent"
+    cp "$SSHD_DROPIN" "$SSHD_INCUMBENT"
+fi
+install -D -m 0644 "$SRC/host/sysroot/etc/ssh/sshd_config.d/40-dev-pair.conf" "$SSHD_DROPIN"
+if ! sshd -t; then
+    # Restored by creating the file in place rather than moving one in, so it
+    # takes the directory's SELinux label instead of $WORKDIR's.
+    if [ -n "$SSHD_INCUMBENT" ]; then
+        install -m 0644 "$SSHD_INCUMBENT" "$SSHD_DROPIN"
+    else
+        rm -f "$SSHD_DROPIN"
+    fi
+    sshd -t || warn "sshd's configuration still does not parse with the previous state restored — this host's sshd was already broken before day zero touched it"
+    die "the keys-only sshd configuration does not parse — the previous state is restored and nothing was reloaded"
+fi
 systemctl reload sshd 2>/dev/null || systemctl restart sshd || die "cannot reload sshd"
 ok "sshd is keys-only; root cannot authenticate remotely"
 
@@ -241,7 +318,14 @@ case "$CORE_HASH" in
     '$6$'*) : ;;
     *) die "the core password hash is not the SHA-512 crypt the declaration promises" ;;
 esac
-usermod -p "$CORE_HASH" "$ADMIN_USER" || die "cannot apply the core password hash"
+# The hash reaches usermod's replacement on stdin. usermod(8) says plainly not
+# to use -p, "because the password (or encrypted password) will be visible by
+# users listing the processes", and /proc/<pid>/cmdline is world-readable. This
+# is the smallest of the three argv leaks — C6 calls a hash a declaration
+# rather than a secret, and at this moment the box is minutes old — but the
+# manual page names the defect and the fix is one line.
+printf '%s:%s\n' "$ADMIN_USER" "$CORE_HASH" | chpasswd -e \
+    || die "cannot apply the core password hash"
 unset CORE_HASH
 ok "administrative password applied — sudo now requires it"
 
@@ -333,13 +417,20 @@ ok "authorization token destroyed"
 say "phase 3: converge"
 
 CONVERGE_ENV="$ENVIRONMENT" bash "$SRC/host/converge/converge.sh" --env "$ENVIRONMENT" \
-    || die "converge failed — the host is partially configured, root is NOT retired, and re-running day zero is safe"
+    || die "converge failed — the host is partially configured, and re-running day zero is safe"
 
 # The tailnet join needs the key, so it happens here rather than in a converger
 # unit: a converge run holds no credentials and must never need any.
 say "tailnet"
 if [ "$tailscale_join_interactive" = 0 ]; then
-    if tailscale up "${TAILSCALE_ARGS[@]}" --authkey="$(cat "$WORKDIR/tskey")"; then
+    # The key goes in by path, never by value. tailscale resolves a `file:`
+    # prefix on the auth key itself, stable since 1.38, which keeps the secret
+    # out of argv — /proc/<pid>/cmdline is world-readable, so a live unexpired
+    # key sat there for anyone on the box, and it landed in this console's
+    # scrollback and in any journal capture of the paste besides. It also
+    # removes the $(cat ...) subshell, which silently depended on command
+    # substitution stripping the file's trailing newline.
+    if tailscale up "${TAILSCALE_ARGS[@]}" --auth-key="file:$WORKDIR/tskey"; then
         ok "joined the tailnet as ${TAILNET_HOSTNAME}"
     else
         warn "the auth key was rejected — falling back to browser authentication"

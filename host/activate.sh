@@ -290,7 +290,14 @@ CONVERGE_ENV="$ENVIRONMENT" bash "$SRC/host/converge/converge.sh" --env "$ENVIRO
 
 say "tailnet"
 if [ "$join_interactive" = 0 ]; then
-    if tailscale up "${TAILSCALE_ARGS[@]}" --authkey="$(cat "$WORKDIR/tskey")"; then
+    # The key goes in by path, never by value. tailscale resolves a `file:`
+    # prefix on the auth key itself, stable since 1.38, which keeps the secret
+    # out of argv — /proc/<pid>/cmdline is world-readable, so a live unexpired
+    # key sat there for anyone on the box, and it landed in this console's
+    # scrollback and in any journal capture of the paste besides. It also
+    # removes the $(cat ...) subshell, which silently depended on command
+    # substitution stripping the file's trailing newline.
+    if tailscale up "${TAILSCALE_ARGS[@]}" --auth-key="file:$WORKDIR/tskey"; then
         ok "joined the tailnet as ${TAILNET_HOSTNAME}, advertising the LAN route"
     else
         warn "the auth key was rejected — falling back to browser authentication"
