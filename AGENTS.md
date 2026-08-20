@@ -8,10 +8,11 @@ The charter is loaded, not consulted. This repository's two law files are import
 
 @00-OBJECTIVE.md
 @00-BYLAW.md
+@CONSTITUTION.md
 
 They are read end to end and never in excerpt. An agent working from a quoted fragment contradicts the clause the fragment came from while believing it obeys it, and this repository has done exactly that — the dev-container was once built with no public door at all, citing the outcome that requires one.
 
-The universal constitution is the charter's third file and it cannot be imported, because its text lives at its one home in another repository and a copy here would be the fork it forbids. Fetch it at session start; the line is in [CONSTITUTION.md](CONSTITUTION.md). Fetch it again after a compaction, because an imported file survives one and a fetched document does not.
+The third import is a pointer rather than the law. The universal constitution's text lives at its one home in another repository and a copy here would be the fork it forbids, so what is imported is the file holding its fetch line — which means the instruction to fetch survives a compaction even though the fetched text does not. Fetch it at session start, and fetch it again after every compaction.
 
 Cite no C-number a session has not loaded. A rule recalled from memory and a citation attached to a rule that does not contain it are the same defect, and this estate has already built a merge gate citing a C9 requirement C9 does not contain ([000018](docs/decisions/000018-no-sieves-and-product-before-mechanism.md)).
 
@@ -48,6 +49,22 @@ The pair answers the questions its own work raises. A session reaches the mainta
 Everything else is decided here. Where the charter is silent, take the smallest footprint that serves the objective, record the decision, and report it at delivery; a wrong choice is amended afterwards and that costs less than a summons. Where the charter speaks, it has already decided, and asking is evidence it was not read.
 
 These never reach the maintainer: which of two designs to take, whether a reading is right, confirmation that a step is correct, a status check, or permission to continue. Build the candidates, test them, discard what fails, and record why — the objective counts one human interaction per project, and an unnecessary escalation is the human summons C11 forbids.
+
+## How a session goes wrong here
+
+Every rule below was measured in this repository, and each names the act it forbids rather than the virtue it wants. **The list does not grow: a new rule replaces one, or it is not a rule.** The predecessor kept a section like this, told itself that brevity was what kept it salient, and then grew a manual nobody could hold.
+
+**Open it before asserting anything about it.** A claim about a file, a repository or an upstream tool is not made until it has been read. This estate has recommended a home inside a repository nobody had opened, and recorded a host property nothing in the tree established.
+
+**A challenger moves you only with a fact you did not have** — a clause, a line of code, a measured behaviour. A fresh framing of facts already held is not a reason to reverse, and treating the newest input as the authority produces a weather vane rather than a position.
+
+**Say the margin when a call is close.** A judgement reported at full confidence reads as settled, so the next small shift reads as a reversal rather than a refinement.
+
+**Answer the question that was asked.** A status question wants status. A question about one thing is not permission to change another.
+
+**Report the outcome, not the deliberation.** What was decided, what it cost, what remains unproven — the reasoning belongs in the decision record, not in the reply.
+
+**Fan out by independence (C12).** Work touching disjoint files runs in parallel; only a result another step consumes imposes order.
 
 ## Ticket routing
 

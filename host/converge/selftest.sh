@@ -517,6 +517,7 @@ _want_import() {   # _want_import <file> <imported-path>
 _want_import CLAUDE.md AGENTS.md            || _load_bad=1
 _want_import AGENTS.md 00-OBJECTIVE.md      || _load_bad=1
 _want_import AGENTS.md 00-BYLAW.md          || _load_bad=1
+_want_import AGENTS.md CONSTITUTION.md      || _load_bad=1
 for _f in CLAUDE.md AGENTS.md 00-OBJECTIVE.md 00-BYLAW.md CONSTITUTION.md; do
     [ -s "$REPO_ROOT/$_f" ] && continue
     printf '        %s is missing or empty\n' "$_f"
@@ -526,6 +527,17 @@ if [ "$_load_bad" = 0 ]; then
     pass "the charter is imported into every session, not left to be read"
 else
     fail "the charter is not wired into the session load"
+fi
+
+# The manual must not outgrow the law. A session's attention is finite, and a
+# manual longer than the charter buries what it exists to deliver — which is
+# how the predecessor reached a 279 KB operating file nobody could hold.
+_manual=$(wc -l < "$REPO_ROOT/AGENTS.md")
+_law=$(( $(wc -l < "$REPO_ROOT/00-OBJECTIVE.md") + $(wc -l < "$REPO_ROOT/00-BYLAW.md") ))
+if [ "$_manual" -lt "$_law" ]; then
+    pass "the manual (${_manual} lines) is shorter than the law it loads (${_law})"
+else
+    fail "the manual is ${_manual} lines against ${_law} of law — it has outgrown what it delivers"
 fi
 
 # Mutation: strip an import on a copy and require the check to catch it.
