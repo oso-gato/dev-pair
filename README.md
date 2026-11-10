@@ -1,6 +1,14 @@
 # dev-pair
 
-The autonomous dev pair: a Fedora host and a dev container, built and run as one system.
+The autonomous dev pair takes a product brief and delivers a tested, ready-to-use product. The product owner supplies the requirements; code review and routine development are the pair's responsibility.
+
+The required platform is a Fedora host with a Podman development container, both operated by Codex. [00-OBJECTIVE.md](00-OBJECTIVE.md) defines the roles and delivery outcomes; [00-BYLAW.md](00-BYLAW.md) B5 defines the runtime.
+
+## Implementation status
+
+The 2026-11-10 requirements revision records the agreed direction. The existing implementation still uses Claude Code and nested Distrobox under Podman; Codex has not yet replaced them. Existing code and historical decisions are retained while the replacement is developed. [ARCHITECTURE.md](ARCHITECTURE.md) remains the map of the actual source, and [decision 000034](docs/decisions/000034-codex-on-podman.md) records the transition.
+
+## Governing documents
 
 The **charter** governs everything in this repository — three documents, maintainer-merge-only:
 

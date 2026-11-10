@@ -2,7 +2,11 @@
 
 Agent-owned map of the system as built. Mutable-on-fact: updated in the same change that alters a fact. Never a conformance target — this map chases the code, not the reverse. It records only what exists: unbuilt work lives in issues, never here, because a list of absent mechanisms sitting in the current-state map reads as a build queue and gets built.
 
-## Current state (2026-08-18)
+## Requirements revision (2026-11-10)
+
+The charter and operating manual now describe the Codex and Podman target recorded in [decision 000034](docs/decisions/000034-codex-on-podman.md). This revision changes documentation only. The source still contains the Claude-specific runtime described below; it does not yet implement the new requirements. No host was contacted or changed, and the August deployment observations below have not been reverified.
+
+## Recorded implementation baseline (2026-08-18)
 
 This repository holds the governing documents, the documentation surfaces, and both lineages' genesis paths as code. The confirmed baseline is the protected tag `chartered` (epochs timestamped per C11 — the only epoch is `chartered-2026-08-18-0159` (Hong Kong time), where the floating tag points, wrapped in a Release); two active tag rulesets armour them — epochs immutable to everyone, the floating name maintainer-movable. The universal principles and the genesis kit live in `oso-gato/homelab-root` (`principles/`, `genesis/`); `CONSTITUTION.md` here carries the pull and its charter membership, and `00-BYLAW.md` carries the B-numbered principles, this repository's platform declaration, and the one instantiation it owns.
 

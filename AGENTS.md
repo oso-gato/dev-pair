@@ -12,6 +12,8 @@ The pair's identities — GitHub App, tailnet, `core` — rest in the estate vau
 
 The dev pair: three parts, always. The **GitHub ticket bus** — issues and PRs — carries every hand-off; nothing durable lives only in a container or a layer. The **host** operates the platform and validates what the container cannot (tier-2); it opens PRs and never merges. The **dev-container** develops, validates (tier-1), and holds sole merge authority — except the locked documents above.
 
+The target is Fedora with rootless Podman and Codex in both roles, as defined in the objective and B5. Codex runs directly inside the dev-container. The checked-in runtime still uses Claude Code and nested Distrobox; this requirements revision does not implement that migration. Read [docs/decisions/000034-codex-on-podman.md](docs/decisions/000034-codex-on-podman.md) for the transition and preserve existing code and frozen records until their replacement is validated.
+
 ## Working method
 
 Per ticket, the loop runs **specify → plan → tasks → analyze → implement**:
@@ -20,7 +22,7 @@ Per ticket, the loop runs **specify → plan → tasks → analyze → implement
 2. `docs/specs/<NNNNNN-slug>/plan.md` — the design that serves it.
 3. `docs/specs/<NNNNNN-slug>/tasks.md` — the decomposition to iterate through.
 4. Analyze — a read-only consistency check across the three before implementing.
-5. Implement, validate, iterate — two tiers, per the objective.
+5. Implement, validate, iterate — two tiers, then independent review, deployment and live verification per the objective and B6. Deliver the usable product and evidence in plain language; the product owner does not review code.
 
 Clarification happens once, at initiation — never a mid-loop human summons (C11). Where the charter is silent, decide with the smallest footprint, record the decision, and report it at delivery — the objective's silence policy. Spec folders merge to main and freeze at ship; a change is a new ticket. A decision stays in `plan.md` while it binds one ticket; it graduates to [docs/decisions/](docs/decisions/) when it binds future ones.
 
@@ -28,11 +30,11 @@ Execution is parallel where independent and sequential only where dependent: `ta
 
 ## Ticket routing
 
-Every ticket carries two stamps: its **pair** (the lineage: `erebus`, `strix`) and its **agent** (`claudebox` = Claude Code, `kimibox` = Kimi Code). Pick up a ticket only when both stamps match your box (C8).
+Every ticket carries its **pair** (the lineage: `erebus`, `strix`) and its **agent**. New Codex work names `codex` and the maintenance, development or review role explicitly. Historical `claudebox` and `kimibox` stamps retain their original meaning; do not rename existing App identities, credential paths or historical tickets as a side effect of the requirements change. Pick up only work routed to the session's pair and role. Runtime routing for Codex must be implemented and verified before claiming unattended pickup works.
 
 ## Self-renewal — never forget this
 
-A maintainer-instructed improvement merges → the host brings itself to the merged state → the host rebuilds and relaunches the dev-container from outside → every session is restored. The dev-container never rebuilds itself — it requests renewal, its own or the host's, through the ticket bus (B4).
+A maintainer-instructed improvement merges → CI builds the production image → the host brings itself to the merged state → the host pulls and relaunches the dev-container from outside → every active job resumes from durable state. The dev-container never replaces itself — it requests renewal, its own or the host's, through the ticket bus (B4).
 
 ## Chartering a new repository
 
@@ -58,7 +60,7 @@ Every document here is written one way, for humans and agents alike. Full prose 
 
 ## Build & test
 
-The erebus lineage's genesis path is built and unapplied; `moros` and the strix pair's activation are the remaining build. What runs today:
+The recorded baseline has both lineages' genesis paths as code and unapplied; the live machines have not been reverified in this requirements revision. The following commands belong to the retained Claude implementation, not the proposed Codex runtime:
 
 - `bash host/converge/selftest.sh` — everything the container can prove without a host: every delivered script parses, shellcheck is clean at style level, the idempotence primitives are exercised against a real filesystem and mutation-checked, and the tree carries no credential, no forbidden channel, and no installation missing `install_weak_deps=False`. This is the tier-1 gate and it must be green before a ticket is offered as done.
 - `sudo host/converge/converge.sh --env <name>` — converge a host. `--list` shows the units, `--only <unit>` runs one. Re-running is the normal case, and a converged host reports zero changes.

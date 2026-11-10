@@ -4,6 +4,8 @@
 
 Confirmed 2026-08-16 with the objective, sharing its authority, and fixed: amendment is a new maintainer confirmation, never a silent edit, and only the maintainer merges it. This is one of the two initiation artifacts (C2) — with the objective and, by reference, the constitution, the charter — co-created with the maintainer in the initiation session. It is subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)) — valid only where it does not conflict — and bare C-numbers below refer to it.
 
+The 2026-11-10 revision records the requested Codex and Podman design and awaits the charter merge. [CONSTITUTION.md](CONSTITUTION.md) records the maintainer-directed departure from C8's runtime placement; all other universal principles continue to apply.
+
 ## B1 — THE THROWAWAY PRINCIPLE & CHURN
 
 This is the pair's build-and-validation mechanism. Every build is a throwaway. The tree it builds from is a throwaway with it. Nothing ever builds from the host's live tree or the container's live tree — a throwaway tree is cut first, used, and torn down. This is what keeps both components immutable (C7) while the pair builds and validates work for any repository.
@@ -40,13 +42,37 @@ A producer-first emission that can strand or wedge a not-yet-upgraded counterpar
 
 Self-renewal is the pair's three parts — **the GitHub ticket bus, the host, and the dev-container** (the objective's definition) — making the pair's own improvement live with no human step.
 
-The chain: a maintainer-instructed improvement merges; the host brings itself to the merged state via its deploy mechanism (C7, instantiated below); the host rebuilds and relaunches the dev-container from outside; the full multi-tenant session set is restored (C8). The dev-container never rebuilds itself — it requests its own renewal, and the host's, through the ticket bus. Each link is verified by reading the live artifact back, fail-closed.
+The chain: a maintainer-instructed improvement merges; CI builds the required production images; the host brings itself to the merged state via its deploy mechanism (C7, instantiated below); the host pulls the verified image and relaunches the dev-container from outside; the active job set resumes from durable checkpoints. The dev-container never replaces itself — it requests its own renewal, and the host's, through the ticket bus. Each link is verified by reading the live artifact back, fail-closed.
 
 Neither component rebuilds the agent doing the work. A renewal that cannot restore its sessions does not fire. A failed link recovers under C11 and surfaces to the maintainer only after bounded attempts fail.
 
+## B5 — PODMAN AND CODEX RUNTIME
+
+Podman is the pair's container runtime. Rootless containers are managed through Quadlet and systemd; Docker Engine and a Docker daemon are not platform dependencies.
+
+The development worker is the dev-container itself: Codex, project tools and tests run directly in that container, with a persistent project workspace. No nested Distrobox or second agent container is required inside it. The maintenance Codex runs in a separate Podman container on the Fedora host.
+
+Development containers receive no host Podman socket, host administration credentials or unrestricted host execution bridge. They request host operations through the ticket bus. The maintenance role reaches only declared operations through a controlled host interface; it does not gain unrestricted passwordless sudo merely because it is autonomous.
+
+Concurrent jobs use separate rootless container instances with separate workspace, Codex state and credential mounts. A Git worktree separates edits but does not by itself enforce access isolation. Host administration and development workloads use distinct service identities and permissions; `core` remains the human administrative identity. Resource ceilings and bounded cleanup apply to every job.
+
+The new runtime retains SELinux confinement and default capability restrictions unless a specific required operation has a measured, recorded exception. The nesting exception in ADR 000029 is not inherited automatically by the replacement.
+
+Codex versions and containing images are pinned and admitted under C4 and C5. Updates rebuild images, preserve external state and pass validation before rollout. The migration must verify an official installation route and record its provenance before adopting it; this requirements change does not waive installation restrictions or declare a Codex package admitted.
+
+## B6 — DELIVERY EVIDENCE
+
+The five-stage working method remains, with records proportional to the change. Acceptance criteria are written before implementation, and execution continues through tests, independent review, deployment and live verification before delivery.
+
+The reviewer runs in a separate Codex session with the confirmed requirements and the exact candidate available for inspection. It cannot alter the candidate to make its review pass. A release binds its source revision, image digest or artifact checksum, test results and review result together; a new candidate invalidates the previous release verdict.
+
+The development side retains the existing merge role, but release checks are enforced outside the author session. A product job cannot weaken its own required checks or substitute an author statement for independent evidence. Platform policy changes follow their own reviewed change path.
+
+Recovery is demonstrated at the real boundary: interrupt a job and resume its work, reject an unhealthy deployment and recover, and restore durable data into a clean destination. Failures consume bounded attempts and produce a blocker report when recovery is exhausted. Numeric limits belong in the project's confirmed requirements and runtime configuration.
+
 ## Instantiations of universal law
 
-This repository declares one platform and owns one instantiation — the estate's live implementation of a universal principle, recorded here as fact.
+This repository declares one platform and the required deploy mechanisms below. [ARCHITECTURE.md](ARCHITECTURE.md) records which parts exist and have been applied; a requirement here is not evidence of live implementation.
 
 **Platform (declares under C4).** This repository builds on Fedora. C4 carries both platforms' ladder names, their minimalism flags and their forbidden instances; none of it is restated here.
 

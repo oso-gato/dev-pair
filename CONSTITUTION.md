@@ -9,3 +9,9 @@ gh api repos/oso-gato/homelab-root/contents/principles/CONSTITUTION.md --jq .con
 ```
 
 Repo-specific law, subordinate to it: [00-BYLAW.md](00-BYLAW.md).
+
+## Maintainer direction for this revision
+
+The 2026-11-10 requirements revision records the maintainer's instruction for dev-pair to use Podman and Codex in both roles, with development Codex running directly inside the dev-container. This later direction takes precedence for this repository over C8's prescribed nested Distrobox placement and independently rebuilt inner agent layer. The replacement keeps disposable images, durable external state and verified renewal; [00-BYLAW.md](00-BYLAW.md) B5 defines its runtime contract.
+
+This is a scoped departure recorded for the charter merge, not a claim that the universal constitution or other repositories have been amended. C4's package-admission requirements remain in force, and the Codex installation route must be resolved before runtime implementation. The rationale and transition are in [docs/decisions/000034-codex-on-podman.md](docs/decisions/000034-codex-on-podman.md).
