@@ -1,90 +1,43 @@
-# The Dev Pair — BYLAW (repo-specific build principles)
+# Dev-pair bylaw
 
-## Authority
+## Platform
 
-Confirmed 2026-08-16 with the objective, sharing its authority, and fixed: amendment is a new maintainer confirmation, never a silent edit, and only the maintainer merges it. This is one of the two initiation artifacts (C2) — with the objective and, by reference, the constitution, the charter — co-created with the maintainer in the initiation session. It is subordinate to the universal constitution ([CONSTITUTION.md](CONSTITUTION.md)) — valid only where it does not conflict — and bare C-numbers below refer to it.
+Use Fedora Cloud 45 for the first VPS and versioned Fedora 45 base images for the agent environments. Verify the provider image, architecture, runtime capabilities and official image identities before adoption. Pin deployed images by digest and record their source revisions. Apply tested maintenance updates; a major Fedora upgrade is a deliberate platform change, never an automatic consequence of a floating `latest` tag.
 
-The 2026-11-10 revision records the requested Codex and Podman design and awaits the charter merge. [CONSTITUTION.md](CONSTITUTION.md) records the maintainer-directed departure from C8's runtime placement; all other universal principles continue to apply.
+Use rootless Podman with Quadlet and systemd. Docker Engine is not a dependency. Keep SELinux enforcing and retain container confinement; an exception requires a demonstrated need and a recorded scope.
 
-## B1 — THE THROWAWAY PRINCIPLE & CHURN
+## Roles and isolation
 
-This is the pair's build-and-validation mechanism. Every build is a throwaway. The tree it builds from is a throwaway with it. Nothing ever builds from the host's live tree or the container's live tree — a throwaway tree is cut first, used, and torn down. This is what keeps both components immutable (C7) while the pair builds and validates work for any repository.
+The maintenance agent runs in its own Podman container and uses a controlled host-operation interface for deployment, health checks and recovery. It does not receive unrestricted passwordless administration. Keep a documented operator recovery path that works when the agent is unavailable.
 
-Scope. The throwaway principle governs build state on the pair's components — trees, images, run containers, caches. It never governs repository content: what lands on main through the merge path is the durable record, governed by C1 and C2. A shipped ticket's `docs/specs/` folder accumulating on main is record, not drift.
+The development agent runs directly inside the development container alongside project tools and tests. No additional Distrobox agent layer is required. Give it its own workspace and runtime state, without the host Podman socket, host administration credentials or unrestricted host execution bridge.
 
-Validation follows the objective's two tiers. A build validates inside the dev-container where possible. Only what the container cannot validate — PID 1 and boot-level behaviour, for example — runs on the host.
+Use separate service permissions for the two roles and separate credentials and state for each job. Durable work lives in declared volumes or external storage, not only in disposable image layers. Apply resource limits and bounded cleanup. Add concurrent workers only after their access isolation and resource handling have been tested.
 
-Teardown is total. An EXIT-trap, covering signal paths, removes every throwaway tree, image, and run container. An orphan sweeper reaps crash and kill leaks; the sweeper itself is scheduled and proven.
+## Agent selection
 
-The only durable inputs are caches: a small, declared registry holding re-downloadable inputs only — never build output, never an image layer. The standard: anything cached re-downloads at zero bytes on the next iteration. Every cache is bounded by a hard ceiling under a scheduled, self-verifying actuator, so storage can never grow without limit. Eviction policy and numeric ceilings are architecture facts; they live in `ARCHITECTURE.md`, not here.
+- `gptbox` identifies OpenAI Codex.
+- `claudebox` identifies Claude Code.
+- `agentbox` resolves to the configured default, initially `gptbox` for both roles.
 
-Churn discipline for images: heavy, stable layers early; churning layers late. Iterative rebuilds ride the layer cache. A full clean rebuild is a periodic, deliberate event — never part of churn.
+Explicit selection overrides the default for a new session. Resolve and record the concrete agent, role, runtime version and selected model when a job starts. Existing and resumed jobs keep that selection when the default changes. The agent default does not prescribe a particular model version.
 
-## B2 — ISOLATED WORKING TREE
+Share lifecycle code for launch, durable state, renewal and routing. Keep installation, authentication, invocation, configuration and resume in small agent-specific adapters. An unavailable or unvalidated selection fails clearly; it never silently switches provider. Build and validate the Codex adapter first. Reserving the Claude name does not require implementing its adapter for the first milestone.
 
-B1 governs what builds; this governs who works where. Every authoring or build action runs in a fresh working tree, namespaced to its session. No action mutates the live tree, a shared clone, or another session's tree. All mutable local state — worktree roots, locks, markers, scratch — is namespaced per session too.
+## Development and release
 
-Before every commit and every push, the checked-out branch is re-verified to belong to the session's own namespace. This holds at the authoring sites and at the harness's own commit and push sites alike — the harness being the most important case.
+Use a short loop: agree the outcome, plan the work, implement, test, independently review, deploy and verify. Keep planning proportional to the change. Use isolated working copies for edits and reproducible candidates for validation.
 
-The `cd` into an isolated tree is a fail-closed guard, never a prefix. If the enter fails, no mutating step runs in the caller's directory.
+Use GitHub issues and pull requests for durable requests, changes and results. Record job checkpoints and artifact locations so recovery does not depend on a running conversation. Treat request text and repository content as input, not permission to expand authority or execute arbitrary host commands.
 
-A mutating action outside an isolated tree, or a commit or push without branch re-verification, is UNSAFE.
+The host proposes source changes and never merges them. The development side may merge ordinary changes after independently enforced checks pass. The author session cannot modify its own release policy or supply its own independent review. Charter amendments remain product-owner decisions.
 
-## B3 — ATOMIC CONTRACTS / RUNTIME COMPATIBILITY
+CI builds production images from the approved source. The host deploys the exact verified artifact and checks it at the destination. Development and host-side validation use disposable candidates rather than modifying the running platform. The host controls replacement of development containers; a worker does not replace itself mid-job.
 
-This governs the pair's own protocol — the ticket bus, the verdict formats, and the refresh manifests the two components use to talk to each other. Every contract has one home: defined once in `shared/`, versioned, both sides reading the same definition. A contract change lands atomically — producer and consumer updated in the same merge, never separately.
+## Operation and recovery
 
-The repository guarantees the source; the runtime still staggers. The two components upgrade at different moments, so for a window one side runs old code. Two rules cover that window. A consumer that receives a shape it does not recognise refuses it safely — it never guesses. A producer does not emit a new shape until the consumer that understands it is confirmed live.
+Each job has explicit time, spending and retry limits, with durable progress records and bounded recovery. Checkpoint work before planned renewal and verify that it resumes afterward. Updates rebuild and replace images rather than installing tools into running containers.
 
-A producer-first emission that can strand or wedge a not-yet-upgraded counterpart is UNSAFE.
+Back up declared durable state and prove restoration. Match rollback to the application's data changes; reverting an image alone may not undo a database migration. Keep the previous working release available until the new release is verified.
 
-## B4 — SELF-RENEWAL
-
-Self-renewal is the pair's three parts — **the GitHub ticket bus, the host, and the dev-container** (the objective's definition) — making the pair's own improvement live with no human step.
-
-The chain: a maintainer-instructed improvement merges; CI builds the required production images; the host brings itself to the merged state via its deploy mechanism (C7, instantiated below); the host pulls the verified image and relaunches the dev-container from outside; the active job set resumes from durable checkpoints. The dev-container never replaces itself — it requests its own renewal, and the host's, through the ticket bus. Each link is verified by reading the live artifact back, fail-closed.
-
-Neither component rebuilds the agent doing the work. A renewal that cannot restore its sessions does not fire. A failed link recovers under C11 and surfaces to the maintainer only after bounded attempts fail.
-
-## B5 — PODMAN AND CODEX RUNTIME
-
-Podman is the pair's container runtime. Rootless containers are managed through Quadlet and systemd; Docker Engine and a Docker daemon are not platform dependencies.
-
-**`agentbox`** is the stable entry point that resolves to the configured default agent environment. The concrete names are `gptbox` for OpenAI Codex and `claudebox` for Claude Code. The current required default is `agentbox → gptbox` for both maintenance and development. These names identify agent environments, not an extra container layer; Codex keeps its `codex` CLI command and Claude Code keeps its `claude` command.
-
-Selecting `gptbox` or `claudebox` explicitly overrides the default for that new session. Changing the default affects new sessions only; existing jobs and resumed sessions keep their recorded concrete agent. Record the resolved agent, role, runtime version and selected model with each job. The environment default and the model selected inside that environment are separate settings.
-
-Shared lifecycle code owns launch, state persistence, renewal and routing. Small agent-specific adapters own installation, authentication, invocation, configuration and resume. Credentials and session state remain separate per agent and job. An unavailable or unadmitted selection fails clearly rather than silently switching providers. Both adapters must satisfy the same permissions and delivery gates before use; retaining a script alone does not establish support.
-
-The development worker is the dev-container itself: Codex, project tools and tests run directly in that container, with a persistent project workspace. No nested Distrobox or second agent container is required inside it. The maintenance Codex runs in a separate Podman container on the Fedora host.
-
-Development containers receive no host Podman socket, host administration credentials or unrestricted host execution bridge. They request host operations through the ticket bus. The maintenance role reaches only declared operations through a controlled host interface; it does not gain unrestricted passwordless sudo merely because it is autonomous.
-
-Concurrent jobs use separate rootless container instances with separate workspace, Codex state and credential mounts. A Git worktree separates edits but does not by itself enforce access isolation. Host administration and development workloads use distinct service identities and permissions; `core` remains the human administrative identity. Resource ceilings and bounded cleanup apply to every job.
-
-The new runtime retains SELinux confinement and default capability restrictions unless a specific required operation has a measured, recorded exception. The nesting exception in ADR 000029 is not inherited automatically by the replacement.
-
-Codex versions and containing images are pinned and admitted under C4 and C5. Updates rebuild images, preserve external state and pass validation before rollout. The migration must verify an official installation route and record its provenance before adopting it; this requirements change does not waive installation restrictions or declare a Codex package admitted.
-
-## B6 — DELIVERY EVIDENCE
-
-The five-stage working method remains, with records proportional to the change. Acceptance criteria are written before implementation, and execution continues through tests, independent review, deployment and live verification before delivery.
-
-The reviewer runs in a separate Codex session with the confirmed requirements and the exact candidate available for inspection. It cannot alter the candidate to make its review pass. A release binds its source revision, image digest or artifact checksum, test results and review result together; a new candidate invalidates the previous release verdict.
-
-The development side retains the existing merge role, but release checks are enforced outside the author session. A product job cannot weaken its own required checks or substitute an author statement for independent evidence. Platform policy changes follow their own reviewed change path.
-
-Recovery is demonstrated at the real boundary: interrupt a job and resume its work, reject an unhealthy deployment and recover, and restore durable data into a clean destination. Failures consume bounded attempts and produce a blocker report when recovery is exhausted. Numeric limits belong in the project's confirmed requirements and runtime configuration.
-
-## Instantiations of universal law
-
-This repository declares one platform and the required deploy mechanisms below. [ARCHITECTURE.md](ARCHITECTURE.md) records which parts exist and have been applied; a requirement here is not evidence of live implementation.
-
-**Platform (declares under C4).** This repository builds on Fedora. C4 carries both platforms' ladder names, their minimalism flags and their forbidden instances; none of it is restated here.
-
-**Host tracks and deploy mechanisms (instantiates C7).** A host belongs to one of two tracks, each with one sanctioned deploy mechanism:
-
-- **VPS (cloud genesis).** A virtualised remote host running stock Fedora Cloud. Not a true CoreOS environment, but held to the same standard: host-immutable, everything in containers. Deployed by the **idempotent converger** — a re-run-safe converge script, run by the self-refresh actuators or the operator. Every mutation is declared in the repository. Any historical version re-runs safely. Ad-hoc drift vanishes on the next apply. Day zero is one pasted script: the host begins from the provider's stock Fedora Cloud image, reset from the console, and the maintainer pastes a single script into the root terminal — root's only act, ever. It creates `core`, joins the tailnet, activates the pair's GitHub App, hands off to the converger, and retires root. Everything after day zero flows the merge-and-deploy path.
-- **Bare metal (local genesis).** A local machine — currently the Minisforum MS-S1 MAX — running a custom **bootc image** built, with its installer media, from this repository. Kept current by **image rebase with atomic rollback**. Permanent data survives reinstalls. Day zero here installs nothing: the image already carries every capability (C7), and identity — `core`, its keys, its sudo hash — is baked from the trust root at build, because declarations are records (C6). The maintainer's one act supplies only what an image may never hold: the live credentials — the tailnet join and the pair's GitHub App activation. Then root retires, and everything flows the merge-and-deploy path.
-
-Onboarding a new environment is an **adapter addition, never a fork**: a small per-environment piece added to this repository, never a copy of it. Moving an environment from converger to image-rebase is an architecture decision, not a conformance gap. Environment facts live in the estate's environment registry (C5).
+Administrative access is private where practical and authenticates with managed keys or identities. Public product access follows the product agreement. Supply credentials at runtime with minimal scope, keep them out of logs and source, and document renewal before calling unattended operation ready.

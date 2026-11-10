@@ -1,19 +1,22 @@
-# The Dev Pair — CONSTITUTION (universal law, applied by reference)
+# Dev-pair constitution
 
-The estate's universal constitution — `oso-gato/homelab-root` → `principles/CONSTITUTION.md` (private; resolvable by the pair's agents) — governs all work in this repository. It is never re-dictated; a re-dictation is a fork. Bare C-numbers estate-wide refer to it. This file is the charter's third member (C2): the reference is what this repository holds and what its epoch locks, while the law's own text stays live at its one home.
+## Authority and restart
 
-Load it at session start:
+This constitution, the objective and the bylaw form the charter. They are self-contained and govern this repository. The README explains current status and use; it cannot silently change the charter.
 
-```
-gh api repos/oso-gato/homelab-root/contents/principles/CONSTITUTION.md --jq .content | base64 -d
-```
+The product owner directed this charter restart on November 10, 2026. It supersedes this repository's previous charter, operating instructions and inherited governance. The old reference to the constitution in `oso-gato/homelab-root` no longer imports rules here. No other repository or external constitution is amended by this restart.
 
-Repo-specific law, subordinate to it: [00-BYLAW.md](00-BYLAW.md).
+Existing source, decisions and tags remain available in Git history as reference, not binding instructions. Do not rebuild old mechanisms merely because they existed. The new baseline starts with the charter and README; implementation files and tests are added when they serve the product.
 
-## Maintainer direction for this revision
+The product owner controls scope, authority and charter changes. Agents may prepare those changes, but charter merges remain maintainer-only. Ordinary implementation and deployment may proceed autonomously within the confirmed requirements and permissions. When requirements conflict, make the conflict explicit rather than silently choosing a weaker outcome.
 
-The 2026-11-10 requirements revision records the maintainer's instruction for dev-pair to use Podman and Codex in both roles, with development Codex running directly inside the dev-container. This later direction takes precedence for this repository over C8's prescribed nested Distrobox placement and independently rebuilt inner agent layer. The replacement keeps disposable images, durable external state and verified renewal; [00-BYLAW.md](00-BYLAW.md) B5 defines its runtime contract.
+## Principles
 
-This is a scoped departure recorded for the charter merge, not a claim that the universal constitution or other repositories have been amended. C4's package-admission requirements remain in force, and the Codex installation route must be resolved before runtime implementation. The rationale and transition are in [docs/decisions/000034-codex-on-podman.md](docs/decisions/000034-codex-on-podman.md).
-
-Agent names and the default selection follow [00-BYLAW.md](00-BYLAW.md) B5. A name or default assignment is not an admission manifest and does not prove that the corresponding runtime exists.
+1. **Deliver the outcome.** Build the smallest system that satisfies the objective. Every mechanism must serve a concrete product capability or failure recovery. Documentation, a passing proxy check or an agent's assertion is not a delivered product.
+2. **Tell the truth about state.** Distinguish requirements, implemented behaviour and live verification. Record limitations and failed checks. Keep the README accurate; do not describe planned capabilities as working.
+3. **Verify through use.** Test real behaviour at the relevant boundary and obtain independent review before release. Bind evidence to the candidate being shipped. Test failure and recovery paths when they protect real state or authority; avoid checks that merely repeat implementation details.
+4. **Keep changes reproducible and recoverable.** Version source and configuration. Rebuild disposable artifacts, preserve durable work, and demonstrate backup restoration and deployment recovery. Never rely on an unrecorded live patch as the only implementation.
+5. **Limit authority.** Separate development from host administration. Grant only the access needed for the agreed work. Keep credentials outside source and images, and prevent untrusted content from widening permissions. An agent's own policy text is not an access-control boundary.
+6. **Use trustworthy inputs.** Prefer Fedora packages and official upstream distributions. Verify identity, pin versions and use the strongest available signature or integrity evidence. Official language-package tooling or upstream binaries are allowed when necessary; verify them before installation and disclose any provenance limitation. Do not substitute an unverified third-party build for convenience.
+7. **Bound autonomous work.** Set budgets and retry limits, preserve progress, and make failure visible. Resume interrupted jobs without duplicating consequential operations. Escalate a genuine unresolved blocker instead of looping indefinitely or claiming success.
+8. **Keep the record useful.** Maintain one clear home for each requirement. Use concise plans and decision notes where they help implementation or operation; there is no mandatory hierarchy of extra governance files, per-task document bundles or ceremonial tags. Historical material does not overrule this charter.

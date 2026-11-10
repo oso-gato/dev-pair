@@ -1,37 +1,41 @@
 # dev-pair
 
-The autonomous dev pair takes a product brief and delivers a tested, ready-to-use product. The product owner supplies the requirements; code review and routine development are the pair's responsibility.
+Dev-pair is an autonomous development pair: a Fedora host that maintains the platform and a Podman development environment that builds products. You describe the outcome; the pair delivers tested, usable software and explains how to use it. You are the product owner and do not need to write or review code.
 
-The required platform is a Fedora host with a Podman development container, both operated by Codex by default. [00-OBJECTIVE.md](00-OBJECTIVE.md) defines the roles and delivery outcomes; [00-BYLAW.md](00-BYLAW.md) B5 defines the agent mapping: `gptbox` runs Codex, `claudebox` runs Claude Code, and `agentbox` selects the default, currently `gptbox`.
+## The charter
 
-## Implementation status
+These three governing documents are collectively **the charter**:
 
-The 2026-11-10 requirements revision records the agreed direction. The existing implementation still uses Claude Code and nested Distrobox under Podman. The `gptbox` runtime scripts and `agentbox` default launcher still need to be developed and tested; setting their names in the requirements does not install Codex or enable switching. Existing code and historical decisions are retained while the replacement is developed. [ARCHITECTURE.md](ARCHITECTURE.md) remains the map of the actual source, and [decision 000034](docs/decisions/000034-codex-on-podman.md) records the transition.
+- [00-OBJECTIVE.md](00-OBJECTIVE.md) defines the product outcome, scope and acceptance criteria.
+- [00-BYLAW.md](00-BYLAW.md) defines this project's platform, agent roles and operating contract.
+- [CONSTITUTION.md](CONSTITUTION.md) defines the principles and authority governing the work.
 
-## Setup and migration
+Together with this README, they are the complete starting documentation. Read the charter before making changes. It is self-contained and replaces the previous inherited governance for this repository.
 
-The commands in [AGENTS.md](AGENTS.md) describe the retained Claude setup. There is no working `gptbox` setup command in this revision. Implementation must admit and pin Codex, provide its authentication and agent-specific adapter, wire the B5 default selection into shared lifecycle scripts, and prove launch, resume and recovery before documenting a ready-to-use setup path. [Decision 000035](docs/decisions/000035-agentbox-name.md) records the naming and switching contract.
+## Current status
 
-## The charter — governing documents
+This is a charter restart, not a working installation. The initial tree contains only these four files. There are no runtime scripts, container images defined here, installation commands, automated tests or CI workflows yet. No live host has been verified or changed by this restart.
 
-The following three governing documents are collectively called **the charter**. They define the product's purpose, requirements and governing rules, and are maintainer-merge-only:
+The previous source and documentation remain in Git history at commit [`90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5`](https://github.com/oso-gato/dev-pair/tree/90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5). They may be consulted selectively but do not govern the new implementation. No history or existing tags are rewritten.
 
-- [00-OBJECTIVE.md](00-OBJECTIVE.md) — why the pair exists and what it must achieve.
-- [00-BYLAW.md](00-BYLAW.md) — this repository's own build principles, subordinate to the constitution.
-- [CONSTITUTION.md](CONSTITUTION.md) — the estate's universal build principles, applied by reference, with the scoped maintainer direction recorded for this revision.
+## Platform and agents
 
-The charter is part of the **project documentation**. The setup guidance, operating manual, architecture map, decision records and changelog support it; they are not additional charter documents.
+The first deployment targets **Fedora Cloud 45** and rootless **Podman**, with Quadlet and systemd managing container lifecycle. Fedora lists Cloud 45 as released on November 3, 2026: [official download](https://fedoraproject.org/cloud/download/). The provider's actual image and required capabilities must be verified during implementation.
 
-Agents start at [AGENTS.md](AGENTS.md) — the session-loaded operating manual. The working map from spec to code is [ARCHITECTURE.md](ARCHITECTURE.md) — agent-owned, mutable-on-fact, never a conformance target. Decisions are recorded in [docs/decisions/](docs/decisions/); notable changes in [CHANGELOG.md](CHANGELOG.md).
+| Name | Meaning | Implementation status |
+|---|---|---|
+| `gptbox` | OpenAI Codex environment | To be built and tested first |
+| `claudebox` | Claude Code environment | Reserved alternative; no adapter retained in this restart |
+| `agentbox` | Selects the configured default, initially `gptbox` | Launcher to be built |
 
-If code and these documents disagree, the documents win — or the documents are changed deliberately, in the open, never silently.
+The complete selection and isolation rules live in [the bylaw](00-BYLAW.md). These names do not install software or introduce a nested agent container. Selecting an agent environment is separate from selecting its model.
 
-## Layout law
+## First working milestone
 
-The standing skeleton is law — universal constitution C2, instantiated for this repository's shape in [00-BYLAW.md](00-BYLAW.md). This repository is the host + container shape:
+Prove one complete journey on one VPS: provision the platform, start Codex in both roles, accept a small product brief, build and independently verify the product, deploy it, and return its usable address. Demonstrate job recovery after interruption and recovery from a failed deployment.
 
-- `host/` — everything that provisions, converges, or operates the Fedora host (VPS or bare metal).
-- `dev-container/` — everything that builds or operates the dev container.
-- `shared/` — versioned atomic contracts and anything both artifacts genuinely share. Nothing lands here to escape a boundary.
+The objective defines the acceptance evidence. Build this path before adding concurrent projects, bare-metal support or another agent adapter. Add source, meaningful tests and setup instructions as the implementation earns them; four files are the starting point, not a permanent file-count limit.
 
-There is no fourth place. A file that fits nowhere is an architecture smell; fix the architecture, not the filing.
+## Setup
+
+There is no setup command yet. Implementation must provide a reproducible Fedora 45 setup and validate it on a disposable or explicitly designated VPS before this README can describe it as ready to use. Do not use a historical installer as the new setup procedure without adapting and testing it against the charter.
