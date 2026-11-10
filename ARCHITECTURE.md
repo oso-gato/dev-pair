@@ -55,10 +55,19 @@
 
 <a id="protected-fedora-roots-and-writable-work-areas"></a>
 <a id="a4"></a>
-## A4 — Protected Fedora roots and writable work areas
+## A4 — Immutable runtime code and writable work areas
 
 <a id="a4-1"></a>
 **A4.1** Protect the running host and agent-container Fedora OS trees from product build and test writes. Configure DevBox and the maintenance container with read-only image roots and explicit writable mounts for job work, agent state and necessary temporary/runtime data. Run build code without privileges that can remount or alter protected roots. On the host, confined job execution may write only its declared data/test resources, not system package paths or configuration. A build directory alone does not enforce this boundary.
+
+<a id="a4-1-1"></a>
+**A4.1.1** Apply the immutable-code boundary to all container roles, including hosted applications and disposable test runtimes, not just the two Codex containers. Protect installed application/agent code, plugins and entrypoints as well as OS paths. Use read-only release/image code with explicit writable data mounts; no writable mount may obscure a managed code location.
+
+<a id="a4-1-2"></a>
+**A4.1.2** For the host, enforce an immutable deployed-code boundary against running jobs and workloads, and activate system/code/configuration changes only through the verified, versioned maintenance path. The selected host update mechanism must demonstrate this invariant; stock Fedora installation alone does not establish it. Controlled activation of a new desired state is distinct from ad hoc edits or package changes by a product build.
+
+<a id="a4-1-3"></a>
+**A4.1.3** Capture candidate image/code identity for validation and deployment. Build image layers and project dependencies in separate staging roots; do not mutate the installed runtime of a running container. Keep editable project source distinct from the platform code executing the agent. Revalidate affected evidence whenever test-candidate code changes.
 
 <a id="a4-2"></a>
 **A4.2** Install baseline tools when constructing a new candidate image. Per-project dependencies belong in a job dependency environment, isolated build root or disposable builder image, never in the running host or DevBox OS. Any image-building backend must preserve the same boundaries; do not grant the worker a host socket simply to build images. Platform updates use the separate approved provisioning/replacement path.

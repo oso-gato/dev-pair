@@ -46,10 +46,19 @@
 
 <a id="protected-operating-systems-and-disposable-build-trees"></a>
 <a id="r5"></a>
-## R5 — Protected operating systems and disposable build trees
+## R5 — Immutable runtime code and disposable build trees
 
 <a id="r5-1"></a>
 **R5.1** Product development and testing must not install into or modify the Fedora operating-system tree on the VPS, DevBox or maintenance container. Use independent, job-owned build trees, dependency roots and fixtures, with enforced boundaries. Builds must not run from live platform trees or replace running system binaries, libraries, packages or configuration. Declared writable workspaces, caches, runtime data and test volumes are separate from the protected OS tree. Authorized platform provisioning, upgrades and deployment are separate controlled operations; a product build/test request does not authorize them.
+
+<a id="r5-1-1"></a>
+**R5.1.1** Immutability covers the host, DevBox, maintenance container and every hosted or test container: all deployed OS, application, agent, library, plugin and startup code is immutable. The rule applies during normal operation, development and testing, not only to Fedora package files.
+
+<a id="r5-1-2"></a>
+**R5.1.2** Build code changes in separate working trees or candidate images, validate them, and activate verified replacements through the controlled maintenance/deployment path. Do not patch installed code inside a running environment. Self-update means managed replacement with session preservation under R9, not in-place mutation.
+
+<a id="r5-1-3"></a>
+**R5.1.3** Declared source workspaces, build trees, caches, application data, logs, secrets and session state remain writable according to their purpose and isolation boundary. They must not shadow deployed executable paths or bypass the verified release with mutable plugins or startup scripts. Configuration changes are declared and controlled; arbitrary live edits are not a deployment mechanism.
 
 <a id="r5-2"></a>
 **R5.2** A disposable build tree can contain fetched source, dependencies, intermediate outputs and test fixtures, but it is not the only copy of valuable work. Preserve source edits, job checkpoints, evidence and deliverables in durable project storage before discarding a tree. Durable uncommitted work must survive interruption as well as committed source.
@@ -84,6 +93,9 @@
 8. <a id="r7-8"></a>**R7.8** A brief with material ambiguities is refined into the recorded product agreement before dependent implementation. After agreement, normal development and test failures are resolved without routine owner intervention; genuine scope/authority decisions and exhausted recovery are reported clearly.
 9. <a id="r7-9"></a>**R7.9** A representative product has meaningful function/unit, integration and end-to-end checks. A required host-only check is handed off, fails with actionable diagnostics, drives a DevBox code repair, and passes on the corrected candidate. A stale verdict or unavailable/blocked test cannot satisfy acceptance. A repeated request after interruption does not duplicate consequential effects.
 10. <a id="r7-10"></a>**R7.10** Representative build and install attempts cannot write outside authorized build/data locations into protected Fedora OS paths on either role or the host. A failed build or host-side test leaves the live platform unchanged apart from declared runtime data. Test routing does not give DevBox host credentials or unrestricted execution.
+
+<a id="r7-10-1"></a>
+**R7.10.1** Acceptance must reject attempted mutation of deployed application/agent code as well as OS files on the host and each applicable container role. Verify that writable mounts cannot shadow managed executable locations, while legitimate workspace/data writes still succeed. A verified replacement changes the recorded artifact identity without losing durable sessions or data; in-place patching cannot satisfy this test.
 11. <a id="r7-11"></a>**R7.11** Consecutive compatible builds demonstrate reuse of unchanged fetched inputs, without unnecessary repeat downloads. Relevant input changes invalidate affected outputs; a clean-candidate check does not destroy the active workspace. Storage and network-use evidence shows bounded cache behaviour.
 12. <a id="r7-12"></a>**R7.12** Completion/idle cleanup and interrupted-cleanup recovery reclaim eligible disposable trees and test resources without deleting another job's or an active job's data. Source changes, checkpoints, test evidence and deliverables survive. Capacity pressure cannot trigger unbounded growth or silent loss of active work.
 
