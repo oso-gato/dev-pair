@@ -6,11 +6,11 @@
 
 - <a id="s1-1"></a>**S1.1** Source: `oso-gato/standards` (private).
 - <a id="s1-2"></a>**S1.2** Standards status: **pre-1.0 working draft (unreleased)**.
-- <a id="s1-3"></a>**S1.3** Full commit SHA: `3bb87753a855720fbabe8dfea51e63579b383293`.
-- <a id="s1-4"></a>**S1.4** [Governance](https://github.com/oso-gato/standards/blob/3bb87753a855720fbabe8dfea51e63579b383293/GOVERNANCE.md).
-- <a id="s1-5"></a>**S1.5** [Engineering standards](https://github.com/oso-gato/standards/blob/3bb87753a855720fbabe8dfea51e63579b383293/ENGINEERING-STANDARDS.md).
-- <a id="s1-6"></a>**S1.6** [Development repository standard](https://github.com/oso-gato/standards/blob/3bb87753a855720fbabe8dfea51e63579b383293/REPOSITORY-SETUP.md).
-- <a id="s1-7"></a>**S1.7** Status: adopted under the product owner’s November 10, 2026 direction, including the development/host-test feedback loop, isolated builds, reuse and cleanup, platform self-update, later application hosting, stable clause references and immutability of all deployed host/container code.
+- <a id="s1-3"></a>**S1.3** Full commit SHA: `08fc080dc8463a16e7ef753eefdefd98463b76b9`.
+- <a id="s1-4"></a>**S1.4** [Governance](https://github.com/oso-gato/standards/blob/08fc080dc8463a16e7ef753eefdefd98463b76b9/GOVERNANCE.md).
+- <a id="s1-5"></a>**S1.5** [Engineering standards](https://github.com/oso-gato/standards/blob/08fc080dc8463a16e7ef753eefdefd98463b76b9/ENGINEERING-STANDARDS.md).
+- <a id="s1-6"></a>**S1.6** [Development repository standard](https://github.com/oso-gato/standards/blob/08fc080dc8463a16e7ef753eefdefd98463b76b9/REPOSITORY-SETUP.md).
+- <a id="s1-7"></a>**S1.7** Status: adoption and the documented product decisions are owner-directed as of November 10, 2026, including restoration of the original Distrobox agent layers and nightly rebuilds, with retained lowercase machine names `erebus` and `strix`.
 - <a id="s1-8"></a>**S1.8** Project exceptions: none.
 
 <a id="s1-9"></a>
@@ -42,7 +42,7 @@
 ## S4 — Implementation gaps and restart boundary
 
 <a id="s4-1"></a>
-**S4.1** This adoption establishes documentation requirements; it does not claim runtime compliance. Agent startup, standards retrieval/version checks, job records, host-test handoffs and result-driven repair, immutable host and container code, build-tree/cache lifecycle, platform self-update and complete session restoration, independent release checks and all other platform capabilities remain to be implemented and verified. README records actual progress. Operational budgets, credentials and the designated VPS must be resolved before dependent execution, as required by the product agreement.
+**S4.1** This adoption establishes documentation requirements; it does not claim runtime compliance. Agent startup, standards retrieval/version checks, job records, host-test handoffs and result-driven repair, immutable host and container code, build-tree/cache lifecycle, platform self-update, nested Distrobox agent placement, nightly rebuild scheduling and complete session restoration, independent release checks and all other platform capabilities remain to be implemented or adapted and verified for this restart. A11 identifies the existing Claudebox implementations; their existence must not be confused with verified Codex compatibility. README records actual progress. Operational budgets, credentials and the designated VPS must be resolved before dependent execution, as required by the product agreement.
 
 <a id="s4-2"></a>
 **S4.2** The November 10, 2026 development restart remains in effect. Historical source and documents are reference material, not binding instructions. Historical governance from `oso-gato/homelab-root` is not imported. Git history is preserved. Premature release labels were retired centrally; this adoption uses the verified draft commit. Other repositories require their own authorized adoption changes.

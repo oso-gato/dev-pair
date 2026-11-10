@@ -53,14 +53,14 @@
 | <a id="dr3-4"></a>**DR3.4** | `agentbox` | Selects the configured default, initially `gptbox` | Launcher to be built |
 
 <a id="dr3-5"></a>
-**DR3.5** The complete selection and isolation rules live in [ARCHITECTURE.md](ARCHITECTURE.md). These names do not install software or introduce a nested agent container. Selecting an agent environment is separate from selecting its model.
+**DR3.5** The complete selection, placement and isolation rules live in [ARCHITECTURE.md](ARCHITECTURE.md), especially A2.4 and A10. The original layered design is restored: a Distrobox-based gptbox on the host and another inside DevBox. Selecting an agent environment is separate from selecting its model. The machine names remain `erebus` and `strix`, both lowercase; A11 records the existing implementation references.
 
 <a id="required-development-loop"></a>
 <a id="dr4"></a>
 ## DR4 — Required development loop
 
 <a id="dr4-1"></a>
-**DR4.1** DevBox is the Podman development container running Codex. It implements the agreed product and runs function/unit, integration and end-to-end checks wherever its environment is sufficient. Checks requiring the real VPS go to the maintenance agent through a durable request. That agent returns results and diagnostics; DevBox repairs failures and requests retesting until acceptance passes or agreed limits produce a clear blocker. Independent review and verification at the delivery destination complete the loop.
+**DR4.1** DevBox is the stable Podman development container hosting its Distrobox-based Codex gptbox. It implements the agreed product and runs function/unit, integration and end-to-end checks wherever its environment is sufficient. Checks requiring the real VPS go to the maintenance agent through a durable request. That agent returns results and diagnostics; DevBox repairs failures and requests retesting until acceptance passes or agreed limits produce a clear blocker. Independent review and verification at the delivery destination complete the loop.
 
 <a id="dr4-2"></a>
 **DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. None of these capabilities is implemented yet.
@@ -93,3 +93,9 @@
 
 <a id="dr8-1"></a>
 **DR8.1** After the development pair is proven, the host also serves other owner-requested Podman applications. The named later workload is a remotely accessible Omarchy desktop succeeding the Fedora desktop experience. REQUIREMENTS R10 records the outcome and feasibility boundary; the Fedora host remains unchanged. No desktop migration or implementation is included in this documentation update.
+
+<a id="dr9"></a>
+## DR9 — Agent freshness and stable platform releases
+
+<a id="dr9-1"></a>
+**DR9.1** The two active agent environments rebuild nightly from verified official stable tooling, with cached inputs and complete session restoration. Host and DevBox releases run on separate, slower tested change cycles. Requirements R11 and architecture A10 define the contract. Model availability is checked separately from CLI/image version; these capabilities have not yet been adapted and verified in this restart. Existing Claudebox implementations in fedora-bootstrap and fedora-dev are linked in A11; they are the reference for the Codex adaptation.

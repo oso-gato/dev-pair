@@ -25,10 +25,13 @@
 ## R3 — The pair
 
 <a id="r3-1"></a>
-**R3.1** The **DevBox** is the Fedora Podman development container with its Codex agent. It owns the product development loop. The **maintenance container** runs the maintenance Codex agent, which operates the Fedora VPS through a controlled host interface, manages deployment and recovery, and executes validation that cannot be proven inside DevBox. Both roles use Codex by default. [ARCHITECTURE.md](ARCHITECTURE.md) defines their boundaries and the agent-selection contract.
+**R3.1** The **DevBox** is the stable Fedora Podman development container hosting a Distrobox-based development agentbox, initially **gptbox** running Codex. It owns the product development loop. A separate Distrobox-based maintenance agentbox runs on the Fedora VPS and provides the maintenance-container role: controlled host operations, deployment, recovery and checks that cannot be proven inside DevBox. Both roles default to `agentbox → gptbox`. [ARCHITECTURE.md](ARCHITECTURE.md) defines their boundaries and agent-selection contract.
 
 <a id="r3-2"></a>
 **R3.2** Development work must not directly administer the host. The two roles exchange durable requests and evidence so a lost terminal or restarted container does not lose the job.
+
+<a id="r3-3"></a>
+**R3.3** Retain the existing machine names `erebus` and `strix`, both lowercase. Naming is separate from deployment readiness: the first milestone remains one VPS pair; later support does not become implemented merely because its machine identity is retained.
 
 <a id="development-validation-and-repair-loop"></a>
 <a id="r4"></a>
@@ -144,3 +147,24 @@
 
 <a id="r10-4"></a>
 **R10.4** Before committing to the desktop implementation, validate Omarchy’s current upstream installation model, graphical/remote-session requirements and feasibility on the selected VPS under Podman. If the required outcome cannot be met within that boundary, present the evidence and a scoped alternative for owner decision. Do not silently replace Omarchy, introduce a VM dependency or change the host OS. Detailed desktop implementation and acceptance remain later work.
+
+<a id="r11"></a>
+## R11 — Agent layers and separate update cycles
+
+<a id="r11-1"></a>
+**R11.1** Run an independently replaceable Distrobox-based agentbox on the VPS host for maintenance and inside DevBox for development. Initially both are gptbox with Codex. The agent tooling lives in these layers rather than being installed or updated in the stable host or DevBox code tree. This restores the original layered design lost during simplification; immutable deployed code and the controlled host-operation boundary still apply.
+
+<a id="r11-2"></a>
+**R11.2** Rebuild both active agent environments nightly from the latest official stable agent tooling available at build time. Resolve and verify the upstream version, pin the resulting candidate and artifact, test it, and promote it through the managed renewal path. Reuse valid download/build caches; nightly does not mean forced repeated downloads. Provide an on-demand rebuild for a needed fix. A failed or unavailable upstream candidate leaves the verified working environment running and produces a recorded stale/update-failure status with bounded recovery.
+
+<a id="r11-3"></a>
+**R11.3** Agent-layer renewal must preserve and restore every active session, its context, credentials/configuration references, work and pending operations. Verify actual resumed progress. Build the nightly candidate separately before replacing the active layer; defer unsafe activation when checkpoint/resume is not viable and report the reason. Nightly agent updates must not force a host or DevBox release just to refresh the agent.
+
+<a id="r11-4"></a>
+**R11.4** The host and DevBox use separate, slower, deliberate release cycles: versioned changes, relevant tests, controlled promotion, live verification and recovery. Important defects or security updates can justify an earlier release. Configure each schedule and timezone explicitly before operation; nightly agent rebuilds do not mandate nightly base-platform rebuilds.
+
+<a id="r11-5"></a>
+**R11.5** Keep access to current provider models under review alongside tooling currency. Verify the latest appropriate supported model actually available to the configured account and within agreed budget/capabilities, and make it available for new work through a recorded selection. An image rebuild updates client tooling; it does not install a remote model or grant account access. Existing/resumed jobs keep their recorded model unless an explicit compatible migration is recorded; never silently substitute a model.
+
+<a id="r11-6"></a>
+**R11.6** First-pair acceptance must prove both agent placements, a nightly-triggered rebuild path, verified runtime/version identity, restoration of active sessions on each role, failure/deferral recovery and an on-demand update. Show that an agent-only update leaves the host/DevBox release identity unchanged. Verify nested runtime capability, parent-code immutability and credential/operation boundaries before declaring the design supported; report a concrete blocker rather than quietly reverting placement or widening permissions.

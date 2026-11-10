@@ -24,10 +24,13 @@
 **A2.1** The maintenance agent runs in its own Podman container and uses a controlled host-operation interface for deployment, health checks and recovery. It does not receive unrestricted passwordless administration. Keep a documented operator recovery path that works when the agent is unavailable.
 
 <a id="a2-2"></a>
-**A2.2** DevBox is the development-role container, distinct from the `agentbox` provider selector. Its Codex agent runs directly inside the development container alongside project tools and tests. No additional Distrobox agent layer is required. Give it its own workspace and runtime state, without the host Podman socket, host administration credentials or unrestricted host execution bridge.
+**A2.2** **Retired.** The direct-in-DevBox Codex placement and no-Distrobox requirement were introduced during an incorrect simplification of the original design. A2.4 and A10 restore the separate Distrobox agent layers; the worker’s host-access restrictions remain in force.
 
 <a id="a2-3"></a>
 **A2.3** Use separate service permissions for the two roles and separate credentials and state for each job. Durable work lives in declared volumes or external storage, not only in disposable image layers. Apply resource limits and bounded cleanup. Add concurrent workers only after their access isolation and resource handling have been tested.
+
+<a id="a2-4"></a>
+**A2.4** DevBox is the stable development-role Podman container, distinct from the `agentbox` selector. It hosts a nested Distrobox-based development agent environment, initially `gptbox` running Codex. The VPS host has a separate Distrobox-based maintenance agent environment, initially `gptbox`; this environment is the maintenance container, not a demand for another wrapper around it. Both use Podman. Keep development workspaces, credentials and session state separately declared, with no outer-host Podman socket, host-administration credentials or unrestricted host bridge exposed to the development role.
 
 <a id="development-and-host-validation-protocol"></a>
 <a id="a3"></a>
@@ -159,7 +162,7 @@
 **A8.6** Checkpoint failure defers renewal. Failed live validation triggers bounded recovery to a compatible verified state, with diagnostic evidence and an operator path if autonomous recovery is exhausted. If a migration cannot safely roll back, use its tested forward-recovery or restore plan rather than guessing. Test both worker and maintenance-role interruption, candidate failure and session restoration before describing unattended self-update as supported.
 
 <a id="a8-7"></a>
-**A8.7** Managed renewal replaces images; provider CLI self-updaters or persistent user-installed binaries must not silently supersede the pinned agent executable. Verify the executable/runtime identity actually used after renewal. Update frequency is an operating policy chosen for tested capabilities and budgets, not a mandatory nightly rebuild.
+**A8.7** **Retired.** Its non-nightly cadence statement incorrectly removed the original nightly agent refresh requirement; A10.2–A10.4 restore it. The replacement preserves verified runtime identity and disables in-place agent self-updates while requiring nightly agent-layer rebuilds.
 
 <a id="a9"></a>
 ## A9 — Later application hosting
@@ -172,3 +175,48 @@
 
 <a id="a9-3"></a>
 **A9.3** The [official Omarchy manual](https://learn.omacom.io/2/the-omarchy-manual/79/omarchy-on) describes an Arch/Hyprland system and VM installation examples; it does not by itself establish a supported Podman desktop deployment. Treat containerization, headless graphics, remote transport and selected VPS compatibility as an explicit feasibility investigation. Present any necessary departure from Podman for approval before adopting it.
+
+<a id="a10"></a>
+## A10 — Distrobox agents and release scheduling
+
+<a id="a10-1"></a>
+**A10.1** Use Podman-backed Distrobox environments for the agent runtime on each side: host → maintenance gptbox; host → DevBox → development gptbox. Keep the outer DevBox and host platform artifacts stable while the inner agent artifacts advance. `agentbox` selects the default provider environment and `gptbox` names the Codex environment; retain the machine names `erebus` and `strix`, always lowercase. Record deployment identity and role/job identity in configuration so reusable lifecycle code does not require a fork for each machine.
+
+<a id="a10-2"></a>
+**A10.2** Maintain distinct manifests and schedules for the host platform, DevBox and each admitted agent runtime. A nightly controller resolves official stable tooling, records the exact source/version and artifact, builds using approved recipes and cached inputs, runs compatibility/renewal checks, and promotes only the verified candidate. CI remains the builder of production artifacts. Record success, failure, retained version and any deferred activation so “latest” is a checked state, not a claim.
+
+<a id="a10-3"></a>
+**A10.3** Keep the replacement executor outside the agent environment it stops. The host controller owns maintenance-agent replacement and outer DevBox replacement. A constrained controller outside the inner development agent owns its replacement, with the outer host path available for recovery. Checkpoint the complete session set, stagger maintenance/development activation where necessary, restore state and verify work progress. The current worker cannot destroy its own only recovery executor.
+
+<a id="a10-4"></a>
+**A10.4** Disable in-place CLI self-update and package upgrades in running agent environments. Prepare Distrobox initialization, package installation and home integration in isolated candidate assembly, then protect installed code in the admitted runtime. Keep agent state and credentials outside the image in explicit mounts without executable shadowing. Distrobox is not an exception to E4.1.1–E4.1.4 or R5.1.1–R5.1.3.
+
+<a id="a10-5"></a>
+**A10.5** Validate the chosen nested Podman/Distrobox arrangement on the selected Fedora release before adopting it. Inspect and test user namespaces, storage/mounts, initialization, lifecycle and SELinux confinement. Distrobox’s normal parent integration, shared home and host-exec facilities must not create an unrestricted bridge to the VPS or writable parent code. Provision the necessary tooling in verified base images; never patch the live host or DevBox to make nesting work. If required permissions conflict with the agreed boundaries, present the measured blocker and a scoped design decision rather than silently granting privileged mode or mounting the outer host engine socket.
+
+<a id="a10-6"></a>
+**A10.6** Model selection is separate from tool-image versioning. Use the provider’s supported model discovery/selection mechanism for the actual authentication mode; verify access and compatibility rather than assuming every published model is available. Record the chosen model per job. Existing jobs require an explicit migration for a model change, even when a nightly CLI rebuild succeeds.
+
+<a id="a10-7"></a>
+**A10.7** Set the agent rebuild window and timezone before deployment and handle missed schedules with bounded reconciliation. Host and DevBox releases follow their own tested change/maintenance schedule and can be expedited for consequential fixes. Do not use a floating latest image at deployment: the schedule resolves an exact candidate, and promotion uses its verified identity.
+
+<a id="a10-8"></a>
+**A10.8** Upstream references: [Distrobox integration and security implications](https://distrobox.it/#security-implications), [Distrobox creation options](https://distrobox.it/usage/distrobox-create/), and [nested Podman examples](https://distrobox.it/useful_tips/#using-podman-inside-a-distrobox). These establish the need to validate integration and privileges; they do not prove that this project’s nested, confined, immutable arrangement already works.
+
+<a id="a11"></a>
+## A11 — Existing implementation references and retained identities
+
+<a id="a11-1"></a>
+**A11.1** Keep the existing machine identities `erebus` and `strix`, both lowercase. The historical architecture identifies `erebus` as the VPS lineage and `strix` as the bare-metal lineage. Preserve those identities without expanding R6's first milestone: prove the VPS pair first, with bare-metal support later. This documentation update does not rename or reconfigure either machine.
+
+<a id="a11-2"></a>
+**A11.2** The host-side implementation reference is [fedora-bootstrap at e8def268](https://github.com/oso-gato/fedora-bootstrap/tree/e8def2684e91facceb985974ac4d38d64f0be8c5): `distrobox.ini`, `setup-user.sh`, `claudebox-daily.sh`, `box-rebuild.sh`, `claudebox-init.sh` and `host-agent-watch.sh`. These contain the Claudebox manifest, a daily 04:00 timer, idle/session-lock deferral, an external systemd rebuild executor, parent integration and development-container session restoration. Inspect the code and its associated tests before replacing these mechanisms; historical comments alone are not live verification.
+
+<a id="a11-3"></a>
+**A11.3** The nested development implementation reference is [fedora-dev at 9811f351](https://github.com/oso-gato/fedora-dev/tree/9811f351a43c89e7da1aa1fa255d4711a7ab5216): `distrobox.ini`, `entrypoint.sh`, `claudebox-assemble.sh`, `claudebox-daily.sh`, `box-rebuild.sh`, `bin/claude` and `bin/rebuild-request.sh`. These contain nested Podman/Distrobox assembly, daily and on-demand rebuild triggers, serialization and busy deferral, durable-home handling, session IDs and manifests that guard against omitted sessions or ambiguous restoration by working directory. Preserve the outcomes and useful regression cases when adapting provider-specific behavior to Codex.
+
+<a id="a11-4"></a>
+**A11.4** Reuse selectively through A5.5's common lifecycle and agent adapters. Replace Claude-specific installation, authentication, invocation and resume with verified Codex equivalents. Adapt destroy-before-build replacement, live-clone script/skill loading and broad parent integration to the candidate-before-replacement, immutable-code and scoped-operation requirements. The old `fedora-dev.container` deliberately adds capabilities and disables SELinux label separation for nesting; evaluate that concrete compatibility issue under A1.2/A10.5 rather than blindly removing needed capabilities or copying the exception. Demonstrate all-session restoration, failure recovery and actual resumed work on the new runtime before claiming equivalence.
+
+<a id="a11-5"></a>
+**A11.5** These references establish that the original mechanisms have code, not that the new Codex design is already implemented or verified. The [pre-restart dev-pair architecture](https://github.com/oso-gato/dev-pair/blob/90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5/ARCHITECTURE.md) also records shared disposable agent layers and the two machine lineages. Preserve that design evidence; the restart retires the implementation baseline, not agreed product behavior. Keep current authoritative requirements here and in REQUIREMENTS rather than importing historical governance.
