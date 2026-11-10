@@ -19,7 +19,7 @@ Read this README, STANDARDS, its three pinned shared documents, then REQUIREMENT
 
 ## Current status
 
-This project adopts `oso-gato/standards` release `v2.0.0`, pinned to the exact commit in [STANDARDS.md](STANDARDS.md). The product owner approved the naming and adoption model on November 10, 2026.
+This project adopts a **pre-1.0 working draft** of `oso-gato/standards`, pinned to the exact commit in [STANDARDS.md](STANDARDS.md). Version 1.0 remains a future milestone. The product owner approved the naming and adoption model on November 10, 2026.
 
 This is a documentation baseline for restarting development. There are no runtime scripts, container images defined here, installation commands, automated tests or CI workflows yet. No live host has been verified or changed by this restart. The intended architecture and acceptance requirements are documented; operational access and budgets still need to be established before dependent execution.
 

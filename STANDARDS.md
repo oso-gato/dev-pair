@@ -3,15 +3,15 @@
 ## Version and approval
 
 - Source: `oso-gato/standards` (private).
-- Release: `v2.0.0`.
-- Full commit SHA: `8f228c9bb0845f27c64797d07ac1d302c14c9dfb`.
-- [Governance](https://github.com/oso-gato/standards/blob/8f228c9bb0845f27c64797d07ac1d302c14c9dfb/GOVERNANCE.md).
-- [Engineering standards](https://github.com/oso-gato/standards/blob/8f228c9bb0845f27c64797d07ac1d302c14c9dfb/ENGINEERING-STANDARDS.md).
-- [Development repository standard](https://github.com/oso-gato/standards/blob/8f228c9bb0845f27c64797d07ac1d302c14c9dfb/REPOSITORY-SETUP.md).
+- Standards status: **pre-1.0 working draft (unreleased)**.
+- Full commit SHA: `a062cf8b6cc39919f23f017f5d4c897a5e209cbd`.
+- [Governance](https://github.com/oso-gato/standards/blob/a062cf8b6cc39919f23f017f5d4c897a5e209cbd/GOVERNANCE.md).
+- [Engineering standards](https://github.com/oso-gato/standards/blob/a062cf8b6cc39919f23f017f5d4c897a5e209cbd/ENGINEERING-STANDARDS.md).
+- [Development repository standard](https://github.com/oso-gato/standards/blob/a062cf8b6cc39919f23f017f5d4c897a5e209cbd/REPOSITORY-SETUP.md).
 - Status: adoption and documentation migration approved by the product owner on November 10, 2026.
 - Project exceptions: none.
 
-All three references use the same exact commit. The release label is descriptive; the commit identifies the content. Publishing new standards does not automatically change this project or an existing job's recorded version. Both shared rules documents remain centrally stored; this repository contains references only.
+All three references use the same exact commit. The commit identifies the exact draft content; adoption does not declare the standards ready for 1.0. Publishing new standards does not automatically change this project or an existing job's recorded version. Both shared rules documents remain centrally stored; this repository contains references only.
 
 ## Project documentation
 
@@ -31,4 +31,4 @@ If the exact documents cannot be loaded, report the access blocker. Do not subst
 
 This adoption establishes documentation requirements; it does not claim runtime compliance. Agent startup, standards retrieval/version checks, job records, independent release checks and all other platform capabilities remain to be implemented and verified. README records actual progress. Operational budgets, credentials and the designated VPS must be resolved before dependent execution, as required by the product agreement.
 
-The November 10, 2026 development restart remains in effect. Historical source and documents are reference material, not binding instructions. Historical governance from `oso-gato/homelab-root` is not imported. Git history and published tags are preserved. Other repositories require their own authorized adoption changes.
+The November 10, 2026 development restart remains in effect. Historical source and documents are reference material, not binding instructions. Historical governance from `oso-gato/homelab-root` is not imported. Git history is preserved. Premature release labels were retired centrally; this adoption uses the verified draft commit. Other repositories require their own authorized adoption changes.
