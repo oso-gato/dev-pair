@@ -8,11 +8,13 @@ These three governing documents are collectively **the charter**:
 
 - [00-OBJECTIVE.md](00-OBJECTIVE.md) defines the product outcome, scope and acceptance criteria.
 - [00-BYLAW.md](00-BYLAW.md) defines this project's platform, agent roles and operating contract.
-- [00-CONSTITUTION.md](00-CONSTITUTION.md) defines the principles and authority governing the work.
+- [00-CONSTITUTION.md](00-CONSTITUTION.md) records the exact adopted versions of the global constitution and shared development principles.
 
-Together with this README, they are the complete starting documentation. Read the charter before making changes. It is self-contained and replaces the previous inherited governance for this repository.
+Together with this README, they are the complete local starting documentation. Read the charter and both pinned standards documents before making changes. Development principles live centrally; they do not require a fourth charter document. The private standards repository requires authorized read access.
 
 ## Current status
+
+This project adopts `oso-gato/standards` release `v1.0.0`, with both shared documents pinned to the exact commit recorded in [00-CONSTITUTION.md](00-CONSTITUTION.md).
 
 This is a charter restart, not a working installation. The initial tree contains only these four files. There are no runtime scripts, container images defined here, installation commands, automated tests or CI workflows yet. No live host has been verified or changed by this restart.
 
