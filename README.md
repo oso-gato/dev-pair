@@ -12,13 +12,15 @@ The 2026-11-10 requirements revision records the agreed direction. The existing 
 
 The commands in [AGENTS.md](AGENTS.md) describe the retained Claude setup. There is no working `gptbox` setup command in this revision. Implementation must admit and pin Codex, provide its authentication and agent-specific adapter, wire the B5 default selection into shared lifecycle scripts, and prove launch, resume and recovery before documenting a ready-to-use setup path. [Decision 000035](docs/decisions/000035-agentbox-name.md) records the naming and switching contract.
 
-## Governing documents
+## The charter — governing documents
 
-The **charter** governs everything in this repository — three documents, maintainer-merge-only:
+The following three governing documents are collectively called **the charter**. They define the product's purpose, requirements and governing rules, and are maintainer-merge-only:
 
 - [00-OBJECTIVE.md](00-OBJECTIVE.md) — why the pair exists and what it must achieve.
-- [CONSTITUTION.md](CONSTITUTION.md) — the estate's universal build principles, applied by reference.
 - [00-BYLAW.md](00-BYLAW.md) — this repository's own build principles, subordinate to the constitution.
+- [CONSTITUTION.md](CONSTITUTION.md) — the estate's universal build principles, applied by reference, with the scoped maintainer direction recorded for this revision.
+
+The charter is part of the **project documentation**. The setup guidance, operating manual, architecture map, decision records and changelog support it; they are not additional charter documents.
 
 Agents start at [AGENTS.md](AGENTS.md) — the session-loaded operating manual. The working map from spec to code is [ARCHITECTURE.md](ARCHITECTURE.md) — agent-owned, mutable-on-fact, never a conformance target. Decisions are recorded in [docs/decisions/](docs/decisions/); notable changes in [CHANGELOG.md](CHANGELOG.md).
 
