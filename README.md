@@ -99,3 +99,17 @@
 
 <a id="dr9-1"></a>
 **DR9.1** The two active agent environments rebuild nightly from verified official stable tooling, with cached inputs and complete session restoration. Host and DevBox releases run on separate, slower tested change cycles. Requirements R11 and architecture A10 define the contract. Model availability is checked separately from CLI/image version; these capabilities have not yet been adapted and verified in this restart. Existing Claudebox implementations in fedora-bootstrap and fedora-dev are linked in A11; they are the reference for the Codex adaptation.
+
+<a id="dr10"></a>
+## DR10 — Development sessions and launch brief
+
+<a id="dr10-1"></a>
+**DR10.1** Follow [A12's session workflow](ARCHITECTURE.md#a12): architecture/coordination with **GPT-6 Astra High**, implementation with **GPT-6.1 Sol High**, and independent review in a fresh **GPT-6 Astra High** session. Use Sol Medium for settled mechanical work; reserve Extra High for a specific difficult problem. Each handoff records the exact candidate, applicable requirements, evidence and next action. The owner provides product decisions, not code review or manual worker coordination.
+
+<a id="dr10-2"></a>
+**DR10.2** To start the separate development conversation, select repository **`oso-gato/dev-pair`**, branch **`main`**, model **GPT-6 Astra**, effort **High**, and an environment with authorized access to private `oso-gato/standards` and the two A11 reference repos. Verify the actual checkout and permissions after startup. Use the title **Dev-pair — architecture and coordination** and the following brief; selecting settings in the client is required because text in a prompt does not switch models:
+
+> Develop oso-gato/dev-pair under ARCHITECTURE A12. First verify the checkout, record its exact revision, and read README, STANDARDS, its three pinned shared documents, REQUIREMENTS and ARCHITECTURE. Begin with the original-charter omission review in A12.11 and inspect the existing fedora-bootstrap and fedora-dev implementations at A11's revisions. Preserve the lowercase names erebus and strix, Fedora/Podman, separate Distrobox agent layers, agentbox → gptbox, nightly agent refreshes, slower platform releases, immutable deployed code, reusable isolated build trees, host-test feedback and complete session recovery. Produce a concise evidence-backed mapping and resolve only material product/authority decisions with me. Then coordinate A12.12's first implementation slice in a separate GPT-6.1 Sol High builder session, with fresh GPT-6 Astra High review and authorized host validation. Keep durable handoffs so I do not have to carry context between sessions. I am the product owner and do not review code. Verify model settings and session creation; report unavailable capabilities, missing execution budgets/access and genuine blockers without inventing success or silently changing requirements. Proceed autonomously within the established agreement and permissions.
+
+<a id="dr10-3"></a>
+**DR10.3** This section documents the workflow and supplies a launch brief. It does not create cloud conversations, configure their models, implement orchestration, or establish runtime/release compliance. Report actual session links and verified progress separately. Current model-selection references are [OpenAI's Codex model guidance](https://learn.chatgpt.com/docs/models) and [GPT-6.1 Sol effort settings](https://developers.openai.com/api/docs/models/gpt-6.1-sol); verify account/client support when launching.
