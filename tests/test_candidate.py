@@ -208,6 +208,8 @@ class NonFixturePreparationTests(unittest.TestCase):
         self.git('rm', '--quiet', 'tools/candidate.py')
         self.git('commit', '--quiet', '-m', 'Synthetic revision without preparation source')
         self.m['source_sha'] = self.git('rev-parse', 'HEAD')
+        # git rm may remove the empty tools directory when bytecode is disabled.
+        self.script.parent.mkdir(parents=True, exist_ok=True)
         self.script.write_bytes(self.source)
         with self.assertRaises(subprocess.CalledProcessError):
             self.subject.prepare(self.m, self.binary, out)
