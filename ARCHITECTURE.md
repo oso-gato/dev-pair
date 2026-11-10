@@ -12,9 +12,49 @@ Use rootless Podman with Quadlet and systemd. Docker Engine is not a dependency.
 
 The maintenance agent runs in its own Podman container and uses a controlled host-operation interface for deployment, health checks and recovery. It does not receive unrestricted passwordless administration. Keep a documented operator recovery path that works when the agent is unavailable.
 
-The development agent runs directly inside the development container alongside project tools and tests. No additional Distrobox agent layer is required. Give it its own workspace and runtime state, without the host Podman socket, host administration credentials or unrestricted host execution bridge.
+DevBox is the development-role container, distinct from the `agentbox` provider selector. Its Codex agent runs directly inside the development container alongside project tools and tests. No additional Distrobox agent layer is required. Give it its own workspace and runtime state, without the host Podman socket, host administration credentials or unrestricted host execution bridge.
 
 Use separate service permissions for the two roles and separate credentials and state for each job. Durable work lives in declared volumes or external storage, not only in disposable image layers. Apply resource limits and bounded cleanup. Add concurrent workers only after their access isolation and resource handling have been tested.
+
+## Development and host validation protocol
+
+DevBox owns clarification, implementation, local unit/integration testing and consumption of host-test results. GitHub issues and PRs provide the durable request and evidence references. The maintenance agent owns the controlled host executor; it never treats a ticket or repository script as authority to run arbitrary host commands.
+
+| Message | Required information |
+|---|---|
+| Test request | Job/request ID; source revision and artifact digest when applicable; test revision and recipe; reason DevBox is insufficient; required host capabilities; permitted effects; workspace/data fixtures; expected outcomes; time/resource limits; cleanup plan |
+| Test result | Request and candidate IDs; executor/environment identity; pass/fail/blocked per check; expected versus actual behaviour; exit status and diagnostic/evidence locations; side effects and cleanup status |
+
+The maintenance side checks capabilities, allowed operations, candidate identity and resource limits before executing. Untrusted candidate code runs with confined job permissions; the controlled host interface exposes only declared operations. The request path never exposes the host Podman socket or host administration credentials to DevBox. Passing results are evidence for their exact candidate and environment, not permission to broaden the next request.
+
+Run each check in the least-privileged environment that can prove it. Local function/unit and suitable integration checks run in DevBox. Host checks can exercise a disposable candidate under the actual host service manager, network or confinement boundary using job-owned resources. Boot changes, destructive system tests, or checks requiring writes to the live OS need a designated disposable VM/VPS or equivalent real target. If unavailable, return blocked; do not claim nested execution proves that behaviour. Preserve the live pair for ongoing development.
+
+DevBox reads returned diagnostics, repairs the candidate and repeats affected local and host checks. Persist request state and results so interruptions can resume or reconcile a request without repeating a destructive action. Duplicate requests reuse a matching completed result or reconcile the previous attempt; they do not blindly replay it. Reject a result whose candidate/test identity no longer matches the required check.
+
+Define each message schema once, version it, and update producer and consumer definitions together. During staggered runtime renewal, reject unknown versions safely and do not emit a new schema until the receiving side supports it. This is a protocol compatibility requirement, not a reason to introduce a separate orchestration framework.
+
+## Protected Fedora roots and writable work areas
+
+Protect the running host and agent-container Fedora OS trees from product build and test writes. Configure DevBox and the maintenance container with read-only image roots and explicit writable mounts for job work, agent state and necessary temporary/runtime data. Run build code without privileges that can remount or alter protected roots. On the host, confined job execution may write only its declared data/test resources, not system package paths or configuration. A build directory alone does not enforce this boundary.
+
+Install baseline tools when constructing a new candidate image. Per-project dependencies belong in a job dependency environment, isolated build root or disposable builder image, never in the running host or DevBox OS. Any image-building backend must preserve the same boundaries; do not grant the worker a host socket simply to build images. Platform updates use the separate approved provisioning/replacement path.
+
+The runtime must declare the following storage classes and ownership:
+
+| Storage | Lifetime and handling |
+|---|---|
+| Source workspaces, uncommitted edits, checkpoints, evidence, deliverables | Durable per project/job; protected from build cleanup and container replacement |
+| Build trees, fetched source copies, generated outputs, test fixtures and candidates | Job-owned and disposable; reusable while active; removed at safe lifecycle boundaries |
+| Verified downloads, dependency/compiler caches and reusable image layers | Bounded by compatibility, trust scope and resource budgets; no secrets; safe reuse and selective invalidation |
+| Agent credentials/state and temporary runtime data | Explicit mounts with minimal scope; retention appropriate to recovery and confidentiality |
+
+A job owns its source worktree, branch, locks and build paths. Verify workspace and branch identity before mutations, commits and pushes; a failed workspace entry stops the action rather than falling back to the caller's directory. Neither cleanup nor a test may modify another job's workspace.
+
+Record source/dependency identities, toolchain/base image, target and build options for compatibility checks. Retain valid build directories and caches across the active loop; invalidate affected outputs when those inputs change. Verify a clean candidate in a separate output root when needed. Keep stable image inputs reusable and changing inputs separate so a source edit does not force every dependency to download again.
+
+Before runtime use, configure disk ceilings, active-use protection, idle retention and cleanup events. Reclaim completed/abandoned or expired inactive trees after preserving durable outputs. Reconcile orphaned resources after crashes, but never identify an active workspace as garbage merely because a worker restarted. At capacity, evict eligible inactive data and checkpoint/pause if insufficient; do not purge in-use caches mid-build. Report cache hits, actual downloads and space reclaimed as evidence for the reuse and cleanup acceptance criteria.
+
+Podman provides [read-only container roots and explicit writable mounts](https://docs.podman.io/en/latest/markdown/podman-run.1.html); [Quadlet](https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html) integrates containers with systemd. These are design inputs, not proof that the proposed enforcement or host-testing route works; verify the selected Fedora/Podman versions during implementation.
 
 ## Agent selection
 

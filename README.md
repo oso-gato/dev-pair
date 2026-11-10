@@ -1,6 +1,6 @@
 # dev-pair
 
-Dev-pair is an autonomous development pair: a Fedora host that maintains the platform and a Podman development environment that builds products. You describe the outcome; the pair delivers tested, usable software and explains how to use it. You are the product owner and do not need to write or review code.
+Dev-pair is an autonomous development pair: a Fedora host that maintains the platform and a Podman development environment that builds products. You describe the outcome; the pair asks focused questions until the product agreement is settled, then develops, tests, repairs and delivers usable software with evidence and instructions. You are the product owner and do not need to write or review code.
 
 ## Project documentation
 
@@ -37,9 +37,15 @@ The first deployment targets **Fedora Cloud 45** and rootless **Podman**, with Q
 
 The complete selection and isolation rules live in [ARCHITECTURE.md](ARCHITECTURE.md). These names do not install software or introduce a nested agent container. Selecting an agent environment is separate from selecting its model.
 
+## Required development loop
+
+DevBox is the Podman development container running Codex. It implements the agreed product and runs function/unit, integration and end-to-end checks wherever its environment is sufficient. Checks requiring the real VPS go to the maintenance agent through a durable request. That agent returns results and diagnostics; DevBox repairs failures and requests retesting until acceptance passes or agreed limits produce a clear blocker. Independent review and verification at the delivery destination complete the loop.
+
+Builds and tests use isolated work trees and dependency environments, protecting both the host and DevBox Fedora OS trees. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. None of these capabilities is implemented yet.
+
 ## First working milestone
 
-Prove one complete journey on one VPS: provision the platform, start Codex in both roles, accept a small product brief, build and independently verify the product, deploy it, and return its usable address. Demonstrate job recovery after interruption and recovery from a failed deployment.
+Prove one complete journey on one VPS: provision the platform, start Codex in both roles, accept a small product brief, build and independently verify the product, deploy it, and return its usable address. Demonstrate job recovery after interruption, recovery from a failed deployment, a failed host test followed by a successful DevBox repair/retest, protected Fedora OS paths, repeated-build reuse and safe cleanup.
 
 REQUIREMENTS defines the acceptance evidence. Build this path before adding concurrent projects, bare-metal support or another agent adapter. Add source, meaningful tests and setup instructions as the implementation earns them; four files are the starting point, not a permanent file-count limit.
 
