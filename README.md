@@ -8,7 +8,7 @@ These three governing documents are collectively **the charter**:
 
 - [00-OBJECTIVE.md](00-OBJECTIVE.md) defines the product outcome, scope and acceptance criteria.
 - [00-BYLAW.md](00-BYLAW.md) defines this project's platform, agent roles and operating contract.
-- [CONSTITUTION.md](CONSTITUTION.md) defines the principles and authority governing the work.
+- [00-CONSTITUTION.md](00-CONSTITUTION.md) defines the principles and authority governing the work.
 
 Together with this README, they are the complete starting documentation. Read the charter before making changes. It is self-contained and replaces the previous inherited governance for this repository.
 
