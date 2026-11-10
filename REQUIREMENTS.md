@@ -105,6 +105,15 @@
 <a id="r7-13"></a>
 **R7.13** These are acceptance requirements, not claims of current capability. The README states what has actually been built and verified.
 
+<a id="r7-14"></a>
+**R7.14** The pair operates headlessly after initial provisioning: installation, authentication, agent launch, development, maintenance and recovery must not require a physical display or a local graphical seat on the host. Verify the supported remote bootstrap/authentication route and both agent roles with no graphical session or display available; a terminal-only launch alone does not prove the complete journey.
+
+<a id="r7-15"></a>
+**R7.15** Client disconnection, network changes and client-device sleep must not stop an active job or lose its session context and work. Reconnecting from an authorized client returns to the same durable job/session and shows verified progress, without a manual worker nudge or duplicated consequential actions. Exercise disconnect/reconnect while work proceeds in both roles. Host/container interruption and replacement additionally retain the recovery obligations in R7.6 and R9.4–R9.6.
+
+<a id="r7-16"></a>
+**R7.16** Administration dashboards and control services must be reachable only through authorized private access; product services may be public when their product agreement calls for it. Remote terminal access requires authorized SSH keys, and direct remote root login is disabled after initial provisioning. Verify that administration is unreachable from the public network, password-based shell authentication and direct remote root login are rejected, and an authorized named administrator retains a working controlled recovery route. The owner confirmed these access outcomes on November 10, 2026; credential products, administrator naming and transport implementation are design choices within these boundaries.
+
 <a id="continuing-work"></a>
 <a id="r8"></a>
 ## R8 — Continuing work

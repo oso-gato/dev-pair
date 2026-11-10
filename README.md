@@ -34,7 +34,7 @@
 **DR2.1** This project adopts a **pre-1.0 working draft** of `oso-gato/standards`, pinned to the exact commit in [STANDARDS.md](STANDARDS.md). Version 1.0 remains a future milestone. The product owner approved the naming and adoption model on November 10, 2026.
 
 <a id="dr2-2"></a>
-**DR2.2** This is a documentation baseline for restarting development. There are no runtime scripts, container images defined here, installation commands, automated tests or CI workflows yet. No live host has been verified or changed by this restart. The intended architecture and acceptance requirements are documented; operational access and budgets still need to be established before dependent execution.
+**DR2.2** The restart now includes an offline, Python-standard-library [candidate preparation tool and local tests](docs/candidate-preparation.md). It validates explicit operator-supplied identities, prepares a deterministic digest-pinned Fedora/Codex build context and prints blocked invocation proposals for both Distrobox placements. No image has been built or agent launched; Distrobox confinement, Fedora validation, authentication and model access remain unverified. There is no working installation, deployment or CI workflow. Operational access and budgets still need to be established before dependent execution.
 
 <a id="dr2-3"></a>
 **DR2.3** The previous source and documentation remain in Git history at commit [`90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5`](https://github.com/oso-gato/dev-pair/tree/90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5). They may be consulted selectively but do not govern the new implementation. No history or existing tags are rewritten.
@@ -63,7 +63,7 @@
 **DR4.1** DevBox is the stable Podman development container hosting its Distrobox-based Codex gptbox. It implements the agreed product and runs function/unit, integration and end-to-end checks wherever its environment is sufficient. Checks requiring the real VPS go to the maintenance agent through a durable request. That agent returns results and diagnostics; DevBox repairs failures and requests retesting until acceptance passes or agreed limits produce a clear blocker. Independent review and verification at the delivery destination complete the loop.
 
 <a id="dr4-2"></a>
-**DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. None of these capabilities is implemented yet.
+**DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. Offline candidate preparation records proposed boundaries; their runtime enforcement and the remaining lifecycle capabilities are not implemented or verified.
 
 <a id="first-working-milestone"></a>
 <a id="dr5"></a>
@@ -80,7 +80,7 @@
 ## DR6 — Setup
 
 <a id="dr6-1"></a>
-**DR6.1** There is no setup command yet. Implementation must provide a reproducible Fedora 45 setup and validate it on a disposable or explicitly designated VPS before this README can describe it as ready to use. Do not use a historical installer as the new setup procedure without adapting and testing it against the adopted standards, requirements and architecture.
+**DR6.1** There is no working platform setup command yet. The [local fixture exercise](docs/candidate-preparation.md#exercise-the-local-path) runs without container tools or external services; it is not a platform installation. Implementation must provide a reproducible Fedora 45 setup and validate it on a disposable or explicitly designated VPS before this README can describe it as ready to use. Do not use a historical installer as the new setup procedure without adapting and testing it against the adopted standards, requirements and architecture.
 
 <a id="dr7"></a>
 ## DR7 — Required platform self-update
@@ -113,3 +113,6 @@
 
 <a id="dr10-3"></a>
 **DR10.3** This section documents the workflow and supplies a launch brief. It does not create cloud conversations, configure their models, implement orchestration, or establish runtime/release compliance. Report actual session links and verified progress separately. Current model-selection references are [OpenAI's Codex model guidance](https://learn.chatgpt.com/docs/models) and [GPT-6.1 Sol effort settings](https://developers.openai.com/api/docs/models/gpt-6.1-sol); verify account/client support when launching.
+
+<a id="dr10-4"></a>
+**DR10.4** The [DR10 work record](docs/dr10-work-record.md) records the source baseline, original-charter reconciliation, owner decisions, actual session capabilities and implementation handoffs. [Local candidate preparation](docs/candidate-preparation.md) is the first partial A12.12(1) implementation; actual Fedora construction, both Distrobox placements and runtime acceptance remain unverified. Exact candidate review and current delivery status belong in the accompanying pull request.

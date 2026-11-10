@@ -138,7 +138,10 @@
 **A7.2** Back up declared durable state and prove restoration. Match rollback to the application's data changes; reverting an image alone may not undo a database migration. Keep the previous working release available until the new release is verified.
 
 <a id="a7-3"></a>
-**A7.3** Administrative access is private where practical and authenticates with managed keys or identities. Public product access follows the product agreement. Supply credentials at runtime with minimal scope, keep them out of logs and source, and document renewal before calling unattended operation ready.
+**A7.3** Administrative access follows R7.16: management dashboards and control services use private access, remote shells require authorized SSH keys, and direct remote root login is disabled after provisioning. Public product access follows the product agreement. Supply credentials at runtime with minimal scope, keep them out of logs and source, and document renewal before calling unattended operation ready.
+
+<a id="a7-4"></a>
+**A7.4** Run job execution independently of the attached client connection, under the appropriate role's lifecycle supervisor, with stable job/session identity and durable context, checkpoints and evidence. Reattachment observes or resumes the existing session without dispatching a duplicate job. Keep bootstrap and provider authentication compatible with a headless host, documenting any authorized remote-device interaction separately from ongoing unattended operation. Validate the complete headless and disconnect/reconnect journeys in R7.14–R7.15; a detached shell or a process listing alone is insufficient evidence.
 
 <a id="a8"></a>
 ## A8 — Managed repair and renewal
