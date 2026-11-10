@@ -50,6 +50,12 @@ Neither component rebuilds the agent doing the work. A renewal that cannot resto
 
 Podman is the pair's container runtime. Rootless containers are managed through Quadlet and systemd; Docker Engine and a Docker daemon are not platform dependencies.
 
+**`agentbox`** is the stable entry point that resolves to the configured default agent environment. The concrete names are `gptbox` for OpenAI Codex and `claudebox` for Claude Code. The current required default is `agentbox → gptbox` for both maintenance and development. These names identify agent environments, not an extra container layer; Codex keeps its `codex` CLI command and Claude Code keeps its `claude` command.
+
+Selecting `gptbox` or `claudebox` explicitly overrides the default for that new session. Changing the default affects new sessions only; existing jobs and resumed sessions keep their recorded concrete agent. Record the resolved agent, role, runtime version and selected model with each job. The environment default and the model selected inside that environment are separate settings.
+
+Shared lifecycle code owns launch, state persistence, renewal and routing. Small agent-specific adapters own installation, authentication, invocation, configuration and resume. Credentials and session state remain separate per agent and job. An unavailable or unadmitted selection fails clearly rather than silently switching providers. Both adapters must satisfy the same permissions and delivery gates before use; retaining a script alone does not establish support.
+
 The development worker is the dev-container itself: Codex, project tools and tests run directly in that container, with a persistent project workspace. No nested Distrobox or second agent container is required inside it. The maintenance Codex runs in a separate Podman container on the Fedora host.
 
 Development containers receive no host Podman socket, host administration credentials or unrestricted host execution bridge. They request host operations through the ticket bus. The maintenance role reaches only declared operations through a controlled host interface; it does not gain unrestricted passwordless sudo merely because it is autonomous.

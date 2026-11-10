@@ -1,6 +1,6 @@
 # The Dev Pair — OBJECTIVE (spec of record)
 
-**The foremost objective is autonomous product delivery**: a Fedora host and its Podman dev-container — one **dev pair**, both operated by Codex — take a product outcome, develop and test it, and deliver a ready-to-use product after one initiation session. **The second objective: the host is a mother platform**, hosting containers as apps and services for whatever the maintainer needs. Everything below serves those two; on any conflict, the twofold objective wins and the conflicting clause is defective.
+**The foremost objective is autonomous product delivery**: a Fedora host and its Podman dev-container — one **dev pair**, both operated by Codex by default — take a product outcome, develop and test it, and deliver a ready-to-use product after one initiation session. **The second objective: the host is a mother platform**, hosting containers as apps and services for whatever the maintainer needs. Everything below serves those two; on any conflict, the twofold objective wins and the conflicting clause is defective.
 
 ## Authority
 
@@ -13,6 +13,8 @@ Why objective and constitution are separate documents: the objective is **scoped
 ## The workflow — one interaction, then ship
 
 The maintainer is the product owner. He specifies the outcome and evaluates the delivered product; he is not required to program, inspect diffs, review code, or operate the development tools.
+
+The default agent is selected through the `agentbox` mapping in [00-BYLAW.md](00-BYLAW.md) B5. Both roles default to Codex through `gptbox`; explicitly selecting another admitted agent does not change the product requirements, authority boundaries or delivery gates.
 
 - **Initiation.** Exactly one interactive session at the very beginning: the maintainer states the objective, intended users, essential user journeys, scope and boundaries. The pair establishes observable acceptance criteria, the delivery destination, data constraints, spending limits and permitted autonomous actions before execution starts.
 - **Confirmation.** The pair co-creates the **confirmed objective and the bylaw** with the maintainer in that session, sharpening and expanding his statement and settling both together: the objective's outcomes and boundaries, and the bylaw's runtime shape, repo-specific principles and instantiations. The constitution joins them as the charter's third file, applied by reference and never re-dictated. The maintainer confirms. That confirmation is the one and only human act the workflow requires.

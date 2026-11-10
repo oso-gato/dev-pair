@@ -4,7 +4,7 @@ Agent-owned map of the system as built. Mutable-on-fact: updated in the same cha
 
 ## Requirements revision (2026-11-10)
 
-The charter and operating manual now describe the Codex and Podman target recorded in [decision 000034](docs/decisions/000034-codex-on-podman.md). This revision changes documentation only. The source still contains the Claude-specific runtime described below; it does not yet implement the new requirements. No host was contacted or changed, and the August deployment observations below have not been reverified.
+The charter and operating manual now describe the Codex and Podman target recorded in [decision 000034](docs/decisions/000034-codex-on-podman.md), with the agent names and default mapping recorded in [decision 000035](docs/decisions/000035-agentbox-name.md). This revision changes documentation only. The source still contains the Claude-specific runtime described below; neither the `gptbox` adapter nor the `agentbox` default launcher exists yet. No host was contacted or changed, and the August deployment observations below have not been reverified.
 
 ## Recorded implementation baseline (2026-08-18)
 

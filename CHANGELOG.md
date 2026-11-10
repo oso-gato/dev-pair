@@ -4,6 +4,8 @@ Curated notable changes and incident narrative. Newest first.
 
 ## 2026-11-10
 
+- The target agent naming separates concrete environments from the default entry point: `gptbox` runs Codex, `claudebox` runs Claude Code, and `agentbox` resolves to the configured default, currently `gptbox`. Existing sessions retain their resolved agent when the default changes. The adapter and routing requirements are documented; the launcher and Codex adapter are not yet implemented. See [decision 000035](docs/decisions/000035-agentbox-name.md).
+
 - The product requirements now name Fedora, rootless Podman and Codex for both maintenance and development. Development Codex runs directly in the dev-container under the target design. Delivery is defined by usable outcomes, independent review, executable evidence and recovery, without requiring the product owner to review code. The bylaw, constitution reference, operating manual and orientation are aligned, and the map explicitly retains the Claude implementation as the unmodified baseline. The charter revision awaits maintainer merge; no runtime migration, deployment, credential change or historical rewrite is included. See [decision 000034](docs/decisions/000034-codex-on-podman.md).
 
 ## 2026-08-18

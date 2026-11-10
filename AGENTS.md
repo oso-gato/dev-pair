@@ -12,7 +12,7 @@ The pair's identities — GitHub App, tailnet, `core` — rest in the estate vau
 
 The dev pair: three parts, always. The **GitHub ticket bus** — issues and PRs — carries every hand-off; nothing durable lives only in a container or a layer. The **host** operates the platform and validates what the container cannot (tier-2); it opens PRs and never merges. The **dev-container** develops, validates (tier-1), and holds sole merge authority — except the locked documents above.
 
-The target is Fedora with rootless Podman and Codex in both roles, as defined in the objective and B5. Codex runs directly inside the dev-container. The checked-in runtime still uses Claude Code and nested Distrobox; this requirements revision does not implement that migration. Read [docs/decisions/000034-codex-on-podman.md](docs/decisions/000034-codex-on-podman.md) for the transition and preserve existing code and frozen records until their replacement is validated.
+The target is Fedora with rootless Podman and Codex as the default in both roles, as defined in the objective and B5. Codex runs directly inside the dev-container. The checked-in runtime still uses Claude Code and nested Distrobox; neither the `gptbox` adapter nor the `agentbox` default launcher is implemented by this requirements revision. Read [docs/decisions/000034-codex-on-podman.md](docs/decisions/000034-codex-on-podman.md) for the transition and preserve existing code and frozen records until their replacement is validated.
 
 ## Working method
 
@@ -30,7 +30,7 @@ Execution is parallel where independent and sequential only where dependent: `ta
 
 ## Ticket routing
 
-Every ticket carries its **pair** (the lineage: `erebus`, `strix`) and its **agent**. New Codex work names `codex` and the maintenance, development or review role explicitly. Historical `claudebox` and `kimibox` stamps retain their original meaning; do not rename existing App identities, credential paths or historical tickets as a side effect of the requirements change. Pick up only work routed to the session's pair and role. Runtime routing for Codex must be implemented and verified before claiming unattended pickup works.
+Every ticket carries its **pair** (the lineage: `erebus`, `strix`) and its **agent**. Resolve `agentbox` to its configured default when starting a new job, currently `gptbox` (Codex), and record that concrete name plus the maintenance, development or review role. Explicit `gptbox` or `claudebox` selection overrides the default for that new session. Resumed jobs retain their recorded agent even if the default changes. B5 owns the mapping and adapter contract. Historical `claudebox` and `kimibox` stamps retain their original meaning; do not rename existing App identities, credential paths or historical tickets as a side effect of the requirements change. Pick up only work routed to the session's pair, concrete agent and role. The new routing and launcher must be implemented and verified before claiming unattended pickup or agent switching works.
 
 ## Self-renewal — never forget this
 
