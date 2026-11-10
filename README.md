@@ -44,7 +44,7 @@
 ## DR3 — Platform and agents
 
 <a id="dr3-1"></a>
-**DR3.1** The first deployment targets **Fedora Cloud 45** and rootless **Podman**, with Quadlet and systemd managing container lifecycle. Fedora lists Cloud 45 as released on November 3, 2026: [official download](https://fedoraproject.org/cloud/download/). The provider's actual image and required capabilities must be verified during implementation.
+**DR3.1** The first deployment targets **Fedora Cloud 44** and rootless **Podman**, with Quadlet and systemd managing container lifecycle. On November 10, 2026, the owner reported that the existing Hostinger VPS runs Fedora Cloud 44 and corrected the earlier Fedora 45 target. The actual host OS, provider image and required capabilities have not been inspected and must be verified before adoption or deployment.
 
 | Clause | Name | Meaning | Implementation status |
 |---|---|---|---|
@@ -80,7 +80,7 @@
 ## DR6 — Setup
 
 <a id="dr6-1"></a>
-**DR6.1** There is no working platform setup command yet. The [local fixture exercise](docs/candidate-preparation.md#exercise-the-local-path) runs without container tools or external services; it is not a platform installation. Implementation must provide a reproducible Fedora 45 setup and validate it on a disposable or explicitly designated VPS before this README can describe it as ready to use. Do not use a historical installer as the new setup procedure without adapting and testing it against the adopted standards, requirements and architecture.
+**DR6.1** There is no working platform setup command yet. The [local fixture exercise](docs/candidate-preparation.md#exercise-the-local-path) runs without container tools or external services; it is not a platform installation. Implementation must provide a reproducible Fedora 44 setup and validate it on a disposable or explicitly designated VPS before this README can describe it as ready to use. Do not use a historical installer as the new setup procedure without adapting and testing it against the adopted standards, requirements and architecture.
 
 <a id="dr7"></a>
 ## DR7 — Required platform self-update

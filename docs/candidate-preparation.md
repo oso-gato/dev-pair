@@ -48,8 +48,8 @@ Set `kind` to `operator-verified-inputs`. Required evidence and identities:
   Preparation checks its own bytes against `git show <SHA>:tools/candidate.py`.
   Record the final reviewed source revision in the host request separately.
 - `standards_sha`: `08fc080dc8463a16e7ef753eefdefd98463b76b9`.
-- `fedora.image`: `registry.fedoraproject.org/fedora:45@sha256:<actual digest>`.
-  An authorized operator must resolve the official Fedora 45 x86_64 manifest,
+- `fedora.image`: `registry.fedoraproject.org/fedora:44@sha256:<actual digest>`.
+  An authorized operator must resolve the official Fedora 44 x86_64 manifest,
   inspect `/etc/os-release`/architecture, and record registry inspection and
   available signature/attestation results in `fedora.verification` (evidence
   reference, not a bare assertion). No digest has been resolved in this work.
@@ -145,7 +145,7 @@ No A3 ticket bus is implemented by this document.
 Fixtures are inadmissible to either request. A changed recipe, initialization or
 binary produces a new context and build result before runtime validation.
 
-Use only a designated disposable Fedora Cloud 45 VPS and separately identified
+Use only a designated disposable Fedora Cloud 44 VPS and separately identified
 DevBox candidate. Requested effects are limited to building/inspecting disposable
 candidates and job-owned test resources; no deployed replacement, host-policy
 change, live package install, paid API call or expanded privilege follows from

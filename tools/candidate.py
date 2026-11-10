@@ -13,7 +13,7 @@ import uuid
 STANDARDS = '08fc080dc8463a16e7ef753eefdefd98463b76b9'
 DESTINATIONS = {'workspace': '/work/job', 'state': '/state/codex',
                 'cache': '/cache/job', 'credentials': '/run/secrets/codex'}
-BLOCKER = ('No validated Fedora 45 Distrobox confinement adapter exists. '
+BLOCKER = ('No validated Fedora 44 Distrobox confinement adapter exists. '
            'Normal Distrobox home/host integration is not an isolation boundary; execution denied.')
 
 
@@ -46,7 +46,7 @@ def validate(m, fixture=False):
     token(m['source_sha'], r'[0-9a-f]{40}', 'source SHA')
     require(m['standards_sha'] == STANDARDS, 'standards pin mismatch')
     keys(m['fedora'], 'image verification', 'fedora')
-    token(m['fedora']['image'], r'registry\.fedoraproject\.org/fedora:45@sha256:[0-9a-f]{64}', 'Fedora 45 digest reference')
+    token(m['fedora']['image'], r'registry\.fedoraproject\.org/fedora:44@sha256:[0-9a-f]{64}', 'Fedora 44 digest reference')
     keys(m['codex'], 'version source sha256 verification', 'codex')
     token(m['codex']['version'], r'[0-9]+\.[0-9]+\.[0-9]+', 'stable Codex version')
     token(m['codex']['sha256'], r'[0-9a-f]{64}', 'Codex binary SHA256')

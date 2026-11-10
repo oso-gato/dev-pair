@@ -62,6 +62,7 @@ class PreparationTests(unittest.TestCase):
         mutations = [lambda m: m.pop('source_sha'),
                      lambda m: m.update(standards_sha='1' * 40),
                      lambda m: m['fedora'].update(image='fedora:latest'),
+                     lambda m: m['fedora'].update(image=m['fedora']['image'].replace('fedora:44@', 'fedora:45@')),
                      lambda m: m['fedora'].pop('verification'),
                      lambda m: m['codex'].update(version='1.2.3-alpha.1'),
                      lambda m: m['codex'].update(source='https://example.com/codex'),
@@ -155,7 +156,7 @@ class NonFixturePreparationTests(unittest.TestCase):
             'kind': 'operator-verified-inputs',
             'source_sha': matching_sha,
             'standards_sha': candidate.STANDARDS,
-            'fedora': {'image': 'registry.fedoraproject.org/fedora:45@sha256:' + digest,
+            'fedora': {'image': 'registry.fedoraproject.org/fedora:44@sha256:' + digest,
                        'verification': evidence},
             'codex': {
                 'version': '9876.5.4',
@@ -232,7 +233,7 @@ class NonFixturePreparationTests(unittest.TestCase):
         for name in ('digest', 'version'):
             m = copy.deepcopy(self.m)
             if name == 'digest':
-                m['fedora']['image'] = 'registry.fedoraproject.org/fedora:45@sha256:' + '0' * 64
+                m['fedora']['image'] = 'registry.fedoraproject.org/fedora:44@sha256:' + '0' * 64
                 error = 'placeholder image digest'
             else:
                 m['codex']['version'] = '0.0.0'

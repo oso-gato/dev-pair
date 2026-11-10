@@ -12,7 +12,7 @@ manifest = {
     'kind': 'fixture',
     'source_sha': '33e08e550690d6954009c3f84bbfd2bec5a6c571',
     'standards_sha': '08fc080dc8463a16e7ef753eefdefd98463b76b9',
-    'fedora': {'image': 'registry.fedoraproject.org/fedora:45@sha256:' + '0' * 64,
+    'fedora': {'image': 'registry.fedoraproject.org/fedora:44@sha256:' + '0' * 64,
                'verification': 'FIXTURE ONLY: no upstream verification'},
     'codex': {'version': '0.0.0',
               'source': 'https://github.com/openai/codex/releases/download/rust-v0.0.0/codex-x86_64-unknown-linux-musl.tar.gz',

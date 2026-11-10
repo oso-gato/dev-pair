@@ -77,7 +77,7 @@
 ## R6 — Initial scope
 
 <a id="r6-1"></a>
-**R6.1** Build one pair on one Fedora Cloud 45 VPS with rootless Podman. Prove one small demonstrator product from brief to delivery. The demonstrator must have observable user journeys and enough persistent job or application state to prove recovery. This milestone must also exercise the host-test failure/repair/retest path and repeated-build reuse/cleanup; an application-only success inside DevBox is insufficient.
+**R6.1** Build one pair on one Fedora Cloud 44 VPS with rootless Podman. Prove one small demonstrator product from brief to delivery. The demonstrator must have observable user journeys and enough persistent job or application state to prove recovery. This milestone must also exercise the host-test failure/repair/retest path and repeated-build reuse/cleanup; an application-only success inside DevBox is insufficient.
 
 <a id="r6-2"></a>
 **R6.2** Concurrency, bare-metal and GPU support, additional agent adapters, and unrelated hosted applications are later work. Keep their addition possible without implementing them before the first delivery succeeds.
@@ -86,7 +86,7 @@
 <a id="r7"></a>
 ## R7 — Acceptance for the first pair
 
-1. <a id="r7-1"></a>**R7.1** A fresh designated Fedora 45 VPS can be provisioned reproducibly. Reapplying setup preserves work and makes no unnecessary changes.
+1. <a id="r7-1"></a>**R7.1** A fresh designated Fedora 44 VPS can be provisioned reproducibly. Reapplying setup preserves work and makes no unnecessary changes.
 2. <a id="r7-2"></a>**R7.2** The default entry point starts Codex in each role with the intended permissions. Authentication works for unattended execution without credentials appearing in source, images or reports.
 3. <a id="r7-3"></a>**R7.3** A product brief produces a working demonstrator whose agreed user journeys and relevant failure paths pass. Test evidence identifies the exact source and artifact tested.
 4. <a id="r7-4"></a>**R7.4** A separate agent session reviews the candidate against the agreed requirements. Automated checks and independent evidence control release; the author cannot approve its own result or weaken its own gates.
