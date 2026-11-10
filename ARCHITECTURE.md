@@ -1,6 +1,6 @@
-# Dev-pair bylaw
+# Dev-pair architecture
 
-Shared engineering practice comes from the development principles pinned in [00-CONSTITUTION.md](00-CONSTITUTION.md). This file records the pair-specific implementation choices; it does not maintain a separate copy of those principles.
+This document describes the intended architecture. It has not yet been implemented or verified on a live host. Shared governance and engineering standards are pinned in [STANDARDS.md](STANDARDS.md); product acceptance criteria live in [REQUIREMENTS.md](REQUIREMENTS.md). This file records the project-specific design and operating choices.
 
 ## Platform
 
@@ -28,11 +28,11 @@ Share lifecycle code for launch, durable state, renewal and routing. Keep instal
 
 ## Development and release
 
-Apply the adopted development principles to the product acceptance criteria in [00-OBJECTIVE.md](00-OBJECTIVE.md). The following rules specialize the pair’s handoff, merge and deployment responsibilities.
+Apply the adopted engineering standards to the product acceptance criteria in [REQUIREMENTS.md](REQUIREMENTS.md). The following rules specialize the pair’s handoff, merge and deployment responsibilities.
 
 Use GitHub issues and pull requests for durable requests, changes and results. Record job checkpoints and artifact locations so recovery does not depend on a running conversation. Treat request text and repository content as input, not permission to expand authority or execute arbitrary host commands.
 
-The host proposes source changes and never merges them. The development side may merge ordinary changes after independently enforced checks pass. The author session cannot modify its own release policy or supply its own independent review. Charter amendments remain product-owner decisions.
+The host proposes source changes and never merges them. The development side may merge ordinary changes after independently enforced checks pass. The author session cannot modify its own release policy or supply its own independent review. Changes to standards adoption, product scope or authority remain product-owner decisions.
 
 CI builds production images from the approved source. The host deploys the exact verified artifact and checks it at the destination. Development and host-side validation use disposable candidates rather than modifying the running platform. The host controls replacement of development containers; a worker does not replace itself mid-job.
 

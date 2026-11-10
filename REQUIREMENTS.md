@@ -1,4 +1,4 @@
-# Dev-pair objective
+# Dev-pair requirements
 
 ## Outcome
 
@@ -12,7 +12,7 @@ Resolve ordinary implementation choices independently and report material decisi
 
 ## The pair
 
-The host maintains the platform, manages deployment and recovery, and performs checks requiring the real host. The development environment implements and tests products in isolation. Both use Codex by default. The bylaw defines their boundaries and the agent-selection contract.
+The host maintains the platform, manages deployment and recovery, and performs checks requiring the real host. The development environment implements and tests products in isolation. Both use Codex by default. [ARCHITECTURE.md](ARCHITECTURE.md) defines their boundaries and the agent-selection contract.
 
 Development work must not directly administer the host. The two roles exchange durable requests and evidence so a lost terminal or restarted container does not lose the job.
 
