@@ -6,6 +6,7 @@ import json
 import pathlib
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -95,9 +96,7 @@ def recipe(m):
             'ENTRYPOINT ["/opt/dev-pair/bin/codex"]\n').encode()
 
 
-def prepare(manifest, binary, output, fixture=False):
-    m = validate(manifest, fixture)
-    data = pathlib.Path(binary).read_bytes()
+def check_binary_and_source(m, data, fixture):
     require(digest(data) == m['codex']['sha256'], 'Codex binary integrity mismatch')
     require(fixture or (len(data) > 20 and data[:6] == b'\x7fELF\x02\x01' and
                         data[18:20] == b'\x3e\x00'), 'expected extracted x86_64 ELF binary')
@@ -108,12 +107,22 @@ def prepare(manifest, binary, output, fixture=False):
             check=True, capture_output=True, timeout=10).stdout
         require(tracked == pathlib.Path(__file__).read_bytes(),
                 'source SHA does not identify this preparation implementation')
-    files = {'inputs.json': canonical(m), 'codex': data, 'Containerfile': recipe(m)}
+
+
+def context_record(files, fixture):
     identity = {name: digest(value) for name, value in files.items()}
-    result = {'kind': 'fixture-not-admissible' if fixture else 'prepared-not-runtime-validated',
-              'files_sha256': identity, 'context_sha256': digest(canonical(identity)),
-              'provenance': 'Operator supplies upstream verification; only local binary hash checked here.',
-              'runtime': 'blocked', 'reason': BLOCKER}
+    return {'kind': 'fixture-not-admissible' if fixture else 'prepared-not-runtime-validated',
+            'files_sha256': identity, 'context_sha256': digest(canonical(identity)),
+            'provenance': 'Operator supplies upstream verification; only local binary hash checked here.',
+            'runtime': 'blocked', 'reason': BLOCKER}
+
+
+def prepare(manifest, binary, output, fixture=False):
+    m = validate(manifest, fixture)
+    data = pathlib.Path(binary).read_bytes()
+    check_binary_and_source(m, data, fixture)
+    files = {'inputs.json': canonical(m), 'codex': data, 'Containerfile': recipe(m)}
+    result = context_record(files, fixture)
     target = pathlib.Path(output).absolute()
     require(target.parent.resolve() == target.parent, 'symlink output parent denied')
     require(not target.exists() and not target.is_symlink(), 'output must be new; refusing overwrite')
@@ -127,6 +136,30 @@ def prepare(manifest, binary, output, fixture=False):
         shutil.rmtree(target)
         raise
     return result
+
+
+def verify(context, expected_context_sha256, fixture=False):
+    """Check staged bytes against a separately trusted handoff identity, without execution."""
+    token(expected_context_sha256, r'[0-9a-f]{64}', 'expected context SHA256')
+    root = pathlib.Path(context).absolute()
+    require(root.resolve() == root and root.is_dir(), 'context must be a nonsymlink directory')
+    names = {'inputs.json', 'codex', 'Containerfile', 'candidate.json'}
+    require({p.name for p in root.iterdir()} == names, 'context: missing or extra files')
+    files = {}
+    for name in names:
+        path = root / name
+        require(stat.S_ISREG(path.lstat().st_mode), 'context: only regular files permitted')
+        files[name] = path.read_bytes()
+    recorded = json.loads(files.pop('candidate.json'))
+    result = context_record(files, fixture)
+    require(result['context_sha256'] == expected_context_sha256,
+            'context identity does not match handoff')
+    require(recorded == result, 'candidate record does not match context bytes')
+    m = validate(json.loads(files['inputs.json']), fixture)
+    require(files['inputs.json'] == canonical(m), 'noncanonical input manifest')
+    require(files['Containerfile'] == recipe(m), 'recipe does not match recorded inputs')
+    check_binary_and_source(m, files['codex'], fixture)
+    return {**result, 'verification': 'local-context-integrity-only'}
 
 
 def plan(m, selector, model, effort, resume=None, fixture=False):
@@ -169,6 +202,10 @@ def main():
     prep = sub.add_parser('prepare')
     prep.add_argument('--binary', required=True)
     prep.add_argument('--output', required=True)
+    check = sub.add_parser('verify')
+    check.add_argument('--context', required=True)
+    check.add_argument('--expected-context-sha256', required=True)
+    check.add_argument('--fixture', action='store_true')
     pl = sub.add_parser('plan')
     pl.add_argument('--selector', choices=('agentbox', 'gptbox', 'claudebox'), default='agentbox')
     pl.add_argument('--model', required=True)
@@ -181,11 +218,14 @@ def main():
     args = parser.parse_args()
     try:
         require(args.command != 'launch', BLOCKER)
-        m = json.loads(pathlib.Path(args.manifest).read_text())
-        if args.command == 'prepare':
-            result = prepare(m, args.binary, args.output, args.fixture)
+        if args.command == 'verify':
+            result = verify(args.context, args.expected_context_sha256, args.fixture)
         else:
-            result = plan(m, args.selector, args.model, args.effort, args.resume, args.fixture)
+            m = json.loads(pathlib.Path(args.manifest).read_text())
+            if args.command == 'prepare':
+                result = prepare(m, args.binary, args.output, args.fixture)
+            else:
+                result = plan(m, args.selector, args.model, args.effort, args.resume, args.fixture)
         sys.stdout.buffer.write(canonical(result))
     except (ValueError, OSError, TypeError, subprocess.SubprocessError) as error:
         print(f'blocked: {error}', file=sys.stderr)

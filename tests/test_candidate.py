@@ -40,6 +40,67 @@ class PreparationTests(unittest.TestCase):
             candidate.prepare(self.m, self.binary, self.root / 'out')
         self.assertFalse((self.root / 'out').exists())
 
+    def test_verify_cli_checks_handoff_identity_and_keeps_fixture_blocked(self):
+        out = self.root / 'context'
+        prepared = candidate.prepare(self.m, self.binary, out, True)
+        result = subprocess.run(
+            [sys.executable, str(ROOT / 'tools/candidate.py'), 'verify', '--fixture',
+             '--context', str(out), '--expected-context-sha256', prepared['context_sha256']],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        verified = json.loads(result.stdout)
+        self.assertEqual(verified['context_sha256'], prepared['context_sha256'])
+        self.assertEqual(verified['kind'], 'fixture-not-admissible')
+        self.assertEqual(verified['runtime'], 'blocked')
+        with self.assertRaisesRegex(ValueError, 'record'):
+            candidate.verify(out, prepared['context_sha256'])
+        with self.assertRaisesRegex(ValueError, 'handoff'):
+            candidate.verify(out, '1' * 64, True)
+
+    def test_verify_rejects_each_changed_context_file(self):
+        for name in ('codex', 'inputs.json', 'Containerfile', 'candidate.json'):
+            with self.subTest(file=name):
+                out = self.root / name
+                prepared = candidate.prepare(self.m, self.binary, out, True)
+                path = out / name
+                path.chmod(0o600)
+                path.write_bytes(b'changed')
+                with self.assertRaises(ValueError):
+                    candidate.verify(out, prepared['context_sha256'], True)
+
+    def test_verify_rejects_rehashed_tampering_against_original_handoff(self):
+        out = self.root / 'context'
+        prepared = candidate.prepare(self.m, self.binary, out, True)
+        (out / 'Containerfile').write_bytes(b'FROM malicious\n')
+        files = {name: (out / name).read_bytes() for name in prepared['files_sha256']}
+        forged = candidate.context_record(files, True)
+        (out / 'candidate.json').write_bytes(candidate.canonical(forged))
+        with self.assertRaisesRegex(ValueError, 'handoff'):
+            candidate.verify(out, prepared['context_sha256'], True)
+        # Even a new identity cannot substitute an unsupported build recipe.
+        with self.assertRaisesRegex(ValueError, 'recipe'):
+            candidate.verify(out, forged['context_sha256'], True)
+
+    def test_verify_rejects_missing_extra_symlink_and_directory_inputs(self):
+        for kind in ('missing', 'extra', 'symlink', 'directory', 'root-symlink'):
+            with self.subTest(kind=kind):
+                out = self.root / kind
+                prepared = candidate.prepare(self.m, self.binary, out, True)
+                if kind == 'extra':
+                    (out / 'unexpected-hook').write_text('untracked input')
+                elif kind == 'root-symlink':
+                    link = self.root / 'linked-context'
+                    link.symlink_to(out, target_is_directory=True)
+                    out = link
+                else:
+                    (out / 'codex').unlink()
+                    if kind == 'symlink':
+                        (out / 'codex').symlink_to(self.binary)
+                    elif kind == 'directory':
+                        (out / 'codex').mkdir()
+                with self.assertRaises(ValueError):
+                    candidate.verify(out, prepared['context_sha256'], True)
+
     def test_corrupt_binary_rejected_before_writes(self):
         self.binary.write_bytes(b'corrupted')
         with self.assertRaisesRegex(ValueError, 'integrity'):
@@ -188,6 +249,9 @@ class NonFixturePreparationTests(unittest.TestCase):
         self.assertEqual((out / 'codex').read_bytes(), self.binary.read_bytes())
         self.assertIn(self.m['source_sha'], (out / 'Containerfile').read_text())
         self.assertEqual(result['files_sha256']['codex'], self.m['codex']['sha256'])
+        verified = self.subject.verify(out, result['context_sha256'])
+        self.assertEqual(verified['verification'], 'local-context-integrity-only')
+        self.assertEqual(verified['runtime'], 'blocked')
 
     def test_existing_git_source_with_different_implementation_is_rejected(self):
         self.script.write_bytes(self.source + b'\n# Different synthetic source revision\n')

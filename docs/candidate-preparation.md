@@ -89,6 +89,32 @@ candidate: Distrobox initialization dependencies/user/home integration still nee
 isolated, pinned assembly and compatibility testing. Do not fix that by installing
 packages or modifying hooks in a live parent or admitted agent container.
 
+Before handing a context to a builder, record the `context_sha256` returned by
+`prepare` in the trusted, source-bound request outside the transferred directory.
+The receiver can check the staged bytes without a container engine:
+
+```text
+python3 tools/candidate.py verify --context /private/staged/context --expected-context-sha256 <hash-from-trusted-request>
+```
+
+For offline fixtures only, add `--fixture`; verification preserves
+`fixture-not-admissible` and fixtures remain forbidden in host requests. The
+command rejects missing/extra files, symlinks and nonregular files, mismatched
+file hashes or candidate records, unsupported recipes, invalid manifests and
+binary/source mismatches. Non-fixture source checking requires the exact Git
+object and matching tool implementation, as preparation does. A successful
+result says `local-context-integrity-only`; runtime stays `blocked`. It does not
+verify upstream evidence or authorize a build/launch. Never obtain the expected
+hash solely from the transferred `candidate.json`: a writer could replace both
+the bytes and their recorded hashes.
+
+Verification reads a snapshot and does not lock or make the context immutable.
+An authorized receiver must privately stage it, prevent concurrent writers,
+verify against the trusted request, and keep those same bytes protected through
+the build. The tool does not enforce ownership, prevent filesystem races or
+constrain a builder. If those staging guarantees cannot be established, return
+blocked rather than execute from a shared writable directory.
+
 ## Storage and invocation boundary
 
 Installed OS/configuration, Codex and any eventual entrypoints/plugins must be
@@ -162,6 +188,9 @@ The operator recovery path and known working artifacts must remain available.
    integration in a separate versioned candidate, then review/retest that changed
    candidate. If normal initialization needs mutable code or excessive privileges,
    return the exact error and scoped design question; do not grant an exception.
+   First privately stage the context and run `verify` against the request's
+   separately recorded context hash; retain that identity in the build result.
+   Keep the verified bytes protected against concurrent changes through building.
 3. For host → maintenance gptbox and host → DevBox → development gptbox separately,
    inspect actual user/mount/PID/network namespaces, UID maps, storage driver,
    rootfs/mount flags, capabilities, SELinux labels/AVCs and lifecycle. Compare
@@ -212,6 +241,11 @@ The operator recovery path and known working artifacts must remain available.
    Retest changed candidates from the affected step. Full all-session renewal,
    nightly scheduling, job bus and deployment are later slices.
 
-Current blocker: this Debian executor has no Podman/Distrobox, designated Fedora
-target, host auth or paid execution budget. Host validation and independent
-candidate review are separate acceptance gates; local tests cannot close them.
+Current blocker: the owner has designated the existing Hostinger Fedora Cloud 44
+test target and supplied a root credential reference, but supported SSH transport
+is unavailable: this managed executor has no configured VPN or TCP grants, and
+the documented raw TCP route requires Tailscale. No host has been contacted or
+inspected. This Debian executor also lacks Podman/Distrobox; host suitability,
+secure access and runtime execution limits still require verification before
+host checks. Host validation and independent candidate review are separate
+acceptance gates; local tests cannot close them.
