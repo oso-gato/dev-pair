@@ -11,7 +11,7 @@ import subprocess
 import sys
 import uuid
 
-STANDARDS = '08fc080dc8463a16e7ef753eefdefd98463b76b9'
+STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 DESTINATIONS = {'workspace': '/work/job', 'state': '/state/codex',
                 'cache': '/cache/job', 'credentials': '/run/secrets/codex'}
 BLOCKER = ('No validated Fedora 44 Distrobox confinement adapter exists. '
@@ -193,6 +193,7 @@ def plan(m, selector, model, effort, resume=None, fixture=False):
                                       'SELinux enforcing; no outer engine socket or host-exec bridge',
                                       'isolated home; no writable config/hooks/plugins shadowing code',
                                       'private tmpfs /tmp and /run; bounded storage and resources',
+                                      'authorized Tailscale-only workload ingress; denial and fail-closed recovery verified',
                                       'credential auth adapter and CLI flags verified for pinned stable version']}
 
 

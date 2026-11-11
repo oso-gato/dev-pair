@@ -47,7 +47,7 @@ Set `kind` to `operator-verified-inputs`. Required evidence and identities:
 - `source_sha`: the exact Git commit containing this preparation implementation.
   Preparation checks its own bytes against `git show <SHA>:tools/candidate.py`.
   Record the final reviewed source revision in the host request separately.
-- `standards_sha`: `08fc080dc8463a16e7ef753eefdefd98463b76b9`.
+- `standards_sha`: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
 - `fedora.image`: `registry.fedoraproject.org/fedora:44@sha256:<actual digest>`.
   An authorized operator must resolve the official Fedora 44 x86_64 manifest,
   inspect `/etc/os-release`/architecture, and record registry inspection and
@@ -150,7 +150,7 @@ permission. No auth secret value is included in the plan.
 ## Candidate-bound Fedora validation request
 
 Dispatch two dependent executor requests. Required clauses: A1, A2.4, A3,
-A4, A5, A10.1/A10.4–A10.6, R5, R7 (including R7.14–R7.16) and R11.1/R11.6.
+A4, A5, A10.1/A10.4–A10.6, R5, R7 (including R7.14–R7.18) and R11.1/R11.6.
 The current source commit is supplied by Git handoff, never a moving branch.
 No A3 ticket bus is implemented by this document.
 
@@ -210,9 +210,14 @@ The operator recovery path and known working artifacts must remain available.
    host-spawn bridge, dangerous capabilities and role-crossing credentials.
    Demonstrate forbidden host operation denial with a harmless scoped probe.
    Maintenance gets no unrestricted bridge either; its future controlled host
-   interface is outside this slice. Inspect host administration exposure for
-   R7.16: private administrative services, key-only shell authentication and no
-   direct root login after bootstrap. Return a mismatch as a blocker; this test
+   interface is outside this slice. Inspect R7.16–R7.18/A7.3/A7.5: authorized
+   Tailscale entry to both roles and hosted workload paths, public/unauthorized
+   denial, and tailnet-loss failure without fallback exposure. Verify key-only
+   shells and no direct remote root after bootstrap. Use separately approved
+   fault-injection effects/limits for loss/recovery tests; if absent, return blocked.
+   Fresh-host enrollment uses an independently authorized temporary SSH/console
+   request, not a preexisting tailnet connection; verify tailnet entry and controlled
+   recovery before retiring bootstrap access. Return a mismatch as a blocker; this test
    request does not authorize changing host access policy. Record expected versus
    actual per denial.
 6. For R7.14, use no graphical seat and unset display variables; verify the
@@ -240,6 +245,11 @@ The operator recovery path and known working artifacts must remain available.
    request's disposable containers/storage after confirming none is active.
    Retest changed candidates from the affected step. Full all-session renewal,
    nightly scheduling, job bus and deployment are later slices.
+
+The preparation manifest's standards pin is an exact current-job adoption check,
+not network enforcement. Old-pin inputs require explicit regeneration/migration;
+historical candidate evidence remains bound to its original revision. No plan or
+fixture establishes R7.17–R7.18 compliance.
 
 Current blocker: the owner has designated the existing Hostinger Fedora Cloud 44
 test target and supplied a root credential reference, but supported SSH transport

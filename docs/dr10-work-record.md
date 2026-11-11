@@ -178,3 +178,57 @@ the ruleset list again showed two active tag rulesets only. Enforcement remains
 unverified. Shell Git push dry-run now succeeds, so the reviewed continuation
 can be published as its exact local commit rather than recreating its Git tree
 through the connector. This does not establish merge/promotion readiness.
+
+
+## Owner correction and explicit tailnet migration — November 10, 2026 (America/New_York)
+
+This current requirement correction supersedes the earlier administrative-only
+access interpretation and public-product allowance; previous observations and
+review verdicts above remain evidence only for their identified candidates.
+The owner explicitly directed a cross-repository standard for executing VPS
+container/VM-like development environments and applications, not merely control
+panels. It does not mandate Podman for all repositories or affect source storage.
+
+- Shared draft baseline: `oso-gato/standards@08fc080dc8463a16e7ef753eefdefd98463b76b9`.
+  Prepared and committed first as
+  `oso-gato/standards@b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`, still
+  pre-1.0 unreleased, no tag. Applicable citations: E12.1–E12.4, G1.4,
+  RS5.10 and SR7.3. No private shared rule text is copied into this project.
+- The owner approved this adoption and explicitly migrated the current
+  DR10 / PR #13 job from the old pin. S1.3–S1.7 and all three links now identify
+  that exact new draft. Other repositories and jobs retain their own pins until
+  separately migrated; central publication is not runtime enforcement.
+- R7.16 retains key-only shells, root retirement and controlled recovery while
+  tracing its superseded network scope to new R7.17. R7.17 applies authorized
+  Tailscale-only access to DevBox, both roles, demonstrator and later hosted
+  workloads; no public-ingress exception is approved here. R7.18 and A7.5 keep
+  authorized fresh-host SSH/provider-console bootstrap separate, avoid enrollment
+  circularity and require proven tailnet entry plus independent recovery before
+  temporary access is retired. A7.3 records topology choices within confinement;
+  R10.3/A9.1 and the Fedora handoff carry these outcomes forward.
+- `tools/candidate.py`, fixture generation and documented inputs use the new
+  exact pin. A regression verifies adoption/fixture agreement and rejects the
+  prior pin before output writes or invocation planning. Generated contexts
+  must be regenerated and re-reviewed under the new source and standards pin;
+  previous reviewed contexts/results are not upgraded to the new obligations.
+- Builder API configuration: `gpt-6.1-sol` / `high`, returned identifier
+  `/root/tailscale_standard_build`; independent provider attestation unavailable.
+  Isolated worktrees: `/workspace/standards-tailscale` and
+  `/workspace/dev-pair-tailscale`, starting from the shared baseline above and
+  dev-pair `fc39196c1532c3f9253b9e82eaf132fa6d8ae839`. Scope is source/docs,
+  local validation and committed handoff only, bounded to 10 minutes before
+  checkpoint and at most two repair cycles. No host or network changes,
+  enrollment, credential use, push, merge or release tag occurred in this task.
+- Local validation: all 18 offline tests pass, including the old-pin denial
+  regression and fixture/non-fixture context checks. Document checks cover
+  whitespace, unique anchors, local links and matching resolvable adoption pins.
+  Tailscale/host runtime tests remain unrun/blocked. A fresh Astra review must
+  independently assess the two exact commits before publication; its identifier
+  and verdict belong in PR #13. This builder supplies no release approval.
+
+Next host handoff must bind to the new source/standards pin and include authorized
+and unauthorized/public access tests, tailnet-loss denial without fallback,
+bootstrap cutover and recovery under explicit effects/limits. The previously
+reported executor transport blocker is distinct from this product requirement:
+an authorized public SSH/provider-console bootstrap path can precede enrollment,
+but this task has established no usable executor-to-host route.

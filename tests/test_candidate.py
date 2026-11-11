@@ -35,6 +35,18 @@ class PreparationTests(unittest.TestCase):
                              (self.root / 'b' / name).read_bytes())
         self.assertEqual(self.binary.read_bytes(), (self.root / 'a/codex').read_bytes())
 
+    def test_adopted_pin_matches_docs_and_fixture_rejects_prior_pin_before_writes(self):
+        standards_doc = (ROOT / 'STANDARDS.md').read_text()
+        self.assertIn(f'**S1.3** Full commit SHA: `{candidate.STANDARDS}`', standards_doc)
+        self.assertEqual(self.m['standards_sha'], candidate.STANDARDS)
+        self.m['standards_sha'] = '08fc080dc8463a16e7ef753eefdefd98463b76b9'
+        out = self.root / 'old-pin'
+        with self.assertRaisesRegex(ValueError, 'standards pin mismatch'):
+            candidate.prepare(self.m, self.binary, out, True)
+        self.assertFalse(out.exists())
+        with self.assertRaisesRegex(ValueError, 'standards pin mismatch'):
+            candidate.plan(self.m, 'agentbox', 'gpt-6.1-sol', 'high', fixture=True)
+
     def test_fixture_not_admitted_without_explicit_fixture_mode(self):
         with self.assertRaisesRegex(ValueError, 'fixture'):
             candidate.prepare(self.m, self.binary, self.root / 'out')

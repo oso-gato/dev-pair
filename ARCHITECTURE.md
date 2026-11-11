@@ -138,10 +138,13 @@
 **A7.2** Back up declared durable state and prove restoration. Match rollback to the application's data changes; reverting an image alone may not undo a database migration. Keep the previous working release available until the new release is verified.
 
 <a id="a7-3"></a>
-**A7.3** Administrative access follows R7.16: management dashboards and control services use private access, remote shells require authorized SSH keys, and direct remote root login is disabled after provisioning. Public product access follows the product agreement. Supply credentials at runtime with minimal scope, keep them out of logs and source, and document renewal before calling unattended operation ready.
+**A7.3** Enforce R7.16–R7.18 for all VPS workload entry points, including development/maintenance, demonstrator use and later hosted apps. Select and document Tailscale topology, workload endpoints, identity/ACL policy and listener/firewall routes before deployment. Host-mediated access, sidecar routing or individual workload identities remain design options subject to rootless Podman and SELinux boundaries; no per-container daemon or privileged-networking requirement is inferred. Test authorized tailnet use, public/unauthorized rejection and loss of the tailnet with no exposure fallback. Supply enrollment/runtime credentials externally with minimal scope, redact logs and record renewal/revocation. This design is required, not implemented.
 
 <a id="a7-4"></a>
 **A7.4** Run job execution independently of the attached client connection, under the appropriate role's lifecycle supervisor, with stable job/session identity and durable context, checkpoints and evidence. Reattachment observes or resumes the existing session without dispatching a duplicate job. Keep bootstrap and provider authentication compatible with a headless host, documenting any authorized remote-device interaction separately from ongoing unattended operation. Validate the complete headless and disconnect/reconnect journeys in R7.14–R7.15; a detached shell or a process listing alone is insufficient evidence.
+
+<a id="a7-5"></a>
+**A7.5** Provision a fresh VPS through the separately authorized, scoped public SSH or provider-console route; record its allowed sources, authentication, effects, duration and retirement condition. Initial access may precede Tailscale enrollment. Verify host identity and inspect first, then enroll through external secret references, configure tailnet-only workload ingress and prove named-administrator key access plus a controlled recovery route independent of the pair/tailnet before retiring temporary public access and direct remote root. Record cutover/rollback checkpoints so enrollment failure cannot strand the host. Operator recovery uses its own scoped authority and must not reopen application ingress. A3 validation requests may observe/test approved paths; they do not authorize enrollment or access-policy changes themselves.
 
 <a id="a8"></a>
 ## A8 — Managed repair and renewal
@@ -171,7 +174,7 @@
 ## A9 — Later application hosting
 
 <a id="a9-1"></a>
-**A9.1** The maintenance side manages owner-approved application containers alongside the pair, with separate state, identities and resource allocations. Reserve enough capacity for development and recovery. Application installation and renewal use isolated candidates and verified artifacts; unrelated applications cannot acquire the pair’s privileged control interface.
+**A9.1** The maintenance side manages owner-approved application containers alongside the pair, with separate state, identities and resource allocations. Reserve enough capacity for development and recovery. Application installation and renewal use isolated candidates and verified artifacts, with tailnet access and failure/recovery acceptance under R7.17–R7.18/A7.3/A7.5; unrelated applications cannot acquire the pair’s privileged control interface.
 
 <a id="a9-2"></a>
 **A9.2** Use oso-gato/fedora-desktop as a reference for the desired remotely accessible desktop experience, not as inherited implementation or policy. The requested successor is an Omarchy workload under the container-as-app goal. Keep Fedora as the host/DevBox platform and keep desktop-specific design in the workload’s own project.
