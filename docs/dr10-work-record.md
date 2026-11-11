@@ -120,3 +120,54 @@ The integration candidate includes the owner-approved R7.14–R7.16/A7.3–A7.4 
 Builder launch brief: Work on `oso-gato/dev-pair`, starting from recorded main `f2e829b0bcaa1fb5d22cf9b12261a122a607d25c`, in your assigned isolated worktree. Configure `gpt-6.1-sol` / `high` through the execution service. Read DR10, STANDARDS and all three exact pinned sources, REQUIREMENTS, ARCHITECTURE A12 and this work record. Implement only the bounded first slice assigned by coordination; preserve A2/A4/A5/A10/A11. Define meaningful tests, run local checks, and return an exact commit plus remaining A3 requests. Do not expand permissions, deploy, purchase infrastructure, silently change models or claim absent host checks passed. Record actual session/configuration evidence, limits and next action.
 
 Reviewer launch brief: Configure a fresh `gpt-6-astra` / `high` session through the execution service. Independently read the same authoritative sources and the exact candidate SHA provided by coordination. Inspect the diff and run appropriate safe tests. Check omitted requirements, provenance, write/credential boundaries, failure/retry behavior and evidence truthfulness. Do not edit the candidate. Return pass, changes required or blocked with precise references, distinguish code-review verdict from full milestone acceptance, and never treat the author summary as proof.
+
+## Continuation checkpoint — 2026-11-11
+
+This entry supersedes earlier unknown-endpoint/credential/target-authorization
+statements; historical observations above remain historical.
+
+- Resumed PR #13 at `512cf6aa3afc41d1db128e82221a9caf9a84ca2b`, branch
+  `codex/dr10-reconciliation-review`, initially clean. Loaded README DR10,
+  STANDARDS, all three Git-object documents at the unchanged standards pin,
+  REQUIREMENTS, ARCHITECTURE A12 and this record.
+- The owner designated the existing Hostinger VPS as clean/disposable and
+  authorized initial root access and wiping if needed. Fedora Cloud 44 remains
+  owner-reported, not inspected. Host address and credential values are not
+  published here. The credential reference is environment variable
+  `hostinger_root`; a boolean-only process check confirmed it was nonempty.
+  Environment status independently reported this runtime variable `ready`,
+  current observations and enforced network policy. No credential was printed,
+  written to source or supplied to a remote endpoint.
+- Supported SSH transport is **blocked before authentication**. The managed
+  executor startup policy reports `vpn_configured: false`,
+  `automatic_tailscale_access: false`, and empty TCP domain/IP grants. The
+  cloud-environment runtime networking/VPN reference specifies that raw TCP
+  CONNECT uses Tailscale transport; unrestricted HTTP is not public SSH access.
+  No supported route to the designated host is established. No SSH retry,
+  authentication, host command, wipe or deployment occurred in this continuation.
+  Diagnostic metadata returned `history_status: not_found`, no captures.
+- No runtime environment-change tool is exposed. To unblock host work, provide
+  an execution environment with a supported authenticated SSH route to the
+  designated VPS (or configure the managed Tailscale route and eligible target).
+  A public-IP TCP grant alone is not established as sufficient by the runtime
+  documentation. Do not bypass the proxy or weaken host-key verification.
+  After connectivity is available, first inspect OS, architecture, disks,
+  services, network exposure, SELinux, users and recovery access read-only;
+  only then plan authorized provisioning. Preserve R7.16 key-only/private
+  administration and root retirement after bootstrap with verified recovery.
+- Local source work may continue under A12.10. This run renews a bounded
+  assessment: one Sol High builder, 10 minutes per task before checkpoint,
+  at most two repair cycles, no new paid infrastructure/API purchases.
+  Deployed runtime budgets/scheduling remain unset until dependent execution.
+- Builder execution API accepted `gpt-6.1-sol` / `high` with fresh context and
+  returned `/root/build_dr10_continue`, using `/workspace/dev-pair-sol`.
+  These are actual API settings, not prompt-only selection. Independent
+  provider-side model attestation and this coordinator's model/effort metadata
+  are unavailable. Local agents are explicitly owner-authorized; no standalone
+  Codex Cloud conversation is claimed. Fresh Astra High review will bind to the
+  exact integrated candidate; its returned identifier/verdict belongs in PR #13.
+- PR #13 remains draft. A historical bot comment offers a `live-validate` loop;
+  that comment is not proof of this restart's required boundary checks or release
+  enforcement and is not authority to enroll this candidate for automatic merge.
+  Required Fedora/Distrobox evidence and independently enforced release checks
+  remain outstanding; no merge or production promotion is claimed.
