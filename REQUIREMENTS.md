@@ -77,7 +77,7 @@
 ## R6 — Initial scope
 
 <a id="r6-1"></a>
-**R6.1** Build one pair on one Fedora Cloud 45 VPS with rootless Podman. Prove one small demonstrator product from brief to delivery. The demonstrator must have observable user journeys and enough persistent job or application state to prove recovery. This milestone must also exercise the host-test failure/repair/retest path and repeated-build reuse/cleanup; an application-only success inside DevBox is insufficient.
+**R6.1** Build one pair on one Fedora Cloud 44 VPS with rootless Podman. Prove one small demonstrator product from brief to delivery. The demonstrator must have observable user journeys and enough persistent job or application state to prove recovery. This milestone must also exercise the host-test failure/repair/retest path and repeated-build reuse/cleanup; an application-only success inside DevBox is insufficient.
 
 <a id="r6-2"></a>
 **R6.2** Concurrency, bare-metal and GPU support, additional agent adapters, and unrelated hosted applications are later work. Keep their addition possible without implementing them before the first delivery succeeds.
@@ -86,7 +86,7 @@
 <a id="r7"></a>
 ## R7 — Acceptance for the first pair
 
-1. <a id="r7-1"></a>**R7.1** A fresh designated Fedora 45 VPS can be provisioned reproducibly. Reapplying setup preserves work and makes no unnecessary changes.
+1. <a id="r7-1"></a>**R7.1** A fresh designated Fedora 44 VPS can be provisioned reproducibly. Reapplying setup preserves work and makes no unnecessary changes.
 2. <a id="r7-2"></a>**R7.2** The default entry point starts Codex in each role with the intended permissions. Authentication works for unattended execution without credentials appearing in source, images or reports.
 3. <a id="r7-3"></a>**R7.3** A product brief produces a working demonstrator whose agreed user journeys and relevant failure paths pass. Test evidence identifies the exact source and artifact tested.
 4. <a id="r7-4"></a>**R7.4** A separate agent session reviews the candidate against the agreed requirements. Automated checks and independent evidence control release; the author cannot approve its own result or weaken its own gates.
@@ -104,6 +104,21 @@
 
 <a id="r7-13"></a>
 **R7.13** These are acceptance requirements, not claims of current capability. The README states what has actually been built and verified.
+
+<a id="r7-14"></a>
+**R7.14** The pair operates headlessly after initial provisioning: installation, authentication, agent launch, development, maintenance and recovery must not require a physical display or a local graphical seat on the host. Verify the supported remote bootstrap/authentication route and both agent roles with no graphical session or display available; a terminal-only launch alone does not prove the complete journey.
+
+<a id="r7-15"></a>
+**R7.15** Client disconnection, network changes and client-device sleep must not stop an active job or lose its session context and work. Reconnecting from an authorized client returns to the same durable job/session and shows verified progress, without a manual worker nudge or duplicated consequential actions. Exercise disconnect/reconnect while work proceeds in both roles. Host/container interruption and replacement additionally retain the recovery obligations in R7.6 and R9.4–R9.6.
+
+<a id="r7-16"></a>
+**R7.16** Remote terminal access requires authorized SSH keys, and direct remote root login is disabled after initial provisioning. Verify rejection of password-based shell authentication and direct remote root login, with a working controlled recovery route for an authorized named administrator. These outcomes were approved on November 10, 2026. The former administrative-only private-access scope and allowance for public product services are superseded by owner-directed R7.17; R7.18 distinguishes authorized fresh-host bootstrap from post-enrollment access.
+
+<a id="r7-17"></a>
+**R7.17** DevBox, both gptbox roles, the first demonstrator and subsequent VPS-hosted Podman applications (including a later remote desktop) must be Tailscale-enabled and usable only by authorized clients behind the owner's tailnet, under adopted engineering standards E12. No public application ingress is approved for this project. Any departure needs explicit scoped owner approval recorded in STANDARDS. For each exposed workload path, prove successful authorized tailnet use, rejection from public and unauthorized clients, and tailnet-loss failure without a public or unauthorized fallback. Record actual candidate/configuration and tested endpoints; no host/runtime evidence exists yet.
+
+<a id="r7-18"></a>
+**R7.18** Fresh-host setup must support separately authorized temporary public SSH or provider-console access before enrollment; it must not require an existing tailnet route to the unenrolled VPS. Keep bootstrap narrowly scoped and verify both authorized tailnet entry and an independent controlled recovery route before retiring temporary access and disabling direct remote root. Recovery must remain possible when the pair or tailnet is unavailable without exposing applications publicly. Exercise enrollment failure, successful cutover and recovery on the designated target under explicit effects/limits; retain credentials outside source and images. A later emergency access change needs its own scope and authority.
 
 <a id="continuing-work"></a>
 <a id="r8"></a>
@@ -143,7 +158,7 @@
 **R10.2** The owner’s named later workload is a remotely accessible Omarchy desktop, replacing the Fedora desktop experience represented by oso-gato/fedora-desktop. Preserve the desired remote-use outcome while developing the new workload against its own requirements. This does not change the Fedora host or DevBox OS choice and does not claim Omarchy currently works as a Podman workload.
 
 <a id="r10-3"></a>
-**R10.3** A hosted application has its own isolated runtime, declared durable data, credentials and resource limits. It must not modify the host or DevBox OS tree or inherit platform-administration authority. Define authenticated remote access and acceptance for the desktop in its product agreement, including the intended browser/native-client experience, session/data continuity and impact on pair capacity.
+**R10.3** A hosted application has its own isolated runtime, declared durable data, credentials and resource limits. It must not modify the host or DevBox OS tree or inherit platform-administration authority. Carry R7.17–R7.18 into workload-specific acceptance and define authenticated tailnet access and acceptance for the desktop in its product agreement, including the intended browser/native-client experience, session/data continuity and impact on pair capacity.
 
 <a id="r10-4"></a>
 **R10.4** Before committing to the desktop implementation, validate Omarchy’s current upstream installation model, graphical/remote-session requirements and feasibility on the selected VPS under Podman. If the required outcome cannot be met within that boundary, present the evidence and a scoped alternative for owner decision. Do not silently replace Omarchy, introduce a VM dependency or change the host OS. Detailed desktop implementation and acceptance remain later work.

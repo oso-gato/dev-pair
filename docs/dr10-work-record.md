@@ -1,0 +1,234 @@
+# DR10 launch reconciliation and work record
+
+## Recorded baseline and authority
+
+- Job: DR10 / A12.11 original-charter reconciliation, followed by the first bounded part of A12.12(1).
+- Repository: `oso-gato/dev-pair`; fetched `main` and verified it equals `f2e829b0bcaa1fb5d22cf9b12261a122a607d25c` on 2026-11-10.
+- Starting checkout: branch `work`, clean, at that same commit. Isolated coordination worktree: `/workspace/dev-pair-dr10`, branch `codex/dr10-reconciliation`, created from `origin/main`.
+- Standards: `oso-gato/standards@08fc080dc8463a16e7ef753eefdefd98463b76b9`; all three adopted documents loaded from the matching local Git objects. Their private text is not copied into this record.
+- Historical comparison: `90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5`, `00-OBJECTIVE.md`, `00-BYLAW.md`, `CONSTITUTION.md`, and historical `ARCHITECTURE.md`. These are evidence, not current authority. In particular, this snapshot contains the subsequently corrected direct-in-DevBox interpretation.
+- A11 references fetched and checked out at exact revisions: `oso-gato/fedora-bootstrap@e8def2684e91facceb985974ac4d38d64f0be8c5` and `oso-gato/fedora-dev@9811f351a43c89e7da1aa1fa255d4711a7ab5216`.
+- The owner requested autonomous coordination and is not the code reviewer. On 2026-11-10 the owner explicitly authorized **model-configured local subagents for this run** after being told they are not standalone Codex Cloud conversations. This is a run-specific execution choice, not a permanent amendment of A12.
+- Current scope: repository inspection, isolated source changes, local tests, durable draft handoff. The owner has identified an existing Hostinger VPS, but its secure endpoint and suitability for disposable testing remain unverified. No infrastructure purchase is authorized, and no deployment or credential migration has occurred. Reference repositories are read-only inputs.
+- Coordinator-selected local limits: no new paid infrastructure/API purchases; one builder at a time; each delegated task bounded to 10 minutes, at most two repair cycles before checkpoint/reassessment. These are conservative limits for this run, not approved operating budgets for the deployed pair. Host spending, disk/retention, execution limits and nightly timezone remain unresolved before dependent execution.
+
+## Owner correction: Fedora Cloud 44 target
+
+On November 10, 2026, the owner reported that the existing Hostinger VPS runs
+**Fedora Cloud 44 (F44)** and directed correction of the earlier Fedora 45 target.
+Fedora Cloud 44 is now the target for the VPS, agent base inputs and validation
+handoff (DR3.1/DR6.1, R6.1/R7.1, A1.1). This is owner-reported OS information,
+not live host verification: no host has been contacted, inspected or changed.
+The exact provider image, architecture, runtime capabilities and digest-pinned
+official Fedora 44 base still require verification before adoption. Historical
+commits and the explicitly historical Fedora 45 blocked-check entry below retain
+the earlier record; no earlier test result is upgraded by this correction.
+
+## Session and environment evidence
+
+The managed executor is Debian 13, not the currently required Fedora Cloud 44 VPS. The environment status reported current observations, connected/running state, and an enforced unrestricted network policy. Its configuration reports no secret bindings or outbound identities. Git fetches and the GitHub connector nevertheless independently establish the repository access used here; absence of configured bindings is not proof that every service lacks credentials.
+
+`codex` is installed (`0.167.0-alpha.4`); `podman` and `distrobox` are absent from PATH. No host runtime, SELinux, nested-container, unattended Codex authentication or model-entitlement acceptance has been established.
+
+No standalone chat-creation tool is exposed in this client. The installed CLI offers `codex cloud exec`, but its read-only access probe, `codex cloud list --limit 1 --json`, returned HTTP 401 (authentication token could not be parsed). No Cloud task was submitted. Local CLI model flags would not by themselves prove Cloud execution settings.
+
+The coordinator chat is `6af394d3-26e0-8191-8818-43e6027740db`, titled “Dev-pair — architecture and coordination”. Reading its service metadata confirmed the chat identity and workspace but did not expose model/effort; those settings remain **unverified**. The local subagent API supports explicit `model` and `reasoning_effort` parameters; the launch ledger records those actual requests and the service-returned identifiers. An accepted launch is configuration evidence, not a separate provider-side model attestation. No prompt text is used as proof of model selection.
+
+| Role | Requested through execution API | Returned identifier | State |
+|---|---|---|---|
+| Architecture reconciliation check | `gpt-6-astra` / `high`, fresh context | `/root/charter_check` (child chat `6af39609-ea78-8191-a036-8140b6f990f9`) | Completed read-only reconciliation; no independent provider attestation |
+| Builder | `gpt-6.1-sol` / `high`, fresh context | `/root/build_candidate_prep` (child chat `6af396e8-e3a4-8191-9560-749bb5dab0c5`) | Completed in `/workspace/dev-pair-build`, branch `codex/dr10-candidate-preparation`, from record commit `33e08e5`; returned `cdcd4a300494783c7e5b6290ed83e77b2cd891ad`, integrated as `a28330a` |
+| Candidate reviewer | `gpt-6-astra` / `high`, fresh context | See accompanying PR handoff | Launch against the exact committed integration candidate; service identifier and verdict recorded in PR |
+
+The GitHub connector reported push/admin permissions for dev-pair. The shell identity received HTTP 403 when reading main branch protection. A subsequent ruleset listing succeeded and returned two active **tag** rulesets, not a demonstrated branch release gate. These observations do not establish independently enforced release checks; A6.3/A12.9 promotion remains blocked until enforcement is verified. No bypass or ruleset change is authorized by this record.
+
+## Original-charter reconciliation
+
+“Retained” means a current contractual home exists, not that the feature is implemented. “Proposed clarification” is not an approved amendment. Historical mechanisms and historical policy references do not supersede the adopted documents.
+
+| Material original item and source | Classification and current home | Acceptance or next action |
+|---|---|---|
+| Outcome → clarification/agreement → autonomous delivery; owner never reviews code (objective: workflow) | Retained: R1.1, R2.1–R2.3, R4, R7.7–R7.8 | Demonstrator journey, failure/repair and plain-language delivery; no routine owner approval loop. |
+| Independent exact-candidate review, destination verification, recovery (objective: delivered; B6) | Retained: R4.6, R7.3–R7.6, A6, A12.4/A12.9 | Separate reviewer; source/artifact-bound tests; real destination and restore checks. Enforcement is presently unverified. |
+| Ticket bus, host/development split, host never merges, CI builds production images (objective: pair/boundaries; B4) | Retained: R3, R4.3–R4.5, R9.2, A2/A3/A6 | Scope-denial and host-test repair round trip; verified CI artifact and controlled replacement. |
+| Headless operation, no display/local seat after genesis (objective: pair/boundaries) | **Restored with owner approval, 2026-11-10**: R7.14 and A7.4 | Make install, authentication, launch and recovery work with no graphical seat; test with display variables absent. Remote browser-based authorization, if needed, must have a documented bootstrap route. No GUI dependency should enter slice 1. |
+| Client disconnect, network roam and device sleep preserve work (objective: security outcome 3) | **Restored with owner approval, 2026-11-10**: R7.15 and A7.4; complements R3.2/R7.6/R9.4 | Detach/reconnect while work proceeds, retain same job/session identity and observable progress, with no manual worker nudge. |
+| Authorized repositories only; GitHub App installation bounds reach; dedicated identities (objective: pair/boundaries) | Retained: R1.1/R9.5/A2.3 require authorized scope and isolated credentials. The owner clarified that dedicated per-pair GitHub Apps are a design choice to explain, not a product requirement to approve. | Enforce declared job scope within actual credential grants; revoked/out-of-scope access fails closed. Explain the selected credential design before provisioning; do not infer expanded repository authority from its mechanism or from this run's admin connector. |
+| Credential/service failure recovery (A12.11; objective: bounded recovery; reference token refresh) | **Proposed acceptance clarification** under R2.3/R7.6/R9.5/R11.2 and A7.3 | Expired/revoked credentials, unavailable model/GitHub/registry, rate limits and interrupted replies preserve checkpoints, bound retry, avoid duplicate effects, and report blocked/stale truthfully. Never silently switch account/model. |
+| Reproducible, re-run-safe installation; fresh target rehearsal (B4 and host-track instantiation) | Retained: R7.1, DR6.1, A1/A8.4 | Rehearse twice on a designated disposable Fedora 44 target, inject interruption, demonstrate state preservation. One pasted root script, exact admin username and registry/vault choices are historical mechanisms; they are not automatically adopted. |
+| Immutable runtime code and isolated author/build trees (B1/B2) | Retained and strengthened: R5.1–R5.2/R7.10, A4 | Reject writes and executable shadowing across host/all roles; job-owned writable paths succeed; verify branch before mutations. |
+| Efficient dependencies, heavy stable layers, no repeated downloads (B1) | Retained: R5.3/R7.11, A4.9 | Same-input reuse and measured downloads; changed-input invalidation; clean check preserves active tree/cache. Dependency minimization is an ordinary engineering choice; the retired package-admission ladder is not imported. |
+| Immediate total teardown/only input caches (B1) | Explicitly superseded by current R5.3–R5.4 and A4.5–A4.10 | Reusable active build trees and image layers; bounded lifecycle cleanup, not per-iteration deletion. Preserve evidence/uncommitted work. |
+| One contract home, atomic producer/consumer change and safe staggered rollout (B3) | Retained: A3.7 | Reject unknown versions; withhold new producer shape until consumer supports it. Historical `shared/` layout is not compulsory. |
+| Complete session inventory, external replacement executor, actual resumed work (B4/B6 and A11 implementation) | Retained: R9.2–R9.6/R11.3, A8/A10.3 | Missing/ambiguous session, checkpoint failure and interrupted replacement tests; restore every session by identity, not just cwd or process presence. |
+| Separate host/DevBox and agent lifecycles; original disposable inner layers | Corrected/restored by owner-directed S1.7, R11, A2.4/A10; direct-in-DevBox snapshot language is superseded | Codex in both Distrobox placements; agent-only update leaves parent identities unchanged; nightly + on-demand triggers and failed candidate retention. |
+| `agentbox → gptbox`, explicit override, recorded model on resumed jobs (B5) | Retained: A5, A10.6, R11.5 | Unavailable choice fails; provider environment and model are separate; no silent default migration. Claude adapter later under R6.2. |
+| `erebus` / `strix`, reusable instance configuration (objective: lineages) | Retained: R3.3/A10.1/A11.1 | Lowercase names; one VPS now. `nox`/`moros` runtime naming is not reinstated by inference. |
+| Bare-metal, GPU/virtualization, concurrent jobs (objective: tracks) | Explicitly later scope: R6.2, A11.1 | No bare-metal dependency for the first VPS pair; preserve extensibility without implementing it now. |
+| Mother platform and remote desktop | Retained as later owner-directed scope: R10/A9 | Deliver pair first; Omarchy feasibility and its own agreement before implementation. No imported desktop or VM exception. |
+| Private-by-default network, SSH/MOSH only, key-only shell, `core`, root retirement, trust-root/vault policy (objective: security; bylaw: genesis) | **Restored with owner approval, 2026-11-10**: R7.16 and A7.3 require private administrative services, key-only remote shells and no direct remote root after bootstrap. Other historical identity/transport/vault mechanisms are engineering choices, not imported policy. | Test public-network administration denial, password-shell/root-login rejection and successful authorized recovery. Explain credential/transport design without requiring the owner to select ordinary mechanisms; never widen authorized repository scope. |
+| Historical human-only charter merge and live homelab-root constitution reference | Explicitly replaced by S1/S4.2 and R2/A6.3 | Pinned standards govern; owner decides product/authority changes, pair owns permitted ordinary review/merge. Do not load/import historical universal law as current authority. |
+| Dogfooding every change through the pair | Bootstrap route explicitly allowed by A12.5; own loop remains required by R7.9/R9.6 | Label cloud bootstrap evidence; later prove the pair's actual handoff loop. |
+
+The reconciliation is an evidence-backed proposal with outstanding decisions, not a claim that omissions are resolved or all historical security requirements were intentionally removed. Existing issue #10 and #11 descriptions predate the restart (Fedora 44/Claude/historical governance) and are background evidence, not current implementation instructions.
+
+## A11 mechanism findings
+
+- Host reference: `setup-user.sh:277–287` wires a 04:00 persistent timer; `claudebox-daily.sh` uses a shared/exclusive session lock and pending marker. `box-rebuild.sh:40–53` stops watchers, removes the old box and reassembles. Retain external ownership and busy deferral; replace destroy-before-build with candidate-before-activation.
+- Host integration: `claudebox-init.sh` exports the parent Podman socket and writes post-assembly code. This is reference behavior, not permission to expose an outer host socket or mutate admitted code under A2.4/A10.4–A10.5.
+- Nested reference: `entrypoint.sh:335–355` actually schedules the next local 04:00 (despite the stale “sleep 86400” comment in `claudebox-daily.sh`). `box-rebuild.sh:25–48` serializes and closes lock fd 9 before assembly to avoid a child retaining the rebuild lock. Preserve that regression case and explicit timezone/missed-run handling.
+- `claudebox-assemble.sh` detects failed/stale assembly and verifies policy readability as the actual session user. It executes scripts from a writable live clone and destroys before assembly. Adapt the failure/readability checks to identified immutable candidates; do not copy the live-clone mechanism or historical policy.
+- `bin/claude` retains explicit session IDs and a shared session lock, but launches a floating model default and copies skills from writable home. Codex needs its own supported identity/resume/model selection path; do not transliterate Claude flags or carry over mutable executable extensions.
+- `bin/rebuild-request.sh` deduplicates by session ID and refuses omitted live IDs or ambiguous same-cwd sessions; `host-agent-watch.sh` uses verified container identity and progress handshakes, not merely a recreated shell. The pinned producer still contains approval-label wording while the pinned host explicitly retires that tap. Do not reintroduce manual coordination from those historical strings.
+- `fedora-dev/fedora-dev.container:60,71` adds `NET_ADMIN SYS_ADMIN` and disables SELinux label separation. This is a concrete feasibility risk under A1.2/A10.5, not an authorized exception for dev-pair.
+
+## Evidence and boundaries
+
+| Check | Result | What it establishes |
+|---|---|---|
+| Fetch dev-pair main, standards Git objects, both A11 pinned revisions | Pass | Source identity/read access; no runtime claim |
+| `fedora-dev`: `timeout 45 bash rebuild-request.test.sh` | Exit 0, ALL PASS | Historical manifest producer fixtures/consumer grammar checks; includes omission, ambiguous cwd and failed filing retention cases; engines/network stubbed |
+| `fedora-dev`: `timeout 45 bash claudebox-assemble.sh --selftest` | Exit 0, five decision cases PASS | Historical assembly decision behavior only; unreadable image ID currently skips, which must not become provenance approval |
+| Cloud session listing | Blocked, HTTP 401 | Standalone CLI launch route not authenticated |
+| Branch protection inspection | Blocked, HTTP 403 | Current shell cannot verify this release gate |
+| Ruleset listing | Pass on second attempt after HTTP 503 | Two tag rulesets visible; no branch enforcement proven |
+| Historical Fedora 45 target, nested Podman/Distrobox, SELinux, headless/auth/host renewal | Not run / blocked | Earlier target before the owner correction; no designated authorized target, runtime tooling or operational budgets at that check |
+| Current Fedora 44 target and both Distrobox placements | Not run / blocked | Owner-reported OS only; no live OS inspection, secure host connection, runtime validation or operational budgets |
+
+Raw local reference-test logs: `/workspace/scratch/dr10-rebuild-request.log` and `/workspace/scratch/dr10-assemble-selftest.log`. They are local evidence, not portable runtime acceptance. No reference repo changes or historical installer execution occurred.
+
+The independent Astra reconciliation check agreed that local preparation may proceed while host/security decisions remain unresolved. It identified headless operation and client disconnect continuity as missing explicit outcomes; installation rehearsal and dependency reuse already have current acceptance. Its recommendation is a small candidate recipe, explicit path layout and fail-closed invocation preparation, not a general orchestration framework. The owner approved restoration of headless operation and client disconnect/network-change/device-sleep continuity on 2026-11-10; R7.14–R7.15 and A7.4 record the decision. After examples, the owner clarified that dedicated GitHub Apps are an engineering design choice to explain, not a requirement requiring product approval. The remaining product questions concern private administration, key-only remote shell/no direct root after bootstrap, and whether an existing test server is available. The owner approved private administration and key-only remote shells with no direct remote root after bootstrap; R7.16 and A7.3 record them. The owner identified an existing Hostinger VPS plan 4 and offered access for deployment. The owner subsequently reported its OS as Fedora Cloud 44 and corrected the target as recorded above. Its address, verified live OS/data/services inventory and secure connection remain unknown; inspection must precede any decision about disposable testing or deployment. No host has been contacted or changed. The host request was clarified as permission to use a spare/test server, not a request for the owner to execute tests or review code.
+
+## Implemented local preparation
+
+The Sol builder returned `cdcd4a300494783c7e5b6290ed83e77b2cd891ad`, integrated as `a28330a`. It adds `tools/candidate.py`, offline fixture generation, eight tests, and a candidate-bound Fedora handoff in `docs/candidate-preparation.md`. Local validation checks binary integrity, explicit identities, deterministic context output, source identity, unsafe path proposals, immutable recorded model/effort, fixture separation and execution refusal. A fixture CLI exercise succeeded; `launch` refused with exit 2 as required. No actual Fedora/Codex upstream identity was invented, no image was built, and no Distrobox execution adapter exists yet. This is preparation within slice 1, not completion of slice 1 or the product.
+
+Fresh Astra reviewer `/root/review_candidate_1` reviewed `3b57e6cc5c3937f8f13cf92585f1d1e78e5bbaeb` and returned changes required: the initial host-build handoff circularly required an already-built image, and committed tests did not exercise non-fixture validation. Sol repaired both in `f035e917fd0370f094591bdc241b7a7974da886c`, integrated as `5d9d05b`. The handoff now separates context-bound build from image-bound runtime checks; five additional offline tests exercise actual isolated Git lookup, source mismatch/missing objects, ELF/architecture and placeholder rejection. All 13 tests pass in the integration tree. Synthetic non-fixture test assertions remain explicitly untrusted and do not establish upstream provenance. Runtime code is unchanged by the repair.
+
+Fresh Astra reviewer `/root/review_candidate_2` reviewed published `b22c72c5e8af101b4de8fa88eb3c322c8a33318a` and confirmed both earlier repairs, but reproduced a test fixture error with `PYTHONDONTWRITEBYTECODE=1`: removing the final tracked file also removed its parent directory. Sol repair `1163a503b16dbe616590dd1347ea64ece531eee2` explicitly recreates that directory. All 13 tests then passed in fresh scratch roots both with normal bytecode behavior and with bytecode disabled. This exhausts the run's two planned repair cycles; further substantive findings require a checkpoint and explicit bounded reassessment. No runtime implementation changed in either repair. A fresh affected review of the final published candidate is recorded in the PR.
+
+The integration candidate includes the owner-approved R7.14–R7.16/A7.3–A7.4 additions and a README link to this record. The local commit IDs above are the audit trail in the execution workspace. Shell Git push lacked write credentials, so publication uses the GitHub connector with a separately identified commit and verified identical Git tree. The final published SHA, fresh reviewer service identity, review verdict, any repair candidates and final test evidence are recorded in the accompanying PR, avoiding a self-referential commit hash or an author-supplied release approval.
+
+## Work queue and durable handoffs
+
+1. Complete reconciliation check; resolve only material product/authority choices before dependent work. Keep proposed additions distinct from current clauses.
+2. One bounded A12.12(1) builder: reproducible candidate inputs/construction and explicit workspace/state boundaries first, with meaningful failure tests. Both real Distrobox placements remain acceptance requirements. Report a partial implementation if host execution is blocked; never substitute a mock launch for success.
+3. Run affected local checks and submit an A3 host request for exact candidate/artifacts once an authorized Fedora target exists. Required host checks: both placements, rootless nesting/SELinux, code-write rejection and writable-state success, no outer-host socket/host-exec bridge, unattended authentication and recorded model/effort, actual launch and checkpoint recovery.
+4. Fresh Astra High reviewer reads authoritative sources and exact committed candidate without editing. Repair through Sol, retest and start fresh affected review. No author self-approval; no merge/promotion while required gates/host evidence remain unavailable.
+5. Continue A12.12(2) durable job + failed host-test repair/retest, (3) nightly and separate platform renewal with failure recovery, then (4) complete demonstrator delivery, cache cleanup and restoration. No later slice is claimed complete here.
+
+Builder launch brief: Work on `oso-gato/dev-pair`, starting from recorded main `f2e829b0bcaa1fb5d22cf9b12261a122a607d25c`, in your assigned isolated worktree. Configure `gpt-6.1-sol` / `high` through the execution service. Read DR10, STANDARDS and all three exact pinned sources, REQUIREMENTS, ARCHITECTURE A12 and this work record. Implement only the bounded first slice assigned by coordination; preserve A2/A4/A5/A10/A11. Define meaningful tests, run local checks, and return an exact commit plus remaining A3 requests. Do not expand permissions, deploy, purchase infrastructure, silently change models or claim absent host checks passed. Record actual session/configuration evidence, limits and next action.
+
+Reviewer launch brief: Configure a fresh `gpt-6-astra` / `high` session through the execution service. Independently read the same authoritative sources and the exact candidate SHA provided by coordination. Inspect the diff and run appropriate safe tests. Check omitted requirements, provenance, write/credential boundaries, failure/retry behavior and evidence truthfulness. Do not edit the candidate. Return pass, changes required or blocked with precise references, distinguish code-review verdict from full milestone acceptance, and never treat the author summary as proof.
+
+## Continuation checkpoint — 2026-11-11
+
+This entry supersedes earlier unknown-endpoint/credential/target-authorization
+statements; historical observations above remain historical.
+
+- Resumed PR #13 at `512cf6aa3afc41d1db128e82221a9caf9a84ca2b`, branch
+  `codex/dr10-reconciliation-review`, initially clean. Loaded README DR10,
+  STANDARDS, all three Git-object documents at the unchanged standards pin,
+  REQUIREMENTS, ARCHITECTURE A12 and this record.
+- The owner designated the existing Hostinger VPS as clean/disposable and
+  authorized initial root access and wiping if needed. Fedora Cloud 44 remains
+  owner-reported, not inspected. Host address and credential values are not
+  published here. The credential reference is environment variable
+  `hostinger_root`; a boolean-only process check confirmed it was nonempty.
+  Environment status independently reported this runtime variable `ready`,
+  current observations and enforced network policy. No credential was printed,
+  written to source or supplied to a remote endpoint.
+- Supported SSH transport is **blocked before authentication**. The managed
+  executor startup policy reports `vpn_configured: false`,
+  `automatic_tailscale_access: false`, and empty TCP domain/IP grants. The
+  cloud-environment runtime networking/VPN reference specifies that raw TCP
+  CONNECT uses Tailscale transport; unrestricted HTTP is not public SSH access.
+  No supported route to the designated host is established. No SSH retry,
+  authentication, host command, wipe or deployment occurred in this continuation.
+  Diagnostic metadata returned `history_status: not_found`, no captures.
+- No runtime environment-change tool is exposed. To unblock host work, provide
+  an execution environment with a supported authenticated SSH route to the
+  designated VPS (or configure the managed Tailscale route and eligible target).
+  A public-IP TCP grant alone is not established as sufficient by the runtime
+  documentation. Do not bypass the proxy or weaken host-key verification.
+  After connectivity is available, first inspect OS, architecture, disks,
+  services, network exposure, SELinux, users and recovery access read-only;
+  only then plan authorized provisioning. Preserve R7.16 key-only/private
+  administration and root retirement after bootstrap with verified recovery.
+- Local source work may continue under A12.10. This run renews a bounded
+  assessment: one Sol High builder, 10 minutes per task before checkpoint,
+  at most two repair cycles, no new paid infrastructure/API purchases.
+  Deployed runtime budgets/scheduling remain unset until dependent execution.
+- Builder execution API accepted `gpt-6.1-sol` / `high` with fresh context and
+  returned `/root/build_dr10_continue`, using `/workspace/dev-pair-sol`.
+  These are actual API settings, not prompt-only selection. Independent
+  provider-side model attestation and this coordinator's model/effort metadata
+  are unavailable. Local agents are explicitly owner-authorized; no standalone
+  Codex Cloud conversation is claimed. Fresh Astra High review will bind to the
+  exact integrated candidate; its returned identifier/verdict belongs in PR #13.
+- PR #13 remains draft. A historical bot comment offers a `live-validate` loop;
+  that comment is not proof of this restart's required boundary checks or release
+  enforcement and is not authority to enroll this candidate for automatic merge.
+  Required Fedora/Distrobox evidence and independently enforced release checks
+  remain outstanding; no merge or production promotion is claimed.
+
+Release-gate recheck in this continuation: the GitHub connector again returned
+HTTP 403 (`Resource not accessible by integration`) for main branch protection;
+the ruleset list again showed two active tag rulesets only. Enforcement remains
+unverified. Shell Git push dry-run now succeeds, so the reviewed continuation
+can be published as its exact local commit rather than recreating its Git tree
+through the connector. This does not establish merge/promotion readiness.
+
+
+## Owner correction and explicit tailnet migration — November 10, 2026 (America/New_York)
+
+This current requirement correction supersedes the earlier administrative-only
+access interpretation and public-product allowance; previous observations and
+review verdicts above remain evidence only for their identified candidates.
+The owner explicitly directed a cross-repository standard for executing VPS
+container/VM-like development environments and applications, not merely control
+panels. It does not mandate Podman for all repositories or affect source storage.
+
+- Shared draft baseline: `oso-gato/standards@08fc080dc8463a16e7ef753eefdefd98463b76b9`.
+  Prepared and committed first as
+  `oso-gato/standards@b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`, still
+  pre-1.0 unreleased, no tag. Applicable citations: E12.1–E12.4, G1.4,
+  RS5.10 and SR7.3. No private shared rule text is copied into this project.
+- The owner approved this adoption and explicitly migrated the current
+  DR10 / PR #13 job from the old pin. S1.3–S1.7 and all three links now identify
+  that exact new draft. Other repositories and jobs retain their own pins until
+  separately migrated; central publication is not runtime enforcement.
+- R7.16 retains key-only shells, root retirement and controlled recovery while
+  tracing its superseded network scope to new R7.17. R7.17 applies authorized
+  Tailscale-only access to DevBox, both roles, demonstrator and later hosted
+  workloads; no public-ingress exception is approved here. R7.18 and A7.5 keep
+  authorized fresh-host SSH/provider-console bootstrap separate, avoid enrollment
+  circularity and require proven tailnet entry plus independent recovery before
+  temporary access is retired. A7.3 records topology choices within confinement;
+  R10.3/A9.1 and the Fedora handoff carry these outcomes forward.
+- `tools/candidate.py`, fixture generation and documented inputs use the new
+  exact pin. A regression verifies adoption/fixture agreement and rejects the
+  prior pin before output writes or invocation planning. Generated contexts
+  must be regenerated and re-reviewed under the new source and standards pin;
+  previous reviewed contexts/results are not upgraded to the new obligations.
+- Builder API configuration: `gpt-6.1-sol` / `high`, returned identifier
+  `/root/tailscale_standard_build`; independent provider attestation unavailable.
+  Isolated worktrees: `/workspace/standards-tailscale` and
+  `/workspace/dev-pair-tailscale`, starting from the shared baseline above and
+  dev-pair `fc39196c1532c3f9253b9e82eaf132fa6d8ae839`. Scope is source/docs,
+  local validation and committed handoff only, bounded to 10 minutes before
+  checkpoint and at most two repair cycles. No host or network changes,
+  enrollment, credential use, push, merge or release tag occurred in this task.
+- Local validation: all 18 offline tests pass, including the old-pin denial
+  regression and fixture/non-fixture context checks. Document checks cover
+  whitespace, unique anchors, local links and matching resolvable adoption pins.
+  Tailscale/host runtime tests remain unrun/blocked. A fresh Astra review must
+  independently assess the two exact commits before publication; its identifier
+  and verdict belong in PR #13. This builder supplies no release approval.
+
+Next host handoff must bind to the new source/standards pin and include authorized
+and unauthorized/public access tests, tailnet-loss denial without fallback,
+bootstrap cutover and recovery under explicit effects/limits. The previously
+reported executor transport blocker is distinct from this product requirement:
+an authorized public SSH/provider-console bootstrap path can precede enrollment,
+but this task has established no usable executor-to-host route.
