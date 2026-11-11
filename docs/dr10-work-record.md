@@ -171,3 +171,10 @@ statements; historical observations above remain historical.
   enforcement and is not authority to enroll this candidate for automatic merge.
   Required Fedora/Distrobox evidence and independently enforced release checks
   remain outstanding; no merge or production promotion is claimed.
+
+Release-gate recheck in this continuation: the GitHub connector again returned
+HTTP 403 (`Resource not accessible by integration`) for main branch protection;
+the ruleset list again showed two active tag rulesets only. Enforcement remains
+unverified. Shell Git push dry-run now succeeds, so the reviewed continuation
+can be published as its exact local commit rather than recreating its Git tree
+through the connector. This does not establish merge/promotion readiness.
