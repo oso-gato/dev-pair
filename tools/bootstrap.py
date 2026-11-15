@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import platform
 import re
+import selectors
+import signal
 import stat
 import subprocess
 import sys
@@ -21,6 +23,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
@@ -89,16 +92,202 @@ class Blocked(Exception):
     pass
 
 class Commands:
-    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
-        # No caller PATH, shell, environment auth keys, or captured daemon output in errors.
-        env = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+    """Bounded execution with secret-safe, explicitly public diagnostics."""
+    deadline = None
+    native_prefix = None
+    diagnostic = None
+    native_register = None
+
+    def limit_timeout(self, timeout):
+        remaining = timeout if self.deadline is None else min(timeout, self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise Blocked('phase execution budget exhausted')
+        return remaining
+
+    @contextlib.contextmanager
+    def phase(self, seconds, prefix, native=True):
+        previous = self.deadline, self.native_prefix
+        phase_deadline = min(time.monotonic() + seconds, self.deadline or float('inf'))
+        remaining = phase_deadline - time.monotonic()
+        if remaining <= 0:
+            raise Blocked('phase execution budget exhausted')
+        def expired(signum, frame):
+            raise Blocked('phase execution budget exhausted')
+        old_handler = signal.signal(signal.SIGALRM, expired)
+        old_timer = signal.setitimer(signal.ITIMER_REAL, remaining)
+        started = time.monotonic()
+        self.deadline = phase_deadline
+        self.native_prefix = prefix + '-' + uuid.uuid4().hex[:8] if native else None
         try:
-            p = subprocess.run(args, env=env, text=True, input=input_text, capture_output=True, timeout=timeout)
-        except (OSError, subprocess.TimeoutExpired):
-            raise Blocked(f'{Path(args[0]).name} failed or timed out; inspect locally (output withheld)') from None
-        if p.returncode not in ok:
-            raise Blocked(f'{Path(args[0]).name} failed (exit {p.returncode}; output withheld)')
-        return p.stdout
+            yield
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
+            self.deadline, self.native_prefix = previous
+            if old_timer[0]:
+                signal.setitimer(signal.ITIMER_REAL, max(.001, old_timer[0] - (time.monotonic() - started)), old_timer[1])
+
+    @staticmethod
+    def public_operation(args):
+        if args and args[0] == '/usr/bin/dnf':
+            return 'signed-packages'
+        if args and args[0] == '/usr/bin/systemd-run' and '/usr/bin/podman' in args:
+            operation = args[args.index('/usr/bin/podman') + 1:]
+            if 'pull' in operation or 'build' in operation:
+                return 'candidate-image'
+        return None
+
+    @staticmethod
+    def native_args(args, timeout):
+        rewritten = []
+        for value in args:
+            if value.startswith('--property=RuntimeMaxSec='):
+                current = value.rsplit('=', 1)[1].removesuffix('s')
+                if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', current):
+                    raise Blocked('invalid native lifetime')
+                ceiling = min(float(current), timeout)
+                if ceiling < .001:
+                    raise Blocked('native execution budget exhausted; zero disables systemd lifetime')
+                value = '--property=RuntimeMaxSec=%.3fs' % (int(ceiling * 1000) / 1000)
+            rewritten.append(value)
+        return tuple(rewritten)
+
+    @staticmethod
+    def reconcile_native(args, env):
+        # Only fixed controller-created descriptions permit exact-unit cleanup.
+        unit = next((v[7:] for v in args if v.startswith('--unit=')), None)
+        description = next((v[14:] for v in args if v.startswith('--description=')), None)
+        if not unit or description != 'dev-pair-owned-' + unit:
+            return
+        # A separate bounded runner has no phase/native wrapper or diagnostic
+        # callback: cleanup observations cannot recursively launch more units.
+        control = Commands()
+        observed = control('/usr/bin/systemctl', 'show', '--property=Description', '--property=ActiveState',
+                           '--property=LoadState', '--property=User', unit, ok=(0, 1, 4), timeout=5)
+        values = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
+        if values.get('ActiveState') in ('active', 'activating', 'deactivating', 'reloading'):
+            expected_user = next((v[6:] for v in args if v.startswith('--uid=')), '')
+            if values.get('Description') != description or values.get('User', '') not in ((expected_user,) if expected_user else ('', 'root')):
+                raise Blocked('native unit ownership mismatch; foreign unit preserved')
+            control('/usr/bin/systemctl', 'stop', unit, timeout=10)
+            after = control('/usr/bin/systemctl', 'show', '--property=ActiveState', '--property=LoadState',
+                            unit, ok=(0, 1, 4), timeout=5)
+            states = dict(line.split('=', 1) for line in after.splitlines() if '=' in line)
+            if states.get('ActiveState') not in ('inactive', 'failed'):
+                raise Blocked('native unit remains unresolved; no duplicate effects')
+        elif values.get('ActiveState') not in ('inactive', 'failed'):
+            raise Blocked('native unit observation failed; no duplicate effects')
+
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
+        timeout = self.limit_timeout(timeout)
+        original = args
+        public = self.public_operation(args) if input_text is None else None
+        unit = None
+        description = None
+        # Existing user transient units are already native executors. Tighten
+        # their ceilings rather than putting them outside the phase budget.
+        if args and args[0] == '/usr/bin/systemd-run':
+            args = self.native_args(args, timeout)
+        elif self.native_prefix:
+            if timeout < .001:
+                raise Blocked('native execution budget exhausted')
+            unit = self.native_prefix + '-' + uuid.uuid4().hex[:8]
+            description = 'dev-pair-owned-' + unit
+            if self.native_register:
+                self.native_register(unit)
+            args = ('/usr/bin/systemd-run', '--unit=' + unit, '--description=' + description,
+                    '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+                    '--property=RuntimeMaxSec=%.3fs' % (int(timeout * 1000) / 1000), '--property=TimeoutStopSec=5',
+                    '--property=KillMode=control-group', '--property=MemoryMax=2G',
+                    '--property=TasksMax=512', '--property=CPUQuota=100%',
+                    '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin', 'LANG=C', 'LC_ALL=C', 'HOME=/root', *args)
+        env = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+        started = time.monotonic()
+        buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+        total = 0
+        status = 'not-started'
+        process = None
+        selector = selectors.DefaultSelector()
+        try:
+            process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            status = 'running'
+            stdin_data = input_text.encode() if input_text is not None else b''
+            stdin_offset = 0
+            if input_text is not None:
+                # Nonblocking stdin shares the command deadline even if a child
+                # never reads. UTF-8 passwords can exceed one PIPE_BUF.
+                if len(stdin_data) > 16384:
+                    raise Blocked('stdin byte budget exceeded; output withheld')
+                if stdin_data:
+                    os.set_blocking(process.stdin.fileno(), False)
+                    selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
+                else:
+                    process.stdin.close()
+            selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+            selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+            while selector.get_map() or process.poll() is None:
+                if time.monotonic() - started >= timeout:
+                    raise Blocked('command deadline exceeded; output withheld')
+                for key, _ in selector.select(timeout=.1):
+                    if key.data == 'stdin':
+                        try:
+                            stdin_offset += os.write(key.fileobj.fileno(), stdin_data[stdin_offset:stdin_offset + 4096])
+                        except BlockingIOError:
+                            continue
+                        if stdin_offset == len(stdin_data):
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                        continue
+                    block = os.read(key.fileobj.fileno(), min(8192, 1048576 - total + 1))
+                    if not block:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(block)
+                    if total > 1048576:
+                        raise Blocked('command output byte budget exceeded; output withheld')
+                    if input_text is None:
+                        buffers[key.data].extend(block)
+            status = process.wait(timeout=1)
+            if status not in ok:
+                raise Blocked('%s failed (exit %s; output withheld)' % (Path(original[0]).name, status))
+            return bytes(buffers['stdout']).decode() if input_text is None else ''
+        except (OSError, subprocess.SubprocessError):
+            status = 'failed-or-timed-out'
+            raise Blocked('command failed or timed out; output withheld') from None
+        except BaseException:
+            if status == 'running':
+                status = 'interrupted-or-failed'
+            raise
+        finally:
+            cleanup_error = None
+            if process is not None and process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+                try:
+                    self.reconcile_native(args, env)
+                except (Blocked, OSError, subprocess.SubprocessError) as exc:
+                    cleanup_error = exc
+                    status = 'cleanup-unresolved'
+            selector.close()
+            if process is not None:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                process.stdout.close()
+                process.stderr.close()
+            if self.diagnostic:
+                record = {'operation': public or 'withheld', 'status': status,
+                          'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
+                if public:
+                    record.update(output_bytes=total, capture_limit_bytes=1048576,
+                                  **{name + '_tail': bytes(data[-8192:]).decode(errors='replace') for name, data in buffers.items()},
+                                  **{name + '_truncated': len(data) > 8192 for name, data in buffers.items()})
+                self.diagnostic(record)
+            if cleanup_error is not None:
+                raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime') from None
 
 def checked_file(path, *, secret=False):
     p = Path(path)
@@ -319,6 +508,9 @@ class Bootstrap:
                 local = False
             allowed = (proto == 'tcp' and port == '22') or (local and proto in ('tcp', 'udp') and port == '53') or (
                 proto == 'udp' and (port in ('68', '546', '41641') or (local and port in ('53', '123', '323'))))
+            if (not allowed and proto in ('tcp', 'udp') and port == '5355'
+                    and not self.path(f'{STATE}/prepared').exists()):
+                allowed = self.resolved_listener(line)
             if not allowed and proto == 'tcp':
                 allowed = self.peerapi_listener(line, host.strip('[]'))
             if not allowed and proto == 'udp' and port.isdigit() and 60000 <= int(port) <= 61000:
@@ -327,6 +519,90 @@ class Bootstrap:
                 raise Blocked('unexpected listener: host is not vanilla; inspect inventory before proceeding')
         return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': 'Enforcing',
                 'phase': 'temporary-bootstrap', 'ssh_cutover': 'not implemented'}
+
+    def resolved_service(self):
+        observed = self.run('/usr/bin/systemctl', 'show', '--property=MainPID', '--property=User',
+                            '--property=ActiveState', '--property=LoadState', 'systemd-resolved.service', ok=(0, 1, 4))
+        fields = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
+        if fields.get('LoadState') == 'not-found' and fields.get('ActiveState') == 'inactive':
+            return None
+        if fields.get('LoadState') != 'loaded' or fields.get('ActiveState') != 'active' or fields.get('User') != 'systemd-resolve':
+            raise Blocked('systemd-resolved service identity/state is not the supported Fedora baseline')
+        pid = fields.get('MainPID', '')
+        if not pid.isdigit() or int(pid) <= 1:
+            raise Blocked('systemd-resolved has no valid main process')
+        executable = '/usr/lib/systemd/systemd-resolved'
+        if str(self.path('/proc/' + pid + '/exe').readlink()) != executable:
+            raise Blocked('systemd-resolved executable mismatch')
+        binary = self.path(executable)
+        for item in [binary, *binary.parents]:
+            info = item.lstat()
+            if item.is_symlink() or info.st_uid != (0 if self.root == Path('/') else os.getuid()) or info.st_mode & 0o022:
+                raise Blocked('systemd-resolved executable path is not protected')
+            if item == self.root:
+                break
+        if not stat.S_ISREG(binary.stat().st_mode):
+            raise Blocked('systemd-resolved executable is not regular')
+        account = self.run('/usr/bin/getent', 'passwd', 'systemd-resolve').strip().split(':')
+        uid = re.search(r'^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$', self.text('/proc/' + pid + '/status'), re.M)
+        if (len(account) != 7 or account[0] != 'systemd-resolve' or not account[2].isdigit()
+                or account[2] == '0' or not uid or any(value != account[2] for value in uid.groups())
+                or self.text('/proc/' + pid + '/cgroup').strip() != '0::/system.slice/systemd-resolved.service'):
+            raise Blocked('systemd-resolved process owner/cgroup mismatch')
+        return pid
+
+    def resolved_listener(self, line):
+        # The observed Fedora discovery listener is temporary provisioning input,
+        # never a general port allowance or post-prepare service policy.
+        owners = re.findall(r'\("([^"\n]+)",pid=(\d+),fd=\d+\)', line)
+        try:
+            return len(owners) == 1 and owners[0][0] == 'systemd-resolve' and owners[0][1] == self.resolved_service()
+        except (Blocked, OSError, ValueError):
+            return False
+
+    @staticmethod
+    def listener_endpoints(inventory):
+        result = set()
+        for line in inventory.splitlines():
+            columns = line.split()
+            if len(columns) < 5:
+                raise Blocked('cannot parse listener inventory')
+            result.add((columns[0], columns[4]))
+        return result
+
+    def configure_resolved(self):
+        before = self.listener_endpoints(self.run('/usr/bin/ss', '-H', '-lntup'))
+        pid = self.resolved_service()
+        self.atomic('/etc/systemd/resolved.conf.d/90-dev-pair-discovery.conf',
+                    '[Resolve]\nLLMNR=no\nMulticastDNS=no\n', mode=0o644)
+        merged = self.run('/usr/bin/systemd-analyze', 'cat-config', 'systemd/resolved.conf')
+        section, values = '', {}
+        for raw in merged.splitlines():
+            line = raw.strip()
+            if line.startswith('[') and line.endswith(']'):
+                section = line[1:-1]
+            elif section == 'Resolve' and '=' in line and not line.startswith(('#', ';')):
+                key, value = line.split('=', 1)
+                values[key.strip()] = value.strip()
+        if any(values.get(key) != 'no' for key in ('LLMNR', 'MulticastDNS')):
+            raise Blocked('effective resolved discovery configuration conflicts')
+        if pid is not None:
+            self.run('/usr/bin/systemctl', 'restart', 'systemd-resolved.service')
+            self.resolved_service()
+        after = self.listener_endpoints(self.run('/usr/bin/ss', '-H', '-lntup'))
+        if any(address.rpartition(':')[2] in ('5353', '5355') for proto, address in after if proto in ('tcp', 'udp')):
+            raise Blocked('discovery listener remains after persistent resolved configuration')
+        def retained(endpoint):
+            proto, address = endpoint
+            host, _, port = address.rpartition(':')
+            if proto == 'tcp' and port == '22':
+                return True
+            try:
+                return port == '53' and ipaddress.ip_address(host.strip('[]').split('%')[0]).is_loopback
+            except ValueError:
+                return False
+        if not {value for value in before if retained(value)}.issubset(after):
+            raise Blocked('SSH or loopback DNS listener disappeared after resolved configuration')
 
     def mosh_listener(self, line):
         match = re.search(r'users:\(\("mosh-server",pid=(\d+),', line)
@@ -363,7 +639,7 @@ class Bootstrap:
             return False
 
     @contextlib.contextmanager
-    def lock(self):
+    def lock(self, name='lock'):
         self.directory('/var/lib/dev-pair', mode=0o755)
         for parent in [self.state, *self.state.parents]:
             if parent.is_symlink():
@@ -377,7 +653,7 @@ class Bootstrap:
         self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
         if self.state.is_symlink() or stat.S_IMODE(self.state.stat().st_mode) != 0o700:
             raise Blocked('bootstrap state directory must be private and not a symlink')
-        fd = os.open(self.state / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        fd = os.open(self.state / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -579,7 +855,7 @@ class Bootstrap:
                 self.path(target).unlink(missing_ok=True)
             raise
 
-    def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None):
+    def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None):
         if gptbox_context is not None and (not isinstance(expected_context, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_context)):
             raise Blocked('a separately trusted context SHA256 is required before preparation')
         sources = validate_sources(sources)
@@ -606,12 +882,15 @@ class Bootstrap:
                               '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'))
                 # Full source verification precedes desired binding, accounts, ingress and normal packages.
                 self.validate_gptbox_context(gptbox_context, expected_context)
+                if source_check:
+                    source_check()
             desired = json.dumps({'schema': 1, 'standards_sha': STANDARDS,
                                   'source_baseline': SOURCE_BASELINE,
                                   'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                                   'gptbox_context_sha256': expected_context, 'operator': name,
                                   'keys_source': KEYS_URL, 'bootstrap_sources': sources}, sort_keys=True) + '\n'
             self.atomic(f'{STATE}/desired.json', desired)
+            self.step('resolved-discovery', self.configure_resolved)
             self.step('packages', lambda: self.run('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1',
                        '--setopt=localpkg_gpgcheck=1', '--disablerepo=*', '--enablerepo=fedora',
                        '--enablerepo=updates', 'install', *PACKAGES))
@@ -733,7 +1012,8 @@ class Bootstrap:
         storage = '/var/lib/dev-pair/maintenance/images'
         self.directory(storage, owner='dp-maint')
         base = ['/usr/bin/systemd-run', '--wait', '--pipe', '--collect', '--service-type=exec',
-                '--uid=dp-maint', f'--unit=dev-pair-gptbox-{expected}',
+                '--uid=dp-maint', f'--unit=dev-pair-gptbox-{expected}.service',
+                f'--description=dev-pair-owned-dev-pair-gptbox-{expected}.service',
                 '--property=RuntimeMaxSec=600', '--property=TimeoutStopSec=10',
                 '--property=KillMode=control-group', '--property=MemoryMax=2G',
                 '--property=TasksMax=512', '--property=CPUQuota=100%', '/usr/bin/env', '-i',
@@ -748,7 +1028,9 @@ class Bootstrap:
         self.event('gptbox-build-intent', 'recorded')
         prior = json.loads(self.text(record_path)) if self.path(record_path).exists() else None
         if prior:
-            if prior.get('context_sha256') != expected or not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', prior.get('image_id', '')):
+            if (prior.get('context_sha256') != expected or prior.get('source_sha') != manifest['source_sha']
+                    or prior.get('base_image') != manifest['fedora']['image'] or prior.get('codex_sha256') != manifest['codex']['sha256']
+                    or not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', prior.get('image_id', ''))):
                 raise Blocked('protected gptbox completion record conflicts')
             inspect = self.run(*base, 'image', 'inspect', prior['image_id'], ok=(0, 125))
             if not inspect:
@@ -925,6 +1207,7 @@ class Bootstrap:
 
     def status(self):
         return {'prepared': self.path(f'{STATE}/prepared').exists(),
+                'initialization': json.loads(self.text(f'{STATE}/initialize.json', '"not requested"')),
                 'maintenance_gptbox': (json.loads(self.text(f'{STATE}/gptbox-image.json'))
                                        if self.path(f'{STATE}/gptbox-image.json').exists() else 'not built'),
                 'enrollment_recorded': self.path(f'{STATE}/node.json').exists(),
@@ -939,13 +1222,18 @@ def main():
     sub = p.add_subparsers(dest='stage', required=True)
     sub.add_parser('inspect')
     sub.add_parser('_fetch-github-keys', help=argparse.SUPPRESS)
+    init = sub.add_parser('initialize', help='prepare then genuine maintenance assembly; no jobs/authentication')
+    init.add_argument('--source-sha', required=True)
+    init.add_argument('--distrobox-source', required=True)
+    init.add_argument('--retry', action='store_true')
     prep = sub.add_parser('prepare')
-    prep.add_argument('--apply', action='store_true', help='perform host changes; absent means inspect only')
-    prep.add_argument('--gptbox-context', required=True, help='real maintenance-role context; fixtures denied')
-    prep.add_argument('--expected-context-sha256', required=True, help='trusted handoff digest outside context')
-    prep.add_argument('--operator', choices=('core',), default='core')
-    prep.add_argument('--password-file', help='protected root-owned core console/sudo password file; never an argv value')
-    prep.add_argument('--bootstrap-source', action='append', required=True, help='explicit IPv4/IPv6 CIDR; repeatable')
+    for entry in (prep, init):
+        entry.add_argument('--apply', action='store_true', help='perform host changes; absent means inspect only')
+        entry.add_argument('--gptbox-context', required=True, help='real maintenance-role context; fixtures denied')
+        entry.add_argument('--expected-context-sha256', required=True, help='trusted handoff digest outside context')
+        entry.add_argument('--operator', choices=('core',), default='core')
+        entry.add_argument('--password-file', help='protected root-owned core console/sudo password file; never an argv value')
+        entry.add_argument('--bootstrap-source', action='append', required=True, help='explicit IPv4/IPv6 CIDR; repeatable')
     en = sub.add_parser('enroll')
     en.add_argument('--apply', action='store_true', help='enroll; absent means inspect only')
     en.add_argument('--auth-key-file', required=True)
@@ -954,6 +1242,19 @@ def main():
     sub.add_parser('finalize')
     args = p.parse_args()
     try:
+        if args.stage == 'initialize':
+            forwarded = [sys.executable, str(Path(__file__).with_name('gptbox.py')), 'initialize',
+                         '--context', args.gptbox_context, '--expected-context-sha256', args.expected_context_sha256,
+                         '--source-sha', args.source_sha, '--distrobox-source', args.distrobox_source]
+            for source in args.bootstrap_source:
+                forwarded.extend(['--bootstrap-source', source])
+            if args.password_file:
+                forwarded.extend(['--password-file', args.password_file])
+            if args.apply:
+                forwarded.append('--apply')
+            if args.retry:
+                forwarded.append('--retry')
+            os.execv(sys.executable, forwarded)
         if args.stage == '_fetch-github-keys':
             sys.stdout.buffer.write(fetch_github_response())
             return 0

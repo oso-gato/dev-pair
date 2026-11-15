@@ -8,9 +8,10 @@ engine tests only. **No Fedora/Podman assembly, confinement, authenticated agent
 model request or VPS operation has run here.** A passing local suite is not
 runtime acceptance or completion of first bootstrap.
 
-The normal [bootstrap](fedora-bootstrap.md) still builds its input OCI candidate
-and does not automatically call this adapter. After authorized SELinux convergence
-and host preparation, an authorized executor can run the separate bounded path:
+The shared [first-bootstrap initialize entry](fedora-bootstrap.md#shared-first-bootstrap-entry)
+actually runs preparation then this adapter, retaining separate phase outcomes.
+After authorized SELinux convergence and preparation, an authorized executor
+can also run the standalone bounded adapter path:
 
 ```sh
 sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/gptbox.py assemble \
@@ -46,7 +47,14 @@ the authorized handoff, outside any mutable agent mounts.
 The constructor deliberately replaces unsafe stock `distrobox-create`; no
 upstream fork or plain-Codex-container substitution is claimed. It copies the
 actual pinned init into the image and runs its real final hook after upstream
-package/account/profile setup. Assembly is a separate writable staging container
+package/account/profile setup. The disposable staging recipe resolves the pinned
+upstream setup_dnf architecture-specific dependency list from signed Fedora
+metadata, installs available names with GPG/local-package checks, restores
+required docs/locales/charmaps/UTC content and records exact RPM NEVRAs. It does
+not create a fake setup marker or skip upstream init/finalization. Image pull and
+build share a 600-second ceiling; the eight GiB reserve is measured again after
+image construction before actual assembly. Repository resolution, TCG timing and
+SELinux/rootless compatibility remain runtime gates. Assembly is a separate writable staging container
 with private PID/IPC/UTS/user/network namespaces, no host bind mounts, bounded
 CPU/memory/PIDs, default seccomp and retained SELinux `container_engine_t`.
 Only this staging container receives mapped `SYS_ADMIN`; no privileged or

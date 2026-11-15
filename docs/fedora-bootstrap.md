@@ -1,11 +1,11 @@
 # Fedora Cloud 44 bootstrap
 
 This is executable host preparation, implemented in [tools/bootstrap.py](../tools/bootstrap.py).
-It has **not been run on Fedora or the designated VPS**. Local fixtures test the
+Preparation and initialization have **not been run on Fedora or the designated VPS**. Local fixtures test the
 control flow and filesystem transactions; they are not installation, firewall,
 SSH, SELinux, reboot or Tailscale evidence. Use only an authorized fresh Fedora
 Cloud 44 target after exact-candidate independent review and host inspection.
-The first bootstrap now builds a Fedora/Codex OCI candidate for the host maintenance gptbox. No application or agent is launched; Distrobox assembly/admission remains blocked for the concrete isolation reasons below.
+The shared `initialize` entry runs host preparation followed by genuine confined maintenance Distrobox assembly and probe-only entry. This is source capability, not first-bootstrap runtime acceptance. No job, authentication, enrollment or model request is admitted.
 
 The scope is initial provisioning under R7.1/R7.18, A1/A7.5/A8.4. This does not
 complete R7.16–R7.18 or A12.12(1). The deployed pair, confined Distrobox placements,
@@ -14,6 +14,61 @@ restoration remain separate work. The bootstrap installs Podman and Distrobox
 prerequisites without using privileged containers, SELinux exceptions, host
 sockets or historical live-clone installers. The A11 agent lifecycle code is
 not adapted or executed here.
+
+## Shared first-bootstrap entry
+
+Use the exact reviewed source and independently verified public maintenance inputs.
+The mandatory source SHA must identify the executing checkout HEAD and context;
+the upstream checkout HEAD/scripts must identify pinned Distrobox1.8.2.5.
+
+```sh
+sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/bootstrap.py initialize \
+  --gptbox-context /root/maintenance-context --expected-context-sha256 TRUSTED_CONTEXT_SHA256 \
+  --source-sha REVIEWED_FULL_SOURCE_COMMIT --distrobox-source /root/distrobox-1.8.2.5 \
+  --password-file /root/core-password --bootstrap-source 192.0.2.9/32
+# Add --apply only on an authorized target after preview/review.
+```
+
+This thin entry shares the existing real prepare/adapter implementations. It
+releases the prepare lock before assembly takes it, while a separate initializer
+lock prevents another initializer. `initialize.json` records the exact target,
+separate pending/complete/blocked prepare and maintenance phases, elapsed times,
+and a result only after genuine assembly,
+sealing and two frozen runtime probe/version cycles. `status` exposes this record;
+`prepared` alone remains prerequisite evidence. A partial unchanged target needs
+explicit `--apply --retry`; a changed target is rejected. Adapter limits remain
+two build attempts and two cleanup-only attempts. Reapply revalidates the actual
+prerequisite image and the sealed image's ID/source/context/upstream labels,
+plus the protected complete result. It cannot promote a stale completion file.
+
+If Git is initially absent, Python-only context/pin/protection checks precede the
+signed minimal `git-core` prerequisite. Complete context/source/upstream Git
+verification then runs before desired binding or ordinary host changes. No
+submitted recipe or arbitrary command is executed. The filesystem/controller
+must remain trusted; Git/SHA metadata is identity, not remote authentication.
+
+Initialization has a 2280-second execution ceiling, a 600-second prepare phase
+(including public key fetching), a 1620-second adapter phase and at most a
+45-second exact-resource cleanup attempt after adapter failure, all clipped to
+remaining execution time. An interrupted command has at most45seconds of
+additional process/native-stop cleanup grace; this does not enlarge any native
+component lifetime. Adapter image pull/build share 600 seconds. Existing
+900-second assembly and 180-second runtime native OCI lifetimes stay unchanged.
+Normal host commands use finite owned transient cgroups; root unit names are
+persisted before launch, and retries verify their descriptions/owners before
+stopping them. User executor units use the exact context identity and the same
+ownership check. Native `RuntimeMaxSec` never grows beyond its component or
+remaining phase ceiling. CLI process-group termination is not proof that an
+escaped engine process stopped: only recorded candidate resources are reconciled;
+uncertain cleanup is recorded as blocked, with native lifetimes retained.
+Actual Fedora systemd/Podman cleanup remains an acceptance gate.
+
+Commands capture at most 1MiB combined output; preparation keeps four recent and
+four failed protected diagnostic records. Only fixed public signed-package and
+candidate-image operations retain 8KiB stream tails, with truncation/byte metadata.
+All stdin-bearing operations discard child output and never record stdin,
+argv or environment. Environments are fixed and credential-free. Standalone
+`prepare` is the prerequisite operation; it does not claim complete initialization.
 
 ## Preconditions and preview
 
@@ -68,6 +123,18 @@ otherwise vanilla listener inventory are mandatory. Competing active firewalld
 or nftables services and foreign nft tables are rejected without disabling them.
 Verified root-owned tailscaled PeerAPI listeners are allowed only on this node’s observed assigned Tailscale addresses, so successful enrollment does not break reapply. This deliberately reports a blocker on a provider image with existing services
 or network policy; it does not guess how to preserve arbitrary configurations.
+The actual stock-Fedora run7 discovery inventory is retained as a parser fixture.
+Before preparation only, port5355 is recognized solely for the verified active
+`systemd-resolved.service` main PID, protected official executable, service UID
+and exact system cgroup. Name/port alone is insufficient. Preparation writes
+`/etc/systemd/resolved.conf.d/90-dev-pair-discovery.conf` with `LLMNR=no` and
+`MulticastDNS=no`, verifies the merged Resolve settings, restarts the verified
+service and rejects surviving discovery listeners. It checks retained SSH and
+loopback DNS endpoints. Override, restart, process/service mismatch and unrelated
+listeners block completion. After `prepared`, discovery listeners are rejected
+even when their service identity matches. No firewall or SELinux exception is
+introduced; effective target behavior still needs the next authorized run.
+
 The actual current SSH source must be in the declared CIDRs before apply.
 
 ## Maintenance gptbox inputs

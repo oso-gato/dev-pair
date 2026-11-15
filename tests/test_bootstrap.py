@@ -66,6 +66,10 @@ class Fake:
             return ''
         if exe == 'getenforce':
             return 'Enforcing\n'
+        if exe == 'systemd-analyze':
+            return '[Resolve]\nLLMNR=no\nMulticastDNS=no\n'
+        if exe == 'systemctl' and args[1] == 'show' and args[-1] == 'systemd-resolved.service':
+            return 'LoadState=not-found\nActiveState=inactive\n'
         if exe == 'systemctl' and args[1] == 'is-active':
             return 'inactive\n'
         if exe == 'ss':
@@ -126,6 +130,99 @@ class BootstrapTests(unittest.TestCase):
         p.write_text('tskey-secret-MUST-NOT-APPEAR')
         p.chmod(0o600)
         return p
+
+    def stock_resolved(self):
+        # Public ss output captured from the disposable run7 guest; identity
+        # observations below remain synthetic, not new Fedora evidence.
+        self.inventory = (ROOT / 'tests/data/fedora44/listeners-run7.txt').read_text()
+        self.resolved_state = 'LoadState=loaded\nActiveState=active\nUser=systemd-resolve\nMainPID=767\n'
+        for path, value in [('/proc/767/status', 'Uid:\t193\t193\t193\t193\n'),
+                            ('/proc/767/cgroup', '0::/system.slice/systemd-resolved.service\n'),
+                            ('/usr/lib/systemd/systemd-resolved', 'synthetic executable identity only\n')]:
+            target = self.app.path(path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(value)
+        self.app.path('/proc/767/exe').symlink_to('/usr/lib/systemd/systemd-resolved')
+        self.fake.accounts['systemd-resolve'] = 'systemd-resolve:x:193:193:Resolver:/:/usr/sbin/nologin\n'
+        original = self.fake
+        def run(*args, **kwargs):
+            if args[:2] == ('/usr/bin/ss', '-H'):
+                original.calls.append(args)
+                return self.inventory
+            if args[:2] == ('/usr/bin/systemctl', 'show') and args[-1] == 'systemd-resolved.service':
+                original.calls.append(args)
+                return self.resolved_state
+            result = original(*args, **kwargs)
+            if args[:2] == ('/usr/bin/systemctl', 'restart') and args[-1] == 'systemd-resolved.service':
+                self.inventory = '\n'.join(line for line in self.inventory.splitlines() if ':5355' not in line) + '\n'
+            return result
+        self.app.run = run
+
+    def test_stock_resolved_discovery_is_temporarily_identity_bound_then_persistently_disabled(self):
+        self.stock_resolved()
+        self.app.preflight()
+        self.prepare()
+        expected = '[Resolve]\nLLMNR=no\nMulticastDNS=no\n'
+        self.assertEqual(self.app.text('/etc/systemd/resolved.conf.d/90-dev-pair-discovery.conf'), expected)
+        self.assertNotIn(':5355', self.inventory)
+        self.assertIn('127.0.0.53%lo:53', self.inventory)
+        self.assertIn('0.0.0.0:22', self.inventory)
+        self.prepare()
+        self.assertEqual(self.app.text('/etc/systemd/resolved.conf.d/90-dev-pair-discovery.conf'), expected)
+        self.inventory += 'udp UNCONN 0 0 0.0.0.0:5355 0.0.0.0:* users:(("systemd-resolve",pid=767,fd=12))\n'
+        with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
+            self.app.preflight()
+
+    def test_resolved_discovery_impostor_service_and_process_mismatches_are_rejected(self):
+        self.stock_resolved()
+        original_inventory, original_state = self.inventory, self.resolved_state
+        for change in (lambda: setattr(self, 'inventory', original_inventory.replace('"systemd-resolve"', '"impostor"')),
+                       lambda: setattr(self, 'resolved_state', original_state.replace('MainPID=767', 'MainPID=999')),
+                       lambda: setattr(self, 'resolved_state', original_state.replace('User=systemd-resolve', 'User=root'))):
+            self.inventory, self.resolved_state = original_inventory, original_state
+            change()
+            with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
+                self.app.preflight()
+        self.inventory, self.resolved_state = original_inventory, original_state
+        self.app.path('/proc/767/cgroup').write_text('0::/system.slice/unrelated.service\n')
+        with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
+            self.app.preflight()
+        self.app.path('/proc/767/cgroup').write_text('0::/system.slice/systemd-resolved.service\n')
+        self.app.path('/proc/767/status').write_text('Uid:\t0\t0\t0\t0\n')
+        with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
+            self.app.preflight()
+
+    def test_resolved_failed_restart_and_effective_override_never_complete_prepare(self):
+        self.stock_resolved()
+        self.fake.fail = lambda args: args[:2] == ('/usr/bin/systemctl', 'restart')
+        with self.assertRaises(b.Blocked):
+            self.prepare()
+        self.assertFalse(self.app.path(b.STATE + '/prepared').exists())
+        self.assertFalse(any(Path(args[0]).name == 'useradd' for args in self.fake.calls))
+        self.fake.fail = None
+        old = self.app.run
+        def run(*args, **kwargs):
+            if args[0] == '/usr/bin/systemd-analyze':
+                return '[Resolve]\nLLMNR=no\nMulticastDNS=no\nLLMNR=yes\n'
+            return old(*args, **kwargs)
+        self.app.run = run
+        with self.assertRaisesRegex(b.Blocked, 'configuration conflicts'):
+            self.prepare()
+        self.assertFalse(self.app.path(b.STATE + '/prepared').exists())
+
+    def test_resolved_successful_restart_with_remaining_discovery_is_blocked(self):
+        self.stock_resolved()
+        inventory = self.inventory
+        old = self.app.run
+        def run(*args, **kwargs):
+            result = old(*args, **kwargs)
+            if args[:2] == ('/usr/bin/systemctl', 'restart'):
+                self.inventory = inventory
+            return result
+        self.app.run = run
+        with self.assertRaisesRegex(b.Blocked, 'discovery listener remains'):
+            self.prepare()
+        self.assertFalse(self.app.path(b.STATE + '/prepared').exists())
 
     def test_nonfedora_and_selinux_denied_before_any_mutation(self):
         self.app.path('/etc/os-release').write_text('ID=debian\nVERSION_ID=12\n')
@@ -248,16 +345,12 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(self.app.status()['root_and_initial_ssh_retained'])
 
     def test_command_errors_and_timeouts_never_echo_secret_output(self):
-        result = subprocess.CompletedProcess([], 1, 'tskey-secret', 'tskey-secret')
-        with patch.object(b.subprocess, 'run', return_value=result):
+        for code, timeout in [('import sys;print("tskey-secret");sys.exit(1)', 3),
+                              ('import time;time.sleep(3)', .05)]:
             with self.assertRaises(b.Blocked) as ctx:
-                b.Commands()('/usr/bin/tailscale', 'up', '--auth-key=file:/secret')
+                b.Commands()(sys.executable, '-c', code, 'secret-argv', timeout=timeout)
             self.assertNotIn('tskey-secret', str(ctx.exception))
-            self.assertNotIn('/secret', str(ctx.exception))
-        with patch.object(b.subprocess, 'run', side_effect=subprocess.TimeoutExpired('tskey-secret', 1)):
-            with self.assertRaises(b.Blocked) as ctx:
-                b.Commands()('/usr/bin/tailscale', 'up')
-            self.assertNotIn('tskey-secret', str(ctx.exception))
+            self.assertNotIn('secret-argv', str(ctx.exception))
 
     def test_existing_or_mismatched_tailnet_never_adopted(self):
         self.prepare()
@@ -395,7 +488,9 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.app.path(b.STATE + '/gptbox-image.json').exists())
         self.assertTrue(self.app.path(b.STATE + '/gptbox-build-intent.json').exists())
         self.fake.fail = None
-        record = {'image_id': 'sha256:' + 'b' * 64, 'context_sha256': digest}
+        manifest = json.loads((context / 'inputs.json').read_text())
+        record = {'image_id': 'sha256:' + 'b' * 64, 'context_sha256': digest, 'source_sha': manifest['source_sha'],
+                  'base_image': manifest['fedora']['image'], 'codex_sha256': manifest['codex']['sha256']}
         self.app.atomic(b.STATE + '/gptbox-image.json', json.dumps(record) + '\n')
         self.fake.image = {'Id': 'sha256:' + 'a' * 64}
         with self.assertRaisesRegex(b.Blocked, 'identity mismatch'):
@@ -952,13 +1047,16 @@ class OperatorInputTests(unittest.TestCase):
         # Execute a harmless real child reading stdin, rather than only asserting a mock call.
         result = b.Commands()(sys.executable, '-c', 'import sys; print(len(sys.stdin.read()))',
                               input_text='synthetic-stdin-value')
-        self.assertEqual(result.strip(), str(len('synthetic-stdin-value')))
-        with patch.object(b.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, 'synthetic-stdin-value', 'synthetic-stdin-value')) as run:
-            with self.assertRaises(b.Blocked) as error:
-                b.Commands()('/usr/sbin/chpasswd', input_text='core:synthetic-stdin-value\n')
-            self.assertEqual(run.call_args.args[0], ('/usr/sbin/chpasswd',))
-            self.assertEqual(run.call_args.kwargs['input'], 'core:synthetic-stdin-value\n')
-            self.assertNotIn('synthetic-stdin-value', str(error.exception))
+        self.assertEqual(result, '')
+        records = []
+        run = b.Commands()
+        run.diagnostic = records.append
+        with self.assertRaises(b.Blocked) as error:
+            run(sys.executable, '-c', 'import sys;print(sys.stdin.read());sys.exit(1)',
+                input_text='core:synthetic-stdin-value\n')
+        self.assertNotIn('synthetic-stdin-value', str(error.exception))
+        self.assertNotIn('synthetic-stdin-value', json.dumps(records))
+        self.assertTrue(records[0]['sensitive_stdin'])
 
     def test_profile_interactive_tty_reconnect_and_noninteractive_protocols(self):
         with tempfile.TemporaryDirectory() as directory:

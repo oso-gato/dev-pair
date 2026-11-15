@@ -41,7 +41,7 @@ class Engine:
         if args[:2] == ('/usr/bin/id', '-u') or args[:2] == ('/usr/bin/id', '-g'):
             return '1001\n'
         if args[:2] == ('/usr/bin/systemctl', 'show'):
-            return 'User=dp-maint\nActiveState=' + ('active' if self.active else 'inactive') + '\n'
+            return 'User=dp-maint\nDescription=dev-pair-owned-dev-pair-gptbox-' + EXPECTED + '.service\nActiveState=' + ('active' if self.active else 'inactive') + '\n'
         if args[:2] == ('/usr/bin/systemctl', 'stop'):
             self.active = False
         if not args or args[0] != '/usr/bin/systemd-run':
@@ -53,7 +53,7 @@ class Engine:
         if 'distrobox-enter' in ' '.join(args[:position]):
             return ''
         if command[:2] == ('image', 'inspect'):
-            return json.dumps([{'Id': SEALED}])
+            return json.dumps([{'Id': SEALED, 'Labels': {'dev-pair.context': EXPECTED, 'dev-pair.distrobox': g.DBX_SHA, 'org.opencontainers.image.revision': SOURCE}}])
         if command[0] == 'pull':
             return ''
         if command[0] == 'build':
@@ -157,6 +157,14 @@ class GptboxTests(unittest.TestCase):
 
     def test_real_command_path_assembles_seals_probes_restarts_cleans_and_never_admits_jobs(self):
         result = self.assemble()
+        recipe = (self.engine.build / 'Containerfile').read_text()
+        shell = next(line[4:] for line in recipe.splitlines() if line.startswith('RUN '))
+        subprocess.run(['/bin/sh', '-n'], input=shell, text=True, check=True, capture_output=True)
+        self.assertIn('glibc-all-langpacks', shell)
+        self.assertIn('dnf-plugins-core', shell)
+        self.assertIn('test -d /usr/share/i18n/charmaps', shell)
+        self.assertIn('localpkg_gpgcheck=1', shell)
+        self.assertIn('rpms.txt', shell)
         self.assertEqual(result['boundary_and_version_cycles'], 2)
         self.assertFalse(result['job_admission'])
         self.assertTrue(result['runtime_container_removed'])
@@ -403,6 +411,18 @@ class ProductionInputContractTests(unittest.TestCase):
                 self.assertEqual(observed, manifest)
                 self.assertEqual(scripts['distrobox-init'], (upstream / 'distrobox-init').read_bytes())
                 self.assertFalse(app.state.exists())
+                with self.assertRaisesRegex(adapter.Blocked, 'context source'):
+                    app.inputs(context, prepared['context_sha256'], upstream, '0' * 40)
+                (repo / 'extra-public-file').write_text('changed HEAD, unchanged executors\n')
+                commit(repo)
+                with self.assertRaisesRegex(adapter.Blocked, 'HEAD differs'):
+                    app.inputs(context, prepared['context_sha256'], upstream, source_sha)
+                subprocess.run(['/usr/bin/git', '-C', str(repo), 'reset', '--hard', source_sha], check=True, capture_output=True)
+                (upstream / 'extra-public-file').write_text('changed HEAD, unchanged scripts\n')
+                commit(upstream)
+                with self.assertRaisesRegex(adapter.Blocked, 'HEAD differs'):
+                    app.inputs(context, prepared['context_sha256'], upstream, source_sha)
+                subprocess.run(['/usr/bin/git', '-C', str(upstream), 'reset', '--hard', upstream_sha], check=True, capture_output=True)
                 (upstream / 'distrobox-enter').write_text('# mutated upstream source\n')
                 with self.assertRaisesRegex(adapter.Blocked, 'exact Git object'):
                     app.inputs(context, prepared['context_sha256'], upstream, source_sha)
