@@ -179,7 +179,7 @@ class RelayTests(unittest.TestCase):
         def root_info(info):
             fields = list(info); fields[4] = 0
             return os.stat_result(fields)
-        with tempfile.TemporaryDirectory(dir='/workspace') as temp:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as temp:
             base = Path(temp)
             (base / 'tools').mkdir(mode=0o755)
             source = base / 'tools/native_relay.py'
