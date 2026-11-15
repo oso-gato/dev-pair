@@ -1301,3 +1301,24 @@ with captured-inventory, service/process mismatch, restart failure and reapply
 checks; fresh first-bootstrap review is informed. No blanket port5355 allowance,
 CI fixture substitution or admission bypass is authorized. No additional CI run
 is started until the next reviewed integration candidate.
+
+
+Shared first-bootstrap candidate `9c8c597ced106c0c5d34cff102d15a5fa5bc6782`
+was integrated byte-identically as `0438afc`. Builder's 184 tests and the
+coordinator's 185 integration tests (including the later diagnostic case) pass,
+as do compilation/diff checks. Cached exact Distrobox source confirmed all55
+staging dependency names; no DNF or init execution was performed locally.
+The candidate adds shared initialize, exact target/HEAD checks, bounded secret-
+aware commands, durable native-unit recovery, image reuse verification, upstream
+staging prerequisites and service-bound persistent resolved discovery disabling.
+Source-only until independent review and actual Fedora execution.
+
+Fresh Astra High `/root/first_bootstrap_review` independently passed184 tests and
+checked CLI exception forwarding and secret-stdin withholding, but reproduced
+two material failures: an exited direct parent causes Commands to skip group/native
+cleanup while a surviving child retains pipes; separate Commands instances can
+replace/cancel the outer alarm, allowing an inner phase to exceed the declared
+total execution deadline. The coordinator and reviewer both reproduced an outer
+0.05s/inner0.2s real0.1s sleep returning success. Review is consolidating findings;
+the builder awaits the complete repair batch. This candidate is not published,
+executed on Fedora or approved. Preserve all existing runtime/security gates.
