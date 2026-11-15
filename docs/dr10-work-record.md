@@ -1692,3 +1692,41 @@ cache is empty. No pull/build/run occurred. Evidence:
 `/workspace/artifacts/local-fedora-executor-feasibility/feasibility.json`.
 Continue with the existing bounded hosted executor for Fedora acceptance; local
 Docker availability alone is not an equivalent replacement.
+
+
+### November16, 2026, 03:08 HKT — reviewed staging diagnostic run
+
+Sole Sol High candidate `3913dd69eb84cd2ed22593a0d21ea580dd965599` is
+integrated byte-identically for tools/tests/CI documentation as `f225652`.
+Builder220tests passed32.855s, coordinator220passed33.157s. It fixes two
+reproduced diagnostic losses: generic staging failures and startup-witness loss
+from console-tail truncation. Fixed staging step, numeric errno/exit/timeout,
+UID and rejected-parent metadata identify the operation. Only exact pre-credential
+restorecon/reload/start operations retain bounded public stderr through an owned
+anonymous regular file,4096-byte native ceiling,768-character tail and byte/hash
+metadata. Other commands still discard streams. Strict failure-only witness
+extraction preserves exact bytes/hash before truncation and can never satisfy
+dedicated report or guest-phase admission. No Fedora root cause is asserted.
+
+Fresh Astra High `/root/native_staging_diagnostic_review` returned PASS with
+limits for exact3913dd69:220tests33.349s,52 independent process/parser checks,
+15 unchanged AST/file boundaries, no material findings.
+Evidence: `/workspace/artifacts/native-staging-diagnostic-review-3913dd69eb84cd2ed22593a0d21ea580dd965599/review.json`.
+Initializer, execution dispatch, unit/profile, report gates, workflow, QEMU and
+resource/security bounds remain unchanged. Under existing test authority,
+coordinator reassessment admits exactly one new diagnostic-only hosted run to
+resolve run10's fixed failing operation. No unchanged retries; reassess its
+measured result before more hosted execution. Source remains frozen during run.
+This is separate from the closed runs8–10 preparation batch and is not production
+or VPS authorization.
+
+Offline stock Codex evidence is now durable in
+`/workspace/artifacts/codex-offline-state-probe/REPORT.txt`, SHA256
+`e82fbad4cf8b88ec8fe6690214ade49f33bfdec1ff1d928aea157f61ef22454c`.
+Actual no-network app-server tests confirm untrusted-source skills discovery,
+fixed-cwd exclusion, required assembly seeding of bundled skills, managed feature/
+path behavior, separate SQLite lifecycle and session-index symlink replacement.
+Strict-config alone accepts unknown requirement keys. Same-owner bubblewrap
+fixtures cannot prove distinct root/job sticky ownership; direct binary
+reinvocation remains a loader-boundary design issue. No authentication, model
+call, true session resume or Fedora placement is claimed. Artifact1.4MiB,116files.
