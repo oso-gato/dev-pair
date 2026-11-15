@@ -1269,3 +1269,14 @@ builder temporarily preserves its larger bootstrap WIP and adds bounded `ss -H
 CI run. No network, package provisioning, listener admission or resource changes
 are included; the exact inventory must precede any listener-policy repair. The
 first-bootstrap source slice resumes afterward without a second builder.
+
+
+Listener-only diagnostic candidate `9aae9d7a188ff82562375b49742878638e391e54`
+is integrated byte-identically as `4584059`. Builder's full 175 tests pass;
+coordinator and fresh Astra High `/root/fedora_listener_diagnostic_review` each
+passed all 37 affected tests. Independent real-process overflow/sanitization and
+report roundtrip checks also passed. Review returned PASS with no findings.
+The only production-code addition is fixed `/usr/bin/ss -H -lntup` through the
+existing 15s/64KiB capture and explicit bounded/truncated diagnostic path.
+Publish for the one previously authorized inspection-only run7; do not infer or
+admit the unknown listener before its actual evidence returns.
