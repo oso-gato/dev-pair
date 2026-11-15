@@ -232,3 +232,55 @@ bootstrap cutover and recovery under explicit effects/limits. The previously
 reported executor transport blocker is distinct from this product requirement:
 an authorized public SSH/provider-console bootstrap path can precede enrollment,
 but this task has established no usable executor-to-host route.
+
+## Fedora 44 bootstrap implementation — 2026-11-15
+
+The owner explicitly redirected continuation to real bootstrap source for the
+vanilla Fedora Cloud host rather than waiting for SSH connectivity. This slice
+starts from `4dcf92e256a49770ddd89e4420b105319885910f`, in isolated worktree
+`/workspace/dev-pair-bootstrap`, branch `codex/fedora44-bootstrap`. README DR10,
+STANDARDS, all three shared Git-object documents at
+`b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`, REQUIREMENTS, ARCHITECTURE/A12 and this
+record were loaded. No A11 code was copied or executed: agent lifecycle adaptation
+is outside this prerequisite-only scope.
+
+The actual executable `tools/bootstrap.py` and [guide](fedora-bootstrap.md) provide
+inspect, default-preview prepare/enroll, explicit `--apply`, status, and a
+fail-closed finalization refusal. Implemented effects: official signature-checked
+RPM prerequisites, isolated operator/runtime identities, nonoverlapping subids,
+durable directories and bounded cgroup defaults, operator effective SSH checks,
+source-CIDR bootstrap guard, external-file Tailscale enrollment and node/tailnet
+identity reconciliation. Desired state records the script SHA256, baseline,
+standards pin and public configuration; journaled stage boundaries permit retry.
+Applications are never started. Runtime storage/cleanup enforcement remains absent
+and jobs are disabled. Temporary root/public SSH is retained deliberately, with
+explicit source restriction; R7.16–R7.18 final cutover is **not complete**. No
+provider credential was read, target contacted, host mutated, image built or
+application launched. No push, merge or release tag is authorized by this task.
+
+Coordinator launched the builder as `/root/fedora_bootstrap_build` with accepted
+API configuration `gpt-6.1-sol` / `high`; independent provider attestation is
+unavailable. A separate research session checked official Fedora package and
+Tailscale repo/flag sources. Execution is source development and local tests only,
+with a 15-minute checkpoint and at most two review/repair cycles before bounded
+reassessment. The first checkpoint reported source/compile completion; continuation
+covered tests/docs. This builder supplies no independent release approval. Fresh
+Astra High review must bind to the exact returned commit.
+
+Local validation uses synthetic command responses and temporary filesystem roots,
+clearly separated from Fedora evidence. Required real checks remain: signed RPM
+install/second apply, actual operator key login and sudo, rejected runtime logins,
+SELinux labels and confinement, rootless Podman/subid behavior, cgroup ceilings,
+nft syntax and ingress on IPv4/IPv6, enrollment failure/mismatch/retry, restart and
+reboot persistence, tailnet ACL authorization, independent console recovery and
+later timed-rollback SSH cutover. No local success upgrades those checks to pass.
+Exact commit, local results and fresh review verdict belong in the PR handoff.
+
+Coordinator additionally generated the operator Match fragment through the fake
+command fixture, made an ephemeral host key in scratch storage and parsed it with
+real Debian OpenSSH `sshd -T -f ... -C ...`. Exit 0 and expected key-only effective
+settings establish Debian parser/precedence behavior only, not Fedora login or
+SELinux acceptance. The temporary material was removed; no host SSH configuration
+was changed. Builder local suite: 35 tests passed (17 bootstrap and 18 candidate),
+Python compilation and CLI help passed, and `git diff --check` passed. Test-owned
+command substitutions do not execute package managers or provisioning on Debian.
