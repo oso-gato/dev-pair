@@ -334,6 +334,17 @@ def build_within_limit(cache, distrobox, output):
             (work / 'cosign').chmod(0o500)
             proof = command(signature_args(work / 'cosign', work / 'codex.sigstore', binary), work, network=True)
             require(b'Verified OK' in proof[0] + proof[1], 'strict Cosign success evidence missing')
+            retained = output / 'verification'
+            retained.mkdir(mode=0o700)
+            shutil.copyfile(work / 'codex.sigstore', retained / 'codex.sigstore')
+            (retained / 'cosign-verification.txt').write_bytes(proof[0] + proof[1])
+            receipt = {'version': 1, 'kind': 'public-codex-verification-receipt', 'helper_source_sha': revision,
+                       'exit_status': 0, 'result': 'Verified OK', 'codex_source_sha': CODEX_SOURCE,
+                       'codex_binary_sha256': CODEX_SHA, 'codex_binary_bytes': CODEX_BYTES,
+                       'artifacts': {name: {'bytes': size, 'sha256': sha} for name, (_, size, sha) in ARTIFACTS.items()},
+                       'verification_output_sha256': hashlib.sha256(proof[0] + proof[1]).hexdigest(),
+                       'note': VERIFICATION}
+            (retained / 'receipt.json').write_bytes(canonical(receipt))
             tree = work / 'payload'
             tree.mkdir()
             clean_checkout(repo, revision, tree / 'dev-pair', work)
@@ -355,8 +366,9 @@ def build_within_limit(cache, distrobox, output):
             context = json.loads(preparation)
             evidence = tree / 'evidence'
             evidence.mkdir()
-            shutil.copyfile(work / 'codex.sigstore', evidence / 'codex.sigstore')
-            (evidence / 'cosign-verification.txt').write_bytes(proof[0] + proof[1])
+            shutil.copyfile(retained / 'codex.sigstore', evidence / 'codex.sigstore')
+            shutil.copyfile(retained / 'cosign-verification.txt', evidence / 'cosign-verification.txt')
+            shutil.copyfile(retained / 'receipt.json', evidence / 'verification-receipt.json')
             files = inventory(tree)
             payload = output / 'maintenance-inputs.tar.gz'
             write_payload(tree, files, payload)
@@ -370,8 +382,21 @@ def build_within_limit(cache, distrobox, output):
             return {'manifest_sha256': digest(output / 'manifest.json'), 'payload_sha256': digest(payload),
                     'context_sha256': context['context_sha256'], 'source_sha': revision, 'output': str(output)}
     except BaseException:
-        shutil.rmtree(output)
+        cleanup_failed_build(output)
         raise
+
+
+def cleanup_failed_build(output):
+    # Successful cryptographic evidence survives an unrelated packaging failure;
+    # it cannot authorize a retry: build always verifies again into a new output.
+    if (output / 'verification/receipt.json').is_file():
+        for path in output.iterdir():
+            if path.name != 'verification':
+                shutil.rmtree(path) if path.is_dir() else path.unlink()
+        (output / 'failure.json').write_bytes(canonical({'status': 'payload-not-published',
+                                                        'verified_input_evidence': 'verification/receipt.json'}))
+    else:
+        shutil.rmtree(output)
 
 
 def validate_manifest(obj):
@@ -396,7 +421,7 @@ def validate_manifest(obj):
         path = safe_path(item['path'])
         require(path.parts[0] in ('dev-pair', 'distrobox', 'context', 'evidence'), 'unexpected payload root')
         if '.git' in (part.lower() for part in path.parts):
-            require(re.fullmatch(r'(dev-pair|distrobox)/\.git/(HEAD|config|shallow|refs/heads/public-input|objects/pack/pack-[0-9a-f]{40}\.(pack|idx))', item['path']),
+            require(re.fullmatch(r'(dev-pair|distrobox)/\.git/(HEAD|config|shallow|refs/heads/public-input|objects/pack/pack-[0-9a-f]{40}\.(pack|idx|rev))', item['path']),
                     'undeclared Git metadata denied')
         require(type(item['bytes']) is int and 0 <= item['bytes'] <= CODEX_BYTES and
                 re.fullmatch('[0-9a-f]{64}', item['sha256']), 'invalid file identity/size')
@@ -404,7 +429,7 @@ def validate_manifest(obj):
         total += item['bytes']
     require(names == sorted(set(names)) and total <= EXPANSION_LIMIT, 'duplicate/unsorted/oversized payload inventory')
     required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile')}
-    required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt'}
+    required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json'}
     for repo in ('dev-pair', 'distrobox'):
         required |= {repo + '/.git/' + name for name in ('HEAD', 'config', 'shallow', 'refs/heads/public-input')}
     require(required <= set(names), 'incomplete maintenance payload')

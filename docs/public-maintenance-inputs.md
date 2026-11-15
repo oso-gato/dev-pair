@@ -87,8 +87,11 @@ compressed payload against 192MiB, and expanded files against 384MiB/2048 files.
 Extraction has a 120-second deadline and a bounded raw-tar expansion before member
 parsing. Only declared regular files are written; links, devices, sparse/PAX
 records, traversal, duplicates and trailing nonzero tar data are rejected.
-Failure removes only the newly created owned output; success removes temporary
-copies while preserving the handoff/evidence. Original caches remain intact.
+Failure removes unpublished payloads and temporary copies. Once strict signature
+verification passes, its bounded public receipt, output and original bundle remain
+under `verification/` even if later packaging fails. They are evidence, not a
+verification bypass: every new build repeats the actual checks. Successful payloads
+also contain this receipt. Original caches remain intact.
 
 Run `python3 -m unittest discover -s tests -p test_public_inputs.py -v` for real
 Git sanitization/history exclusion, filesystem/hash/archive rejection, trusted

@@ -3,6 +3,7 @@ import gzip
 import io
 import json
 import os
+import shutil
 import pathlib
 import subprocess
 import sys
@@ -115,7 +116,7 @@ class PublicInputsTests(unittest.TestCase):
             path = tree / 'context' / name
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(b'explicit parser fixture, no admissible Codex binary')
-        for name in ('codex.sigstore', 'cosign-verification.txt'):
+        for name in ('codex.sigstore', 'cosign-verification.txt', 'verification-receipt.json'):
             path = tree / 'evidence' / name
             path.parent.mkdir(exist_ok=True)
             path.write_text('parser fixture, not signature evidence')
@@ -139,6 +140,23 @@ class PublicInputsTests(unittest.TestCase):
         self.assertIn('transport integrity', result['verification'])
         self.assertEqual(inputs.inventory(tree), inputs.inventory(self.root / 'extracted'))
         self.assertFalse((self.root / 'extracted/dev-pair/.git/hooks').exists())
+
+    def test_real_git_metadata_passes_shared_manifest_and_extracted_git_reads(self):
+        tree, payload, manifest, record = self.fixture_payload()
+        repo, revision, _ = self.source_repo()
+        shutil.rmtree(tree / 'dev-pair')
+        inputs.clean_checkout(repo, revision, tree / 'dev-pair', self.work)
+        record['source_sha'] = revision
+        record['files'] = inputs.inventory(tree)
+        payload.unlink()
+        inputs.write_payload(tree, record['files'], payload)
+        record['payload'] = {'bytes': payload.stat().st_size, 'sha256': inputs.digest(payload)}
+        inputs.validate_manifest(record)
+        manifest.write_bytes(inputs.canonical(record))
+        inputs.extract(payload, manifest, inputs.digest(manifest), self.root / 'git-roundtrip')
+        restored = self.root / 'git-roundtrip/dev-pair'
+        self.assertEqual(self.git(restored, 'show', revision + ':source.txt'), 'exact current public source')
+        self.git(restored, 'fsck', '--full', '--strict')
 
     def test_consumer_rejects_unknown_schema_and_unexpected_git_metadata(self):
         tree, payload, manifest, record = self.fixture_payload()
@@ -176,6 +194,18 @@ class PublicInputsTests(unittest.TestCase):
         self.assertNotIn('PYTHONPATH', env)
         self.assertEqual(env['HTTPS_PROXY'], 'synthetic-approved-proxy')
         self.assertNotIn('HTTPS_PROXY', inputs.environment(self.work / 'home'))
+
+    def test_failed_packaging_keeps_existing_public_receipt_but_not_unpublished_payload(self):
+        output = self.root / 'failed'
+        output.mkdir()
+        retained = output / 'verification'
+        retained.mkdir()
+        (retained / 'receipt.json').write_text('explicit cleanup fixture, not verification evidence')
+        (output / 'maintenance-inputs.tar.gz').write_text('unpublished fixture')
+        inputs.cleanup_failed_build(output)
+        self.assertTrue((retained / 'receipt.json').is_file())
+        self.assertFalse((output / 'maintenance-inputs.tar.gz').exists())
+        self.assertEqual(json.loads((output / 'failure.json').read_text())['status'], 'payload-not-published')
 
     def test_real_command_output_and_timeout_bounds(self):
         with self.assertRaisesRegex(ValueError, 'output limit'):
