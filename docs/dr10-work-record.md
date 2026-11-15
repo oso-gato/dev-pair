@@ -1375,3 +1375,20 @@ native900/180 component limits and no jobs, auth, enrollment or Hostinger access
 Add an in-image fixed dependency-build timeout within the600s image-work budget;
 this does not establish complete detached-helper cleanup. Fresh exact-candidate
 review precedes hosted execution. No source after76e7d61 has yet been published.
+
+
+The CI integration builder is active in `/workspace/dev-pair-fedora-prepare`,
+branch `codex/fedora-prepare-integration`, from
+`8bd3f973e9821ebc71faba656fd3cee1af191698`, with a thirty-minute source budget.
+The implementation now wires current-source verified compressed inputs, protected
+source/Git objects, shared initialize, target-bound partial evidence and reportv2,
+fixed resource/timing bounds and isolated VM provisioning egress. Post-password
+arbitrary journal collection is removed; only selected service/RPM/socket fields,
+filtered executor AVCs and bounded public-operation tails are proposed. A fixed
+in-image dependency-build timeout supplements the reviewed initializer bounds.
+Local phase/secret/failure/profile tests are being added; no hosted run, download,
+password, enrollment, model call or source publication occurs in this builder.
+Fresh API-configured Astra High `/root/fedora_prepare_ci_review` has loaded the
+contract and waits for an immutable candidate. The latest published source is
+still76e7d61 and the last actual run is7; do not confuse this WIP with runtime
+acceptance or a completed platform.
