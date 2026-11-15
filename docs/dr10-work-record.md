@@ -486,3 +486,53 @@ cache retaining `user_home_t` (fedora-bootstrap commit
 actual confined mount/cache checks are required, not just `getenforce` output.
 Choose labels according to role/trust sharing; do not indiscriminately share
 private-role storage or disable labeling to make tests pass.
+
+### Core access implementation and independent findings
+
+Sol High returned `8f4771751954184f672b09683997dd668526d2a2`, integrated with the
+owner-documentation commit as `e788373db27b8900556c8906caedfe2cfa87553f`. This
+implements core password-gated administration, GitHub public-key import,
+interactive-only tmux attachment, tailnet-only mosh with reserved ephemeral
+ports, persistent erebus hostname and clock-service setup. Both builder and
+coordinator ran 66 passing local tests, including real key parsing, stdin
+handling and Bash PTY/noninteractive behavior; these are not Fedora acceptance.
+
+Fresh API-configured Astra High `/root/core_access_review` independently ran
+the 66 tests and reviewed exact candidate e788373. Verdict: changes required.
+It reproduced (1) a failed password-marker write after unlocking core but before
+installing its key-only SSH fragment, leaving password SSH possible under a
+permissive provider default, and (2) blocking DNS outside the urllib socket/read
+deadline. Repair must establish and verify SSH restrictions while the account
+is locked, before setting its password, and impose a process-level fetch
+deadline covering DNS/TLS/headers. These findings return to the Sol builder;
+the passing tests alone do not approve the candidate. Fresh affected review is
+required after repair.
+
+The cloud desktop fallback also failed to start with
+`the gaas-browser node_repl sandbox cannot be disabled`; no provider-console
+session could be inspected. No credentials were entered and no host action
+occurred. Source work continues independently of that unavailable route.
+
+### Confined Distrobox implementation direction
+
+Fresh Astra High research inspected Distrobox 1.8.2.5 at
+`40c3cd724faa434aeb0a23e28776665b92de68bd`. Ordinary init rewrites configuration
+and mounts devpts even after `/.containersetupdone`; preassembly alone cannot
+make normal restarts compatible with an immutable root. Its documented hooks
+offer a narrow downstream integration: actual upstream init in isolated
+candidate assembly, fixed finalizer hook that seals/exits, then a new confined
+nonroot read-only container using upstream pre-init to exec a fixed frozen
+startup verifier. Controlled entry uses actual upstream distrobox-enter with
+`--no-tty --no-workdir --clean-path`, an explicit command, clean environment and
+protected parent configuration. Verify the exact existing container before
+entry so upstream's absent-container auto-create never invokes unsafe defaults.
+The constructor replaces unsafe stock creation explicitly; this is not an
+upstream-certified confined mode or runtime acceptance. Actual Fedora assembly,
+effective labels, mounts, code-write rejection and restart tests remain required.
+
+Nested DevBox still needs measured namespace/storage/seccomp/SELinux validation.
+`container_engine_t` and `label=nested` are research candidates, not permissions
+to enable global booleans, disable labels or widen agent authority. No runtime
+admission follows from source research. The detailed scratch handoff is
+`/workspace/scratch/confined-distrobox-handoff.md`; the durable constraints and
+next slice are captured here so its loss does not erase the design decision.
