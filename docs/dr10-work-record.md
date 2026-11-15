@@ -9,26 +9,32 @@ owner decisions remain retained in order.
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
   Latest published source: `76e7d61b8966f2c25420e66bed84f44f36142b2c`.
   Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
-- All 174 tests pass locally and in [CI run6](https://github.com/oso-gato/dev-pair/actions/runs/43736703953).
+- All 175 tests passed in [CI run7](https://github.com/oso-gato/dev-pair/actions/runs/43737631539).
   Signed image/tooling/source, real TCG boot, complete dedicated report, Fedora44
   Enforcing SELinux/systemd/cgroupv2, bootstrap status and cleanup passed.
-  Bootstrap inspection rejected an unexpected listener; exact socket inventory
-  is pending a reviewed diagnostic-only follow-up. Prepare/assembly never ran.
+  Bootstrap inspection rejected stock resolved LLMNR listeners on wildcard
+  TCP/UDP5355, captured in the diagnostic report. Prepare/assembly never ran.
 - Public-input repair 62eb1f6 and dedicated-report repair 12d73c3 passed fresh
   Astra High reviews; source is integrated as 921654d and 3a49fd8 respectively.
-  All 174 integration tests pass. Builder `/root/durable_job_build` uses accepted
+  Those source cycles passed their integration checks. Builder `/root/durable_job_build` uses accepted
   API settings Sol High; reviewers use Astra High. Provider backend attestation
   and coordinator model metadata remain unavailable.
 - Shared first-bootstrap source and both repairs are integrated through674954e;
   fresh final review passed exact8c47d238. All189 integration tests pass.
   Initialize/command/native-unit and resolved convergence behavior remains
-  source/local evidence until its actual Fedora run. Builder resumes the next
-  CI integration slice after this checkpoint.
+  source/local evidence until its actual Fedora run. The CI integration builder
+  is active; its first checkpoint passed195 local tests, with final tests and
+  fresh exact-candidate review pending.
 - Run7 identified stock resolved LLMNR5355 as the listener blocker. Reviewed
   source now recognizes the exact service and persists LLMNR/mDNS disabling.
-  Next: connect current-source verified inputs and shared initialize into CI,
+  Next: finish current-source verified inputs and shared initialize in CI,
   using `/workspace/scratch/fedora-prepare-integration-plan.md`; independently
   review the complete resource/network/secret boundary before executing.
+- In parallel, fresh API-configured Astra High `/root/nested_devbox_design`
+  performs a twenty-minute read-only design of the required nested DevBox
+  placement against committed source and A11 references. Its scratch handoff
+  cannot substitute for actual nested Fedora/SELinux acceptance. No second
+  implementation builder is active.
 - VPS remains untouched. Root credential reference was available, but this cloud
   executor has no supported VPS TCP/SSH route. CI is a separate test target.
   Authenticated jobs, both actual placements, enforced quota/cleanup, tailnet
