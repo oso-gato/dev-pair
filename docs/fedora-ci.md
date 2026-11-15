@@ -155,7 +155,14 @@ one complete frame is required; EOF or a visible frame alone is insufficient.
 
 Public diagnostics select fixed RPM/socket/service-result fields, scoped AVC
 lines and at most two public failure records per preparation/adapter, with
-bounded1500-character stream tails, original counts and truncation flags. No
+bounded1500-character stream tails, original counts and truncation flags. Fixed
+operation/prepare-step IDs distinguish accepted nonzero exits from rejected
+commands; recent metadata remains available when a later Python source gate fails.
+Source/context/upstream verification exports fixed stage/outcome only, never raw
+Git paths/configuration/output. Failed owned native commands additionally query
+only bounded unit state/result/exit fields; a collected or unstarted unit is
+explicitly unavailable, never inferred successful. SELinux enforcement is a
+fixed public read operation; password/stdin output remains withheld. No
 post-password arbitrary journal, shadow, environment, auth state, password file,
 complete native history or filesystem is exported. Modern `::command::` and
 legacy `##[command]` forms are neutralized by central emitters; structured JSON

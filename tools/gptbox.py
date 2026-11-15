@@ -143,13 +143,16 @@ class Gptbox(Bootstrap):
         for file in Path(context).iterdir():
             self.protected(file)
         _, _, manifest = self.check_gptbox_inputs(context, expected)
+        self.source_stage = 'context-source'
         candidate.verify(context, expected)
         if (manifest['role'] != 'maintenance' or manifest['fedora']['image'] != FEDORA
                 or manifest['codex']['version'] != '0.169.0' or manifest['codex']['sha256'] != CODEX_SHA):
             raise Blocked('first adapter accepts only the independently verified pinned maintenance inputs')
         if manifest['source_sha'] != revision:
             raise Blocked('context source differs from requested adapter target')
+        self.source_stage = 'executing-source'
         self.source(revision)
+        self.source_stage = 'upstream-head-and-bytes'
         upstream = self.protected(upstream)
         if self.run('/usr/bin/git', '-C', str(upstream), 'rev-parse', 'HEAD').strip() != DBX_SHA:
             raise Blocked('upstream Distrobox HEAD differs from pinned target')
@@ -589,7 +592,7 @@ class Gptbox(Bootstrap):
                 location = STATE + '/prepare-diagnostics.json'
                 history = json.loads(self.text(location, '{"recent":[],"failures":[]}'))
                 history['recent'] = (history['recent'] + [entry])[-4:]
-                if entry['status'] != 0:
+                if entry.get('accepted_exit') is not True:
                     history['failures'] = (history['failures'] + [entry])[-4:]
                 self.atomic(location, json.dumps(history, sort_keys=True) + '\n', expected=self.text(location) or None)
             save()
@@ -603,6 +606,23 @@ class Gptbox(Bootstrap):
             preparation.run.native_register = register
             self.run.native_register = register
             preparation.run.diagnostic = diagnostic
+            def source_check():
+                previous = self.run.diagnostic
+                def source_diagnostic(buffers, status):
+                    diagnostic({'operation': 'withheld', 'operation_id': 'source-git-read',
+                                'step': 'adapter-source-and-upstream', 'status': status,
+                                'accepted_exit': status == 0, 'outcome': 'accepted' if status == 0 else 'rejected'})
+                self.run.diagnostic = source_diagnostic
+                try:
+                    self.source_stage = 'input-content'
+                    self.inputs(context, expected, upstream, revision)
+                    record['source_verification'] = {'stage': 'all-inputs', 'outcome': 'complete'}
+                except BaseException:
+                    record['source_verification'] = {'stage': getattr(self, 'source_stage', 'unavailable'), 'outcome': 'blocked-or-interrupted'}
+                    raise
+                finally:
+                    self.run.diagnostic = previous
+                    save()
             prepare_started = time.monotonic()
             adapter_started = None
             try:
@@ -615,7 +635,7 @@ class Gptbox(Bootstrap):
                         preparation.run.reconcile_native(('--unit=' + unit, '--description=dev-pair-owned-' + unit, '--uid=dp-maint'),
                                                          {'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'})
                     preparation.prepare('core', keys, sources, context, expected, password=password,
-                                        source_check=lambda: self.inputs(context, expected, upstream, revision))
+                                        source_check=source_check)
                 record.update(phase='maintenance-gptbox', prepare='complete',
                               prepare_elapsed_seconds=round(time.monotonic() - prepare_started, 3))
                 self.target = ROOT + '/' + expected
@@ -636,6 +656,7 @@ class Gptbox(Bootstrap):
                 else:
                     record['maintenance_gptbox'] = 'blocked'
                     record['adapter_elapsed_seconds'] = round(time.monotonic() - (adapter_started or time.monotonic()), 3)
+                record['prepare_step'] = getattr(preparation, 'prepare_step', 'not-started')
                 record['failure'] = 'blocked-or-interrupted; inspect protected diagnostics; explicit retry required'
                 record['cleanup'] = 'not verified; recorded native command/OCI lifetimes remain finite'
                 if record['prepare'] == 'complete':

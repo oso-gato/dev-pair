@@ -286,7 +286,7 @@ def diagnostics(end=None):
             if name == 'selinux_avcs':
                 lines = output.decode('utf-8', 'replace').splitlines()
                 selected = [line for line in lines if re.search(r'type=(?:AVC|USER_AVC|1400|1107)\b', line) and
-                            re.search(r'comm="(?:podman|crun|conmon|distrobox-init|python3|dnf5?|systemd-run|chpasswd)"', line)]
+                            re.search(r'comm="(?:podman|crun|conmon|distrobox-init|python3|dnf5?|systemd-run|systemctl|systemd|dbus-broker|polkitd|sshd|getenforce|chpasswd)"', line)]
                 observed[name] = {'exit_status': code, 'tail': safe_text('\n'.join(selected), 3000),
                                   'selected_lines': len(selected), 'omitted_lines': len(lines) - len(selected)}
             else:
@@ -427,9 +427,22 @@ def public_diagnostics(state_root, expected):
             record = read_json(path, 524288)
             failures = record.get('failures', [])
             selected[name] = {'available_failures': len(failures), 'retained_failures': min(2, len(failures)), 'records': []}
+            selected[name]['recent_metadata'] = [{key: item.get(key) for key in
+                    ('operation_id', 'step', 'status', 'outcome', 'accepted_exit', 'allowed_exit_statuses', 'native')}
+                    for item in record.get('recent', [])[-4:]]
+            for recent, item in zip(selected[name]['recent_metadata'], record.get('recent', [])[-4:]):
+                if item.get('operation') in ('selinux-enforcement', 'resolved-service-identity'):
+                    recent['public_stdout_tail'] = safe_text(item.get('stdout_tail', ''), 300)
+                    recent['public_stderr_tail'] = safe_text(item.get('stderr_tail', ''), 300)
+                    recent['output_bytes'] = item.get('output_bytes')
             for item in failures[-2:]:
                 entry = {'status': item['status'] if type(item['status']) is int else safe_text(item['status'], 100),
-                         'output_bytes': item.get('output_bytes')}
+                         'output_bytes': item.get('output_bytes'),
+                         'operation_id': safe_text(item.get('operation_id', 'unavailable'), 80),
+                         'step': safe_text(item.get('step', 'unavailable'), 80),
+                         'outcome': safe_text(item.get('outcome', 'legacy-unknown'), 40),
+                         'accepted_exit': item.get('accepted_exit'), 'allowed_exit_statuses': item.get('allowed_exit_statuses'),
+                         'native': item.get('native', {'availability': 'not-recorded'})}
                 for stream in ('stdout', 'stderr'):
                     text = item.get(stream + '_tail', '')
                     entry[stream + '_tail'] = safe_text(text, 1500)
@@ -437,6 +450,13 @@ def public_diagnostics(state_root, expected):
                 selected[name]['records'].append(entry)
         except (OSError, ValueError, KeyError):
             selected[name] = 'No bounded public failure record available'
+    try:
+        state = read_json(state_root / 'initialize.json')
+        initialize_projection(state, expected, None)
+        selected['prepare_progress'] = {'step': safe_text(state.get('prepare_step', 'unavailable'), 80),
+                                        'source_verification': state.get('source_verification', {'outcome': 'unavailable'})}
+    except (OSError, ValueError, KeyError):
+        selected['prepare_progress'] = {'step': 'unavailable', 'source_verification': {'outcome': 'unavailable'}}
     return selected
 
 

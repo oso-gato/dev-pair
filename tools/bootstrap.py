@@ -102,6 +102,7 @@ class Commands:
     diagnostic = None
     native_register = None
     _cleanup_deadline = None
+    current_step = 'unscoped'
 
     def execution_deadline(self):
         # Explicit cleanup controls are finite and may run after an execution
@@ -154,6 +155,11 @@ class Commands:
 
     @staticmethod
     def public_operation(args):
+        if args == ('/usr/sbin/getenforce',):
+            return 'selinux-enforcement'
+        if (len(args) == 7 and args[:2] == ('/usr/bin/systemctl', 'show') and args[-1] == 'systemd-resolved.service' and
+                set(args[2:-1]) == {'--property=MainPID', '--property=User', '--property=ActiveState', '--property=LoadState'}):
+            return 'resolved-service-identity'
         if args and args[0] == '/usr/bin/dnf':
             return 'signed-packages'
         if args and args[0] == '/usr/bin/systemd-run' and '/usr/bin/podman' in args:
@@ -161,6 +167,51 @@ class Commands:
             if 'pull' in operation or 'build' in operation:
                 return 'candidate-image'
         return None
+
+    @staticmethod
+    def operation_id(args):
+        # IDs are fixed enums; never echo argv, paths or environment.
+        if args == ('/usr/sbin/getenforce',):
+            return 'selinux-enforcement'
+        if (len(args) == 7 and args[:2] == ('/usr/bin/systemctl', 'show') and args[-1] == 'systemd-resolved.service' and
+                set(args[2:-1]) == {'--property=MainPID', '--property=User', '--property=ActiveState', '--property=LoadState'}):
+            return 'resolved-service-identity'
+        fixed = {'/usr/bin/git': 'source-git-read', '/usr/bin/dnf': 'signed-packages',
+                 '/usr/bin/ss': 'listener-inventory', '/usr/sbin/nft': 'firewall-control',
+                 '/usr/bin/hostnamectl': 'host-identity', '/usr/bin/chronyc': 'time-status',
+                 '/usr/bin/rpm': 'package-inventory', '/usr/sbin/chpasswd': 'operator-password'}
+        if args and args[0] == '/usr/sbin/sshd':
+            return 'sshd-effective' if '-T' in args else 'sshd-validation'
+        if args and args[0] == '/usr/bin/systemctl':
+            return {'is-active': 'service-active', 'show': 'service-properties', 'restart': 'service-restart',
+                    'start': 'service-start', 'enable': 'service-enable', 'daemon-reload': 'service-reload',
+                    'reload': 'service-reload', 'stop': 'service-stop'}.get(args[1] if len(args) > 1 else '', 'service-control')
+        if args and args[0] == '/usr/bin/systemd-run':
+            return 'candidate-native-executor'
+        return fixed.get(args[0] if args else '', 'withheld-operation')
+
+    @staticmethod
+    def native_diagnostic(args):
+        unit = next((value[7:] for value in args if value.startswith('--unit=')), None)
+        description = next((value[14:] for value in args if value.startswith('--description=')), None)
+        if not unit or description != 'dev-pair-owned-' + unit:
+            return {'availability': 'not-controller-owned-or-not-native'}
+        if not re.fullmatch(r'dev-pair-(?:initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}|gptbox-[0-9a-f]{64}(?:\.service)?)', unit):
+            return {'availability': 'unrecognized-controller-unit'}
+        control = Commands()
+        control._cleanup_deadline = time.monotonic() + 2
+        properties = ('Description', 'LoadState', 'ActiveState', 'Result', 'ExecMainCode', 'ExecMainStatus', 'StatusErrno')
+        try:
+            text = control('/usr/bin/systemctl', 'show', *('--property=' + key for key in properties), unit,
+                           ok=(0, 1, 4), timeout=2)
+            values = dict(line.split('=', 1) for line in text.splitlines() if '=' in line)
+            if values.get('LoadState') == 'not-found':
+                return {'availability': 'unavailable-collected-or-not-started', 'unit': unit}
+            if values.get('Description') != description:
+                return {'availability': 'ownership-unverified', 'unit': unit}
+            return {'availability': 'observed', 'unit': unit, **{key: values.get(key, 'unavailable')[:80] for key in properties if key != 'Description'}}
+        except (Blocked, OSError, ValueError, subprocess.SubprocessError):
+            return {'availability': 'observation-failed', 'unit': unit}
 
     @staticmethod
     def native_args(args, timeout):
@@ -327,8 +378,12 @@ class Commands:
                 process.stdout.close()
                 process.stderr.close()
             if self.diagnostic:
-                record = {'operation': public or 'withheld', 'status': status,
+                record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
+                          'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
+                          'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
+                if not completed or type(status) is int and status != 0:
+                    record['native'] = self.native_diagnostic(args)
                 if public:
                     record.update(output_bytes=total, capture_limit_bytes=1048576,
                                   **{name + '_tail': bytes(data[-8192:]).decode(errors='replace') for name, data in buffers.items()},
@@ -719,7 +774,13 @@ class Bootstrap:
             f.flush()
             os.fsync(f.fileno())
 
+    def mark_prepare_step(self, value):
+        self.prepare_step = value
+        if isinstance(self.run, Commands):
+            self.run.current_step = value
+
     def step(self, action, callback):
+        self.mark_prepare_step(action)
         self.event(action, 'begin')
         try:
             callback()
@@ -904,6 +965,7 @@ class Bootstrap:
             raise
 
     def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None):
+        self.mark_prepare_step('input-admission')
         if gptbox_context is not None and (not isinstance(expected_context, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_context)):
             raise Blocked('a separately trusted context SHA256 is required before preparation')
         sources = validate_sources(sources)
@@ -917,10 +979,13 @@ class Bootstrap:
                 raise Blocked('current SSH source is outside declared bootstrap CIDRs')
         if name != 'core' or (password is None and not self.path(f'{STATE}/operator-password-set').exists()):
             raise Blocked('core operator and securely supplied password are required')
+        self.mark_prepare_step('host-preflight')
         self.preflight()
         if gptbox_context is not None:
+            self.mark_prepare_step('context-content')
             self.check_gptbox_inputs(gptbox_context, expected_context)
             if self.path('/usr/bin/git').exists():
+                self.mark_prepare_step('context-source')
                 self.validate_gptbox_context(gptbox_context, expected_context)
         with self.lock():
             if gptbox_context is not None:
@@ -928,10 +993,13 @@ class Bootstrap:
                     self.step('git-prerequisite', lambda: self.run('/usr/bin/dnf', '-y',
                               '--setopt=gpgcheck=1', '--setopt=localpkg_gpgcheck=1', '--disablerepo=*',
                               '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'))
+                self.mark_prepare_step('context-source')
                 # Full source verification precedes desired binding, accounts, ingress and normal packages.
                 self.validate_gptbox_context(gptbox_context, expected_context)
                 if source_check:
+                    self.mark_prepare_step('adapter-source-and-upstream')
                     source_check()
+            self.mark_prepare_step('desired-state')
             desired = json.dumps({'schema': 1, 'standards_sha': STANDARDS,
                                   'source_baseline': SOURCE_BASELINE,
                                   'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -952,6 +1020,7 @@ class Bootstrap:
                 self.directory(f'/var/lib/dev-pair/{role}', owner=who)
                 for directory in ('workspaces', 'checkpoints', 'evidence', 'deliverables', 'builds', 'cache', 'state'):
                     self.directory(f'/var/lib/dev-pair/{role}/{directory}', owner=who)
+            self.mark_prepare_step('managed-limits')
             self.atomic('/etc/dev-pair/limits.json', json.dumps({
                 'jobs_enabled': False, 'per_role_memory_max': '2G', 'per_role_tasks_max': 512,
                 'per_role_cpu_quota': '100%', 'storage_budget_bytes': 21474836480,
@@ -963,6 +1032,7 @@ class Bootstrap:
                 self.atomic(f'/etc/systemd/system/user-{uid}.slice.d/50-dev-pair.conf',
                             '[Slice]\nMemoryMax=2G\nTasksMax=512\nCPUQuota=100%\n', mode=0o644)
             self.step('ingress-guard', lambda: self.guard(sources))
+            self.mark_prepare_step('tailscale-package-config')
             self.atomic('/etc/yum.repos.d/dev-pair-tailscale.repo', REPO, mode=0o644)
             self.step('tailscale-package', lambda: self.run('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1',
                       '--disablerepo=*', '--enablerepo=fedora', '--enablerepo=updates',
@@ -970,10 +1040,12 @@ class Bootstrap:
             self.atomic('/etc/systemd/system/tailscaled.service.d/50-dev-pair-guard.conf', TAILSCALE_UNIT, mode=0o644)
             self.run('/usr/bin/systemctl', 'daemon-reload')
             self.run('/usr/bin/systemctl', 'enable', '--now', 'tailscaled.service')
+            self.mark_prepare_step('package-inventory')
             versions = self.run('/usr/bin/rpm', '-q', *PACKAGES, 'tailscale')
             self.atomic(f'{STATE}/packages.txt', versions, expected=self.text(f'{STATE}/packages.txt') or None)
             if gptbox_context is not None:
                 self.step('maintenance-gptbox-build', lambda: self.build_gptbox(gptbox_context, expected_context))
+            self.mark_prepare_step('preparation-completion')
             self.atomic(f'{STATE}/prepared', desired)
             self.event('prepare', 'complete')
         return self.status()

@@ -296,6 +296,62 @@ class InitializeTests(unittest.TestCase):
                 self.assertEqual(records, [status])
                 reconcile.assert_not_called()
 
+    def test_command_diagnostics_distinguish_accepted_nonzero_without_echoing_argv(self):
+        records = []
+        run = b.Commands()
+        run.current_step = 'host-preflight'
+        run.diagnostic = records.append
+        value = 'synthetic-secret-argv-sentinel'
+        output = run(sys.executable, '-c', 'import sys;print(sys.argv[1]);sys.exit(1)', value, ok=(0, 1))
+        self.assertIn(value, output)
+        self.assertTrue(records[-1]['accepted_exit'])
+        self.assertEqual(records[-1]['outcome'], 'accepted')
+        self.assertEqual(records[-1]['allowed_exit_statuses'], [0, 1])
+        self.assertNotIn(value, json.dumps(records))
+        with self.assertRaises(b.Blocked):
+            run(sys.executable, '-c', 'import sys;print(sys.argv[1]);sys.exit(1)', value)
+        self.assertFalse(records[-1]['accepted_exit'])
+        self.assertEqual(records[-1]['outcome'], 'rejected')
+        self.assertEqual(records[-1]['native']['availability'], 'not-controller-owned-or-not-native')
+        self.assertNotIn(value, json.dumps(records))
+        self.assertEqual(b.Commands.operation_id(('/usr/sbin/getenforce',)), 'selinux-enforcement')
+        self.assertEqual(b.Commands.public_operation(('/usr/sbin/getenforce',)), 'selinux-enforcement')
+        self.assertIsNone(b.Commands.public_operation(('/usr/sbin/getenforce', value)))
+        resolved = ('/usr/bin/systemctl', 'show', '--property=MainPID', '--property=User',
+                    '--property=ActiveState', '--property=LoadState', 'systemd-resolved.service')
+        self.assertEqual(b.Commands.public_operation(resolved), 'resolved-service-identity')
+        self.assertIsNone(b.Commands.public_operation(resolved[:-1] + ('--property=Environment', resolved[-1])))
+
+    def test_native_diagnostic_collected_unit_is_explicitly_unavailable(self):
+        unit = 'dev-pair-initialize-prepare-12345678-12345678'
+        args = ('--unit=' + unit, '--description=dev-pair-owned-' + unit)
+        with patch.object(b.Commands, '__call__', return_value='LoadState=not-found\nActiveState=inactive\n'):
+            observed = b.Commands.native_diagnostic(args)
+        self.assertEqual(observed['availability'], 'unavailable-collected-or-not-started')
+        self.assertNotIn('ExecMainStatus', observed)
+        with patch.object(b.Commands, '__call__', return_value='Description=foreign\nLoadState=loaded\nActiveState=failed\n'):
+            self.assertEqual(b.Commands.native_diagnostic(args)['availability'], 'ownership-unverified')
+        fields = 'Description=dev-pair-owned-' + unit + '\nLoadState=loaded\nActiveState=failed\nResult=exit-code\nExecMainCode=1\nExecMainStatus=7\nEnvironment=synthetic-secret-sentinel\n'
+        with patch.object(b.Commands, '__call__', return_value=fields):
+            observed = b.Commands.native_diagnostic(args)
+        self.assertEqual(observed['ExecMainStatus'], '7')
+        self.assertNotIn('synthetic-secret-sentinel', json.dumps(observed))
+
+    def test_source_gate_failure_retains_fixed_stage_without_exception_or_git_output(self):
+        preparation = self.app.preparation()
+        preparation.prepare_step = 'adapter-source-and-upstream'
+        def inputs(*args):
+            self.app.source_stage = 'upstream-head-and-bytes'
+            raise b.Blocked('synthetic-secret-path-and-raw-exception')
+        with patch.object(self.app, 'preparation', return_value=preparation), patch.object(self.app, 'inputs', side_effect=inputs):
+            with self.assertRaises(b.Blocked):
+                self.initialize()
+        record = json.loads(self.app.text(b.STATE + '/initialize.json'))
+        self.assertEqual(record['prepare_step'], 'adapter-source-and-upstream')
+        self.assertEqual(record['source_verification'], {'stage': 'upstream-head-and-bytes', 'outcome': 'blocked-or-interrupted'})
+        self.assertNotIn('synthetic-secret-path', json.dumps(record))
+        self.assertIsNone(self.app.run.diagnostic)
+
     def test_native_root_unit_is_recorded_before_spawn_and_runs_clean_environment(self):
         run = b.Commands()
         run.native_prefix = 'dev-pair-initialize-prepare-12345678'
