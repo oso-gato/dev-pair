@@ -16,6 +16,7 @@ import gptbox as g
 import native_io as io
 import fedora_ci_guest as guest
 from native_io_fixture import install, manager
+VERIFY_LABELS = io.verify_labels
 
 UNIT = 'dev-pair-gptbox-' + 'a' * 64 + '.service'
 PREFIX = ('/usr/bin/systemd-run', '--unit=' + UNIT, '--description=dev-pair-owned-' + UNIT, '--wait', '--collect', '--property=RuntimeMaxSec=30')
@@ -41,7 +42,7 @@ class NativeIOTests(unittest.TestCase):
         self.assertIn('--property=StandardInput=null', native)
         self.assertFalse(any('LimitFSIZE' in value for value in native))
         self.assertEqual(list((self.root / 'records').iterdir()), [])
-        self.assertFalse((self.root / UNIT).exists())
+        self.assertFalse((self.root / 'streams' / UNIT).exists())
 
     def test_guest_image_observation_retains_narrow_256k_transport_cap(self):
         source = Path(__file__).resolve().parents[1]
@@ -187,7 +188,7 @@ class NativeIOTests(unittest.TestCase):
     def test_real_controller_sigkill_retains_proven_input_until_exact_restart_recovery(self):
         # The subprocess uses only this synthetic ownership fixture; no native
         # unit or credential is started. Persistence and SIGKILL are real.
-        code = 'import sys,os,time;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import native_io as io;io.ROOT=Path(sys.argv[2]);io.guard_root=lambda:None;t=io.NativeTransport(sys.argv[3]);t.setup(b"synthetic-secret");print("ready",flush=True);time.sleep(10)'
+        code = 'import sys,os,time;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import native_io as io;io.ROOT=Path(sys.argv[2]);io.STREAM_ROOT=io.ROOT/"streams";io.guard_root=lambda:None;t=io.NativeTransport(sys.argv[3]);t.setup(b"synthetic-secret");print("ready",flush=True);time.sleep(10)'
         original = subprocess.Popen
         process = original([sys.executable, '-c', code, str(Path(io.__file__).parent), str(self.root), UNIT],
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -198,7 +199,7 @@ class NativeIOTests(unittest.TestCase):
             self.assertEqual(process.stdout.readline(), b'ready\n')
             os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=2)
-            directory = self.root / UNIT
+            directory = self.root / 'streams' / UNIT
             self.assertEqual((directory / 'stdin').read_bytes(), b'synthetic-secret')
             self.assertNotIn('synthetic-secret', (self.root / 'records' / (UNIT + '.json')).read_text())
             io.NativeTransport.recover(UNIT)  # This test knows no unit was launched.
@@ -229,3 +230,61 @@ class NativeIOTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             io.NativeTransport.recover(UNIT)
         self.assertTrue(partial.record.exists())
+
+    def test_positive_helper_completion_required_even_for_allowed_startup_failure_codes(self):
+        from native_io_fixture import launch_payload
+        original = subprocess.Popen
+        base = manager(original, self.calls)
+        for status in (1, 4, 125, 250):
+            # A real service/launcher that never reaches the helper cannot emit
+            # terminal evidence, even when its number was accepted by a caller.
+            def fail_start(args, **kwargs):
+                if args[0] == '/usr/bin/systemd-run':
+                    args = tuple(value for value in args if value != '-I')
+                    return launch_payload(original, args, kwargs, [sys.executable, '-c', 'raise SystemExit(' + str(status) + ')'])
+                return base(args, **kwargs)
+            with patch.object(b.subprocess, 'Popen', side_effect=fail_start), self.assertRaises(b.Blocked):
+                b.Commands()(*PREFIX, sys.executable, '-c', 'pass', ok=(status,))
+            self.assertEqual(list((self.root / 'records').iterdir()), [])
+        for status in (1, 4, 125):
+            records = []
+            run = b.Commands(); run.metadata_diagnostic = records.append
+            self.assertEqual(run(*PREFIX, sys.executable, '-c', 'raise SystemExit(' + str(status) + ')', ok=(status,)), '')
+            self.assertTrue(records[-1]['relay_verified'])
+            self.assertEqual(records[-1]['native_exit_status'], status)
+            self.assertEqual(records[-1]['relay']['status'], status)
+            self.assertEqual(records[-1]['relay']['uid'], os.getuid())
+            self.assertEqual(records[-1]['relay']['helper'], __import__('hashlib').sha256(Path(io.relay.__file__).read_bytes()).hexdigest())
+
+    def test_legacy_layout_and_unknown_version_are_preserved(self):
+        legacy = self.root / UNIT
+        legacy.mkdir(mode=0o700)
+        (legacy / 'stdin').write_bytes(b'NONCREDENTIAL')
+        with self.assertRaisesRegex(ValueError, 'Legacy'):
+            io.NativeTransport(UNIT).setup(None)
+        with self.assertRaisesRegex(ValueError, 'Legacy'):
+            io.NativeTransport.recover(UNIT)
+        self.assertEqual((legacy / 'stdin').read_bytes(), b'NONCREDENTIAL')
+        (legacy / 'stdin').unlink(); legacy.rmdir()
+        transport = io.NativeTransport(UNIT); transport.setup(None)
+        state = json.loads(transport.record.read_text()); state['version'] = 1
+        transport.record.write_text(json.dumps(state))
+        with self.assertRaisesRegex(ValueError, 'Invalid transport ownership record'):
+            io.NativeTransport.recover(UNIT)
+        self.assertTrue(transport.path.exists())
+        state['version'] = 2; transport.record.write_text(json.dumps(state))
+        io.NativeTransport.recover(UNIT)
+
+    def test_exact_expected_and_observed_standard_labels_both_required(self):
+        # Kernel labels cannot be set by this unprivileged local test. Exercise
+        # exact checks with injected observations, never claim Fedora evidence.
+        transport = io.NativeTransport(UNIT); transport.setup(None)
+        class Control:
+            def _call(self, *args, **kwargs):
+                return io.EXPECTED_CONTEXT + '\n'
+        with patch.object(io.os, 'getxattr', return_value=(io.EXPECTED_CONTEXT + '\0').encode()):
+            VERIFY_LABELS(transport, Control(), 1)
+        with patch.object(io.os, 'getxattr', return_value=b'system_u:object_r:var_run_t:s0\0'):
+            with self.assertRaisesRegex(ValueError, 'context mismatch'):
+                VERIFY_LABELS(transport, Control(), 1)
+        io.NativeTransport.recover(UNIT)

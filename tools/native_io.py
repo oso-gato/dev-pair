@@ -2,12 +2,22 @@
 import contextlib
 import fcntl
 import json
+import hashlib
+import importlib.util
+import pwd
 import os
 from pathlib import Path
 import re
 import stat
 
 ROOT = Path('/run/dev-pair-command-io')
+STREAM_ROOT = Path('/run/systemd/dev-pair-stdio')
+RELAY_ROOT = Path('/usr/local/libexec/dev-pair-native-io')
+EXPECTED_CONTEXT = 'system_u:object_r:init_var_run_t:s0'
+_spec = importlib.util.spec_from_file_location('dev_pair_native_relay', Path(__file__).with_name('native_relay.py'))
+relay = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(relay)
+
 CAPACITY = 4096
 INPUT_LIMIT = 16384
 UNIT = r'dev-pair-(?:initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}|gptbox-[0-9a-f]{64}(?:\.service)?|ci-observe-[0-9a-f]{16}\.service)'
@@ -26,16 +36,73 @@ def identity(path):
 
 def guard_root():
     require(os.geteuid() == 0, 'Native transport controller requires root')
-    for path in reversed(ROOT.parents):
+    for path in dict.fromkeys((*reversed(ROOT.parents), *reversed(STREAM_ROOT.parents))):
         info = path.lstat()
         require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'Unsafe transport ancestor')
-    for path in (ROOT, ROOT / 'records'):
+    for path in (ROOT, ROOT / 'records', STREAM_ROOT):
         try:
             path.mkdir(mode=0o700)
         except FileExistsError:
             pass
         info = path.lstat()
         require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o700, 'Unsafe transport root')
+
+
+def expected_uid(args):
+    user = next((value[6:] for value in args if value.startswith('--uid=')), None)
+    require(user in (None, 'root', 'dp-maint'), 'Unexpected native relay user')
+    try:
+        return pwd.getpwnam(user).pw_uid if user else 0
+    except KeyError:
+        raise ValueError('Native relay account unavailable') from None
+
+
+def stage_relay():
+    source = Path(__file__).with_name('native_relay.py')
+    for path in (source, *source.parents):
+        info = path.lstat()
+        require(not path.is_symlink() and info.st_uid == 0 and not info.st_mode & 0o022, 'Unprotected relay source')
+    fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_size <= 65536, 'Invalid relay source')
+        data = stream.read(65537)
+        require(len(data) == info.st_size and len(data) <= 65536, 'Relay source changed')
+    digest = hashlib.sha256(data).hexdigest()
+    target = RELAY_ROOT / digest / 'relay.py'
+    for path in reversed(target.parent.parents):
+        if not path.exists():
+            path.mkdir(mode=0o755)
+        info = path.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'Unprotected relay artifact ancestor')
+    try:
+        target.parent.mkdir(mode=0o755)
+    except FileExistsError:
+        pass
+    info = target.parent.lstat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'Unprotected relay artifact directory')
+    try:
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o444)
+    except FileExistsError:
+        fd = None
+    if fd is not None:
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), 0o444)
+            output.write(data); output.flush(); os.fsync(output.fileno())
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o444 and info.st_nlink == 1 and info.st_size == len(data) and
+                stream.read(65537) == data, 'Relay artifact collision preserved')
+    return target, digest
+
+
+def verify_labels(transport, control, timeout):
+    for path in (STREAM_ROOT, transport.path, *(transport.path / name for name in transport.state['nodes'])):
+        expected = control._call('/usr/sbin/matchpathcon', '-n', str(path), timeout=timeout, maximum=4096).strip()
+        actual = os.getxattr(path, 'security.selinux', follow_symlinks=False).decode().rstrip('\x00\n')
+        require(expected == actual == EXPECTED_CONTEXT, 'Native manager stream context mismatch')
+    transport.verify()
 
 
 def pipe_pair():
@@ -55,9 +122,9 @@ class NativeTransport:
     def __init__(self, unit):
         require(re.fullmatch(UNIT, unit or ''), 'Unrecognized owned native transport unit')
         self.unit = unit
-        self.path = ROOT / unit
+        self.path = STREAM_ROOT / unit
         self.record = ROOT / 'records' / (unit + '.json')
-        self.state = {'version': 1, 'unit': unit, 'directory': None, 'nodes': {}, 'cleanup_started': False}
+        self.state = {'version': 2, 'unit': unit, 'directory': None, 'nodes': {}, 'cleanup_started': False}
         self.readers, self.keepers = {}, []
         self.created_intent = False
 
@@ -85,6 +152,7 @@ class NativeTransport:
     def setup(self, stdin_data, register=None):
         require(stdin_data is None or len(stdin_data) <= INPUT_LIMIT, 'Native stdin byte budget exceeded')
         guard_root()
+        require(not (ROOT / self.unit).exists() and not (ROOT / self.unit).is_symlink(), 'Legacy transport retained for explicit reconciliation')
         self.save(first=True)  # Intent precedes every allocation and any secret.
         self.created_intent = True
         if register is not None:
@@ -166,6 +234,7 @@ class NativeTransport:
         # Caller must first prove this exact native unit inactive/not-found.
         transport = cls(unit)
         guard_root()
+        require(not (ROOT / unit).exists() and not (ROOT / unit).is_symlink(), 'Legacy transport retained for explicit reconciliation')
         if not transport.record.exists() and not transport.record.is_symlink():
             require(not transport.path.exists() and not transport.path.is_symlink(), 'Unregistered transport retained')
             return
@@ -184,7 +253,7 @@ class NativeTransport:
                 return value
             state = json.loads(source.read(4097), object_pairs_hook=unique)
         require(identity(transport.record) == recorded, 'Transport ownership record replaced')
-        require(type(state) is dict and set(state) == {'version', 'unit', 'directory', 'nodes', 'cleanup_started'} and type(state['version']) is int and state['version'] == 1 and state['unit'] == unit and
+        require(type(state) is dict and set(state) == {'version', 'unit', 'directory', 'nodes', 'cleanup_started'} and type(state['version']) is int and state['version'] == 2 and state['unit'] == unit and
                 type(state['cleanup_started']) is bool and type(state['nodes']) is dict and set(state['nodes']) <= {'stdout', 'stderr', 'stdin'} and
                 (state['directory'] is not None or state['nodes'] == {}), 'Invalid transport ownership record')
         for entry in ([state['directory']] if state['directory'] is not None else []) + list(state['nodes'].values()):

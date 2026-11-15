@@ -27,12 +27,13 @@ import urllib.request
 import uuid
 
 try:
-    from native_io import NativeTransport, pipe_pair
+    from native_io import NativeTransport, pipe_pair, expected_uid, stage_relay, verify_labels, relay
 except ModuleNotFoundError:
     _io_spec = importlib.util.spec_from_file_location('dev_pair_native_io', Path(__file__).with_name('native_io.py'))
     _io_module = importlib.util.module_from_spec(_io_spec)
     _io_spec.loader.exec_module(_io_module)
     NativeTransport, pipe_pair = _io_module.NativeTransport, _io_module.pipe_pair
+    expected_uid, stage_relay, verify_labels, relay = _io_module.expected_uid, _io_module.stage_relay, _io_module.verify_labels, _io_module.relay
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
@@ -332,6 +333,10 @@ class Commands:
         process = None
         completed = False
         transport = None
+        decoder = None
+        relay_sha = None
+        relay_uid = None
+        relay_verified = False
         launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
@@ -359,16 +364,24 @@ class Commands:
                 # Explicit dp-maint context units have their own UID-bound retry
                 # path and protected transport journal, not root-unit authority.
                 transport.setup(stdin_data, self.native_register if register_root_wrapper else None)
+                relay_path, relay_sha = stage_relay()
+                relay_uid = expected_uid(args)
+                decoder = relay.Decoder(maximum)
                 # No wrapped/native command and no forwarded FDs are involved in labeling.
                 control._call('/usr/sbin/restorecon', '-F', str(transport.path.parent), str(transport.record.parent),
                               str(transport.record), str(transport.path), *(str(transport.path / name) for name in transport.state['nodes']),
                               timeout=self.limit_timeout(timeout), maximum=8192)
+                control._call('/usr/sbin/restorecon', '-F', str(relay_path.parent), str(relay_path), timeout=self.limit_timeout(timeout), maximum=4096)
+                verify_labels(transport, control, self.limit_timeout(timeout))
                 transport.verify()
                 transport.open_streams()
                 args = self.native_args(args, min(self.limit_timeout(timeout), timeout - (time.monotonic() - started)))
                 payload = next((index for index, value in enumerate(args[1:], 1) if not value.startswith('-')), len(args))
-                args = (*tuple(value for value in args[:payload] if value not in ('--pipe', '--pty')), *args[payload:])
-                args = (args[0], *transport.properties(), *args[1:])
+                prefix = tuple(value for value in args[:payload] if value not in ('--pipe', '--pty'))
+                seconds = min(self.limit_timeout(timeout), timeout - (time.monotonic() - started))
+                args = (prefix[0], *transport.properties(), '--property=LimitCORE=0', *prefix[1:],
+                        '/usr/bin/python3', '-I', str(relay_path), '--uid', str(relay_uid), '--stdin', str(int(stdin_data is not None)),
+                        '--maximum', str(maximum), '--seconds', str(max(.001, seconds - .1)), '--helper', relay_sha, '--', *args[payload:])
                 for _ in range(2):
                     launcher_pairs.append(pipe_pair())
                 process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=launcher_pairs[0][1],
@@ -411,22 +424,26 @@ class Commands:
                             process.stdin.close()
                         continue
                     descriptor = key.fileobj if isinstance(key.fileobj, int) else key.fileobj.fileno()
-                    block = os.read(descriptor, min(8192, maximum - total + 1))
+                    block = os.read(descriptor, 8192 if decoder is not None and key.data == 'stderr' else min(8192, maximum - total + 1))
                     if not block:
                         selector.unregister(key.fileobj)
                         continue
-                    total += len(block)
-                    if total > maximum:
-                        raise Blocked('command output byte budget exceeded; output withheld')
-                    if input_text is None:
-                        # Launcher output never becomes application stdout.
-                        name = 'stderr' if key.data.startswith('launcher_') else key.data
-                        buffers[name].extend(block)
+                    chunks = decoder.feed(block) if decoder is not None and key.data == 'stderr' else (block,)
+                    for chunk in chunks:
+                        total += len(chunk)
+                        if total > maximum:
+                            raise Blocked('command output byte budget exceeded; output withheld')
+                        if input_text is None:
+                            name = 'stderr' if key.data.startswith('launcher_') else key.data
+                            buffers[name].extend(chunk)
             status = process.wait(timeout=1)
             if time.monotonic() - started >= timeout:
                 raise Blocked('command deadline exceeded; output withheld')
             self.limit_timeout(timeout)
-            if status not in ok:
+            if decoder is not None:
+                decoder.finish(status, relay_uid, relay_sha)
+                relay_verified = True
+            if (decoder is not None and status == relay.ERROR_STATUS) or status not in ok:
                 raise Blocked('%s failed (exit %s; output withheld)' % (Path(original[0]).name, status))
             result = bytes(buffers['stdout']).decode() if input_text is None else ''
             completed = True
@@ -478,6 +495,11 @@ class Commands:
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
+                if decoder is not None:
+                    record['relay_verified'] = relay_verified
+                    record['native_exit_status'] = process.returncode if process is not None else None
+                    if decoder.control is not None:
+                        record['relay'] = dict(decoder.control)
                 if not completed or type(status) is int and status != 0:
                     record['native'] = self.native_diagnostic(args)
                 if self.metadata_diagnostic:

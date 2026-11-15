@@ -147,7 +147,7 @@ class InitializeTests(unittest.TestCase):
                     if args[0] == '/usr/bin/systemd-run':
                         native_launches.append(args)
                         if app.interrupt_prepare and mode == 'prelaunch-input':
-                            path = native_io.ROOT / NATIVE_UNIT
+                            path = native_io.STREAM_ROOT / NATIVE_UNIT
                             self.assertEqual((path / 'stdin').read_bytes(), b'NONCREDENTIAL-retained-input')
                             self.assertNotIn('NONCREDENTIAL', (native_io.ROOT / 'records' / (NATIVE_UNIT + '.json')).read_text())
                             raise OSError('fixture prelaunch interruption')
@@ -161,7 +161,7 @@ class InitializeTests(unittest.TestCase):
                     self.assertNotIn(NATIVE_UNIT, prior['native_units'])
                     self.assertTrue(all(__import__('re').fullmatch(r'dev-pair-initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}', value) for value in prior['native_units']))
                     if mode == 'prelaunch-input':
-                        self.assertTrue((native_io.ROOT / NATIVE_UNIT / 'stdin').exists())
+                        self.assertTrue((native_io.STREAM_ROOT / NATIVE_UNIT / 'stdin').exists())
                     else:
                         self.assertGreater(len(prior['native_units']), 0)
                     app.interrupt_prepare = False
@@ -174,7 +174,7 @@ class InitializeTests(unittest.TestCase):
                     explicit_retry = [args for args in callbacks if '--unit=' + NATIVE_UNIT in args and args[0] != '/usr/bin/systemd-run']
                     self.assertTrue(explicit_retry)
                     self.assertTrue(all('--uid=dp-maint' in args for args in explicit_retry))
-                    self.assertFalse((native_io.ROOT / NATIVE_UNIT).exists())
+                    self.assertFalse((native_io.STREAM_ROOT / NATIVE_UNIT).exists())
                     self.assertEqual(list((native_io.ROOT / 'records').iterdir()), [])
                     recorded = json.loads(app.text(b.STATE + '/initialize.json'))
                     self.assertNotIn(NATIVE_UNIT, recorded['native_units'])
@@ -258,7 +258,7 @@ class InitializeTests(unittest.TestCase):
                 return manager(original, [])(args, **kwargs)
             ceilings.append(float(next(v.rsplit('=', 1)[1].removesuffix('s') for v in args
                                        if v.startswith('--property=RuntimeMaxSec='))))
-            return launch_payload(original, args, kwargs, args[args.index(sys.executable):])
+            return launch_payload(original, args, kwargs, args[(args.index(sys.executable) if sys.executable in args else args.index('/usr/bin/python3')):])
         with patch.object(b.subprocess, 'Popen', side_effect=spawned):
             with outer.phase(.5, 'outer', native=False):
                 with inner.phase(1, 'inner', native=False):
@@ -299,7 +299,7 @@ class InitializeTests(unittest.TestCase):
                 if native:
                     if args[0] != '/usr/bin/systemd-run':
                         return manager(original, [])(args, **kwargs)
-                    process = launch_payload(original, args, kwargs, args[args.index(sys.executable):])
+                    process = launch_payload(original, args, kwargs, args[(args.index(sys.executable) if sys.executable in args else args.index('/usr/bin/python3')):])
                 else:
                     process = original(args, **kwargs)
                 processes.append(process)
@@ -317,7 +317,7 @@ class InitializeTests(unittest.TestCase):
                         patch.object(run, 'reconcile_native') as reconcile:
                     with self.assertRaisesRegex(b.Blocked, 'deadline|timed out'):
                         run(*prefix, sys.executable, '-c', script, str(marker), timeout=.2 if native else .1)
-                    self.assertEqual(processes[0].poll(), 0)
+                    self.assertEqual(processes[0].poll(), 250 if native else 0)
                     reconcile.assert_called_once()
                     if native:
                         self.assertIn('--unit=' + NATIVE_UNIT, reconcile.call_args.args[0])
@@ -343,7 +343,7 @@ class InitializeTests(unittest.TestCase):
             def spawned(args, **kwargs):
                 if args[0] != '/usr/bin/systemd-run':
                     return manager(original, [])(args, **kwargs)
-                process = launch_payload(original, args, kwargs, args[args.index(sys.executable):])
+                process = launch_payload(original, args, kwargs, args[(args.index(sys.executable) if sys.executable in args else args.index('/usr/bin/python3')):])
                 processes.append(process)
                 return process
             script = ('import os,time,pathlib,sys; os.write(2,b"public failure fixture\\n"); '

@@ -1,5 +1,7 @@
 """Synthetic manager/ownership fixture; FIFO/process behavior is real, root/systemd is not."""
 import os
+import hashlib
+import bootstrap
 from pathlib import Path
 import subprocess
 import sys
@@ -11,7 +13,21 @@ def install(test, root):
     root = Path(root) / 'native-transport'
     root.mkdir(mode=0o700)
     (root / 'records').mkdir(mode=0o700)
-    for item in (patch.object(native_io, 'ROOT', root), patch.object(native_io, 'guard_root', return_value=None)):
+    (root / 'streams').mkdir(mode=0o700)
+    helper = Path(native_io.__file__).with_name('native_relay.py')
+    digest = hashlib.sha256(helper.read_bytes()).hexdigest()
+    boundaries = (
+        patch.object(native_io, 'ROOT', root),
+        patch.object(native_io, 'guard_root', return_value=None),
+        patch.object(native_io, 'STREAM_ROOT', root / 'streams'),
+        patch.object(bootstrap, 'stage_relay', return_value=(helper, digest)),
+        patch.object(native_io, 'stage_relay', return_value=(helper, digest)),
+        patch.object(bootstrap, 'expected_uid', return_value=os.getuid()),
+        patch.object(native_io, 'expected_uid', return_value=os.getuid()),
+        patch.object(bootstrap, 'verify_labels', return_value=None),
+        patch.object(native_io, 'verify_labels', return_value=None),
+    )
+    for item in boundaries:
         item.start()
         test.addCleanup(item.stop)
     return root
@@ -20,6 +36,16 @@ def install(test, root):
 def launch_payload(original, args, kwargs, payload):
     # Fake manager opens regular stdin/FIFO outputs itself, exactly at the
     # properties supplied by production. No stdio FD passes through systemd.
+    # Run the real relay and wire protocol; only native UID/SELinux admission is
+    # simulated because this test process is not a Fedora service.
+    if '-I' in args and '--helper' in args:
+        index = args.index('-I')
+        helper = args[index + 1]
+        relay_args = args[index + 2:]
+        code = ('import sys;sys.path.insert(0,sys.argv[1]);import native_relay as r;'
+                'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:None;'
+                'sys.argv=["relay",*sys.argv[2:]];raise SystemExit(r.main())')
+        payload = [sys.executable, '-c', code, str(Path(helper).parent), *relay_args]
     opened = []
     def stream(name, mode):
         value = next(v.split('=', 2)[2] for v in args if v.startswith('--property=' + name + '='))
@@ -47,7 +73,7 @@ def manager(original, calls):
             text = 'Description=dev-pair-owned-' + unit + '\nLoadState=not-found\nActiveState=inactive\nUser=\n'
             return original([sys.executable, '-c', 'import sys;sys.stdout.write(sys.argv[1])', text], **kwargs)
         if args[0] == '/usr/bin/systemd-run':
-            position = args.index('/usr/bin/env') if '/usr/bin/env' in args else args.index(sys.executable)
+            position = args.index('/usr/bin/env') if '/usr/bin/env' in args else (args.index(sys.executable) if sys.executable in args else args.index('/usr/bin/python3'))
             return launch_payload(original, args, kwargs, args[position:])
         return original(args, **kwargs)
     return run
