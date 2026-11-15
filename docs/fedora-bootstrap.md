@@ -1,9 +1,11 @@
 # Fedora Cloud 44 bootstrap
 
 This is executable host preparation, implemented in [tools/bootstrap.py](../tools/bootstrap.py).
-Preparation and initialization have **not been run on Fedora or the designated VPS**. Local fixtures test the
-control flow and filesystem transactions; they are not installation, firewall,
-SSH, SELinux, reboot or Tailscale evidence. Use only an authorized fresh Fedora
+Initialization has been attempted in disposable Fedora CI, but **preparation and
+maintenance assembly have not completed**. No designated VPS execution has
+occurred. See [the work record](dr10-work-record.md) for candidate-bound results.
+Local fixtures test control flow and filesystem transactions; they are not
+installation, firewall, SSH, reboot or Tailscale evidence. Use only an authorized fresh Fedora
 Cloud 44 target after exact-candidate independent review and host inspection.
 The shared `initialize` entry runs host preparation followed by genuine confined maintenance Distrobox assembly and probe-only entry. This is source capability, not first-bootstrap runtime acceptance. No job, authentication, enrollment or model request is admitted.
 

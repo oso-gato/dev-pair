@@ -1682,3 +1682,13 @@ to a host engine socket. No socket will enter the Fedora guest or product.
 Current managed status is the same instance/spec1, network unrestricted/enforced,
 credential reference hostinger_root ready. This does not establish a supported
 public SSH route or change the observed VPS connectivity limitation.
+
+
+The local Docker feasibility check is complete: CgroupDriver=none prevents
+claiming the existing aggregate CPU/memory/PID ceilings. Daemon UID2000 versus
+task UID1000 also prevents copying protected bind/FIFO assumptions; shared vfs
+storage needs different accounting and owned cleanup. Image/container/volume
+cache is empty. No pull/build/run occurred. Evidence:
+`/workspace/artifacts/local-fedora-executor-feasibility/feasibility.json`.
+Continue with the existing bounded hosted executor for Fedora acceptance; local
+Docker availability alone is not an equivalent replacement.
