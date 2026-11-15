@@ -1986,3 +1986,31 @@ test must establish actual manager-opened command behavior, protected recovery
 and the existing preparation/assembly checks, returning exact diagnostics on
 failure. No unchanged retry, policy relaxation, secret/model use, VPS mutation,
 release promotion or added execution budget follows from this admission.
+
+### November 16, 2026, 04:33 HKT — Fedora run 14 identified FIFO label denial
+
+Published source `8bdd19d050dc2fe6012b19052f2af538b77d5705` produced
+[run 14](https://github.com/oso-gato/dev-pair/actions/runs/43758085093), job
+132946493509. All 254 tests passed in 41.125 seconds. Real native service
+admission, Enforcing Fedora 44, authenticated inputs, pre/post inspection,
+original password-file absence, complete report framing and outer cleanup passed.
+The 7882-byte frame has SHA256
+`b7e4b98c18c93e9bbcd9c0e90d9f6e60dcd1d00b17f04de7249ca41573a90512`.
+
+Initialization blocked after 16.811 seconds at its first getenforce command,
+with native status 209 and zero output. Structural audit projection retained
+the actual denial: init_t writing fifo_file labeled var_run_t, permissive=0.
+This is a concrete manager-opened FIFO labeling failure; the transport does not
+yet pass Fedora. A second same-boot setfiles_t/file/var_lib_t denial was retained
+without claiming it caused this command failure. RPM inventory timed out within
+the diagnostic budget. Root filesystem observation is btrfs with no selected
+quota flags; this does not establish quota support or enforcement.
+
+No package preparation, image assembly or container runtime is admitted.
+Artifacts: `/workspace/artifacts/fedora-ci-run-43758085093.log`,
+`-controller.json`, `-report.json` and `-request.json`. The one-run retest scope
+is closed. Bounded Astra High source diagnosis now checks the correct supported
+manager runtime labeling path; no unchanged retry, policy bypass or SELinux-mode
+change is authorized by this failure. The sole Sol builder is preparing a small
+independent read-only storage measurement/admission component while diagnosis
+proceeds. Hard filesystem enforcement and cleanup remain separate future gates.
