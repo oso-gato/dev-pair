@@ -1763,3 +1763,18 @@ Use exact measured profile rather than blanket CODEX_HOME denial, which conflict
 with the stock helper directory. Actual agent tool-path wiring and Fedora/
 Distrobox execution remain unverified. No model/auth/network calls. Evidence:
 `/workspace/artifacts/codex-offline-child-boundary/REPORT.txt` and hash manifest.
+
+
+Reload allocation candidate `39285a1ffa352e48414397d3a6f5f89328a87d31`
+is integrated byte-identically as8951e44. Builder221tests33.336s, coordinator
+221tests32.703s passed. Fresh Astra High `/root/native_reload_budget_review`
+returned PASS with no findings:221tests33.331s and independent sequential real-
+child deadline/cleanup checks. After one command consumed most of the shared
+end, the next received only43.48ms and timed out; an expired third launched no
+child. Exact argv alone gets30seconds; other control caps remain5seconds.
+Evidence: `/workspace/artifacts/native-reload-budget-review-39285a1ffa352e48414397d3a6f5f89328a87d31/review.json`.
+
+One bounded Fedora retest is admitted for this measured timeout repair under the
+existing executor envelope. It must verify actual reload, subsequent native
+service admission and remaining preparation; a new blocker is returned for
+diagnosis rather than weakening any gate. No production or VPS action.
