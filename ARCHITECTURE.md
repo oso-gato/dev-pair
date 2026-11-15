@@ -78,6 +78,15 @@
 <a id="a4-3"></a>
 **A4.3** The runtime must declare the following storage classes and ownership:
 
+The owner-approved directory design uses `/var/lib/dev-pair/maintenance` and
+`/var/lib/dev-pair/development`, owned separately by the restricted role accounts.
+Within each, `workspaces`, `checkpoints`, `evidence`, `deliverables`, `builds`,
+`cache` and `state` implement the classes below. Credential delivery uses separate
+protected sources and scoped mounts; naming a directory does not enforce access,
+quotas or safe cleanup. Configure and validate actual resource budgets against
+the target's capacity before enabling jobs. A11 supplies lifecycle lessons, not
+a requirement to reproduce the historical home-directory layout.
+
 | Clause | Storage | Lifetime and handling |
 |---|---|---|
 | <a id="a4-4"></a>**A4.4** | Source workspaces, uncommitted edits, checkpoints, evidence, deliverables | Durable per project/job; protected from build cleanup and container replacement |
@@ -145,6 +154,12 @@
 
 <a id="a7-5"></a>
 **A7.5** Provision a fresh VPS through the separately authorized, scoped public SSH or provider-console route; record its allowed sources, authentication, effects, duration and retirement condition. Initial access may precede Tailscale enrollment. Verify host identity and inspect first, then enroll through external secret references, configure tailnet-only workload ingress and prove named-administrator key access plus a controlled recovery route independent of the pair/tailnet before retiring temporary public access and direct remote root. Record cutover/rollback checkpoints so enrollment failure cannot strand the host. Operator recovery uses its own scoped authority and must not reopen application ingress. A3 validation requests may observe/test approved paths; they do not authorize enrollment or access-policy changes themselves.
+
+<a id="a7-6"></a>
+**A7.6** Provision `core` as the human operator with password-gated sudo and console authentication, separate from locked, noninteractive `dp-maint` and `dp-dev` runtime accounts. Accept the password through a protected external channel, never command arguments, logs, images or source. Fetch public keys from the owner's `oso-gato` GitHub account over verified HTTPS, validate the complete bounded response before installing, and preserve the prior working key set on retrieval/validation failure. Install mosh and tmux; scope mosh UDP ingress to `tailscale0` and attach tmux only for interactive terminals so commands and file transfers remain usable. Preserve `erebus` across cloud-init runs, enable clock synchronization, and declare the renewal timezone. These are intended first-bootstrap behaviors under R7.19; README and the bootstrap guide record actual implementation and evidence.
+
+<a id="a7-7"></a>
+**A7.7** Inspect live SELinux state, persistent configuration and kernel boot arguments before changing mode. Preserve an already-enforcing host. For a disabled/unlabeled provider image, use a recorded, resumable permissive relabel transition before enforcing; a permissive state alone is not proof that relabeling completed. Verify the running enforcing state and durable configuration before recording completion or disarming transition machinery. Keep workloads disabled until admission verifies enforcement and confinement. Missing policy, conflicting boot arguments, relabel failure or failed enforcement must surface as incomplete/blocked, never success or an implicit permanent permissive fallback. Preserve the independently verified recovery route through the authorized setup reboots. Adapt the A11 reference's useful transition lessons without importing its suppressed failures, retired service dependencies or container-label exceptions.
 
 <a id="a8"></a>
 ## A8 — Managed repair and renewal

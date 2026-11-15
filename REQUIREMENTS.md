@@ -120,6 +120,9 @@
 <a id="r7-18"></a>
 **R7.18** Fresh-host setup must support separately authorized temporary public SSH or provider-console access before enrollment; it must not require an existing tailnet route to the unenrolled VPS. Keep bootstrap narrowly scoped and verify both authorized tailnet entry and an independent controlled recovery route before retiring temporary access and disabling direct remote root. Recovery must remain possible when the pair or tailnet is unavailable without exposing applications publicly. Exercise enrollment failure, successful cutover and recovery on the designated target under explicit effects/limits; retain credentials outside source and images. A later emergency access change needs its own scope and authority.
 
+<a id="r7-19"></a>
+**R7.19** First bootstrap provisions the named operator `core` with an externally supplied password for console access and password-gated administration, imports the owner's public SSH keys from GitHub, enrolls Tailscale, and provides mosh/tmux for reconnectable interactive use. SSH remains key-only; agents use separate restricted identities. Verify valid-key access and invalid/password rejection, preservation of working keys on failed refresh, interactive reconnect without breaking scripted SSH/file transfer, and mosh ingress only through the authorized tailnet. Bootstrap must handle the inspected initial SELinux state, including a disabled provider image: complete any necessary relabel/reboot transition and verify enforcing mode with container confinement before enabling workloads. Prove interruption/reapply and reboot persistence; neither a configuration file nor a successful setup exit alone proves these outcomes. These first-bootstrap details were confirmed by the owner on November 15, 2026.
+
 <a id="continuing-work"></a>
 <a id="r8"></a>
 ## R8 — Continuing work

@@ -417,3 +417,72 @@ Tailscale, Podman, secret, push or deployment operation occurred. The schema
 citation supports fixture accuracy; it does not establish live Fedora behavior.
 This narrow correction still requires fresh affected independent review of the
 exact returned commit before publication.
+
+### Owner direction: directory layout and reference learning (2026-11-15)
+
+The owner confirmed retaining the new `/var/lib/dev-pair/{maintenance,development}`
+directory design provided it satisfies the requirements. Its `workspaces`,
+`checkpoints`, `evidence`, `deliverables`, `builds`, `cache` and `state` classes
+remain subject to A4.3–A4.7: separate role ownership, durable work protected from
+cleanup, bounded disposable storage, and scoped credentials/state outside
+immutable code. This approves the layout direction, not proof of enforcement or
+the provisional numerical resource budgets. Credential delivery, disk quota and
+cleanup implementation remain incomplete.
+
+Use the exact A11 references as prior learning, selecting useful lifecycle,
+recovery and regression-test ideas without copying their code or inheriting
+their directory conventions, governance or security exceptions. In particular,
+retain lessons about external replacement executors, complete session inventory,
+verified resumed work, persistent state, cache reuse and interrupted operations.
+
+Related owner clarifications to carry into the next bootstrap slice: provision
+`core` with a securely supplied password, Tailscale login, mosh/tmux, and GitHub
+public-key import. Remote SSH remains key-only; core is the operator, separate
+from restricted agent identities. SELinux must reach enforcing with container
+confinement retained. The reference's disabled-to-permissive relabel/reboot flow
+is relevant to fresh-host setup; inspect live state and boot arguments, verify
+labeling and successful enforcement, and gate workloads on completion. Do not
+copy its suppressed `setenforce` failure or disabled container labeling. Current
+bootstrap instead requires enforcing at entry and needs an enablement stage.
+
+This is a durable decision/handoff note against source baseline
+`9d86e325c13241ef6e93dbe72269af261126f925` and the unchanged STANDARDS pin
+`b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`, not a runtime implementation or
+deployment claim. No host changes were made for this clarification.
+
+### Implementation continuation and current execution boundary
+
+On November 15 the owner instructed continuation through the dev-pair build.
+R7.19 and A7.6–A7.7 now record the agreed first-bootstrap operator and SELinux
+outcomes; A4.3 records the retained directory design. Coordinate one Sol High
+builder at a time, followed by a fresh Astra High exact-candidate review. For
+this continuation, each implementation slice is bounded to 25 minutes and
+research/review to 15 minutes, with at most two repair cycles before explicit
+checkpoint/reassessment. These local coordination bounds replace the earlier
+ten-minute slice default for this continuation, not deployed job budgets. No
+new paid infrastructure/API purchases are authorized or needed for source work.
+
+The agent API accepted `/root/bootstrap_owner_requirements_build` configured
+`gpt-6.1-sol` / `high` in an isolated worktree, and fresh architecture research
+`/root/confined_distrobox_design` configured `gpt-6-astra` / `high`. These are
+local subagents, not standalone Cloud conversations; independent provider
+attestation is unavailable. The coordinator's model/effort cannot be independently
+verified from available runtime metadata.
+
+Current environment status reports ready `hostinger_root` and enforced
+unrestricted networking. Credential presence was checked without reading it
+into output. An actual OpenSSH connection to `31.97.145.144:22` returned
+`Connection refused` before authentication; no password was sent. This is an
+observed transport failure, not proof that missing Tailscale or a specific host
+configuration caused it. No host inspection, wipe, deployment or reboot occurred.
+The local executor has PID 1 `tail`, no SELinux filesystem or KVM device, and no
+installed Podman/Distrobox; user-namespace creation succeeds. Local source tests
+cannot establish Fedora systemd, reboot or SELinux acceptance. The unchanged
+baseline's 53 local tests passed before implementation.
+
+Reference history also records an enforcement regression from a shared dnf
+cache retaining `user_home_t` (fedora-bootstrap commit
+`8a39c70894808d43b001d84649c673aed18c8573`); its scoped shared-label fix explains why
+actual confined mount/cache checks are required, not just `getenforce` output.
+Choose labels according to role/trust sharing; do not indiscriminately share
+private-role storage or disable labeling to make tests pass.
