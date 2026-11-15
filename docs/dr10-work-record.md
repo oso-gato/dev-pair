@@ -1186,3 +1186,18 @@ are unchanged. Fresh Astra High `/root/fedora_report_transport_review` is review
 this exact source before publication; all helper and transport changes remain
 local pending that verdict. The builder is reading the next integration design
 without editing while review completes.
+
+
+Fresh transport review found one material P2 before publication: guest main
+powered off in a finally block even when the report's final drain failed. The
+reviewer reproduced actual main finalization with a real PTY, a complete accepted
+678-byte frame, injected tcdrain EIO and an incorrectly invoked normal poweroff.
+Since QEMU then exits normally, the controller could accept failed delivery.
+All 171 tests and additional framing/aggregate tests passed but missed this path.
+
+The builder has an eight-minute repair scope: permit normal shutdown only after
+successful write/drain; propagate failure and retain the existing controller/
+native VM timeout as its bound. Add actual PTY/main-finalization regression and
+success gating, without a new protocol or changed runtime limits. Fresh Astra
+High `/root/fedora_report_shutdown_review` is API-selected and awaits the exact
+fix. No hosted run or publication occurred for the defective candidate.
