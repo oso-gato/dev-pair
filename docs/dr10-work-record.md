@@ -1922,3 +1922,34 @@ state work to that PR now would rerun the known unchanged Fedora failure. The
 next reviewed combined candidate returns to the requested PR branch.
 Native I/O builder has a30-minute source/test slice from39cc4bc; fresh independent
 `/root/native_command_io_review` is prepared. No new hosted run yet.
+
+### November 16, 2026, 04:20 HKT — native stream candidate under review
+
+Sol High candidate `ce3ecb76546debf98172a57642bfcdcf84a8c3da` is integrated
+locally as `d69ad5d`, after the reviewed offline-state checkpoint. The builder's
+242 tests passed in 35.983 seconds; the combined 253 tests passed in 37.212
+seconds. The transport covers ordinary root commands, explicit dp-maint
+commands, diagnostic probes and guest image observation. Separate capture
+ceilings remain 1 MiB, 4 MiB and 256 KiB respectively. Private manager-opened
+FIFOs replace D-Bus stdio descriptor forwarding; ownership records precede
+sensitive input and launch. No SELinux policy exception or resource-budget
+increase is included. Actual Fedora execution is still unverified.
+
+Fresh Astra High review found a likely retry defect: explicit gptbox native
+units enter the initializer's durable list, but its retry parser accepts only
+initializer unit names. The sole builder is repairing this with a regression;
+the immutable candidate remains under review and is not published to PR13.
+No further hosted run is admitted until the repair and independent review pass.
+Model and effort selections are verified at the agent API boundary only;
+backend attestation and coordinator model metadata remain unavailable.
+
+Read-only source research at
+`/workspace/scratch/nested-profile-source-research.md` identifies a plausible
+confined nested engine profile. Narrow mapping helpers need SETUID/SETGID
+acquisition, while the inner agent retains zero capabilities and NNP1. Upstream
+container_engine_t is MCS constrained, but the examined source does not establish
+its required child transition. Installed Fedora policy and runtime versions must
+be inspected before admitting a concrete profile; a narrowly scoped dedicated
+domain remains an engineering possibility, not an accepted policy change. No
+unavoidable owner exception was established. Native nesting, storage enforcement,
+authentication, renewal and delivery acceptance remain outstanding.
