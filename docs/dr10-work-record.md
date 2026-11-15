@@ -13,15 +13,15 @@ owner decisions remain retained in order.
   Signed Fedora download, tooling construction and source transfer passed. The
   real Fedora VM booted/shut down under TCG; guest report framing was rejected.
   Partial preflight/status text is not complete accepted evidence. Cleanup passed.
-- One API-configured Sol High builder, `/root/durable_job_build`, is implementing
-  dedicated bounded VM report transport from coordination commit c9a47ef.
-  The public-input helper repair passed fresh Astra High review at 62eb1f6,
-  integrated as 921654d; all 163 integration tests pass. No provider backend
-  attestation or coordinator model metadata is available.
-- Next: complete/review dedicated bounded guest result transport using
-  `/workspace/scratch/fedora-ci-serial-plan.md`.
-  Only then authorize the next exact-candidate CI run and integrate real guest
-  prepare/maintenance assembly. Preserve finite budgets and existing gates.
+- Public-input repair 62eb1f6 and dedicated-report repair 12d73c3 passed fresh
+  Astra High reviews; source is integrated as 921654d and 3a49fd8 respectively.
+  All 174 integration tests pass. Builder `/root/durable_job_build` uses accepted
+  API settings Sol High; reviewers use Astra High. Provider backend attestation
+  and coordinator model metadata remain unavailable.
+- Next: publish this reviewed candidate for one reassessed actual Fedora run.
+  Require a complete dedicated-channel baseline report, then implement shared
+  first-bootstrap prepare/assembly using the bounded design at
+  `/workspace/scratch/fedora-prepare-integration-plan.md`. Preserve all gates.
 - VPS remains untouched. Root credential reference was available, but this cloud
   executor has no supported VPS TCP/SSH route. CI is a separate test target.
   Authenticated jobs, both actual placements, enforced quota/cleanup, tailnet
@@ -1201,3 +1201,20 @@ native VM timeout as its bound. Add actual PTY/main-finalization regression and
 success gating, without a new protocol or changed runtime limits. Fresh Astra
 High `/root/fedora_report_shutdown_review` is API-selected and awaits the exact
 fix. No hosted run or publication occurred for the defective candidate.
+
+
+The shutdown-gating fix `12d73c39fd662f116e328da725fe69a5271ededa` is integrated
+byte-identically as `3a49fd8`. All 174 integration tests pass. Fresh Astra High
+`/root/fedora_report_shutdown_review` returned PASS with no new findings after
+36 affected checks and independent real-PTY EIO/drain-timeout/success tests.
+The same independent regression fails against the parent candidate, establishing
+sensitivity to the actual defect. Evidence:
+`/workspace/artifacts/fedora-report-shutdown-review-12d73c3/review.json`.
+
+Coordinator reassessment authorizes one exact-candidate standard public CI run
+for this reviewed dedicated transport. The previous five-run diagnostic batch
+is closed; this is a distinct corrected transport checkpoint. Existing resource,
+network-none and inspection-only phase scope stay unchanged. Require complete
+candidate-bound baseline results and cleanup; prepare/assembly remain blocked
+until their next reviewed implementation. The source and review results support
+publication of the draft branch, not merge, deployment or job admission.
