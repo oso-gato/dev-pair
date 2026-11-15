@@ -807,3 +807,17 @@ timing must be measured; capacity/time failure remains blocked evidence. No
 VPS access, tailnet enrollment, authenticated model execution or release follows
 from a CI VM pass. The exact workflow source requires fresh review before parent
 publication and observation of the first bounded CI run.
+
+The size repair returned as `8c27db4eebaf2d258b8af36ff9fdddaff6b552d6`,
+integrated as `17ab51a595ffce7b5015cf836990ebc8aff550bb`. Requests reserve output
+capacity with a 16384-byte canonical limit; reconciliation diagnostics/evidence
+have an 8192-byte pretransaction limit. Fresh Astra High
+`/root/durable_size_review` returned scoped PASS. All 123 tests passed
+independently, along with the prior concurrency, malformed-input and hot-journal
+probes. Exact-cap requests produced bounded complete results through both real
+OS errors and reconciliation; one-byte-over reconciliation input changed neither
+events nor state. An additional suspected Unicode filesystem-error expansion
+was disproved on the actual CLI worker path, not assumed safe from fixtures.
+The source findings are closed; authenticated transport, actual pair recovery
+and host execution remain separate gates. Publish the reviewed local-protocol
+checkpoint while the independently scoped CI harness continues.
