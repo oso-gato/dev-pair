@@ -1871,3 +1871,27 @@ image files, not only output. Structured AVC security-field projection can retai
 USER_AVC diagnostics without arbitrary path/proctitle/argv/private payload.
 No implementation or new hosted run is admitted yet; no SELinux exception.
 The sole Sol builder is finishing the independent offline-state component.
+
+
+Offline state candidate `112ec05bcd5d9c382fca58065b454c4f2bd9d972`
+is integrated locally as942b2f2 but NOT published/admitted. Builder231tests and
+coordinator combined234tests32.724s passed. Its real stock-binary run passed9
+checks; report `/workspace/artifacts/codex-state-acceptance-local.json`, SHA256
+`6cb985b1f36b426bda0784148792d39a158b5ced9cc0a49e7073b44d089186a4`.
+Fresh Astra High `/root/codex_state_component_review` independently passed10
+focused tests and all9stock checks but returned CHANGES: P2 cleanup exception
+after those checks can leave status=pass/exit0. Evidence:
+`/workspace/artifacts/codex-state-component-review-112ec05/review.json`, SHA256
+`ab12d4f5ffa83309948dc7bc7cdf4cf0a7ffabdfeef56bfc468caa3fdf882c4a`.
+The sole builder is applying a bounded narrow fix/regression before continuing
+native command I/O. Fresh `/root/codex_state_cleanup_review` will independently
+review the immutable repair. Successful behavior checks do not override this
+failure-reporting defect or the component's runtime_admitted=false gates.
+
+Native command transport design is complete at
+`/workspace/scratch/native-command-io-design.md`. Systemd259 file: explicitly
+supports FIFOs; using manager-opened private FIFO paths removes D-Bus descriptor
+transfer while preserving nonseekable bounded output. Actual SELinux path access
+remains unverified. IO ownership must be persisted before secret/launch, with
+collision preservation and scoped crash reconciliation; Python finally cannot
+claim SIGKILL cleanup. No new hosted run or global policy change is admitted yet.
