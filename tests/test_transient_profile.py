@@ -56,6 +56,93 @@ class ProfileFiles(unittest.TestCase):
         fragment.unlink()
         self.assertEqual(n.configuration_snapshot(self.paths, UNIT)[0][:5], baseline[0][:5])
 
+    def test_real_old_atime_scan_keeps_exact_security_and_mutation_evidence(self):
+        transport = n.NativeTransport(UNIT); transport.setup(None)
+        directory = transport.profile_path
+        info = directory.stat()
+        os.utime(directory, ns=(1, info.st_mtime_ns))
+        before = directory.stat()
+        n.configuration_snapshot(self.paths, UNIT, owned_mask=True)
+        after = directory.stat()
+        self.assertGreater(after.st_atime_ns, before.st_atime_ns)
+        self.assertEqual(n.configuration_identity(after), n.configuration_identity(before))
+        n.NativeTransport.recover(UNIT)
+
+    def test_real_metadata_mutation_during_scan_still_blocks_including_ctime_only(self):
+        transport = n.NativeTransport(UNIT); transport.setup(None)
+        directory = transport.profile_path
+        original = os.scandir
+        from contextlib import contextmanager
+        for kind in ('ctime-only', 'mtime-ns', 'mode', 'inode'):
+            before = directory.stat()
+            @contextmanager
+            def mutate(path):
+                with original(path) as entries:
+                    yield entries
+                if Path(path) == directory:
+                    if kind == 'ctime-only':
+                        directory.chmod(0o700); directory.chmod(0o755)
+                    elif kind == 'mtime-ns':
+                        os.utime(directory, ns=(before.st_atime_ns, before.st_mtime_ns + 1))
+                    elif kind == 'mode':
+                        directory.chmod(0o700)
+                    else:
+                        directory.rename(directory.with_name('saved-profile'))
+                        directory.mkdir(mode=0o755)
+            with self.subTest(kind=kind), patch.object(n.os, 'scandir', side_effect=mutate):
+                with self.assertRaisesRegex(ValueError, 'Concurrent configuration mutation'):
+                    n.configuration_snapshot(self.paths, UNIT, owned_mask=True)
+            after = directory.stat()
+            if kind == 'ctime-only':
+                self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+                self.assertEqual(after.st_mode, before.st_mode)
+                self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+            if kind == 'inode':
+                self.assertNotEqual(before.st_ino, after.st_ino)
+                directory.rmdir(); directory.with_name('saved-profile').rename(directory)
+            directory.chmod(0o755)
+        n.NativeTransport.recover(UNIT)
+
+    def test_security_identity_covers_all_fields_at_nanosecond_resolution(self):
+        fields = dict(st_dev=1, st_ino=2, st_mode=0o40755, st_uid=1000, st_gid=1000,
+                      st_nlink=2, st_size=4096, st_mtime_ns=1000000001,
+                      st_ctime_ns=1000000002, st_atime_ns=1)
+        before = n.configuration_identity(types.SimpleNamespace(**fields))
+        for key in fields:
+            changed = dict(fields); changed[key] += 1
+            with self.subTest(field=key):
+                self.assertEqual(n.configuration_identity(types.SimpleNamespace(**changed)) == before,
+                                 key == 'st_atime_ns')
+
+    def test_cache_recheck_records_closed_subconditions_before_launch(self):
+        original = subprocess.Popen
+        for wanted in ('cache-load-state', 'cache-active-state', 'cache-snapshot-directory-mutation', 'cache-snapshot-rejected'):
+            calls = []; base = manager(original, calls); count = [0]
+            def manager_state(args, **kwargs):
+                if args[0] == '/usr/bin/systemctl' and '--property=LoadState' in args:
+                    count[0] += 1
+                    if count[0] == 2 and wanted in ('cache-load-state', 'cache-active-state'):
+                        state = ('LoadState=loaded\nActiveState=inactive' if wanted == 'cache-load-state'
+                                 else 'LoadState=not-found\nActiveState=active')
+                        return original([sys.executable, '-c', 'print(' + repr(state) + ')'], **kwargs)
+                return base(args, **kwargs)
+            snapshot = b.configuration_snapshot
+            def scanner(*args, **kwargs):
+                if kwargs.get('owned_mask') and wanted.startswith('cache-snapshot'):
+                    raise ValueError('Concurrent configuration mutation' if wanted.endswith('directory-mutation')
+                                     else 'SECRET-SENTINEL-UNKNOWN-ERROR')
+                return snapshot(*args, **kwargs)
+            records = []; run = b.Commands(); run.metadata_diagnostic = records.append
+            with patch.object(b.subprocess, 'Popen', side_effect=manager_state), \
+                 patch.object(b, 'configuration_snapshot', side_effect=scanner), self.assertRaises(b.Blocked):
+                run('/usr/bin/systemd-run', '--unit=' + UNIT, '--description=dev-pair-owned-' + UNIT,
+                    '--property=RuntimeMaxSec=3', sys.executable, '-c', 'raise AssertionError("never")')
+            self.assertFalse(any(args[0] == '/usr/bin/systemd-run' for args in calls))
+            self.assertEqual(records[-1]['admission_stage'], 'cache-recheck')
+            self.assertEqual(records[-1]['admission_reason'], wanted)
+            self.assertNotIn('SECRET-SENTINEL', json.dumps(records))
+            self.assertFalse(records[-1]['accepted_exit'])
+
     def test_owned_mask_creation_tamper_and_partial_cleanup(self):
         transport = n.NativeTransport(UNIT); transport.setup(b'NONCREDENTIAL')
         mask = transport.profile_path/n.MASK

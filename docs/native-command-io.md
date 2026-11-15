@@ -254,3 +254,11 @@ not claim a no-sensitive-property-read contract for those other paths; their
 audit/migration is a declared separate limitation. The independent local private
 session-bus probe used installed systemd257.13 and verified JSON shape/order only.
 It did not contact a host bus and is not Fedora259, SELinux or native acceptance.
+
+Configuration scans compare directory device/inode, type/mode, UID/GID, link
+count, size and exact nanosecond mtime/ctime across enumeration. Access time is
+excluded because enumeration itself may update it. This keeps security and
+configuration mutations blocking without rejecting a read alone. Cache-recheck
+failures retain fixed subcondition/category codes; no exception text, paths or
+configuration content enter those diagnostics. A local atime regression does
+not establish the cause of any prior native failure.

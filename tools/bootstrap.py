@@ -407,26 +407,46 @@ class Commands:
                               timeout=self.limit_timeout(timeout), maximum=8192)
                 verify_labels(transport, control, self.limit_timeout(timeout))
                 admission_stage = 'cache-recheck'
+                admission_reason = 'cache-snapshot'
                 after = configuration_snapshot(paths, unit, owned_mask=True, end=command_end)
                 root = str(transport.profile_path.parent)
                 def normalized(rows):
                     return tuple((row[:5] + (None,)) if row[0] == root else row for row in rows
                                  if row[0] not in (str(transport.profile_path), str(transport.profile_path / '10-timeout-abort.conf')))
+                admission_reason = 'cache-staging-comparison'
                 if normalized(snapshot) != normalized(after):
                     raise Blocked('configuration changed during mask staging')
+                admission_reason = 'cache-parent-lookup'
                 before_root = next(row for row in snapshot if row[0] == root)
                 after_root = next(row for row in after if row[0] == root)
-                if before_root[5] != transport.state['profile']['before_us'] or after_root[5] != transport.state['profile']['after_us']:
+                admission_reason = 'cache-before-mtime'
+                if before_root[5] != transport.state['profile']['before_us']:
                     raise Blocked('lookup parent changed before mask staging')
+                admission_reason = 'cache-after-mtime'
+                if after_root[5] != transport.state['profile']['after_us']:
+                    raise Blocked('lookup parent changed after mask staging')
+                admission_reason = 'cache-state-query'
                 observed = control._call('/usr/bin/systemctl', 'show', '--property=LoadState', '--property=ActiveState',
                                          transport.canonical, ok=(0, 1, 4), timeout=self.limit_timeout(timeout), maximum=4096)
                 state = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
-                if state.get('LoadState') != 'not-found' or state.get('ActiveState') != 'inactive' or paths != lookup_paths(control, self.limit_timeout(timeout)):
+                admission_reason = 'cache-load-state'
+                if state.get('LoadState') != 'not-found':
                     raise Blocked('native cache refresh is not pristine')
-                if after != configuration_snapshot(paths, unit, owned_mask=True, end=command_end):
+                admission_reason = 'cache-active-state'
+                if state.get('ActiveState') != 'inactive':
+                    raise Blocked('native cache refresh is not pristine')
+                admission_reason = 'cache-manager-paths'
+                if paths != lookup_paths(control, self.limit_timeout(timeout)):
+                    raise Blocked('native cache refresh is not pristine')
+                admission_reason = 'cache-final-snapshot'
+                final = configuration_snapshot(paths, unit, owned_mask=True, end=command_end)
+                admission_reason = 'cache-final-comparison'
+                if after != final:
                     raise Blocked('configuration changed before native launch')
+                admission_reason = 'cache-transport-verification'
                 transport.verify()
                 transport.open_streams()
+                admission_reason = 'none'
                 remaining = min(self.limit_timeout(timeout), command_end - time.monotonic())
                 if remaining < .002:
                     raise Blocked('native startup budget exhausted')
@@ -543,14 +563,26 @@ class Commands:
             known = {'Lookup directory timestamp did not advance': 'lookup-mtime-not-advanced', 'Unknown manager UnitPath': 'manager-paths-rejected',
                      'Unknown applicable drop-in': 'unknown-drop-in', 'Applicable dependency effects are forbidden': 'dependency-effects',
                      'Existing native fragment or alias': 'fragment-or-alias', 'Native manager stream context mismatch': 'label-mismatch',
-                     'Runtime configuration parent unavailable': 'runtime-path-unavailable'}
-            admission_reason = known.get(error.args[0] if error.args and type(error.args[0]) is str else '', 'admission-rejected')
+                     'Runtime configuration parent unavailable': 'runtime-path-unavailable',
+                     'Concurrent configuration mutation': 'directory-mutation',
+                     'Configuration admission deadline exceeded': 'scan-deadline',
+                     'Applicable configuration inventory bound exceeded': 'inventory-bound',
+                     'Transport verification deadline exceeded': 'transport-deadline'}
+            text = error.args[0] if error.args and type(error.args[0]) is str else ''
             if isinstance(error, OSError):
-                admission_reason = {2: 'runtime-path-unavailable', 13: 'permission-denied', 17: 'owned-name-collision'}.get(error.errno, 'io-unavailable')
+                category = {2: 'runtime-path-unavailable', 13: 'permission-denied', 17: 'owned-name-collision'}.get(error.errno, 'io-unavailable')
+            else:
+                category = known.get(text, 'rejected')
+            if admission_stage == 'cache-recheck' and admission_reason.startswith('cache-'):
+                # Both terms are fixed operation/categories, never error values.
+                admission_reason += '-' + category
+            else:
+                admission_reason = known.get(text, 'admission-rejected') if not isinstance(error, OSError) else category
             status = 'failed-or-timed-out'
             raise Blocked('command failed or timed out; output withheld') from None
         except BaseException:
-            admission_reason = 'blocked-or-interrupted'
+            if admission_stage != 'cache-recheck' or not admission_reason.startswith('cache-'):
+                admission_reason = 'blocked-or-interrupted'
             if status == 'running' or (not completed and status in ok):
                 status = 'interrupted-or-failed'
             raise

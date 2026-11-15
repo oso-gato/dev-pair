@@ -170,6 +170,13 @@ def lookup_paths(control, timeout):
     return tuple(values)
 
 
+def configuration_identity(info):
+    # Directory reads can update atime (including during this very scan).
+    # Preserve exact nanosecond mutation/security evidence, never access time.
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def configuration_snapshot(paths, unit, owned_mask=False, end=None):
     unit = canonical_unit(unit)
     stem = unit.removesuffix('.service')
@@ -212,7 +219,8 @@ def configuration_snapshot(paths, unit, owned_mask=False, end=None):
                             require(info.st_size == 0 and stat.S_IMODE(info.st_mode) == 0o644, 'Controlled mask changed')
                         snapshot.append((str(path_entry), info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns))
                 require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
-                require(directory.lstat() == before, 'Concurrent configuration mutation')
+                require(configuration_identity(directory.lstat()) == configuration_identity(before),
+                        'Concurrent configuration mutation')
     return tuple(snapshot)
 
 
