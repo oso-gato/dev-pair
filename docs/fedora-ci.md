@@ -2,14 +2,15 @@
 
 [The pull-request workflow](../.github/workflows/fedora-vm.yml) and
 [controller](../tools/fedora_ci.py) implement an initial real-VM execution route
-for an exact public candidate. The [first actual CI run](https://github.com/oso-gato/dev-pair/actions/runs/43729422976)
-passed all 136 tests but Podman rejected its long runroot pathname. The reviewed
-short-path/cleanup repair then ran in [run 2](https://github.com/oso-gato/dev-pair/actions/runs/43729968336):
-all 140 tests, actual runner preflight and cleanup passed. Measured resources were
-91541061632 free disk bytes and 16760348672 RAM bytes with Podman4.9.3. A subsequent
-tmp-directory initialization-order defect blocked before any image download or
-Fedora boot; its narrow repair passes 142 integrated tests and fresh affected review, awaiting runner retest. Local tests remain distinct from
-Fedora runtime evidence.
+for an exact public candidate. [Run 3](https://github.com/oso-gato/dev-pair/actions/runs/43730306931)
+passed all 142 tests and runner preflight, then downloaded and cryptographically
+verified the actual signed Fedora44 Cloud image. Tooling package construction
+reached DNF cleanup, but storage monitoring exceeded its 64KiB diagnostic limit;
+the underlying errors were not retained, so ordinary disappearance is not yet
+proven to be the cause. Owned cleanup passed. No completed tooling image or
+Fedora boot is claimed. The previous path-length and directory-order defects
+were repaired and passed this real runner. Free disk was 94978641920 bytes,
+RAM 16464302080 bytes and Podman4.9.3. A bounded diagnostic repair is underway.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and

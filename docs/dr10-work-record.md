@@ -931,3 +931,29 @@ Fresh Astra-configured High `/root/fedora_ci_init_review` returned narrow PASS
 and independently passed all 19 CI tests. Declared paths now initialize before
 Podman probes, retaining owner/mode/symlink/device checks and existing cleanup.
 Publish the third exact-candidate run to verify the observed real-engine case.
+
+Third actual run `43730306931`, job `132861068210`, source
+`b514e8d90c1fd8de875b23fb5cd0cf3b4a6f1a6d`, passed all 142 tests and runner
+preflight. It downloaded the actual 583729152-byte Fedora44 Cloud image and
+verified the pinned GPG signer, checksum and image SHA256. Tooling construction
+reached signed DNF package installation/cleanup, then storage monitoring stopped
+on its 65536-byte diagnostic ceiling. The underlying du diagnostic text was not
+retained, so ENOENT-only churn is a hypothesis, not an established diagnosis.
+Owned cleanup passed. No completed tooling-image identity, payload or Fedora
+guest boot is claimed. Runner free disk was 94978641920 bytes and memory
+16464302080 bytes; its image20261111.127.1/AWS kernel differs from run2.
+Logs: https://github.com/oso-gato/dev-pair/actions/runs/43730306931 and
+`/workspace/artifacts/fedora-ci-run-43730306931.log`.
+
+Coordinator authorized a ten-minute evidence-driven storage-diagnostic repair
+with fresh review, and at most two more runtime repair/runs in this batch before
+reassessing the route. Do not silently ignore large stderr or assume permission/
+I/O errors are disappearance. Preserve bounded diagnostic counts/tails, validate
+every admitted diagnostic, retain maximum samples, final stable measurement,
+resource limits and owned cleanup. Extension implementation remains paused.
+The measured runner capacity is sufficient to consider an explicit later
+16GiB physical-overlay/32GiB virtual-disk/4GiB overhead profile with unchanged
+3GiB host reserve and >=23GiB initial free disk, but this profile is only a
+proposal; no current limit changed. Existing 900s assembly/180s runtime bounds
+remain fixed, and any longer full-test VM deadline stays inside the 60-minute
+workflow with reserved cleanup time.
