@@ -21,8 +21,10 @@ prior evidence and owner decisions.
   the daemon cannot traverse it. Native mode was not recorded, so actual run18
   attribution remains provisional. Sole Sol High builder works on scoped
   directory/label/diagnostic repair in `/workspace/dev-pair-resolved-directory-repair`,
-  base52b80c4, source window07:39:20–07:51:20 HKT. Fresh Astra High reviewer
-  `/root/resolved_config_review` is prepared.
+  base52b80c4, source window07:39:20–07:51:20 HKT. Candidate `84d4122`, integrated as `9d4c64b`, passed344 tests but review
+  found a malformed-witness report failure. Narrow repair `5f79dc2`, integrated
+  as `7fb59a2`, passed fresh affected review:27 tests and20 independent checks.
+  Native verification awaits the repaired signed-base integration.
 - Signed-base source `914a954` is frozen separately in
   `/workspace/dev-pair-signed-base` and on remote
   `codex/signed-fedora-base-checkpoint`.344 tests pass; actual signature checks,
@@ -2494,3 +2496,41 @@ layer identities while retaining exact authenticated config and complete diffID.
 Original compressed-hash equality is not a supported save guarantee. This is
 source/cached-input progress, not native import acceptance. The sole builder
 continues toward its finite07:44:20 HKT checkpoint and fresh exact review.
+
+### November 16, 2026, 07:54 HKT — resolved source and report repair reviewed
+
+Sol High candidate `84d4122e3d3c98216f7ecaf8ae244b4a50c419c6`, integrated
+as `9d4c64b`, gives only the declared public configuration directory0755 and
+file0644 under unchanged private UMask0077. Real local mode proof confirms
+unrelated private files remain0600. Protected ancestry is checked by nofollow
+descriptors before mutation; unproven0700/foreign/symlink conflicts are preserved
+and blocked. This is not an automatic migration or complete interruption/reapply
+claim. Two exact stock labels, identity/content and typed global discovery modes
+are verified before existing listener/DNS/SSH gates. A bounded source/context
+witness records modes/stage and fixed failure reasons without arbitrary text.
+
+The344-test candidate passed in49.648 seconds. Fresh Astra review independently
+passed89 affected tests and18 checks, but found R1: a valid JSON non-object
+witness reached .get before type validation, causing AttributeError during guest
+finalization. Receipt:
+`/workspace/artifacts/resolved-review-84d4122e3d3c98216f7ecaf8ae244b4a50c419c6/review.json`,
+SHA256 `471b64b4a25f43f55b2f923c6f8ccbe34f1a689d527610998c8868bf186f4a6b`.
+
+One-line guard repair `5f79dc28d42017016e879a38769e80aa0a2d075e`, integrated
+as `7fb59a2`, checks exact dict type before .get. Existing regression now covers
+all five non-object JSON forms.27 affected tests pass; fresh Astra reviewer
+`/root/resolved_report_review` passed27 tests in10.391 seconds and20 additional
+checks, including old/fixed reproduction, valid witnesses, secret withholding
+and final-report encoding. Receipt:
+`/workspace/artifacts/resolved-report-review-5f79dc28d42017016e879a38769e80aa0a2d075e/review.json`,
+SHA256 `8f3cf3dcfec99a578b6abac1202c3c2f26d58870dc13d5bf5e4c6e8fb73a6f11`.
+Main tools/tests/workflow match the final repair exactly. The original344-test
+full run plus final affected checks are distinct; no redundant full-suite run
+or native acceptance is claimed. Combined signed integration will receive its
+full required checks before a new Fedora scope.
+
+The sole builder resumed signed SB1–4 repairs at07:52:04 HKT with17m10 remaining,
+checkpoint08:09:14 HKT. Fresh repair reviewer `/root/signed_base_repair_review`
+is prepared. Actual CI host uses Podman4.9.3; Fedora guest uses5.8.1, so source
+semantics and eventual native evidence must cover both instead of transferring
+one version's behavior. No active CI, VPS action or production admission.
