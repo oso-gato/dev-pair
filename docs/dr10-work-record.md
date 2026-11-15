@@ -2,7 +2,7 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 05:03 HKT. This section summarizes the current state;
+Updated November 16, 2026, 05:46 HKT. This section summarizes the current state;
 chronological records below retain earlier evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
@@ -27,14 +27,15 @@ chronological records below retain earlier evidence and owner decisions.
   Source and tests match the reviewed checkpoint. It provides no hard quota,
   reservation, deletion or job admission. Unknown Btrfs inode capacity stays
   unknown. Native hard storage enforcement and safe cleanup remain required.
-- Sole Sol High builder `/root/durable_job_build` is implementing the native
-  relay in `/workspace/dev-pair-native-relay`, separately based on `8bdd19d`.
-  Source design: manager-only standard runtime stream objects, app ownership
-  journal outside that namespace, and immutable same-identity helper creating
-  ordinary anonymous child pipes. Positive bounded completion framing prevents
-  failed startup from masquerading as an accepted payload exit. The pre-freeze
-  suite passed 268 tests; exact candidate and fresh `/root/native_relay_review`
-  verdict are pending. No policy grants, forced contexts or budget increases.
+- Native relay `da2ebf5` and deadline/signal repair `afac296` are integrated
+  locally through `9a97b81`. Fresh independent review passed the narrow repair
+  with 275 tests and five adversarial checks, but native admission remains
+  blocked by an inherited systemd timeout-abort drop-in. Sole Sol High builder
+  `/root/durable_job_build` is implementing exact-unit owned masks, prelaunch
+  configuration checks and an in-relay effective-profile gate in
+  `/workspace/dev-pair-transient-profile`. Fresh Astra High
+  `/root/transient_profile_review` is prepared for the immutable candidate.
+  No policy grants, forced contexts or budget increases are included.
 - Source handoffs are `/workspace/scratch/native-fifo-label-design.md`,
   `/workspace/scratch/nested-profile-source-research.md` and
   `/workspace/scratch/storage-admission-design.md`. They are source research,
@@ -43,7 +44,7 @@ chronological records below retain earlier evidence and owner decisions.
 - Subagent model/effort choices are accepted API settings: Sol High builder and
   fresh Astra High review. Backend attestation and coordinator model metadata
   are unavailable. Each implementation/review/retest slice retains its finite
-  scope and evidence; current relay source slice is 30 minutes before checkpoint.
+  scope and evidence; current profile source slice is 35 minutes before checkpoint.
 - VPS remains untouched; root credential availability was checked without
   exposing or sending it. This cloud has no verified supported VPS SSH route.
   Local managed Docker works but lacks the cgroup enforcement needed to replace
@@ -2087,3 +2088,35 @@ Exact upstream v259 service/timer/exit-status sources are cached under
 Fedora vendor-binary acceptance. The sole builder is making a narrow repair;
 fresh `/root/native_relay_deadline_review` is prepared. No new hosted run,
 policy change or deployment is admitted by the local test pass.
+
+### November 16, 2026, 05:46 HKT — narrow repair passed; transient profile in progress
+
+Sol High repair `afac2969e638e9c870010490267bb537f57cd323`, integrated as
+`9a97b81`, bounds startup within the original command deadline and independently
+rejects signaled payloads despite systemd-run's numerical exit mapping. Fresh
+Astra High `/root/native_relay_deadline_review` returned scoped PASS for NR-1
+and NR-2: 275 tests in 43.638 seconds and five adversarial checks in 3.044
+seconds. Evidence:
+`/workspace/artifacts/native-relay-deadline-review-afac2969e638e9c870010490267bb537f57cd323/review.json`,
+SHA256 `162175389f0e10ec668fa44545638e95bf8fc7106c8eab0d4c054ecfd3149604`.
+
+That verdict does not admit another native run: v259 source shows the global
+service timeout-abort drop-in loads after transient properties and can override
+the requested stop behavior. The next correction journals an exact-unit empty
+mask, rejects unexpected applicable fragments/drop-ins/dependencies before
+launch, refreshes the not-found cache through verified directory timestamp
+advance, and checks the effective profile inside the relay before sensitive
+input or payload execution. It retains the separate root, maintenance and
+observation stop budgets. Design:
+`/workspace/scratch/transient-profile-design.md`. The sole builder's source
+slice started around 05:24 HKT, with a checkpoint by 05:59 HKT; no new CI run
+or production change is admitted yet.
+
+Independent read-only Codex research at
+`/workspace/scratch/codex-tool-boundary-design.md` identifies actual shell,
+filesystem-helper and conditional extension paths in stock 0.169.0. A finite
+synthetic Responses fixture can exercise actual tool dispatch offline while
+retaining the managed permission policy; endpoint/auth-mode differences must
+be recorded. This is a queued validation component, not model authentication
+or proof that every production tool path is covered. No real model/auth call
+or additional native target was used by that research.
