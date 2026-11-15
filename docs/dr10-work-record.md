@@ -973,3 +973,23 @@ A deterministic large-output test uses already-deleted argv operands; it does
 not reproduce the production recursive traversal or identify run3's errors.
 Publish run4 to collect actual cause, then use at most the one remaining
 repair/run in this batch before coordinator reassessment.
+
+Fourth actual run `43731292754`, job `132864071280`, source
+`5a966ebdda2ff6d1e807f5998bb4272061630131`, passed all 146 tests, runner
+preflight and signed-image verification. Tool construction advanced through its
+image build and real RPM-manifest read; a stable overhead sample was 1025351680
+bytes. The monitor then captured exit1, zero stdout and this exact 90-byte stderr:
+`/usr/bin/du: fts_read failed: /tmp/dpvm-0n1yt9k2/graph/overlay: No such file or directory`.
+Unlike the earlier ordinary ENOENT cases, this traversal aborted without a total.
+This establishes run4's cause, not run3's discarded oversized diagnostic.
+Cleanup passed. No payload or Fedora boot occurred. Logs:
+https://github.com/oso-gato/dev-pair/actions/runs/43731292754 and
+`/workspace/artifacts/fedora-ci-run-43731292754.log`.
+
+The final ten-minute repair in this runtime batch retries only the captured
+owned-path fatal ENOENT, retaining an explicitly absent sample instead of zero.
+Three-attempt/capture/resource bounds remain; at least one usable sample is
+required for any provisional result and a stable total for phase completion.
+Unknown, permission, I/O and foreign-path errors remain immediate blockers.
+Fresh review precedes run5. Reassess after that result rather than silently
+continuing an unbounded CI repair loop. Independent source work remains possible.

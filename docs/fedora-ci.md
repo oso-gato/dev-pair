@@ -2,15 +2,14 @@
 
 [The pull-request workflow](../.github/workflows/fedora-vm.yml) and
 [controller](../tools/fedora_ci.py) implement an initial real-VM execution route
-for an exact public candidate. [Run 3](https://github.com/oso-gato/dev-pair/actions/runs/43730306931)
-passed all 142 tests and runner preflight, then downloaded and cryptographically
-verified the actual signed Fedora44 Cloud image. Tooling package construction
-reached DNF cleanup, but storage monitoring exceeded its 64KiB diagnostic limit;
-the underlying errors were not retained, so ordinary disappearance is not yet
-proven to be the cause. Owned cleanup passed. No completed tooling image or
-Fedora boot is claimed. The previous path-length and directory-order defects
-were repaired and passed this real runner. Free disk was 94978641920 bytes,
-RAM 16464302080 bytes and Podman4.9.3. The bounded diagnostic candidate passes 146 integrated tests and fresh review; its next hosted run must identify the actual error.
+for an exact public candidate. [Run 4](https://github.com/oso-gato/dev-pair/actions/runs/43731292754)
+passed all 146 tests, runner preflight and signed Fedora44 download verification.
+Tooling construction reached its RPM report, with a stable overhead sample of
+1025351680 bytes. Monitoring then recorded GNU du exit1, no stdout total and an
+owned overlay `fts_read failed ... No such file or directory` error. This proves
+run4's failure cause; run3's oversized diagnostics remain unidentified. Cleanup
+passed. A bounded exact-error retry repair is underway, with absent totals never
+accepted as zero. No Fedora guest boot has occurred.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and
