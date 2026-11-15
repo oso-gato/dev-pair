@@ -93,13 +93,13 @@ class FedoraPrepareTests(unittest.TestCase):
                  'Labels': {'dev-pair.context': expected['context_sha256'], 'org.opencontainers.image.revision': expected['source_sha'],
                             'dev-pair.distrobox': expected['distrobox_sha']}}]
         with mock.patch.object(guest.pwd, 'getpwnam', return_value=type('UID', (), {'pw_uid': 1001})()), \
-                mock.patch.object(guest, 'command', side_effect=lambda argv, **kwargs: json.dumps(rows).encode()) as command:
+                mock.patch.object(guest, 'native_image_capture', side_effect=lambda source, argv, timeout: json.dumps(rows).encode()) as command:
             projected = guest.initialize_projection(state(maintenance='complete'), expected, 0)
             guest.image_evidence(expected, projected, self.root, source, time.monotonic() + 20)
             self.assertTrue(projected['prepared_image_verified'])
             self.assertTrue(projected['assembled_image_verified'])
             self.assertEqual(projected['package_count'], 3)
-            self.assertIn('--uid=dp-maint', command.call_args.args[0])
+            self.assertIn('--uid=dp-maint', command.call_args.args[1])
             rows[1]['Labels']['org.opencontainers.image.revision'] = 'f' * 40
             projected = guest.initialize_projection(state(maintenance='complete'), expected, 0)
             with self.assertRaisesRegex(ValueError, 'identity/source'):
@@ -257,7 +257,7 @@ class FedoraPrepareTests(unittest.TestCase):
         def capture(args, *extra, **kwargs):
             calls.append(args)
             if 'ausearch' in args[0]:
-                return 0, (b'type=AVC comm="crun" denied fixture\n'
+                return 0, (b'type=AVC msg=audit(1794.5:12): avc: denied { write } for comm="crun" scontext=system_u:system_r:container_t:s0 tcontext=system_u:object_r:tmp_t:s0 tclass=fifo_file permissive=0\n'
                            b'type=PROCTITLE proctitle=synthetic-password-sentinel\n'
                            b'type=AVC comm="unrelated" name=synthetic-password-sentinel\n')
             return 0, b'fixed public status'
@@ -265,8 +265,9 @@ class FedoraPrepareTests(unittest.TestCase):
             observed = guest.diagnostics(time.monotonic() + 10)
         self.assertFalse(any('journalctl' in command[0] for command in calls))
         self.assertNotIn('synthetic-password-sentinel', json.dumps(observed))
-        self.assertIn('crun', observed['selinux_avcs']['tail'])
-        self.assertEqual(observed['selinux_avcs']['omitted_lines'], 2)
+        self.assertEqual(observed['selinux_avcs']['records'][0]['comm'], 'crun')
+        self.assertEqual(observed['selinux_avcs']['typed_seen'], 2)
+        self.assertEqual(observed['selinux_avcs']['malformed'], 1)
 
 
 if __name__ == '__main__':

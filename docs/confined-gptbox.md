@@ -137,3 +137,8 @@ separate `Mounts` array. Fields missing on
 the actual target block admission; synthetic schema fixtures do not establish
 real Fedora compatibility. Fresh exact-candidate review and authorized host
 failure/repair/retest evidence remain necessary before promotion.
+
+Native execution now shares the [manager-opened stream transport](native-command-io.md).
+Diagnostic-enabled probes retain4MiB aggregate capture; the ordinary/source-check
+path stays1MiB. Private FIFO/stdin ownership and actual Fedora access remain
+required runtime checks; no payload file-size restriction is introduced.

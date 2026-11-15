@@ -5,6 +5,8 @@ import contextlib
 import array
 import fcntl
 import hashlib
+import importlib.util
+import shlex
 import json
 import os
 import pathlib
@@ -76,7 +78,7 @@ def service_unit(expected, guest_sha):
 def observed_context(value):
     # procfs includes a terminating NUL on the measured Fedora executor.
     value = value.rstrip('\x00\n')
-    require(len(value) <= 200 and re.fullmatch(r'[A-Za-z0-9_]+:[A-Za-z0-9_]+:[A-Za-z0-9_]+:s[0-9]+[A-Za-z0-9_:.,-]*', value),
+    require(len(value) <= 200 and re.fullmatch(r'[A-Za-z0-9_]+:[A-Za-z0-9_]+:[A-Za-z0-9_]+:s[0-9]+(?::c[0-9]+(?:\.c[0-9]+)?(?:,c[0-9]+(?:\.c[0-9]+)?)*)?(?:-s[0-9]+(?::c[0-9]+(?:\.c[0-9]+)?(?:,c[0-9]+(?:\.c[0-9]+)?)*)?)?', value),
             'Malformed observed SELinux context')
     return value
 
@@ -605,6 +607,12 @@ def command(argv, timeout=30, **kwargs):
     return output
 
 
+class CaptureOverflow(ValueError):
+    def __init__(self, output):
+        super().__init__('Guest diagnostic command exceeded byte limit (truncated)')
+        self.output = output
+
+
 def capture(argv, timeout=15, maximum=65536, tick=None):
     started = time.monotonic()
     process = None
@@ -624,7 +632,9 @@ def capture(argv, timeout=15, maximum=65536, tick=None):
                 if not data:
                     selector.unregister(key.fileobj)
                     continue
-                require(len(output) + len(data) <= maximum, 'Guest diagnostic command exceeded byte limit (truncated)')
+                if len(output) + len(data) > maximum:
+                    output.extend(data[:maximum - len(output)])
+                    raise CaptureOverflow(bytes(output))
                 output.extend(data)
         code = process.wait(timeout=1)
         require(time.monotonic() - started < timeout, 'Guest diagnostic command deadline exceeded')
@@ -673,6 +683,26 @@ def stage_source(payload, destination, archive_sha, bundle_sha):
     return source
 
 
+def root_filesystem():
+    try:
+        with open('/proc/self/mountinfo', 'rb') as stream:
+            raw = stream.read(65537)
+        require(len(raw) <= 65536, 'Mount metadata bound exceeded')
+        data = raw.decode()
+        matches = []
+        for line in data.splitlines():
+            before, separator, after = line.partition(' - ')
+            fields, filesystem = before.split(), after.split()
+            if separator and len(fields) >= 6 and fields[4] == '/' and len(filesystem) >= 3:
+                require(re.fullmatch('[A-Za-z0-9_.-]{1,32}', filesystem[0]), 'Invalid filesystem type')
+                options = set(fields[5].split(',')) | set(filesystem[2].split(','))
+                matches.append({'type': filesystem[0], 'quota_flags': sorted(options & {'usrquota', 'grpquota', 'prjquota', 'pquota', 'uquota', 'gquota'})})
+        require(len(matches) == 1, 'Ambiguous root filesystem')
+        return matches[0]
+    except (OSError, ValueError, UnicodeError):
+        return {'availability': 'unavailable'}
+
+
 def baseline(end=None):
     release = pathlib.Path('/etc/os-release').read_text()
     require('ID=fedora' in release and 'VERSION_ID=44' in release, 'Guest is not Fedora 44')
@@ -686,9 +716,97 @@ def baseline(end=None):
     require(policy.is_file(), 'Active SELinux policy unavailable')
     return {'os': 'Fedora 44', 'kernel': platform.release(), 'architecture': platform.machine(),
             'pid1': 'systemd', 'selinux': selinux, 'cgroup': 'v2',
-            'root_free_bytes': shutil.disk_usage('/').free,
+            'root_free_bytes': shutil.disk_usage('/').free, 'root_filesystem': root_filesystem(),
             'executor_context': pathlib.Path('/proc/self/attr/current').read_text().strip(),
             'boot_id': pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
+
+
+AUDIT_TYPES = {'AVC': 'AVC', '1400': 'AVC', 'USER_AVC': 'USER_AVC', '1107': 'USER_AVC'}
+AUDIT_COMMS = {'podman', 'crun', 'conmon', 'distrobox-init', 'python3', 'dnf', 'dnf5', 'systemd-run', 'systemctl', 'systemd', 'dbus-broker', 'polkitd', 'sshd', 'getenforce', 'chpasswd'}
+AUDIT_DOMAINS = {'cloud_init_t', 'system_dbusd_t', 'init_t', 'unconfined_service_t', 'container_t', 'sshd_t', 'setfiles_t', 'dnf_t'}
+AUDIT_CONTEXT = re.compile(r'[A-Za-z0-9_]+:[A-Za-z0-9_]+:[A-Za-z0-9_]+:s[0-9]+(?::c[0-9]+(?:\.c[0-9]+)?(?:,c[0-9]+(?:\.c[0-9]+)?)*)?(?:-s[0-9]+(?::c[0-9]+(?:\.c[0-9]+)?(?:,c[0-9]+(?:\.c[0-9]+)?)*)?)?')
+AUDIT_SYMBOL = re.compile(r'[A-Za-z_][A-Za-z0-9_]{0,31}')
+
+
+def audit_require(value):
+    if not value:
+        raise ValueError('malformed audit security fields')
+
+
+def audit_fields(tokens):
+    result = {}
+    for token in tokens:
+        if '=' not in token:
+            continue
+        key, value = token.split('=', 1)
+        audit_require(key not in result)
+        result[key] = value
+    return result
+
+
+def audit_record(line):
+    audit_require(len(line.encode()) <= 4096)
+    header = re.fullmatch(r'type=(AVC|USER_AVC|1400|1107)\s+msg=audit\(([0-9]{1,12}(?:\.[0-9]{1,9})?:[0-9]{1,12})\):\s*(.*)', line)
+    audit_require(header)
+    kind, event, body = header.groups()
+    outer = shlex.split(body, posix=True)
+    selected = audit_fields(outer)
+    if AUDIT_TYPES[kind] == 'USER_AVC':
+        audit_require('msg' in selected)
+        # Only the structural nested msg field is parsed. Quoted path/name/
+        # proctitle data is never rescanned for embedded fake security tokens.
+        payload = selected.pop('msg')
+        tokens = shlex.split(payload, posix=True)
+    else:
+        tokens = outer
+    audit_require(tokens[:3] == ['avc:', 'denied', '{'] and '}' in tokens)
+    end = tokens.index('}')
+    permissions = tokens[3:end]
+    audit_require(0 < len(permissions) <= 8 and len(set(permissions)) == len(permissions) and all(AUDIT_SYMBOL.fullmatch(p) for p in permissions))
+    nested = audit_fields(tokens[end + 1:])
+    if AUDIT_TYPES[kind] == 'USER_AVC':
+        audit_require(not (set(selected) & set(nested)))
+        selected.update(nested)
+    else:
+        selected = nested
+    result = {'type': AUDIT_TYPES[kind], 'audit_event_id': event, 'permissions': permissions}
+    for key in ('scontext', 'tcontext'):
+        value = selected.get(key)
+        audit_require(type(value) is str and len(value) <= 192 and AUDIT_CONTEXT.fullmatch(value))
+        result[key] = value
+    audit_require(type(selected.get('tclass')) is str and AUDIT_SYMBOL.fullmatch(selected['tclass']))
+    result['tclass'] = selected['tclass']
+    if 'pid' in selected:
+        audit_require(re.fullmatch('[0-9]{1,10}', selected['pid']))
+        result['pid'] = int(selected['pid'])
+    if 'permissive' in selected:
+        audit_require(selected['permissive'] in ('0', '1'))
+        result['permissive'] = int(selected['permissive'])
+    if selected.get('comm') in AUDIT_COMMS:
+        result['comm'] = selected['comm']
+    return result
+
+
+def project_avcs(raw, *, truncated=False, available=True):
+    seen, malformed, candidates = 0, 0, []
+    for line in raw.decode('utf-8', 'replace').splitlines():
+        if not re.match(r'^type=(?:AVC|USER_AVC|1400|1107)(?:\s|$)', line):
+            continue
+        seen += 1
+        try:
+            candidates.append(audit_record(line))
+        except (ValueError, TypeError):
+            malformed += 1
+    def relevant(row):
+        return row.get('comm') in AUDIT_COMMS or any(row[key].split(':')[2] in AUDIT_DOMAINS for key in ('scontext', 'tcontext'))
+    ordered = [row for row in reversed(candidates) if relevant(row)] + [row for row in reversed(candidates) if not relevant(row)]
+    output = []
+    for row in ordered:
+        if len(output) < 8 and len(json.dumps(output + [row], sort_keys=True, ensure_ascii=True).encode()) <= 3000:
+            output.append(row)
+    return {'records': output, 'typed_seen': seen, 'projected': len(output), 'malformed': malformed,
+            'omitted_for_cap': len(candidates) - len(output), 'input_truncated': bool(truncated), 'unavailable': not available,
+            'selection_scope': 'same boot; latest known comm/domain first; counts cover captured input only'}
 
 
 def diagnostics(end=None):
@@ -701,13 +819,11 @@ def diagnostics(end=None):
         try:
             code, output = capture(argv, timeout=remaining(end, 1) if end is not None else 15)
             if name == 'selinux_avcs':
-                lines = output.decode('utf-8', 'replace').splitlines()
-                selected = [line for line in lines if re.search(r'type=(?:AVC|USER_AVC|1400|1107)\b', line) and
-                            re.search(r'comm="(?:podman|crun|conmon|distrobox-init|python3|dnf5?|systemd-run|systemctl|systemd|dbus-broker|polkitd|sshd|getenforce|chpasswd)"', line)]
-                observed[name] = {'exit_status': code, 'tail': safe_text('\n'.join(selected), 3000),
-                                  'selected_lines': len(selected), 'omitted_lines': len(lines) - len(selected)}
+                observed[name] = {'exit_status': code, **project_avcs(output, available=code in (0, 1))}
             else:
                 observed[name] = {'exit_status': code, 'tail': safe_text(output, 3000), 'captured_bytes': len(output)}
+        except CaptureOverflow as exc:
+            observed[name] = {'status': 'incomplete', **project_avcs(exc.output, truncated=True)} if name == 'selinux_avcs' else {'status': 'unavailable', 'detail': 'Diagnostic capture limit exceeded'}
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             observed[name] = {'status': 'unavailable', 'detail': safe_text(exc, 500)}
     return observed
@@ -788,6 +904,19 @@ def initialize_projection(state, expected, exit_status):
     return validate_initialization(result, expected)
 
 
+def native_image_capture(source, argv, timeout):
+    # The protected exact public source was already authenticated on admission.
+    spec = importlib.util.spec_from_file_location('dev_pair_observe_bootstrap', source / 'tools/bootstrap.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    try:
+        run = module.Commands()
+        with run.phase(timeout, 'dev-pair-ci-observe', native=False):
+            return run._call(*argv, timeout=timeout, maximum=262144).encode()
+    except module.Blocked:
+        raise ValueError('Native image observation blocked; inspect exact owned transport and security diagnostics') from None
+
+
 def image_evidence(expected, projection, state_root, source, end):
     images = []
     if projection['prepare'] == 'complete':
@@ -812,14 +941,14 @@ def image_evidence(expected, projection, state_root, source, end):
     timeout = remaining(end, 10)
     require(timeout >= 2, 'Insufficient bounded time for native image observation')
     argv = ['/usr/bin/systemd-run', '--unit=' + unit, '--description=dev-pair-owned-' + unit,
-            '--uid=dp-maint', '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+            '--uid=dp-maint', '--quiet', '--wait', '--collect', '--service-type=exec',
             '--property=RuntimeMaxSec=' + str(max(1, int(timeout - 1))), '--property=TimeoutStopSec=1', '--property=KillMode=control-group',
             '--property=MemoryMax=2G', '--property=TasksMax=512', '--property=CPUQuota=100%',
             '/usr/bin/env', '-i', 'PATH=/usr/bin:/usr/sbin', 'HOME=/usr/local/libexec/dev-pair-gptbox/home',
             'XDG_RUNTIME_DIR=/run/user/' + str(uid), 'CONTAINERS_CONF=/usr/local/libexec/dev-pair-gptbox/containers.conf',
             '/usr/bin/podman', '--root=/var/lib/dev-pair/maintenance/images', '--runroot=/run/user/' + str(uid) + '/dev-pair-gptbox',
             '--storage-driver=vfs', 'image', 'inspect', *images]
-    rows = json.loads(command(argv, timeout=timeout, maximum=262144))
+    rows = json.loads(native_image_capture(source, argv, timeout))
     require(type(rows) is list and len(rows) == len(images), 'Actual engine image evidence missing')
     for index, (identity, row) in enumerate(zip(images, rows)):
         labels = row.get('Labels') or row.get('Config', {}).get('Labels', {})

@@ -26,6 +26,14 @@ import urllib.error
 import urllib.request
 import uuid
 
+try:
+    from native_io import NativeTransport, pipe_pair
+except ModuleNotFoundError:
+    _io_spec = importlib.util.spec_from_file_location('dev_pair_native_io', Path(__file__).with_name('native_io.py'))
+    _io_module = importlib.util.module_from_spec(_io_spec)
+    _io_spec.loader.exec_module(_io_module)
+    NativeTransport, pipe_pair = _io_module.NativeTransport, _io_module.pipe_pair
+
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
@@ -232,10 +240,13 @@ class Commands:
     @staticmethod
     def reconcile_native(args, env):
         # Only fixed controller-created descriptions permit exact-unit cleanup.
+        if args and args[0] != '/usr/bin/systemd-run' and not all(value.startswith(('--unit=', '--description=', '--uid=')) for value in args):
+            return
         unit = next((v[7:] for v in args if v.startswith('--unit=')), None)
         description = next((v[14:] for v in args if v.startswith('--description=')), None)
         if not unit or description != 'dev-pair-owned-' + unit:
             return
+        NativeTransport(unit)  # Validate fixed controller unit grammar before any manager effect.
         # A separate bounded runner has no phase/native wrapper or diagnostic
         # callback: cleanup observations cannot recursively launch more units.
         control = Commands()
@@ -243,6 +254,9 @@ class Commands:
         observed = control('/usr/bin/systemctl', 'show', '--property=Description', '--property=ActiveState',
                            '--property=LoadState', '--property=User', unit, ok=(0, 1, 4), timeout=5)
         values = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
+        expected_user = next((v[6:] for v in args if v.startswith('--uid=')), '')
+        if values.get('LoadState') != 'not-found' and (values.get('Description') != description or values.get('User', '') not in ((expected_user,) if expected_user else ('', 'root'))):
+            raise Blocked('native unit ownership mismatch; foreign unit preserved')
         if values.get('ActiveState') in ('active', 'activating', 'deactivating', 'reloading'):
             expected_user = next((v[6:] for v in args if v.startswith('--uid=')), '')
             if values.get('Description') != description or values.get('User', '') not in ((expected_user,) if expected_user else ('', 'root')):
@@ -255,6 +269,10 @@ class Commands:
                 raise Blocked('native unit remains unresolved; no duplicate effects')
         elif values.get('ActiveState') not in ('inactive', 'failed'):
             raise Blocked('native unit observation failed; no duplicate effects')
+        try:
+            NativeTransport.recover(unit)
+        except ValueError:
+            raise Blocked('native transport cleanup unresolved; exact ownership records preserved') from None
 
     def interrupt(self, process, args, env):
         # A reaped/exited launcher still owns its session's process group, and
@@ -278,7 +296,13 @@ class Commands:
             raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime')
 
     def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
+        return self._call(*args, ok=ok, input_text=input_text, timeout=timeout)
+
+    def _call(self, *args, ok=(0,), input_text=None, timeout=900, maximum=1048576, probe=False):
         timeout = self.limit_timeout(timeout)
+        stdin_data = input_text.encode() if input_text is not None else None
+        if stdin_data is not None and len(stdin_data) > 16384:
+            raise Blocked('stdin byte budget exceeded; output withheld')
         original = args
         public = self.public_operation(args) if input_text is None else None
         unit = None
@@ -292,10 +316,8 @@ class Commands:
                 raise Blocked('native execution budget exhausted')
             unit = self.native_prefix + '-' + uuid.uuid4().hex[:8]
             description = 'dev-pair-owned-' + unit
-            if self.native_register:
-                self.native_register(unit)
             args = ('/usr/bin/systemd-run', '--unit=' + unit, '--description=' + description,
-                    '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+                    '--quiet', '--wait', '--collect', '--service-type=exec',
                     '--property=RuntimeMaxSec=%.3fs' % (int(timeout * 1000) / 1000), '--property=TimeoutStopSec=5',
                     '--property=KillMode=control-group', '--property=MemoryMax=2G',
                     '--property=TasksMax=512', '--property=CPUQuota=100%',
@@ -307,28 +329,72 @@ class Commands:
         status = 'not-started'
         process = None
         completed = False
+        transport = None
+        launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
-            process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            if args and args[0] == '/usr/bin/systemd-run':
+                unit = next((value[7:] for value in args if value.startswith('--unit=')), None)
+                if next((value[14:] for value in args if value.startswith('--description=')), None) != 'dev-pair-owned-' + str(unit):
+                    raise Blocked('native stream ownership unverified')
+                if any(value.startswith(('--property=StandardInput=', '--property=StandardOutput=', '--property=StandardError=')) for value in args):
+                    raise Blocked('caller native stdio properties are forbidden')
+                transport = NativeTransport(unit)
+                # Observe before allocation/registration: an existing busy/foreign
+                # unit is a collision, never this attempt's cleanup authority.
+                control = Commands()
+                control._cleanup_deadline = min(self.execution_deadline() or float('inf'), started + timeout)
+                observed = control._call('/usr/bin/systemctl', 'show', '--property=LoadState', '--property=ActiveState',
+                                         '--property=Description', '--property=User', unit, ok=(0, 1, 4),
+                                         timeout=self.limit_timeout(timeout), maximum=4096)
+                values = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
+                expected_user = next((value[6:] for value in args if value.startswith('--uid=')), '')
+                if values.get('LoadState') != 'not-found' and (values.get('Description') != 'dev-pair-owned-' + unit or
+                        values.get('User', '') not in ((expected_user,) if expected_user else ('', 'root')) or
+                        values.get('ActiveState') not in ('inactive', 'failed')):
+                    raise Blocked('native unit collision; existing resources preserved')
+                transport.setup(stdin_data, self.native_register)
+                # No wrapped/native command and no forwarded FDs are involved in labeling.
+                control._call('/usr/sbin/restorecon', '-F', str(transport.path.parent), str(transport.record.parent),
+                              str(transport.record), str(transport.path), *(str(transport.path / name) for name in transport.state['nodes']),
+                              timeout=self.limit_timeout(timeout), maximum=8192)
+                transport.verify()
+                transport.open_streams()
+                args = self.native_args(args, min(self.limit_timeout(timeout), timeout - (time.monotonic() - started)))
+                payload = next((index for index, value in enumerate(args[1:], 1) if not value.startswith('-')), len(args))
+                args = (*tuple(value for value in args[:payload] if value not in ('--pipe', '--pty')), *args[payload:])
+                args = (args[0], *transport.properties(), *args[1:])
+                for _ in range(2):
+                    launcher_pairs.append(pipe_pair())
+                process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=launcher_pairs[0][1],
+                                           stderr=launcher_pairs[1][1], start_new_session=True, close_fds=True)
+                process.stdout = os.fdopen(launcher_pairs[0][0], 'rb', buffering=0)
+                process.stderr = os.fdopen(launcher_pairs[1][0], 'rb', buffering=0)
+                for reader, writer in launcher_pairs:
+                    os.close(writer)
+                launcher_pairs.clear()
+                selector.register(process.stdout, selectors.EVENT_READ, 'launcher_stdout')
+                selector.register(process.stderr, selectors.EVENT_READ, 'launcher_stderr')
+                for name, fd in transport.readers.items():
+                    selector.register(fd, selectors.EVENT_READ, name)
+            else:
+                process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True, close_fds=True)
+                stdin_offset = 0
+                if input_text is not None:
+                    if stdin_data:
+                        os.set_blocking(process.stdin.fileno(), False)
+                        selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
+                    else:
+                        process.stdin.close()
+                selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+                selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
             status = 'running'
-            stdin_data = input_text.encode() if input_text is not None else b''
-            stdin_offset = 0
-            if input_text is not None:
-                # Nonblocking stdin shares the command deadline even if a child
-                # never reads. UTF-8 passwords can exceed one PIPE_BUF.
-                if len(stdin_data) > 16384:
-                    raise Blocked('stdin byte budget exceeded; output withheld')
-                if stdin_data:
-                    os.set_blocking(process.stdin.fileno(), False)
-                    selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
-                else:
-                    process.stdin.close()
-            selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
-            selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
             while selector.get_map() or process.poll() is None:
                 if time.monotonic() - started >= timeout:
                     raise Blocked('command deadline exceeded; output withheld')
+                if transport is not None and process.poll() is not None:
+                    transport.release()
                 for key, _ in selector.select(timeout=.1):
                     if key.data == 'stdin':
                         try:
@@ -339,15 +405,18 @@ class Commands:
                             selector.unregister(key.fileobj)
                             process.stdin.close()
                         continue
-                    block = os.read(key.fileobj.fileno(), min(8192, 1048576 - total + 1))
+                    descriptor = key.fileobj if isinstance(key.fileobj, int) else key.fileobj.fileno()
+                    block = os.read(descriptor, min(8192, maximum - total + 1))
                     if not block:
                         selector.unregister(key.fileobj)
                         continue
                     total += len(block)
-                    if total > 1048576:
+                    if total > maximum:
                         raise Blocked('command output byte budget exceeded; output withheld')
                     if input_text is None:
-                        buffers[key.data].extend(block)
+                        # Launcher output never becomes application stdout.
+                        name = 'stderr' if key.data.startswith('launcher_') else key.data
+                        buffers[name].extend(block)
             status = process.wait(timeout=1)
             if time.monotonic() - started >= timeout:
                 raise Blocked('command deadline exceeded; output withheld')
@@ -357,7 +426,7 @@ class Commands:
             result = bytes(buffers['stdout']).decode() if input_text is None else ''
             completed = True
             return result
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError):
             status = 'failed-or-timed-out'
             raise Blocked('command failed or timed out; output withheld') from None
         except BaseException:
@@ -366,19 +435,40 @@ class Commands:
             raise
         finally:
             cleanup_error = None
+            if transport is not None:
+                try:
+                    transport.close()
+                except OSError as exc:
+                    cleanup_error, status, completed = exc, 'cleanup-unresolved', False
+            for reader, writer in launcher_pairs:
+                for fd in (reader, writer):
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
             if process is not None and not completed:
                 try:
                     self.interrupt(process, args, env)
                 except (Blocked, OSError, subprocess.SubprocessError) as exc:
                     cleanup_error = exc
                     status = 'cleanup-unresolved'
+            if transport is not None and transport.created_intent and cleanup_error is None:
+                try:
+                    if completed or process is None:
+                        self.reconcile_native(args, env)
+                    NativeTransport.recover(transport.unit)
+                except (ValueError, Blocked, OSError, subprocess.SubprocessError) as exc:
+                    cleanup_error = exc
+                    status = 'cleanup-unresolved'
+                    completed = False
             selector.close()
             if process is not None:
                 if process.stdin is not None and not process.stdin.closed:
                     process.stdin.close()
                 process.stdout.close()
                 process.stderr.close()
-            if self.diagnostic or self.metadata_diagnostic:
+            if probe and self.diagnostic:
+                actual = process.returncode if process is not None else None
+                self.diagnostic(buffers, actual if actual is not None and actual not in ok else status)
+            elif self.diagnostic or self.metadata_diagnostic:
                 record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
@@ -388,7 +478,7 @@ class Commands:
                 if self.metadata_diagnostic:
                     self.metadata_diagnostic(dict(record))
                 if public:
-                    record.update(output_bytes=total, capture_limit_bytes=1048576,
+                    record.update(output_bytes=total, capture_limit_bytes=maximum,
                                   **{name + '_tail': bytes(data[-8192:]).decode(errors='replace') for name, data in buffers.items()},
                                   **{name + '_truncated': len(data) > 8192 for name, data in buffers.items()})
                 if self.diagnostic:
@@ -1135,7 +1225,7 @@ class Bootstrap:
         self.run('/usr/bin/systemctl', 'start', f'user@{uid}.service')
         storage = '/var/lib/dev-pair/maintenance/images'
         self.directory(storage, owner='dp-maint')
-        base = ['/usr/bin/systemd-run', '--wait', '--pipe', '--collect', '--service-type=exec',
+        base = ['/usr/bin/systemd-run', '--wait', '--collect', '--service-type=exec',
                 '--uid=dp-maint', f'--unit=dev-pair-gptbox-{expected}.service',
                 f'--description=dev-pair-owned-dev-pair-gptbox-{expected}.service',
                 '--property=RuntimeMaxSec=600', '--property=TimeoutStopSec=10',

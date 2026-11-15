@@ -206,8 +206,8 @@ share fields/limits. Wrong/unknown versions, duplicate fields, unknown identity
 or initialization fields and unmatched hashes reject. Executor exit0 plus exactly
 one complete frame is required; EOF or a visible frame alone is insufficient.
 
-Public diagnostics select fixed RPM/socket/service-result fields, scoped AVC
-lines and at most two public failure records per preparation/adapter, with
+Public diagnostics select fixed RPM/socket/service-result fields, strict structural AVC/USER_AVC
+security fields and at most two public failure records per preparation/adapter, with
 bounded1500-character stream tails, original counts and truncation flags. Fixed
 operation/prepare-step IDs distinguish accepted nonzero exits from rejected
 commands; recent metadata remains available when a later Python source gate fails.
@@ -241,3 +241,8 @@ explicit synthetic contracts, not Fedora execution. Actual Fedora owned-mask sel
 fetch/Cosign, package timing/capacity, rootless SELinux confinement and genuine
 Distrobox initialization require a separately reviewed hosted run. No local
 VM, authentication/model, VPS or complete-pair acceptance is claimed.
+
+The [native stream transport](native-command-io.md) also covers the final dp-maint
+image observation. Same-run security diagnostics retain bounded structured
+no-comm USER_AVC records without exporting audit paths/proctitles/arguments.
+Root filesystem type and selected quota flags are diagnostic-only observations.

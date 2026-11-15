@@ -55,59 +55,14 @@ class ProbeCommands(Commands):
     diagnostic = None
 
     def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
-        timeout = self.limit_timeout(timeout)
-        args = self.native_args(args, timeout)
         if self.diagnostic is None:
             return super().__call__(*args, ok=ok, input_text=input_text, timeout=timeout)
         if input_text is not None:
             raise Blocked('probe diagnostics cannot accept stdin credentials or prompts')
-        environment = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
-        process = None
-        buffers = {'stdout': bytearray(), 'stderr': bytearray()}
-        selector = selectors.DefaultSelector()
-        deadline, total = time.monotonic() + timeout, 0
         try:
-            process = subprocess.Popen(args, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, start_new_session=True)
-            selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
-            selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
-            while selector.get_map():
-                if time.monotonic() >= deadline:
-                    raise TimeoutError()
-                for key, _ in selector.select(min(0.2, max(0, deadline - time.monotonic()))):
-                    chunk = os.read(key.fileobj.fileno(), 8192)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    total += len(chunk)
-                    if total > 4194304:
-                        raise Blocked('probe output budget exceeded')
-                    buffers[key.data].extend(chunk)
-            process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            if time.monotonic() >= deadline:
-                raise TimeoutError()
-            self.limit_timeout(timeout)
-            if process.returncode not in ok:
-                raise Blocked('probe command exited with disallowed status')
-            output = bytes(buffers['stdout']).decode('utf-8')
-        except BaseException:
-            cleanup = 'interrupted-or-failed'
-            try:
-                if process is not None:
-                    self.interrupt(process, args, environment)
-            except (Blocked, OSError, subprocess.SubprocessError):
-                cleanup = 'cleanup-unresolved'
-            actual_status = process.returncode if process is not None else None
-            status = actual_status if actual_status is not None and actual_status not in ok else cleanup
-            self.diagnostic(buffers, status)
-            raise Blocked('probe command failed or timed out; bounded protected diagnostics retained; ' + cleanup) from None
-        finally:
-            selector.close()
-            if process is not None:
-                process.stdout.close()
-                process.stderr.close()
-        self.diagnostic(buffers, process.returncode)
-        return output
+            return self._call(*args, ok=ok, timeout=timeout, maximum=4194304, probe=True)
+        except Blocked as error:
+            raise Blocked('probe command failed or timed out; ' + ('cleanup-unresolved' if 'cleanup unresolved' in str(error) else 'interrupted-or-failed') + '; ' + str(error)) from None
 
 
 class Gptbox(Bootstrap):
@@ -132,7 +87,7 @@ class Gptbox(Bootstrap):
         repo = Path(__file__).resolve().parents[1]
         if self.run('/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD').strip() != revision:
             raise Blocked('adapter source HEAD differs from requested exact target')
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py'):
             data = self.protected(Path(__file__).with_name(name)).read_bytes()
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
@@ -224,7 +179,9 @@ class Gptbox(Bootstrap):
             after = self.run('/usr/bin/systemctl', 'show', '--property=ActiveState', self.unit, ok=(0, 1, 4))
             if any(value in after for value in ('=active', '=activating', '=deactivating', '=reloading')):
                 raise Blocked('prior context executor has not stopped; no cleanup or duplicate operation')
-        self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+        if retry and isinstance(self.run, Commands):
+            self.run.reconcile_native(('--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--uid=dp-maint'), {})
+        self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--quiet', '--wait', '--collect', '--service-type=exec',
                          '--uid=dp-maint', '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=10',
                          '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
                          '--property=CPUQuota=100%', '/usr/bin/env', '-i', 'PATH=' + str(self.path(CONTROL + '/bin')) + ':/usr/bin:/usr/sbin:/bin',
@@ -551,7 +508,7 @@ class Gptbox(Bootstrap):
         self.protected(upstream)
         for name in ('distrobox-init', 'distrobox-enter'):
             self.protected(Path(upstream) / name)
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py'):
             self.protected(Path(__file__).with_name(name))
         if self.path('/usr/bin/git').exists():
             self.inputs(context, expected, upstream, revision)
@@ -659,7 +616,7 @@ class Gptbox(Bootstrap):
                     record['adapter_elapsed_seconds'] = round(time.monotonic() - (adapter_started or time.monotonic()), 3)
                 record['prepare_step'] = getattr(preparation, 'prepare_step', 'not-started')
                 record['failure'] = 'blocked-or-interrupted; inspect protected diagnostics; explicit retry required'
-                record['cleanup'] = 'not verified; recorded native command/OCI lifetimes remain finite'
+                record['cleanup'] = 'not verified; root-only native stdin transport may remain until exact retry/reboot; native/OCI lifetimes remain finite'
                 if record['prepare'] == 'complete':
                     try:
                         with self.run.phase(CLEANUP_EXECUTION, 'dev-pair-initialize-cleanup'):

@@ -68,7 +68,9 @@ escaped engine process stopped: only recorded candidate resources are reconciled
 uncertain cleanup is recorded as blocked, with native lifetimes retained.
 Actual Fedora systemd/Podman cleanup remains an acceptance gate.
 
-Commands capture at most 1MiB combined output; preparation keeps four recent and
+[Native command streams](native-command-io.md) use manager-opened private FIFOs
+and a protected stdin file, with exact recorded recovery and explicit crash
+retention. Commands capture at most 1MiB combined output; preparation keeps four recent and
 four failed protected diagnostic records. Only fixed public signed-package and
 candidate-image operations retain 8KiB stream tails, with truncation/byte metadata.
 All stdin-bearing operations discard child output and never record stdin,

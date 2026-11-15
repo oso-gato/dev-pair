@@ -14,9 +14,11 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bootstrap as b
 import gptbox as g
+from native_io_fixture import install, launch_payload, manager
 
 SOURCE = '1' * 40
 CONTEXT = 'a' * 64
+NATIVE_UNIT = 'dev-pair-gptbox-' + CONTEXT + '.service'
 
 
 class InitializeFixture(g.Gptbox):
@@ -72,6 +74,7 @@ class InitializeTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        install(self, self.tmp.name)
         self.app = InitializeFixture(Path(self.tmp.name))
         self.app.directory('/var/lib/dev-pair', mode=0o755)
         self.app.state.mkdir(parents=True, mode=0o700)
@@ -181,18 +184,20 @@ class InitializeTests(unittest.TestCase):
         original = b.subprocess.Popen
         ceilings = []
         def spawned(args, **kwargs):
+            if args[0] != '/usr/bin/systemd-run':
+                return manager(original, [])(args, **kwargs)
             ceilings.append(float(next(v.rsplit('=', 1)[1].removesuffix('s') for v in args
                                        if v.startswith('--property=RuntimeMaxSec='))))
-            return original(args[args.index(sys.executable):], **kwargs)
+            return launch_payload(original, args, kwargs, args[args.index(sys.executable):])
         with patch.object(b.subprocess, 'Popen', side_effect=spawned):
-            with outer.phase(.15, 'outer', native=False):
+            with outer.phase(.5, 'outer', native=False):
                 with inner.phase(1, 'inner', native=False):
-                    self.assertLess(third.limit_timeout(900), .15)
-                    third('/usr/bin/systemd-run', '--property=RuntimeMaxSec=180',
+                    self.assertLess(third.limit_timeout(900), .5)
+                    third('/usr/bin/systemd-run', '--unit=' + NATIVE_UNIT, '--description=dev-pair-owned-' + NATIVE_UNIT, '--property=RuntimeMaxSec=180',
                           sys.executable, '-c', 'print("local native-argv dispatch only")')
         self.assertEqual(len(ceilings), 1)
         self.assertGreater(ceilings[0], 0)
-        self.assertLessEqual(ceilings[0], .15)
+        self.assertLessEqual(ceilings[0], .5)
         with self.assertRaises(b.Blocked):
             with outer.phase(.05, 'outer', native=False):
                 with inner.phase(1, 'inner', native=False):
@@ -222,8 +227,11 @@ class InitializeTests(unittest.TestCase):
             processes = []
             def spawned(args, **kwargs):
                 if native:
-                    args = args[args.index(sys.executable):]
-                process = original(args, **kwargs)
+                    if args[0] != '/usr/bin/systemd-run':
+                        return manager(original, [])(args, **kwargs)
+                    process = launch_payload(original, args, kwargs, args[args.index(sys.executable):])
+                else:
+                    process = original(args, **kwargs)
                 processes.append(process)
                 return process
             script = ('import os,time,pathlib,sys; pid=os.fork(); '
@@ -232,16 +240,20 @@ class InitializeTests(unittest.TestCase):
             run = runner()
             if isinstance(run, g.ProbeCommands):
                 run.diagnostic = lambda buffers, status: None
-            prefix = ('/usr/bin/systemd-run', '--unit=dev-pair-exited-test',
-                      '--description=dev-pair-owned-dev-pair-exited-test', '--property=RuntimeMaxSec=180') if native else ()
+            prefix = ('/usr/bin/systemd-run', '--unit=' + NATIVE_UNIT,
+                      '--description=dev-pair-owned-' + NATIVE_UNIT, '--property=RuntimeMaxSec=180') if native else ()
             try:
                 with patch.object(b.subprocess, 'Popen', side_effect=spawned), \
                         patch.object(run, 'reconcile_native') as reconcile:
                     with self.assertRaisesRegex(b.Blocked, 'deadline|timed out'):
-                        run(*prefix, sys.executable, '-c', script, str(marker), timeout=.1)
+                        run(*prefix, sys.executable, '-c', script, str(marker), timeout=.2 if native else .1)
                     self.assertEqual(processes[0].poll(), 0)
                     reconcile.assert_called_once()
-                    self.assertEqual(reconcile.call_args.args[0][:len(prefix)], prefix[:-1] + ('--property=RuntimeMaxSec=0.100s',) if native else ())
+                    if native:
+                        self.assertIn('--unit=' + NATIVE_UNIT, reconcile.call_args.args[0])
+                        ceiling = float(next(v.rsplit('=', 1)[1].removesuffix('s') for v in reconcile.call_args.args[0] if v.startswith('--property=RuntimeMaxSec=')))
+                        self.assertGreater(ceiling, 0)
+                        self.assertLessEqual(ceiling, .2)
                 time.sleep(.4)
                 self.assertFalse(marker.exists())
             finally:
@@ -253,13 +265,15 @@ class InitializeTests(unittest.TestCase):
 
     def test_failed_probe_launcher_with_closed_pipes_cleans_and_retains_exit_status(self):
         original = b.subprocess.Popen
-        prefix = ('/usr/bin/systemd-run', '--unit=dev-pair-failed-probe',
-                  '--description=dev-pair-owned-dev-pair-failed-probe', '--property=RuntimeMaxSec=180')
+        prefix = ('/usr/bin/systemd-run', '--unit=' + NATIVE_UNIT,
+                  '--description=dev-pair-owned-' + NATIVE_UNIT, '--property=RuntimeMaxSec=180')
         for unresolved in (False, True):
             marker = Path(self.tmp.name) / ('closed-pipe-probe-' + str(unresolved))
             processes, records = [], []
             def spawned(args, **kwargs):
-                process = original(args[args.index(sys.executable):], **kwargs)
+                if args[0] != '/usr/bin/systemd-run':
+                    return manager(original, [])(args, **kwargs)
+                process = launch_payload(original, args, kwargs, args[args.index(sys.executable):])
                 processes.append(process)
                 return process
             script = ('import os,time,pathlib,sys; os.write(2,b"public failure fixture\\n"); '
@@ -396,6 +410,8 @@ class InitializeTests(unittest.TestCase):
         run.native_register = identities.append
         original = b.subprocess.Popen
         def spawned(args, **kwargs):
+            if args[0] != '/usr/bin/systemd-run':
+                return manager(original, [])(args, **kwargs)
             unit = next(value[7:] for value in args if value.startswith('--unit='))
             self.assertEqual(identities, [unit])
             self.assertIn('--description=dev-pair-owned-' + unit, args)
@@ -403,14 +419,14 @@ class InitializeTests(unittest.TestCase):
             # Execute the actual fixed env/child tail locally; this proves its
             # environment contract, not a running systemd native-unit boundary.
             position = args.index('/usr/bin/env')
-            return original(args[position:], **kwargs)
+            return launch_payload(original, args, kwargs, args[position:])
         with patch.object(b.subprocess, 'Popen', side_effect=spawned), patch.dict(os.environ, {'OPENAI_API_KEY': 'native-secret-sentinel'}):
             output = run(sys.executable, '-c', 'import os;print(os.getenv("OPENAI_API_KEY"))')
         self.assertEqual(output.strip(), 'None')
 
     def test_native_ceiling_never_expands_and_cleanup_verifies_exact_description(self):
-        native = ('/usr/bin/systemd-run', '--property=RuntimeMaxSec=180', '--unit=dev-pair-test',
-                  '--description=dev-pair-owned-dev-pair-test')
+        native = ('/usr/bin/systemd-run', '--property=RuntimeMaxSec=180', '--unit=' + NATIVE_UNIT,
+                  '--description=dev-pair-owned-' + NATIVE_UNIT)
         self.assertIn('--property=RuntimeMaxSec=180.000s', b.Commands.native_args(native, 600))
         self.assertIn('--property=RuntimeMaxSec=2.500s', b.Commands.native_args(native, 2.5))
         with self.assertRaisesRegex(b.Blocked, 'native execution budget'):
@@ -422,10 +438,10 @@ class InitializeTests(unittest.TestCase):
             with self.assertRaisesRegex(b.Blocked, 'ownership mismatch'):
                 b.Commands.reconcile_native(native, {})
             self.assertEqual(calls.call_count, 1)
-        results = ['Description=dev-pair-owned-dev-pair-test\nActiveState=active\n', '', 'ActiveState=inactive\n']
+        results = ['Description=dev-pair-owned-' + NATIVE_UNIT + '\nActiveState=active\n', '', 'ActiveState=inactive\n']
         with patch.object(b.Commands, '__call__', side_effect=results) as calls:
             b.Commands.reconcile_native(native, {})
-            self.assertEqual(calls.call_args_list[1].args, ('/usr/bin/systemctl', 'stop', 'dev-pair-test'))
+            self.assertEqual(calls.call_args_list[1].args, ('/usr/bin/systemctl', 'stop', NATIVE_UNIT))
 
 
 if __name__ == '__main__':
