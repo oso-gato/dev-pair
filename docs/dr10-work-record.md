@@ -597,3 +597,30 @@ CODEX_HOME also contains extension/configuration inputs; hooks/plugins default
 enabled. The adapter must enforce immutable managed configuration and loader
 boundaries, preserve refreshable credentials separately, and verify actual
 auth/model/session behavior before claiming usable runtime admission.
+
+### SELinux second repair and bounded reassessment
+
+The first native-labeling correction returned as
+`d09910006c6fa5ce2dbe19babcb330d832a1b897`, integrated as
+`e777992641d3f265b887d58b8b5559a92f842747` (96 local tests).
+Fresh Astra High `/root/selinux_repair_review` reproduced Fedora 44's merged
+`/usr/sbin -> bin` layout rejecting the protected setfiles path, and a read-only
+ancestor exclusion silently suppressing a writable child mount. Its additional
+interruption probes passed; actual Fedora execution remained unavailable.
+
+Sol corrected canonical native-tool/RPM paths, exclusion overlap and subprocess
+group timeout cleanup in `579f97e0e02ef4f91a6eead18302fcd01a8ce4d8`, integrated as
+`47acb75392c6e2a18968899d476e8889ee66c83b` (99 tests).
+Fresh Astra High `/root/selinux_final_source_review` independently passed the
+tests and those affected fixes, but found one remaining variant: native
+non-seclabel exclusions also recursively suppress admitted writable child
+mounts. Its `/mnt` vfat plus `/mnt/data` labeled ext4 reproduction showed false
+completion; upstream SELinux 3.11 source confirms the implicit exclusion.
+
+After the two repair cycles, the coordinator explicitly reassessed and authorized
+one additional ten-minute correction/review of this same exclusion defect:
+reject admitted writable mounts below any native implicit exclusion, preserving
+ordinary nonoverlapping pseudo mounts and EFI handling. No permissions or
+runtime scope expand. Further material findings require another explicit
+checkpoint rather than an unbounded repair loop. No source PASS or Fedora
+readiness is claimed for 47acb75 while this finding remains open.
