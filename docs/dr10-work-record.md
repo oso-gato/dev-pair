@@ -2,55 +2,59 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 07:33 HKT. Chronological records below retain
+Updated November 16, 2026, 07:46 HKT. Chronological records below retain
 prior evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Standards remain `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
-- Run16 at `574ba6a` passed310 hosted tests and reached the immutable relay on
-  enforcing Fedora44. It blocked before payload because three queried stdio
-  path properties are setter-only. Its one-run scope is closed.
-- Reviewed native correction `ae1893a` is integrated as `c1895cd`:35 exact typed
-  property getters across fixed interfaces, plus exact inherited-FD identity
-  checks. Three query processes share the original5-second/8192-byte allowance.
-  Fresh Astra High review passed63 affected tests and five independent checks.
-  Actual Fedora259 root/dp-maint access and package/assembly remain unverified.
-- Reviewed partial stock-Codex component `01b753d` and output-kind hardening
-  `502e38f` are integrated. Actual14 actions plus9 baseline checks pass with
-  synthetic credentials and private local transport. Complete inventory stays
-  BLOCKED for seven tool names; authentication/runtime acceptance is not claimed.
-- Combined332-test verification found one real cleanup-fixture failure: shared
-  host process inventory exceeded8192. Test-only repair `186b9d1`, integrated as
-  `a06c2f6`, passed333 tests in51.813 seconds and fresh independent affected review.
-  Production bytes/limits are unchanged. The positive test injects enumeration
-  while retaining real adoption, pidfd termination and reaping. Production
-  cleanup can still block at its global inventory limit; every cleanup failure
-  remains blocking. Main source/tests match the tested candidate exactly.
-- Run17 at `25c9808` passed333 hosted tests in43.308 seconds, then blocked
-  at cache-recheck before the first command started. The new typed relay gate
-  was not exercised. Its exact cause remains unproven. The independently reproduced scanner
-  atime defect is repaired by reviewed `4cabf87`, integrated as `c2716ed`:337
-  tests pass, fresh review passes72 affected tests and15 independent checks.
-  Run17 is closed; one changed-candidate retest is admitted below. No unchanged retry, policy exception, credentials, VPS
-  action or release promotion is included. PR remains draft and unmerged.
-- Sole Sol High builder `/root/durable_job_build` works separately in
-  `/workspace/dev-pair-signed-base` on verified signed Fedora OCI input,
-  candidate identity, local import and authenticated package refresh. Its incomplete source checkpoint is `0a65d2c`; after the native repair detour
-  it resumed at07:18 HKT with26m20 remaining, checkpoint07:44:20 HKT.
-  Verified archive research is not import/build proof.
-- Reviewed storage observation and peak arithmetic provide no hard reservation,
-  quota, deletion or job admission. Native hard storage and cleanup remain work.
-  Actual preparation/assembly, both gptbox placements, complete credential/tool
-  isolation, authenticated jobs, durable host-test repair, tailnet cutover and
-  recovery, all-session renewal, enforced releases and demonstrator delivery
-  remain incomplete. The owner does not review code or coordinate workers.
-- Model/effort choices are accepted API selections: Sol High builder and fresh
-  Astra High review. Backend attestation and coordinator metadata are unavailable.
-  VPS remains untouched; credential reference was checked without disclosure or
-  sending it. This managed cloud has no verified supported VPS SSH route.
-  Local managed Docker lacks the cgroup enforcement needed for the bounded
-  Fedora VM test. No CI/Docker/tunnel workaround is authorized or used.
+  Published candidate `932c296`; current documentation checkpoint `52b80c4` is
+  retained on `codex/dr10-reviewed-checkpoint`. Standards remain exact
+  `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
+- Run18 passed337 hosted tests in42.935 seconds and actual root native typed
+  property/FD/relay checks on enforcing Fedora44. Source verification completed;
+  pre/post inspection, full report and outer cleanup passed. Initialization
+  blocked at resolved-discovery after268.25 seconds because the restarted daemon
+  retained5355 listeners. No native dp-maint, package or image acceptance follows.
+  Run18 is closed; no active CI or unchanged retry.
+- Exact atomic() reproduction under provisioning UMask0077 creates the public
+  resolved configuration directory as0700 and its file0644. Root can read it,
+  the daemon cannot traverse it. Native mode was not recorded, so actual run18
+  attribution remains provisional. Sole Sol High builder works on scoped
+  directory/label/diagnostic repair in `/workspace/dev-pair-resolved-directory-repair`,
+  base52b80c4, source window07:39:20–07:51:20 HKT. Fresh Astra High reviewer
+  `/root/resolved_config_review` is prepared.
+- Signed-base source `914a954` is frozen separately in
+  `/workspace/dev-pair-signed-base` and on remote
+  `codex/signed-fedora-base-checkpoint`.344 tests pass; actual signature checks,
+  producer/consumer and extracted isolated-Python verification pass. Payload
+  is191,666,279 bytes, expanded371,233,612 bytes,293 files, within unchanged
+ 192/384MiB ceilings. This is not native import or runtime acceptance.
+- Independent signed-base review requires four repairs: save's80MiB process
+  cap conflicts with its188MB uncompressed spool; temporary/unlinked allocation
+  accounting and owned cleanup are incomplete; an executed sibling is missing
+  from source binding; CI fetches the same Fedora input twice. Evidence:
+  `/workspace/artifacts/signed-base-review-914a954/review.json`, SHA256
+  `a957200989d32ca80c2e7eb31793841018d14cc2dc6a12826bafaec1e1e19b1e`.
+  After the narrow resolved repair, the sole builder addresses this batch in a
+  finite20-minute source slice, then fresh independent affected review. No
+  source/policy/limit waiver or native publication of914 is admitted.
+- Reviewed offline Codex components pass14 actual tool actions plus9 baseline
+  checks with synthetic credentials/private local transport. Complete inventory
+  stays BLOCKED for seven exposed tools; next source handoff is
+  `/workspace/scratch/codex-next-inventory-build-handoff.md`. Production cleanup
+  still has an8192-process census cap; test-only repair does not remove it.
+- Reviewed storage observation/arithmetic provides no hard reservations, quotas,
+  deletion or job admission. Actual preparation/assembly, both gptbox placements,
+  hard storage/cleanup, complete tool/credential isolation, authenticated jobs,
+  durable host-test repair, tailnet cutover/recovery, all-session renewal,
+  enforced independent releases and demonstrator delivery remain incomplete.
+- API selections are Sol High builder and fresh Astra High reviewers. Backend
+  attestation and coordinator metadata are unavailable. VPS remains untouched;
+  root credential reference was checked without disclosure or sending it. This
+  managed cloud has no verified supported VPS SSH route. Local Docker lacks
+  the cgroup enforcement needed for the bounded Fedora VM. No CI/Docker/tunnel
+  workaround, real credential/model call or production promotion is included.
+  The owner does not review code or coordinate workers; PR stays draft/unmerged.
 
 ## Recorded baseline and authority
 
