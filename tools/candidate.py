@@ -10,7 +10,15 @@ import stat
 import subprocess
 import sys
 import uuid
-import fedora_oci
+try:
+    import fedora_oci
+except ModuleNotFoundError:
+    # -I excludes scriptdir; load only this source-bound immutable sibling.
+    import importlib.util
+    _fedora_spec = importlib.util.spec_from_file_location('fedora_oci', pathlib.Path(__file__).with_name('fedora_oci.py'))
+    fedora_oci = importlib.util.module_from_spec(_fedora_spec)
+    sys.modules['fedora_oci'] = fedora_oci
+    _fedora_spec.loader.exec_module(fedora_oci)
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 DESTINATIONS = {'workspace': '/work/job', 'state': '/state/codex',
@@ -175,7 +183,7 @@ def _verify_content(context, expected_context_sha256, fixture=False):
         path = root / name
         require(stat.S_ISREG(path.lstat().st_mode), 'context: only regular files permitted')
         if name in fedora_oci.ARTIFACTS and not fixture:
-            from public_inputs import capture_regular
+            capture_regular = fedora_oci._public_inputs().capture_regular
             _, size, expected = fedora_oci.ARTIFACTS[name]
             data, actual = capture_regular(path, size, exact_size=size)
             require(actual == expected, 'context Fedora signed artifact identity mismatch')

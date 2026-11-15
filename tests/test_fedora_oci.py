@@ -177,6 +177,21 @@ class FedoraOCI(unittest.TestCase):
             wrong,_=self.graph(raw=b'changed rootfs',declared_diff=pins['DIFF'])
             with self.assertRaises(ValueError):f.parse_oci(wrong,time.monotonic()+2,derived=True)
 
+    def test_isolated_python_keeps_source_siblings_without_ambient_import_path(self):
+        import subprocess
+        tools=Path(f.__file__).parent
+        result=subprocess.run([sys.executable,'-I',str(tools/'candidate.py'),'launch'],
+                              capture_output=True,timeout=3,env={'PATH':'/usr/bin:/bin'})
+        self.assertEqual(result.returncode,2)
+        self.assertNotIn(b'ModuleNotFoundError',result.stderr)
+        code=('import importlib.util,sys;from pathlib import Path;'
+              's=importlib.util.spec_from_file_location("fedora_oci",Path(sys.argv[1]));'
+              'm=importlib.util.module_from_spec(s);sys.modules["fedora_oci"]=m;s.loader.exec_module(m);'
+              'p=m._public_inputs();assert Path(p.__file__).parent==Path(m.__file__).parent;print("bound")')
+        result=subprocess.run([sys.executable,'-I','-c',code,str(tools/'fedora_oci.py')],
+                              capture_output=True,timeout=3,env={'PATH':'/usr/bin:/bin'})
+        self.assertEqual((result.returncode,result.stdout),(0,b'bound\n'),result.stderr)
+
     def test_real_gpg_rejects_altered_signed_checksum(self):
         # Public Fedora key and CHECKSUM are small committed fixtures; no network.
         data=Path(__file__).parent/'data/fedora44'

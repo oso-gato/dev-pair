@@ -6,6 +6,7 @@ import json
 import lzma
 import math
 import os
+import sys
 from pathlib import Path
 import re
 import shutil
@@ -76,8 +77,20 @@ def _hash(stream, maximum, end, output=None):
     return total, digest.hexdigest()
 
 
+def _public_inputs():
+    try:
+        import public_inputs
+    except ModuleNotFoundError:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('public_inputs', Path(__file__).with_name('public_inputs.py'))
+        public_inputs = importlib.util.module_from_spec(spec)
+        sys.modules['public_inputs'] = public_inputs
+        spec.loader.exec_module(public_inputs)
+    return public_inputs
+
+
 def _signature(work, end):
-    from public_inputs import command
+    command = _public_inputs().command
     home = work / 'gpg'; home.mkdir(mode=0o700)
     gpg = ['/usr/bin/gpg', '--batch', '--no-options', '--no-autostart', '--no-auto-key-retrieve', '--homedir', str(home)]
     command(gpg + ['--import', str(work / FILES[2])], work, timeout=max(.001, end-time.monotonic()))
@@ -215,7 +228,7 @@ def _wall_deadline(end):
 @contextlib.contextmanager
 def verified(source, *, seconds=120):
     """Private captured bytes, fixed pin first, signature before decoding; owned cleanup."""
-    from public_inputs import capture_regular
+    capture_regular = _public_inputs().capture_regular
     require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 120, 'invalid Fedora verification budget')
     end = time.monotonic() + seconds
     with tempfile.TemporaryDirectory(prefix='dev-pair-fedora-') as temporary:
@@ -252,7 +265,7 @@ def imported(rows):
 
 def import_image(engine, plain, uid=None, seconds=120):
     """Local-only import and save-back proof; failed imports may retain store data."""
-    from public_inputs import capture_regular
+    capture_regular = _public_inputs().capture_regular
     require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 120, 'invalid Fedora import budget')
     end = time.monotonic() + seconds
     parse_oci(plain, end)  # Invalid local sources never reach even the first engine call.
