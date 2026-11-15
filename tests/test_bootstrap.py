@@ -445,6 +445,113 @@ class BootstrapTests(unittest.TestCase):
             chown.assert_not_called()
         self.assertEqual(victim.stat().st_mode & 0o777, 0o755)
 
+    def assert_no_host_mutation(self):
+        mutations = {'dnf', 'useradd', 'usermod', 'loginctl', 'nft', 'systemd-run'}
+        self.assertFalse(any(Path(call[0]).name in mutations for call in self.fake.calls))
+        self.assertFalse(self.app.state.exists())
+        self.assertFalse(self.app.path('/etc/dev-pair').exists())
+
+    def test_upfront_context_hash_role_fixture_and_arch_rejections_leave_no_state(self):
+        context, digest = self.context(role='development')
+        for expected in (digest, '1' * 64):
+            with self.subTest(expected=expected):
+                with self.assertRaises(b.Blocked):
+                    self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, expected)
+                self.assert_no_host_mutation()
+        with patch.object(b.platform, 'machine', return_value='aarch64'):
+            with self.assertRaisesRegex(b.Blocked, 'x86_64'):
+                self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+        self.assert_no_host_mutation()
+        for file in context.iterdir():
+            file.unlink()
+        context.rmdir()
+        context, digest = self.context(fixture=True)
+        with self.assertRaises(b.Blocked):
+            self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+        self.assert_no_host_mutation()
+
+    def test_corrected_hash_retry_and_minimal_git_prerequisite_before_binding(self):
+        context, digest = self.context()
+        with self.assertRaises(b.Blocked):
+            self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, '1' * 64)
+        self.assert_no_host_mutation()
+        original = self.fake.__call__
+        def prerequisite(*args, **kwargs):
+            if Path(args[0]).name == 'dnf' and args[-1] == 'git-core':
+                self.assertFalse(self.app.path(b.STATE + '/desired.json').exists())
+                self.assertFalse(any(Path(call[0]).name == 'useradd' for call in self.fake.calls))
+            return original(*args, **kwargs)
+        self.app.run = prerequisite
+        with patch.object(b.shutil, 'disk_usage', return_value=SimpleNamespace(free=10 * 1024 ** 3)):
+            self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+        dnf = [call for call in self.fake.calls if Path(call[0]).name == 'dnf']
+        self.assertEqual(dnf[0][-2:], ('install', 'git-core'))
+        self.assertTrue(self.app.path(b.STATE + '/prepared').exists())
+
+    def test_source_failure_after_git_prerequisite_does_not_bind_desired(self):
+        context, digest = self.context()
+        tool = self.app.candidate_tool()
+        with patch.object(tool, 'check_source', side_effect=ValueError('source mismatch')):
+            with self.assertRaisesRegex(b.Blocked, 'source verification'):
+                self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+        self.assertFalse(self.app.path(b.STATE + '/desired.json').exists())
+        dnf = [call for call in self.fake.calls if Path(call[0]).name == 'dnf']
+        self.assertEqual(len(dnf), 1)
+        self.assertEqual(dnf[0][-2:], ('install', 'git-core'))
+        self.assertFalse(any(Path(call[0]).name == 'useradd' for call in self.fake.calls))
+
+    def test_post_up_status_json_and_persistence_failures_disconnect(self):
+        self.prepare()
+        guard = self.app.text('/etc/dev-pair/bootstrap.nft')
+        original_run, original_atomic = self.fake.__call__, self.app.atomic
+        for failure in ('status', 'json', 'persist', 'persist_after_write'):
+            with self.subTest(failure=failure):
+                self.fake.node = {'BackendState': 'NeedsLogin'}
+                after_up = False
+                def run(*args, **kwargs):
+                    nonlocal after_up
+                    if after_up and args[:2] == ('/usr/bin/tailscale', 'status'):
+                        if failure == 'status':
+                            raise b.Blocked('post-up status failed (output withheld)')
+                        if failure == 'json':
+                            return 'malformed tskey-SECRET payload'
+                    result = original_run(*args, **kwargs)
+                    if args[:2] == ('/usr/bin/tailscale', 'up'):
+                        after_up = True
+                    return result
+                def atomic(path, *args, **kwargs):
+                    if path == b.STATE + '/node.json':
+                        if failure == 'persist_after_write':
+                            original_atomic(path, *args, **kwargs)
+                            raise OSError('synthetic failure after visible write')
+                        if failure == 'persist':
+                            raise OSError('synthetic persistence failure')
+                    return original_atomic(path, *args, **kwargs)
+                self.app.run, self.app.atomic = run, atomic
+                with patch.object(b, 'checked_file', return_value=self.secret()):
+                    with self.assertRaises((b.Blocked, ValueError, OSError)):
+                        self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+                self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+                self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
+                self.assertEqual(self.app.text('/etc/dev-pair/bootstrap.nft'), guard)
+        self.app.run, self.app.atomic = original_run, original_atomic
+
+    def test_accepted_node_status_failure_does_not_disconnect(self):
+        self.prepare()
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+            original = self.fake.__call__
+            def failed_status(*args, **kwargs):
+                if args[:2] == ('/usr/bin/tailscale', 'status'):
+                    raise b.Blocked('temporary status error')
+                return original(*args, **kwargs)
+            self.app.run = failed_status
+            with self.assertRaises(b.Blocked):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Running')
+        self.assertTrue(self.app.path(b.STATE + '/node.json').exists())
+        self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'down') for call in self.fake.calls))
+
     def test_finalize_always_blocks_without_reading_fake_evidence(self):
         proc = subprocess.run([sys.executable, str(ROOT / 'tools/bootstrap.py'), 'finalize'], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2)

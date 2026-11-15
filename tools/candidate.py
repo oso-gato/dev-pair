@@ -96,10 +96,13 @@ def recipe(m):
             'ENTRYPOINT ["/opt/dev-pair/bin/codex"]\n').encode()
 
 
-def check_binary_and_source(m, data, fixture):
+def check_binary(m, data, fixture):
     require(digest(data) == m['codex']['sha256'], 'Codex binary integrity mismatch')
     require(fixture or (len(data) > 20 and data[:6] == b'\x7fELF\x02\x01' and
                         data[18:20] == b'\x3e\x00'), 'expected extracted x86_64 ELF binary')
+
+
+def check_source(m, fixture):
     if not fixture:
         repo = pathlib.Path(__file__).resolve().parents[1]
         tracked = subprocess.run(
@@ -108,6 +111,11 @@ def check_binary_and_source(m, data, fixture):
             env={'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'}).stdout
         require(tracked == pathlib.Path(__file__).read_bytes(),
                 'source SHA does not identify this preparation implementation')
+
+
+def check_binary_and_source(m, data, fixture):
+    check_binary(m, data, fixture)
+    check_source(m, fixture)
 
 
 def context_record(files, fixture):
@@ -139,8 +147,8 @@ def prepare(manifest, binary, output, fixture=False):
     return result
 
 
-def verify(context, expected_context_sha256, fixture=False):
-    """Check staged bytes against a separately trusted handoff identity, without execution."""
+def _verify_content(context, expected_context_sha256, fixture=False):
+    """Python-only integrity stage, never source/release admission; internal bootstrap prerequisite check."""
     token(expected_context_sha256, r'[0-9a-f]{64}', 'expected context SHA256')
     root = pathlib.Path(context).absolute()
     require(root.resolve() == root and root.is_dir(), 'context must be a nonsymlink directory')
@@ -159,7 +167,14 @@ def verify(context, expected_context_sha256, fixture=False):
     m = validate(json.loads(files['inputs.json']), fixture)
     require(files['inputs.json'] == canonical(m), 'noncanonical input manifest')
     require(files['Containerfile'] == recipe(m), 'recipe does not match recorded inputs')
-    check_binary_and_source(m, files['codex'], fixture)
+    check_binary(m, files['codex'], fixture)
+    return result, m
+
+
+def verify(context, expected_context_sha256, fixture=False):
+    """Always check both content and Git source; no CLI source-check bypass exists."""
+    result, manifest = _verify_content(context, expected_context_sha256, fixture)
+    check_source(manifest, fixture)
     return {**result, 'verification': 'local-context-integrity-only'}
 
 

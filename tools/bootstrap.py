@@ -385,7 +385,18 @@ class Bootstrap:
         if not re.fullmatch(r'[a-z][a-z0-9-]{2,24}', name) or name in ('dp-maint', 'dp-dev'):
             raise Blocked('invalid named operator')
         self.preflight()
+        if gptbox_context is not None:
+            self.check_gptbox_inputs(gptbox_context, expected_context)
+            if self.path('/usr/bin/git').exists():
+                self.validate_gptbox_context(gptbox_context, expected_context)
         with self.lock():
+            if gptbox_context is not None:
+                if not self.path('/usr/bin/git').exists():
+                    self.step('git-prerequisite', lambda: self.run('/usr/bin/dnf', '-y',
+                              '--setopt=gpgcheck=1', '--setopt=localpkg_gpgcheck=1', '--disablerepo=*',
+                              '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'))
+                # Full source verification precedes desired binding, accounts, ingress and normal packages.
+                self.validate_gptbox_context(gptbox_context, expected_context)
             desired = json.dumps({'schema': 1, 'standards_sha': STANDARDS,
                                   'source_baseline': SOURCE_BASELINE,
                                   'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -434,13 +445,16 @@ class Bootstrap:
         spec.loader.exec_module(module)
         return module
 
-    def build_gptbox(self, context, expected):
+    def check_gptbox_inputs(self, context, expected):
+        """Python-only input checks before any mutation; does not admit source or runtime."""
         if platform.machine() != 'x86_64':
             raise Blocked('current pinned Codex context supports x86_64 maintenance builds only')
         if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected):
             raise Blocked('a separately trusted context SHA256 is required')
         tool = self.candidate_tool()
         source = Path(context)
+        if not source.is_absolute():
+            raise Blocked('gptbox context path must be absolute')
         # Protect transferred bytes before snapshot/verification; only root can race this source.
         if self.root == Path('/'):
             for entry in [source, *source.parents, *source.iterdir()]:
@@ -448,10 +462,24 @@ class Bootstrap:
                 if entry.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
                     raise Blocked('gptbox context must be root-owned, protected and nonsymlink')
         try:
-            tool.verify(source, expected)  # fixtures and non-reconstructed recipes denied before engine calls
-            manifest = json.loads((source / 'inputs.json').read_text())
+            _, manifest = tool._verify_content(source, expected)
             if manifest['role'] != 'maintenance':
                 raise Blocked('first bootstrap accepts only maintenance-role gptbox contexts')
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise Blocked('gptbox context/source verification failed; no host changes permitted') from None
+        return tool, source, manifest
+
+    def validate_gptbox_context(self, context, expected):
+        tool, source, manifest = self.check_gptbox_inputs(context, expected)
+        try:
+            tool.verify(source, expected)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise Blocked('gptbox context/source verification failed; no admission') from None
+        return tool, source, manifest
+
+    def build_gptbox(self, context, expected):
+        tool, source, manifest = self.validate_gptbox_context(context, expected)
+        try:
             stage = f'/var/lib/dev-pair/artifacts/gptbox/{expected}'
             self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
             self.directory('/var/lib/dev-pair/artifacts/gptbox', mode=0o755)
@@ -597,32 +625,43 @@ class Bootstrap:
                 self.step('enroll', lambda: self.run('/usr/bin/tailscale', 'up', '--auth-key=file:' + str(secret),
                          '--accept-routes=false', '--accept-dns=false', '--ssh=false',
                          '--advertise-exit-node=false', '--netfilter-mode=off', '--timeout=60s'))
+                live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json'))
+                if not isinstance(live, dict) or live.get('BackendState') != 'Running':
+                    raise Blocked('enrollment did not reach Running; bootstrap access retained')
+                self.check_node(live, tailnet, disconnect_on_mismatch=False)
+                self.event('enrollment-observed', 'complete')
             except BaseException:
-                # The daemon can commit enrollment before CLI timeout/error. Never leave it unverified.
-                self.event('enrollment-failure-cleanup', 'begin')
-                try:
-                    self.run('/usr/bin/tailscale', 'down')
-                except BaseException:
-                    self.event('enrollment-failure-cleanup', 'failed')
-                    raise Blocked('enrollment failed and Tailscale disconnect failed; initial SSH retained, inspect/revoke externally') from None
-                self.event('enrollment-failure-cleanup', 'complete')
+                # CLI success is insufficient: observation, decoding and persistence must also succeed.
+                # Disconnect is attempted even if a full disk makes journaling fail.
+                self.disconnect_unverified()
+                # No prior accepted marker existed on this new-enrollment path.
+                # A write may have become visible before its fsync/completion failed.
+                self.path(f'{STATE}/node.json').unlink(missing_ok=True)
                 raise
-            live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json'))
-            if live.get('BackendState') != 'Running':
-                raise Blocked('enrollment did not reach Running; bootstrap access retained')
-            self.check_node(live, tailnet)
-            self.event('enrollment-observed', 'complete')
         return self.status()
 
-    def check_node(self, live, tailnet):
+    def disconnect_unverified(self):
+        try:
+            self.run('/usr/bin/tailscale', 'down')
+        except BaseException:
+            try:
+                self.event('enrollment-failure-cleanup', 'failed')
+            except OSError:
+                pass
+            raise Blocked('enrollment unverified and Tailscale disconnect failed; initial SSH retained, inspect/revoke externally') from None
+        try:
+            self.event('enrollment-failure-cleanup', 'complete')
+        except OSError:
+            pass
+
+    def check_node(self, live, tailnet, disconnect_on_mismatch=True):
         node = json.dumps({'tailnet': tailnet, 'node_id': live.get('Self', {}).get('ID')}, sort_keys=True) + '\n'
         previous = self.text(f'{STATE}/node.json')
         if (live.get('CurrentTailnet', {}).get('Name') != tailnet or not live.get('Self', {}).get('ID')
                 or (previous and previous != node)):
-            self.event('unexpected-tailnet', 'disconnecting')
-            self.run('/usr/bin/tailscale', 'down')
-            self.event('unexpected-tailnet', 'disconnected')
-            raise Blocked('tailnet identity mismatch: Tailscale taken down; initial SSH retained, revoke key externally')
+            if disconnect_on_mismatch:
+                self.disconnect_unverified()
+            raise Blocked('tailnet identity mismatch: unverified node taken down; initial SSH retained, revoke key externally')
         self.atomic(f'{STATE}/node.json', node)
 
     def status(self):
@@ -664,6 +703,13 @@ def main():
                                    args.gptbox_context, args.expected_context_sha256)
             else:
                 result = {**b.preflight(), 'preview': 'prepare', 'sources': validate_sources(args.bootstrap_source)}
+                b.check_gptbox_inputs(args.gptbox_context, args.expected_context_sha256)
+                public_key(args.public_key_file)
+                if b.path('/usr/bin/git').exists():
+                    b.validate_gptbox_context(args.gptbox_context, args.expected_context_sha256)
+                    result['gptbox_context'] = 'content and source verified read-only; build not executed'
+                else:
+                    result['gptbox_context'] = 'content checked; Git source verification pending prerequisite install; not admitted'
         elif args.stage == 'enroll':
             result = b.enroll(args.auth_key_file, args.tailnet) if args.apply else {**b.preflight(), 'preview': 'enroll'}
         elif args.stage == 'finalize':

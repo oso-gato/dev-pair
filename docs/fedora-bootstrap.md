@@ -47,7 +47,7 @@ The actual current SSH source must be in the declared CIDRs before apply.
 
 ## Maintenance gptbox inputs
 
-First bootstrap requires `--gptbox-context` and a separately recorded trusted
+Before any state, account, network or normal package changes, Python-only checks verify the context hash, exact file/schema/recipe/binary contents, maintenance role and x86_64 platform. An invalid input leaves no immutable desired binding; correcting the hash or inputs can be retried. First bootstrap requires `--gptbox-context` and a separately recorded trusted
 `--expected-context-sha256`; there is no implicit/latest image or fixture fallback.
 Use [candidate preparation](candidate-preparation.md#supply-real-inputs-without-inventing-pins)
 with **role `maintenance`**, actual upstream-verified Fedora44 digest/Codex binary,
@@ -115,10 +115,7 @@ This is not final private administration or completed root retirement.
 
 ## First-bootstrap image build and its limit
 
-After the signed prerequisites and isolated accounts exist, prepare verifies the
-real context using `candidate.py`, reconstructs the only permitted Containerfile,
-and rejects fixtures, changed bytes and development-role contexts **before any
-engine call**. Verification checks source Git bytes using a fixed Git executable
+Prepare and its read-only preview check the real context using `candidate.py`, reconstruct the only permitted Containerfile, and reject fixtures, changed bytes, unsupported architecture and development-role contexts **before host mutation**. With Git available, full source-object verification also occurs before mutation. On a vanilla host without Git, only a minimal signature-checked Fedora `git-core` prerequisite is installed; full source verification must then pass before immutable desired binding, normal packages, accounts or ingress changes. That prerequisite may remain if source verification fails, with no admitted desired target. Preview reports source verification pending instead of admitting the candidate. There is no verifier CLI bypass for source checks. The context is checked again before staging and the protected staged bytes receive full verification before any engine call. Verification checks source Git bytes using a fixed Git executable
 and clean environment. It does not independently authenticate upstream operator
 evidence. Root-owned 0444 snapshots under
 `/var/lib/dev-pair/artifacts/gptbox/<context-sha256>` prevent runtime-user changes
@@ -187,7 +184,7 @@ sudo -n true
 The node ID is recorded and must remain consistent on retry. An unrelated
 already-running node is never adopted. A successful-but-wrong tailnet is taken
 down before reporting failure; the initial SSH route stays in place and external
-credential revocation may still be needed. A failed/timeout enrollment command also takes Tailscale down because the daemon may have enrolled before the CLI failed. A failed disconnect is reported as a
+credential revocation may still be needed. A failed/timeout enrollment command, post-enrollment status observation/JSON decode, node validation, persistence or completion-journal write takes the new unverified node down because the daemon may already have enrolled. Disconnect does not depend on a working journal. A partially visible new node-completion marker is removed after disconnect. Previously accepted unchanged nodes are not disconnected merely because a retry cannot observe their status. A failed disconnect is reported as a
 failure, not a claim of isolation. Existing accepted nodes are not automatically
 reauthenticated or reset after losing enrollment.
 

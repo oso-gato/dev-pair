@@ -334,3 +334,35 @@ systemd, Tailscale and account command in build/bootstrap tests is fake. No
 Podman/image, SSH, provider credential or live target operation occurred. Fresh
 Astra review must assess the exact combined candidate; this author record grants
 no release approval or completed Fedora/runtime acceptance.
+
+### Second scoped repair — post-enrollment failures and upfront input checks
+
+Fresh combined review of `777fc5e417c02079caff24291df012b5007aeb97` found that
+successful `tailscale up` followed by status/JSON/persistence failure could leave
+a new unverified node running. The complete new-enrollment transaction now shares
+fail-closed cleanup: up, observed status, JSON, identity, node persistence and
+completion journal. Disconnect is attempted even with broken journaling. A
+partially visible new completion record is removed after disconnect. The already
+accepted unchanged-node retry remains separate, so an observation failure does
+not unnecessarily disconnect that established node. Initial source-scoped SSH and
+independent recovery remain intact.
+
+The same repair moves context/hash/schema/role/recipe/binary/platform checks ahead
+of state/package/account/network mutation. These checks are Python-only and do
+not admit source/runtime. If Git exists, full source-object verification also
+precedes mutation. A vanilla host lacking Git installs only the declared signed
+Fedora `git-core` prerequisite, then must pass full source verification before
+immutable desired binding or normal provisioning. That prerequisite can remain
+if source verification fails; no failed desired target traps the corrected retry.
+Public candidate verification always includes Git source checking; no CLI bypass
+or `source_verified=false` admission was added. Read-only preview validates
+available inputs and explicitly reports pending source verification when Git is
+absent. Full context and protected-stage verification still precede engine use.
+
+All 46 local tests pass, including post-up command/JSON/node-persistence failure
+(before and after a visible write), accepted-node observation failure preservation,
+upfront invalid-context no-mutation, corrected-hash retry and minimal-Git/source
+failure boundaries. Compilation and whitespace checks pass. Source, model/API
+settings, host restrictions and absence of live Podman/Fedora evidence remain as
+recorded above. This is the second scoped repair cycle; further substantive
+findings require the bounded reassessment rather than silent repeated repair.
