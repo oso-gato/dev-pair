@@ -2,7 +2,7 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 05:46 HKT. This section summarizes the current state;
+Updated November 16, 2026, 05:54 HKT. This section summarizes the current state;
 chronological records below retain earlier evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
@@ -30,11 +30,13 @@ chronological records below retain earlier evidence and owner decisions.
 - Native relay `da2ebf5` and deadline/signal repair `afac296` are integrated
   locally through `9a97b81`. Fresh independent review passed the narrow repair
   with 275 tests and five adversarial checks, but native admission remains
-  blocked by an inherited systemd timeout-abort drop-in. Sole Sol High builder
-  `/root/durable_job_build` is implementing exact-unit owned masks, prelaunch
-  configuration checks and an in-relay effective-profile gate in
-  `/workspace/dev-pair-transient-profile`. Fresh Astra High
-  `/root/transient_profile_review` is prepared for the immutable candidate.
+  blocked pending review and runtime proof of the transient-profile repair.
+  Exact candidate `ef213da`, integrated as `cd2db26`, adds owned masks,
+  prelaunch configuration checks and an in-relay effective-profile gate.
+  Its 293 tests pass; combined integration passes 304 tests. Fresh Astra High
+  `/root/transient_profile_review` is reviewing that immutable candidate.
+  Sole Sol High builder `/root/durable_job_build` now works on the independent
+  offline tool-boundary component in `/workspace/dev-pair-tool-boundary`.
   No policy grants, forced contexts or budget increases are included.
 - Source handoffs are `/workspace/scratch/native-fifo-label-design.md`,
   `/workspace/scratch/nested-profile-source-research.md` and
@@ -44,7 +46,7 @@ chronological records below retain earlier evidence and owner decisions.
 - Subagent model/effort choices are accepted API settings: Sol High builder and
   fresh Astra High review. Backend attestation and coordinator model metadata
   are unavailable. Each implementation/review/retest slice retains its finite
-  scope and evidence; current profile source slice is 35 minutes before checkpoint.
+  scope and evidence; the offline source slice is 35 minutes before checkpoint.
 - VPS remains untouched; root credential availability was checked without
   exposing or sending it. This cloud has no verified supported VPS SSH route.
   Local managed Docker works but lacks the cgroup enforcement needed to replace
@@ -2120,3 +2122,29 @@ retaining the managed permission policy; endpoint/auth-mode differences must
 be recorded. This is a queued validation component, not model authentication
 or proof that every production tool path is covered. No real model/auth call
 or additional native target was used by that research.
+
+### November 16, 2026, 05:54 HKT — exact profile candidate and combined checks
+
+Sol High candidate `ef213dac4bbf848207d5e80e8b3d77f4c82c7167` is frozen
+and integrated as `cd2db266e729826573502c7540de9be412bd1c8b`. All ten changed
+files match the immutable candidate. Builder tests: 293 passed in 44.361
+seconds, including 18 focused profile tests. Combined integration with reviewed
+storage: 304 passed in 46.435 seconds. Evidence:
+`/workspace/artifacts/transient-profile-ef213da/` and
+`/workspace/artifacts/transient-profile-combined-tests.log`.
+
+Fresh Astra High `/root/transient_profile_review` is independently reviewing
+the exact source and failure paths. No new Fedora run is admitted before its
+verdict and any required repair. Existing protected `/run/systemd/system`,
+real cache refresh, SELinux labels/transitions, D-Bus reads and effective timers
+remain native checks; local injections do not prove them.
+
+The sole builder now has an isolated offline-tool worktree from the combined
+candidate. Its 35-minute checkpoint is due around 06:28 HKT. It may run one
+bounded local stock-binary experiment using only synthetic Responses and
+credentials in a private namespace, with the existing 180-second experiment
+envelope. No ambient credentials, public listener, external model/auth call,
+new container/VM or VPS change is permitted by that slice. Fresh independent
+`/root/codex_tool_boundary_review` is preparing. Native profile findings take
+priority; this concurrent independent component does not permit a second
+builder or weaken the native acceptance gate.
