@@ -8,7 +8,7 @@ short-path/cleanup repair then ran in [run 2](https://github.com/oso-gato/dev-pa
 all 140 tests, actual runner preflight and cleanup passed. Measured resources were
 91541061632 free disk bytes and 16760348672 RAM bytes with Podman4.9.3. A subsequent
 tmp-directory initialization-order defect blocked before any image download or
-Fedora boot; its narrow repair is underway. Local tests remain distinct from
+Fedora boot; its narrow repair passes 142 integrated tests and fresh affected review, awaiting runner retest. Local tests remain distinct from
 Fedora runtime evidence.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source

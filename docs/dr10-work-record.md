@@ -923,3 +923,11 @@ Logs: https://github.com/oso-gato/dev-pair/actions/runs/43729968336 and
 a five-minute narrow initialization-order repair with a realistic regression,
 fresh review and third exact-candidate run. Measured capacity supports later
 engineering reassessment of CI sizing; no limits have been silently enlarged.
+
+The ordering correction returned as
+`79b1f984e1b3f0883964b904197e1f3e02f994cf`, integrated as
+`247b0dbcd28f8ebb3eb95fd3bdc6a565bf042896`. All 142 integrated tests pass.
+Fresh Astra-configured High `/root/fedora_ci_init_review` returned narrow PASS
+and independently passed all 19 CI tests. Declared paths now initialize before
+Podman probes, retaining owner/mode/symlink/device checks and existing cleanup.
+Publish the third exact-candidate run to verify the observed real-engine case.
