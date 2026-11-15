@@ -1335,3 +1335,20 @@ consolidated source repair is assigned; fresh API-configured Astra High
 immutable candidate. No further hosted run is authorized for the defective
 source. The same candidate's secret withholding, script entry and cross-process
 initializer lock checks passed, but do not override the failed execution bounds.
+
+
+First repair `da3e4e3bb26aeb51ba0b10e3d245d10381f8e98b` is integrated
+byte-identically as `68f2e11`; builder187/coordinator188 tests pass. Fresh Astra
+High `/root/first_bootstrap_deadline_review` independently passed187 repository
+tests and twelve targeted checks. Shared absolute deadline inheritance,
+restoration, success-boundary enforcement and generic command cleanup now pass.
+
+The review still requires one P2 repair: ProbeCommands checks a disallowed exit
+after its cleanup try block. A parent exiting9 with a descendant that closes its
+pipes leaves that descendant alive and skips native reconciliation. Evidence:
+`/workspace/artifacts/first-bootstrap-deadline-review-da3e4e3/review.json`.
+The second bounded repair cycle is eight minutes, limited to routing this failed
+exit through the shared cleanup and preserving real exit diagnostics, with a
+real closed-pipe orphan regression. Fresh API-configured Astra High
+`/root/first_bootstrap_probe_exit_review` awaits its immutable source. No
+publication or hosted execution of either first-bootstrap candidate occurred.
