@@ -61,14 +61,15 @@ class ProbeCommands(Commands):
         if input_text is not None:
             raise Blocked('probe diagnostics cannot accept stdin credentials or prompts')
         environment = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
-        process = subprocess.Popen(args, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, start_new_session=True)
+        process = None
         buffers = {'stdout': bytearray(), 'stderr': bytearray()}
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
-        selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
         deadline, total = time.monotonic() + timeout, 0
         try:
+            process = subprocess.Popen(args, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, start_new_session=True)
+            selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+            selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
             while selector.get_map():
                 if time.monotonic() >= deadline:
                     raise TimeoutError()
@@ -81,20 +82,24 @@ class ProbeCommands(Commands):
                     if total > 4194304:
                         raise Blocked('probe output budget exceeded')
                     buffers[key.data].extend(chunk)
-            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                raise TimeoutError()
+            self.limit_timeout(timeout)
         except BaseException:
+            cleanup = 'interrupted-or-failed'
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=5)
-            self.reconcile_native(args, environment)
-            self.diagnostic(buffers, 'interrupted-or-failed')
-            raise Blocked('probe command failed or timed out; bounded protected diagnostics retained') from None
+                if process is not None:
+                    self.interrupt(process, args, environment)
+            except (Blocked, OSError, subprocess.SubprocessError):
+                cleanup = 'cleanup-unresolved'
+            self.diagnostic(buffers, cleanup)
+            raise Blocked('probe command failed or timed out; bounded protected diagnostics retained; ' + cleanup) from None
         finally:
             selector.close()
-            process.stdout.close()
-            process.stderr.close()
+            if process is not None:
+                process.stdout.close()
+                process.stderr.close()
         self.diagnostic(buffers, process.returncode)
         if process.returncode not in ok:
             raise Blocked('probe command failed; bounded protected diagnostics retained')

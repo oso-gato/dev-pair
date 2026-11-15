@@ -50,7 +50,10 @@ must remain trusted; Git/SHA metadata is identity, not remote authentication.
 Initialization has a 2280-second execution ceiling, a 600-second prepare phase
 (including public key fetching), a 1620-second adapter phase and at most a
 45-second exact-resource cleanup attempt after adapter failure, all clipped to
-remaining execution time. An interrupted command has at most45seconds of
+remaining execution time. Separate command runners inherit the earliest enclosing
+absolute deadline for timers, native limits and successful boundary checks.
+An interrupted capture kills its owned process group and reconciles its exact
+native unit even when the direct launcher already exited. An interrupted command has at most45seconds of
 additional process/native-stop cleanup grace; this does not enlarge any native
 component lifetime. Adapter image pull/build share 600 seconds. Existing
 900-second assembly and 180-second runtime native OCI lifetimes stay unchanged.

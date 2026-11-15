@@ -2,6 +2,7 @@
 import contextlib
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -154,6 +155,101 @@ class InitializeTests(unittest.TestCase):
             run(sys.executable, '-c', 'import time;time.sleep(5)', input_text='x' * 16384, timeout=.05)
         self.assertNotIn('secret-stdin-sentinel', json.dumps(records))
         self.assertNotIn('secret-env-sentinel', json.dumps(records))
+
+    def test_separate_runners_share_earliest_phase_timer_and_child_native_limit(self):
+        outer, inner, third = b.Commands(), b.Commands(), b.Commands()
+        records = []
+        third.diagnostic = records.append
+        for _ in range(3):
+            with self.assertRaisesRegex(b.Blocked, 'deadline'):
+                third(sys.executable, '-c', 'import time;time.sleep(.04)', timeout=.02)
+            self.assertNotEqual(records[-1]['status'], 0)
+        third.diagnostic = None
+        started = time.monotonic()
+        with self.assertRaisesRegex(b.Blocked, 'phase execution budget'):
+            with outer.phase(.05, 'outer', native=False):
+                with inner.phase(.2, 'inner', native=False):
+                    time.sleep(.1)
+        self.assertLess(time.monotonic() - started, .2)
+        self.assertIsNone(outer.deadline)
+        self.assertIsNone(inner.deadline)
+        with self.assertRaisesRegex(b.Blocked, 'phase execution budget'):
+            with outer.phase(.05, 'outer', native=False):
+                with inner.phase(1, 'inner', native=False):
+                    time.sleep(.005)
+                time.sleep(.1)
+        original = b.subprocess.Popen
+        ceilings = []
+        def spawned(args, **kwargs):
+            ceilings.append(float(next(v.rsplit('=', 1)[1].removesuffix('s') for v in args
+                                       if v.startswith('--property=RuntimeMaxSec='))))
+            return original(args[args.index(sys.executable):], **kwargs)
+        with patch.object(b.subprocess, 'Popen', side_effect=spawned):
+            with outer.phase(.15, 'outer', native=False):
+                with inner.phase(1, 'inner', native=False):
+                    self.assertLess(third.limit_timeout(900), .15)
+                    third('/usr/bin/systemd-run', '--property=RuntimeMaxSec=180',
+                          sys.executable, '-c', 'print("local native-argv dispatch only")')
+        self.assertEqual(len(ceilings), 1)
+        self.assertGreater(ceilings[0], 0)
+        self.assertLessEqual(ceilings[0], .15)
+        with self.assertRaises(b.Blocked):
+            with outer.phase(.05, 'outer', native=False):
+                with inner.phase(1, 'inner', native=False):
+                    third(sys.executable, '-c', 'import time;time.sleep(.3)', timeout=2)
+
+    def test_expired_nested_phase_rejects_at_exit_even_with_alarm_delivery_blocked(self):
+        outer, inner = b.Commands(), b.Commands()
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        try:
+            with self.assertRaisesRegex(b.Blocked, 'phase execution budget'):
+                with outer.phase(.02, 'outer', native=False):
+                    with inner.phase(.2, 'inner', native=False):
+                        time.sleep(.04)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            while signal.SIGALRM in signal.sigpending():
+                signal.sigtimedwait({signal.SIGALRM}, 0)
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        self.assertIsNone(outer.deadline)
+        self.assertIsNone(inner.deadline)
+        self.assertIsNone(b._PHASE_DEADLINE.get())
+
+    def test_exited_launcher_descendant_is_killed_and_native_dispatch_reconciled(self):
+        original = b.subprocess.Popen
+        for runner, native in ((b.Commands, False), (b.Commands, True), (g.ProbeCommands, True)):
+            marker = Path(self.tmp.name) / ('escaped-after-exit-' + runner.__name__ + str(native))
+            processes = []
+            def spawned(args, **kwargs):
+                if native:
+                    args = args[args.index(sys.executable):]
+                process = original(args, **kwargs)
+                processes.append(process)
+                return process
+            script = ('import os,time,pathlib,sys; pid=os.fork(); '
+                      'os._exit(0) if pid else None; time.sleep(.35); '
+                      'pathlib.Path(sys.argv[1]).write_text("escaped")')
+            run = runner()
+            if isinstance(run, g.ProbeCommands):
+                run.diagnostic = lambda buffers, status: None
+            prefix = ('/usr/bin/systemd-run', '--unit=dev-pair-exited-test',
+                      '--description=dev-pair-owned-dev-pair-exited-test', '--property=RuntimeMaxSec=180') if native else ()
+            try:
+                with patch.object(b.subprocess, 'Popen', side_effect=spawned), \
+                        patch.object(run, 'reconcile_native') as reconcile:
+                    with self.assertRaisesRegex(b.Blocked, 'deadline|timed out'):
+                        run(*prefix, sys.executable, '-c', script, str(marker), timeout=.1)
+                    self.assertEqual(processes[0].poll(), 0)
+                    reconcile.assert_called_once()
+                    self.assertEqual(reconcile.call_args.args[0][:len(prefix)], prefix[:-1] + ('--property=RuntimeMaxSec=0.100s',) if native else ())
+                time.sleep(.4)
+                self.assertFalse(marker.exists())
+            finally:
+                for process in processes:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_native_root_unit_is_recorded_before_spawn_and_runs_clean_environment(self):
         run = b.Commands()

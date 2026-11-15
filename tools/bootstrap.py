@@ -3,6 +3,7 @@
 import argparse
 import base64
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import http.client
@@ -91,15 +92,27 @@ KEYS_FETCH_ATTEMPTS = 3
 class Blocked(Exception):
     pass
 
+_PHASE_DEADLINE = contextvars.ContextVar('dev_pair_phase_deadline', default=None)
+
+
 class Commands:
     """Bounded execution with secret-safe, explicitly public diagnostics."""
     deadline = None
     native_prefix = None
     diagnostic = None
     native_register = None
+    _cleanup_deadline = None
+
+    def execution_deadline(self):
+        # Explicit cleanup controls are finite and may run after an execution
+        # deadline; ordinary fresh runners always inherit the enclosing phase.
+        if self._cleanup_deadline is not None:
+            return self._cleanup_deadline
+        return min((value for value in (self.deadline, _PHASE_DEADLINE.get()) if value is not None), default=None)
 
     def limit_timeout(self, timeout):
-        remaining = timeout if self.deadline is None else min(timeout, self.deadline - time.monotonic())
+        deadline = self.execution_deadline()
+        remaining = timeout if deadline is None else min(timeout, deadline - time.monotonic())
         if remaining <= 0:
             raise Blocked('phase execution budget exhausted')
         return remaining
@@ -107,25 +120,37 @@ class Commands:
     @contextlib.contextmanager
     def phase(self, seconds, prefix, native=True):
         previous = self.deadline, self.native_prefix
-        phase_deadline = min(time.monotonic() + seconds, self.deadline or float('inf'))
+        started = time.monotonic()
+        old_timer = signal.getitimer(signal.ITIMER_REAL)
+        old_timer_deadline = started + old_timer[0] if old_timer[0] else None
+        phase_deadline = min(started + seconds, self.execution_deadline() or float('inf'),
+                             old_timer_deadline or float('inf'))
         remaining = phase_deadline - time.monotonic()
         if remaining <= 0:
             raise Blocked('phase execution budget exhausted')
         def expired(signum, frame):
             raise Blocked('phase execution budget exhausted')
-        old_handler = signal.signal(signal.SIGALRM, expired)
-        old_timer = signal.setitimer(signal.ITIMER_REAL, remaining)
-        started = time.monotonic()
-        self.deadline = phase_deadline
-        self.native_prefix = prefix + '-' + uuid.uuid4().hex[:8] if native else None
+        old_handler = signal.getsignal(signal.SIGALRM)
+        token = None
         try:
+            signal.signal(signal.SIGALRM, expired)
+            token = _PHASE_DEADLINE.set(phase_deadline)
+            self.deadline = phase_deadline
+            self.native_prefix = prefix + '-' + uuid.uuid4().hex[:8] if native else None
+            signal.setitimer(signal.ITIMER_REAL, remaining)
             yield
         finally:
+            elapsed = time.monotonic() >= phase_deadline
             signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, old_handler)
             self.deadline, self.native_prefix = previous
-            if old_timer[0]:
-                signal.setitimer(signal.ITIMER_REAL, max(.001, old_timer[0] - (time.monotonic() - started)), old_timer[1])
+            if token is not None:
+                _PHASE_DEADLINE.reset(token)
+            signal.signal(signal.SIGALRM, old_handler)
+            if old_timer_deadline is not None:
+                # Restore the absolute deadline, never a fresh outer duration.
+                signal.setitimer(signal.ITIMER_REAL, max(.000001, old_timer_deadline - time.monotonic()), old_timer[1])
+            if elapsed:
+                raise Blocked('phase execution budget exhausted')
 
     @staticmethod
     def public_operation(args):
@@ -162,6 +187,7 @@ class Commands:
         # A separate bounded runner has no phase/native wrapper or diagnostic
         # callback: cleanup observations cannot recursively launch more units.
         control = Commands()
+        control._cleanup_deadline = time.monotonic() + 20
         observed = control('/usr/bin/systemctl', 'show', '--property=Description', '--property=ActiveState',
                            '--property=LoadState', '--property=User', unit, ok=(0, 1, 4), timeout=5)
         values = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
@@ -177,6 +203,27 @@ class Commands:
                 raise Blocked('native unit remains unresolved; no duplicate effects')
         elif values.get('ActiveState') not in ('inactive', 'failed'):
             raise Blocked('native unit observation failed; no duplicate effects')
+
+    def interrupt(self, process, args, env):
+        # A reaped/exited launcher still owns its session's process group, and
+        # the exact native unit can outlive that launcher independently.
+        failed = False
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            failed = True
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            failed = True
+        try:
+            self.reconcile_native(args, env)
+        except (Blocked, OSError, subprocess.SubprocessError):
+            failed = True
+        if failed:
+            raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime')
 
     def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
         timeout = self.limit_timeout(timeout)
@@ -207,6 +254,7 @@ class Commands:
         total = 0
         status = 'not-started'
         process = None
+        completed = False
         selector = selectors.DefaultSelector()
         try:
             process = subprocess.Popen(args, env=env, stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
@@ -249,26 +297,26 @@ class Commands:
                     if input_text is None:
                         buffers[key.data].extend(block)
             status = process.wait(timeout=1)
+            if time.monotonic() - started >= timeout:
+                raise Blocked('command deadline exceeded; output withheld')
+            self.limit_timeout(timeout)
             if status not in ok:
                 raise Blocked('%s failed (exit %s; output withheld)' % (Path(original[0]).name, status))
-            return bytes(buffers['stdout']).decode() if input_text is None else ''
+            result = bytes(buffers['stdout']).decode() if input_text is None else ''
+            completed = True
+            return result
         except (OSError, subprocess.SubprocessError):
             status = 'failed-or-timed-out'
             raise Blocked('command failed or timed out; output withheld') from None
         except BaseException:
-            if status == 'running':
+            if status == 'running' or (not completed and status in ok):
                 status = 'interrupted-or-failed'
             raise
         finally:
             cleanup_error = None
-            if process is not None and process.poll() is None:
+            if process is not None and not completed:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=5)
-                try:
-                    self.reconcile_native(args, env)
+                    self.interrupt(process, args, env)
                 except (Blocked, OSError, subprocess.SubprocessError) as exc:
                     cleanup_error = exc
                     status = 'cleanup-unresolved'
