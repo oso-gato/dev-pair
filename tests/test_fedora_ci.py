@@ -39,6 +39,11 @@ class FedoraCITests(unittest.TestCase):
         observed=guest.public_diagnostics(state,expected)['resolved_discovery']
         self.assertEqual(observed['reason'],'discovery-listener-remains')
         self.assertEqual(observed['directory_mode'],0o755)
+        for malformed in ([], None, 'SECRET-STRING', 123, True):
+            path.write_text(json.dumps(malformed))
+            observed=guest.public_diagnostics(state,expected)['resolved_discovery']
+            self.assertEqual(observed,{'status':'unavailable'})
+            self.assertNotIn('SECRET',json.dumps(observed))
         for key,value in (('reason','SECRET-UNRECOGNIZED'),('source_sha','d'*40),
                           ('directory_mode',True),('stock_labels_match','SECRET')):
             wrong=dict(witness);wrong[key]=value;path.write_text(json.dumps(wrong))

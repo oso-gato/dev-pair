@@ -1012,6 +1012,7 @@ def public_diagnostics(state_root, expected):
         selected['prepare_progress'] = {'step': 'unavailable', 'source_verification': {'outcome': 'unavailable'}}
     try:
         witness = read_json(state_root / 'resolved-discovery.json', 8192)
+        require(type(witness) is dict, 'Invalid discovery witness object')
         reasons = {'none','config-directory-mode','config-owner-or-type','config-file-mode','config-file-conflict','config-label-mismatch',
                    'merged-config-conflict','runtime-discovery-enabled','runtime-properties-unavailable','runtime-properties-malformed','discovery-listener-remains',
                    'retained-listener-missing','resolved-identity-rejected'}
