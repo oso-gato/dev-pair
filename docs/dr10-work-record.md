@@ -14,8 +14,8 @@ owner decisions remain retained in order.
   real Fedora VM booted/shut down under TCG; guest report framing was rejected.
   Partial preflight/status text is not complete accepted evidence. Cleanup passed.
 - One API-configured Sol High builder, `/root/durable_job_build`, is implementing
-  verified public-input transfer in `/workspace/dev-pair-fedora-inputs`. Fresh
-  Astra High `/root/fedora_public_inputs_review` awaits its exact commit. No
+  verified public-input transfer in `/workspace/dev-pair-fedora-inputs`. The first review found input snapshot/deadline flaws; the builder is repairing
+  them for fresh Astra High `/root/public_inputs_snapshot_review`. No
   provider backend attestation or coordinator model metadata is available.
 - Next: complete/review input helper, then implement/review dedicated bounded
   guest result transport using `/workspace/scratch/fedora-ci-serial-plan.md`.
@@ -1079,3 +1079,32 @@ rules, not a main-branch release gate. The detailed protection endpoint returned
 No settings were changed. This corroborates the previously recorded independent
 release-enforcement gap; local subagent reviews and the current workflow do not
 establish a separately enforced production gate. Keep draft/unmerged status.
+
+The public-input helper returned two commits, `c7ece54` and
+`db27f3a462066d2f560eca571365d9e02a7e5a6f`, integrated locally as a313332
+and ce38a54; not published. Builder's 159 tests pass. A real cached-input run
+repeated strict Cosign successfully through the supported proxy, then produced
+and extracted a payload and passed the unchanged candidate context verifier.
+Evidence: `/workspace/artifacts/public-inputs-db27f3a-jcqaoe7x`. The coordinator
+read its public receipt/results and independently hashed the final files:
+manifest `16d147d868e43e547ec942a9dab3d57416e8160767643d0fd29529aec19e1187`;
+payload `8745b41e2f8264ff61ce50137597373d1d06926fdd0dcc6103bb0c6e70f5e274`;
+context `148ea8ac35cbb5c2264de333efdb9fa128bd414f073aacfb9a8f9d2c47836834`.
+Compressed size121065775 bytes, expanded300075694 bytes/257 files. Git reverse
+index support was corrected after actual Git generated a .rev file. Original
+signature bundle, verifier output and hash-bound receipt now survive later
+packaging failures; the initial failed run's deleted receipt was not recreated.
+
+Fresh Astra High `/root/fedora_public_inputs_review` returned changes required:
+P1 manifest hashing and parsing reopen the input and can authenticate different
+bytes; P2 FIFO/nonregular admission can block before the extraction deadline.
+Both were reproduced. Eleven helper tests passed but did not cover these cases;
+a malformed Codex-tar test also stopped before member validation. The Sol builder
+owns a twelve-minute consolidated repair: capture regular bounded inputs once,
+hash/parse/decompress the same private bytes, put every admission step under the
+deadline, and add real replacement/FIFO/device/size/time plus parser tests.
+Re-extract the existing trusted payload without repeating unchanged cryptography.
+Fresh `/root/public_inputs_snapshot_review` awaits its exact fix. The retained
+pre-fix payload is evidence for its recorded source only, not an admitted release
+or an assertion that the new consumer boundary already passed. No CI/runtime
+change or further hosted execution accompanies this helper yet.
