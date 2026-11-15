@@ -1839,3 +1839,35 @@ shadowing, effective kill values, native identity and preparation remain gates.
 No source publication grants job, authentication, model or VPS admission.
 The sole builder has resumed the isolated offline-state WIP; it cannot change
 the frozen native test source or publish without its own review.
+
+
+### November16, 2026, 03:35 HKT — native admission passes; command transport blocked
+
+[Run13](https://github.com/oso-gato/dev-pair/actions/runs/43752925913), job132930653097,
+source39cc4bc, passed224tests30.648s and actual native executor admission.
+The protected mask, effective kill profile, root/MainPID1194/cgroup and default
+SELinux transition to unconfined_service_t were verified. This is the authorized
+root provisioning executor, not an agent/container relaxation. Enforcing Fedora,
+authenticated inputs, pre/post inspection/status, password absence and outer
+cleanup passed. Complete reportv4 frame7410bytes SHA256
+`adea5fce4dcd2b6bec08f3a7e408fed3223b205ee2effce39a8cda18d3295900`.
+
+Initialization still stopped after10.224s at first transient getenforce, with
+connection-reset-by-peer from systemd-run. The native handoff alone did not
+resolve command execution. The selected AVC filter retained0lines and omitted1;
+it currently requires a known comm field, so the omitted record cannot be
+interpreted. Recurrence of the error does not independently prove the exact
+run9 denial. No packages, discovery convergence or assembly are accepted.
+Evidence: `/workspace/artifacts/fedora-ci-run-43752925913.log`,
+`-controller.json` and `-report.json`. The scoped mask retest is closed.
+
+Fresh Astra High `/root/native_command_io_design` is doing bounded read-only
+diagnosis/design. A documented candidate is manager-opened private FIFO paths
+for stdout/stderr, avoiding systemd-run --pipe FD transfer over D-Bus while
+preserving1MiB combined capture and native cgroup/deadline cleanup. Sensitive
+stdin would need a separately protected bounded ephemeral file and exact crash/
+retry ownership cleanup. Blanket LimitFSIZE is unsuitable: it also limits dnf/
+image files, not only output. Structured AVC security-field projection can retain
+USER_AVC diagnostics without arbitrary path/proctitle/argv/private payload.
+No implementation or new hosted run is admitted yet; no SELinux exception.
+The sole Sol builder is finishing the independent offline-state component.
