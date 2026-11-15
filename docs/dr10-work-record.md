@@ -774,3 +774,36 @@ secret-free test execution before a workflow is proposed. No workflow or VM has
 been launched by that research, and a CI VM would not replace final acceptance
 on the designated Hostinger VPS. The existing local runtime capability blocker
 does not imply that every other authorized test executor is unavailable.
+
+The ledger source returned as `111e036161cdc108805b86e36c74d7009e8f4078`,
+integrated as `d55d5a1e3ad449eb4558915c9fd219045a2679df`. It adds one strict
+schema library, a transactional SQLite controller, CLI and a fixed local JSON
+data recipe; it accepts no arbitrary command or external unauthenticated result.
+The documented journey ran in separate processes and retained failure evidence
+while rejecting stale consumption after a repaired checkpoint. All 122 tests
+passed. Fresh Astra High `/root/durable_job_review` also verified hot-journal
+recovery after process death, sixteen duplicate submissions/executors with one
+reservation/result, and 83 malformed-field rejects. It found one P2 defect:
+an accepted near-limit request can overflow the result envelope and make both
+execution and reconciliation fail permanently. The Sol builder is correcting
+that size contract with a regression before fresh review; the ledger is not yet
+published as reviewed source.
+
+Public CI research verified that standard public-repository runners are free;
+the initial workflow will use `ubuntu-24.04`, logs only, no cache/artifact upload,
+paid runner or external account credentials. The official Fedora 44 Cloud
+Generic 44-1.7 qcow2 checksum signature passed verification against fingerprint
+`36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6`. Image length is 583729152 bytes and
+SHA256 is `28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f`.
+Research handoff: `/workspace/scratch/fedora-ci-feasibility.md`; official evidence
+is public and does not include the private standards text.
+
+The same Sol High builder began a separate CI worktree at
+`/workspace/dev-pair-fedora-ci`, branch `codex/fedora-ci-probe`, from d55d5a1,
+then paused it for the ledger repair. Its bounded thirty-minute initial task is
+an executable signed-image Fedora VM boot/preflight route, followed by actual
+maintenance gptbox probes where supported. KVM, available storage, tooling and
+timing must be measured; capacity/time failure remains blocked evidence. No
+VPS access, tailnet enrollment, authenticated model execution or release follows
+from a CI VM pass. The exact workflow source requires fresh review before parent
+publication and observation of the first bounded CI run.
