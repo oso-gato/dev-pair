@@ -234,10 +234,11 @@ def main():
         report['diagnostics'] = diagnostics()
         # ttyS0 remains diagnostic console only. Failed dedicated delivery has
         # no console fallback and cannot become a passing controller report.
-        try:
-            write_report(report)
-        finally:
-            subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=10)
+        # A complete frame can already be visible before native drain fails.
+        # Only successful delivery permits normal shutdown/executor success;
+        # failure leaves this VM to the unchanged controller/native deadlines.
+        write_report(report)
+        subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=10)
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 import base64
 import contextlib
+import errno
 import io
 import json
 import os
@@ -210,6 +211,75 @@ class FedoraReportTests(unittest.TestCase):
         finally:
             os.close(master)
             os.close(slave)
+
+    def test_real_main_pty_complete_frame_late_drain_failure_blocks_poweroff(self):
+        self.exercise_main_shutdown(late_failure=True)
+
+    def test_real_main_pty_success_requests_poweroff_only_after_drain(self):
+        self.exercise_main_shutdown(late_failure=False)
+
+    def exercise_main_shutdown(self, late_failure):
+        master, slave = pty.openpty()
+        received = bytearray()
+        stopped = threading.Event()
+        events = []
+        def read_terminal():
+            while not stopped.is_set():
+                if select.select([master], [], [], .02)[0]:
+                    received.extend(os.read(master, 4096))
+        reader = threading.Thread(target=read_terminal)
+        reader.start()
+        actual_open, actual_drain = os.open, termios.tcdrain
+        def open_terminal(path, *args, **kwargs):
+            return actual_open(os.ttyname(slave) if path == '/dev/ttyS1' else path, *args, **kwargs)
+        def drain(fd):
+            actual_drain(fd)
+            if late_failure:
+                raise OSError(errno.EIO, 'real completed PTY frame, injected late drain failure')
+            events.append('drained')
+        def shutdown(*args, **kwargs):
+            self.assertEqual(events, ['drained'])
+            events.append('poweroff')
+            return subprocess.CompletedProcess(args[0], 0)
+        argv = ['fedora_ci_guest.py', '--source', 'a' * 40, '--archive-sha256', 'c' * 64,
+                '--bundle-sha256', 'd' * 64, '--guest-sha256', guest.digest(pathlib.Path(guest.__file__))]
+        try:
+            # Stop before Fedora checks rather than fabricating passing host
+            # outcomes. main/finalization and the terminal write are real.
+            with mock.patch.object(sys, 'argv', argv), \
+                 mock.patch.object(guest, 'stage_source', side_effect=ValueError('transport-only fixture; baseline not run')), \
+                 mock.patch.object(guest, 'diagnostics', return_value={'fixture': 'no Fedora evidence'}), \
+                 mock.patch.object(guest.os, 'open', side_effect=open_terminal), \
+                 mock.patch.object(guest.termios, 'tcdrain', side_effect=drain), \
+                 mock.patch.object(guest.subprocess, 'run', side_effect=shutdown) as poweroff:
+                if late_failure:
+                    with self.assertRaises(OSError):
+                        guest.main()
+                    poweroff.assert_not_called()
+                else:
+                    guest.main()
+                    poweroff.assert_called_once()
+            limit = time.monotonic() + 1
+            while not received.endswith(guest.REPORT_END) and time.monotonic() < limit:
+                time.sleep(.01)
+            parsed = ci.parse_serial(bytes(received), 'a' * 40, argv[-1])
+            self.assertEqual(parsed['phases']['fedora-preflight']['status'], 'blocked')
+            self.assertEqual(events, [] if late_failure else ['drained', 'poweroff'])
+        finally:
+            stopped.set()
+            reader.join(timeout=1)
+            os.close(master)
+            os.close(slave)
+
+    def test_complete_fifo_frame_without_executor_completion_still_times_out(self):
+        frame = guest.encode_report(self.report())
+        code = ('import os,sys,base64,time;fd=os.open(sys.argv[1],os.O_WRONLY);'
+                'os.write(fd,base64.b64decode(sys.argv[2]));time.sleep(5)')
+        with ci.ReportPipe(self.root) as pipe, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ci.Blocked, 'deadline exceeded'):
+                self.probe.bounded([sys.executable, '-c', code, str(pipe.base) + '.out', base64.b64encode(frame).decode()],
+                                   .2, 'guest did not shut down', disk_check=False, report_pipe=pipe)
+        self.assertTrue(self.probe.report['dedicated_report_witness']['framing_complete'])
 
 
 if __name__ == '__main__':

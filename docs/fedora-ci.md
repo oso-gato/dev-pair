@@ -160,8 +160,11 @@ hardware flow control disabled. One frame contains `DP_FEDORA_REPORT_V1` plus LF
 at most65536 JSON bytes, and the fixed LF/`DP_FEDORA_REPORT_END`/LF footer. The
 producer and consumer use the same constants from the hash-bound guest source.
 Short writes and EAGAIN are handled; queue draining and native `tcdrain` share a
-finite30-second write deadline before poweroff is requested. Failure never falls
-back to cloud-init stdout, and partial output cannot pass framing validation.
+finite30-second write deadline before poweroff is requested. Normal poweroff is
+requested only after successful write/drain return. A late drain failure may
+leave complete bytes visible, so it propagates without normal shutdown; the
+unchanged controller/native timeout then blocks executor success. Failure never
+falls back to cloud-init stdout, and partial output cannot pass framing validation.
 
 The controller concurrently drains console and result streams under the unchanged
 aggregate8MiB limit. The report has its own JSON-plus-fixed-framing cap; reads
