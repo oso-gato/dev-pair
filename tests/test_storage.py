@@ -184,6 +184,22 @@ class StorageTests(unittest.TestCase):
                                         platform_growth_bytes=0, guest_metadata_margin_bytes=0, guest=s.Space(8 * s.GIB, 10000)))
         self.assertTrue(unchanged['fits_capacity_plan'])
 
+    def test_existing_unreserved_growth_must_be_within_full_declared_existing_maximum(self):
+        values = {name: 0 for name in self.plan() if name not in ('guest', 'runner')}
+        values.update(guest=s.Space(32 * s.GIB, 100), runner=s.Space(32 * s.GIB, 100))
+        for existing, growth in ((0, s.GIB), (s.GIB, 15 * s.GIB)):
+            with self.subTest(existing=existing, growth=growth), self.assertRaisesRegex(s.StorageBlocked, 'contradictory-existing-managed-growth'):
+                s.admit(**{**values, 'existing_managed_bytes': existing, 'existing_unreserved_growth_bytes': growth,
+                           'overlay_growth_upper_bound_bytes': growth})
+        admitted = s.admit(**{**values, 'existing_managed_bytes': 20 * s.GIB, 'existing_unreserved_growth_bytes': s.GIB,
+                             'overlay_growth_upper_bound_bytes': s.GIB})
+        self.assertTrue(admitted['fits_capacity_plan'])
+        self.assertEqual(admitted['managed_reserved_after_bytes'], 20 * s.GIB)
+        self.assertEqual(admitted['guest_peak_additional_bytes'], s.GIB)
+        rejected = s.admit(**{**values, 'existing_managed_bytes': 20 * s.GIB, 'new_managed_bytes': 1,
+                             'existing_unreserved_growth_bytes': s.GIB, 'overlay_growth_upper_bound_bytes': s.GIB + 1})
+        self.assertIn('managed-aggregate-20gib', rejected['blockers'])
+
     def test_independent_guest_ci_and_aggregate_limits_cannot_substitute_for_each_other(self):
         cases = (({'existing_managed_bytes': 16 * s.GIB}, 'managed-aggregate-20gib'),
                  ({'guest': s.Space(14 * s.GIB, 10000)}, 'guest-8gib-reserve'),

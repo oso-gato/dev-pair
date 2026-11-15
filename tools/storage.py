@@ -201,7 +201,9 @@ def admit(*, guest: Space, runner: Space, existing_managed_bytes, new_managed_by
     overlay_current_bytes is the greater observed file length/allocated bytes;
     its growth bound covers BOTH length and allocation growth, including qcow
     metadata/stale COW clusters. These conservative maxima are caller evidence.
-    Existing materialized reservations are already charged to guest free space.
+    Existing managed bytes are FULL declared maximum lengths, including any
+    sparse/unreserved remainder. That remainder must be a subset; only it is
+    charged again to guest free space, not the materialized portion.
     Outstanding commitments are unmaterialized; growth maxima include overlapping
     phase peaks/rollback/copy/COW metadata, never image-inspect logical Size.
     """
@@ -212,6 +214,7 @@ def admit(*, guest: Space, runner: Space, existing_managed_bytes, new_managed_by
     for name, value in values.items():
         if name not in ('guest', 'runner'):
             number(value, name.replace('_', '-'))
+    require(existing_unreserved_growth_bytes <= existing_managed_bytes, 'contradictory-existing-managed-growth')
     managed = existing_managed_bytes + new_managed_bytes + outstanding_managed_bytes
     guest_charge = new_managed_bytes + outstanding_managed_bytes + existing_unreserved_growth_bytes + platform_growth_bytes + guest_metadata_margin_bytes
     overlay_peak = overlay_current_bytes + overlay_growth_upper_bound_bytes

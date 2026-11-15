@@ -48,9 +48,12 @@ no selected quota-option flags; that proves neither enabled enforcement nor its
 absence. This component does not inspect or claim Btrfs quota enforcement.
 
 The Python `admit(...)` function requires `Space` measurements and every named
-peak input explicitly. Missing/null/mistyped/negative metrics block. Existing
-materialized reservations are included in the single20GiB aggregate but are not
-subtracted again from current guest free space. New and outstanding unmaterialized
+peak input explicitly. Missing/null/mistyped/negative metrics block. Existing managed bytes mean the FULL declared maximum lengths, including
+currently sparse/unreserved remainder, in the single20GiB aggregate. The
+`existing_unreserved_growth_bytes` remainder must be <= those existing declared
+maxima; contradictory inputs block. Only that remainder is additionally charged
+to guest free space. The already materialized portion is not charged twice, and
+the remainder is not added twice to the managed aggregate. New and outstanding unmaterialized
 reservations, remaining unreserved growth, platform writes and metadata margin
 are charged to the guest peak; planned inode growth must also fit.
 
