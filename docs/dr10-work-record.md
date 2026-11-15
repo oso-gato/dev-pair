@@ -2,14 +2,15 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 06:16 HKT. This section summarizes the current state;
+Updated November 16, 2026, 06:28 HKT. This section summarizes the current state;
 chronological records below retain earlier evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
   branch `codex/dr10-reconciliation-review`, coordination tree
-  `/workspace/dev-pair`. Reviewed combined source `c5f9c6e` reached run15, whose
-  sole failure was a test-only local-path assumption before the VM stage.
-  Publish portable fixture repair `42bd4c3` and this record for one retest. Previously
+  `/workspace/dev-pair`. Published source `574ba6a` passed all310 hosted tests
+  and reached the relay in enforcing Fedora during run16. It blocked before
+  payload execution because a queried stdio path property is not readable.
+  A source-backed property/FD-identity correction is being designed. Previously
   separate reviewed storage is included. Supplemental checkpoint
   `f15c11efbc7213f2d96f9133edf16a530601a05c` retains earlier reviewed work.
   Standards remain `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
@@ -18,8 +19,9 @@ chronological records below retain earlier evidence and owner decisions.
   inputs, pre/post inspection, complete report framing and outer cleanup.
   Initialize blocked after 16.811 seconds: status209, with actual init_t write
   denial on a var_run_t FIFO. No preparation/assembly acceptance. Its single-run
-  scope is closed. Run15's scope is also closed without executing Fedora; the
-  reviewed test repair receives one separate retest below.
+  scope is closed. Run15 stopped in a test fixture, subsequently repaired;
+  run16's native scope is now closed with the specific profile-query failure.
+  No new run or unchanged retry is admitted.
 - Reviewed offline stock-Codex state and managed-child component is included on
   the PR. Actual no-network checks passed; independent review verified cleanup
   failures cannot return success. Authentication, complete tool-path enforcement,
@@ -2254,3 +2256,50 @@ because its filesystem helper could not set a nested UID map. The baseline
 UID1000 checks and cleanup passed. A setup-only single-identity namespace
 refinement is being investigated within the remaining source/experiment limits;
 no managed policy or tool-coverage verdict is weakened to obtain a pass.
+
+### November 16, 2026, 06:28 HKT — run16 reached relay; readable-property correction
+
+[Run16](https://github.com/oso-gato/dev-pair/actions/runs/43768378827), job
+132978517323, source `574ba6ad6ae037d8d423594b346c82523696378e`, passed
+all310 hosted tests in41.221 seconds. Real Enforcing Fedora44, systemd259.5,
+policy43.3, authenticated inputs, native provisioning admission, pre/post
+inspection, password absence, complete reporting and outer cleanup passed.
+The frame is8518 bytes, SHA256
+`db74d53d146a9223cb666bca2986fa09848f1728370e437ab4815b9cf750a8e1`.
+
+Initialization blocked after14.515 seconds. Its first command reached the
+immutable relay and returned bounded failure metadata in2.766 seconds:
+effective-profile, StandardInputFile missing, native status250, no payload
+output or accepted exit. This is not a completed effective-profile/cache gate
+or preparation/assembly acceptance. The captured audit projection contains one
+separate setfiles_t/var_lib_t:file read/write denial; it contains no earlier
+init_t/var_run_t FIFO denial. Do not infer absence outside captured input or
+claim every package/maintenance transition works. Guest cleanup remains
+unverified beyond the reported password absence and outer teardown.
+
+Artifacts: `/workspace/artifacts/fedora-ci-run-43768378827.log`,
+`-controller.json`, `-report.json` and `-request.json`. The one-run scope is
+closed. Bounded v259 source diagnosis found all three StandardInputFile,
+StandardOutputFile and StandardErrorFile names are setters without readable
+vtable entries. The remaining selected-property names exist, with output/type
+audit in progress. Verification must retain stdio mode checks and bind actual
+opened FDs to controller-recorded device/inode identities before sensitive
+input or payload execution; simply accepting missing path properties is not
+an adequate repair.
+
+Source diagnosis also found systemctl show applies its property filter after
+a D-Bus GetAll. A closed output filter is not a server-side read restriction.
+The in-relay gate must use bounded exact property reads if it is to uphold its
+no-Environment/ExecStart-read contract. Design:
+`/workspace/scratch/native-profile-property-design.md` (pending completion).
+No new policy grant, generalized property API, extended timer or relaxed gate
+is proposed. The sole builder continues the nearly complete independent
+offline tool component while this concrete native correction is prepared.
+
+The actual offline fixture now completed14 stock shell/patch/image actions in
+16 HTTP requests under UID/GID1000, private loopback, all capabilities zero and
+NNP. Setup used only single-identity mappings inside an unprivileged namespace;
+no host capability or managed-policy change. Its report still blocks complete
+inventory closure for other exposed tools, and exact candidate/review remain
+pending. Source design for those remaining surfaces is
+`/workspace/scratch/codex-tool-inventory-closure-design.md`.
