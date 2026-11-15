@@ -15,6 +15,7 @@ import resource
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,31 @@ SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL'
 PHASES = ('runner-preflight', 'signed-cloud-image', 'tooling', 'source-payload',
           'fedora-boot', 'fedora-preflight', 'bootstrap-inspect', 'bootstrap-status',
           'bootstrap-prepare', 'maintenance-gptbox', 'cleanup')
+
+
+def scratch_root(runner_temp):
+    require(runner_temp and pathlib.Path(runner_temp).is_dir(), 'RUNNER_TEMP unavailable')
+    # Podman 4.9 rejects runroot paths longer than 50 characters. The normal
+    # /home/runner/work/_temp prefix plus our leaf already exceeds that limit.
+    # All storage/disks/accounting stay together in one private, short leaf.
+    parent = pathlib.Path('/tmp')
+    info = parent.lstat()
+    require(stat.S_ISDIR(info.st_mode) and not parent.is_symlink() and info.st_uid == 0 and
+            (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX), 'short scratch parent is not trusted')
+    root = pathlib.Path(tempfile.mkdtemp(prefix='dpvm-', dir=parent))
+    root.chmod(0o755)  # public payload only; engine storage retains private modes
+    return root
+
+
+def mounts_below(root):
+    for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
+        fields = line.split()
+        require(len(fields) >= 6, 'cannot validate scratch mount inventory')
+        decoded = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
+        mounted = pathlib.Path(decoded)
+        if mounted == root or root in mounted.parents:
+            return True
+    return False
 
 
 class Blocked(Exception):
@@ -273,6 +299,13 @@ class Probe:
         self.source = source
         self.repo = pathlib.Path(__file__).resolve().parents[1]
         self.root = root
+        info = root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not root.is_symlink() and info.st_uid == os.getuid(),
+                'scratch must be an owned nonsymlink directory')
+        require(all(len(os.fsencode(root / name)) <= 50 for name in ('graph', 'runroot', 'tmp')),
+                'scratch engine paths exceed Podman 50-byte runroot compatibility limit')
+        self.scratch_identity = (info.st_dev, info.st_ino)
+        self.engine_activity = False
         self.report = {'version': 1, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
                        'controller_sha256': file_hash(pathlib.Path(__file__)),
                        'workflow_sha256': file_hash(self.repo / '.github/workflows/fedora-vm.yml'),
@@ -346,6 +379,7 @@ class Probe:
             process.stdout.close()
 
     def helper(self, args, timeout=60, **kwargs):
+        self.engine_activity = True  # version-only preflight never starts resources
         return self.bounded(self.podman + args, timeout, 'tooling command', **kwargs)
 
     def run_args(self, entrypoint, mounts=True):
@@ -377,7 +411,8 @@ class Probe:
         version = run_small(self.podman + ['version', '--format=json']).decode()
         self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
                                  'podman': json.loads(version), 'free_bytes': free, 'memory_bytes': mem,
-                                 'merge_sha': os.environ.get('DP_MERGE_SOURCE', 'unreported')}
+                                 'merge_sha': os.environ.get('DP_MERGE_SOURCE', 'unreported'),
+                                 'scratch_device': self.scratch_identity[0], 'scratch_root': str(self.root)}
         self.phase('runner-preflight', 'pass', 'Actual standard-runner OS/source/tools/capacity checked; no host packages installed')
 
     def inputs(self):
@@ -489,10 +524,28 @@ class Probe:
     def cleanup(self):
         # No system reset, prune, shared storage deletion or runner cleanup.
         # Rootful storage exists solely below the controller's mkdtemp leaf.
-        result = subprocess.run(self.podman + ['rm', '--force', '--all'], capture_output=True, env=SAFE_ENV, timeout=20)
-        require(result.returncode in (0, 1), 'own test container cleanup failed')
-        cleanup = subprocess.run(['sudo', '-n', '/bin/rm', '-rf', '--', str(self.root)], capture_output=True, env=SAFE_ENV, timeout=60)
-        require(cleanup.returncode == 0 and not self.root.exists(), 'own scratch cleanup incomplete')
+        info = self.root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not self.root.is_symlink() and info.st_uid == os.getuid() and
+                (info.st_dev, info.st_ino) == self.scratch_identity, 'scratch identity changed; cleanup refused')
+        if self.engine_activity:
+            result = subprocess.run(self.podman + ['rm', '--force', '--all'], capture_output=True, env=SAFE_ENV, timeout=20)
+            require(result.returncode == 0, 'engine cleanup failed; owned scratch preserved for reconciliation: ' +
+                    evidence_tail(result.stderr, 1500))
+            remaining = subprocess.run(self.podman + ['ps', '--all', '--external', '--format={{.ID}}'],
+                                       capture_output=True, env=SAFE_ENV, timeout=20)
+            require(remaining.returncode == 0 and not remaining.stdout.strip(),
+                    'engine resource inventory unresolved; owned scratch preserved: ' +
+                    evidence_tail(remaining.stderr, 1500))
+        require(not mounts_below(self.root), 'active scratch mounts remain; owned scratch preserved')
+        # Preflight-only failures need no working engine or sudo. After actual
+        # engine use, root-owned storage can require narrowly scoped removal.
+        try:
+            shutil.rmtree(self.root)
+        except PermissionError:
+            cleanup = subprocess.run(['sudo', '-n', '/bin/rm', '-rf', '--', str(self.root)],
+                                     capture_output=True, env=SAFE_ENV, timeout=60)
+            require(cleanup.returncode == 0, 'own scratch cleanup incomplete')
+        require(not self.root.exists(), 'own scratch cleanup incomplete')
         self.phase('cleanup', 'pass', 'Only this run\'s isolated Podman containers and unique scratch/storage/disks were removed')
 
     def execute(self):
@@ -531,10 +584,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--expected-source', required=True)
     args = parser.parse_args()
-    scratch_parent = os.environ.get('RUNNER_TEMP')
-    require(scratch_parent and pathlib.Path(scratch_parent).is_dir(), 'RUNNER_TEMP unavailable')
-    root = pathlib.Path(tempfile.mkdtemp(prefix='dev-pair-fedora-', dir=scratch_parent))
-    root.chmod(0o755)
+    root = scratch_root(os.environ.get('RUNNER_TEMP'))
     return Probe(args.expected_source, root).execute()
 
 

@@ -127,6 +127,17 @@ workflow-command controls are escaped, tails are bounded, and truncation is
 explicit. No qcow2, complete filesystem, environment or credential directory is
 uploaded. `DP_PHASE`, `DP_SERIAL_TAIL`, `DP_REPORT` and the job summary distinguish
 the exact attempted phases; fixture/local-test results never become Fedora passes.
+
+Podman4.9 requires its runroot path to fit within 50 characters. All probe state,
+graph/runroot/tmp paths and disks therefore share one uniquely owned short
+`/tmp/dpvm-*` leaf; capacity/accounting inspect that actual filesystem. The normal
+long `RUNNER_TEMP` path remains an environment precondition, not the storage root.
+Preflight/version-only failure deletes the verified owned scratch without needing
+a functioning engine. After engine activity, deletion requires successful removal,
+an empty inventory including external build containers, and no remaining mount
+under scratch. Any uncertainty preserves scratch and reports cleanup failure.
+UID, device/inode and nonsymlink identity are checked before deletion; unrelated
+or replaced paths are never cleanup targets.
 All controller log output uses central safe emitters covering both modern
 `::command::` and legacy `##[command]` syntax. Structured JSON escapes introducer
 characters inside strings, preserving valid JSON and exact decoded evidence,

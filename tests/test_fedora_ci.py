@@ -150,6 +150,69 @@ class FedoraCITests(unittest.TestCase):
         with self.assertRaisesRegex(ci.Blocked, 'invalid payload identity'):
             ci.seed_data('a' * 39 + '\n', 'b' * 64, 'c' * 64, 'd' * 64)
 
+    def test_realistic_runner_temp_uses_short_owned_engine_paths(self):
+        old_root = pathlib.Path('/home/runner/work/_temp/dev-pair-fedora-abcdefgh')
+        self.assertGreater(len(os.fsencode(old_root / 'runroot')), 50)
+        runner_temp = self.root / 'home/runner/work/_temp'
+        runner_temp.mkdir(parents=True)
+        short = ci.scratch_root(str(runner_temp))
+        self.addCleanup(lambda: shutil.rmtree(short, ignore_errors=True))
+        probe = ci.Probe('a' * 40, short)
+        self.assertEqual(short.parent, pathlib.Path('/tmp'))
+        self.assertEqual(short.stat().st_uid, os.getuid())
+        self.assertEqual(short.stat().st_mode & 0o022, 0)
+        for name in ('graph', 'runroot', 'tmp'):
+            self.assertLessEqual(len(os.fsencode(short / name)), 50)
+            self.assertIn(str(short / name), ' '.join(probe.podman))
+
+    def test_preflight_failure_removes_owned_scratch_without_engine_or_sudo(self):
+        short = ci.scratch_root(str(self.root))
+        self.addCleanup(lambda: shutil.rmtree(short, ignore_errors=True))
+        (short / 'partial-public-input').write_text('preserve diagnostics in report, not scratch')
+        probe = ci.Probe('a' * 40, short)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}), \
+             mock.patch.object(probe, 'preflight', side_effect=ci.Blocked('engine initialization rejected')), \
+             mock.patch.object(ci.subprocess, 'run', side_effect=AssertionError('no engine/sudo should be needed')):
+            self.assertEqual(probe.execute(), 2)
+        self.assertFalse(short.exists())
+        self.assertEqual(probe.report['phases']['cleanup']['status'], 'pass')
+        report = next(json.loads(line.split(' ', 1)[1]) for line in captured.getvalue().splitlines()
+                      if line.startswith('DP_REPORT '))
+        self.assertEqual(report['blocker'], 'engine initialization rejected')
+
+    def test_active_engine_failure_or_mount_preserves_owned_scratch(self):
+        probe = ci.Probe('a' * 40, self.root)
+        probe.engine_activity = True
+        evidence = self.root / 'evidence'
+        evidence.write_text('retain')
+        with mock.patch.object(ci.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, b'', b'engine failed')) as run:
+            with self.assertRaisesRegex(ci.Blocked, 'scratch preserved'):
+                probe.cleanup()
+            self.assertEqual(run.call_count, 1)
+        with mock.patch.object(ci.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'', b'')), \
+             mock.patch.object(ci, 'mounts_below', return_value=True):
+            with self.assertRaisesRegex(ci.Blocked, 'active scratch mounts'):
+                probe.cleanup()
+        with mock.patch.object(ci.subprocess, 'run', side_effect=[
+                subprocess.CompletedProcess([], 0, b'', b''),
+                subprocess.CompletedProcess([], 0, b'active-buildah-resource\n', b'')]):
+            with self.assertRaisesRegex(ci.Blocked, 'inventory unresolved'):
+                probe.cleanup()
+        self.assertEqual(evidence.read_text(), 'retain')
+
+    def test_cleanup_refuses_replaced_owned_directory(self):
+        original = self.root / 'original'
+        original.mkdir()
+        probe = ci.Probe('a' * 40, original)
+        original.rename(self.root / 'retained-original')
+        original.mkdir()
+        marker = original / 'replacement'
+        marker.write_text('retain')
+        with self.assertRaisesRegex(ci.Blocked, 'identity changed'):
+            probe.cleanup()
+        self.assertEqual(marker.read_text(), 'retain')
+
     def test_real_du_churn_is_provisional_then_stabilizes_without_ignoring_permissions(self):
         tree = self.root / 'churn'
         tree.mkdir()
