@@ -97,7 +97,8 @@ against a 2GiB ceiling. If the real runner cannot fit, record capacity blocked;
 never remove preinstalled software or enlarge bounds to force a pass.
 Measurements use one-filesystem traversal to avoid counting overlay merged mounts
 again. During live package/storage churn, only exact owned-path ENOENT diagnostics
-are eligible for three bounded retries. The largest observed size remains subject
+are eligible for three bounded retries; both proven `cannot access` and
+`cannot read directory` ENOENT forms are covered. The largest observed size remains subject
 to the overhead cap; an incomplete live sample is explicitly provisional. Every
 completed command must obtain a stable error-free measurement before advancing.
 Permission, I/O, invalid summaries and unrecognized errors block immediately;

@@ -193,7 +193,7 @@ def parse_du(root, result):
     # Accept only GNU du's precise ENOENT traversal race, beneath this owned
     # root. Permission, I/O, mount, sudo and unrecognized errors stay blockers.
     for line in result.stderr.splitlines():
-        match = re.fullmatch(rb"(?:/usr/bin/)?du: cannot access '([^'\r\n]+)': No such file or directory", line)
+        match = re.fullmatch(rb"(?:/usr/bin/)?du: cannot (?:access|read directory) '([^'\r\n]+)': No such file or directory", line)
         require(match is not None and match[1].startswith(os.fsencode(root) + b'/') and
                 b'..' not in match[1].split(b'/'),
                 'storage measurement has non-disappearance errors')

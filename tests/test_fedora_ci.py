@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
+import shutil
 import time
 import unittest
 from unittest import mock
@@ -204,6 +206,55 @@ class FedoraCITests(unittest.TestCase):
         with mock.patch.object(ci.subprocess, 'run', return_value=huge):
             with self.assertRaisesRegex(ci.Blocked, 'overhead limit'):
                 ci.measure_storage(self.root, live=True, sudo=False)
+
+    def test_real_removed_recreated_directories_and_exact_read_directory_enoent(self):
+        # The same FTS race has two proven GNU forms. Exercise the exact
+        # read-directory variant deterministically, then real directory churn;
+        # do not make CI depend on which sub-millisecond race a kernel exposes.
+        summary = ('4096\t' + str(self.root) + '\n').encode()
+        read_directory = ("du: cannot read directory '" + str(self.root / 'gone') +
+                          "': No such file or directory\n").encode()
+        self.assertEqual(ci.parse_du(self.root, subprocess.CompletedProcess([], 1, summary, read_directory)),
+                         (4096, True))
+        for malformed in (read_directory.replace(b'No such file or directory', b'Permission denied'),
+                          read_directory.replace(b'No such file or directory', b'Input/output error'),
+                          read_directory.replace(str(self.root).encode(), b'/outside')):
+            with self.assertRaisesRegex(ci.Blocked, 'non-disappearance'):
+                ci.parse_du(self.root, subprocess.CompletedProcess([], 1, summary, malformed))
+        for index in range(1500):
+            directory = self.root / str(index)
+            directory.mkdir()
+            (directory / 'x').touch()
+        stop = threading.Event()
+        def churn():
+            while not stop.is_set():
+                for directory in self.root.iterdir():
+                    if stop.is_set():
+                        break
+                    try:
+                        shutil.rmtree(directory)
+                        directory.mkdir()
+                        (directory / 'x').touch()
+                    except FileNotFoundError:
+                        pass
+        worker = threading.Thread(target=churn)
+        worker.start()
+        disappearance_seen = False
+        try:
+            for _ in range(250):
+                result = subprocess.run(['/usr/bin/du', '--summarize', '--block-size=1',
+                                         '--one-file-system', '--exclude=guest.qcow2', str(self.root)],
+                                        env=ci.SAFE_ENV, capture_output=True, timeout=5)
+                _, vanished = ci.parse_du(self.root, result)
+                disappearance_seen |= vanished
+                if b'cannot read directory' in result.stderr:
+                    break
+            self.assertTrue(disappearance_seen, 'real directory removal race was not exercised')
+        finally:
+            stop.set()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+        self.assertFalse(ci.measure_storage(self.root, sudo=False)['provisional'])
 
     def test_all_public_emitters_neutralize_both_runner_commands_without_losing_json_evidence(self):
         attack = '::error::modern :::notice:::: overlap ##[warning]legacy ###['
