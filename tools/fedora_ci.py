@@ -24,7 +24,7 @@ import time
 import urllib.request
 
 from fedora_ci_guest import (REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS,
-                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object)
+                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor)
 import public_inputs as public
 
 GIB = 1024 ** 3
@@ -422,7 +422,7 @@ def seed_data(source, inputs, guest_sha):
     validate_inputs(inputs)
     require(inputs['source_sha'] == source and re.fullmatch('[0-9a-f]{64}', guest_sha), 'invalid payload identity')
     # Only public hashes and filenames enter NoCloud; password exists in guest only.
-    command = ['/usr/bin/python3', '/run/dev-pair-payload/guest.py', '--source', source,
+    command = ['/usr/bin/python3', '/run/dev-pair-payload/guest.py', '--stage-systemd', '--source', source,
                '--inputs-json', json.dumps(inputs, sort_keys=True), '--guest-sha256', guest_sha]
     return ('#cloud-config\n'
             'disable_root: true\nssh_pwauth: false\n'
@@ -459,6 +459,8 @@ def parse_serial(data, expected_source, expected_guest, expected_inputs):
         require(type(phase) is dict and set(phase) == {'status', 'detail'} and
                 phase['status'] in ('pass', 'fail', 'blocked') and type(phase['detail']) is str and
                 len(phase['detail']) <= 4000, 'invalid guest phase')
+    if any(phase['status'] == 'pass' for phase in result['phases'].values()):
+        validate_executor(result['identity'].get('provisioning_executor'), expected_inputs, expected_guest)
     observed = result['initialization']
     if observed:
         validate_initialization(observed, expected_inputs)
@@ -795,7 +797,7 @@ class Probe:
         require(record['source_sha'] == self.source and produced['source_sha'] == self.source and
                 produced['context_sha256'] == record['context_sha256'] and produced['payload_sha256'] == record['payload']['sha256'],
                 'Public producer target differs from exact checked out candidate')
-        self.handoff = {'source_sha': self.source, 'helper_sha256': file_hash(helper), 'manifest_sha256': manifest_sha,
+        self.handoff = {'controller_sha256': self.report['controller_sha256'], 'source_sha': self.source, 'helper_sha256': file_hash(helper), 'manifest_sha256': manifest_sha,
                         'payload_sha256': record['payload']['sha256'], 'payload_bytes': record['payload']['bytes'],
                         'context_sha256': record['context_sha256'], 'distrobox_sha': record['distrobox_sha'],
                         'standards_sha': record['standards_sha'], 'codex_sha256': public.CODEX_SHA, 'codex_source_sha': public.CODEX_SOURCE}

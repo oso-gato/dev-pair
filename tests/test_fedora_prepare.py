@@ -23,6 +23,15 @@ def identities():
     return {**{key: 'c' * length for key, length in guest.INPUT_LENGTHS.items()}, 'source_sha': 'a' * 40, 'payload_bytes': 123}
 
 
+def executor_fixture(expected, guest_sha):
+    # Contract fixture only, never evidence of a running systemd executor.
+    return {'kind': 'native-systemd-service', 'source_sha': expected['source_sha'], 'controller_sha256': expected['controller_sha256'],
+            'unit': guest.SERVICE_NAME, 'configuration_sha256': guest.executor_profile_hash(), 'unit_sha256': ci.sha256(guest.service_unit(expected, guest_sha).encode()),
+            'script_sha256': guest_sha, 'uid': 0, 'euid': 0, 'main_pid': 12345, 'manager_main_pid': 12345,
+            'cgroup': '0::/system.slice/' + guest.SERVICE_NAME, 'context': 'system_u:system_r:fixture_t:s0',
+            'launcher_context': 'system_u:system_r:cloud_init_t:s0', 'admission_deadline': 12345.0}
+
+
 def state(prepare='complete', maintenance='blocked'):
     expected = identities()
     result = {'target': {'source_sha': expected['source_sha'], 'context_sha256': expected['context_sha256'],
@@ -52,7 +61,7 @@ class FedoraPrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'target'):
             guest.initialize_projection(changed, expected, 0)
         report = {'version': guest.REPORT_VERSION, 'source_sha': expected['source_sha'], 'guest_sha256': 'b' * 64,
-                  'inputs': expected, 'initialization': partial, 'identity': {}, 'diagnostics': {},
+                  'inputs': expected, 'initialization': partial, 'identity': {'provisioning_executor': executor_fixture(expected, 'b' * 64)}, 'diagnostics': {},
                   'phases': {name: {'status': 'blocked', 'detail': 'synthetic protocol fixture only'} for name in guest.GUEST_PHASES}}
         report['phases']['bootstrap-prepare']['status'] = 'pass'
         with self.assertRaisesRegex(ci.Blocked, 'actual preparation evidence'):
@@ -113,7 +122,7 @@ class FedoraPrepareTests(unittest.TestCase):
         complete = guest.initialize_projection(state(maintenance='complete'), expected, 0)
         complete.update(prepared_image_id='d' * 64, prepared_image_verified=True, assembled_image_verified=True, packages_sha256='f' * 64, package_count=3)
         report = {'version': guest.REPORT_VERSION, 'source_sha': expected['source_sha'], 'guest_sha256': 'b' * 64,
-                  'inputs': expected, 'initialization': complete, 'identity': {}, 'diagnostics': {},
+                  'inputs': expected, 'initialization': complete, 'identity': {'provisioning_executor': executor_fixture(expected, 'b' * 64)}, 'diagnostics': {},
                   'phases': {name: {'status': 'pass', 'detail': 'synthetic contract only; no host acceptance'} for name in guest.GUEST_PHASES}}
         changed = {**expected, 'payload_sha256': 'f' * 64}
         with self.assertRaisesRegex(ci.Blocked, 'public input identity'):
@@ -193,10 +202,11 @@ class FedoraPrepareTests(unittest.TestCase):
                 (state_root / 'initialize.json').write_text(json.dumps(failed))
                 return 2, b'fixed public initialization failure'
             return 0, b'{"enrollment_recorded": false}'
-        argv = ['guest.py', '--source', expected['source_sha'], '--inputs-json', json.dumps(expected),
+        argv = ['guest.py', '--native-service', '--source', expected['source_sha'], '--inputs-json', json.dumps(expected),
                 '--guest-sha256', guest.digest(Path(guest.__file__))]
         with mock.patch.object(sys, 'argv', argv), mock.patch.object(guest, 'STATE_ROOT', state_root), \
                 mock.patch.object(guest, 'INPUT_DESTINATION', destination), mock.patch.object(guest, 'SECRET_DIRECTORY', secret_dir), \
+                mock.patch.object(guest, 'native_executor_identity', return_value={'admission_deadline': time.monotonic() + 60}), \
                 mock.patch.object(guest, 'baseline', return_value={'root_free_bytes': 9 * ci.GIB, 'fixture': 'no Fedora evidence'}), \
                 mock.patch.object(guest, 'admit_inputs', return_value=source), \
                 mock.patch.object(guest, 'capture', side_effect=capture), \

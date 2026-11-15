@@ -67,7 +67,21 @@ contains adopted standards identities, never private standards text.
    actual bounded initialization succeeds; otherwise record TCG fallback. Keep
    QEMU's existing scoped disks/public payload, no monitor/listener/engine socket,
    no host PID/network namespace or broad mounts, cap-drop ALL and NNP.
-7. Observe actual Fedora44, Enforcing policy, systemd/cgroupv2 and >=8GiB free.
+7. Cloud-init stages an exact controller-bound script under `/usr/local/libexec/dev-pair-ci`,
+   a protected target record under `/var/lib/dev-pair/ci-executor` and a deterministic
+   `dev-pair-ci-provision.service`. Standard `restorecon` contexts apply; no process
+   label, policy or container confinement override is installed. The Type=exec root
+   service has null standard streams, a clean environment, control-group termination,
+   RuntimeMaxSec2445 and stop grace5s. Staging, selected startup acknowledgement and
+   input admission share60s. No cloud-final ordering wait or cloud-init pipe forwarding
+   occurs. Selected manager fields, exact loaded fragment/no drop-ins, effective limits,
+   actual root UID/MainPID/cgroup/SELinux context and script/unit/controller hashes must
+   match before any phase can pass. The unit contains public targets and its separate
+   protected record contains the unit hash, avoiding a hash cycle. Failed startup emits
+   only a bounded console diagnostic and requests shutdown; it cannot replace a report.
+   Staged files persist only inside the disposable VM. Observation files are bounded
+   anonymous owned regular files and close on every query exit.
+   Observe actual Fedora44, Enforcing policy, systemd/cgroupv2 and >=8GiB free.
    Admit the public inputs and run actual pre-initialization inspect/status.
    Generate a disposable password only inside the root guest in a private0700
    directory and O_EXCL0600 file. Its value never enters seed, argv, environment,
@@ -147,7 +161,7 @@ block, retaining bounded diagnostic counts/tails and truncation classifications.
 
 Dedicated ttyS1 retains the owned0600 FIFO pair, raw115200 terminal, bounded
 write/drain and exact frame protocol. Normal poweroff requires successful report
-delivery; no console salvage is accepted. JSON envelope version2 adds strict
+delivery; no console salvage is accepted. JSON envelope version3 requires strict
 public-input identities and selected initialization evidence. Producer/consumer
 share fields/limits. Wrong/unknown versions, duplicate fields, unknown identity
 or initialization fields and unmatched hashes reject. Executor exit0 plus exactly
@@ -184,7 +198,7 @@ Run `python3 -m unittest discover -s tests -q`. Local checks cover actual proces
 limits/descendants, authenticated cached payload extraction, public GPG metadata,
 FIFO/PTY framing, secret-sentinel failure paths, phase/identity rejection and fixed
 profile/network construction. Engine/service responses injected in tests remain
-explicit synthetic contracts, not Fedora execution. Actual current-source public
+explicit synthetic contracts, not Fedora execution. Actual normal Fedora native service transition/startup, current-source public
 fetch/Cosign, package timing/capacity, rootless SELinux confinement and genuine
 Distrobox initialization require a separately reviewed hosted run. No local
 VM, authentication/model, VPS or complete-pair acceptance is claimed.

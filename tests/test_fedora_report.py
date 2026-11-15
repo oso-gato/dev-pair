@@ -246,11 +246,12 @@ class FedoraReportTests(unittest.TestCase):
             self.assertEqual(events, ['drained'])
             events.append('poweroff')
             return subprocess.CompletedProcess(args[0], 0)
-        argv = ['fedora_ci_guest.py', '--source', 'a' * 40, '--inputs-json', json.dumps(fixture_inputs()), '--guest-sha256', guest.digest(pathlib.Path(guest.__file__))]
+        argv = ['fedora_ci_guest.py', '--native-service', '--source', 'a' * 40, '--inputs-json', json.dumps(fixture_inputs()), '--guest-sha256', guest.digest(pathlib.Path(guest.__file__))]
         try:
             # Stop before Fedora checks rather than fabricating passing host
             # outcomes. main/finalization and the terminal write are real.
             with mock.patch.object(sys, 'argv', argv), \
+                 mock.patch.object(guest, 'native_executor_identity', return_value={'admission_deadline': time.monotonic() + 60}), \
                  mock.patch.object(guest, 'baseline', side_effect=ValueError('transport-only fixture; baseline not run')), \
                  mock.patch.object(guest, 'diagnostics', return_value={'fixture': 'no Fedora evidence'}), \
                  mock.patch.object(guest.os, 'open', side_effect=open_terminal), \
