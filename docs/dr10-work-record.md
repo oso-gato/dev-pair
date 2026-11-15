@@ -34,9 +34,11 @@ chronological records below retain earlier evidence and owner decisions.
   Exact candidate `ef213da`, integrated as `cd2db26`, adds owned masks,
   prelaunch configuration checks and an in-relay effective-profile gate.
   Its 293 tests pass; combined integration passes 304 tests. Fresh Astra High
-  `/root/transient_profile_review` is reviewing that immutable candidate.
-  Sole Sol High builder `/root/durable_job_build` now works on the independent
-  offline tool-boundary component in `/workspace/dev-pair-tool-boundary`.
+  review returned CHANGES REQUIRED for TP-1: eager directory enumeration occurs
+  before inventory limits. Sole Sol High builder `/root/durable_job_build` is
+  repairing that finding in `/workspace/dev-pair-profile-scan-fix`; fresh
+  `/root/transient_inventory_fix_review` is prepared. Independent offline-tool
+  work is safely parked at WIP `692956f` and is not admitted.
   No policy grants, forced contexts or budget increases are included.
 - Source handoffs are `/workspace/scratch/native-fifo-label-design.md`,
   `/workspace/scratch/nested-profile-source-research.md` and
@@ -2148,3 +2150,32 @@ new container/VM or VPS change is permitted by that slice. Fresh independent
 `/root/codex_tool_boundary_review` is preparing. Native profile findings take
 priority; this concurrent independent component does not permit a second
 builder or weaken the native acceptance gate.
+
+### November 16, 2026, 06:00 HKT — finite inventory repair and signed base research
+
+Fresh profile review returned CHANGES REQUIRED for TP-1 only: Path.iterdir
+materializes directory contents before the 256-entry/16-KiB scanner bounds;
+profile and stream verification also collect foreign entries before rejection.
+Real oversized-directory reproductions confirm the issue. Independent suite:
+293 tests in 48.167 seconds; nine adversarial checks passed. Evidence:
+`/workspace/artifacts/transient-profile-review-ef213dac4bbf848207d5e80e8b3d77f4c82c7167/review.json`,
+SHA256 `5e4a0bcb26440ddab05c0eeb162802269977c60f11bd1441af020f4079314ada`.
+The sole builder switched to a 15-minute narrow streaming-enumeration repair;
+fresh Astra High `/root/transient_inventory_fix_review` is prepared.
+
+Offline-tool draft `692956f07c5d49430ce73cd76b452c7056d5c8f5` is parked
+cleanly in its separate worktree after about 6.5 minutes. It is WIP, compile-only
+and not admitted; no stock CLI or fixture listener experiment has run.
+
+Independent public-metadata research found a signed Fedora44 OCI release archive.
+Actual verification of its 1841-byte Container CHECKSUM succeeded under the
+already pinned Fedora44 fingerprint. The archive is 70,170,200 bytes, SHA256
+`75200f5752a74a21a616ca9a75e25beb594e2e117a0195c54f87c0b3e3974d1b`.
+This does not authenticate the current registry digest or yet verify archive
+bytes. Source design: `/workspace/scratch/fedora-oci-authenticity-design.md`.
+A separate local inspection may acquire that exact archive, verify its signed
+size/hash before streaming OCI metadata, and measure its graph within 180
+seconds, 512 MiB expanded reads, 4096 entries and a 64-KiB report. No extraction,
+import, layer execution, build or native target is admitted by that inspection.
+Adopting the archive will require changed source, independent review and fresh
+candidate tests; no current input or runtime verdict is upgraded.
