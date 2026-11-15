@@ -1660,3 +1660,25 @@ stock Codex state/config boundary offline in scratch, without product edits,
 credentials, login or model calls. Its15-minute/2GiB scope does not overlap the
 sole builder. The API accepted the requested model/effort; backend attestation
 and coordinator actual model metadata remain unavailable.
+
+
+### November16, 2026, 03:03 HKT — supported local Docker capability
+
+Cloud runtime skill guidance led to an explicit managed socket check.
+`/var/run/docker.sock` resolves to `/run/codex-docker/docker.sock` and the task
+user can access it. Clearing only Docker host/context/TLS endpoint overrides,
+`docker --host=unix:///var/run/docker.sock info` reports29.9.2, rootless, builtin
+seccomp and cgroupns,18882662400bytes RAM and5CPUs. This corrects the broader
+earlier inference that missing local Podman/QEMU/sudo implies no local VM path.
+No supported local Fedora execution has yet been demonstrated; the existing
+Podman runner needs an explicitly verified Docker adaptation or test harness.
+
+Fresh Astra High `/root/local_fedora_executor_feasibility` has a10-minute
+read-only/source/capability scope to assess that path without product edits,
+image pull/build or VM execution. Preserve signed inputs, exact source binding,
+network/CPU/memory/disk/time boundaries and no container privilege exceptions.
+The supported managed Docker endpoint is distinct from forbidden workload access
+to a host engine socket. No socket will enter the Fedora guest or product.
+Current managed status is the same instance/spec1, network unrestricted/enforced,
+credential reference hostinger_root ready. This does not establish a supported
+public SSH route or change the observed VPS connectivity limitation.
