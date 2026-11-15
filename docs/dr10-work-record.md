@@ -7,7 +7,7 @@ owner decisions remain retained in order.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Latest published source: `f03c6db16c3a3bc6a34a0517c74bdc4e9bf0ba31`.
+  Latest published source: `c5cef5fb8c2d22d35cc1bb8e945cae4aa1244f9b`.
   Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
 - All 175 tests passed in [CI run7](https://github.com/oso-gato/dev-pair/actions/runs/43737631539).
   Signed image/tooling/source, real TCG boot, complete dedicated report, Fedora44
@@ -1520,3 +1520,13 @@ match. Evidence: `/workspace/artifacts/fedora-diagnostic-budget-review-7aa5eba/r
 This admits the next bounded diagnostic run only; the original Fedora preparation
 cause remains unknown. The run consumes the first of two repair attempts in the
 current hosted batch, with all resource/network/secrecy limits unchanged.
+
+
+Published reviewed diagnostics `c5cef5fb8c2d22d35cc1bb8e945cae4aa1244f9b`.
+GitHub confirms that exact open draft PR head, but after several minutes both the
+commit workflow query and repository workflow-run collection report no new run.
+Run8 remains the latest completed run. No diagnostic execution is yet claimed.
+Allow a short bounded event-delivery interval, then if still absent use one
+same-candidate PR-reopen trigger (already declared in the unchanged workflow).
+Do not rerun old-source run8 or push speculative source changes to fabricate a
+new result. Record actual executor identity once a new run exists.
