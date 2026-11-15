@@ -748,3 +748,29 @@ tailnet endpoint/recovery acceptance, durable host-test repair, complete session
 renewal and the demonstrator remain unfinished. Current tools provide neither a
 supported VPS SSH route nor a local Fedora VM runtime. Do not present this
 checkpoint as completion of the owner's full dev-pair build.
+
+### Continued implementation after the reviewed checkpoint
+
+The owner renewed the instruction to continue and complete the build. The current
+checkout is clean at published `2635376af24d1c1a6acdf038484d6493b5d01214`;
+environment identity/configuration is unchanged and its credential reference is
+ready. The Fedora/VPS gate remains open, but A12.10 permits independent source
+work to continue. No product requirement or acceptance boundary is deferred.
+
+API-configured Sol High `/root/durable_job_build` is implementing the A3 durable
+job/request/result ledger in an isolated worktree, with a twenty-minute initial
+source checkpoint and at most two repair cycles before reassessment. The slice
+must preserve exact candidate/test identities, transactional recovery, duplicate
+request handling, interrupted-effect reconciliation and failure/repair/retest
+evidence. Local protocol tests cannot authorize host execution or establish the
+pair's actual host-test acceptance. No secrets, arbitrary host-command runner,
+deployment or model invocation are part of this slice.
+
+Independent Astra High `/root/fedora_ci_feasibility` is investigating a possible
+Fedora VM test executor on standard GitHub Actions runners. Connected repository
+metadata confirms that dev-pair is public. Research must verify current free
+public-runner terms, runner capabilities, official image provenance and bounded,
+secret-free test execution before a workflow is proposed. No workflow or VM has
+been launched by that research, and a CI VM would not replace final acceptance
+on the designated Hostinger VPS. The existing local runtime capability blocker
+does not imply that every other authorized test executor is unavailable.
