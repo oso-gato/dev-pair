@@ -709,3 +709,42 @@ Fedora VM result nor VPS validation exists. Missing KVM alone was not treated as
 proof that software emulation is impossible. The current environment remains
 the same configured instance, with the root credential reference reported ready;
 its value was neither displayed nor sent to the VPS.
+
+### Reviewed confined-adapter checkpoint and real prepared inputs
+
+The normalization correction returned as
+`bf597cab3f2ba0d2279735f1a46bc2944bbc7c96`, integrated byte-identically as
+`9001ea81203d66e37e5e922d6030a0862fd07b93`. It explicitly requests
+`notmpcopyup`; the guard remains strict. Fresh Astra High
+`/root/gptbox_normalization_review` returned scoped source PASS against ed9b8f3.
+It independently passed all 111 tests, compilation and whitespace checks,
+re-fetched seven official Podman source files to verify normalization semantics,
+and used emitted arguments in an independent synthetic projection that completed
+both probe cycles and rejected 32 option/ownership/mode mutations. Its Go harness
+was unavailable, so native parser execution is not claimed. Together with the
+prior affected review, this closes the recorded adapter source findings. It
+does not establish Fedora, OCI, SELinux, authentication or model acceptance.
+
+The coordinator also prepared and verified a real maintenance context using the
+recorded Codex binary and Fedora digest, bound to source 9001ea8. It lives at
+`/workspace/artifacts/dev-pair-9001ea8`, with the original input manifest, public
+verification artifacts, preparation/verification results and a transfer README.
+Its separately recorded context SHA256 is
+`9d02dc4654bf4c8e8f7b9d070e5d5f8e8aaa1ed776a0f9c7c2738e567214f5ce`.
+Its status is `prepared-not-runtime-validated` and `local-context-integrity-only`.
+The manifest records maintenance/gptbox, requested Sol High and dedicated
+`bootstrap-probe` leaves in the approved storage classes; it supplies no secrets
+and establishes no model entitlement. The local task-owned artifact must be
+transferred into protected root-owned staging before host use. If this workspace
+artifact is lost, regenerate from the recorded exact verified inputs and record
+the new context identity; never substitute a fixture or claim the old bytes exist.
+
+Publish this reviewed source checkpoint to draft PR #13 without merging. The
+next dependency is actual Fedora assembly and boundary/failure/restart validation,
+then repair of observed runtime failures, before integrating an admitted usable
+gptbox into first bootstrap and building the nested development placement.
+Authenticated jobs, credential/session loader isolation, quota/cleanup admission,
+tailnet endpoint/recovery acceptance, durable host-test repair, complete session
+renewal and the demonstrator remain unfinished. Current tools provide neither a
+supported VPS SSH route nor a local Fedora VM runtime. Do not present this
+checkpoint as completion of the owner's full dev-pair build.
