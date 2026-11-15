@@ -7,7 +7,7 @@ owner decisions remain retained in order.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Latest published source: `d79f3a4d9a6c1e3f9e611fcaeb83ca6d5e1e2fd6`.
+  Latest published source: `b8ac722ab8dac31543d0e258c8f5d2552135f1d3`.
   Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
 - 148 tests pass locally and in [CI run5](https://github.com/oso-gato/dev-pair/actions/runs/43731901140).
   Signed Fedora download, tooling construction and source transfer passed. The
@@ -1218,3 +1218,23 @@ network-none and inspection-only phase scope stay unchanged. Require complete
 candidate-bound baseline results and cleanup; prepare/assembly remain blocked
 until their next reviewed implementation. The source and review results support
 publication of the draft branch, not merge, deployment or job admission.
+
+
+Published reviewed candidate `b8ac722ab8dac31543d0e258c8f5d2552135f1d3`
+without merge. [CI run6](https://github.com/oso-gato/dev-pair/actions/runs/43736703953),
+job132880789582, is in progress; all 174 CI tests already passed. PR13 remains
+draft and its description now distinguishes implemented code, local evidence,
+prior actual boot evidence and unresolved delivery requirements.
+
+While that immutable candidate executes, the sole builder starts a separate
+25-minute source-only first-bootstrap slice from b8ac722. This overlaps no runtime
+mutation and cannot affect run6. Scope: shared initialize/prepare/assembly entry,
+exact source/context/upstream validation with signed Git prerequisite, bounded
+credential-aware command diagnostics and whole-phase/native cleanup, and pinned
+upstream staging dependencies. No CI integration changes yet. Actual report
+acceptance and fresh review precede enabling prepare in CI. Fresh API-configured
+Astra High `/root/first_bootstrap_review` prepares against the stable baseline;
+review begins only at the exact new candidate. In particular, adapter transient
+systemd units are outside a parent process group: native remaining deadlines and
+owned-unit reconciliation must cover them explicitly. No new privilege, auth,
+job, enrollment or cutover scope is granted.
