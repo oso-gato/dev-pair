@@ -366,3 +366,31 @@ failure boundaries. Compilation and whitespace checks pass. Source, model/API
 settings, host restrictions and absence of live Podman/Fedora evidence remain as
 recorded above. This is the second scoped repair cycle; further substantive
 findings require the bounded reassessment rather than silent repeated repair.
+
+### Bounded final enrollment-state repair
+
+After the two scoped repair cycles, the coordinator explicitly authorized one
+final ten-minute repair/review for another reproduction of the same enrollment
+state defect: a crash after `up` leaves Running plus matching intent but no
+accepted node record, and the old retry treated that as established before
+persistence succeeded. The resumed unverified Running state now enters the same
+full validation/persistence/disconnect transaction as a new enrollment, without
+repeating `up`. Initial status failure on a matching unverified intent also
+attempts disconnect; accepted unchanged-node observation failures retain their
+established route.
+
+Explicit `enroll --apply` now permits a narrow same-intent retry of an unverified
+Stopped state only with no accepted node record and expected/absent observed
+tailnet identity. Accepted stopped nodes are never automatically reactivated.
+Observed wrong-tailnet states create a protected recovery-required record and
+remain blocked even if later status omits the identity; scoped operator recovery
+and checked/replaced credentials remain necessary. No reset, forced reauth,
+secret logging or broader access path was added.
+
+All **50 local tests** pass, with new regressions for resumed-Running persistence
+failure, same-intent unverified-Stopped retry, accepted-Stopped refusal and
+wrong-tailnet-Stopped refusal/latching. Compilation and whitespace checks pass.
+These are synthetic state/command fixtures, not live Tailscale/Fedora evidence.
+No host, provider credential, image build, push or deployment occurred. This
+bounded repair needs fresh affected independent review of its exact commit;
+further substantive work requires a new bounded assessment.

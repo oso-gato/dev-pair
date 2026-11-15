@@ -552,6 +552,69 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(self.app.path(b.STATE + '/node.json').exists())
         self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'down') for call in self.fake.calls))
 
+    def test_resumed_unverified_running_persistence_failure_disconnects_without_up(self):
+        self.prepare()
+        self.app.atomic(b.STATE + '/enrollment-intent.json', json.dumps({'tailnet': 'example.ts.net'}, sort_keys=True) + '\n')
+        self.fake.node = {'BackendState': 'Running', 'CurrentTailnet': {'Name': 'example.ts.net'},
+                          'Self': {'ID': 'interrupted-unverified-node'}}
+        original = self.app.atomic
+        def failed_persistence(path, *args, **kwargs):
+            if path == b.STATE + '/node.json':
+                raise OSError('resumed persistence failure')
+            return original(path, *args, **kwargs)
+        self.app.atomic = failed_persistence
+        guard = self.app.text('/etc/dev-pair/bootstrap.nft')
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            with self.assertRaises(OSError):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+        self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
+        self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
+        self.assertEqual(self.app.text('/etc/dev-pair/bootstrap.nft'), guard)
+
+    def test_same_intent_unverified_stopped_retry_succeeds_with_explicit_enroll(self):
+        self.prepare()
+        self.app.atomic(b.STATE + '/enrollment-intent.json', json.dumps({'tailnet': 'example.ts.net'}, sort_keys=True) + '\n')
+        # This is the daemon state left by cleanup after an observation/persistence failure.
+        self.fake.node = {'BackendState': 'Stopped', 'CurrentTailnet': {'Name': 'example.ts.net'},
+                          'Self': {'ID': 'unverified-node'}}
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Running')
+        self.assertTrue(self.app.path(b.STATE + '/node.json').exists())
+        up = [call for call in self.fake.calls if call[:2] == ('/usr/bin/tailscale', 'up')]
+        self.assertEqual(len(up), 1)
+        self.assertFalse(any('force-reauth' in argument or 'reset' in argument for argument in up[0]))
+
+    def test_accepted_stopped_node_is_never_automatically_reactivated(self):
+        self.prepare()
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+            self.fake.node['BackendState'] = 'Stopped'
+            count = len(self.fake.calls)
+            with self.assertRaisesRegex(b.Blocked, 'explicit recovery'):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+        self.assertTrue(self.app.path(b.STATE + '/node.json').exists())
+        self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls[count:]))
+
+    def test_wrong_tailnet_stopped_retry_is_latched_for_explicit_recovery(self):
+        self.prepare()
+        self.app.atomic(b.STATE + '/enrollment-intent.json', json.dumps({'tailnet': 'example.ts.net'}, sort_keys=True) + '\n')
+        self.fake.node = {'BackendState': 'Stopped', 'CurrentTailnet': {'Name': 'wrong.ts.net'},
+                          'Self': {'ID': 'unverified-wrong-node'}}
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            with self.assertRaisesRegex(b.Blocked, 'tailnet mismatch'):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+            self.assertTrue(self.app.path(b.STATE + '/enrollment-recovery-required.json').exists())
+            # Later daemon omission of CurrentTailnet cannot erase the observed mismatch.
+            self.fake.node = {'BackendState': 'Stopped'}
+            with self.assertRaisesRegex(b.Blocked, 'explicit recovery'):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+        self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
+        self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
+
     def test_finalize_always_blocks_without_reading_fake_evidence(self):
         proc = subprocess.run([sys.executable, str(ROOT / 'tools/bootstrap.py'), 'finalize'], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2)

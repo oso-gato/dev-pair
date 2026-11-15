@@ -186,7 +186,19 @@ already-running node is never adopted. A successful-but-wrong tailnet is taken
 down before reporting failure; the initial SSH route stays in place and external
 credential revocation may still be needed. A failed/timeout enrollment command, post-enrollment status observation/JSON decode, node validation, persistence or completion-journal write takes the new unverified node down because the daemon may already have enrolled. Disconnect does not depend on a working journal. A partially visible new node-completion marker is removed after disconnect. Previously accepted unchanged nodes are not disconnected merely because a retry cannot observe their status. A failed disconnect is reported as a
 failure, not a claim of isolation. Existing accepted nodes are not automatically
-reauthenticated or reset after losing enrollment.
+reauthenticated or reset after losing enrollment. A crash after daemon enrollment
+but before `node.json` creates an **unverified** running attempt; same-intent
+retry validates/persists that node inside the same disconnect-on-failure
+transaction, without repeating `tailscale up`. An explicit `enroll --apply` may
+retry a stopped **unverified** attempt only when the protected intent matches,
+no accepted node record exists, and the observed tailnet is the expected one or
+absent. It uses the supplied external auth-file reference with the normal fixed
+flags, never reset/force-reauth. An accepted stopped node always requires separate
+controlled recovery. A previously observed wrong tailnet creates a root-protected
+recovery-required record, remains down, and cannot be retried merely because a
+later daemon response omits that identity. Such mismatches need a separately
+scoped operator recovery with credentials checked/revoked/replaced as appropriate;
+this tool provides no override or generic state deletion command.
 
 Enrollment disables Tailscale SSH, DNS/route acceptance, exit-node advertising
 and Tailscale-managed netfilter rules. Ordinary key-authenticated OpenSSH runs

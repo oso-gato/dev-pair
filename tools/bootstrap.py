@@ -608,23 +608,45 @@ class Bootstrap:
         with self.lock():
             if not self.path(f'{STATE}/prepared').exists():
                 raise Blocked('prepare must complete before enrollment')
-            live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json', ok=(0, 1)))
             intent = f'{STATE}/enrollment-intent.json'
             expected = json.dumps({'tailnet': tailnet}, sort_keys=True) + '\n'
-            if live.get('BackendState') == 'Running':
-                if self.text(intent) != expected:
-                    raise Blocked('refusing to adopt an already enrolled node')
+            same_intent = self.text(intent) == expected
+            accepted = self.path(f'{STATE}/node.json').exists()
+            try:
+                live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json', ok=(0, 1)))
+                if not isinstance(live, dict):
+                    raise Blocked('invalid Tailscale status observation')
+            except BaseException:
+                if same_intent and not accepted:
+                    self.disconnect_unverified()
+                raise
+            state = live.get('BackendState')
+            if state == 'Running' and not same_intent:
+                raise Blocked('refusing to adopt an already enrolled node')
+            if accepted:
+                if state != 'Running':
+                    raise Blocked('previous node lost enrollment; explicit recovery required')
                 self.check_node(live, tailnet)
                 return self.status()
-            if live.get('BackendState') not in ('NeedsLogin', 'NoState'):
+            if self.path(f'{STATE}/enrollment-recovery-required.json').exists():
+                if state == 'Running' and same_intent:
+                    self.disconnect_unverified()
+                raise Blocked('enrollment identity requires explicit recovery/new credentials; automatic retry denied')
+            if state not in ('Running', 'NeedsLogin', 'NoState', 'Stopped'):
                 raise Blocked('unexpected Tailscale state; no automatic reauthentication')
-            if self.path(f'{STATE}/node.json').exists():
-                raise Blocked('previous node lost enrollment; explicit recovery required')
+            if state == 'Stopped' and not same_intent:
+                raise Blocked('stopped unowned enrollment requires explicit recovery')
+            observed_tailnet = live.get('CurrentTailnet', {}).get('Name')
+            if state != 'Running' and observed_tailnet and observed_tailnet != tailnet:
+                if same_intent:
+                    self.require_enrollment_recovery(tailnet)
+                raise Blocked('stopped enrollment tailnet mismatch; explicit recovery/new credentials required')
             self.atomic(intent, expected)
             try:
-                self.step('enroll', lambda: self.run('/usr/bin/tailscale', 'up', '--auth-key=file:' + str(secret),
-                         '--accept-routes=false', '--accept-dns=false', '--ssh=false',
-                         '--advertise-exit-node=false', '--netfilter-mode=off', '--timeout=60s'))
+                if state != 'Running':
+                    self.step('enroll', lambda: self.run('/usr/bin/tailscale', 'up', '--auth-key=file:' + str(secret),
+                             '--accept-routes=false', '--accept-dns=false', '--ssh=false',
+                             '--advertise-exit-node=false', '--netfilter-mode=off', '--timeout=60s'))
                 live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json'))
                 if not isinstance(live, dict) or live.get('BackendState') != 'Running':
                     raise Blocked('enrollment did not reach Running; bootstrap access retained')
@@ -639,6 +661,10 @@ class Bootstrap:
                 self.path(f'{STATE}/node.json').unlink(missing_ok=True)
                 raise
         return self.status()
+
+    def require_enrollment_recovery(self, tailnet):
+        self.atomic(f'{STATE}/enrollment-recovery-required.json',
+                    json.dumps({'expected_tailnet': tailnet, 'reason': 'observed identity mismatch'}, sort_keys=True) + '\n')
 
     def disconnect_unverified(self):
         try:
@@ -659,8 +685,11 @@ class Bootstrap:
         previous = self.text(f'{STATE}/node.json')
         if (live.get('CurrentTailnet', {}).get('Name') != tailnet or not live.get('Self', {}).get('ID')
                 or (previous and previous != node)):
-            if disconnect_on_mismatch:
-                self.disconnect_unverified()
+            try:
+                self.require_enrollment_recovery(tailnet)
+            finally:
+                if disconnect_on_mismatch:
+                    self.disconnect_unverified()
             raise Blocked('tailnet identity mismatch: unverified node taken down; initial SSH retained, revoke key externally')
         self.atomic(f'{STATE}/node.json', node)
 
