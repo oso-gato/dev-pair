@@ -16,8 +16,11 @@ Root controls `/run/dev-pair-command-io`, its records directory and each unit's
 collisions. The root-only ownership record persists before allocation; directory
 and node device/inode/type/owner/mode/link proofs persist before any stdin bytes
 or launch. A failure between creation and proof leaves an unproven object that
-is retained. Its name alone never authorizes deletion. Existing initializer unit
-registration precedes allocation and binds exact retry to the protected job target.
+is retained. Its name alone never authorizes deletion. Initializer registration covers only the root wrappers constructed by Commands.
+Explicit dp-maint context units keep their protected transport journal and are
+reconciled by the existing exact-context retry path with User=dp-maint; they never
+enter the root-only initializer inventory. Registration precedes node allocation
+and binds exact retry to the protected job target.
 
 Each output FIFO and each launcher stdout/stderr pipe has a measured4096-byte
 capacity. Thus four native output channels have16384 bytes of kernel capacity,

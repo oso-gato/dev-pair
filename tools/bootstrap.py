@@ -307,6 +307,7 @@ class Commands:
         public = self.public_operation(args) if input_text is None else None
         unit = None
         description = None
+        register_root_wrapper = False
         # Existing user transient units are already native executors. Tighten
         # their ceilings rather than putting them outside the phase budget.
         if args and args[0] == '/usr/bin/systemd-run':
@@ -314,6 +315,7 @@ class Commands:
         elif self.native_prefix:
             if timeout < .001:
                 raise Blocked('native execution budget exhausted')
+            register_root_wrapper = True
             unit = self.native_prefix + '-' + uuid.uuid4().hex[:8]
             description = 'dev-pair-owned-' + unit
             args = ('/usr/bin/systemd-run', '--unit=' + unit, '--description=' + description,
@@ -353,7 +355,10 @@ class Commands:
                         values.get('User', '') not in ((expected_user,) if expected_user else ('', 'root')) or
                         values.get('ActiveState') not in ('inactive', 'failed')):
                     raise Blocked('native unit collision; existing resources preserved')
-                transport.setup(stdin_data, self.native_register)
+                # Initializer inventory contains only wrappers constructed here.
+                # Explicit dp-maint context units have their own UID-bound retry
+                # path and protected transport journal, not root-unit authority.
+                transport.setup(stdin_data, self.native_register if register_root_wrapper else None)
                 # No wrapped/native command and no forwarded FDs are involved in labeling.
                 control._call('/usr/sbin/restorecon', '-F', str(transport.path.parent), str(transport.record.parent),
                               str(transport.record), str(transport.path), *(str(transport.path / name) for name in transport.state['nodes']),

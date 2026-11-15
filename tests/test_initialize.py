@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bootstrap as b
 import gptbox as g
 from native_io_fixture import install, launch_payload, manager
+import native_io
 
 SOURCE = '1' * 40
 CONTEXT = 'a' * 64
@@ -108,6 +109,75 @@ class InitializeTests(unittest.TestCase):
         with patch.object(self.app, 'check_gptbox_inputs', return_value=(None, Path('/context'), {'source_sha': '2' * 40})):
             with self.assertRaisesRegex(b.Blocked, 'context/source'):
                 self.initialize(retry=True)
+
+    def test_real_native_registration_and_uid_bound_retry_after_completed_or_prelaunch_context_failure(self):
+        original = subprocess.Popen
+        for mode in ('completed-command', 'prelaunch-input'):
+            with self.subTest(mode=mode):
+                root = Path(self.tmp.name) / mode
+                root.mkdir()
+                callbacks, native_launches = [], []
+                class App(InitializeFixture):
+                    interrupt_prepare = True
+                    def preparation(app):
+                        class Preparation:
+                            run = b.Commands()
+                            def prepare(preparation, *args, source_check=None, **kwargs):
+                                source_check()
+                                if app.interrupt_prepare and mode == 'prelaunch-input':
+                                    def unresolved(args, env):
+                                        raise b.Blocked('fixture initial cleanup unavailable')
+                                    preparation.run.reconcile_native = unresolved
+                                preparation.run('/usr/bin/systemd-run', '--unit=' + NATIVE_UNIT,
+                                                '--description=dev-pair-owned-' + NATIVE_UNIT, '--uid=dp-maint',
+                                                '--wait', '--collect', '--property=RuntimeMaxSec=5', sys.executable,
+                                                '-c', 'import sys;sys.stdin.read();print("context payload")',
+                                                input_text='NONCREDENTIAL-retained-input')
+                                preparation.run(sys.executable, '-c', 'print("root wrapper payload")')
+                                if app.interrupt_prepare:
+                                    raise b.Blocked('fixture post-command prepare interruption')
+                        return Preparation()
+                app = App(root)
+                app.directory('/var/lib/dev-pair', mode=0o755)
+                app.state.mkdir(parents=True, mode=0o700)
+                (app.state / 'operator-password-set').write_text('fixture only')
+                calls = []
+                ordinary = manager(original, calls)
+                def dispatch(args, **kwargs):
+                    if args[0] == '/usr/bin/systemd-run':
+                        native_launches.append(args)
+                        if app.interrupt_prepare and mode == 'prelaunch-input':
+                            path = native_io.ROOT / NATIVE_UNIT
+                            self.assertEqual((path / 'stdin').read_bytes(), b'NONCREDENTIAL-retained-input')
+                            self.assertNotIn('NONCREDENTIAL', (native_io.ROOT / 'records' / (NATIVE_UNIT + '.json')).read_text())
+                            raise OSError('fixture prelaunch interruption')
+                    return ordinary(args, **kwargs)
+                def initialize(retry=False):
+                    return app.initialize('/context', CONTEXT, '/upstream', SOURCE, ['192.0.2.9/32'], apply=True, retry=retry)
+                with patch.object(b.subprocess, 'Popen', side_effect=dispatch), patch.object(g, 'github_keys', return_value='fixture key'):
+                    with self.assertRaises(b.Blocked):
+                        initialize()
+                    prior = json.loads(app.text(b.STATE + '/initialize.json'))
+                    self.assertNotIn(NATIVE_UNIT, prior['native_units'])
+                    self.assertTrue(all(__import__('re').fullmatch(r'dev-pair-initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}', value) for value in prior['native_units']))
+                    if mode == 'prelaunch-input':
+                        self.assertTrue((native_io.ROOT / NATIVE_UNIT / 'stdin').exists())
+                    else:
+                        self.assertGreater(len(prior['native_units']), 0)
+                    app.interrupt_prepare = False
+                    reconcile = b.Commands.reconcile_native
+                    def observe(args, env):
+                        callbacks.append(tuple(args))
+                        return reconcile(args, env)
+                    with patch.object(b.Commands, 'reconcile_native', side_effect=observe):
+                        self.assertEqual(initialize(retry=True)['phase'], 'complete')
+                    explicit_retry = [args for args in callbacks if '--unit=' + NATIVE_UNIT in args and args[0] != '/usr/bin/systemd-run']
+                    self.assertTrue(explicit_retry)
+                    self.assertTrue(all('--uid=dp-maint' in args for args in explicit_retry))
+                    self.assertFalse((native_io.ROOT / NATIVE_UNIT).exists())
+                    self.assertEqual(list((native_io.ROOT / 'records').iterdir()), [])
+                    recorded = json.loads(app.text(b.STATE + '/initialize.json'))
+                    self.assertNotIn(NATIVE_UNIT, recorded['native_units'])
 
     def test_prepare_failure_never_runs_adapter_or_claims_completion(self):
         with patch.object(self.app, 'preparation', side_effect=b.Blocked('fixture admission')):
