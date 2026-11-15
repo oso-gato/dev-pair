@@ -2,10 +2,12 @@
 
 [The pull-request workflow](../.github/workflows/fedora-vm.yml) and
 [controller](../tools/fedora_ci.py) implement an initial real-VM execution route
-for an exact public candidate. **No CI run or Fedora guest boot has been observed
-yet.** Local tests validate signature verification, parsing, process/file bounds
-and source staging; they are not Fedora evidence. The first published run must
-establish whether runner capability, capacity and stock Cloud boot actually work.
+for an exact public candidate. The [first actual CI run](https://github.com/oso-gato/dev-pair/actions/runs/43729422976)
+passed all 136 tests but blocked during runner preflight: Podman rejected a
+runroot pathname longer than 50 characters, and cleanup repeated that error.
+No image download, build or Fedora guest boot occurred. A bounded path/cleanup
+repair is in progress. Local signature, parsing, process/file-bound and source
+staging tests are not Fedora evidence; stock Cloud boot remains unverified.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and
@@ -31,8 +33,8 @@ are absent. Superseded PR runs cancel, with no automatic retries.
 Standard public runners are the authorized free test environment. This workflow
 uses no larger runners, purchases, secrets, private repositories/standards,
 registry publication, cache or artifact upload. Public job logs and a bounded job
-summary are the only retained CI evidence. GitHub Actions policy/availability,
-workflow permission and the first actual run remain unverified until observed.
+summary are the only retained CI evidence. Workflow publication and standard-runner execution were confirmed by the first
+run; later dependency/build/guest capabilities remain unverified.
 CI executes reviewed public test code; it does not start an autonomous agent that
 would require private standards retrieval or credentials.
 
