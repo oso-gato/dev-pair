@@ -7,7 +7,7 @@ owner decisions remain retained in order.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Latest published source: `b8ac722ab8dac31543d0e258c8f5d2552135f1d3`.
+  Latest published source: `76e7d61b8966f2c25420e66bed84f44f36142b2c`.
   Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
 - All 174 tests pass locally and in [CI run6](https://github.com/oso-gato/dev-pair/actions/runs/43736703953).
   Signed image/tooling/source, real TCG boot, complete dedicated report, Fedora44
@@ -1280,3 +1280,24 @@ The only production-code addition is fixed `/usr/bin/ss -H -lntup` through the
 existing 15s/64KiB capture and explicit bounded/truncated diagnostic path.
 Publish for the one previously authorized inspection-only run7; do not infer or
 admit the unknown listener before its actual evidence returns.
+
+
+[Run7](https://github.com/oso-gato/dev-pair/actions/runs/43737631539),
+job132883635284, completed against `76e7d61b8966f2c25420e66bed84f44f36142b2c`.
+All 175 tests and prior successful baseline/report/status/cleanup phases passed.
+The bounded socket inventory exited0 without truncation. The rejected listeners
+are stock `systemd-resolve` PID767 on TCP/UDP IPv4/IPv6 wildcard port5355 (LLMNR).
+Other observed sockets are loopback systemd-resolved DNS53, chronyd323 and sshd22.
+Inspection correctly remained blocked; prepare/assembly were not attempted.
+Logs/report: `/workspace/artifacts/fedora-ci-run-43737631539*`.
+
+The actual evidence justifies a narrow ordinary first-provisioning correction,
+not a security exception: recognize the verified resolved service/process during
+initial inspection, persist LLMNR=no and MulticastDNS=no through owned resolved
+configuration, verify merged settings and restart, then reject any remaining
+discovery listener. Keep unrelated/impostor listeners rejected and ordinary DNS
+and bootstrap SSH intact. The current Sol source slice includes this prerequisite
+with captured-inventory, service/process mismatch, restart failure and reapply
+checks; fresh first-bootstrap review is informed. No blanket port5355 allowance,
+CI fixture substitution or admission bypass is authorized. No additional CI run
+is started until the next reviewed integration candidate.
