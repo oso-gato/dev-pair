@@ -1,5 +1,32 @@
 # DR10 launch reconciliation and work record
 
+## Latest continuation checkpoint
+
+This section supersedes historical status statements below; earlier evidence and
+owner decisions remain retained in order.
+
+- Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
+  `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
+  Latest published source: `d79f3a4d9a6c1e3f9e611fcaeb83ca6d5e1e2fd6`.
+  Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
+- 148 tests pass locally and in [CI run5](https://github.com/oso-gato/dev-pair/actions/runs/43731901140).
+  Signed Fedora download, tooling construction and source transfer passed. The
+  real Fedora VM booted/shut down under TCG; guest report framing was rejected.
+  Partial preflight/status text is not complete accepted evidence. Cleanup passed.
+- One API-configured Sol High builder, `/root/durable_job_build`, is implementing
+  verified public-input transfer in `/workspace/dev-pair-fedora-inputs`. Fresh
+  Astra High `/root/fedora_public_inputs_review` awaits its exact commit. No
+  provider backend attestation or coordinator model metadata is available.
+- Next: complete/review input helper, then implement/review dedicated bounded
+  guest result transport using `/workspace/scratch/fedora-ci-serial-plan.md`.
+  Only then authorize the next exact-candidate CI run and integrate real guest
+  prepare/maintenance assembly. Preserve finite budgets and existing gates.
+- VPS remains untouched. Root credential reference was available, but this cloud
+  executor has no supported VPS TCP/SSH route. CI is a separate test target.
+  Authenticated jobs, both actual placements, enforced quota/cleanup, tailnet
+  cutover/recovery, session renewal, release enforcement and demonstrator delivery
+  remain incomplete. Main is reported unprotected; no merge/promotion occurred.
+
 ## Recorded baseline and authority
 
 - Job: DR10 / A12.11 original-charter reconciliation, followed by the first bounded part of A12.12(1).
