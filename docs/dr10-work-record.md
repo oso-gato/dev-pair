@@ -536,3 +536,64 @@ to enable global booleans, disable labels or widen agent authority. No runtime
 admission follows from source research. The detailed scratch handoff is
 `/workspace/scratch/confined-distrobox-handoff.md`; the durable constraints and
 next slice are captured here so its loss does not erase the design decision.
+
+### Checked SELinux slice and review-driven corrections
+
+Sol returned `835acc7f0f69b0e4f20e3b618be3a9e34086e3f4`, integrated as
+`0ee5f8bc8b322a258a19f592eb4eaa196755abdd`: a protected, resumable SELinux setup
+helper and temporary autorelabel override, explicit setup-reboot authorization,
+boot identity records, normal-boot finalizer and 16 new local tests (82 total).
+Fresh Astra High `/root/selinux_convergence_review` independently passed the
+tests but returned changes required: Fedora policycoreutils 3.11's `fixfiles`
+can itself hide underlying `setfiles` failure, and a persistent kernel
+`autorelabel` trigger could repeatedly enter the relabel target despite marker
+removal and evade per-boot reboot limits. The reviewer reproduced both. Direct
+native labeling with preserved filesystem/exclusion semantics, bounded total
+transition history and checked interrupted-marker recovery are being repaired;
+neither source completion nor the original 82 passing tests establish a safe
+Fedora transition. Recovery entry also needs bounded process containment.
+
+The earlier core-access corrections returned as
+`14d467e9b00ef974f669a4175f8b247183175868`, integrated as
+`aa853c44cc01ee92007a882cd467d2372b88893a`. Fresh Astra High
+`/root/core_access_repair_review` reported scoped PASS: all 86 tests passed,
+eight additional interruption probes resumed safely, unlocked core retained
+key-only policy, and a real blocked DNS child was killed by the unchanged
+25-second production deadline in 25.027 seconds. Child environment isolation
+was independently tested. This verdict excludes the separate SELinux findings
+and does not establish Fedora authentication acceptance.
+
+### Actual upstream inputs and corrected transport evidence
+
+Read-only official release inspection resolved stable Codex 0.169.0 to source
+`d32063f96c2dff1dc96af839b3952abb6acfeda4` (distinct from its annotated tag object).
+The official musl archive SHA256 is
+`9af4d751fce183faedea629437d5252dbf458eeb04130cf4f97be844621ea985`; its extracted
+binary SHA256 is `b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b`.
+Fresh Astra High research verified version/help interfaces in an empty scratch
+home, then verified the binary's official Sigstore bundle using Cosign 3.1.4
+with exact issuer/workflow/repository/tag/source-SHA constraints: `Verified OK`,
+exit 0. Cosign itself was obtained over official HTTPS and matched the GitHub
+asset digest; its own signature was not independently verified. No model call,
+credential inspection or runtime admission occurred. The detailed handoff is
+`/workspace/scratch/codex-stable-adapter-handoff.md`.
+
+An initial signature-verification network failure was caused by clearing the
+required HTTP proxy environment. It was corrected by retaining only inherited
+proxy/CA settings with an empty scratch home, without disabling verification.
+Do not carry that superseded failure forward as an endpoint access blocker.
+Separately, the live cloud proxy status confirms TCP forwarding is disabled
+with empty destination grants and Tailscale unconfigured. This explains the
+lack of a supported SSH executor route here; the observed direct refusal does
+not prove the VPS SSH service is closed. No transport bypass was attempted.
+
+Official Fedora registry HTTPS inspection verified the manifest/config digests
+and linux/amd64 identity for
+`registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e`.
+Image signature verification is not established. These are real inspected
+inputs, not fixture digests or a built/validated gptbox. Stable Codex adds
+strict configuration and exact thread-UUID resume interfaces, but writable
+CODEX_HOME also contains extension/configuration inputs; hooks/plugins default
+enabled. The adapter must enforce immutable managed configuration and loader
+boundaries, preserve refreshable credentials separately, and verify actual
+auth/model/session behavior before claiming usable runtime admission.
