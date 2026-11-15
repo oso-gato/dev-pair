@@ -52,7 +52,8 @@ Set `kind` to `operator-verified-inputs`. Required evidence and identities:
   An authorized operator must resolve the official Fedora 44 x86_64 manifest,
   inspect `/etc/os-release`/architecture, and record registry inspection and
   available signature/attestation results in `fedora.verification` (evidence
-  reference, not a bare assertion). No digest has been resolved in this work.
+  reference, not a bare assertion). The inspected first adapter inputs and the
+  remaining image-signature gap are recorded in [the adapter guide](confined-gptbox.md).
 - `codex.version`: actual official **stable** numeric version, not the local
   `0.167.0-alpha.4` executor CLI. `codex.source` must be the matching official
   `https://github.com/openai/codex/releases/download/rust-v<VERSION>/codex-x86_64-unknown-linux-musl.tar.gz`.
@@ -141,9 +142,10 @@ sockets and unrestricted host-spawn are not proposed workarounds.
 The argv proposal runs `/opt/dev-pair/bin/codex exec`, or `exec resume <UUID>`,
 with explicit model, `model_reasoning_effort` and OpenAI provider; prompt arrives
 on stdin and cwd is `/work/job`. It uses no shell interpolation, arbitrary user
-flags or `--last`. The flag shape was inspected against the local alpha CLI's
-help **only**. The pinned stable binary's own help/schema must confirm it before
-use. The plan is not unattended launch proof. In particular Codex writable-home
+flags or `--last`. The original proposal was checked against local alpha CLI help.
+Later inspection of stable Codex 0.169.0 confirmed its own help/schema and
+identified additional managed-configuration and loader requirements; authenticated
+launch remains unverified. The plan is not unattended launch proof. In particular Codex writable-home
 configuration, skills, MCP/hooks and authentication loading need a tested immutable
 configuration policy and a constrained credential adapter; do not copy arbitrary
 parent home/configuration into CODEX_HOME or treat workspace instructions as

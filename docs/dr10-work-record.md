@@ -644,3 +644,30 @@ slice continues in an isolated worktree and is not part of this checkpoint.
 Its runtime constructor must preserve genuine upstream Distrobox initialization
 and entry, controlled source/artifact identities and enforced boundaries; it
 cannot substitute a successful version probe for authenticated job admission.
+
+### Confined gptbox source candidate and review handoff
+
+Sol High `/root/bootstrap_owner_requirements_build` returned
+`588ecab96d005eb6ff75ff5677abce8be869395a`, integrated without source changes as
+`8362a39` on the PR branch. It adds executable maintenance Distrobox assembly,
+an image-owned finalizer, sealed readonly nonroot startup, controlled upstream
+entry, two boundary/version cycles, bounded retry/reconciliation and protected
+credential-free diagnostics. Candidate paths now match the approved role
+directories; bootstrap adds the signed slirp4netns prerequisite. All 107 local
+tests and compilation/whitespace checks pass on the integrated source.
+
+Fresh `/root/gptbox_adapter_review` was launched with API-selected
+`gpt-6-astra` / `high`, verified the exact standards checkout, and independently
+passed 107 tests in a detached checkout of 588ecab. Interface, failure-path and
+boundary review is still pending at this checkpoint. This is local-subagent
+configuration evidence, not a standalone Cloud conversation or independent
+provider attestation; the coordinator model/effort remains unavailable.
+
+The adapter is deliberately a separate probe step, not yet automatically called
+by first bootstrap. Its result cannot admit jobs. Authentication, model access,
+immutable credential/session loaders, nested development placement, enforced
+storage quotas/cleanup and real Fedora acceptance remain required. No image was
+built or started here, and no host was contacted or changed. The next action is
+fresh exact-candidate review, bounded Sol repairs if needed, then the authorized
+Fedora assembly/failure/repair/retest gate when a supported executor route exists.
+Do not promote this source checkpoint or substitute fixtures for that gate.

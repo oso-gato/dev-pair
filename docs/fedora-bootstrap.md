@@ -81,8 +81,12 @@ adopted standards pin. Transfer the four resulting files into a root-owned
 protected context directory. Refresh contexts after the verifier source change;
 prior context provenance is not silently upgraded. The current binary recipe is
 x86_64-only; ARM bootstrap preparation cannot complete the host-gptbox build yet.
-No real upstream digests or Codex release inputs have been invented or acquired
-by this source-only task. `TRUSTED_CONTEXT_SHA256` in the commands is a required
+Official Fedora 44 manifest/configuration digests and the stable Codex 0.169.0
+binary have now been inspected; Codex's official Sigstore bundle passed strict
+verification. The exact identities and remaining Fedora image-signature gap are
+recorded in [the work record](dr10-work-record.md#actual-upstream-inputs-and-corrected-transport-evidence).
+These checks do not establish an OCI build or Fedora runtime result.
+`TRUSTED_CONTEXT_SHA256` in the commands is a required
 handoff value, not an executable sample pin. The CLI rejects missing inputs.
 
 ## Prepare
