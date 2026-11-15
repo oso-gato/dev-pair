@@ -2,22 +2,22 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 05:54 HKT. This section summarizes the current state;
+Updated November 16, 2026, 06:08 HKT. This section summarizes the current state;
 chronological records below retain earlier evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
   branch `codex/dr10-reconciliation-review`, coordination tree
-  `/workspace/dev-pair`. PR source remains
-  `8bdd19d050dc2fe6012b19052f2af538b77d5705`. Reviewed additional storage
-  source is durably published at supplemental checkpoint
-  `f15c11efbc7213f2d96f9133edf16a530601a05c`; it has no execution trigger.
+  `/workspace/dev-pair`. Publish the reviewed combined source through `a18e81b`
+  and this documentation to PR13 for one bounded Fedora retest. Previously
+  separate reviewed storage is included. Supplemental checkpoint
+  `f15c11efbc7213f2d96f9133edf16a530601a05c` retains earlier reviewed work.
   Standards remain `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
 - [Fedora run14](https://github.com/oso-gato/dev-pair/actions/runs/43758085093)
   passed 254 tests and native service admission, Enforcing Fedora, authenticated
   inputs, pre/post inspection, complete report framing and outer cleanup.
   Initialize blocked after 16.811 seconds: status209, with actual init_t write
   denial on a var_run_t FIFO. No preparation/assembly acceptance. Its single-run
-  scope is closed; there is no active CI run or permission for an unchanged retry.
+  scope is closed; the new reviewed candidate receives one separate retest below.
 - Reviewed offline stock-Codex state and managed-child component is included on
   the PR. Actual no-network checks passed; independent review verified cleanup
   failures cannot return success. Authentication, complete tool-path enforcement,
@@ -30,15 +30,14 @@ chronological records below retain earlier evidence and owner decisions.
 - Native relay `da2ebf5` and deadline/signal repair `afac296` are integrated
   locally through `9a97b81`. Fresh independent review passed the narrow repair
   with 275 tests and five adversarial checks, but native admission remains
-  blocked pending review and runtime proof of the transient-profile repair.
+  blocked pending runtime proof of the transient-profile repair.
   Exact candidate `ef213da`, integrated as `cd2db26`, adds owned masks,
   prelaunch configuration checks and an in-relay effective-profile gate.
-  Its 293 tests pass; combined integration passes 304 tests. Fresh Astra High
-  review returned CHANGES REQUIRED for TP-1: eager directory enumeration occurs
-  before inventory limits. Sole Sol High builder `/root/durable_job_build` is
-  repairing that finding in `/workspace/dev-pair-profile-scan-fix`; fresh
-  `/root/transient_inventory_fix_review` is prepared. Independent offline-tool
-  work is safely parked at WIP `692956f` and is not admitted.
+  Its review found TP-1, eager directory enumeration before inventory limits.
+  Repair `d58237e`, integrated as `a18e81b`, passed fresh Astra High review:
+  299 tests and eight adversarial checks. Combined integration passes 310 tests.
+  Sole Sol High builder `/root/durable_job_build` has resumed the independent
+  offline-tool work from WIP `692956f`; it is not admitted.
   No policy grants, forced contexts or budget increases are included.
 - Source handoffs are `/workspace/scratch/native-fifo-label-design.md`,
   `/workspace/scratch/nested-profile-source-research.md` and
@@ -2179,3 +2178,40 @@ seconds, 512 MiB expanded reads, 4096 entries and a 64-KiB report. No extraction
 import, layer execution, build or native target is admitted by that inspection.
 Adopting the archive will require changed source, independent review and fresh
 candidate tests; no current input or runtime verdict is upgraded.
+
+### November 16, 2026, 06:08 HKT — streaming repair passed; one Fedora retest
+
+Sol High repair `d58237eb29d4ab1d2ad3a2600abe8c753a590f99` is integrated
+byte-identically as `a18e81b053f6d0bf9866613a0cf45124cd9caab0`. Fresh Astra
+High `/root/transient_inventory_fix_review` returned PASS_SOURCE_ONLY for TP-1,
+with 299 tests in 49.981 seconds and eight independent adversarial checks.
+They cover early rejection, iterator closure, deadline propagation, foreign
+object preservation, interrupted cleanup/retry and the two recovery calls.
+Evidence:
+`/workspace/artifacts/transient-inventory-fix-review-d58237eb29d4ab1d2ad3a2600abe8c753a590f99/review.json`,
+SHA256 `7e397a078c1202828c9986e2a3ba41f8fa42850f9e507b0d29702c73aef4c1c2`.
+Combined storage/state/native integration passes 310 tests in 49.934 seconds;
+log `/workspace/artifacts/profile-scan-fix-combined-tests.log`, SHA256
+`cd2d4e1123b5569bb732af7da98cb3a288b59a633dafc5363b8df5328197ff61`.
+
+Publish this reviewed combined candidate to the requested PR13 branch for one
+changed-candidate Fedora test. Retain the existing 60-minute hosted job and
+3300-second controller (setup540/VM2640/cleanup120), guest6GiB/2CPUs/32GiB
+virtual disk, outer8GiB/3CPUs/1024PIDs,16GiB overlay,4GiB overhead,3GiB host
+reserve,8GiB guest reserve and8MiB log/64KiB report ceilings. This run tests
+actual manager stream labels, helper process/profile admission, lookup-cache
+refresh, root and dp-maint commands, finite timers, owned cleanup and the
+existing preparation/maintenance-assembly path. Report the first real failure;
+no unchanged retry, policy relaxation, real credential/model use, VPS mutation,
+release promotion or budget increase is admitted.
+
+Signed OCI artifact inspection separately passed in 16.765 seconds. Actual
+archive bytes, OCI graph and rootfs diff ID verify; the selected authenticated
+manifest is `sha256:f1e66cdd6eff2c9ccad192f8865af9be6d69b46b3f13329d2975a2d61a1296c5`.
+No extraction/import/execution occurred. Evidence:
+`/workspace/scratch/fedora-signed-oci-inspection.json`, SHA256
+`c16b35273b2fea55b3fc89c4ba88c8a5a32ac599a1017bfffde6a9708701fa12`.
+The archive integration is queued at
+`/workspace/scratch/signed-fedora-base-build-handoff.md`. This native candidate
+still uses its recorded registry digest with the separately disclosed signature
+limitation; the signed archive does not retroactively authenticate that input.
