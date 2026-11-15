@@ -327,6 +327,7 @@ class Commands:
                     '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin', 'LANG=C', 'LC_ALL=C', 'HOME=/root', *args)
         env = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
         started = time.monotonic()
+        command_end = min(started + timeout, self.execution_deadline() or float('inf'))
         buffers = {'stdout': bytearray(), 'stderr': bytearray()}
         total = 0
         status = 'not-started'
@@ -344,13 +345,18 @@ class Commands:
                 unit = next((value[7:] for value in args if value.startswith('--unit=')), None)
                 if next((value[14:] for value in args if value.startswith('--description=')), None) != 'dev-pair-owned-' + str(unit):
                     raise Blocked('native stream ownership unverified')
-                if any(value.startswith(('--property=StandardInput=', '--property=StandardOutput=', '--property=StandardError=')) for value in args):
-                    raise Blocked('caller native stdio properties are forbidden')
+                if any(value.startswith(('--property=StandardInput=', '--property=StandardOutput=', '--property=StandardError=', '--property=TimeoutStartSec=')) for value in args):
+                    raise Blocked('caller native transport/startup properties are forbidden')
+                native_limits = [float(value.rsplit('=', 1)[1].removesuffix('s')) for value in args
+                                 if value.startswith('--property=RuntimeMaxSec=')]
+                if not native_limits:
+                    raise Blocked('finite native lifetime is required')
+                command_end = min(command_end, started + min(native_limits))
                 transport = NativeTransport(unit)
                 # Observe before allocation/registration: an existing busy/foreign
                 # unit is a collision, never this attempt's cleanup authority.
                 control = Commands()
-                control._cleanup_deadline = min(self.execution_deadline() or float('inf'), started + timeout)
+                control._cleanup_deadline = command_end
                 observed = control._call('/usr/bin/systemctl', 'show', '--property=LoadState', '--property=ActiveState',
                                          '--property=Description', '--property=User', unit, ok=(0, 1, 4),
                                          timeout=self.limit_timeout(timeout), maximum=4096)
@@ -375,13 +381,21 @@ class Commands:
                 verify_labels(transport, control, self.limit_timeout(timeout))
                 transport.verify()
                 transport.open_streams()
-                args = self.native_args(args, min(self.limit_timeout(timeout), timeout - (time.monotonic() - started)))
+                remaining = min(self.limit_timeout(timeout), command_end - time.monotonic())
+                if remaining < .002:
+                    raise Blocked('native startup budget exhausted')
+                # Activation can block before exec while the manager opens a FIFO.
+                # Reserve its independent finite timer inside the existing wall
+                # budget, rather than relying on the later active-runtime timer.
+                startup = min(5.0, remaining / 2)
+                args = self.native_args(args, remaining - startup)
                 payload = next((index for index, value in enumerate(args[1:], 1) if not value.startswith('-')), len(args))
                 prefix = tuple(value for value in args[:payload] if value not in ('--pipe', '--pty'))
-                seconds = min(self.limit_timeout(timeout), timeout - (time.monotonic() - started))
-                args = (prefix[0], *transport.properties(), '--property=LimitCORE=0', *prefix[1:],
+                helper_end = command_end - min(.1, remaining / 2)
+                args = (prefix[0], *transport.properties(), '--property=LimitCORE=0',
+                        '--property=TimeoutStartSec=%.3fs' % (int(startup * 1000) / 1000), *prefix[1:],
                         '/usr/bin/python3', '-I', str(relay_path), '--uid', str(relay_uid), '--stdin', str(int(stdin_data is not None)),
-                        '--maximum', str(maximum), '--seconds', str(max(.001, seconds - .1)), '--helper', relay_sha, '--', *args[payload:])
+                        '--maximum', str(maximum), '--deadline', str(helper_end), '--helper', relay_sha, '--', *args[payload:])
                 for _ in range(2):
                     launcher_pairs.append(pipe_pair())
                 process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=launcher_pairs[0][1],
@@ -409,7 +423,7 @@ class Commands:
                 selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
             status = 'running'
             while selector.get_map() or process.poll() is None:
-                if time.monotonic() - started >= timeout:
+                if time.monotonic() >= command_end:
                     raise Blocked('command deadline exceeded; output withheld')
                 if transport is not None and process.poll() is not None:
                     transport.release()
@@ -437,7 +451,7 @@ class Commands:
                             name = 'stderr' if key.data.startswith('launcher_') else key.data
                             buffers[name].extend(chunk)
             status = process.wait(timeout=1)
-            if time.monotonic() - started >= timeout:
+            if time.monotonic() >= command_end:
                 raise Blocked('command deadline exceeded; output withheld')
             self.limit_timeout(timeout)
             if decoder is not None:

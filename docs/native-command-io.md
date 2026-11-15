@@ -45,8 +45,11 @@ capacity: six pipes without stdin (24576 kernel bytes), seven with stdin
 (28672 bytes). Relay output queues total at most8192 bytes; optional input is
 at most16384 bytes. No payload LimitFSIZE is set. The helper multiplexes
 nonblocking streams with backpressure and a finite deadline, reserving100ms
-inside the original remaining command budget for owned child-group cleanup.
-It never gains time beyond the original native/phase deadline. Its bounded
+inside the original remaining command budget for owned child-group cleanup
+(or half the remaining budget when shorter than200ms). The controller passes
+an absolute host CLOCK_MONOTONIC deadline; setup and service startup consume it.
+The helper checks it before reading input, during input admission and immediately
+before payload launch. It never restarts a relative time window. Its bounded
 kill/reap does not replace native cgroup reconciliation or prove escaped
 engine helpers stopped.
 
@@ -54,7 +57,10 @@ Stdout stays raw. Helper stderr uses an8-byte header plus data bodies of4096
 bytes (one final partial allowed), followed by exactly one control frame of
 at most256 bytes including its header. Control binds actual payload status,
 observed UID/domain and helper hash. Parent admission requires complete framing,
-no duplicate/trailing control, and agreement with actual native exit/signal.
+no duplicate/trailing control, and exact agreement for normal nonnegative exits.
+Signaled payloads are rejected independently of caller allowed statuses. Systemd
+can map clean TERM/INT/HUP/PIPE to0 and other service signals to255; neither
+translation may turn a signaled payload into a successful command.
 Missing helper evidence rejects service startup exits even when a caller accepts
 that numeric status. Exit250 is reserved for relay failure and is never accepted.
 For the256KiB/1MiB/4MiB decoded limits, raw framing overhead is bounded separately
@@ -82,8 +88,13 @@ pipes. No payload LimitFSIZE is installed: DNF/image writes keep their original
 behavior. Fixed restorecon setup has a separate8KiB withheld capture bound within
 the same deadline.
 
-Remaining absolute phase and command time clips native RuntimeMaxSec again after
-transport setup; setup cannot give the separately spawned service a fresh budget.
+Remaining absolute phase, command and stricter caller lifetime are checked after
+transport setup. Type=exec activation has a separate TimeoutStartSec: at most5s
+and half the remaining budget. Active RuntimeMaxSec receives only the rest, with
+both values rounded down and required to stay positive milliseconds. Startup
+plus active time stays within the original envelope; existing stop grace is
+separate. Caller startup overrides are rejected. Setup cannot give the separately
+spawned helper a fresh budget.
 Memory/tasks/CPU/stop/cgroup limits and900s staging/180s runtime ceilings are
 unchanged. Kill/reap and exact native reconciliation occur even after the launcher
 has already exited. Loaded foreign descriptions/users block before stop; a
@@ -138,3 +149,10 @@ Fedora run must still validate manager-opened files, labels, effective identitie
 all native paths and actual failed-start/timeout/secret cleanup. Local relay tests
 execute the real helper pump and completion parser; only Fedora manager/UID/label
 admission is injected. They cannot establish SELinux transition compatibility.
+
+The global Fedora timeout-abort drop-in is a separate native-boundary finding:
+transient properties are applied before systemd parses inherited drop-ins. Merely
+requesting kill-mode properties cannot prove those effective settings. A scoped
+prelaunch override/rejection design and effective runtime evidence are required
+before this transport can claim a finite native stop bound on that configuration.
+This source checkpoint does not resolve that inherited-stop-policy gate.

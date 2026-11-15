@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 import unittest
+import time
 from unittest.mock import patch, mock_open
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import native_relay as r
@@ -22,7 +23,7 @@ CODE = ('import sys;sys.path.insert(0,sys.argv[1]);import native_relay as r;'
 def launch(script, *, data=None, maximum=262144, seconds=2):
     args = [sys.executable, '-c', CODE, str(HELPER.parent), '--uid', str(os.getuid()),
             '--stdin', str(int(data is not None)), '--maximum', str(maximum),
-            '--seconds', str(seconds), '--helper', SHA, '--', sys.executable, '-c', script]
+            '--deadline', str(time.monotonic() + seconds), '--helper', SHA, '--', sys.executable, '-c', script]
     return subprocess.Popen(args, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
 
@@ -101,7 +102,8 @@ class RelayTests(unittest.TestCase):
         self.assertEqual((actual, out, wire), (250, b'', b''))
         actual, _, wire = self.capture('import os,signal;os.kill(os.getpid(),signal.SIGTERM)')
         self.assertEqual(actual, -signal.SIGTERM)
-        self.decode(wire, actual)
+        with self.assertRaises(ValueError):
+            self.decode(wire, actual)
         actual, out, wire = self.capture('import os,json;print(json.dumps([os.readlink("/proc/self/fd/"+str(i)) for i in range(3)]))', data=b'')
         self.assertTrue(all(value.startswith('pipe:[') for value in json.loads(out)))
         self.decode(wire, actual)
@@ -213,11 +215,11 @@ class RelayTests(unittest.TestCase):
     def test_allocation_and_spawn_failure_have_no_terminal_control(self):
         for attribute, failure in (('pipe_pair', OSError('synthetic allocation failure')),):
             with patch.object(r, attribute, side_effect=failure), self.assertRaises(OSError):
-                r.pump([sys.executable, '-c', 'pass'], None, 262144, 1, {})
+                r.pump([sys.executable, '-c', 'pass'], None, 262144, time.monotonic() + 1, {})
         blocking = {fd: os.get_blocking(fd) for fd in (1, 2)}
         try:
             with patch.object(r.subprocess, 'Popen', side_effect=OSError('synthetic spawn failure')), self.assertRaises(OSError):
-                r.pump([sys.executable, '-c', 'pass'], None, 262144, 1, {})
+                r.pump([sys.executable, '-c', 'pass'], None, 262144, time.monotonic() + 1, {})
         finally:
             for fd, value in blocking.items():
                 os.set_blocking(fd, value)
@@ -231,3 +233,62 @@ class RelayTests(unittest.TestCase):
         with patch.object(io.pwd, 'getpwnam', side_effect=KeyError()):
             with self.assertRaisesRegex(ValueError, 'account unavailable'):
                 io.expected_uid(('--uid=dp-maint',))
+
+    def test_expired_absolute_deadline_blocks_before_secret_read_and_payload_launch(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / 'read-or-launch'
+            # A real delayed manager/helper startup consumes the original wall
+            # budget. The input-read hook records only that a read happened.
+            code = ('import time;time.sleep(.15);' + CODE.replace(
+                'sys.argv=["relay",*sys.argv[2:]];',
+                'original_read=r.os.read;r.os.read=lambda *a: (__import__("pathlib").Path(' + repr(str(marker)) + ').write_text("read"),original_read(*a))[1];sys.argv=["relay",*sys.argv[2:]];'))
+            args = [sys.executable, '-c', code, str(HELPER.parent), '--uid', str(os.getuid()),
+                    '--stdin', '1', '--maximum', '262144', '--deadline', str(time.monotonic() + .05),
+                    '--helper', SHA, '--', sys.executable, '-c', 'print("must-not-launch")']
+            result = subprocess.run(args, input=b'NONCREDENTIAL', capture_output=True, timeout=2)
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (250, b'', b''))
+            self.assertFalse(marker.exists())
+
+    def test_real_startup_delay_does_not_restart_payload_budget(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            marker = Path(temp) / 'late'
+            code = 'import time;time.sleep(.15);' + CODE
+            args = [sys.executable, '-c', code, str(HELPER.parent), '--uid', str(os.getuid()),
+                    '--stdin', '0', '--maximum', '262144', '--deadline', str(time.monotonic() + .25),
+                    '--helper', SHA, '--', sys.executable, '-c',
+                    'import time;from pathlib import Path;time.sleep(.2);Path(' + repr(str(marker)) + ').write_text("escaped")']
+            started = time.monotonic()
+            result = subprocess.run(args, capture_output=True, timeout=2)
+            self.assertEqual(result.returncode, 250)
+            self.assertLess(time.monotonic() - started, .6)
+            time.sleep(.25)
+            self.assertFalse(marker.exists())
+
+    def test_expiry_during_admission_blocks_actual_spawn_and_closes_allocations(self):
+        original = r.pipe_pair
+        pairs = []
+        def slow_pair():
+            pair = original(); pairs.append(pair); time.sleep(.03)
+            return pair
+        blocking = {fd: os.get_blocking(fd) for fd in (1, 2)}
+        try:
+            with patch.object(r, 'pipe_pair', side_effect=slow_pair), patch.object(r.subprocess, 'Popen') as spawn:
+                with self.assertRaises(ValueError):
+                    r.pump([sys.executable, '-c', 'pass'], None, 262144, time.monotonic() + .02, {})
+                spawn.assert_not_called()
+            for pair in pairs:
+                for fd in pair:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+        finally:
+            for fd, value in blocking.items():
+                os.set_blocking(fd, value)
+
+    def test_manager_signal_mappings_never_admit_a_signaled_payload(self):
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGPIPE, signal.SIGKILL):
+            for native_status in (0, 255, -signum, 128 + signum):
+                decoder = r.Decoder(262144); decoder.feed(control(-signum))
+                with self.subTest(signal=signum, native_status=native_status), self.assertRaises(ValueError):
+                    decoder.finish(native_status, os.getuid(), SHA)

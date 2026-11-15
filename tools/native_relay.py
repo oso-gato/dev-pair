@@ -93,8 +93,10 @@ class Decoder:
         require(self.control is not None and not self.header and not self.body and self.length is None)
         value = self.control
         require(value['uid'] == expected_uid and value['helper'] == helper_sha and value['status'] != ERROR_STATUS)
-        expected = (value['status'],) if value['status'] >= 0 else (value['status'], 128 - value['status'])
-        require(native_status in expected)
+        # systemd-run maps clean service signals to0 and other signals to255;
+        # neither is an ordinary successful payload exit. Signals are outside
+        # this provisioning contract, independently of any caller's allowed set.
+        require(value['status'] >= 0 and native_status == value['status'])
         return value
 
 
@@ -132,10 +134,14 @@ def verify_fds(has_input):
             if has_input else (stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(1, 3)))
 
 
-def pump(argv, data, maximum, seconds, control):
+def check_deadline(end):
+    require(type(end) in (int, float) and math.isfinite(end) and 0 < end - time.monotonic() <= 2280)
+
+
+def pump(argv, data, maximum, end, control):
     require(data is None or isinstance(data, (bytes, bytearray)) and len(data) <= INPUT_LIMIT)
-    require(maximum in MAXIMA and type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 2280 and argv)
-    end = time.monotonic() + seconds
+    require(maximum in MAXIMA and argv)
+    check_deadline(end)
     pairs, process = [], None
     selector = selectors.DefaultSelector()
     queues = {'stdout': bytearray(), 'stderr': bytearray()}
@@ -154,6 +160,7 @@ def pump(argv, data, maximum, seconds, control):
         if incoming:
             os.set_blocking(incoming[1], False)
         os.set_blocking(1, False); os.set_blocking(2, False)
+        check_deadline(end)
         process = subprocess.Popen(argv, stdin=incoming[0] if incoming else subprocess.DEVNULL,
                                    stdout=out[1], stderr=err[1], close_fds=True, start_new_session=True)
         for fd in (out[1], err[1], *( (incoming[0],) if incoming else () )):
@@ -246,24 +253,27 @@ def main():
         parser.add_argument('--uid', type=int, required=True)
         parser.add_argument('--stdin', type=int, choices=(0, 1), required=True)
         parser.add_argument('--maximum', type=int, choices=MAXIMA, required=True)
-        parser.add_argument('--seconds', type=float, required=True)
+        parser.add_argument('--deadline', type=float, required=True)
         parser.add_argument('--helper', required=True)
         parser.add_argument('argv', nargs=argparse.REMAINDER)
         args = parser.parse_args()
         require(args.argv and args.argv[0] == '--' and args.helper == hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+        check_deadline(args.deadline)
         domain = verify_process(args.uid)
         verify_fds(args.stdin == 1)
+        check_deadline(args.deadline)  # Before any secret byte is read.
         data = None
         if args.stdin:
             data = bytearray()
             while True:
+                check_deadline(args.deadline)
                 chunk = os.read(0, INPUT_LIMIT - len(data) + 1)
                 if not chunk:
                     break
                 require(len(data) + len(chunk) <= INPUT_LIMIT)
                 data.extend(chunk)
         os.close(0)
-        status = pump(args.argv[1:], data, args.maximum, args.seconds, {'uid': args.uid, 'domain': domain, 'helper': args.helper})
+        status = pump(args.argv[1:], data, args.maximum, args.deadline, {'uid': args.uid, 'domain': domain, 'helper': args.helper})
         if status < 0:
             if -status not in (signal.SIGKILL, signal.SIGSTOP):
                 signal.signal(-status, signal.SIG_DFL)

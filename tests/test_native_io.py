@@ -288,3 +288,66 @@ class NativeIOTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'context mismatch'):
                 VERIFY_LABELS(transport, Control(), 1)
         io.NativeTransport.recover(UNIT)
+
+    def test_finite_native_start_and_active_timers_share_original_stricter_budget(self):
+        original = subprocess.Popen
+        base = manager(original, self.calls)
+        observed = []
+        def delayed(args, **kwargs):
+            if args[0] == '/usr/bin/systemd-run':
+                observed.append(args)
+                time.sleep(.04)  # Real startup delay before the exact helper.
+            return base(args, **kwargs)
+        prefix = tuple('--property=RuntimeMaxSec=0.8' if value.startswith('--property=RuntimeMaxSec=') else value for value in PREFIX)
+        started = time.monotonic()
+        with patch.object(b.subprocess, 'Popen', side_effect=delayed):
+            self.assertEqual(b.Commands()(*prefix, sys.executable, '-c', 'print("bounded")', timeout=2), 'bounded\n')
+        native = observed[0]
+        startup = float(next(value.rsplit('=', 1)[1][:-1] for value in native if value.startswith('--property=TimeoutStartSec=')))
+        active = float(next(value.rsplit('=', 1)[1][:-1] for value in native if value.startswith('--property=RuntimeMaxSec=')))
+        self.assertGreaterEqual(startup, .001)
+        self.assertGreaterEqual(active, .001)
+        self.assertLessEqual(startup + active, .8)
+        self.assertLessEqual(startup, 5)
+        self.assertNotIn('--seconds', native)
+        self.assertLessEqual(float(native[native.index('--deadline') + 1]), started + .8)
+        for supplied in ('--property=TimeoutStartSec=infinity', '--property=TimeoutStartSec=0'):
+            with self.assertRaises(b.Blocked):
+                b.Commands()(*PREFIX, supplied, sys.executable, '-c', 'pass')
+        before = len(self.calls)
+        tiny = tuple('--property=RuntimeMaxSec=0.001' if value.startswith('--property=RuntimeMaxSec=') else value for value in PREFIX)
+        with self.assertRaises(b.Blocked):
+            b.Commands()(*tiny, sys.executable, '-c', 'pass')
+        self.assertFalse(any(args[0] == '/usr/bin/systemd-run' for args in self.calls[before:]))
+
+    def test_real_helper_signal_remains_failure_when_manager_maps_status_to_success(self):
+        from native_io_fixture import launch_payload
+        original = subprocess.Popen
+        base = manager(original, self.calls)
+        for mapped in (0, 255):
+            def mapped_manager(args, **kwargs):
+                if args[0] != '/usr/bin/systemd-run':
+                    return base(args, **kwargs)
+                child = launch_payload(original, args, kwargs, ())
+                class Manager:
+                    # Transport process descriptors/pid are real; only manager
+                    # exit translation is injected from v259's source contract.
+                    def __getattr__(self, name):
+                        return getattr(child, name)
+                    @property
+                    def returncode(self):
+                        return None if child.returncode is None else mapped
+                    def poll(self):
+                        result = child.poll()
+                        return None if result is None else mapped
+                    def wait(self, timeout=None):
+                        child.wait(timeout=timeout)
+                        return mapped
+                return Manager()
+            run = b.Commands(); records = []; run.metadata_diagnostic = records.append
+            with patch.object(b.subprocess, 'Popen', side_effect=mapped_manager), self.assertRaises(b.Blocked):
+                run(*PREFIX, sys.executable, '-c', 'import os,signal;os.kill(os.getpid(),signal.SIGTERM)', ok=(0, 255, -15))
+            self.assertFalse(records[-1]['accepted_exit'])
+            self.assertEqual(records[-1]['native_exit_status'], mapped)
+            self.assertEqual(records[-1]['relay']['status'], -15)
+            self.assertEqual(list((self.root / 'records').iterdir()), [])
