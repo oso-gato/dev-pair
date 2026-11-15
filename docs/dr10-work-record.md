@@ -19,13 +19,16 @@ owner decisions remain retained in order.
   All 174 integration tests pass. Builder `/root/durable_job_build` uses accepted
   API settings Sol High; reviewers use Astra High. Provider backend attestation
   and coordinator model metadata remain unavailable.
-- The sole builder has preserved shared first-bootstrap WIP in
-  `/workspace/dev-pair-initialize`, branch `codex/first-bootstrap-initialize`.
-  It briefly detours to bounded socket diagnostics, then resumes initialize,
-  command bounds and staged dependencies. Fresh reviews await exact candidates;
-  no listener allowlist or access requirement is weakened.
-- Next: identify the actual rejected listener, complete/review the shared
-  first-bootstrap source, then integrate real prepare/assembly in CI using
+- Shared first-bootstrap candidate 9c8c597 is integrated as 0438afc; all185
+  integration tests pass. Fresh review found total-deadline inheritance and
+  exited-launcher cleanup defects. The sole Sol High builder repairs both in
+  `/workspace/dev-pair-initialize`; fresh Astra High
+  `/root/first_bootstrap_deadline_review` awaits the exact fix. No source from
+  this candidate has been published or executed on Fedora.
+- Run7 identified stock resolved LLMNR5355 as the listener blocker. The source
+  candidate includes service-bound recognition and persistent LLMNR/mDNS disable;
+  that actual runtime behavior remains unverified. Next: repair/review shared
+  initialization, then integrate it into CI using
   `/workspace/scratch/fedora-prepare-integration-plan.md`. Preserve all gates.
 - VPS remains untouched. Root credential reference was available, but this cloud
   executor has no supported VPS TCP/SSH route. CI is a separate test target.
@@ -1322,3 +1325,13 @@ total execution deadline. The coordinator and reviewer both reproduced an outer
 0.05s/inner0.2s real0.1s sleep returning success. Review is consolidating findings;
 the builder awaits the complete repair batch. This candidate is not published,
 executed on Fedora or approved. Preserve all existing runtime/security gates.
+
+
+The first-bootstrap review finalized CHANGES REQUIRED with exactly the two
+reproduced deadline/cleanup findings above. Detailed evidence:
+`/workspace/artifacts/first-bootstrap-review-9c8c597/review.json`. A twelve-minute
+consolidated source repair is assigned; fresh API-configured Astra High
+`/root/first_bootstrap_deadline_review` reads governing sources and waits for its
+immutable candidate. No further hosted run is authorized for the defective
+source. The same candidate's secret withholding, script entry and cross-process
+initializer lock checks passed, but do not override the failed execution bounds.
