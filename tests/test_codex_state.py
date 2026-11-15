@@ -145,6 +145,34 @@ class CodexStateTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertTrue(process.stdout.closed)
 
+    def test_main_cleanup_failure_blocks_after_real_fixture_removal_and_preserves_passed_checks(self):
+        actual_directory = tempfile.TemporaryDirectory
+        removed = []
+        class FailedCleanup(actual_directory):
+            def __exit__(self, *args):
+                path = Path(self.name)
+                result = super().__exit__(*args)
+                removed.append(not path.exists())
+                raise OSError('injected cleanup outcome failure after actual removal')
+        class FixtureHarness:
+            def __init__(self, root, binary):
+                (Path(root) / 'owned-fixture').write_text('synthetic data')
+                self.checks = {'synthetic_probe': True}
+                self.observations, self.records, self.used = {}, [], 0
+            def exercise(self):
+                return {'checks': self.checks, 'runtime_admitted': False}
+        report = self.root / 'cleanup-report.json'
+        with mock.patch.object(state.tempfile, 'TemporaryDirectory', FailedCleanup), mock.patch.object(state, 'Harness', FixtureHarness), \
+                mock.patch.object(sys, 'argv', ['codex_state.py', '--binary', '/unused-fixture', '--report', str(report)]):
+            status = state.main()
+        value = json.loads(report.read_text())
+        self.assertEqual(removed, [True])
+        self.assertEqual(status, 2)
+        self.assertEqual(value['status'], 'blocked')
+        self.assertEqual(value['checks'], {'synthetic_probe': True})
+        self.assertFalse(value['runtime_admitted'])
+        self.assertIn('cleanup outcome', value['blocker'])
+
     def test_native_file_ceiling_enforced_by_real_child(self):
         path = self.root / 'native-limit'
         process = subprocess.run([sys.executable, '-c', 'import pathlib,sys;pathlib.Path(sys.argv[1]).write_bytes(b"x"*(17*1024**2))', str(path)],

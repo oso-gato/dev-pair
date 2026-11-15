@@ -94,7 +94,8 @@ process termination; the report retains exact policy/skills identities, actual
 RPC evidence, database integrity and bounded operation counts/hashes. Durable
 product state is never used or deleted by this experiment.
 
-Exit0 means the offline component checks passed. Every report still sets
+Exit0 requires both the offline component checks and owned fixture cleanup to
+complete. A cleanup failure retains completed checks but returns exit2/statusblocked. Every report still sets
 `runtime_admitted=false` and lists required gates: actual Fedora/Podman/Distrobox
 mount/SELinux/sandbox behavior and toolchain inventory; distinct root/job and
 credential-link ownership; every real agent tool path using the managed child

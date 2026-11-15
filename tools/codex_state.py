@@ -471,9 +471,11 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='dev-pair-codex-') as root:
             runner = Harness(root, args.binary)
-            report.update(runner.exercise(), status='pass')
+            report.update(runner.exercise())
+        # Acceptance includes successful owned-fixture teardown, not just probes.
+        report['status'] = 'pass'
     except (OSError, ValueError, KeyError, TypeError, RecursionError, subprocess.SubprocessError) as error:
-        report['blocker'] = str(error)[-2000:]
+        report.update(status='blocked', blocker=str(error)[-2000:])
         if runner is not None:
             report.update(checks=runner.checks, observations=runner.observations, operations=runner.records, captured_bytes=runner.used)
     data = canonical(report) + b'\n'
