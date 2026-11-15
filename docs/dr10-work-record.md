@@ -19,17 +19,16 @@ owner decisions remain retained in order.
   All 174 integration tests pass. Builder `/root/durable_job_build` uses accepted
   API settings Sol High; reviewers use Astra High. Provider backend attestation
   and coordinator model metadata remain unavailable.
-- Shared first-bootstrap candidate 9c8c597 is integrated as 0438afc; all185
-  integration tests pass. Fresh review found total-deadline inheritance and
-  exited-launcher cleanup defects. The sole Sol High builder repairs both in
-  `/workspace/dev-pair-initialize`; fresh Astra High
-  `/root/first_bootstrap_deadline_review` awaits the exact fix. No source from
-  this candidate has been published or executed on Fedora.
-- Run7 identified stock resolved LLMNR5355 as the listener blocker. The source
-  candidate includes service-bound recognition and persistent LLMNR/mDNS disable;
-  that actual runtime behavior remains unverified. Next: repair/review shared
-  initialization, then integrate it into CI using
-  `/workspace/scratch/fedora-prepare-integration-plan.md`. Preserve all gates.
+- Shared first-bootstrap source and both repairs are integrated through674954e;
+  fresh final review passed exact8c47d238. All189 integration tests pass.
+  Initialize/command/native-unit and resolved convergence behavior remains
+  source/local evidence until its actual Fedora run. Builder resumes the next
+  CI integration slice after this checkpoint.
+- Run7 identified stock resolved LLMNR5355 as the listener blocker. Reviewed
+  source now recognizes the exact service and persists LLMNR/mDNS disabling.
+  Next: connect current-source verified inputs and shared initialize into CI,
+  using `/workspace/scratch/fedora-prepare-integration-plan.md`; independently
+  review the complete resource/network/secret boundary before executing.
 - VPS remains untouched. Root credential reference was available, but this cloud
   executor has no supported VPS TCP/SSH route. CI is a separate test target.
   Authenticated jobs, both actual placements, enforced quota/cleanup, tailnet
@@ -1352,3 +1351,27 @@ exit through the shared cleanup and preserving real exit diagnostics, with a
 real closed-pipe orphan regression. Fresh API-configured Astra High
 `/root/first_bootstrap_probe_exit_review` awaits its immutable source. No
 publication or hosted execution of either first-bootstrap candidate occurred.
+
+
+Second repair `8c47d2382d7488ccbcbb22b78cd64bfe470c7496` is integrated
+byte-identically as `674954e`. Main's189 tests pass. Fresh Astra High
+`/root/first_bootstrap_probe_exit_review` returned PASS with no new findings after
+188 repository tests and21 independent process/deadline/cleanup checks. Failed
+exit9 now kills the closed-pipe descendant and reconciles owned native units
+while preserving its exit status; the same regression fails on the parent.
+Foreign-unit protection, allowed exits and prior timing/secret boundaries pass.
+Evidence: `/workspace/artifacts/first-bootstrap-probe-exit-review-8c47d23/review.json`.
+This completes the two source repair cycles; no native manager/engine acceptance
+is inferred from local tests.
+
+The next bounded slice integrates the reviewed path into the actual CI guest:
+current-source strict public input production/transport, real shared initialize,
+scoped public package egress without listeners/forwarding, guest-only disposable
+password, exact phase records/diagnostics and owned cleanup. The proposed resource
+profile is32GiB virtual/16GiB physical overlay/4GiB overhead/3GiB host reserve,
+with controller3300s split540s public setup +2640s VM +120s outer cleanup/report.
+The guest reserves initialize2280s and its45s cleanup grace explicitly. Preserve
+native900/180 component limits and no jobs, auth, enrollment or Hostinger access.
+Add an in-image fixed dependency-build timeout within the600s image-work budget;
+this does not establish complete detached-helper cleanup. Fresh exact-candidate
+review precedes hosted execution. No source after76e7d61 has yet been published.
