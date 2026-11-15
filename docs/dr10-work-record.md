@@ -1819,3 +1819,23 @@ passed seven offline checks; report `/workspace/artifacts/codex-state-first-loca
 SHA256`27d93d8266ef7109a8ebff144e626adb50429193c0e1ff1eab08588812c6da7a`.
 Strict layout/requirements validation, unit mutation/bound checks, documentation
 and review remain unfinished. Resume after the measured native blocker repair.
+
+
+Scoped unit candidate `8fa968348869b66410c65ca4418eb92cd8dea33e` is
+integrated byte-identically asad55ac9. Builder224tests36.082s and coordinator
+224tests31.779s passed. Requestv2/reportv4 bind the empty mask's path,device,inode
+and SHA; native admission reopens and checks protected ownership,0644,zero bytes,
+singlelink and original identity before accepting any phase. The only permitted
+DropInPaths is the controlled file. Effective stop fields must be kill/yes/9.
+Per-key diagnostic caps preserve its complete73-byte path within the unchanged
+4096-byte worst-case witness bound. Native2445s,stop5s,admission60s,VM2640s unchanged.
+
+Fresh Astra High `/root/native_unit_mask_review` returned PASS for exact8fa9683,
+scoped to one bounded Fedora retest:56 affected tests passed10.664s, source/diff
+review found no blocking issue. Evidence:
+`/workspace/artifacts/native-unit-mask-review-8fa968348869b66410c65ca4418eb92cd8dea33e/review.json`.
+The coordinator admits that single unchanged-envelope test; actual Fedora
+shadowing, effective kill values, native identity and preparation remain gates.
+No source publication grants job, authentication, model or VPS admission.
+The sole builder has resumed the isolated offline-state WIP; it cannot change
+the frozen native test source or publish without its own review.
