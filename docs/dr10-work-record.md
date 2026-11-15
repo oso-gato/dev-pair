@@ -2,7 +2,7 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 07:13 HKT. Chronological records below retain
+Updated November 16, 2026, 07:21 HKT. Chronological records below retain
 prior evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
@@ -29,13 +29,16 @@ prior evidence and owner decisions.
   remains blocking. Main source/tests match the tested candidate exactly.
 - Run17 at `25c9808` passed333 hosted tests in43.308 seconds, then blocked
   at cache-recheck before the first command started. The new typed relay gate
-  was not exercised. Exact internal cause is under bounded source diagnosis;
-  its scope is closed. No unchanged retry, policy exception, credentials, VPS
+  was not exercised. Its exact cause remains unproven. The independently reproduced scanner
+  atime defect is repaired by reviewed `4cabf87`, integrated as `c2716ed`:337
+  tests pass, fresh review passes72 affected tests and15 independent checks.
+  Run17 is closed; one changed-candidate retest is admitted below. No unchanged retry, policy exception, credentials, VPS
   action or release promotion is included. PR remains draft and unmerged.
 - Sole Sol High builder `/root/durable_job_build` works separately in
   `/workspace/dev-pair-signed-base` on verified signed Fedora OCI input,
-  candidate identity, local import and authenticated package refresh. Its source
-  slice is07:05–07:40 HKT. Verified archive research is not import/build proof.
+  candidate identity, local import and authenticated package refresh. Its incomplete source checkpoint is `0a65d2c`; after the native repair detour
+  it resumed at07:18 HKT with26m20 remaining, checkpoint07:44:20 HKT.
+  Verified archive research is not import/build proof.
 - Reviewed storage observation and peak arithmetic provide no hard reservation,
   quota, deletion or job admission. Native hard storage and cleanup remain work.
   Actual preparation/assembly, both gptbox placements, complete credential/tool
@@ -2416,3 +2419,32 @@ snapshot timestamps and closed failure diagnostics need investigation without
 loosening the lookup/profile checks. Cleanup-fixture independent PASS receipt:
 `/workspace/artifacts/subreaper-repair-review-186b9d1e52786eaf0631ab23393410b3dd70aa84/review.json`,
 SHA256 `9fce8c4a3b54bb38351481203d7b81e74e4c329c679c606bc3c88509917b2999`.
+
+### November 16, 2026, 07:21 HKT — atime repair reviewed; changed Fedora retest
+
+Sol High candidate `4cabf87695a8522c99feba5f3d8ab18c591b161e`, integrated
+as `c2716ed`, fixes a reproduced source defect: the scanner's own directory
+read changed atime and was rejected as configuration mutation. Only atime is
+excluded; device/inode/mode/uid/gid/link count/size and exact nanosecond mtime/
+ctime remain checked. Parent-mtime/cache invalidation proof, lookup inventory,
+profile and command deadlines are unchanged. Closed subcondition/category
+codes flow through existing admission_reason; unknown error text stays withheld.
+
+Full337 tests pass in53.403 seconds. Fresh Astra High `/root/native_atime_review`
+passed72 affected tests and15 independent checks, including old/fixed real
+filesystem reproduction, mutation rejection and13 injected prelaunch failures
+through public diagnostics. Review:
+`/workspace/artifacts/native-atime-review-4cabf87695a8522c99feba5f3d8ab18c591b161e/review.json`,
+SHA256 `adc630556cd5c36ddaaffe695b85a18c3b0c6a31278ca317ddcc5bf7404ae1e9`.
+Source/tests/.github match the full-suite candidate byte-for-byte. Run17's exact
+predicate remains unproven; source repair is not native acceptance.
+
+Publish the changed reviewed candidate for one Fedora retest of these checks,
+the typed relay gate and existing preparation/assembly path. Retain the07:06 HKT
+limits: hosted60min; controller3300(setup540/VM2640/cleanup120); guest6GiB,
+2CPU,32GiB virtual; outer8GiB,3CPU,1024PIDs; overlay16GiB/overhead4GiB;
+host reserve3GiB/guest reserve8GiB; logs8MiB/report64KiB. Preserve the first
+actual closed failure code and complete report. No unchanged retry, policy
+exception, forced context, credential/model call, VPS mutation, release
+promotion or budget increase. Signed OCI base integration remains a separate
+unreviewed source checkpoint; it is not part of this native test.
