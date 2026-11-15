@@ -95,6 +95,13 @@ limited to 540+10 seconds. Public bundle/archive each have a native 32MiB file
 limit. Tooling/source/base overhead is measured, including root-owned storage,
 against a 2GiB ceiling. If the real runner cannot fit, record capacity blocked;
 never remove preinstalled software or enlarge bounds to force a pass.
+Measurements use one-filesystem traversal to avoid counting overlay merged mounts
+again. During live package/storage churn, only exact owned-path ENOENT diagnostics
+are eligible for three bounded retries. The largest observed size remains subject
+to the overhead cap; an incomplete live sample is explicitly provisional. Every
+completed command must obtain a stable error-free measurement before advancing.
+Permission, I/O, invalid summaries and unrecognized errors block immediately;
+the independent host-free-space reserve watchdog remains active.
 
 Before VM boot, free host disk must cover the complete 8GiB overlay maximum plus
 3GiB host reserve. The guest's 12GiB virtual disk is thin provisioned, not a
@@ -117,6 +124,11 @@ workflow-command controls are escaped, tails are bounded, and truncation is
 explicit. No qcow2, complete filesystem, environment or credential directory is
 uploaded. `DP_PHASE`, `DP_SERIAL_TAIL`, `DP_REPORT` and the job summary distinguish
 the exact attempted phases; fixture/local-test results never become Fedora passes.
+All controller log output uses central safe emitters covering both modern
+`::command::` and legacy `##[command]` syntax. Structured JSON escapes introducer
+characters inside strings, preserving valid JSON and exact decoded evidence,
+including nested diagnostic fields and RPM manifests. Text tails visibly separate
+command introducers; the structured report retains their original strings.
 
 Run `python3 -m unittest discover -s tests -p test_fedora_ci.py -v` locally. The
 committed checksum/key inputs are public official Fedora metadata used for real

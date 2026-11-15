@@ -1,4 +1,5 @@
 import io
+import contextlib
 import json
 import os
 import pathlib
@@ -146,6 +147,90 @@ class FedoraCITests(unittest.TestCase):
         self.assertNotIn('\x1b', ci.sanitize(b'bad\x1b[31m'))
         with self.assertRaisesRegex(ci.Blocked, 'invalid payload identity'):
             ci.seed_data('a' * 39 + '\n', 'b' * 64, 'c' * 64, 'd' * 64)
+
+    def test_real_du_churn_is_provisional_then_stabilizes_without_ignoring_permissions(self):
+        tree = self.root / 'churn'
+        tree.mkdir()
+        for index in range(10000):
+            (tree / str(index)).touch()
+        code = ('import pathlib,sys;root=pathlib.Path(sys.argv[1]);\n'
+                'while True:\n for path in root.iterdir():\n'
+                '  path.unlink(missing_ok=True);path.touch()\n')
+        process = subprocess.Popen([sys.executable, '-c', code, str(tree)])
+        observed = False
+        try:
+            for _ in range(30):
+                result = subprocess.run(['/usr/bin/du', '--summarize', '--block-size=1',
+                                         '--one-file-system', '--exclude=guest.qcow2', str(self.root)],
+                                        env=ci.SAFE_ENV, capture_output=True, timeout=5)
+                _, vanished = ci.parse_du(self.root, result)
+                observed |= vanished
+                # Real live traversal can tolerate only classified ENOENT.
+                measurement = ci.measure_storage(self.root, live=True, sudo=False)
+                self.assertLessEqual(measurement['bytes'], ci.OVERHEAD_LIMIT)
+                if observed:
+                    break
+            self.assertTrue(observed, 'real removed/recreated-file race was not exercised')
+        finally:
+            process.kill()
+            process.wait(timeout=5)
+        stable = ci.measure_storage(self.root, sudo=False)
+        self.assertFalse(stable['provisional'])
+        restricted = self.root / 'inaccessible'
+        restricted.mkdir()
+        restricted.chmod(0)
+        try:
+            if os.geteuid() != 0:
+                with self.assertRaisesRegex(ci.Blocked, 'non-disappearance'):
+                    ci.measure_storage(self.root, live=True, sudo=False)
+        finally:
+            restricted.chmod(0o700)
+
+    def test_storage_retries_do_not_turn_unstable_or_invalid_measurement_into_stable_pass(self):
+        output = ('100\t' + str(self.root) + '\n').encode()
+        disappearance = ("du: cannot access '" + str(self.root / 'gone') + "': No such file or directory\n").encode()
+        result = subprocess.CompletedProcess([], 1, output, disappearance)
+        with mock.patch.object(ci.subprocess, 'run', return_value=result) as run:
+            self.assertTrue(ci.measure_storage(self.root, live=True, sudo=False)['provisional'])
+            self.assertEqual(run.call_count, 3)
+            with self.assertRaisesRegex(ci.Blocked, 'did not stabilize'):
+                ci.measure_storage(self.root, sudo=False)
+        for error in (b'du: Input/output error\n', b'sudo: permission denied\n',
+                      ("du: cannot access '" + str(self.root) + "/../outside': No such file or directory\n").encode(),
+                      b"du: cannot access '/outside/gone': No such file or directory\n"):
+            with self.assertRaises(ci.Blocked):
+                ci.parse_du(self.root, subprocess.CompletedProcess([], 1, output, error))
+        huge = subprocess.CompletedProcess([], 0, (str(ci.OVERHEAD_LIMIT + 1) + '\t' + str(self.root) + '\n').encode(), b'')
+        with mock.patch.object(ci.subprocess, 'run', return_value=huge):
+            with self.assertRaisesRegex(ci.Blocked, 'overhead limit'):
+                ci.measure_storage(self.root, live=True, sudo=False)
+
+    def test_all_public_emitters_neutralize_both_runner_commands_without_losing_json_evidence(self):
+        attack = '::error::modern :::notice:::: overlap ##[warning]legacy ###['
+        original = {'identity##[error]': {'diagnostics': [attack, 'unicode é "quoted" \\u003a']}}
+        captured = io.StringIO()
+        probe = ci.Probe('a' * 40, self.root)
+        probe.report['guest'] = original
+        probe.report['tooling'] = {'rpm_manifest': attack}
+        with contextlib.redirect_stdout(captured), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}):
+            ci.emit_json('DP_JSON_TEST', original)
+            for prefix in ('DP_SERIAL_TAIL\n', 'DP_TOOL_RPMS\n', 'DP_BLOCKED '):
+                ci.emit_text(prefix, attack)
+            with self.assertRaises(ci.Blocked):
+                probe.bounded([sys.executable, '-c', 'import sys;print(sys.argv[1]);sys.exit(1)', attack],
+                              5, 'local output failure', disk_check=False)
+            with mock.patch.object(probe, 'preflight', side_effect=ci.Blocked(attack)), \
+                 mock.patch.object(probe, 'cleanup', side_effect=lambda: probe.phase('cleanup', 'pass', attack)):
+                self.assertEqual(probe.execute(), 2)
+        public = captured.getvalue()
+        self.assertNotIn('::', public)
+        self.assertNotIn('##[', public)
+        decoded = {line.split(' ', 1)[0]: json.loads(line.split(' ', 1)[1])
+                   for line in public.splitlines() if line.startswith(('DP_JSON_TEST ', 'DP_REPORT '))}
+        self.assertEqual(decoded['DP_JSON_TEST'], original)
+        self.assertEqual(decoded['DP_REPORT']['guest'], original)
+        self.assertEqual(decoded['DP_REPORT']['tooling']['rpm_manifest'], attack)
+        self.assertEqual(decoded['DP_REPORT']['blocker'], attack)
 
 
 if __name__ == '__main__':

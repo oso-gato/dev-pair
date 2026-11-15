@@ -81,7 +81,32 @@ def sanitize(data, limit=12000):
     """Public candidate output is untrusted: escape workflow and terminal controls."""
     text = data.decode('utf-8', 'replace') if isinstance(data, bytes) else str(data)
     text = ''.join(c if c in '\n\t' or 32 <= ord(c) < 127 else '?' for c in text)
-    text = text.replace('::', ': :')
+    # Both current ::command:: and legacy ##[command] forms are recognized
+    # anywhere in a runner log line. Break complete colon runs, not only pairs.
+    text = re.sub(r':{2,}', lambda match: ' '.join(match.group()), text).replace('##[', '# #[')
+    return ('[truncated; tail follows]\n' if len(text) > limit else '') + text[-limit:]
+
+
+def safe_json(value):
+    """Keep JSON evidence lossless while escaping runner command introducers."""
+    encoded = json.dumps(value, sort_keys=True, ensure_ascii=True)
+    # Escape inside JSON strings only; structural colons remain valid JSON.
+    # json.loads reconstructs every original string/key, including literal
+    # backslashes, while the runner never sees either command introducer.
+    return re.sub(r'"(?:\\.|[^"\\])*"',
+                  lambda match: match.group().replace(':', r'\u003a').replace('#', r'\u0023'), encoded)
+
+
+def emit_json(prefix, value):
+    print(prefix + ' ' + safe_json(value), flush=True)
+
+
+def emit_text(prefix, value, limit=12000):
+    print(prefix + sanitize(value, limit), flush=True)
+
+
+def evidence_tail(value, limit):
+    text = value.decode('utf-8', 'replace') if isinstance(value, bytes) else str(value)
     return ('[truncated; tail follows]\n' if len(text) > limit else '') + text[-limit:]
 
 
@@ -125,7 +150,7 @@ def checksum_identity(plaintext):
 def run_small(argv, timeout=30, cwd=None, input_data=None):
     result = subprocess.run(argv, cwd=cwd, input=input_data, capture_output=True,
                             env=SAFE_ENV, timeout=timeout)
-    require(result.returncode == 0, 'command failed: ' + sanitize(result.stderr, 1500))
+    require(result.returncode == 0, 'command failed: ' + evidence_tail(result.stderr, 1500))
     require(len(result.stdout) <= SOURCE_LIMIT, 'command output exceeds limit')
     return result.stdout
 
@@ -155,6 +180,42 @@ def check_capacity(root, before_boot=False):
     require(free >= HOST_RESERVE + (OVERLAY_LIMIT if before_boot else 0),
             'capacity blocked: insufficient free disk for declared overlay and host reserve')
     return free
+
+
+def parse_du(root, result):
+    require(len(result.stdout) + len(result.stderr) <= 65536, 'storage measurement diagnostic limit exceeded')
+    summary = re.fullmatch(rb'([0-9]+)\t' + re.escape(os.fsencode(root)) + rb'\n', result.stdout)
+    require(summary is not None, 'invalid storage measurement summary')
+    if result.returncode == 0:
+        require(not result.stderr, 'unexpected storage measurement diagnostics')
+        return int(summary[1]), False
+    require(result.returncode == 1 and result.stderr, 'storage measurement failed')
+    # Accept only GNU du's precise ENOENT traversal race, beneath this owned
+    # root. Permission, I/O, mount, sudo and unrecognized errors stay blockers.
+    for line in result.stderr.splitlines():
+        match = re.fullmatch(rb"(?:/usr/bin/)?du: cannot access '([^'\r\n]+)': No such file or directory", line)
+        require(match is not None and match[1].startswith(os.fsencode(root) + b'/') and
+                b'..' not in match[1].split(b'/'),
+                'storage measurement has non-disappearance errors')
+    return int(summary[1]), True
+
+
+def measure_storage(root, live=False, sudo=True, attempts=3):
+    require(type(attempts) is int and 1 <= attempts <= 3, 'invalid storage retry bound')
+    argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/du', '--summarize', '--block-size=1',
+            '--one-file-system', '--exclude=guest.qcow2', str(root)]
+    maximum = 0
+    for attempt in range(attempts):
+        result = subprocess.run(argv, env=SAFE_ENV, capture_output=True, timeout=5)
+        size, vanished = parse_du(root, result)
+        maximum = max(maximum, size)
+        require(maximum <= OVERHEAD_LIMIT, 'capacity blocked: tooling/source overhead limit exceeded')
+        if not vanished:
+            return {'bytes': maximum, 'provisional': False, 'attempts': attempt + 1}
+    # Live churn can produce valid but incomplete traversals. Keep the largest
+    # observed count; it is provisional, never a completed-phase validation.
+    require(live, 'storage measurement did not stabilize within bounded retries')
+    return {'bytes': maximum, 'provisional': True, 'attempts': attempts}
 
 
 def tooling_recipe():
@@ -229,8 +290,8 @@ class Probe:
         self.log_used = 0
 
     def phase(self, name, status, detail):
-        self.report['phases'][name] = {'status': status, 'detail': sanitize(detail, 4000)}
-        print('DP_PHASE ' + json.dumps({'phase': name, **self.report['phases'][name]}), flush=True)
+        self.report['phases'][name] = {'status': status, 'detail': evidence_tail(detail, 4000)}
+        emit_json('DP_PHASE', {'phase': name, **self.report['phases'][name]})
 
     def bounded(self, argv, timeout, name, disk_check=True, file_limit=None):
         """Bound logs/time and watch storage while a native child runs."""
@@ -253,11 +314,9 @@ class Probe:
                     # Rootful Podman owns private storage directories. Measure
                     # via a fixed read-only privileged tool, never silently skip
                     # inaccessible files in an unprivileged os.walk.
-                    usage = run_small(['sudo', '-n', '/usr/bin/du', '--summarize', '--block-size=1',
-                                       '--exclude=guest.qcow2', str(self.root)], timeout=5)
-                    require(re.fullmatch(rb'[0-9]+\s+[^\n]+\n', usage), 'cannot measure scratch overhead')
-                    overhead = int(usage.split()[0])
-                    require(overhead <= OVERHEAD_LIMIT, 'capacity blocked: tooling/source overhead limit exceeded')
+                    measurement = measure_storage(self.root, live=True)
+                    if measurement['provisional']:
+                        self.report['provisional_storage_samples'] = self.report.get('provisional_storage_samples', 0) + 1
                 for key, _ in selector.select(timeout=1):
                     data = os.read(key.fileobj.fileno(), 65536)
                     if not data:
@@ -268,6 +327,9 @@ class Probe:
                     log.extend(data)
             process.wait(timeout=5)
             require(process.returncode == 0, name + ' failed with exit ' + str(process.returncode))
+            if disk_check:
+                check_capacity(self.root)
+                self.report['last_stable_overhead_bytes'] = measure_storage(self.root)['bytes']
             return bytes(log)
         except BaseException:
             # Podman/conmon scopes may outlive the CLI; cleanup also force-removes
@@ -277,7 +339,7 @@ class Probe:
             except ProcessLookupError:
                 pass
             process.wait(timeout=5)
-            print(sanitize(bytes(log), 12000), flush=True)
+            emit_text('', bytes(log), 12000)
             raise
         finally:
             selector.close()
@@ -349,7 +411,7 @@ class Probe:
         require(re.fullmatch('sha256:[0-9a-f]{64}', self.image), 'tool image ID missing')
         packages = self.helper(self.run_args('/usr/bin/cat', mounts=False) + [self.image, '/tool-rpms.txt', '/tool-rpm-sha256.txt'])
         self.report['tooling'] = {'base': BASE, 'image_id': self.image, 'rpm_manifest': packages.decode()}
-        print('DP_TOOL_RPMS\n' + sanitize(packages, 32000), flush=True)
+        emit_text('DP_TOOL_RPMS\n', packages, 32000)
         self.phase('tooling', 'pass', 'Disposable image with GPG-checked RPMs; exact NEVRAs recorded, live repositories remain a reproducibility limit')
 
     def payload(self):
@@ -417,7 +479,7 @@ class Probe:
                  '-drive', 'file=/disks/seed.iso,media=cdrom,readonly=on,format=raw',
                  '-drive', 'file=/disks/payload.iso,media=cdrom,readonly=on,format=raw']
         serial = self.helper(args, timeout=300 if accel == 'kvm' else 900)
-        print('DP_SERIAL_TAIL\n' + sanitize(serial, 24000), flush=True)
+        emit_text('DP_SERIAL_TAIL\n', serial, 24000)
         guest = parse_serial(serial, self.source, self.guest_sha)
         self.report['guest'] = guest
         self.phase('fedora-boot', 'pass', 'Real signed Fedora Cloud image booted and emitted a complete candidate-bound serial result using ' + accel)
@@ -443,15 +505,15 @@ class Probe:
                                    ('source-payload', self.payload), ('fedora-boot', self.boot)):
                 action()
         except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
-            self.report['blocker'] = sanitize(str(exc), 4000)
+            self.report['blocker'] = evidence_tail(exc, 4000)
             self.phase(active, 'blocked', self.report['blocker'])
-            print('DP_BLOCKED ' + self.report['blocker'], flush=True)
+            emit_text('DP_BLOCKED ', self.report['blocker'], 4000)
         finally:
             try:
                 self.cleanup()
             except (Blocked, OSError, subprocess.SubprocessError) as exc:
                 self.phase('cleanup', 'fail', str(exc))
-            print('DP_REPORT ' + json.dumps(self.report, sort_keys=True), flush=True)
+            emit_json('DP_REPORT', self.report)
             summary = os.environ.get('GITHUB_STEP_SUMMARY')
             if summary:
                 with open(summary, 'a') as output:
@@ -480,5 +542,5 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except (Blocked, OSError) as exc:
-        print('DP_BLOCKED ' + sanitize(str(exc)), flush=True)
+        emit_text('DP_BLOCKED ', str(exc))
         sys.exit(2)
