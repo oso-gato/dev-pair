@@ -2,14 +2,14 @@
 
 [The pull-request workflow](../.github/workflows/fedora-vm.yml) and
 [controller](../tools/fedora_ci.py) implement an initial real-VM execution route
-for an exact public candidate. [Run 4](https://github.com/oso-gato/dev-pair/actions/runs/43731292754)
-passed all 146 tests, runner preflight and signed Fedora44 download verification.
-Tooling construction reached its RPM report, with a stable overhead sample of
-1025351680 bytes. Monitoring then recorded GNU du exit1, no stdout total and an
-owned overlay `fts_read failed ... No such file or directory` error. This proves
-run4's failure cause; run3's oversized diagnostics remain unidentified. Cleanup
-passed. The exact-error retry repair passes 148 integrated tests and fresh review,
-awaiting runner retest; absent totals are never accepted as zero. No Fedora guest boot has occurred.
+for an exact public candidate. [Run 5](https://github.com/oso-gato/dev-pair/actions/runs/43731901140)
+passed all 148 tests, runner preflight, signed Fedora download verification,
+tooling image construction and source transfer. The Fedora VM actually booted
+and powered off under TCG in approximately 95 seconds. The controller rejected
+the guest report framing; the retained tail contains only partial preflight/status
+results, which cannot satisfy the complete candidate-bound report contract.
+Cleanup passed. Stable tooling/source overhead was 1029046272 bytes. Structured
+report transport is under read-only diagnosis before another runtime attempt.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and

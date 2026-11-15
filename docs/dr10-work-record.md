@@ -1004,3 +1004,34 @@ block, maximum usable totals remain conservative and stable completion is
 required. All capture, scan, storage and component bounds are unchanged.
 Publish run5 as the final runtime attempt in the current repair batch; inspect
 its actual phases and explicitly reassess any further runtime work.
+
+Fifth actual run `43731901140`, job `132865981669`, source
+`d79f3a4d9a6c1e3f9e611fcaeb83ca6d5e1e2fd6`, passed all 148 tests, runner
+preflight, signed-image verification, tooling construction and source-payload
+creation. Tooling image was
+`sha256:e498edf5aed83d47cfd0afc04bcf8fe8a13fa35ca6697edc59443ca1ca0b8533`;
+actual QEMU10.2.2/RPM identities and hashes were retained. Stable overhead was
+1029046272 bytes. The VM booted real Fedora Cloud and shut down under TCG in
+approximately 95 seconds; this is actual guest execution, not a fixture.
+The controller rejected its completed-result framing as missing/ambiguous.
+The bounded 24000-character serial tail starts inside a guest JSON record and
+contains preflight/status pass fragments, but cannot establish a complete
+candidate-bound result. Do not promote those fragments to accepted phase passes.
+Cloud-init output prefixing/interleaving is a hypothesis pending diagnosis.
+Cleanup passed. Logs: https://github.com/oso-gato/dev-pair/actions/runs/43731901140
+and `/workspace/artifacts/fedora-ci-run-43731901140.log`.
+
+The runtime repair batch is complete. Coordinator reassessment: the route now
+proves actual Fedora boot with capacity/time headroom, while structured result
+transport remains an implementation blocker. Do not broaden parser acceptance
+to partial/arbitrary console text. A separate bounded read-only Astra High
+`/root/fedora_ci_serial_diagnosis` examines the transport and public cloud-init
+source before any further implementation/run decision.
+
+The single Sol High builder continues an independent 25-minute verified-public-
+input helper slice in `/workspace/dev-pair-fedora-inputs`, based on d79f3a4.
+Scope: bounded verified Codex/Cosign/Distrobox inputs, exact-source maintenance
+context, sanitized public Git objects and compressed transfer with separate
+hashes. Workflow, VM limits, guest prepare and production bootstrap integration
+are unchanged in this slice. No credentials, model calls or private standards
+content enter the payload. Fresh exact-candidate review follows the helper.
