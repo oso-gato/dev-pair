@@ -1144,3 +1144,26 @@ implementing the source-backed FIFO plan. Fresh reviewer
 review before one reassessed hosted run; two repair cycles maximum before another
 checkpoint. No private policy, credentials, model calls or host deployment enter
 this test. API settings are configuration evidence, not backend attestation.
+
+
+Read-only Astra High `/root/fedora_prepare_integration_design` completed the
+next integration design against 8c9a41b; it did not modify source or execute a
+hosted test. Handoff: `/workspace/scratch/fedora-prepare-integration-plan.md`.
+Use a shared production first-bootstrap entry for real prepare followed by
+confined assembly, with distinct durable phase results and exact source/context
+binding; a separate CI-only adapter call is insufficient. The guest alone creates
+its disposable root0600 test password, and never publishes it. Proposed finite
+CI profile: 32GiB virtual disk, 16GiB physical overlay, 4GiB overhead and unchanged
+3GiB host reserve, with isolated public provisioning egress and no forwarded
+ports, enrollment, model calls or Hostinger route. These values are a design,
+not yet implemented or tested. Preserve the adapter's 900s staging and 180s
+runtime ceilings and enforce an enclosing whole-phase deadline.
+
+Pinned Distrobox init requests additional Fedora packages absent from the
+current staging recipe. The next implementation should resolve and preinstall
+that actual signed dependency set, preserving genuine unchanged init and its
+verification hooks. Add bounded credential-aware diagnostics to the preparation
+path and truthful partial completion/reapply behavior. Actual SELinux/rootless
+failures must drive scoped diagnosis; no label-disable, privileged, host-socket
+or seccomp-disable fallback is authorized. Complete the report-channel review
+and its exact-candidate run before enabling this new test scope.
