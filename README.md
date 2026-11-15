@@ -39,6 +39,9 @@
 <a id="dr2-3"></a>
 **DR2.3** The previous source and documentation remain in Git history at commit [`90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5`](https://github.com/oso-gato/dev-pair/tree/90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5). They may be consulted selectively but do not govern the new implementation. No history or existing tags are rewritten.
 
+<a id="dr2-4"></a>
+**DR2.4** A [durable local job/test protocol and recovery ledger](docs/durable-jobs.md) now provides versioned strict request/results, transactional checkpoints, duplicate/collision handling, explicit interrupted-attempt reconciliation and candidate-bound result consumption. Real local-process tests exercise failure, changed-candidate repair, passing retest, restart and concurrent reservation. Its sole executor checks local JSON data; Fedora host requests remain blocked. This groundwork does not enable pair jobs, authenticate external messages or establish R7.6/R7.9 host acceptance.
+
 <a id="platform-and-agents"></a>
 <a id="dr3"></a>
 ## DR3 — Platform and agents
