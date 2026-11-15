@@ -74,7 +74,20 @@ contains adopted standards identities, never private standards text.
    service has null standard streams, a clean environment, control-group termination,
    RuntimeMaxSec2445 and stop grace5s. Staging, selected startup acknowledgement and
    input admission share60s. No cloud-final ordering wait or cloud-init pipe forwarding
-   occurs. Selected manager fields, exact loaded fragment/no drop-ins, effective limits,
+   occurs. The guest stages an exclusive root-owned0644 zero-byte
+   `/etc/systemd/system/dev-pair-ci-provision.service.d/10-timeout-abort.conf`,
+   restoring standard contexts on that directory and file. On systemd v259 this
+   per-service same-basename empty regular file suppresses the stock generic
+   timeout-abort drop-in; the owned empty path remains in DropInPaths. It never
+   changes or accepts the global vendor file. This service explicitly selects
+   TimeoutStopFailureMode=kill, SendSIGKILL=yes and FinalKillSignal=SIGKILL;
+   effective values must be kill/yes/9, retaining2445s runtime and5s stop grace.
+   Only the exact owned DropInPaths value is admitted; missing, vendor, substituted
+   or additional paths block. Request version2 and native evidence bind the
+   protected mask path, empty-content digest, device and inode. Native admission
+   independently rejects symlinks/nonregular files, non-root or writable parents,
+   changed mode, nonempty/multiply-linked files and inode/path replacement.
+   Selected manager fields, exact loaded fragment/owned drop-in, effective limits,
    actual root UID/MainPID/cgroup/SELinux context and script/unit/controller hashes must
    match before any phase can pass. The unit contains public targets and its separate
    protected record contains the unit hash, avoiding a hash cycle. Failed startup emits
@@ -98,7 +111,9 @@ contains adopted standards identities, never private standards text.
    no caller-selected timeout or additional VM/service time is introduced. Reload
    remains explicit so changed unit installation is not dependent on manager cache
    state. No journal is queried. Manager property values retain
-   explicit64-character tails within the unchanged4096-byte console witness cap.
+   per-key bounded tails within the unchanged4096-byte console witness cap.
+   Exact known public unit/mask paths are retained completely; scalar properties
+   have smaller fixed caps. Unknown path values retain explicit truncation markers.
    The controller scans its already bounded console before tail truncation, verifies
    the witness schema and exact source/controller/script/unit targets, and retains
    the complete validated failure bytes and hash. Missing/partial/ambiguous witnesses
@@ -185,7 +200,7 @@ block, retaining bounded diagnostic counts/tails and truncation classifications.
 
 Dedicated ttyS1 retains the owned0600 FIFO pair, raw115200 terminal, bounded
 write/drain and exact frame protocol. Normal poweroff requires successful report
-delivery; no console salvage is accepted. JSON envelope version3 requires strict
+delivery; no console salvage is accepted. JSON envelope version4 requires strict
 public-input identities and selected initialization evidence. Producer/consumer
 share fields/limits. Wrong/unknown versions, duplicate fields, unknown identity
 or initialization fields and unmatched hashes reject. Executor exit0 plus exactly
@@ -222,7 +237,7 @@ Run `python3 -m unittest discover -s tests -q`. Local checks cover actual proces
 limits/descendants, authenticated cached payload extraction, public GPG metadata,
 FIFO/PTY framing, secret-sentinel failure paths, phase/identity rejection and fixed
 profile/network construction. Engine/service responses injected in tests remain
-explicit synthetic contracts, not Fedora execution. Actual normal Fedora native service transition/startup, current-source public
+explicit synthetic contracts, not Fedora execution. Actual Fedora owned-mask selection/effective kill profile/native context admission, current-source public
 fetch/Cosign, package timing/capacity, rootless SELinux confinement and genuine
 Distrobox initialization require a separately reviewed hosted run. No local
 VM, authentication/model, VPS or complete-pair acceptance is claimed.

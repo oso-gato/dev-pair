@@ -26,7 +26,7 @@ import tty
 
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 REPORT_LIMIT = 65536
-REPORT_VERSION = 3
+REPORT_VERSION = 4
 GUEST_PHASES = ('fedora-preflight', 'guest-inputs', 'bootstrap-inspect', 'bootstrap-status',
                 'bootstrap-prepare', 'maintenance-gptbox', 'bootstrap-post-inspect', 'bootstrap-post-status')
 INPUT_LENGTHS = {'controller_sha256': 64, 'source_sha': 40, 'helper_sha256': 64, 'manifest_sha256': 64, 'payload_sha256': 64,
@@ -43,6 +43,8 @@ SERVICE_NAME = 'dev-pair-ci-provision.service'
 SERVICE_SCRIPT = pathlib.Path('/usr/local/libexec/dev-pair-ci/guest.py')
 SERVICE_UNIT = pathlib.Path('/etc/systemd/system') / SERVICE_NAME
 SERVICE_REQUEST = pathlib.Path('/var/lib/dev-pair/ci-executor/request.json')
+SERVICE_MASK = SERVICE_UNIT.parent / (SERVICE_NAME + '.d') / '10-timeout-abort.conf'
+EMPTY_SHA256 = hashlib.sha256(b'').hexdigest()
 SERVICE_SECONDS = GUEST_ADMISSION_SECONDS + INITIALIZE_SECONDS + INITIALIZE_CLEANUP_SECONDS + GUEST_FINAL_SECONDS
 SERVICE_STOP_SECONDS = 5
 STATE_ROOT = pathlib.Path('/var/lib/dev-pair/bootstrap')
@@ -68,7 +70,7 @@ def service_unit(expected, guest_sha):
             '[Service]\nType=exec\nUser=root\nGroup=root\nUMask=0077\n'
             'StandardInput=null\nStandardOutput=null\nStandardError=null\n'
             'RuntimeMaxSec=' + str(SERVICE_SECONDS) + 's\nTimeoutStartSec=10s\nTimeoutStopSec=' + str(SERVICE_STOP_SECONDS) + 's\n'
-            'KillMode=control-group\nRestart=no\nExecStart=' + command + '\n')
+            'KillMode=control-group\nTimeoutStopFailureMode=kill\nSendSIGKILL=yes\nFinalKillSignal=SIGKILL\nRestart=no\nExecStart=' + command + '\n')
 
 
 def observed_context(value):
@@ -81,7 +83,8 @@ def observed_context(value):
 
 def executor_profile():
     return {'Type': 'exec', 'User': 'root', 'Group': 'root', 'StandardInput': 'null', 'StandardOutput': 'null',
-            'StandardError': 'null', 'KillMode': 'control-group', 'Restart': 'no', 'DropInPaths': '',
+            'StandardError': 'null', 'KillMode': 'control-group', 'Restart': 'no', 'DropInPaths': str(SERVICE_MASK),
+            'TimeoutStopFailureMode': 'kill', 'SendSIGKILL': 'yes', 'FinalKillSignal': '9',
             'SELinuxContext': '', 'RootDirectory': '', 'RootImage': '',
             'RuntimeMaxUSec': SERVICE_SECONDS, 'TimeoutStopUSec': SERVICE_STOP_SECONDS}
 
@@ -124,6 +127,38 @@ def executor_file(path, data, mode):
         os.fsync(stream.fileno())
 
 
+def read_mask_file(path):
+    # Open nonblocking/no-follow; reject devices before reading the same inode.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o644 and info.st_size == 0 and info.st_nlink == 1,
+                'Owned service mask must be an empty regular0644 file')
+        require(os.read(fd, 1) == b'', 'Owned service mask content changed')
+        final = pathlib.Path(path).lstat()
+        require((final.st_dev, final.st_ino, final.st_mode, final.st_uid, final.st_gid, final.st_size, final.st_nlink) ==
+                (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_size, info.st_nlink), 'Owned service mask path identity changed')
+        return {'path': str(path), 'device': info.st_dev, 'inode': info.st_ino, 'sha256': EMPTY_SHA256}, info.st_uid
+    finally:
+        os.close(fd)
+
+
+def validate_mask_record(value):
+    require(type(value) is dict and set(value) == {'path', 'device', 'inode', 'sha256'} and value['path'] == str(SERVICE_MASK) and
+            value['sha256'] == EMPTY_SHA256 and type(value['device']) is int and value['device'] >= 0 and
+            type(value['inode']) is int and value['inode'] > 0, 'Invalid owned service mask identity')
+    return value
+
+
+def mask_identity():
+    for parent in (SERVICE_MASK, *SERVICE_MASK.parents):
+        info = parent.lstat()
+        require(not parent.is_symlink() and info.st_uid == 0 and not info.st_mode & 0o022, 'Owned mask path ownership/protection changed')
+    identity, owner = read_mask_file(SERVICE_MASK)
+    require(owner == 0, 'Owned mask file must be root-owned')
+    return validate_mask_record(identity)
+
+
 def executor_control(argv, end):
     # Measured TCG daemon-reload exceeded5s. Only this exact fixed operation
     # gets30s; every allocation remains clipped to the original admission end.
@@ -131,7 +166,7 @@ def executor_control(argv, end):
     # Only these pre-credential fixed public operations may retain stderr. It
     # goes to an owned size-limited regular file, never a forwarded stream pipe.
     public = argv in (
-        ['/usr/sbin/restorecon', '-F', str(SERVICE_SCRIPT.parent), str(SERVICE_SCRIPT), str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT)],
+        ['/usr/sbin/restorecon', '-F', str(SERVICE_SCRIPT.parent), str(SERVICE_SCRIPT), str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT), str(SERVICE_MASK.parent), str(SERVICE_MASK)],
         ['/usr/bin/systemctl', 'daemon-reload'], ['/usr/bin/systemctl', '--no-block', 'start', SERVICE_NAME])
     with contextlib.ExitStack() as stack:
         stderr = subprocess.DEVNULL
@@ -163,7 +198,7 @@ def executor_control(argv, end):
 
 
 STAGING_OPERATIONS = ('root-identity', 'script-snapshot', 'source-identity', 'render-unit', 'launcher-context',
-                      'install-script', 'install-request', 'install-unit', 'restore-contexts', 'reload-manager',
+                      'install-script', 'install-request', 'install-unit', 'install-mask', 'verify-mask', 'restore-contexts', 'reload-manager',
                       'start-service', 'observe-startup')
 STARTUP_MARKER = b'DP_NATIVE_START_BLOCKED '
 
@@ -221,17 +256,21 @@ def stage_executor(expected, guest_sha):
         unit = service_unit(expected, guest_sha).encode()
         operation = 'launcher-context'
         context = observed_context(pathlib.Path('/proc/self/attr/current').read_text())
-        request = {'version': 1, 'source_sha': expected['source_sha'], 'inputs': expected, 'guest_sha256': guest_sha,
+        request = {'version': 2, 'source_sha': expected['source_sha'], 'inputs': expected, 'guest_sha256': guest_sha,
                    'unit_sha256': hashlib.sha256(unit).hexdigest(), 'launcher_context': context, 'admission_deadline': end}
         operation = 'install-script'
         executor_file(SERVICE_SCRIPT, script, 0o444)
+        operation = 'install-mask'
+        executor_file(SERVICE_MASK, b'', 0o644)
+        operation = 'verify-mask'
+        request['mask'] = mask_identity()
         operation = 'install-request'
         executor_file(SERVICE_REQUEST, json.dumps(request, sort_keys=True).encode() + b'\n', 0o600)
         operation = 'install-unit'
         executor_file(SERVICE_UNIT, unit, 0o644)
         operation = 'restore-contexts'
         executor_control(['/usr/sbin/restorecon', '-F', str(SERVICE_SCRIPT.parent), str(SERVICE_SCRIPT),
-                          str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT)], end)
+                          str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT), str(SERVICE_MASK.parent), str(SERVICE_MASK)], end)
         operation = 'reload-manager'
         executor_control(['/usr/bin/systemctl', 'daemon-reload'], end)
         operation = 'start-service'
@@ -253,6 +292,23 @@ class ExecutorStartupError(ValueError):
 def startup_properties():
     return tuple(dict.fromkeys(('MainPID', 'User', 'ActiveState', 'LoadState', 'Result', 'ExecMainCode',
                                'ExecMainStatus', 'FragmentPath', *executor_profile())))
+
+
+def startup_property_limit(key, value):
+    if (key == 'DropInPaths' and value == str(SERVICE_MASK)) or (key == 'FragmentPath' and value == str(SERVICE_UNIT)):
+        return len(value)  # Exact known public paths stay lossless.
+    if key in ('Type', 'User', 'Group', 'StandardInput', 'StandardOutput', 'StandardError', 'Restart',
+               'TimeoutStopFailureMode', 'SendSIGKILL', 'FinalKillSignal', 'ExecMainCode', 'ExecMainStatus'):
+        return 16
+    if key in ('MainPID', 'ActiveState', 'LoadState', 'KillMode'):
+        return 24
+    if key in ('Result', 'RuntimeMaxUSec', 'TimeoutStopUSec'):
+        return 32
+    return 64
+
+
+def startup_property_value(key, value):
+    return safe_text(value, startup_property_limit(key, value))
 
 
 def observe_executor_start(end):
@@ -290,7 +346,7 @@ def observe_executor_start(end):
         if observed.get('ActiveState') == 'failed' or observed.get('LoadState') in ('error', 'bad-setting', 'not-found'):
             break
         time.sleep(min(.05, max(0, stop - time.monotonic())))
-    raise ExecutorStartupError({key: safe_text(observed.get(key, 'unavailable'), 64) for key in properties}, query_exit_status)
+    raise ExecutorStartupError({key: startup_property_value(key, observed.get(key, 'unavailable')) for key in properties}, query_exit_status)
 
 
 def validate_startup_witness(value, expected, guest_sha):
@@ -327,7 +383,7 @@ def validate_startup_witness(value, expected, guest_sha):
                 value['startup_properties'] == {'availability': 'unavailable'}, 'Invalid fixed public control diagnostic')
     properties = value['startup_properties']
     require(type(properties) is dict and (properties == {'availability': 'unavailable'} or
-            set(properties) == set(startup_properties()) and all(type(item) is str and len(item) <= 64 and all(32 <= ord(c) < 127 for c in item) for item in properties.values())),
+            set(properties) == set(startup_properties()) and all(type(item) is str and len(item) <= startup_property_limit(key, item) and all(32 <= ord(c) < 127 for c in item) for key, item in properties.items())),
             'Invalid selected startup properties')
     return value
 
@@ -354,9 +410,10 @@ def write_startup_failure(witness):
 
 
 def verify_executor_target(request, expected, guest_sha, script, unit):
-    require(type(request) is dict and set(request) == {'version', 'source_sha', 'inputs', 'guest_sha256', 'unit_sha256', 'launcher_context', 'admission_deadline'} and
-            type(request['version']) is int and request['version'] == 1 and request['source_sha'] == expected['source_sha'] and
+    require(type(request) is dict and set(request) == {'version', 'source_sha', 'inputs', 'guest_sha256', 'unit_sha256', 'launcher_context', 'admission_deadline', 'mask'} and
+            type(request['version']) is int and request['version'] == 2 and request['source_sha'] == expected['source_sha'] and
             request['inputs'] == expected and request['guest_sha256'] == guest_sha, 'Staged executor target mismatch')
+    validate_mask_record(request['mask'])
     unit_sha = hashlib.sha256(service_unit(expected, guest_sha).encode()).hexdigest()
     require(hashlib.sha256(script).hexdigest() == guest_sha and unit == service_unit(expected, guest_sha).encode() and hashlib.sha256(unit).hexdigest() == request['unit_sha256'] == unit_sha,
             'Actual script/unit differ from controller-bound target')
@@ -375,6 +432,7 @@ def native_executor_identity(expected, guest_sha):
     request = read_json(SERVICE_REQUEST, 65536)
     require(digest(pathlib.Path(__file__)) == guest_sha, 'Executing service script differs from controller target')
     unit_sha = verify_executor_target(request, expected, guest_sha, read_bytes(SERVICE_SCRIPT, 1024 ** 2), read_bytes(SERVICE_UNIT, 16384))
+    require(mask_identity() == request['mask'], 'Actual owned mask differs from staged identity')
     fields = command(['/usr/bin/systemctl', 'show', '--property=MainPID', '--property=ActiveState', '--property=FragmentPath', *('--property=' + key for key in executor_profile()), SERVICE_NAME], timeout=remaining(request['admission_deadline'], 5)).decode()
     observed = dict(line.split('=', 1) for line in fields.splitlines() if '=' in line)
     configuration_sha = verify_executor_profile(observed)
@@ -384,15 +442,16 @@ def native_executor_identity(expected, guest_sha):
             observed.get('FragmentPath') == str(SERVICE_UNIT) and cgroup == '0::/system.slice/' + SERVICE_NAME and
             context and ':cloud_init_t:' not in context, 'Actual native provisioning executor identity mismatch')
     return {'kind': 'native-systemd-service', 'source_sha': expected['source_sha'], 'controller_sha256': expected['controller_sha256'],
-            'unit': SERVICE_NAME, 'unit_sha256': unit_sha, 'configuration_sha256': configuration_sha, 'script_sha256': guest_sha, 'uid': os.getuid(), 'euid': os.geteuid(),
+            'unit': SERVICE_NAME, 'mask': request['mask'], 'unit_sha256': unit_sha, 'configuration_sha256': configuration_sha, 'script_sha256': guest_sha, 'uid': os.getuid(), 'euid': os.geteuid(),
             'main_pid': os.getpid(), 'manager_main_pid': int(observed['MainPID']), 'cgroup': cgroup, 'context': context,
             'launcher_context': safe_text(request['launcher_context'], 200), 'admission_deadline': request['admission_deadline']}
 
 
 def validate_executor(value, expected, guest_sha):
     keys = {'kind', 'source_sha', 'controller_sha256', 'unit', 'unit_sha256', 'script_sha256', 'uid', 'euid',
-            'main_pid', 'manager_main_pid', 'cgroup', 'context', 'launcher_context', 'admission_deadline', 'configuration_sha256'}
+            'main_pid', 'manager_main_pid', 'cgroup', 'context', 'launcher_context', 'admission_deadline', 'configuration_sha256', 'mask'}
     require(type(value) is dict and set(value) == keys, 'Missing/unknown native executor evidence')
+    validate_mask_record(value['mask'])
     require(value['kind'] == 'native-systemd-service' and value['source_sha'] == expected['source_sha'] and
             value['controller_sha256'] == expected['controller_sha256'] and value['unit'] == SERVICE_NAME and
             value['unit_sha256'] == hashlib.sha256(service_unit(expected, guest_sha).encode()).hexdigest() and value['script_sha256'] == guest_sha and value['configuration_sha256'] == executor_profile_hash(),

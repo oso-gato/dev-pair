@@ -26,7 +26,7 @@ def identities():
 def executor_fixture(expected, guest_sha):
     # Contract fixture only, never evidence of a running systemd executor.
     return {'kind': 'native-systemd-service', 'source_sha': expected['source_sha'], 'controller_sha256': expected['controller_sha256'],
-            'unit': guest.SERVICE_NAME, 'configuration_sha256': guest.executor_profile_hash(), 'unit_sha256': ci.sha256(guest.service_unit(expected, guest_sha).encode()),
+            'unit': guest.SERVICE_NAME, 'mask': {'path': str(guest.SERVICE_MASK), 'device': 1, 'inode': 2, 'sha256': guest.EMPTY_SHA256}, 'configuration_sha256': guest.executor_profile_hash(), 'unit_sha256': ci.sha256(guest.service_unit(expected, guest_sha).encode()),
             'script_sha256': guest_sha, 'uid': 0, 'euid': 0, 'main_pid': 12345, 'manager_main_pid': 12345,
             'cgroup': '0::/system.slice/' + guest.SERVICE_NAME, 'context': 'system_u:system_r:fixture_t:s0',
             'launcher_context': 'system_u:system_r:cloud_init_t:s0', 'admission_deadline': 12345.0}

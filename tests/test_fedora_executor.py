@@ -23,6 +23,10 @@ def inputs():
     return {**{key: 'c' * length for key, length in guest.INPUT_LENGTHS.items()}, 'source_sha': 'a' * 40, 'payload_bytes': 123}
 
 
+def mask_fixture():
+    return {'path': str(guest.SERVICE_MASK), 'device': 1, 'inode': 2, 'sha256': guest.EMPTY_SHA256}
+
+
 class FedoraExecutorTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -38,6 +42,8 @@ class FedoraExecutorTests(unittest.TestCase):
         self.assertIn('TimeoutStopSec=5s', text)
         self.assertIn('KillMode=control-group', text)
         self.assertIn('Restart=no', text)
+        for setting in ('TimeoutStopFailureMode=kill', 'SendSIGKILL=yes', 'FinalKillSignal=SIGKILL'):
+            self.assertIn(setting, text)
         for stream in ('Input', 'Output', 'Error'):
             self.assertIn('Standard' + stream + '=null', text)
         for forbidden in ('cloud-final', 'SELinuxContext', 'runcon', 'setenforce', '/bin/sh', '--pipe', 'EnvironmentFile', 'PassEnvironment'):
@@ -102,14 +108,19 @@ class FedoraExecutorTests(unittest.TestCase):
         with mock.patch.object(guest.os, 'getuid', return_value=0), mock.patch.object(guest.os, 'geteuid', return_value=0), \
                 mock.patch.object(guest, 'executor_file', side_effect=write), mock.patch.object(guest, 'executor_control', side_effect=control), \
                 mock.patch.object(guest, 'observe_executor_start', side_effect=lambda end: calls.append(['ack'])), \
+                mock.patch.object(guest, 'mask_identity', return_value=mask_fixture()), \
                 mock.patch.object(guest.pathlib.Path, 'read_text', return_value='system_u:system_r:cloud_init_t:s0\x00'):
             request = guest.stage_executor(inputs(), guest.digest(Path(guest.__file__)))
-        self.assertEqual([row[2] for row in writes], [0o444, 0o600, 0o644])
+        self.assertEqual([row[2] for row in writes], [0o444, 0o644, 0o600, 0o644])
         self.assertEqual(calls[0][0], '/usr/sbin/restorecon')
         self.assertEqual(calls[1], ['/usr/bin/systemctl', 'daemon-reload'])
         self.assertEqual(calls[2], ['/usr/bin/systemctl', '--no-block', 'start', guest.SERVICE_NAME])
         self.assertEqual(calls[3], ['ack'])
-        self.assertEqual(request['unit_sha256'], hashlib.sha256(writes[2][1]).hexdigest())
+        self.assertEqual(request['unit_sha256'], hashlib.sha256(writes[3][1]).hexdigest())
+        self.assertEqual(writes[1][1], b'')
+        self.assertEqual(request['mask'], mask_fixture())
+        self.assertIn(str(guest.SERVICE_MASK), calls[0])
+        self.assertIn(str(guest.SERVICE_MASK.parent), calls[0])
         self.assertEqual(request['guest_sha256'], hashlib.sha256(writes[0][1]).hexdigest())
         self.assertLessEqual(request['admission_deadline'] - time.monotonic(), guest.GUEST_ADMISSION_SECONDS)
 
@@ -139,6 +150,7 @@ class FedoraExecutorTests(unittest.TestCase):
 
     def staging_fixture(self):
         stack = __import__('contextlib').ExitStack()
+        stack.enter_context(mock.patch.object(guest, 'mask_identity', return_value=mask_fixture()))
         stack.enter_context(mock.patch.object(guest.os, 'getuid', return_value=0))
         stack.enter_context(mock.patch.object(guest.os, 'geteuid', return_value=0))
         stack.enter_context(mock.patch.object(guest.pathlib.Path, 'read_text', return_value='system_u:system_r:cloud_init_t:s0\x00'))
@@ -205,6 +217,90 @@ class FedoraExecutorTests(unittest.TestCase):
         error = guest.ExecutorStagingError('reload-manager', caught.exception, time.monotonic())
         self.assertEqual(error.fields['control_diagnostic'], diagnostic)
 
+    def test_real_empty_mask_snapshot_rejects_content_mode_links_and_nonregular_inputs(self):
+        path = self.root / '10-timeout-abort.conf'
+        path.write_bytes(b'')
+        path.chmod(0o644)
+        identity, owner = guest.read_mask_file(path)
+        self.assertEqual(owner, os.geteuid())
+        self.assertEqual(identity['inode'], path.stat().st_ino)
+        self.assertEqual(identity['sha256'], guest.EMPTY_SHA256)
+        path.write_text('unreviewed vendor or replacement content')
+        with self.assertRaises(ValueError):
+            guest.read_mask_file(path)
+        path.write_bytes(b'')
+        path.chmod(0o600)
+        with self.assertRaises(ValueError):
+            guest.read_mask_file(path)
+        path.chmod(0o644)
+        linked = self.root / 'hardlink'
+        os.link(path, linked)
+        with self.assertRaises(ValueError):
+            guest.read_mask_file(path)
+        linked.unlink()
+        alias = self.root / 'alias'
+        alias.symlink_to(path)
+        with self.assertRaises(OSError):
+            guest.read_mask_file(alias)
+        fifo = self.root / 'fifo'
+        os.mkfifo(fifo, 0o644)
+        started = time.monotonic()
+        for target in (fifo, Path('/dev/null')):
+            with self.assertRaises(ValueError):
+                guest.read_mask_file(target)
+        self.assertLess(time.monotonic() - started, .2)
+        with mock.patch.object(guest, 'SERVICE_MASK', path):
+            # Actual user-owned or unsafe /tmp ancestors cannot become an
+            # admitted root-owned mask merely through an empty-file digest.
+            with self.assertRaisesRegex(ValueError, 'ownership/protection'):
+                guest.mask_identity()
+
+    def test_real_mask_snapshot_detects_path_replacement_and_records_exact_inode(self):
+        path, replacement = self.root / 'mask', self.root / 'replacement'
+        for target in (path, replacement):
+            target.write_bytes(b'')
+            target.chmod(0o644)
+        original, _ = guest.read_mask_file(path)
+        actual_read = os.read
+        def replace(fd, count):
+            data = actual_read(fd, count)
+            os.replace(replacement, path)
+            return data
+        with mock.patch.object(guest.os, 'read', side_effect=replace):
+            with self.assertRaisesRegex(ValueError, 'path identity changed'):
+                guest.read_mask_file(path)
+        current, _ = guest.read_mask_file(path)
+        self.assertNotEqual(current['inode'], original['inode'])
+        actual_read = os.read
+        def change_mode(fd, count):
+            data = actual_read(fd, count)
+            os.chmod(path, 0o600)
+            return data
+        with mock.patch.object(guest.os, 'read', side_effect=change_mode):
+            with self.assertRaisesRegex(ValueError, 'path identity changed'):
+                guest.read_mask_file(path)
+        path.chmod(0o644)
+        with mock.patch.object(guest, 'SERVICE_MASK', path):
+            guest.validate_mask_record(current)
+            for change in ({'path': '/usr/lib/systemd/system/service.d/10-timeout-abort.conf'}, {'sha256': 'f' * 64},
+                           {'device': True}, {'inode': 0}, {'unknown': 1}):
+                with self.assertRaises(ValueError):
+                    guest.validate_mask_record({**current, **change})
+
+    def test_known_long_mask_path_is_lossless_in_failure_witness_and_executor_proof_rejects_substitution(self):
+        self.assertGreater(len(str(guest.SERVICE_MASK)), 64)
+        self.assertEqual(guest.startup_property_value('DropInPaths', str(guest.SERVICE_MASK)), str(guest.SERVICE_MASK))
+        self.assertEqual(guest.startup_property_value('FragmentPath', str(guest.SERVICE_UNIT)), str(guest.SERVICE_UNIT))
+        from test_fedora_prepare import executor_fixture
+        expected = inputs()
+        proof = executor_fixture(expected, 'b' * 64)
+        guest.validate_executor(proof, expected, 'b' * 64)
+        for change in ({'path': '/usr/lib/systemd/system/service.d/10-timeout-abort.conf'}, {'sha256': 'f' * 64}, {'inode': False}):
+            bad = copy.deepcopy(proof)
+            bad['mask'].update(change)
+            with self.assertRaises(ValueError):
+                guest.validate_executor(bad, expected, 'b' * 64)
+
     def test_real_scaled_reload_allocation_and_shared_deadline_without_general_timeout_override(self):
         original_run, original_remaining = subprocess.run, guest.remaining
         allocations = []
@@ -263,7 +359,7 @@ class FedoraExecutorTests(unittest.TestCase):
 
     def test_maximum_escaped_selected_failure_witness_fits_unchanged_console_cap(self):
         expected = inputs()
-        error = guest.ExecutorStartupError({key: '"' * 64 for key in guest.startup_properties()}, 0)
+        error = guest.ExecutorStartupError({key: guest.startup_property_value(key, '"' * 64) for key in guest.startup_properties()}, 0)
         failure = guest.ExecutorStagingError('observe-startup', error, time.monotonic() - 60)
         failure.fields['path_metadata'] = {'position': 15, 'uid': 4294967295, 'gid': 4294967295,
                                            'mode': 0o7777, 'type': stat.S_IFDIR, 'bytes': 2 ** 63 - 1}
@@ -275,6 +371,10 @@ class FedoraExecutorTests(unittest.TestCase):
         data = guest.STARTUP_MARKER + json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode() + b'\n'
         self.assertLessEqual(len(data), 4096)
         self.assertEqual(ci.startup_witness(data, expected, 'b' * 64)['diagnostic'], value)
+        value['startup_properties']['DropInPaths'] = str(guest.SERVICE_MASK)
+        data = guest.STARTUP_MARKER + json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode() + b'\n'
+        self.assertLessEqual(len(data), 4096)
+        self.assertEqual(ci.startup_witness(data, expected, 'b' * 64)['diagnostic']['startup_properties']['DropInPaths'], str(guest.SERVICE_MASK))
 
     def test_failure_witness_survives_shutdown_tail_and_cannot_supply_a_report(self):
         expected = inputs()
@@ -315,7 +415,9 @@ class FedoraExecutorTests(unittest.TestCase):
     def test_effective_profile_rejects_dropins_stream_forwarding_and_changed_native_limits(self):
         observed = {**guest.executor_profile(), 'RuntimeMaxUSec': '40min 45s', 'TimeoutStopUSec': '5s'}
         self.assertEqual(guest.verify_executor_profile(observed), guest.executor_profile_hash())
-        for key, value in (('DropInPaths', '/run/systemd/unknown.conf'), ('StandardOutput', 'journal'),
+        for key, value in (('DropInPaths', '/run/systemd/unknown.conf'), ('DropInPaths', '/usr/lib/systemd/system/service.d/10-timeout-abort.conf'),
+                           ('DropInPaths', str(guest.SERVICE_MASK) + ' /run/systemd/extra.conf'), ('TimeoutStopFailureMode', 'abort'),
+                           ('SendSIGKILL', 'no'), ('FinalKillSignal', '6'), ('StandardOutput', 'journal'),
                            ('SELinuxContext', 'forced'), ('RuntimeMaxUSec', 'infinity'), ('TimeoutStopUSec', '10s')):
             with self.assertRaises(ValueError):
                 guest.verify_executor_profile({**observed, key: value})
@@ -325,7 +427,7 @@ class FedoraExecutorTests(unittest.TestCase):
         script = b'public controlled executor fixture\n'
         guest_sha = hashlib.sha256(script).hexdigest()
         unit = guest.service_unit(expected, guest_sha).encode()
-        request = {'version': 1, 'source_sha': expected['source_sha'], 'inputs': expected, 'guest_sha256': guest_sha,
+        request = {'version': 2, 'mask': mask_fixture(), 'source_sha': expected['source_sha'], 'inputs': expected, 'guest_sha256': guest_sha,
                    'unit_sha256': hashlib.sha256(unit).hexdigest(), 'launcher_context': 'fixture', 'admission_deadline': time.monotonic() + 30}
         self.assertEqual(guest.verify_executor_target(request, expected, guest_sha, script, unit), request['unit_sha256'])
         with self.assertRaisesRegex(ValueError, 'controller-bound target'):
