@@ -41,6 +41,8 @@ PAYLOAD_LIMIT = 192 * MIB
 EXPANSION_LIMIT = 384 * MIB
 WORK_LIMIT = 1536 * MIB
 FILE_LIMIT = 2048
+MANIFEST_LIMIT = 256 * 1024
+EXTRACTION_SECONDS = 120
 VERIFICATION = 'strict-cosign-keyless; Cosign bootstrap is official HTTPS plus pinned digest; no runtime/model admission'
 PROXY_ENV = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy',
              'all_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE')
@@ -185,6 +187,30 @@ def snapshot(source, destination, expected_bytes, expected_sha):
     require(copied == expected_bytes and digest(destination) == expected_sha, 'public artifact SHA256 mismatch')
 
 
+def capture_regular(path, maximum, *, exact_size=None, destination=None):
+    """Capture an untrusted input once; callers consume these exact bytes."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with contextlib.ExitStack() as stack:
+        stack.callback(os.close, fd)
+        info = os.fstat(fd)
+        require(stat.S_ISREG(info.st_mode), 'admission input must be a regular file')
+        require(0 < info.st_size <= maximum, 'admission input size limit exceeded')
+        require(exact_size is None or info.st_size == exact_size, 'admission input exact size mismatch')
+        output = stack.enter_context(open(destination, 'xb')) if destination else None
+        data = bytearray() if output is None else None
+        value, copied = hashlib.sha256(), 0
+        while True:
+            block = os.read(fd, min(MIB, maximum - copied + 1))
+            if not block:
+                break
+            copied += len(block)
+            require(copied <= maximum and (exact_size is None or copied <= exact_size), 'admission input grew past size limit')
+            value.update(block)
+            output.write(block) if output is not None else data.extend(block)
+        require(copied == info.st_size and (exact_size is None or copied == exact_size), 'admission input changed size during capture')
+        return bytes(data) if data is not None else None, value.hexdigest()
+
+
 class HTTPSOnly(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         require(newurl.startswith('https://'), 'non-HTTPS public artifact redirect denied')
@@ -230,15 +256,20 @@ def fetch_within_limit(output):
 def extract_codex(archive, destination):
     require(archive.stat().st_size == ARTIFACTS['codex.tar.gz'][1] and digest(archive) == ARTIFACTS['codex.tar.gz'][2],
             'official Codex archive identity mismatch before expansion')
+    return _parse_codex_archive(archive, destination, CODEX_BYTES, CODEX_SHA)
+
+
+def _parse_codex_archive(archive, destination, expected_bytes, expected_sha):
+    """Internal parser; production calls only with the fixed verified identities."""
     with tarfile.open(archive, 'r:gz') as source:
         members = source.getmembers()
         require(len(members) == 1, 'Codex archive must contain exactly its official binary')
         item = members[0]
-        require(item.name == 'codex-x86_64-unknown-linux-musl' and item.isfile() and item.size == CODEX_BYTES,
+        require(item.name == 'codex-x86_64-unknown-linux-musl' and item.isfile() and item.size == expected_bytes,
                 'unexpected Codex archive member/type/expansion')
         with source.extractfile(item) as src, open(destination, 'xb') as dst:
             shutil.copyfileobj(src, dst, length=MIB)
-    require(destination.stat().st_size == CODEX_BYTES and digest(destination) == CODEX_SHA, 'extracted Codex digest mismatch')
+    require(destination.stat().st_size == expected_bytes and digest(destination) == expected_sha, 'extracted Codex digest mismatch')
 
 
 def signature_args(verifier, bundle, binary):
@@ -436,28 +467,43 @@ def validate_manifest(obj):
     return obj
 
 
-def read_manifest(path, expected_sha):
+def parse_manifest(data, actual_sha, expected_sha):
     require(re.fullmatch('[0-9a-f]{64}', expected_sha), 'separately trusted manifest digest required')
-    require(path.stat().st_size <= 256 * 1024 and digest(path) == expected_sha, 'manifest integrity/size mismatch')
+    require(actual_sha == expected_sha, 'manifest integrity/size mismatch')
     def unique(items):
         result = {}
         for key, value in items:
             require(key not in result, 'duplicate manifest field')
             result[key] = value
         return result
-    return validate_manifest(json.loads(path.read_bytes(), object_pairs_hook=unique))
+    return validate_manifest(json.loads(data, object_pairs_hook=unique))
+
+
+def read_manifest(path, expected_sha):
+    with wall_limit(EXTRACTION_SECONDS):
+        data, actual_sha = capture_regular(path, MANIFEST_LIMIT)
+        return parse_manifest(data, actual_sha, expected_sha)
 
 
 def extract(payload, manifest_path, expected_manifest_sha, destination):
-    record = read_manifest(manifest_path, expected_manifest_sha)
-    require(payload.stat().st_size == record['payload']['bytes'] and digest(payload) == record['payload']['sha256'],
-            'payload identity mismatch')
+    # Admission (including open/fstat/hash/JSON) is inside the same deadline as
+    # expansion. Neither untrusted path is ever reopened for consumption.
+    with wall_limit(EXTRACTION_SECONDS):
+        data, actual_sha = capture_regular(manifest_path, MANIFEST_LIMIT)
+        record = parse_manifest(data, actual_sha, expected_manifest_sha)
+        return _extract_captured(payload, record, destination)
+
+
+def _extract_captured(payload, record, destination):
     destination = private_directory(destination)
     try:
-        with wall_limit(120), tempfile.TemporaryDirectory(prefix='expand-', dir=destination) as temporary:
+        with tempfile.TemporaryDirectory(prefix='expand-', dir=destination) as temporary:
+            compressed = pathlib.Path(temporary) / 'payload.gz'
+            _, actual_sha = capture_regular(payload, PAYLOAD_LIMIT, exact_size=record['payload']['bytes'], destination=compressed)
+            require(actual_sha == record['payload']['sha256'], 'payload identity mismatch')
             raw = pathlib.Path(temporary) / 'payload.tar'
             count = 0
-            with gzip.open(payload, 'rb') as src, open(raw, 'xb') as dst:
+            with gzip.open(compressed, 'rb') as src, open(raw, 'xb') as dst:
                 while True:
                     block = src.read(MIB)
                     if not block:

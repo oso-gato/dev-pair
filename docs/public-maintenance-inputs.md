@@ -84,8 +84,14 @@ digests and HTTPS redirects. Fixed child commands have 120-second deadlines,
 bounded output and native file-size limits; timeout kills their process group.
 Build staging is checked against 1536MiB, each clean repository against 32MiB,
 compressed payload against 192MiB, and expanded files against 384MiB/2048 files.
-Extraction has a 120-second deadline and a bounded raw-tar expansion before member
-parsing. Only declared regular files are written; links, devices, sparse/PAX
+Extraction's 120-second deadline encloses all admission, beginning before the
+first input open. Manifest (<=256KiB) and payload (<=192MiB and exact declared
+size) are each opened once with `O_NOFOLLOW`/`O_NONBLOCK`, checked using `fstat`
+for regular type/size, and captured within byte limits. Hashing and JSON parsing
+use the same captured manifest bytes; gzip reads the same verified private
+payload snapshot, never a reopened transfer path. FIFO/device/symlink inputs
+reject before reading. A bounded raw-tar expansion precedes member parsing.
+Only declared regular files are written; links, devices, sparse/PAX
 records, traversal, duplicates and trailing nonzero tar data are rejected.
 Failure removes unpublished payloads and temporary copies. Once strict signature
 verification passes, its bounded public receipt, output and original bundle remain

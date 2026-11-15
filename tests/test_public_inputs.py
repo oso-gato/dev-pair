@@ -1,4 +1,7 @@
 import copy
+import builtins
+import contextlib
+import hashlib
 import gzip
 import io
 import json
@@ -101,6 +104,18 @@ class PublicInputsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 inputs.extract_codex(archive, self.work / ('binary-' + kind))
             self.assertFalse((self.work / ('binary-' + kind)).exists())
+            # Explicit parser-level fixtures bypass only the outer test's pinned
+            # transport identity. The production wrapper has no override switch.
+            with self.assertRaises(ValueError):
+                inputs._parse_codex_archive(archive, self.work / ('parsed-' + kind),
+                                            2 if kind == 'size' else 1, hashlib.sha256(b'x').hexdigest())
+        valid = self.root / 'valid-parser-fixture.gz'
+        with tarfile.open(valid, 'w:gz') as output:
+            member = tarfile.TarInfo('codex-x86_64-unknown-linux-musl')
+            member.size = 1
+            output.addfile(member, io.BytesIO(b'x'))
+        inputs._parse_codex_archive(valid, self.work / 'parsed-valid', 1, hashlib.sha256(b'x').hexdigest())
+        self.assertEqual((self.work / 'parsed-valid').read_bytes(), b'x')
 
     def fixture_payload(self):
         tree = self.work / 'tree'
@@ -140,6 +155,93 @@ class PublicInputsTests(unittest.TestCase):
         self.assertIn('transport integrity', result['verification'])
         self.assertEqual(inputs.inventory(tree), inputs.inventory(self.root / 'extracted'))
         self.assertFalse((self.root / 'extracted/dev-pair/.git/hooks').exists())
+
+    @contextlib.contextmanager
+    def replace_after_open(self, target, replacement):
+        real_os_open, real_open = inputs.os.open, builtins.open
+        changed = []
+        def swap(path):
+            if not changed and isinstance(path, (str, os.PathLike)) and pathlib.Path(path) == target:
+                os.replace(replacement, target)
+                changed.append(True)
+        def fd_open(path, *args, **kwargs):
+            fd = real_os_open(path, *args, **kwargs)
+            swap(path)
+            return fd
+        def file_open(path, *args, **kwargs):
+            result = real_open(path, *args, **kwargs)
+            swap(path)
+            return result
+        with mock.patch.object(inputs.os, 'open', side_effect=fd_open), mock.patch('builtins.open', side_effect=file_open):
+            yield changed
+
+    def test_actual_manifest_replacement_after_open_cannot_change_hashed_bytes(self):
+        tree, payload, manifest, record = self.fixture_payload()
+        trusted = inputs.digest(manifest)
+        replacement = self.root / 'replacement.json'
+        changed = copy.deepcopy(record)
+        changed['source_sha'] = 'c' * 40
+        replacement.write_bytes(inputs.canonical(changed))
+        with self.replace_after_open(manifest, replacement) as swapped:
+            accepted = inputs.read_manifest(manifest, trusted)
+        self.assertTrue(swapped)
+        self.assertEqual(accepted, record)
+        self.assertEqual(json.loads(manifest.read_bytes()), changed)
+
+    def test_actual_payload_replacement_cannot_change_decompressed_snapshot(self):
+        tree, payload, manifest, record = self.fixture_payload()
+        trusted = inputs.digest(manifest)
+        replacement = self.root / 'replacement.gz'
+        damaged = bytearray(payload.read_bytes())
+        damaged[0] ^= 1
+        replacement.write_bytes(damaged)
+        with self.replace_after_open(payload, replacement) as swapped:
+            inputs.extract(payload, manifest, trusted, self.root / 'captured-output')
+        self.assertTrue(swapped)
+        self.assertEqual(inputs.inventory(tree), inputs.inventory(self.root / 'captured-output'))
+        self.assertEqual(payload.read_bytes(), damaged)
+
+    def test_actual_fifo_device_and_oversize_admission_is_fast_and_bounded(self):
+        tree, payload, manifest, record = self.fixture_payload()
+        trusted = inputs.digest(manifest)
+        fifo = self.root / 'fifo'
+        os.mkfifo(fifo)
+        oversize = self.root / 'oversize-manifest'
+        with open(oversize, 'wb') as stream:
+            stream.truncate(inputs.MANIFEST_LIMIT + 1)
+        big_payload = self.root / 'oversize-payload'
+        with open(big_payload, 'wb') as stream:
+            stream.truncate(inputs.PAYLOAD_LIMIT + 1)
+        manifest_link = self.root / 'manifest-link'
+        manifest_link.symlink_to(manifest)
+        payload_link = self.root / 'payload-link'
+        payload_link.symlink_to(payload)
+        for index, (manifest_input, payload_input) in enumerate(((fifo, payload), (pathlib.Path('/dev/zero'), payload),
+                (oversize, payload), (manifest, fifo), (manifest, pathlib.Path('/dev/zero')), (manifest, big_payload),
+                (manifest_link, payload), (manifest, payload_link))):
+            destination = self.root / ('reject-' + str(index))
+            result = subprocess.run([sys.executable, str(ROOT / 'tools/public_inputs.py'), 'extract', '--manifest', str(manifest_input),
+                                     '--payload', str(payload_input), '--expected-manifest-sha256', trusted,
+                                     '--output', str(destination)], capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertFalse(destination.exists())
+        with mock.patch.object(inputs.os, 'read', side_effect=AssertionError('oversize must reject before read')):
+            with self.assertRaisesRegex(ValueError, 'size limit'):
+                inputs.capture_regular(oversize, inputs.MANIFEST_LIMIT)
+
+    def test_admission_deadline_interrupts_actual_blocking_read_before_hash(self):
+        tree, payload, manifest, record = self.fixture_payload()
+        code = ('import sys,time;sys.path.insert(0,sys.argv[1]);import public_inputs as p;'
+                'p.EXTRACTION_SECONDS=.1;original=p.os.read;'
+                'p.os.read=lambda *a:(time.sleep(5),original(*a))[1]\n'
+                'try:p.extract(p.pathlib.Path(sys.argv[2]),p.pathlib.Path(sys.argv[3]),sys.argv[4],p.pathlib.Path(sys.argv[5]))\n'
+                'except ValueError as e:\n assert "wall-time" in str(e);print("bounded admission")\n'
+                'else:raise AssertionError("deadline did not run during admission")\n')
+        result = subprocess.run([sys.executable, '-c', code, str(ROOT / 'tools'), str(payload), str(manifest),
+                                 inputs.digest(manifest), str(self.root / 'slow-output')], capture_output=True, timeout=2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(b'bounded admission', result.stdout)
+        self.assertFalse((self.root / 'slow-output').exists())
 
     def test_real_git_metadata_passes_shared_manifest_and_extracted_git_reads(self):
         tree, payload, manifest, record = self.fixture_payload()
