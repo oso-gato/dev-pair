@@ -287,7 +287,7 @@ class FedoraCITests(unittest.TestCase):
         output = ('100\t' + str(self.root) + '\n').encode()
         disappearance = ("du: cannot access '" + str(self.root / 'gone') + "': No such file or directory\n").encode()
         result = subprocess.CompletedProcess([], 1, output, disappearance)
-        with mock.patch.object(ci.subprocess, 'run', return_value=result) as run:
+        with mock.patch.object(ci, 'capture_du', return_value=result) as run:
             self.assertTrue(ci.measure_storage(self.root, live=True, sudo=False)['provisional'])
             self.assertEqual(run.call_count, 3)
             with self.assertRaisesRegex(ci.Blocked, 'did not stabilize'):
@@ -298,9 +298,69 @@ class FedoraCITests(unittest.TestCase):
             with self.assertRaises(ci.Blocked):
                 ci.parse_du(self.root, subprocess.CompletedProcess([], 1, output, error))
         huge = subprocess.CompletedProcess([], 0, (str(ci.OVERHEAD_LIMIT + 1) + '\t' + str(self.root) + '\n').encode(), b'')
-        with mock.patch.object(ci.subprocess, 'run', return_value=huge):
+        with mock.patch.object(ci, 'capture_du', return_value=huge):
             with self.assertRaisesRegex(ci.Blocked, 'overhead limit'):
                 ci.measure_storage(self.root, live=True, sudo=False)
+
+    def test_real_gnu_du_deleted_path_volume_keeps_bounded_failure_diagnostics(self):
+        # Deterministic queued-path disappearance, not claimed proof of the
+        # runner's still-unknown teardown errno. Real GNU du emits >64KiB here.
+        paths = [self.root / ('deleted-' + str(index) + '-' + 'x' * 80) for index in range(1000)]
+        for path in paths:
+            path.touch()
+        for path in paths:
+            path.unlink()
+        argv = ['/usr/bin/du', '--summarize', '--block-size=1', *map(str, paths), str(self.root)]
+        actual = subprocess.run(argv, capture_output=True, env=ci.SAFE_ENV, timeout=5)
+        self.assertEqual(actual.returncode, 1)
+        self.assertGreater(len(actual.stderr), ci.DU_CAPTURE_LIMIT)
+        complete = ci.du_diagnostics(self.root, actual)
+        self.assertEqual(complete['retained_line_types']['access_enoent'], 1000)
+        self.assertEqual(complete['retained_line_types']['other'], 0)
+        with self.assertRaisesRegex(ci.StorageMeasurementBlocked, 'diagnostic limit') as caught:
+            ci.capture_du(self.root, argv)
+        detail = caught.exception.diagnostics
+        self.assertTrue(detail['truncated'])
+        self.assertGreater(detail['stderr_bytes_seen'], ci.DU_CAPTURE_LIMIT)
+        self.assertGreater(detail['retained_line_types']['access_enoent'], 0)
+        self.assertIn('No such file or directory', detail['stderr_tail'])
+        self.assertLess(len(ci.safe_json(detail)), 5000)
+        probe = ci.Probe('a' * 40, self.root)
+        with mock.patch.object(ci, 'capture_du', side_effect=caught.exception):
+            with self.assertRaises(ci.StorageMeasurementBlocked):
+                probe.storage_measurement(live=True)
+        self.assertEqual(probe.report['storage_measurement_failure'], detail)
+
+    def test_storage_failure_retains_other_error_and_still_rejects_it(self):
+        output = ('0\t' + str(self.root) + '\n').encode()
+        stderr = b'du: Input/output error ##[warning] ::error::\n'
+        with self.assertRaisesRegex(ci.StorageMeasurementBlocked, 'non-disappearance') as caught:
+            ci.parse_du(self.root, subprocess.CompletedProcess([], 1, output, stderr))
+        detail = caught.exception.diagnostics
+        self.assertFalse(detail['truncated'])
+        self.assertEqual(detail['retained_line_types']['other'], 1)
+        self.assertEqual(detail['stderr_tail'], stderr.decode())
+        encoded = ci.safe_json(detail)
+        self.assertNotIn('##[', encoded)
+        self.assertNotIn('::', encoded)
+        self.assertEqual(json.loads(encoded), detail)
+
+    def test_storage_capture_cap_kills_real_unprivileged_descendant(self):
+        marker = self.root / 'scan-descendant'
+        code = ('import os,time,pathlib,sys\n'
+                'if os.fork()==0:\n time.sleep(1);pathlib.Path(sys.argv[1]).write_text("escaped");os._exit(0)\n'
+                'os.write(2,b"x"*131072);time.sleep(5)\n')
+        with self.assertRaisesRegex(ci.StorageMeasurementBlocked, 'diagnostic limit'):
+            ci.capture_du(self.root, [sys.executable, '-c', code, str(marker)])
+        time.sleep(1.1)
+        self.assertFalse(marker.exists())
+
+    def test_privileged_measurement_has_fixed_root_side_timeout(self):
+        summary = ('4096\t' + str(self.root) + '\n').encode()
+        with mock.patch.object(ci, 'capture_du', return_value=subprocess.CompletedProcess([], 0, summary, b'')) as capture:
+            ci.measure_storage(self.root)
+        argv = capture.call_args.args[1]
+        self.assertEqual(argv[:7], ['sudo', '-n', '/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s', '/usr/bin/du'])
 
     def test_real_removed_recreated_directories_and_exact_read_directory_enoent(self):
         # The same FTS race has two proven GNU forms. Exercise the exact

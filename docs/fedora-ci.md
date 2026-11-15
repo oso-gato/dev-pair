@@ -108,6 +108,13 @@ to the overhead cap; an incomplete live sample is explicitly provisional. Every
 completed command must obtain a stable error-free measurement before advancing.
 Permission, I/O, invalid summaries and unrecognized errors block immediately;
 the independent host-free-space reserve watchdog remains active.
+Storage output is streamed under the unchanged 64KiB capture cap and a fixed
+root-side five-second timeout with one-second forced termination. A rejected
+measurement retains byte counts, retained-line classifications, explicit
+partial/truncated flags and bounded stdout/stderr tails in `DP_REPORT`.
+Truncated counts describe only the retained prefix; they do not establish the
+cause of omitted diagnostics. The observed CI cap failure remains unclassified
+until an actual run returns this evidence; no capture-budget increase is implied.
 
 Before VM boot, free host disk must cover the complete 8GiB overlay maximum plus
 3GiB host reserve. The guest's 12GiB virtual disk is thin provisioned, not a

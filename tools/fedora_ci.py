@@ -36,6 +36,7 @@ HOST_RESERVE = 3 * GIB
 OVERLAY_LIMIT = 8 * GIB
 OVERHEAD_LIMIT = 2 * GIB
 LOG_LIMIT = 8 * MIB
+DU_CAPTURE_LIMIT = 65536  # unchanged until actual diagnostic volume/type is known
 SOURCE_LIMIT = 32 * MIB
 CONTAINER_SECONDS = 1050  # >= 15-minute TCG boot allowance, finite native lifetime
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
@@ -71,6 +72,12 @@ def mounts_below(root):
 
 class Blocked(Exception):
     pass
+
+
+class StorageMeasurementBlocked(Blocked):
+    def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 def require(condition, message):
@@ -208,8 +215,94 @@ def check_capacity(root, before_boot=False):
     return free
 
 
+def du_disappearance(root, line):
+    match = re.fullmatch(rb"(?:/usr/bin/)?du: cannot (access|read directory) '([^'\r\n]+)': No such file or directory", line)
+    if match is not None and match[2].startswith(os.fsencode(root) + b'/') and b'..' not in match[2].split(b'/'):
+        return match[1].decode()
+    return None
+
+
+def du_diagnostics(root, result, seen=None, truncated=False):
+    counts = {'access_enoent': 0, 'read_directory_enoent': 0, 'other': 0}
+    for line in result.stderr.splitlines():
+        kind = du_disappearance(root, line)
+        counts['access_enoent' if kind == 'access' else 'read_directory_enoent' if kind else 'other'] += 1
+    return {'exit_status': result.returncode, 'capture_limit_bytes': DU_CAPTURE_LIMIT,
+            'stdout_bytes_seen': (seen or {}).get('stdout', len(result.stdout)),
+            'stderr_bytes_seen': (seen or {}).get('stderr', len(result.stderr)),
+            'retained_diagnostic_lines': sum(counts.values()), 'retained_line_types': counts,
+            'retained_trailing_partial_line': bool(result.stderr and not result.stderr.endswith(b'\n')),
+            'truncated': truncated, 'counts_cover': 'retained prefix only' if truncated else 'complete captured output',
+            'stderr_tail': evidence_tail(result.stderr, 2048), 'stdout_tail': evidence_tail(result.stdout, 512)}
+
+
+def capture_du(root, argv):
+    buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+    seen = {'stdout': 0, 'stderr': 0}
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=SAFE_ENV, start_new_session=True)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+    selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+    started = time.monotonic()
+    failure = None
+    try:
+        while selector.get_map():
+            require(time.monotonic() - started < 5, 'storage measurement deadline exceeded')
+            for key, _ in selector.select(timeout=.1):
+                data = os.read(key.fileobj.fileno(), 4096)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                seen[key.data] += len(data)
+                remaining = DU_CAPTURE_LIMIT - sum(map(len, buffers.values()))
+                buffers[key.data].extend(data[:remaining])
+                require(sum(seen.values()) <= DU_CAPTURE_LIMIT, 'storage measurement diagnostic limit exceeded')
+        return subprocess.CompletedProcess(argv, process.wait(timeout=1), bytes(buffers['stdout']), bytes(buffers['stderr']))
+    except (Blocked, subprocess.SubprocessError) as exc:
+        result = subprocess.CompletedProcess(argv, process.poll(), bytes(buffers['stdout']), bytes(buffers['stderr']))
+        failure = StorageMeasurementBlocked(str(exc), du_diagnostics(root, result, seen, truncated=True))
+        raise failure from exc
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+        if process.poll() is None:
+            try:
+                if argv[0] == 'sudo':
+                    # SIGTERM lets sudo relay to its root command. Independently,
+                    # the root-side timeout below bounds even an orphaned scan.
+                    process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                process.wait(timeout=7 if argv[0] == 'sudo' else 1)
+            except subprocess.TimeoutExpired:
+                if failure:
+                    failure.diagnostics['termination'] = 'controller wait expired; fixed root-side timeout remains the scan bound'
+                try:
+                    process.kill()
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    pass  # failure remains blocked; root-side timeout is independent
+        if failure:
+            failure.diagnostics['controller_exit_status'] = process.poll()
+
+
 def parse_du(root, result):
-    require(len(result.stdout) + len(result.stderr) <= 65536, 'storage measurement diagnostic limit exceeded')
+    try:
+        return validate_du(root, result)
+    except Blocked as exc:
+        raise StorageMeasurementBlocked(str(exc), du_diagnostics(root, result)) from exc
+
+
+def validate_du(root, result):
+    require(len(result.stdout) + len(result.stderr) <= DU_CAPTURE_LIMIT, 'storage measurement diagnostic limit exceeded')
     summary = re.fullmatch(rb'([0-9]+)\t' + re.escape(os.fsencode(root)) + rb'\n', result.stdout)
     require(summary is not None, 'invalid storage measurement summary')
     if result.returncode == 0:
@@ -219,28 +312,31 @@ def parse_du(root, result):
     # Accept only GNU du's precise ENOENT traversal race, beneath this owned
     # root. Permission, I/O, mount, sudo and unrecognized errors stay blockers.
     for line in result.stderr.splitlines():
-        match = re.fullmatch(rb"(?:/usr/bin/)?du: cannot (?:access|read directory) '([^'\r\n]+)': No such file or directory", line)
-        require(match is not None and match[1].startswith(os.fsencode(root) + b'/') and
-                b'..' not in match[1].split(b'/'),
-                'storage measurement has non-disappearance errors')
+        require(du_disappearance(root, line) is not None, 'storage measurement has non-disappearance errors')
     return int(summary[1]), True
 
 
 def measure_storage(root, live=False, sudo=True, attempts=3):
     require(type(attempts) is int and 1 <= attempts <= 3, 'invalid storage retry bound')
-    argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/du', '--summarize', '--block-size=1',
+    argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s',
+            '/usr/bin/du', '--summarize', '--block-size=1',
             '--one-file-system', '--exclude=guest.qcow2', str(root)]
     maximum = 0
     for attempt in range(attempts):
-        result = subprocess.run(argv, env=SAFE_ENV, capture_output=True, timeout=5)
+        result = capture_du(root, argv)
         size, vanished = parse_du(root, result)
         maximum = max(maximum, size)
-        require(maximum <= OVERHEAD_LIMIT, 'capacity blocked: tooling/source overhead limit exceeded')
+        if maximum > OVERHEAD_LIMIT:
+            raise StorageMeasurementBlocked('capacity blocked: tooling/source overhead limit exceeded',
+                                            {**du_diagnostics(root, result), 'max_observed_bytes': maximum})
         if not vanished:
             return {'bytes': maximum, 'provisional': False, 'attempts': attempt + 1}
     # Live churn can produce valid but incomplete traversals. Keep the largest
     # observed count; it is provisional, never a completed-phase validation.
-    require(live, 'storage measurement did not stabilize within bounded retries')
+    if not live:
+        raise StorageMeasurementBlocked('storage measurement did not stabilize within bounded retries',
+                                        {**du_diagnostics(root, result), 'attempts': attempts,
+                                         'max_observed_bytes': maximum})
     return {'bytes': maximum, 'provisional': True, 'attempts': attempts}
 
 
@@ -312,6 +408,7 @@ class Probe:
                        'phases': {name: {'status': 'blocked', 'detail': 'Not reached'} for name in PHASES},
                        'limits': {'overlay_bytes': OVERLAY_LIMIT, 'host_reserve_bytes': HOST_RESERVE,
                                   'overhead_bytes': OVERHEAD_LIMIT, 'log_bytes': LOG_LIMIT,
+                                  'storage_diagnostic_bytes': DU_CAPTURE_LIMIT,
                                   'container_seconds': CONTAINER_SECONDS, 'guest_virtual_bytes': 12 * GIB,
                                   'cpus': 3, 'memory_bytes': 8 * GIB, 'guest_cpus': 2, 'guest_memory_bytes': 6 * GIB},
                        'hostinger_acceptance': False, 'job_admission': False}
@@ -338,6 +435,13 @@ class Probe:
                     not info.st_mode & 0o022 and info.st_dev == self.scratch_identity[0],
                     'declared scratch directory is unsafe or on another filesystem: ' + name)
 
+    def storage_measurement(self, live=False):
+        try:
+            return measure_storage(self.root, live=live)
+        except StorageMeasurementBlocked as exc:
+            self.report['storage_measurement_failure'] = exc.diagnostics
+            raise
+
     def bounded(self, argv, timeout, name, disk_check=True, file_limit=None):
         """Bound logs/time and watch storage while a native child runs."""
         log = bytearray()
@@ -359,7 +463,7 @@ class Probe:
                     # Rootful Podman owns private storage directories. Measure
                     # via a fixed read-only privileged tool, never silently skip
                     # inaccessible files in an unprivileged os.walk.
-                    measurement = measure_storage(self.root, live=True)
+                    measurement = self.storage_measurement(live=True)
                     if measurement['provisional']:
                         self.report['provisional_storage_samples'] = self.report.get('provisional_storage_samples', 0) + 1
                 for key, _ in selector.select(timeout=1):
@@ -374,7 +478,7 @@ class Probe:
             require(process.returncode == 0, name + ' failed with exit ' + str(process.returncode))
             if disk_check:
                 check_capacity(self.root)
-                self.report['last_stable_overhead_bytes'] = measure_storage(self.root)['bytes']
+                self.report['last_stable_overhead_bytes'] = self.storage_measurement()['bytes']
             return bytes(log)
         except BaseException:
             # Podman/conmon scopes may outlive the CLI; cleanup also force-removes
@@ -413,7 +517,8 @@ class Probe:
         require(re.fullmatch('[0-9a-f]{40}', self.source), 'invalid exact source SHA')
         require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source, 'checkout differs from exact PR head')
         require(not run_small(['/usr/bin/git', '-C', str(self.repo), 'status', '--porcelain']), 'source checkout must be clean')
-        for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo'):
+        for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo',
+                        '/usr/bin/timeout', '/usr/bin/du'):
             require(pathlib.Path(command).is_file(), 'required preinstalled runner tool unavailable: ' + command)
         require(os.cpu_count() >= 2, 'at least two CPUs required')
         mem = int(re.search(r'^MemTotal:\s+(\d+) kB$', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
