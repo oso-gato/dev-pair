@@ -326,6 +326,18 @@ class Probe:
         self.report['phases'][name] = {'status': status, 'detail': evidence_tail(detail, 4000)}
         emit_json('DP_PHASE', {'phase': name, **self.report['phases'][name]})
 
+    def initialize_directories(self):
+        # Podman version can create graph/runroot/tmp while validating config.
+        # Establish every declared leaf first; no post-probe mkdir may assume
+        # the engine left those paths absent.
+        for name in ('graph', 'runroot', 'tmp', 'payload', 'disks', 'empty-hooks'):
+            path = self.root / name
+            path.mkdir(mode=0o700 if name in ('graph', 'runroot', 'tmp') else 0o755, exist_ok=True)
+            info = path.lstat()
+            require(stat.S_ISDIR(info.st_mode) and not path.is_symlink() and info.st_uid == os.getuid() and
+                    not info.st_mode & 0o022 and info.st_dev == self.scratch_identity[0],
+                    'declared scratch directory is unsafe or on another filesystem: ' + name)
+
     def bounded(self, argv, timeout, name, disk_check=True, file_limit=None):
         """Bound logs/time and watch storage while a native child runs."""
         log = bytearray()
@@ -407,7 +419,6 @@ class Probe:
         mem = int(re.search(r'^MemTotal:\s+(\d+) kB$', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
         require(mem >= 10 * GIB, 'insufficient runner memory')
         free = check_capacity(self.root, before_boot=True)
-        (self.root / 'empty-hooks').mkdir()
         version = run_small(self.podman + ['version', '--format=json']).decode()
         self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
                                  'podman': json.loads(version), 'free_bytes': free, 'memory_bytes': mem,
@@ -551,9 +562,8 @@ class Probe:
     def execute(self):
         active = 'runner-preflight'
         try:
+            self.initialize_directories()
             self.preflight()
-            for name in ('payload', 'disks', 'tmp'):
-                (self.root / name).mkdir(mode=0o755)
             for active, action in (('signed-cloud-image', self.inputs), ('tooling', self.tooling),
                                    ('source-payload', self.payload), ('fedora-boot', self.boot)):
                 action()

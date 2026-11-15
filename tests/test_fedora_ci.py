@@ -181,6 +181,38 @@ class FedoraCITests(unittest.TestCase):
                       if line.startswith('DP_REPORT '))
         self.assertEqual(report['blocker'], 'engine initialization rejected')
 
+    def test_engine_version_directory_creation_does_not_break_next_phase(self):
+        short = ci.scratch_root(str(self.root))
+        self.addCleanup(lambda: shutil.rmtree(short, ignore_errors=True))
+        probe = ci.Probe('a' * 40, short)
+        def version_probe():
+            # Actual filesystem behavior of Podman version with explicit paths,
+            # without installing/running Podman on the development machine.
+            for name in ('graph', 'runroot', 'tmp'):
+                (short / name).mkdir(parents=True, exist_ok=True)
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}), \
+             mock.patch.object(probe, 'preflight', side_effect=version_probe), \
+             mock.patch.object(probe, 'inputs', side_effect=ci.Blocked('reached input phase')) as inputs:
+            self.assertEqual(probe.execute(), 2)
+        inputs.assert_called_once_with()
+        self.assertEqual(probe.report['blocker'], 'reached input phase')
+        self.assertEqual(probe.report['phases']['cleanup']['status'], 'pass')
+        self.assertFalse(short.exists())
+
+    def test_directory_initialization_rejects_symlink_or_foreign_write_mode(self):
+        probe = ci.Probe('a' * 40, self.root)
+        target = self.root / 'preserved'
+        target.mkdir()
+        (self.root / 'graph').symlink_to(target, target_is_directory=True)
+        with self.assertRaisesRegex(ci.Blocked, 'unsafe'):
+            probe.initialize_directories()
+        self.assertTrue(target.is_dir())
+        (self.root / 'graph').unlink()
+        (self.root / 'graph').mkdir()
+        (self.root / 'graph').chmod(0o777)
+        with self.assertRaisesRegex(ci.Blocked, 'unsafe'):
+            probe.initialize_directories()
+
     def test_active_engine_failure_or_mount_preserves_owned_scratch(self):
         probe = ci.Probe('a' * 40, self.root)
         probe.engine_activity = True
