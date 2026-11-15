@@ -103,8 +103,9 @@ def check_binary_and_source(m, data, fixture):
     if not fixture:
         repo = pathlib.Path(__file__).resolve().parents[1]
         tracked = subprocess.run(
-            ['git', '-C', str(repo), 'show', m['source_sha'] + ':tools/candidate.py'],
-            check=True, capture_output=True, timeout=10).stdout
+            ['/usr/bin/git', '-C', str(repo), 'show', m['source_sha'] + ':tools/candidate.py'],
+            check=True, capture_output=True, timeout=10,
+            env={'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'}).stdout
         require(tracked == pathlib.Path(__file__).read_bytes(),
                 'source SHA does not identify this preparation implementation')
 

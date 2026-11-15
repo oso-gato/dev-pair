@@ -284,3 +284,53 @@ SELinux acceptance. The temporary material was removed; no host SSH configuratio
 was changed. Builder local suite: 35 tests passed (17 bootstrap and 18 candidate),
 Python compilation and CLI help passed, and `git diff --check` passed. Test-owned
 command substitutions do not execute package managers or provisioning on Debian.
+
+### Owner addition: host maintenance gptbox in first bootstrap
+
+The owner subsequently directed: “also build the gptbox for the host in first
+bootstrap.” Source continuation starts from builder commit
+`6ce6adae37db4d951a31c4a6f31091a098273baf`. The prepare CLI now requires a real
+maintenance-role prepared context and separately trusted expected context hash.
+The implementation stages public inputs root-owned/read-only, uses the actual
+candidate verifier (fixed recipe, source, binary and standards checks), builds
+with rootless Podman as `dp-maint`, and records the immutable ID returned by the
+builder plus context/source/base/Codex identities. Separate vfs storage and fixed
+bounded transient systemd operations keep it outside root/system package paths.
+Existing labels/tags are insufficient provenance: reuse requires a root-protected
+completed record matching actual image ID/context; an unrecorded interrupted
+build is rebuilt from its verified inputs. No fixtures, arbitrary submitted
+Containerfiles, development-role context, live package install into agent code,
+engine socket, host bridge or secret-bearing build input is accepted.
+
+This produces a **Fedora/Codex OCI candidate for host maintenance gptbox**, not a
+Distrobox-assembled/admitted runtime. Independent official-source research pinned
+Distrobox1.8.2.5 to `40c3cd724faa434aeb0a23e28776665b92de68bd`: its create path
+unconditionally grants privileged/SELinux-disable/root configuration and host/home
+mounts; init discovers/links host sockets. The concrete A1.2/A2.4/A10.5 conflict
+blocks stock Distrobox execution. The required Distrobox layer remains in the
+design; no plain Podman agent launch substitutes for it. Full assembly/confinement,
+authentication/model access and actual host-image build remain live validation
+requirements. This source task neither resolves actual upstream pins nor builds
+an image on the current development machine.
+
+Fresh review of `6ce6ada` returned three changes required. This first combined
+repair cycle fixes: (1) enrollment CLI failure/timeout after daemon-side commit
+now explicitly disconnects the unverified node, (2) known root-owned tailscaled
+PeerAPI listeners on observed node addresses no longer cause false non-vanilla
+rejections on reapply, and (3) runtime-owned directory traversal now uses dirfds,
+`O_NOFOLLOW`, `mkdirat` and fd-only chmod/chown to prevent symlink redirection of
+root writes. Tests reproduce the enrollment side-effect case, enrolled PeerAPI
+reapply and an injected directory symlink swap, checking preservation of the
+victim and bootstrap recovery route. Candidate Git verification also uses a
+fixed executable and clean environment; contexts must be regenerated against
+this changed verifier revision.
+
+Continuation remains `/root/fedora_bootstrap_build`, API-configured Sol High,
+source/local tests only. A 15-minute checkpoint recorded code and initial tests;
+continuation completed documentation and affected checks. All **41 local tests**
+pass (23 bootstrap, 18 candidate), compilation and whitespace checks pass. Real
+Git verification is exercised in isolated synthetic repositories; every engine,
+systemd, Tailscale and account command in build/bootstrap tests is fake. No
+Podman/image, SSH, provider credential or live target operation occurred. Fresh
+Astra review must assess the exact combined candidate; this author record grants
+no release approval or completed Fedora/runtime acceptance.

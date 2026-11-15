@@ -1,5 +1,7 @@
 """Synthetic tempfile/command tests. These do NOT establish Fedora/runtime behavior."""
 import importlib.util
+import hashlib
+from types import SimpleNamespace
 import json
 import os
 from pathlib import Path
@@ -22,12 +24,28 @@ class Fake:
         self.accounts = {}
         self.fail = None
         self.node = {'BackendState': 'NeedsLogin'}
+        self.image = None
 
     def __call__(self, *args, ok=(0,)):
         self.calls.append(args)
         if self.fail and self.fail(args):
             raise b.Blocked('injected command failure (output withheld)')
         exe = Path(args[0]).name
+        if exe == 'systemd-run':
+            operation = args[args.index('--storage-driver=vfs') + 1:]
+            if operation[:2] == ('image', 'inspect'):
+                return json.dumps([self.image]) if self.image else ''
+            if operation[0] == 'build':
+                context = Path(operation[-1])
+                m = json.loads((context / 'inputs.json').read_text())
+                expected = operation[operation.index('--label') + 1].split('=', 1)[1]
+                self.image = {'Id': 'sha256:' + 'a' * 64, 'Architecture': 'amd64', 'Os': 'linux',
+                              'Labels': {'dev-pair.context': expected, 'dev-pair.role': 'maintenance',
+                                         'dev-pair.standards': b.STANDARDS,
+                                         'org.opencontainers.image.revision': m['source_sha'],
+                                         'dev-pair.codex.version': m['codex']['version']}}
+                return self.image['Id'] + '\n'
+            return ''
         if exe == 'getenforce':
             return 'Enforcing\n'
         if exe == 'systemctl' and args[1] == 'is-active':
@@ -173,6 +191,7 @@ class BootstrapTests(unittest.TestCase):
 
     def test_lock_and_symlink_conflicts(self):
         self.app.state.parent.mkdir(parents=True)
+        self.app.state.parent.chmod(0o755)
         target = self.root / 'elsewhere'
         target.mkdir()
         self.app.state.symlink_to(target)
@@ -273,6 +292,158 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(b.Blocked):
             self.prepare()
         self.assertTrue(self.app.path('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf').exists())
+
+    def context(self, role='maintenance', fixture=False):
+        repo = self.root / 'isolated-candidate-source'
+        (repo / 'tools').mkdir(parents=True, exist_ok=True)
+        source = repo / 'tools/candidate.py'
+        source.write_bytes((ROOT / 'tools/candidate.py').read_bytes())
+        for arguments in [('init', '--quiet'), ('add', 'tools/candidate.py'),
+                          ('-c', 'user.name=Offline fixture', '-c', 'user.email=fixture@example.invalid',
+                           '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
+                           'commit', '--allow-empty', '--quiet', '-m', 'Synthetic verifier source')]:
+            subprocess.run(['/usr/bin/git', '-C', str(repo), *arguments], check=True, capture_output=True)
+        tool_spec = importlib.util.spec_from_file_location('isolated_build_candidate', source)
+        tool = importlib.util.module_from_spec(tool_spec)
+        tool_spec.loader.exec_module(tool)
+        self.app.candidate_tool = lambda: tool
+        binary = self.root / 'synthetic-ELF-NOT-CODEX'
+        data = bytearray(64)
+        data[:6] = b'\x7fELF\x02\x01'
+        data[18:20] = b'\x3e\x00'
+        binary.write_bytes(data)
+        sha = subprocess.run(['/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD'], check=True, text=True, capture_output=True).stdout.strip()
+        m = {'kind': 'fixture' if fixture else 'operator-verified-inputs', 'source_sha': sha,
+             'standards_sha': b.STANDARDS,
+             'fedora': {'image': 'registry.fedoraproject.org/fedora:44@sha256:' + hashlib.sha256(b'SYNTHETIC NOT FEDORA').hexdigest(),
+                        'verification': 'SYNTHETIC OFFLINE TEST - no upstream acceptance'},
+             'codex': {'version': '9876.5.4',
+                       'source': 'https://github.com/openai/codex/releases/download/rust-v9876.5.4/codex-x86_64-unknown-linux-musl.tar.gz',
+                       'sha256': hashlib.sha256(data).hexdigest(), 'verification': 'SYNTHETIC OFFLINE TEST - no upstream acceptance'},
+             'role': role, 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
+             'mounts': {key: '/var/lib/dev-pair/jobs/offline-test/' + key for key in ('workspace', 'state', 'cache', 'credentials')}}
+        out = self.root / 'context'
+        result = tool.prepare(m, binary, out, fixture=fixture)
+        return out, result['context_sha256']
+
+    def test_real_verifier_build_handoff_and_artifact_replay(self):
+        self.prepare()
+        context, digest = self.context()
+        with patch.object(b.shutil, 'disk_usage', return_value=SimpleNamespace(free=10 * 1024 ** 3)):
+            result = self.app.build_gptbox(context, digest)
+            self.app.build_gptbox(context, digest)
+            # An unrecorded prior engine success is rebuilt; public labels are insufficient.
+            self.app.path(b.STATE + '/gptbox-image.json').unlink()
+            self.app.build_gptbox(context, digest)
+        engine = [a for a in self.fake.calls if Path(a[0]).name == 'systemd-run']
+        self.assertEqual(len([a for a in engine if 'build' in a]), 2)
+        self.assertTrue(all('--uid=dp-maint' in a for a in engine))
+        self.assertTrue(all('--property=KillMode=control-group' in a for a in engine))
+        build = next(a for a in engine if 'build' in a)
+        self.assertIn('--network=none', build)
+        self.assertIn('--pull=never', build)
+        self.assertEqual(result['image_id'], 'sha256:' + 'a' * 64)
+        self.assertFalse(result['distrobox_assembled'])
+        self.assertFalse(result['runtime_validated'])
+        stage = self.app.path('/var/lib/dev-pair/artifacts/gptbox/' + digest)
+        self.assertTrue(all(p.stat().st_mode & 0o777 == 0o444 for p in stage.iterdir()))
+
+    def test_gptbox_tamper_fixture_role_denied_before_engine(self):
+        self.prepare()
+        context, digest = self.context(role='development')
+        with self.assertRaisesRegex(b.Blocked, 'maintenance-role'):
+            self.app.build_gptbox(context, digest)
+        (context / 'Containerfile').write_text('FROM bad\nRUN arbitrary-command\n')
+        with self.assertRaisesRegex(b.Blocked, 'verification failed'):
+            self.app.build_gptbox(context, digest)
+        self.assertFalse(any(Path(a[0]).name == 'systemd-run' for a in self.fake.calls))
+        for file in context.iterdir():
+            file.unlink()
+        context.rmdir()
+        context, digest = self.context(fixture=True)
+        with self.assertRaisesRegex(b.Blocked, 'verification failed'):
+            self.app.build_gptbox(context, digest)
+        self.assertFalse(any(Path(a[0]).name == 'systemd-run' for a in self.fake.calls))
+
+    def test_gptbox_missing_identity_and_engine_failure_record_no_success(self):
+        self.prepare()
+        context, digest = self.context()
+        with self.assertRaisesRegex(b.Blocked, 'trusted context'):
+            self.app.build_gptbox(context, None)
+        self.fake.fail = lambda a: Path(a[0]).name == 'systemd-run' and 'build' in a
+        with patch.object(b.shutil, 'disk_usage', return_value=SimpleNamespace(free=10 * 1024 ** 3)):
+            with self.assertRaises(b.Blocked):
+                self.app.build_gptbox(context, digest)
+        self.assertFalse(self.app.path(b.STATE + '/gptbox-image.json').exists())
+        self.assertTrue(self.app.path(b.STATE + '/gptbox-build-intent.json').exists())
+        self.fake.fail = None
+        record = {'image_id': 'sha256:' + 'b' * 64, 'context_sha256': digest}
+        self.app.atomic(b.STATE + '/gptbox-image.json', json.dumps(record) + '\n')
+        self.fake.image = {'Id': 'sha256:' + 'a' * 64}
+        with self.assertRaisesRegex(b.Blocked, 'identity mismatch'):
+            self.app.build_gptbox(context, digest)
+
+    def test_failed_enroll_after_daemon_side_effect_disconnects(self):
+        self.prepare()
+        original = self.fake.__call__
+        def committed_but_failed(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[:2] == ('/usr/bin/tailscale', 'up'):
+                self.fake.node['CurrentTailnet']['Name'] = 'wrong.ts.net'
+                raise b.Blocked('CLI timeout after daemon committed')
+            return result
+        self.app.run = committed_but_failed
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            with self.assertRaises(b.Blocked):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+        self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
+
+    def test_peerapi_allowed_only_for_actual_root_tailscaled_node_address(self):
+        exe = self.app.path('/usr/bin/tailscale')
+        exe.parent.mkdir(parents=True)
+        exe.touch()
+        proc = self.app.path('/proc/99')
+        proc.mkdir()
+        (proc / 'exe').symlink_to('/usr/sbin/tailscaled')
+        (proc / 'status').write_text('Uid:\t0\t0\t0\t0\n')
+        self.fake.node = {'BackendState': 'Running', 'TailscaleIPs': ['100.64.0.2']}
+        line = 'tcp LISTEN 0 4096 100.64.0.2:45879 0.0.0.0:* users:(("tailscaled",pid=99,fd=20))'
+        self.assertTrue(self.app.peerapi_listener(line, '100.64.0.2'))
+        self.assertFalse(self.app.peerapi_listener(line, '0.0.0.0'))
+        self.fake.node = {'BackendState': 'NeedsLogin'}
+        self.prepare()
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+            self.fake.node['TailscaleIPs'] = ['100.64.0.2']
+            original = self.fake.__call__
+            def peerapi(*args, **kwargs):
+                if Path(args[0]).name == 'ss':
+                    return line + '\n'
+                return original(*args, **kwargs)
+            self.app.run = peerapi
+            self.prepare()
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        (proc / 'status').write_text('Uid:\t1001\t1001\t1001\t1001\n')
+        self.assertFalse(self.app.peerapi_listener(line, '100.64.0.2'))
+
+    def test_directory_symlink_swap_never_chmods_or_chowns_victim(self):
+        victim = self.root / 'victim'
+        victim.mkdir(mode=0o755)
+        victim.chmod(0o755)
+        parent = self.app.path('/var/lib/dev-pair/development')
+        parent.mkdir(parents=True)
+        actual_mkdir = b.os.mkdir
+        def swap(path, mode=0o777, *, dir_fd=None):
+            actual_mkdir(path, mode, dir_fd=dir_fd)
+            if path == 'cache' and dir_fd is not None:
+                b.os.rmdir(path, dir_fd=dir_fd)
+                b.os.symlink(str(victim), path, dir_fd=dir_fd)
+        with patch.object(b.os, 'mkdir', side_effect=swap), patch.object(b.os, 'fchown') as chown:
+            with self.assertRaisesRegex(b.Blocked, 'traversal'):
+                b.Bootstrap.directory(self.app, '/var/lib/dev-pair/development/cache', owner='dp-dev')
+            chown.assert_not_called()
+        self.assertEqual(victim.stat().st_mode & 0o777, 0o755)
 
     def test_finalize_always_blocks_without_reading_fake_evidence(self):
         proc = subprocess.run([sys.executable, str(ROOT / 'tools/bootstrap.py'), 'finalize'], capture_output=True, text=True)
