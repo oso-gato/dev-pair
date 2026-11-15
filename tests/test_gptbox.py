@@ -1,6 +1,8 @@
 """Synthetic engine/command tests only: no Fedora, Podman or Distrobox runtime acceptance."""
 import copy
 import hashlib
+import importlib.util
+import subprocess
 import json
 import os
 from pathlib import Path
@@ -28,6 +30,8 @@ class Engine:
         self.fail = None
         self.bad_attestation = False
         self.active = False
+        self.starts = 0
+        self.stale_logs = False
         self.app = None
 
     def __call__(self, *args, **kwargs):
@@ -62,11 +66,15 @@ class Engine:
             identity = RUNTIME if runtime else STAGE
             name = next(value.split('=', 1)[1] for value in command if value.startswith('--name='))
             config = {'User': '1000:1000' if runtime else '',
+                      'Timeout': g.RUNTIME_LIFETIME if runtime else g.ASSEMBLY_LIFETIME,
                       'Labels': {'manager': 'distrobox', 'distrobox.unshare_groups': '0', 'dev-pair.context': EXPECTED}}
             host = {'Privileged': False, 'ReadonlyRootfs': runtime, 'CapAdd': [] if runtime else ['CAP_SYS_ADMIN'],
                     'CapDrop': ['ALL'] if runtime else [], 'SecurityOpt': ['no-new-privileges'],
                     'PidMode': 'private', 'IpcMode': 'private', 'UTSMode': 'private', 'NetworkMode': 'none' if runtime else 'slirp4netns',
-                    'UsernsMode': 'private', 'IDMappings': {'UidMap': ['1000:1001:1'], 'GidMap': ['1000:1001:1']},
+                    'UsernsMode': 'private', 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0},
+                    'Tmpfs': ({'/run': 'rw,nosuid,nodev,uid=1000,gid=1000,mode=0700', '/tmp': 'rw,nosuid,nodev,uid=1000,gid=1000,mode=0700'}
+                              if runtime else {'/run': 'rw,nosuid,nodev,mode=0755', '/tmp': 'rw,nosuid,nodev,mode=1777'}),
+                    'IDMappings': {'UidMap': ['1000:1001:1'], 'GidMap': ['1000:1001:1']},
                     'Memory': 2147483648, 'PidsLimit': 256 if runtime else 512, 'NanoCpus': 1000000000}
             self.containers[identity] = {'Id': identity, 'Name': name, 'Image': SEALED if runtime else BASE,
                 'Config': config, 'HostConfig': host, 'State': {'Status': 'created', 'Running': False, 'ExitCode': 0},
@@ -93,9 +101,10 @@ class Engine:
                 if self.bad_attestation:
                     record['inputs_sha256'] = '0' * 64
                 return 'Synthetic fixture upstream progress\n' + json.dumps(record)
-            self.containers[identity]['State'].update(Status='running', Running=True)
+            self.starts += 1
+            self.containers[identity]['State'].update(Status='running', Running=True, StartedAt=f'2026-11-15T00:00:{self.starts:02d}.123456789Z')
         if command[0] == 'logs':
-            return 'container_setup_done\n'
+            return '' if self.stale_logs and any(value.startswith('--since=') for value in command) else 'container_setup_done\n'
         if command[0] == 'stop':
             self.containers[command[-1]]['State'].update(Status='exited', Running=False)
         if command[0] == 'rm':
@@ -201,6 +210,10 @@ class GptboxTests(unittest.TestCase):
             lambda row: row['HostConfig'].update(Memory=0),
             lambda row: row['HostConfig'].update(PidsLimit=-1),
             lambda row: row['HostConfig'].update(NanoCpus=0),
+            lambda row: row['Config'].update(Timeout=0),
+            lambda row: row['HostConfig']['Tmpfs'].update({'/usr/local/lib': 'rw,nosuid,nodev,mode=0700'}),
+            lambda row: row['HostConfig']['Tmpfs'].update({'/run': 'rw,suid,dev,mode=0700'}),
+            lambda row: row['HostConfig'].update(RestartPolicy={'Name': 'always'}),
             lambda row: row['HostConfig'].update(IDMappings={'UidMap': ['0:100000:65536'], 'GidMap': []}),
             lambda row: row.update(EffectiveCaps=['CAP_SYS_ADMIN']),
             lambda row: row.update(ProcessLabel='unconfined_u:unconfined_r:unconfined_t:s0'),
@@ -257,6 +270,42 @@ class GptboxTests(unittest.TestCase):
         self.assertNotIn(secret, path.read_text())
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_exhausted_build_budget_still_cleans_orphan_after_second_cleanup_failure(self):
+        self.engine.bad_attestation = True
+        with self.assertRaises(g.Blocked):
+            self.assemble()
+        self.engine.bad_attestation = False
+        self.engine.fail = lambda args: ('logs' in args or ('rm' in args and args[-1] == RUNTIME))
+        with self.assertRaises(g.Blocked):
+            self.assemble(True)
+        self.assertTrue(self.engine.containers[RUNTIME]['State']['Running'])
+        builds = len([call for call, _ in self.engine.calls if 'build' in call])
+        self.engine.fail = None
+        with patch.object(g.shutil, 'disk_usage', return_value=SimpleNamespace(free=1024)):
+            with self.assertRaisesRegex(g.Blocked, 'resources cleaned without another build'):
+                self.assemble(True)
+        self.assertFalse(self.engine.containers)
+        self.assertEqual(len([call for call, _ in self.engine.calls if 'build' in call]), builds)
+        self.assertEqual(json.loads(self.app.text(self.app.target + '/cleanup-only.json'))['phase'], 'complete')
+        creates = [call for call, _ in self.engine.calls if 'create' in call]
+        self.assertTrue(all('--restart=no' in call for call in creates))
+        self.assertTrue(all(any(value in call for value in ('--timeout=900', '--timeout=180')) for call in creates))
+
+    def test_restart_requires_new_start_identity_and_current_start_readiness_marker(self):
+        self.assemble()
+        row = copy.deepcopy(self.engine.saved_runtime)
+        row['State'].update(Status='running', Running=True, StartedAt='2026-11-15T01:02:03.123456789Z')
+        self.engine.containers[RUNTIME] = row
+        with self.assertRaisesRegex(g.Blocked, 'stale'):
+            self.app.ready(RUNTIME, SEALED, row['State']['StartedAt'])
+        self.engine.stale_logs = True
+        with patch.object(g.time, 'monotonic', side_effect=[0, 1, 31]), patch.object(g.time, 'sleep'):
+            with self.assertRaisesRegex(g.Blocked, 'deadline'):
+                self.app.ready(RUNTIME, SEALED)
+        logs = [call for call, _ in self.engine.calls if 'logs' in call]
+        self.assertIn('--since=' + row['State']['StartedAt'], logs[-1])
+        self.assertTrue(all(any(value.startswith('--since=') for value in call) for call in logs))
+
     def test_preview_and_low_storage_leave_engine_unchanged(self):
         before = len(self.engine.calls)
         result = self.app.assemble(self.context, EXPECTED, '/unused', SOURCE)
@@ -266,6 +315,71 @@ class GptboxTests(unittest.TestCase):
             with self.assertRaisesRegex(g.Blocked, 'eight GiB'):
                 self.assemble()
         self.assertFalse(any(call[0][0] == '/usr/bin/systemd-run' for call in self.engine.calls))
+
+class ProductionInputContractTests(unittest.TestCase):
+    def test_production_inputs_accepts_real_helper_triple_and_checks_git_objects(self):
+        # Actual production inputs()/check_gptbox_inputs()/candidate verification run.
+        # The tiny ELF/upstream scripts are explicitly UNTRUSTED synthetic artifacts;
+        # only their external trust pins are injected. No engine or binary is run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / 'reviewed-adapter-source'
+            tools = repo / 'tools'
+            tools.mkdir(parents=True)
+            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py'):
+                (tools / name).write_bytes((ROOT / 'tools' / name).read_bytes())
+            upstream = root / 'synthetic-upstream-NOT-DISTROBOX'
+            upstream.mkdir()
+            for name in ('distrobox-init', 'distrobox-enter'):
+                (upstream / name).write_text('#!/bin/sh\nexit 0\n')
+            def commit(path):
+                for args in (('init', '--quiet'), ('add', '.'),
+                             ('-c', 'user.name=Offline fixture', '-c', 'user.email=fixture@example.invalid',
+                              '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
+                              'commit', '--quiet', '-m', 'Untrusted test source')):
+                    subprocess.run(['/usr/bin/git', '-C', str(path), *args], check=True, capture_output=True)
+                return subprocess.run(['/usr/bin/git', '-C', str(path), 'rev-parse', 'HEAD'],
+                                      check=True, text=True, capture_output=True).stdout.strip()
+            source_sha, upstream_sha = commit(repo), commit(upstream)
+            def module(name, file):
+                spec = importlib.util.spec_from_file_location(name, file)
+                value = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(value)
+                return value
+            adapter = module('production_adapter_contract_fixture', tools / 'gptbox.py')
+            preparation = module('production_candidate_contract_fixture', tools / 'candidate.py')
+            data = bytearray(64)
+            data[:6] = b'\x7fELF\x02\x01'
+            data[18:20] = b'\x3e\x00'
+            binary = root / 'synthetic-ELF-NOT-CODEX'
+            binary.write_bytes(data)
+            manifest = {'kind': 'operator-verified-inputs', 'source_sha': source_sha,
+                        'standards_sha': preparation.STANDARDS,
+                        'fedora': {'image': adapter.FEDORA, 'verification': 'SYNTHETIC OFFLINE CONTRACT TEST - no Fedora evidence'},
+                        'codex': {'version': '0.169.0', 'sha256': hashlib.sha256(data).hexdigest(),
+                                  'source': 'https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-x86_64-unknown-linux-musl.tar.gz',
+                                  'verification': 'SYNTHETIC OFFLINE CONTRACT TEST - not Codex provenance'},
+                        'role': 'maintenance', 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
+                        'mounts': {name: ('/var/lib/dev-pair/credentials/maintenance/contract-test' if name == 'credentials'
+                                         else '/var/lib/dev-pair/maintenance/' + {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}[name] + '/contract-test')
+                                   for name in ('workspace', 'state', 'cache', 'credentials')}}
+            context = root / 'actual-verified-context'
+            prepared = preparation.prepare(manifest, binary, context)
+            app = adapter.Gptbox(root)
+            # Redirect only physical module location/external trust pins; preserve
+            # production helper implementation and its actual three-value return.
+            bootstrap_module = sys.modules[adapter.Bootstrap.__module__]
+            with patch.object(bootstrap_module, '__file__', str(tools / 'bootstrap.py')), \
+                    patch.object(adapter, 'candidate', preparation), \
+                    patch.object(adapter, 'CODEX_SHA', manifest['codex']['sha256']), \
+                    patch.object(adapter, 'DBX_SHA', upstream_sha):
+                observed, scripts = app.inputs(context, prepared['context_sha256'], upstream, source_sha)
+                self.assertEqual(observed, manifest)
+                self.assertEqual(scripts['distrobox-init'], (upstream / 'distrobox-init').read_bytes())
+                self.assertFalse(app.state.exists())
+                (upstream / 'distrobox-enter').write_text('# mutated upstream source\n')
+                with self.assertRaisesRegex(adapter.Blocked, 'exact Git object'):
+                    app.inputs(context, prepared['context_sha256'], upstream, source_sha)
 
 if __name__ == '__main__':
     unittest.main()

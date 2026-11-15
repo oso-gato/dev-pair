@@ -28,6 +28,8 @@ ROOT = STATE + '/gptbox-adapter'
 INIT = ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt', '--init', '0']
 FINAL_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' finalize'
 FROZEN_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' frozen'
+ASSEMBLY_LIFETIME = 900
+RUNTIME_LIFETIME = 180
 
 
 def sha(data):
@@ -120,7 +122,7 @@ class Gptbox(Bootstrap):
         self.protected(context)
         for file in Path(context).iterdir():
             self.protected(file)
-        _, manifest = self.check_gptbox_inputs(context, expected)
+        _, _, manifest = self.check_gptbox_inputs(context, expected)
         candidate.verify(context, expected)
         if (manifest['role'] != 'maintenance' or manifest['fedora']['image'] != FEDORA
                 or manifest['codex']['version'] != '0.169.0' or manifest['codex']['sha256'] != CODEX_SHA):
@@ -205,8 +207,8 @@ class Gptbox(Bootstrap):
         path = self.target + '/' + name + '.json'
         self.atomic(path, json.dumps(value, sort_keys=True) + '\n', expected=self.text(path) or None)
 
-    def inspect_container(self, identity, sealed, runtime=True):
-        rows = json.loads(self.engine('inspect', '--type=container', identity))
+    def inspect_container(self, identity, sealed, runtime=True, timeout=30):
+        rows = json.loads(self.engine('inspect', '--type=container', identity, timeout=timeout))
         if not isinstance(rows, list) or len(rows) != 1:
             raise Blocked('ambiguous engine inspection')
         item = rows[0]
@@ -244,6 +246,34 @@ class Gptbox(Bootstrap):
             if (host.get('Memory') != 2147483648 or host.get('PidsLimit') != 512 or host.get('NanoCpus') != 1000000000
                     or ':container_engine_t:s0:' not in item.get('ProcessLabel', '')):
                 raise Blocked('isolated assembly budget/confinement mismatch')
+        if config.get('Timeout') != (RUNTIME_LIFETIME if runtime else ASSEMBLY_LIFETIME):
+            raise Blocked('independent native container lifetime is missing or mismatched')
+        policy = host.get('RestartPolicy', {})
+        if policy.get('Name') not in ('no', '') or policy.get('MaximumRetryCount', 0) != 0:
+            raise Blocked('automatic OCI restart would bypass finite candidate lifetime')
+        tmpfs = host.get('Tmpfs')
+        if not isinstance(tmpfs, dict) or set(tmpfs) != {'/run', '/tmp'}:
+            raise Blocked('tmpfs mounts must exactly match the private runtime allowlist')
+        for destination, value in tmpfs.items():
+            if not isinstance(value, str):
+                raise Blocked('invalid tmpfs inspection format')
+            options = set(value.split(','))
+            if not {'rw', 'nosuid', 'nodev'} <= options or options & {'ro', 'suid', 'dev'}:
+                raise Blocked('tmpfs access/security options mismatch')
+            expected_mode = 0o700 if runtime else (0o755 if destination == '/run' else 0o1777)
+            mode = [entry[5:] for entry in options if entry.startswith('mode=')]
+            if len(mode) != 1 or not re.fullmatch(r'[0-7]{3,4}', mode[0]) or int(mode[0], 8) != expected_mode:
+                raise Blocked('tmpfs mode differs from the fixed construction policy')
+            for entry in options:
+                if entry in {'rw', 'nosuid', 'nodev', 'noexec', 'rprivate', 'private', 'relatime', 'noatime', 'strictatime'} or entry.startswith('mode='):
+                    continue
+                if entry.startswith(('uid=', 'gid=')):
+                    if entry.split('=', 1)[1] != ('1000' if runtime else '0'):
+                        raise Blocked('tmpfs ownership mismatch')
+                elif not re.fullmatch(r'size=[0-9]+[kKmMgG]?', entry):
+                    raise Blocked('undeclared tmpfs option')
+            if runtime and not {'uid=1000', 'gid=1000'} <= options:
+                raise Blocked('runtime tmpfs ownership is not inspected')
         actual = {}
         for mount in item.get('Mounts', []):
             if mount.get('Type') == 'tmpfs' and mount.get('Destination') in ('/run', '/tmp'):
@@ -267,14 +297,20 @@ class Gptbox(Bootstrap):
         self.inspect_container(identity, sealed)
         return output
 
-    def ready(self, identity, sealed):
+    def ready(self, identity, sealed, previous_start=None):
         deadline = time.monotonic() + 30
+        first = self.inspect_container(identity, sealed, timeout=5)
+        started = first.get('State', {}).get('StartedAt')
+        if (not isinstance(started, str) or not re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+(?:Z|[+-][0-9]{2}:[0-9]{2})', started)
+                or started == previous_start):
+            raise Blocked('current container start identity is missing or stale')
         while time.monotonic() < deadline:
-            observed = self.inspect_container(identity, sealed)
-            if observed['State']['Status'] != 'running':
-                raise Blocked('frozen Distrobox initializer exited before readiness')
-            if 'container_setup_done' in self.engine('logs', '--tail=20', identity, timeout=5).splitlines():
-                return
+            observed = self.inspect_container(identity, sealed, timeout=5)
+            if observed['State']['Status'] != 'running' or observed['State'].get('StartedAt') != started:
+                raise Blocked('frozen initializer exited or changed start identity before readiness')
+            logs = self.engine('logs', '--since=' + started, '--tail=20', identity, timeout=5)
+            if 'container_setup_done' in logs.splitlines():
+                return started
             time.sleep(0.2)
         raise Blocked('frozen Distrobox readiness deadline exceeded')
 
@@ -304,8 +340,6 @@ class Gptbox(Bootstrap):
         if not self.path(STATE + '/prepared').exists():
             raise Blocked('normal host preparation must complete first')
         with self.lock():
-            if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
-                raise Blocked('eight GiB free reserve is required before assembly')
             self.target = ROOT + '/' + expected
             self.directory(self.target, mode=0o755)
             previous = json.loads(self.text(self.target + '/attempt.json', '{}'))
@@ -322,9 +356,19 @@ class Gptbox(Bootstrap):
                 raise Blocked('incomplete attempt requires explicit --retry; evidence remains intact')
             count = previous.get('count', 0) + 1
             if count > 2:
-                raise Blocked('two-attempt assembly budget exhausted; recovery required')
+                cleanup_path = self.target + '/cleanup-only.json'
+                cleanup = json.loads(self.text(cleanup_path, '{"count":0}'))
+                if cleanup.get('count', 0) >= 2:
+                    raise Blocked('cleanup-only retry budget exhausted; native lifetimes still bound candidates')
+                cleanup = {'count': cleanup['count'] + 1, 'phase': 'begin', 'build_attempts': previous['count']}
+                self.record('cleanup-only', cleanup)
+                self.recover_resources(expected)
+                self.record('cleanup-only', {**cleanup, 'phase': 'complete'})
+                raise Blocked('build budget exhausted; exact owned resources cleaned without another build')
             if previous:
                 self.recover_resources(expected)
+            if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
+                raise Blocked('eight GiB free reserve is required before assembly')
             self.record('attempt', {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'count': count})
             self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
             self.directory('/var/lib/dev-pair/artifacts/gptbox-adapter', mode=0o755)
@@ -358,10 +402,10 @@ class Gptbox(Bootstrap):
             stage_name, runtime_name = 'dp-gptbox-a-' + expected[:16] + '-' + str(count), 'dp-gptbox-r-' + expected[:16] + '-' + str(count)
             self.record('resources', {stage_name: base})
             try:
-                stage = image_id(self.engine('create', '--name=' + stage_name, '--label=dev-pair.context=' + expected,
+                stage = image_id(self.engine('create', '--name=' + stage_name, '--label=dev-pair.context=' + expected, '--timeout=' + str(ASSEMBLY_LIFETIME), '--restart=no',
                     '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private', '--userns=private', '--cap-add=SYS_ADMIN',
                     '--security-opt=no-new-privileges', '--security-opt=label=type:container_engine_t',
-                    '--memory=2g', '--pids-limit=512', '--cpus=1', '--tmpfs=/run:rw,nosuid,nodev', '--tmpfs=/tmp:rw,nosuid,nodev',
+                    '--memory=2g', '--pids-limit=512', '--cpus=1', '--tmpfs=/run:rw,nosuid,nodev,mode=0755', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777',
                     '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--entrypoint=/usr/bin/distrobox-init', base,
                     *INIT[1:], '--', FINAL_HOOK))
                 self.inspect_container(stage, base, runtime=False)
@@ -385,16 +429,17 @@ class Gptbox(Bootstrap):
                     self.directory(source, owner='dp-maint')
                     self.mounts[destination] = (str(self.path(source)), True)
                     mount_args += ['--volume', str(self.path(source)) + ':' + destination + ':rw,Z']
-                runtime_id = image_id(self.engine('create', '--name=' + runtime_name, '--label=dev-pair.context=' + expected, '--read-only', '--read-only-tmpfs=false', '--user=1000:1000',
+                runtime_id = image_id(self.engine('create', '--name=' + runtime_name, '--label=dev-pair.context=' + expected, '--timeout=' + str(RUNTIME_LIFETIME), '--restart=no', '--read-only', '--read-only-tmpfs=false', '--user=1000:1000',
                     '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                     '--network=none', '--pid=private', '--ipc=private', '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1',
-                    '--no-hosts', '--no-hostname', '--dns=none', '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000', '--tmpfs=/tmp:rw,nosuid,nodev',
+                    '--no-hosts', '--no-hostname', '--dns=none', '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700', '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700',
                     '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
                     *mount_args, '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
                 self.inspect_container(runtime_id, sealed)
+                previous_start = None
                 for cycle in range(2):
                     self.engine('start', runtime_id)
-                    self.ready(runtime_id, sealed)
+                    previous_start = self.ready(runtime_id, sealed, previous_start)
                     observed = json.loads(self.enter(runtime_id, sealed, 'probe'))
                     if observed.get('boundary_probe') != 'passed':
                         raise Blocked('runtime boundary probe did not pass')

@@ -76,12 +76,22 @@ whether the proposed assembly domain/nesting interfaces work.
 Entry uses the pinned real `distrobox-enter`, clean environment, supported
 `DBX_CONTAINER_MANAGER=podman`, a protected PATH wrapper and immutable controller
 HOME. The exact existing running target is checked before and after entry;
-unsafe fallback creation has no installed create helper. Readiness is bounded.
+unsafe fallback creation has no installed create helper. Readiness requires a
+new inspected `State.StartedAt` on each cycle, unchanged during the wait, and logs
+scoped with `--since` to that actual start; a previous marker cannot pass restart.
+Exact inspected `HostConfig.Tmpfs` paths/options are restricted to `/run` and
+`/tmp`, separately from bind-mount inspection. Native OCI lifetime limits are
+900seconds for staging and180seconds per probe start, with automatic restart
+disabled and `Config.Timeout` inspected. They bound orphan candidates even if
+Podman/conmon moves them outside the transient client's cgroup.
 Stable context-scoped transient units prevent overlapping operations, with
 per-operation runtime limits, control-group stop and longer client deadlines.
 Explicit retry first stops/rechecks an owned busy executor and reconciles only
 recorded context/image-matching container resources. Context bytes/cache are
-reused; conflicting targets or exhausted attempts block.
+reused; conflicting targets or exhausted build attempts block another build.
+After two failed builds, up to two explicit cleanup-only reconciliations can
+still remove exact owned resources, even below the free-space build threshold.
+Neither cleanup allowance resets the execution budget.
 
 Protected root records live under `/var/lib/dev-pair/bootstrap/gptbox-adapter`;
 public immutable build bytes live separately under `/var/lib/dev-pair/artifacts`
@@ -106,7 +116,11 @@ Inspect schema/option references were upstream Podman commit
 `a6a942f2ae0fc8ea001af86c2fd6322299c5a66c`,
 `libpod/define/container_inspect.go` (`IDMappings.UidMap/GidMap` string triples,
 `Memory`, `PidsLimit`, `NanoCpus`, `EffectiveCaps`, `BoundingCaps`, namespace
-fields) and the documented no-hosts/no-hostname/dns options. Fields missing on
+fields, `Config.Timeout` and `HostConfig.Tmpfs`) and the documented
+no-hosts/no-hostname/dns/timeout options. The actual inspector maps native
+container timeout into `Config.Timeout` and joins tmpfs option arrays into the
+`HostConfig.Tmpfs` destination-to-options map; tmpfs entries are omitted from the
+separate `Mounts` array. Fields missing on
 the actual target block admission; synthetic schema fixtures do not establish
 real Fedora compatibility. Fresh exact-candidate review and authorized host
 failure/repair/retest evidence remain necessary before promotion.
