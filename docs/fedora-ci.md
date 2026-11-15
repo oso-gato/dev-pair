@@ -1,17 +1,15 @@
 # Secret-free Fedora 44 CI execution route
 
 [The pull-request workflow](../.github/workflows/fedora-vm.yml) and
-[controller](../tools/fedora_ci.py) implement an initial real-VM execution route
-for an exact public candidate. [Run 5](https://github.com/oso-gato/dev-pair/actions/runs/43731901140)
-passed all 148 tests, runner preflight, signed Fedora download verification,
-tooling image construction and source transfer. The Fedora VM actually booted
-and powered off under TCG in approximately 95 seconds. The controller rejected
-the guest report framing; the retained tail contains only partial preflight/status
-results, which cannot satisfy the complete candidate-bound report contract.
-Cleanup passed. Stable tooling/source overhead was 1029046272 bytes. A dedicated
-second-serial report transport is now implemented and locally tested; it still
-requires independent review and a fresh Fedora run. Historical console fragments
-are not upgraded into complete phase results.
+[controller](../tools/fedora_ci.py) implement a real-VM execution route for an
+exact public candidate. [Run6](https://github.com/oso-gato/dev-pair/actions/runs/43736703953)
+passed all 174 tests, runner preflight, signed Fedora download, tooling build,
+source transfer, real TCG boot and the complete dedicated serial report. The guest
+proved Fedora44, Enforcing SELinux, systemd PID1, cgroupv2 and bootstrap status.
+Bootstrap inspection blocked on an unexpected listener; exact socket inventory
+is needed before any admission change. Prepare/assembly were not attempted.
+Cleanup passed. Stable tooling/source overhead was 1029308416 bytes. This is
+component evidence, not a complete installation or designated-host acceptance.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and

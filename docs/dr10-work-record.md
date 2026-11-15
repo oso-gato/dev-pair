@@ -9,18 +9,23 @@ owner decisions remain retained in order.
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
   Latest published source: `b8ac722ab8dac31543d0e258c8f5d2552135f1d3`.
   Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
-- 148 tests pass locally and in [CI run5](https://github.com/oso-gato/dev-pair/actions/runs/43731901140).
-  Signed Fedora download, tooling construction and source transfer passed. The
-  real Fedora VM booted/shut down under TCG; guest report framing was rejected.
-  Partial preflight/status text is not complete accepted evidence. Cleanup passed.
+- All 174 tests pass locally and in [CI run6](https://github.com/oso-gato/dev-pair/actions/runs/43736703953).
+  Signed image/tooling/source, real TCG boot, complete dedicated report, Fedora44
+  Enforcing SELinux/systemd/cgroupv2, bootstrap status and cleanup passed.
+  Bootstrap inspection rejected an unexpected listener; exact socket inventory
+  is pending a reviewed diagnostic-only follow-up. Prepare/assembly never ran.
 - Public-input repair 62eb1f6 and dedicated-report repair 12d73c3 passed fresh
   Astra High reviews; source is integrated as 921654d and 3a49fd8 respectively.
   All 174 integration tests pass. Builder `/root/durable_job_build` uses accepted
   API settings Sol High; reviewers use Astra High. Provider backend attestation
   and coordinator model metadata remain unavailable.
-- Next: publish this reviewed candidate for one reassessed actual Fedora run.
-  Require a complete dedicated-channel baseline report, then implement shared
-  first-bootstrap prepare/assembly using the bounded design at
+- The sole builder has preserved shared first-bootstrap WIP in
+  `/workspace/dev-pair-initialize`, branch `codex/first-bootstrap-initialize`.
+  It briefly detours to bounded socket diagnostics, then resumes initialize,
+  command bounds and staged dependencies. Fresh reviews await exact candidates;
+  no listener allowlist or access requirement is weakened.
+- Next: identify the actual rejected listener, complete/review the shared
+  first-bootstrap source, then integrate real prepare/assembly in CI using
   `/workspace/scratch/fedora-prepare-integration-plan.md`. Preserve all gates.
 - VPS remains untouched. Root credential reference was available, but this cloud
   executor has no supported VPS TCP/SSH route. CI is a separate test target.
