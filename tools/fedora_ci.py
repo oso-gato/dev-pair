@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""Bounded secret-free Fedora Cloud VM probe on a public standard CI runner.
+
+This controller never installs packages into the runner or launches agents.
+Full bootstrap/maintenance assembly is explicitly blocked in this first slice.
+"""
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import pathlib
+import re
+import resource
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+BASE = 'registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e'
+FINGERPRINT = '36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6'
+IMAGE_NAME = 'Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2'
+IMAGE_SHA256 = '28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f'
+IMAGE_BYTES = 583729152
+IMAGE_ROOT = 'https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/'
+CHECKSUM_NAME = 'Fedora-Cloud-44-1.7-x86_64-CHECKSUM'
+CHECKSUM_SHA256 = 'a436186ff0e930d77637d03e6f357206b686c4ef3fcde234b6f1da63041d4b32'
+HOST_RESERVE = 3 * GIB
+OVERLAY_LIMIT = 8 * GIB
+OVERHEAD_LIMIT = 2 * GIB
+LOG_LIMIT = 8 * MIB
+SOURCE_LIMIT = 32 * MIB
+CONTAINER_SECONDS = 1050  # >= 15-minute TCG boot allowance, finite native lifetime
+SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
+PHASES = ('runner-preflight', 'signed-cloud-image', 'tooling', 'source-payload',
+          'fedora-boot', 'fedora-preflight', 'bootstrap-inspect', 'bootstrap-status',
+          'bootstrap-prepare', 'maintenance-gptbox', 'cleanup')
+
+
+class Blocked(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Blocked(message)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+@contextlib.contextmanager
+def deadline(seconds):
+    def expired(signum, frame):
+        raise Blocked('public dependency phase wall-time budget exceeded')
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def file_hash(path):
+    result = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for chunk in iter(lambda: stream.read(MIB), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def sanitize(data, limit=12000):
+    """Public candidate output is untrusted: escape workflow and terminal controls."""
+    text = data.decode('utf-8', 'replace') if isinstance(data, bytes) else str(data)
+    text = ''.join(c if c in '\n\t' or 32 <= ord(c) < 127 else '?' for c in text)
+    text = text.replace('::', ': :')
+    return ('[truncated; tail follows]\n' if len(text) > limit else '') + text[-limit:]
+
+
+class HTTPSOnly(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        require(newurl.startswith('https://'), 'non-HTTPS dependency redirect denied')
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(url, destination, maximum, exact_size=None, expected_sha=None, deadline=600):
+    require(url.startswith('https://'), 'only official HTTPS dependency URLs are supported')
+    started = time.monotonic()
+    total = 0
+    opener = urllib.request.build_opener(HTTPSOnly())
+    with opener.open(url, timeout=30) as response, open(destination, 'xb') as output:
+        require(response.geturl().startswith('https://'), 'non-HTTPS response denied')
+        while True:
+            require(time.monotonic() - started <= deadline, 'dependency download deadline exceeded')
+            data = response.read(min(MIB, maximum - total + 1))
+            if not data:
+                break
+            total += len(data)
+            require(total <= maximum, 'dependency download exceeds byte limit')
+            output.write(data)
+    if exact_size is not None:
+        require(total == exact_size, 'dependency byte length mismatch')
+    if expected_sha is not None:
+        require(file_hash(destination) == expected_sha, 'dependency SHA256 mismatch')
+    return total
+
+
+def checksum_identity(plaintext):
+    """Require exactly one matching named image/length pair in verified plaintext."""
+    text = plaintext.decode('utf-8') if isinstance(plaintext, bytes) else plaintext
+    digests = re.findall(r'^SHA256 \(' + re.escape(IMAGE_NAME) + r'\) = ([0-9a-f]{64})$', text, re.M)
+    lengths = re.findall(r'^# ' + re.escape(IMAGE_NAME) + r': ([0-9]+) bytes$', text, re.M)
+    require(digests == [IMAGE_SHA256] and lengths == [str(IMAGE_BYTES)], 'signed checksum image identity mismatch')
+    return {'name': IMAGE_NAME, 'sha256': digests[0], 'bytes': int(lengths[0])}
+
+
+def run_small(argv, timeout=30, cwd=None, input_data=None):
+    result = subprocess.run(argv, cwd=cwd, input=input_data, capture_output=True,
+                            env=SAFE_ENV, timeout=timeout)
+    require(result.returncode == 0, 'command failed: ' + sanitize(result.stderr, 1500))
+    require(len(result.stdout) <= SOURCE_LIMIT, 'command output exceeds limit')
+    return result.stdout
+
+
+def verify_checksum(key_bundle, signed_checksum, home):
+    home.mkdir(mode=0o700)
+    gpg = ['/usr/bin/gpg', '--batch', '--no-auto-key-retrieve', '--homedir', str(home)]
+    run_small(gpg + ['--import', str(key_bundle)])
+    key = run_small(gpg + ['--export', FINGERPRINT])
+    require(key, 'Fedora 44 signing key absent')
+    keyring = home / 'fedora44.gpg'
+    keyring.write_bytes(key)
+    # Explicit isolated keyring: no trust in other Fedora keys from the bundle.
+    result = subprocess.run(gpg + ['--no-default-keyring', '--keyring', str(keyring), '--status-fd=1',
+                                  '--verify', str(signed_checksum)], capture_output=True, env=SAFE_ENV, timeout=30)
+    require(result.returncode == 0, 'Fedora checksum signature verification failed')
+    fingerprints = re.findall(rb'^\[GNUPG:\] VALIDSIG ([0-9A-F]{40}) ', result.stdout, re.M)
+    require(fingerprints == [FINGERPRINT.encode()], 'unexpected Fedora signer fingerprint')
+    # Only parse the text after successful cryptographic verification. The
+    # immutable file digest also rules out ambiguous extra clear-signed content.
+    require(file_hash(signed_checksum) == CHECKSUM_SHA256, 'signed checksum file identity mismatch')
+    return checksum_identity(signed_checksum.read_bytes())
+
+
+def check_capacity(root, before_boot=False):
+    free = shutil.disk_usage(root).free
+    require(free >= HOST_RESERVE + (OVERLAY_LIMIT if before_boot else 0),
+            'capacity blocked: insufficient free disk for declared overlay and host reserve')
+    return free
+
+
+def tooling_recipe():
+    # Repository packages resolve at execution time. GPG checking is mandatory;
+    # exact installed NEVRAs are emitted, not claimed reproducible from a lock.
+    return f'''FROM {BASE}
+RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /usr/bin/dnf -y --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --setopt=keepcache=True --setopt=install_weak_deps=False install qemu-system-x86-core qemu-img genisoimage python3 seabios-bin && /usr/bin/find /var/cache -type f -name '*.rpm' -exec /usr/bin/sha256sum {{}} + > /tool-rpm-sha256.txt && /usr/bin/test -s /tool-rpm-sha256.txt && /usr/bin/dnf clean all
+RUN /usr/bin/rpm -qa --qf '%{{NAME}}-%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' | /usr/bin/sort > /tool-rpms.txt
+COPY qemu_entry.py /usr/local/bin/dp-qemu-entry.py
+ENTRYPOINT ["/usr/bin/python3", "/usr/local/bin/dp-qemu-entry.py"]
+'''
+
+
+def seed_data(source, archive_sha, bundle_sha, guest_sha):
+    for value, length in ((source, 40), (archive_sha, 64), (bundle_sha, 64), (guest_sha, 64)):
+        require(re.fullmatch('[0-9a-f]{%d}' % length, value), 'invalid payload identity')
+    # No credentials/passwords/tokens are placed in cloud-init or serial text.
+    command = ['/usr/bin/python3', '/run/dev-pair-payload/guest.py', '--source', source,
+               '--archive-sha256', archive_sha, '--bundle-sha256', bundle_sha, '--guest-sha256', guest_sha]
+    return ('#cloud-config\n'
+            'disable_root: true\nssh_pwauth: false\n'
+            'bootcmd:\n  - [mkdir, -p, /run/dev-pair-payload]\n'
+            '  - [mount, -o, "ro,nosuid,nodev,noexec", "LABEL=DPPAYLOAD", /run/dev-pair-payload]\n'
+            'runcmd:\n  - ' + json.dumps(command) + '\n')
+
+
+def parse_serial(data, expected_source, expected_guest):
+    # Treat serial assertions as candidate-controlled test evidence. Require
+    # one complete result, exact identities and every requested phase.
+    matches = re.findall(rb'^DP_FEDORA_RESULT ([^\r\n]+)\r?$', data, re.M)
+    require(len(matches) == 1, 'missing or ambiguous completed Fedora serial result')
+    require(len(matches[0]) <= 65536, 'guest result exceeds byte limit')
+    def unique(items):
+        value = {}
+        for key, item in items:
+            require(key not in value, 'duplicate guest result field')
+            value[key] = item
+        return value
+    result = json.loads(matches[0], object_pairs_hook=unique)
+    require(type(result) is dict and set(result) == {'version', 'source_sha', 'guest_sha256', 'phases', 'identity', 'diagnostics'}, 'invalid guest result shape')
+    require(type(result['version']) is int and result['version'] == 1 and
+            result['source_sha'] == expected_source and result['guest_sha256'] == expected_guest,
+            'guest source/implementation identity mismatch')
+    required = {'fedora-preflight', 'bootstrap-inspect', 'bootstrap-status', 'bootstrap-prepare', 'maintenance-gptbox'}
+    require(type(result['phases']) is dict and set(result['phases']) == required, 'missing guest phases')
+    for phase in result['phases'].values():
+        require(type(phase) is dict and set(phase) == {'status', 'detail'} and
+                phase['status'] in ('pass', 'fail', 'blocked') and type(phase['detail']) is str and
+                len(phase['detail']) <= 4000, 'invalid guest phase')
+    return result
+
+
+class Probe:
+    def __init__(self, source, root):
+        self.source = source
+        self.repo = pathlib.Path(__file__).resolve().parents[1]
+        self.root = root
+        self.report = {'version': 1, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
+                       'controller_sha256': file_hash(pathlib.Path(__file__)),
+                       'workflow_sha256': file_hash(self.repo / '.github/workflows/fedora-vm.yml'),
+                       'phases': {name: {'status': 'blocked', 'detail': 'Not reached'} for name in PHASES},
+                       'limits': {'overlay_bytes': OVERLAY_LIMIT, 'host_reserve_bytes': HOST_RESERVE,
+                                  'overhead_bytes': OVERHEAD_LIMIT, 'log_bytes': LOG_LIMIT,
+                                  'container_seconds': CONTAINER_SECONDS, 'guest_virtual_bytes': 12 * GIB,
+                                  'cpus': 3, 'memory_bytes': 8 * GIB, 'guest_cpus': 2, 'guest_memory_bytes': 6 * GIB},
+                       'hostinger_acceptance': False, 'job_admission': False}
+        self.podman = ['sudo', '-n', '/usr/bin/podman', '--root=' + str(root / 'graph'),
+                       '--runroot=' + str(root / 'runroot'), '--tmpdir=' + str(root / 'tmp'),
+                       '--hooks-dir=' + str(root / 'empty-hooks'),
+                       '--storage-driver=overlay']
+        self.container = 'dp-fedora-probe-' + root.name.rsplit('-', 1)[-1]
+        self.log_used = 0
+
+    def phase(self, name, status, detail):
+        self.report['phases'][name] = {'status': status, 'detail': sanitize(detail, 4000)}
+        print('DP_PHASE ' + json.dumps({'phase': name, **self.report['phases'][name]}), flush=True)
+
+    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None):
+        """Bound logs/time and watch storage while a native child runs."""
+        log = bytearray()
+        started = time.monotonic()
+        def child_limits():
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            if file_limit is not None:
+                resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+        process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   stdin=subprocess.DEVNULL, env=SAFE_ENV, start_new_session=True,
+                                   preexec_fn=child_limits)
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            while selector.get_map():
+                require(time.monotonic() - started < timeout, name + ' deadline exceeded')
+                if disk_check:
+                    check_capacity(self.root)
+                    # Rootful Podman owns private storage directories. Measure
+                    # via a fixed read-only privileged tool, never silently skip
+                    # inaccessible files in an unprivileged os.walk.
+                    usage = run_small(['sudo', '-n', '/usr/bin/du', '--summarize', '--block-size=1',
+                                       '--exclude=guest.qcow2', str(self.root)], timeout=5)
+                    require(re.fullmatch(rb'[0-9]+\s+[^\n]+\n', usage), 'cannot measure scratch overhead')
+                    overhead = int(usage.split()[0])
+                    require(overhead <= OVERHEAD_LIMIT, 'capacity blocked: tooling/source overhead limit exceeded')
+                for key, _ in selector.select(timeout=1):
+                    data = os.read(key.fileobj.fileno(), 65536)
+                    if not data:
+                        selector.unregister(key.fileobj)
+                        continue
+                    self.log_used += len(data)
+                    require(self.log_used <= LOG_LIMIT, 'aggregate diagnostic byte limit exceeded (truncated)')
+                    log.extend(data)
+            process.wait(timeout=5)
+            require(process.returncode == 0, name + ' failed with exit ' + str(process.returncode))
+            return bytes(log)
+        except BaseException:
+            # Podman/conmon scopes may outlive the CLI; cleanup also force-removes
+            # only our named container. Native --timeout limits the VM itself.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            print(sanitize(bytes(log), 12000), flush=True)
+            raise
+        finally:
+            selector.close()
+            process.stdout.close()
+
+    def helper(self, args, timeout=60, **kwargs):
+        return self.bounded(self.podman + args, timeout, 'tooling command', **kwargs)
+
+    def run_args(self, entrypoint, mounts=True):
+        args = ['run', '--rm', '--name=' + self.container, '--timeout=' + str(CONTAINER_SECONDS),
+                '--restart=no', '--network=none', '--read-only', '--read-only-tmpfs=false',
+                '--user=' + str(os.getuid()) + ':' + str(os.getgid()), '--cap-drop=ALL',
+                '--security-opt=no-new-privileges', '--pids-limit=1024', '--memory=8g', '--cpus=3',
+                '--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '--entrypoint=' + entrypoint]
+        if mounts:
+            args += ['--volume=' + str(self.root / 'payload') + ':/payload:ro',
+                     '--volume=' + str(self.root / 'disks') + ':/disks:rw']
+        return args
+
+    def preflight(self):
+        require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('GITHUB_REPOSITORY') == 'oso-gato/dev-pair',
+                'this mutating test harness is restricted to the authorized public CI repository')
+        release = pathlib.Path('/etc/os-release').read_text()
+        require('ID=ubuntu' in release and 'VERSION_ID="24.04"' in release, 'only ubuntu-24.04 standard runner supported')
+        require(re.fullmatch('[0-9a-f]{40}', self.source), 'invalid exact source SHA')
+        require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source, 'checkout differs from exact PR head')
+        require(not run_small(['/usr/bin/git', '-C', str(self.repo), 'status', '--porcelain']), 'source checkout must be clean')
+        for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo'):
+            require(pathlib.Path(command).is_file(), 'required preinstalled runner tool unavailable: ' + command)
+        require(os.cpu_count() >= 2, 'at least two CPUs required')
+        mem = int(re.search(r'^MemTotal:\s+(\d+) kB$', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
+        require(mem >= 10 * GIB, 'insufficient runner memory')
+        free = check_capacity(self.root, before_boot=True)
+        (self.root / 'empty-hooks').mkdir()
+        version = run_small(self.podman + ['version', '--format=json']).decode()
+        self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
+                                 'podman': json.loads(version), 'free_bytes': free, 'memory_bytes': mem,
+                                 'merge_sha': os.environ.get('DP_MERGE_SOURCE', 'unreported')}
+        self.phase('runner-preflight', 'pass', 'Actual standard-runner OS/source/tools/capacity checked; no host packages installed')
+
+    def inputs(self):
+        with deadline(600):
+            self.download_inputs()
+
+    def download_inputs(self):
+        downloads = self.root / 'downloads'
+        downloads.mkdir()
+        key = downloads / 'fedora.gpg'
+        checksum = downloads / CHECKSUM_NAME
+        download('https://fedoraproject.org/fedora.gpg', key, MIB)
+        download(IMAGE_ROOT + CHECKSUM_NAME, checksum, 65536, expected_sha=CHECKSUM_SHA256)
+        identity = verify_checksum(key, checksum, self.root / 'gnupg')
+        download(IMAGE_ROOT + IMAGE_NAME, self.root / 'payload/base.qcow2', IMAGE_BYTES,
+                 exact_size=IMAGE_BYTES, expected_sha=IMAGE_SHA256)
+        self.report['cloud_image'] = {**identity, 'signer': FINGERPRINT, 'signature': 'verified-gpg'}
+        self.phase('signed-cloud-image', 'pass', json.dumps(self.report['cloud_image']))
+
+    def tooling(self):
+        build = self.root / 'tool-build'
+        build.mkdir()
+        (build / 'Containerfile').write_text(tooling_recipe())
+        shutil.copyfile(self.repo / 'tools/fedora_ci_qemu.py', build / 'qemu_entry.py')
+        (self.root / 'empty-auth.json').write_text('{"auths":{}}\n')
+        self.image = self.helper(['build', '--pull=always', '--http-proxy=false', '--authfile=' + str(self.root / 'empty-auth.json'),
+                                  '--memory=2g', '--cpu-quota=200000', '--force-rm',
+                                  '--ulimit=fsize=2147483648:2147483648', '--iidfile=' + str(self.root / 'tool-image'),
+                                  '--file=' + str(build / 'Containerfile'), str(build)], timeout=600)
+        self.image = run_small(['sudo', '-n', '/usr/bin/cat', str(self.root / 'tool-image')]).decode().strip()
+        require(re.fullmatch('sha256:[0-9a-f]{64}', self.image), 'tool image ID missing')
+        packages = self.helper(self.run_args('/usr/bin/cat', mounts=False) + [self.image, '/tool-rpms.txt', '/tool-rpm-sha256.txt'])
+        self.report['tooling'] = {'base': BASE, 'image_id': self.image, 'rpm_manifest': packages.decode()}
+        print('DP_TOOL_RPMS\n' + sanitize(packages, 32000), flush=True)
+        self.phase('tooling', 'pass', 'Disposable image with GPG-checked RPMs; exact NEVRAs recorded, live repositories remain a reproducibility limit')
+
+    def payload(self):
+        payload = self.root / 'payload'
+        guest = self.repo / 'tools/fedora_ci_guest.py'
+        shutil.copyfile(guest, payload / 'guest.py')
+        self.guest_sha = file_hash(guest)
+        self.bounded(['/usr/bin/git', '-C', str(self.repo), 'bundle', 'create', str(payload / 'source.bundle'), 'HEAD'],
+                     60, 'public source bundle', file_limit=SOURCE_LIMIT)
+        # A bundle contains Git objects, never checkout .git/config or CI env.
+        run_small(['/usr/bin/git', '-C', str(self.repo), 'bundle', 'verify', str(payload / 'source.bundle')])
+        self.bounded(['/usr/bin/git', '-C', str(self.repo), 'archive', '--format=tar',
+                      '--output=' + str(payload / 'source.tar'), self.source],
+                     30, 'public source archive', file_limit=SOURCE_LIMIT)
+        bundle = payload / 'source.bundle'
+        require(bundle.stat().st_size <= SOURCE_LIMIT, 'public Git bundle exceeds source limit')
+        archive_sha, bundle_sha = file_hash(payload / 'source.tar'), file_hash(bundle)
+        seed = self.root / 'seed'
+        seed.mkdir()
+        (seed / 'user-data').write_text(seed_data(self.source, archive_sha, bundle_sha, self.guest_sha))
+        (seed / 'meta-data').write_text('instance-id: dev-pair-' + self.source + '\nlocal-hostname: fedora-ci\n')
+        # Only these reviewed public payload files reach the VM, never runner
+        # environment, worktree .git metadata/config, credentials or private rules.
+        self.helper(self.run_args('/usr/bin/genisoimage') + ['--volume=' + str(seed) + ':/seed:ro', self.image,
+                    '-quiet', '-output', '/disks/seed.iso', '-volid', 'cidata', '-joliet', '-rock', '/seed'])
+        # Base disk is excluded from the source ISO to avoid duplication.
+        self.helper(self.run_args('/usr/bin/genisoimage') + [self.image, '-quiet', '-output', '/disks/payload.iso',
+                    '-volid', 'DPPAYLOAD', '-joliet', '-rock', '-graft-points',
+                    'guest.py=/payload/guest.py', 'source.tar=/payload/source.tar', 'source.bundle=/payload/source.bundle'])
+        base_info = json.loads(self.helper(self.run_args('/usr/bin/qemu-img') +
+                                          [self.image, 'info', '--output=json', '/payload/base.qcow2']))
+        require(base_info.get('format') == 'qcow2' and not base_info.get('backing-filename') and
+                0 < base_info.get('virtual-size', 0) <= 12 * GIB, 'signed base disk layout exceeds declared scope')
+        self.report['cloud_image']['virtual_bytes'] = base_info['virtual-size']
+        self.helper(self.run_args('/usr/bin/qemu-img') + [self.image, 'create', '-f', 'qcow2', '-F', 'qcow2',
+                    '-b', '/payload/base.qcow2', '/disks/guest.qcow2', '12G'])
+        self.report['payload'] = {'source_sha': self.source, 'guest_sha256': self.guest_sha,
+                                  'archive_sha256': archive_sha, 'bundle_sha256': bundle_sha}
+        self.phase('source-payload', 'pass', json.dumps(self.report['payload']))
+
+    def boot(self):
+        check_capacity(self.root, before_boot=True)
+        accel = 'tcg'
+        # Merely finding /dev/kvm is insufficient. Prove VM initialization with
+        # QEMU's native paused-start + QMP quit, bounded separately.
+        if pathlib.Path('/dev/kvm').exists() and os.access('/dev/kvm', os.R_OK | os.W_OK):
+            try:
+                command = self.run_args('/usr/bin/python3', mounts=False) + ['--device=/dev/kvm',
+                           '--group-add=' + str(pathlib.Path('/dev/kvm').stat().st_gid), self.image,
+                           '-c', "import subprocess,sys; p=subprocess.run(['/usr/bin/qemu-system-x86_64','-machine','accel=kvm','-m','128','-nodefaults','-display','none','-S','-qmp','stdio'],input=b'{\"execute\":\"qmp_capabilities\"}\\n{\"execute\":\"quit\"}\\n',stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=10); sys.stdout.buffer.write(p.stdout+p.stderr); raise SystemExit(p.returncode)"]
+                self.helper(command, timeout=20)
+                accel = 'kvm'
+            except (Blocked, OSError, subprocess.SubprocessError):
+                self.report['kvm'] = 'actual initialization failed; bounded TCG fallback selected'
+                # A failed --rm command may still be stopping; remove own name.
+                subprocess.run(self.podman + ['rm', '--force', self.container], env=SAFE_ENV, capture_output=True, timeout=15)
+        self.report['acceleration'] = accel
+        args = self.run_args('/usr/bin/python3')
+        if accel == 'kvm':
+            args += ['--device=/dev/kvm', '--group-add=' + str(pathlib.Path('/dev/kvm').stat().st_gid)]
+        args += [self.image, '/usr/local/bin/dp-qemu-entry.py', '-machine', 'q35,accel=' + accel,
+                 '-cpu', 'host' if accel == 'kvm' else 'max', '-smp', '2', '-m', '6144',
+                 '-display', 'none', '-serial', 'stdio', '-monitor', 'none', '-no-reboot',
+                 '-nic', 'none', '-drive', 'file=/disks/guest.qcow2,if=virtio,format=qcow2,cache=none',
+                 '-drive', 'file=/disks/seed.iso,media=cdrom,readonly=on,format=raw',
+                 '-drive', 'file=/disks/payload.iso,media=cdrom,readonly=on,format=raw']
+        serial = self.helper(args, timeout=300 if accel == 'kvm' else 900)
+        print('DP_SERIAL_TAIL\n' + sanitize(serial, 24000), flush=True)
+        guest = parse_serial(serial, self.source, self.guest_sha)
+        self.report['guest'] = guest
+        self.phase('fedora-boot', 'pass', 'Real signed Fedora Cloud image booted and emitted a complete candidate-bound serial result using ' + accel)
+        for name, phase in guest['phases'].items():
+            self.phase(name, phase['status'], phase['detail'])
+
+    def cleanup(self):
+        # No system reset, prune, shared storage deletion or runner cleanup.
+        # Rootful storage exists solely below the controller's mkdtemp leaf.
+        result = subprocess.run(self.podman + ['rm', '--force', '--all'], capture_output=True, env=SAFE_ENV, timeout=20)
+        require(result.returncode in (0, 1), 'own test container cleanup failed')
+        cleanup = subprocess.run(['sudo', '-n', '/bin/rm', '-rf', '--', str(self.root)], capture_output=True, env=SAFE_ENV, timeout=60)
+        require(cleanup.returncode == 0 and not self.root.exists(), 'own scratch cleanup incomplete')
+        self.phase('cleanup', 'pass', 'Only this run\'s isolated Podman containers and unique scratch/storage/disks were removed')
+
+    def execute(self):
+        active = 'runner-preflight'
+        try:
+            self.preflight()
+            for name in ('payload', 'disks', 'tmp'):
+                (self.root / name).mkdir(mode=0o755)
+            for active, action in (('signed-cloud-image', self.inputs), ('tooling', self.tooling),
+                                   ('source-payload', self.payload), ('fedora-boot', self.boot)):
+                action()
+        except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
+            self.report['blocker'] = sanitize(str(exc), 4000)
+            self.phase(active, 'blocked', self.report['blocker'])
+            print('DP_BLOCKED ' + self.report['blocker'], flush=True)
+        finally:
+            try:
+                self.cleanup()
+            except (Blocked, OSError, subprocess.SubprocessError) as exc:
+                self.phase('cleanup', 'fail', str(exc))
+            print('DP_REPORT ' + json.dumps(self.report, sort_keys=True), flush=True)
+            summary = os.environ.get('GITHUB_STEP_SUMMARY')
+            if summary:
+                with open(summary, 'a') as output:
+                    output.write('### Fedora 44 VM component probe\n\n')
+                    output.write('Source: `' + self.source + '`; Hostinger/pair acceptance: **unverified**.\n\n')
+                    for name, phase in self.report['phases'].items():
+                        output.write('- ' + name + ': **' + phase['status'] + '** — ' + sanitize(phase['detail'], 500).replace('\n', ' ') + '\n')
+                    output.write('\nNo artifact/cache uploads, secrets, enrollment or model calls.\n')
+        # The intentionally blocked assembly phase keeps this initial route
+        # from becoming a green claim of maintenance-runtime acceptance.
+        return 0 if all(p['status'] == 'pass' for p in self.report['phases'].values()) else 2
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--expected-source', required=True)
+    args = parser.parse_args()
+    scratch_parent = os.environ.get('RUNNER_TEMP')
+    require(scratch_parent and pathlib.Path(scratch_parent).is_dir(), 'RUNNER_TEMP unavailable')
+    root = pathlib.Path(tempfile.mkdtemp(prefix='dev-pair-fedora-', dir=scratch_parent))
+    root.chmod(0o755)
+    return Probe(args.expected_source, root).execute()
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (Blocked, OSError) as exc:
+        print('DP_BLOCKED ' + sanitize(str(exc)), flush=True)
+        sys.exit(2)
