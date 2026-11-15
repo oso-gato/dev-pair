@@ -45,6 +45,9 @@
 <a id="dr2-5"></a>
 **DR2.5** An initial [secret-free Fedora44 CI VM probe](docs/fedora-ci.md) now implements a signed Cloud-image QEMU boot route on standard public Ubuntu24.04 runners, explicit resource/log limits and real guest enforcing-SELinux/systemd/bootstrap inspect/status checks. Local verification covers signatures, parsers and actual process bounds. The fifth public CI run passed all 148 tests, verified the downloaded Fedora image, built the tooling image and staged source. The Fedora VM booted and shut down under software emulation, but the controller rejected the guest report framing; preflight/status fragments cannot count as accepted complete results. Cleanup passed. Structured report transport is under investigation while verified bootstrap-input transfer is implemented. Prepare and maintenance-gptbox assembly remain explicitly blocked in this checkpoint, pending the first reviewed CI evidence and the next integration slice. This route cannot establish designated Hostinger or complete pair acceptance.
 
+<a id="dr2-6"></a>
+**DR2.6** A separate [public maintenance-input helper](docs/public-maintenance-inputs.md) now verifies pinned Codex/Cosign/Distrobox inputs and creates a compressed current-HEAD context/source handoff with sanitized Git objects and separate integrity manifests. It does not yet integrate those inputs into the CI guest or production bootstrap, and it grants no agent/model or runtime admission.
+
 <a id="platform-and-agents"></a>
 <a id="dr3"></a>
 ## DR3 — Platform and agents
