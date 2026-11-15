@@ -23,18 +23,23 @@ owner decisions remain retained in order.
   fresh final review passed exact8c47d238. All189 integration tests pass.
   Initialize/command/native-unit and resolved convergence behavior remains
   source/local evidence until its actual Fedora run. The CI integration builder
-  is active; its first checkpoint passed195 local tests, with final tests and
-  fresh exact-candidate review pending.
+  returned immutable candidate `d76adbfcc9d3c39bd4d21b7524658c7e9797eaf1`,
+  integrated byte-identically as `bbd2f47`. All198 builder and coordination
+  tests pass. Fresh Astra High `/root/fedora_prepare_ci_review` returned PASS
+  after198 independent repository tests and17 additional checks, no findings.
 - Run7 identified stock resolved LLMNR5355 as the listener blocker. Reviewed
   source now recognizes the exact service and persists LLMNR/mDNS disabling.
-  Next: finish current-source verified inputs and shared initialize in CI,
-  using `/workspace/scratch/fedora-prepare-integration-plan.md`; independently
-  review the complete resource/network/secret boundary before executing.
-- In parallel, fresh API-configured Astra High `/root/nested_devbox_design`
-  performs a twenty-minute read-only design of the required nested DevBox
-  placement against committed source and A11 references. Its scratch handoff
-  cannot substitute for actual nested Fedora/SELinux acceptance. No second
-  implementation builder is active.
+  Next: publish the reviewed integration and execute current-source verified
+  inputs and shared initialize in CI. Preserve the fixed resource/network/secret
+  boundary and collect exact-candidate runtime evidence before any acceptance.
+- Fresh API-configured Astra High `/root/nested_devbox_design` completed a
+  read-only design of the required nested DevBox placement against committed
+  source and A11 references. `/workspace/scratch/nested-devbox-design.md`
+  identifies mapping/helper, ancestor seccomp and actual SELinux transitions as
+  measured gates. It proposes an offline real nested engine and reused genuine
+  sealed agent, with separate placement provenance and immutable parent. This
+  scratch handoff cannot substitute for actual nested Fedora/SELinux acceptance.
+  No second implementation builder is active.
 - VPS remains untouched. Root credential reference was available, but this cloud
   executor has no supported VPS TCP/SSH route. CI is a separate test target.
   Authenticated jobs, both actual placements, enforced quota/cleanup, tailnet
@@ -1398,3 +1403,25 @@ Fresh API-configured Astra High `/root/fedora_prepare_ci_review` has loaded the
 contract and waits for an immutable candidate. The latest published source is
 still76e7d61 and the last actual run is7; do not confuse this WIP with runtime
 acceptance or a completed platform.
+
+
+CI preparation integration candidate `d76adbfcc9d3c39bd4d21b7524658c7e9797eaf1`
+was integrated byte-identically as `bbd2f47`. Builder198 tests passed33.472s;
+coordination198 tests passed31.688s. Fresh API-configured Astra High
+`/root/fedora_prepare_ci_review` returned PASS with no material findings after
+198 tests32.723s and17 additional identity/phase/duplicate, secret-stdin echo,
+quiet/orphan deadline, setup-cleanup and concrete network/profile checks.
+Evidence: `/workspace/artifacts/fedora-prepare-ci-review-d76adbf/review.json`.
+The separate README status update was also checked. Source/configuration review
+is not fresh producer cryptography or native Fedora acceptance.
+
+The next hosted validation batch is limited to one initial preparation run and
+at most two evidence-driven repair runs, each after exact-candidate independent
+source review. Preserve the existing standard public runner,60-minute job,
+3300s controller,540s setup,2640s VM,120s cleanup and fixed disk/memory/CPU/log
+bounds. No purchases, uploaded artifacts/caches, private standards, provider
+secrets, enrollment, model use or Hostinger route is added. A measured blocker
+requires diagnosis; do not retry unchanged inputs indefinitely or relax security,
+capacity or acceptance. After the batch, reassess the concrete outcome and
+continue independent work where possible. This publication remains a draft
+component test, not production promotion; release enforcement remains absent.
