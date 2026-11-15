@@ -1035,3 +1035,20 @@ context, sanitized public Git objects and compressed transfer with separate
 hashes. Workflow, VM limits, guest prepare and production bootstrap integration
 are unchanged in this slice. No credentials, model calls or private standards
 content enter the payload. Fresh exact-candidate review follows the helper.
+
+Read-only serial diagnosis completed: cloud-init25.3 uses journal+console and
+tee output plumbing, so a dedicated bounded second serial channel is preferred
+to relaxed matching on mixed console text. The exact rejected prefix is not
+recoverable from run5's truncated tail. The source-backed QEMU10.2.2 FIFO plan
+is retained at `/workspace/scratch/fedora-ci-serial-plan.md`; no transport code
+or additional hosted execution has occurred. Complete the current input helper,
+then implement/review this distinct transport correction before another run.
+
+Connected read-only GitHub checks additionally confirm main at
+`f2e829b0bcaa1fb5d22cf9b12261a122a607d25c` has `protected=false` and no required
+checks in the branch response. Repository rulesets list only two historical tag
+rules, not a main-branch release gate. The detailed protection endpoint returned
+403 Resource not accessible by integration; that API capability is unavailable.
+No settings were changed. This corroborates the previously recorded independent
+release-enforcement gap; local subagent reviews and the current workflow do not
+establish a separately enforced production gate. Keep draft/unmerged status.
