@@ -7,7 +7,7 @@ owner decisions remain retained in order.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Latest published source: `76e7d61b8966f2c25420e66bed84f44f36142b2c`.
+  Latest published source: `f03c6db16c3a3bc6a34a0517c74bdc4e9bf0ba31`.
   Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
 - All 175 tests passed in [CI run7](https://github.com/oso-gato/dev-pair/actions/runs/43737631539).
   Signed image/tooling/source, real TCG boot, complete dedicated report, Fedora44
@@ -1425,3 +1425,12 @@ requires diagnosis; do not retry unchanged inputs indefinitely or relax security
 capacity or acceptance. After the batch, reassess the concrete outcome and
 continue independent work where possible. This publication remains a draft
 component test, not production promotion; release enforcement remains absent.
+
+
+Published reviewed integration `f03c6db16c3a3bc6a34a0517c74bdc4e9bf0ba31`
+started [run8](https://github.com/oso-gato/dev-pair/actions/runs/43743748166),
+job132902382113. Runtime result is pending. The PR remains draft/unmerged, and
+its metadata records198 tests plus independent review. Source stays frozen while
+this exact candidate executes; do not publish documentation-only commits that
+cancel/replace its run. The sole Sol builder performs a bounded read-only next-
+slice plan against the nested-placement handoff while awaiting actual diagnostics.
