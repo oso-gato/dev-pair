@@ -1591,3 +1591,35 @@ should distinguish a queued request from actual execution without journal export
 Fresh `/root/fedora_native_executor_review` has the governing sources and run9 AVC;
 review begins only after an immutable candidate. No policy or confinement change,
 new hosted run, VPS access or production deployment has occurred in this slice.
+
+
+Native executor candidate `9ca8641f3c276b5cd66c6bef24d2f1cbbad48936` is
+integrated byte-identically as `ee1589a`. Builder211 tests passed34.267s;
+coordinator211 tests passed31.788s. Nine focused tests cover real null-FD/clean-
+environment children, protected files, failed startup without a passing frame,
+target mismatch, effective profile/drop-ins and captured SELinux NUL terminators.
+Reportv3 requires the actual native executor before accepting any passed guest
+phase. Native runtime2445s plus stop5s and shared admission60s preserve the VM
+bound. The service has no cloud-final wait and forwards no cloud-init pipe FDs.
+
+Fresh Astra High `/root/fedora_native_executor_review` independently passed211
+tests31.326s and has no material finding so far; review is not yet final. Unknown
+global service drop-ins intentionally block and selected failure-witness fields
+retain their paths; their presence/content on this exact Fedora guest is not yet
+known. Do not assume remembered vendor defaults or blanket-allow them. Actual
+unit loading/default SELinux transition/effective configuration and subsequent
+preparation remain runtime gates. Local systemd-analyze verification was blocked
+by /run/systemd permissions and is not claimed. No new source is published yet.
+
+
+Fresh Astra High `/root/fedora_native_executor_review` returned PASS for exact
+`9ca8641f3c276b5cd66c6bef24d2f1cbbad48936`, with no material findings. All 211
+repository tests passed in 31.326s and 77 independent checks passed: actual local
+process/FD boundaries, identity/ownership, start ordering/failures, deadlines and
+report admission. Evidence:
+`/workspace/artifacts/fedora-native-executor-review-9ca8641/review.json`.
+Review permits the final bounded repair run in this hosted batch; native Fedora
+transition/profile and preparation remain pending. No unknown global drop-in,
+policy exception or confinement relaxation is accepted by this verdict. After
+the actual result, close/reassess the batch against the concrete blocker or
+passing evidence and continue independent authorized work where possible.
