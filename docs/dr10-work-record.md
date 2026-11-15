@@ -882,3 +882,20 @@ or proof that boot failed. The single Sol builder is preparing a bounded
 read-only extension plan while baseline evidence is collected. No VPS access,
 paid runner, credentials, model invocation, release or merge is authorized by
 this CI probe. Existing project authority and requirements remain unchanged.
+
+The first published workflow actually ran as GitHub run `43729422976`, job
+`132858362638`, source `21397430f7f74c1f11b4a529d776d237e87ab549`.
+The standard Ubuntu24.04.5 runner (image 20261111.370.1) passed all 136 tests.
+Runner preflight then blocked: Podman rejected the generated runroot pathname
+as longer than 50 characters. Cleanup repeated that configuration error and
+did not report successful scratch removal; the disposable runner was finalized.
+No dependency image was downloaded/built and no Fedora guest boot occurred.
+Logs: https://github.com/oso-gato/dev-pair/actions/runs/43729422976 ; local
+retention: `/workspace/artifacts/fedora-ci-run-43729422976.log`.
+
+This is a concrete runtime integration defect, not an exhausted capability
+claim. The coordinator reassessed the earlier source-review repair limit and
+authorized one bounded ten-minute path/early-cleanup correction followed by
+fresh affected review and a new exact-candidate CI run. The single Sol builder
+paused the extension plan for this repair. Preserve unique owned storage,
+resource accounting and limited cleanup; no host-wide paths or pruning.
