@@ -1778,3 +1778,44 @@ One bounded Fedora retest is admitted for this measured timeout repair under the
 existing executor envelope. It must verify actual reload, subsequent native
 service admission and remaining preparation; a new blocker is returned for
 diagnosis rather than weakening any gate. No production or VPS action.
+
+
+### November16, 2026, 03:22 HKT — native service active; vendor drop-in gate
+
+[Run12](https://github.com/oso-gato/dev-pair/actions/runs/43751625705), job132926640810,
+source88b3a6b, passed221tests37.840s, fresh verified inputs, networking and cleanup.
+Reload and service start succeeded; selected observation after4659ms showed
+MainPID1200, active/root, exact fragment, null streams,2445s runtime and5s stop.
+Admission rejected the actual global drop-in
+`/usr/lib/systemd/system/service.d/10-timeout-abort.conf`. File content was not
+captured. Complete validated failure witness1086bytes SHA256
+`dc5c9497066d045c99291bc995b6bef5a743ade630d3fa145f9d39f78f3f6fae`;
+no dedicated report, native SELinux context or guest phase is accepted. Evidence:
+`/workspace/artifacts/fedora-ci-run-43751625705.log` and sibling-controller.json.
+The one-run reload retest is closed with a new measured configuration gate.
+
+Read-only Astra architecture investigation confirmed upstream systemd v259
+per-unit same-basename shadowing, including that an empty regular file REMAINS
+in DropInPaths. Sources: systemd.unit.xml241–250,shared/dropin.c256–290,
+basic/conf-files.c246–255/321–329,core/load-dropin.c128–146 and dbus-unit.c942.
+This is source feasibility, not exact Fedora installed-byte proof.
+
+The sole builder has a15-minute repair slice: root-owned0644exclusive empty
+`/etc/systemd/system/dev-pair-ci-provision.service.d/10-timeout-abort.conf`,
+protected parents, standard restorecon and native admission verification.
+Require precisely this controlled path as the only drop-in; reject any other.
+No unknown vendor content is accepted and no global file is changed. Declare
+TimeoutStopFailureMode=kill,SendSIGKILL=yes,FinalKillSignal=SIGKILL and verify
+effective kill/yes/9 to avoid abort/core-dump stop extension. All total budgets,
+SELinux and container confinement remain fixed. Fresh Astra High
+`/root/native_unit_mask_review` reviews the immutable candidate before a bounded
+retest. Recheck4096-byte witness after adding properties.
+
+The independent state harness WIP is parked as local incomplete commit
+`efe838ada27d068242840101f9739260f82a7604` in
+`/workspace/dev-pair-codex-state`, branchcodex/offline-state-policy. It is not
+integrated, published or admitted. One actual no-network stock-binary run
+passed seven offline checks; report `/workspace/artifacts/codex-state-first-local.json`,
+SHA256`27d93d8266ef7109a8ebff144e626adb50429193c0e1ff1eab08588812c6da7a`.
+Strict layout/requirements validation, unit mutation/bound checks, documentation
+and review remain unfinished. Resume after the measured native blocker repair.
