@@ -2062,3 +2062,28 @@ because a numerical exit alone could mistake failed startup for an accepted
 nonzero payload result. No policy grants or forced process labels are proposed.
 The sole Sol builder works from `8bdd19d` in a separate native-relay worktree;
 fresh Astra High review is prepared. No new Fedora run is admitted yet.
+
+### November 16, 2026, 05:12 HKT — relay source reviewed; deadline repair required
+
+Sol High relay candidate `da2ebf5834fa9ae266f81fe434517eac1a3db7ec`
+is integrated locally as `b88d6f1`; it is not published or admitted. Builder
+269 tests passed in 42.864 seconds; combined storage/relay integration passed
+280 tests in 42.445 seconds. Helper identity is SHA256
+`993ad277ec4458c57c745c8f02ea6ec5dfbe83acb2ea0382cd430a2ba4f04b33`.
+Fresh Astra High review independently passed 269 tests and five adversarial
+stream checks, but returned CHANGES REQUIRED with two P2 findings:
+
+- NR-1: manager FIFO opening can block before helper exec. Type=exec startup is
+  not covered by RuntimeMaxSec. Set a finite remaining-budget startup timeout;
+  pass the original absolute deadline to the helper so startup cannot renew it.
+- NR-2: systemd-run returns 255 for signal failures and can return 0 for clean
+  signal stops. The helper protocol must handle that mapping while independently
+  rejecting unaccepted payload signals; accepting launcher zero alone is unsafe.
+
+Review: `/workspace/artifacts/native-relay-review-da2ebf5/review.json`, SHA256
+`e0b9e30bfde154544c06449298a4bd921b66948e798c0eb9b7f7fe8aeac196f0`.
+Exact upstream v259 service/timer/exit-status sources are cached under
+`/workspace/scratch/systemd-v259-start-timers`; these are source evidence, not
+Fedora vendor-binary acceptance. The sole builder is making a narrow repair;
+fresh `/root/native_relay_deadline_review` is prepared. No new hosted run,
+policy change or deployment is admitted by the local test pass.
