@@ -66,7 +66,8 @@ The transition follows these boundaries:
   the root and system trees, and honors configured exclusions outside those
   required trees. Read-only mounts are explicitly excluded. Conflicting critical
   exclusions, ambiguous overmounts or unsupported paths block without rewriting
-  their configuration. Excluded/read-only ancestors of an admitted writable mount block because native
+  their configuration. Configured, read-only and implicit non-seclabel ancestors of an admitted
+  writable mount block because native
   exclusions would also skip its descendants. The RPM-verified native
   `/usr/bin/setfiles` path supports Fedora 44's merged `/usr/sbin -> bin` layout
   and retains its

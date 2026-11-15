@@ -501,6 +501,20 @@ class SELinuxTests(unittest.TestCase):
         with self.assertRaisesRegex(s.Blocked, 'excluded ancestor'):
             self.app.relabel_plan()
 
+    def test_native_implicit_nonseclabel_ancestor_cannot_hide_writable_child(self):
+        self.app.path('/proc/self/mounts').write_text(
+            'root / ext4 rw,seclabel 0 0\n'
+            'parent /mnt vfat rw 0 0\n'
+            'child /mnt/data ext4 rw,seclabel 0 0\n')
+        with self.assertRaisesRegex(s.Blocked, 'excluded ancestor'):
+            self.app.relabel_plan()
+        self.app.path('/proc/self/mounts').write_text(
+            'root / ext4 rw,seclabel 0 0\n'
+            'efi /boot/efi vfat rw 0 0\n'
+            'proc /proc proc rw 0 0\nsys /sys sysfs ro 0 0\n'
+            'child /mnt/data ext4 rw,seclabel 0 0\n')
+        self.assertEqual(self.app.relabel_plan()['mounts'], ['/', '/mnt/data'])
+
     def test_timeout_kills_forked_descendant_before_later_write(self):
         marker = self.root / 'orphan-write'
         handshake = self.root / 'fork-handshake'

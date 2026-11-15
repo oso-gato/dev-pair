@@ -346,7 +346,8 @@ class SELinuxBootstrap(Bootstrap):
                     raise Blocked('configured relabel exclusion covers required system code; preserving it for recovery')
                 excluded.append(path)
         excluded = sorted(set(excluded + readonly))
-        if any(contains(exclude, point) for exclude in excluded for point in writable):
+        implicit_excluded = [point for point, entry in mounts.items() if 'seclabel' not in entry['options']]
+        if any(contains(exclude, point) for exclude in excluded + implicit_excluded for point in writable):
             raise Blocked('an excluded ancestor would hide an admitted writable filesystem from native relabel')
         if len(excluded) > 128:
             raise Blocked('too many relabel exclusions for initial bootstrap')
