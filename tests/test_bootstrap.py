@@ -32,7 +32,7 @@ class Fake:
         self.password_inputs = []
         self.password_set = False
 
-    def __call__(self, *args, ok=(0,), input_text=None):
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
         self.calls.append(args)
         if self.fail and self.fail(args):
             raise b.Blocked('injected command failure (output withheld)')
@@ -74,6 +74,10 @@ class Fake:
             return 'inactive\n'
         if exe == 'ss':
             return 'tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n'
+        if exe in ('matchpathcon', 'stat'):
+            return 'system_u:object_r:systemd_conf_t:s0\n' * 2
+        if exe == 'busctl':
+            return '{"type":"s","data":"no"}\n' * 2
         if exe == 'sshd' and args[1] == '-T':
             if '-C' in args:
                 name = args[-1].split(',')[0].split('=')[1]
@@ -115,6 +119,9 @@ class BootstrapTests(unittest.TestCase):
             p = self.app.path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(data)
+        self.app.path('/etc').chmod(0o755)
+        self.app.path('/etc/systemd').mkdir(mode=0o755)
+        self.app.path('/etc/systemd').chmod(0o755)
         self.rootpatch = patch.object(b.os, 'geteuid', return_value=0)
         self.rootpatch.start()
         self.addCleanup(self.rootpatch.stop)
@@ -154,7 +161,9 @@ class BootstrapTests(unittest.TestCase):
                 return self.resolved_state
             result = original(*args, **kwargs)
             if args[:2] == ('/usr/bin/systemctl', 'restart') and args[-1] == 'systemd-resolved.service':
-                self.inventory = '\n'.join(line for line in self.inventory.splitlines() if ':5355' not in line) + '\n'
+                directory = self.app.path('/etc/systemd/resolved.conf.d')
+                if directory.stat().st_mode & 0o001:
+                    self.inventory = '\n'.join(line for line in self.inventory.splitlines() if ':5355' not in line) + '\n'
             return result
         self.app.run = run
 
@@ -172,6 +181,84 @@ class BootstrapTests(unittest.TestCase):
         self.inventory += 'udp UNCONN 0 0 0.0.0.0:5355 0.0.0.0:* users:(("systemd-resolve",pid=767,fd=12))\n'
         with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
             self.app.preflight()
+
+    def test_resolved_public_directory_ignores_umask_without_changing_private_modes(self):
+        self.stock_resolved()
+        previous=os.umask(0o077)
+        try:
+            self.prepare()
+            self.assertEqual(os.umask(0o077),0o077)
+            directory=self.app.path('/etc/systemd/resolved.conf.d')
+            self.assertEqual(directory.stat().st_mode & 0o777,0o755)
+            self.assertEqual((directory/'90-dev-pair-discovery.conf').stat().st_mode & 0o777,0o644)
+            self.assertEqual(self.app.state.stat().st_mode & 0o777,0o700)
+            witness=json.loads(self.app.text(b.STATE+'/resolved-discovery.json'))
+            self.assertEqual(witness['status'],'pass');self.assertTrue(witness['stock_labels_match'])
+            self.assertTrue(witness['runtime_discovery_disabled'])
+            self.prepare()
+        finally:os.umask(previous)
+
+    def test_resolved_old_private_directory_is_preserved_without_adoption(self):
+        self.app.directory(b.STATE)
+        directory=self.app.path('/etc/systemd/resolved.conf.d');directory.mkdir(mode=0o700);directory.chmod(0o700)
+        foreign=directory/'private';foreign.write_bytes(b'SECRET-FOREIGN-CONTENT')
+        with self.assertRaises(b.Blocked):self.app.configure_resolved()
+        self.assertEqual(directory.stat().st_mode & 0o777,0o700)
+        self.assertEqual(foreign.read_bytes(),b'SECRET-FOREIGN-CONTENT')
+        witness=json.loads(self.app.text(b.STATE+'/resolved-discovery.json'))
+        self.assertEqual(witness['reason'],'config-directory-mode')
+        self.assertNotIn('SECRET',json.dumps(witness))
+        self.assertFalse(any(args[:2]==('/usr/bin/systemctl','restart') for args in self.fake.calls))
+
+    def test_resolved_foreign_managed_filename_is_preserved_with_fixed_reason(self):
+        directory=self.app.path('/etc/systemd/resolved.conf.d');directory.mkdir(mode=0o755);directory.chmod(0o755)
+        target=directory/'90-dev-pair-discovery.conf';target.write_bytes(b'SECRET-FOREIGN-CONTENT');target.chmod(0o644)
+        with self.assertRaises(b.Blocked):self.app.configure_resolved()
+        self.assertEqual(target.read_bytes(),b'SECRET-FOREIGN-CONTENT')
+        self.assertEqual(self.app.resolved_witness['reason'],'config-file-conflict')
+        self.assertNotIn('SECRET',json.dumps(self.app.resolved_witness))
+        target.chmod(0o600)
+        with self.assertRaises(b.Blocked):self.app.configure_resolved()
+        self.assertEqual(self.app.resolved_witness['file_mode'],0o600)
+        self.assertEqual(self.app.resolved_witness['reason'],'config-file-mode')
+
+    def test_resolved_unsafe_ancestor_and_symlink_block_before_creation_or_chmod(self):
+        self.app.path('/etc/systemd').chmod(0o777)
+        with self.assertRaises(b.Blocked):self.app.configure_resolved()
+        self.assertFalse(self.app.path('/etc/systemd/resolved.conf.d').exists())
+        self.assertEqual(self.app.path('/etc/systemd').stat().st_mode & 0o777,0o777)
+        self.app.path('/etc/systemd').chmod(0o755)
+        elsewhere=self.root/'foreign';elsewhere.mkdir(mode=0o700)
+        leaf=self.app.path('/etc/systemd/resolved.conf.d');leaf.symlink_to(elsewhere)
+        with self.assertRaises(b.Blocked):self.app.configure_resolved()
+        self.assertTrue(leaf.is_symlink());self.assertEqual(list(elsewhere.iterdir()),[])
+        self.assertEqual(elsewhere.stat().st_mode & 0o777,0o700)
+
+    def test_resolved_stock_label_mismatch_blocks_before_restart(self):
+        self.stock_resolved();original=self.app.run
+        def run(*args,**kwargs):
+            if args[:2]==('/usr/bin/stat','--format=%C'):
+                return 'system_u:object_r:wrong_t:s0\n'*2
+            return original(*args,**kwargs)
+        self.app.run=run
+        with self.assertRaises(b.Blocked):self.prepare()
+        self.assertEqual(self.app.resolved_witness['reason'],'config-label-mismatch')
+        self.assertFalse(any(args[:2]==('/usr/bin/systemctl','restart') for args in self.fake.calls))
+        labels=[args for args in self.fake.calls if args[0]=='/usr/sbin/restorecon']
+        self.assertTrue(labels);self.assertTrue(all('-R' not in args and '-RF' not in args for args in labels))
+
+    def test_resolved_live_typed_property_mismatch_and_python_listener_reason(self):
+        self.stock_resolved();original=self.app.run
+        for raw in ('', '{"type":"s","data":"yes"}\n'*2,
+                    '{"type":"s","data":"no","data":"yes"}\n'*2,
+                    '{"type":"b","data":false}\n'*2, 'SECRET'*100):
+            def run(*args,**kwargs):
+                if args[0]=='/usr/bin/busctl':return raw
+                return original(*args,**kwargs)
+            self.app.run=run
+            with self.assertRaises(b.Blocked):self.prepare()
+            self.assertEqual(self.app.resolved_witness['reason'], 'runtime-discovery-enabled' if '"yes"' in raw and '"data":"no",' not in raw else 'runtime-properties-malformed')
+            self.assertNotIn('SECRET',json.dumps(self.app.resolved_witness))
 
     def test_resolved_discovery_impostor_service_and_process_mismatches_are_rejected(self):
         self.stock_resolved()
@@ -199,6 +286,10 @@ class BootstrapTests(unittest.TestCase):
             self.prepare()
         self.assertFalse(self.app.path(b.STATE + '/prepared').exists())
         self.assertFalse(any(Path(args[0]).name == 'useradd' for args in self.fake.calls))
+        witness=json.loads(self.app.text(b.STATE+'/resolved-discovery.json'))
+        self.assertTrue(witness['stock_labels_match'])
+        self.assertEqual(witness['status'],'blocked')
+        self.assertEqual(witness['reason'],'resolved-identity-rejected')
         self.fake.fail = None
         old = self.app.run
         def run(*args, **kwargs):

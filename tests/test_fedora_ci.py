@@ -29,6 +29,23 @@ class FedoraCITests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name)
 
+    def test_resolved_witness_projection_is_bounded_closed_and_target_aware(self):
+        expected=fixture_inputs();state=self.root/'state';state.mkdir()
+        witness={'version':1,'status':'blocked','reason':'discovery-listener-remains',
+                 'bootstrap_sha256':'a'*64,'source_sha':expected['source_sha'],
+                 'context_sha256':expected['context_sha256'],'directory_mode':0o755,'file_mode':0o644,
+                 'owner_and_type_verified':True,'stock_labels_match':True,'runtime_discovery_disabled':True}
+        path=state/'resolved-discovery.json';path.write_text(json.dumps(witness))
+        observed=guest.public_diagnostics(state,expected)['resolved_discovery']
+        self.assertEqual(observed['reason'],'discovery-listener-remains')
+        self.assertEqual(observed['directory_mode'],0o755)
+        for key,value in (('reason','SECRET-UNRECOGNIZED'),('source_sha','d'*40),
+                          ('directory_mode',True),('stock_labels_match','SECRET')):
+            wrong=dict(witness);wrong[key]=value;path.write_text(json.dumps(wrong))
+            observed=guest.public_diagnostics(state,expected)['resolved_discovery']
+            self.assertEqual(observed,{'status':'unavailable'})
+            self.assertNotIn('SECRET',json.dumps(observed))
+
     def test_actual_official_checksum_signature_and_tamper_rejection(self):
         inputs = ROOT / 'tests/data/fedora44'
         result = ci.verify_checksum(inputs / 'fedora.gpg', inputs / 'CHECKSUM', self.root / 'good')

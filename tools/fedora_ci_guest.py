@@ -1010,6 +1010,24 @@ def public_diagnostics(state_root, expected):
                                         'source_verification': state.get('source_verification', {'outcome': 'unavailable'})}
     except (OSError, ValueError, KeyError):
         selected['prepare_progress'] = {'step': 'unavailable', 'source_verification': {'outcome': 'unavailable'}}
+    try:
+        witness = read_json(state_root / 'resolved-discovery.json', 8192)
+        reasons = {'none','config-directory-mode','config-owner-or-type','config-file-mode','config-file-conflict','config-label-mismatch',
+                   'merged-config-conflict','runtime-discovery-enabled','runtime-properties-unavailable','runtime-properties-malformed','discovery-listener-remains',
+                   'retained-listener-missing','resolved-identity-rejected'}
+        require(witness.get('version') == 1 and witness.get('status') in ('pass','blocked') and witness.get('reason') in reasons,
+                'Invalid discovery witness')
+        require(witness.get('context_sha256') in (None, expected['context_sha256'])
+                and witness.get('source_sha') in (None, expected['source_sha'])
+                and re.fullmatch('[0-9a-f]{64}', witness.get('bootstrap_sha256','')), 'Discovery target mismatch')
+        for key in ('directory_mode','file_mode'):
+            require(witness.get(key) is None or type(witness[key]) is int and 0 <= witness[key] <= 0o7777, 'Invalid discovery mode')
+        for key in ('owner_and_type_verified','stock_labels_match','runtime_discovery_disabled'):
+            require(type(witness.get(key)) is bool, 'Invalid discovery observation')
+        selected['resolved_discovery'] = {key:witness[key] for key in ('status','reason','directory_mode','file_mode',
+                    'owner_and_type_verified','stock_labels_match','runtime_discovery_disabled','bootstrap_sha256','source_sha','context_sha256')}
+    except (OSError, ValueError, KeyError, TypeError):
+        selected['resolved_discovery'] = {'status':'unavailable'}
     return selected
 
 

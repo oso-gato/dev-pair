@@ -443,3 +443,19 @@ now implements an owned constructor with genuine upstream init/entry. It is not
 called automatically by prepare and has no real Fedora/OCI acceptance yet.
 Stock unsafe Distrobox creation remains blocked; authenticated agent, model,
 nested placement and complete first-bootstrap acceptance remain pending.
+
+Preparation creates only the declared public resolved drop-in directory with
+mode0755 through the descriptor-safe helper, after checking existing protected
+`/etc/systemd` ancestry. The provisioner's umask0077 remains unchanged. Existing
+unproven0700 directories, symlinks, wrong owners and conflicting files are
+preserved and blocked; there is no blind migration chmod. Both fixed paths get
+stock restorecon labels with exact matchpathcon comparison and protected
+inode/content recheck. After the verified restart, two bounded typed resolve1
+properties must both be `no`; listener and retained SSH/DNS checks still apply.
+
+`resolved-discovery.json` retains only closed failure reasons, numeric fixed-path
+modes, protection/label/runtime observation booleans and source/context hashes.
+The existing guest public diagnostics expose this bounded witness even when all
+subprocesses passed but a Python listener gate rejected. No config bodies,
+journals, environment, arbitrary exceptions or password data are exported.
+Local mode/fixture results do not establish native Fedora label/daemon acceptance.

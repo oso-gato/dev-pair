@@ -931,39 +931,148 @@ class Bootstrap:
             result.add((columns[0], columns[4]))
         return result
 
+    def resolved_ancestry(self):
+        # Validate every existing public ancestor before directory() can create
+        # or chmod its leaf. directory() alone checks only its final component.
+        wanted = 0 if self.root == Path('/') else os.getuid()
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for part in (None, 'etc', 'systemd'):
+                if part is not None:
+                    child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    os.close(fd); fd = child
+                info = os.fstat(fd)
+                if info.st_uid != wanted or info.st_mode & 0o022 or (part is not None and not info.st_mode & 0o001):
+                    raise Blocked('unprotected resolved configuration ancestry')
+        finally:
+            os.close(fd)
+
+    def resolved_file_state(self, directory, target):
+        wanted = 0 if self.root == Path('/') else os.getuid()
+        info = self.path(directory).lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != wanted or stat.S_IMODE(info.st_mode) != 0o755:
+            raise Blocked('resolved directory protection changed')
+        fd = os.open(self.path(target), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            item = os.fstat(fd)
+            if (not stat.S_ISREG(item.st_mode) or item.st_uid != wanted or item.st_nlink != 1
+                    or stat.S_IMODE(item.st_mode) != 0o644 or item.st_size > 64
+                    or os.read(fd, 65) != b'[Resolve]\nLLMNR=no\nMulticastDNS=no\n'):
+                raise Blocked('resolved managed file protection/content changed')
+        finally:
+            os.close(fd)
+        return {'directory_mode': stat.S_IMODE(info.st_mode), 'file_mode': stat.S_IMODE(item.st_mode),
+                'owner_and_type_verified': True,
+                'identity': [(value.st_dev,value.st_ino,value.st_mode,value.st_uid,value.st_gid,value.st_nlink,value.st_size)
+                             for value in (info,item)]}
+
     def configure_resolved(self):
-        before = self.listener_endpoints(self.run('/usr/bin/ss', '-H', '-lntup'))
-        pid = self.resolved_service()
-        self.atomic('/etc/systemd/resolved.conf.d/90-dev-pair-discovery.conf',
-                    '[Resolve]\nLLMNR=no\nMulticastDNS=no\n', mode=0o644)
-        merged = self.run('/usr/bin/systemd-analyze', 'cat-config', 'systemd/resolved.conf')
-        section, values = '', {}
-        for raw in merged.splitlines():
-            line = raw.strip()
-            if line.startswith('[') and line.endswith(']'):
-                section = line[1:-1]
-            elif section == 'Resolve' and '=' in line and not line.startswith(('#', ';')):
-                key, value = line.split('=', 1)
-                values[key.strip()] = value.strip()
-        if any(values.get(key) != 'no' for key in ('LLMNR', 'MulticastDNS')):
-            raise Blocked('effective resolved discovery configuration conflicts')
-        if pid is not None:
-            self.run('/usr/bin/systemctl', 'restart', 'systemd-resolved.service')
-            self.resolved_service()
-        after = self.listener_endpoints(self.run('/usr/bin/ss', '-H', '-lntup'))
-        if any(address.rpartition(':')[2] in ('5353', '5355') for proto, address in after if proto in ('tcp', 'udp')):
-            raise Blocked('discovery listener remains after persistent resolved configuration')
-        def retained(endpoint):
-            proto, address = endpoint
-            host, _, port = address.rpartition(':')
-            if proto == 'tcp' and port == '22':
-                return True
-            try:
-                return port == '53' and ipaddress.ip_address(host.strip('[]').split('%')[0]).is_loopback
-            except ValueError:
-                return False
-        if not {value for value in before if retained(value)}.issubset(after):
-            raise Blocked('SSH or loopback DNS listener disappeared after resolved configuration')
+        witness = {'version': 1, 'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                   'directory_mode': None, 'file_mode': None, 'owner_and_type_verified': False,
+                   'stock_labels_match': False, 'runtime_discovery_disabled': False,
+                   'status': 'blocked', 'reason': 'resolved-identity-rejected'}
+        desired = json.loads(self.text(STATE + '/desired.json', '{}'))
+        target = json.loads(self.text(STATE + '/initialize.json', '{}')).get('target', {})
+        witness['context_sha256'] = desired.get('gptbox_context_sha256')
+        witness['source_sha'] = target.get('source_sha')
+        self.resolved_witness = witness
+        def save_witness():
+            if self.state.is_dir():
+                path = STATE + '/resolved-discovery.json'
+                self.atomic(path, json.dumps(witness, sort_keys=True) + '\n', expected=self.text(path) or None)
+        reason = 'resolved-identity-rejected'
+        try:
+            before = self.listener_endpoints(self.run('/usr/bin/ss', '-H', '-lntup'))
+            pid = self.resolved_service()
+            reason = 'config-owner-or-type'
+            self.resolved_ancestry()
+            directory = '/etc/systemd/resolved.conf.d'
+            target = directory + '/90-dev-pair-discovery.conf'
+            reason = 'config-directory-mode'
+            if self.path(directory).exists() or self.path(directory).is_symlink():
+                info = self.path(directory).lstat()
+                witness['directory_mode'] = stat.S_IMODE(info.st_mode)
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != (0 if self.root == Path('/') else os.getuid()):
+                    reason = 'config-owner-or-type'
+                    raise Blocked('resolved configuration directory ownership/type conflict')
+            self.directory(directory, mode=0o755)
+            reason = 'config-file-conflict'
+            if self.path(target).exists() or self.path(target).is_symlink():
+                info = self.path(target).lstat()
+                witness['file_mode'] = stat.S_IMODE(info.st_mode)
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != (0 if self.root == Path('/') else os.getuid()) or info.st_nlink != 1:
+                    reason = 'config-owner-or-type'
+                    raise Blocked('resolved configuration file ownership/type conflict')
+                if stat.S_IMODE(info.st_mode) != 0o644:
+                    reason = 'config-file-mode'
+                    raise Blocked('resolved configuration file mode conflict')
+            self.atomic(target, '[Resolve]\nLLMNR=no\nMulticastDNS=no\n', mode=0o644)
+            initial = self.resolved_file_state(directory, target)
+            witness.update({key:initial[key] for key in ('directory_mode','file_mode','owner_and_type_verified')})
+            reason = 'config-label-mismatch'
+            self.run('/usr/sbin/restorecon', '-F', str(self.path(directory)), str(self.path(target)))
+            expected = self.run('/usr/sbin/matchpathcon', '-n', directory, target).splitlines()
+            actual = self.run('/usr/bin/stat', '--format=%C', str(self.path(directory)), str(self.path(target))).splitlines()
+            if len(expected) != 2 or actual != expected or any(len(value)>200 or not re.fullmatch(r'[A-Za-z0-9_]+:[A-Za-z0-9_]+:[A-Za-z0-9_]+:s[0-9]+(?::[A-Za-z0-9.,-]+)?', value) for value in expected):
+                raise Blocked('resolved configuration stock label mismatch')
+            witness['stock_labels_match'] = True
+            self.resolved_ancestry()
+            final = self.resolved_file_state(directory, target)
+            if initial != final:
+                raise Blocked('resolved configuration identity changed during labeling')
+            reason = 'merged-config-conflict'
+            merged = self.run('/usr/bin/systemd-analyze', 'cat-config', 'systemd/resolved.conf')
+            section, values = '', {}
+            for raw in merged.splitlines():
+                line = raw.strip()
+                if line.startswith('[') and line.endswith(']'):
+                    section = line[1:-1]
+                elif section == 'Resolve' and '=' in line and not line.startswith(('#', ';')):
+                    key, value = line.split('=', 1)
+                    values[key.strip()] = value.strip()
+            if any(values.get(key) != 'no' for key in ('LLMNR', 'MulticastDNS')):
+                raise Blocked('effective resolved discovery configuration conflicts')
+            witness['reason'] = 'resolved-identity-rejected'
+            save_witness()  # Public staged-state evidence survives a later restart interruption.
+            if pid is not None:
+                reason = 'resolved-identity-rejected'
+                self.run('/usr/bin/systemctl', 'restart', 'systemd-resolved.service')
+                self.resolved_service()
+                reason = 'runtime-properties-unavailable'
+                raw = self.run('/usr/bin/busctl', '--system', '--json=short', '--no-pager', 'get-property',
+                               'org.freedesktop.resolve1', '/org/freedesktop/resolve1', 'org.freedesktop.resolve1.Manager',
+                               'LLMNR', 'MulticastDNS', timeout=5)
+                reason = 'runtime-properties-malformed'
+                if len(raw.encode()) > 512:
+                    raise Blocked('resolved runtime property bound exceeded')
+                try:
+                    values = relay.property_records(raw.encode(), (('LLMNR','s'),('MulticastDNS','s')))
+                except (ValueError, TypeError):
+                    raise Blocked('resolved runtime property contract mismatch') from None
+                reason = 'runtime-discovery-enabled'
+                if values != {'LLMNR':'no','MulticastDNS':'no'}:
+                    raise Blocked('resolved runtime discovery remains enabled')
+                witness['runtime_discovery_disabled'] = True
+            reason = 'discovery-listener-remains'
+            after = self.listener_endpoints(self.run('/usr/bin/ss', '-H', '-lntup'))
+            if any(address.rpartition(':')[2] in ('5353', '5355') for proto, address in after if proto in ('tcp', 'udp')):
+                raise Blocked('discovery listener remains after persistent resolved configuration')
+            def retained(endpoint):
+                proto, address = endpoint
+                host, _, port = address.rpartition(':')
+                if proto == 'tcp' and port == '22':
+                    return True
+                try:
+                    return port == '53' and ipaddress.ip_address(host.strip('[]').split('%')[0]).is_loopback
+                except ValueError:
+                    return False
+            reason = 'retained-listener-missing'
+            if not {value for value in before if retained(value)}.issubset(after):
+                raise Blocked('SSH or loopback DNS listener disappeared after resolved configuration')
+            witness.update(status='pass', reason='none')
+        finally:
+            if witness['status'] != 'pass': witness['reason'] = reason
+            save_witness()
 
     def mosh_listener(self, line):
         match = re.search(r'users:\(\("mosh-server",pid=(\d+),', line)
