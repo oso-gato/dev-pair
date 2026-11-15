@@ -2,50 +2,58 @@
 
 ## Latest continuation checkpoint
 
-This section supersedes historical status statements below; earlier evidence and
-owner decisions remain retained in order.
+Updated November 16, 2026, 05:03 HKT. This section summarizes the current state;
+chronological records below retain earlier evidence and owner decisions.
 
-- Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
-  `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Latest published source: `c5cef5fb8c2d22d35cc1bb8e945cae4aa1244f9b`.
-  Current standards pin: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
-- All 175 tests passed in [CI run7](https://github.com/oso-gato/dev-pair/actions/runs/43737631539).
-  Signed image/tooling/source, real TCG boot, complete dedicated report, Fedora44
-  Enforcing SELinux/systemd/cgroupv2, bootstrap status and cleanup passed.
-  Bootstrap inspection rejected stock resolved LLMNR listeners on wildcard
-  TCP/UDP5355, captured in the diagnostic report. Prepare/assembly never ran.
-- Public-input repair 62eb1f6 and dedicated-report repair 12d73c3 passed fresh
-  Astra High reviews; source is integrated as 921654d and 3a49fd8 respectively.
-  Those source cycles passed their integration checks. Builder `/root/durable_job_build` uses accepted
-  API settings Sol High; reviewers use Astra High. Provider backend attestation
-  and coordinator model metadata remain unavailable.
-- Shared first-bootstrap source and both repairs are integrated through674954e;
-  fresh final review passed exact8c47d238. All189 integration tests pass.
-  Initialize/command/native-unit and resolved convergence behavior remains
-  source/local evidence until its actual Fedora run. The CI integration builder
-  returned immutable candidate `d76adbfcc9d3c39bd4d21b7524658c7e9797eaf1`,
-  integrated byte-identically as `bbd2f47`. All198 builder and coordination
-  tests pass. Fresh Astra High `/root/fedora_prepare_ci_review` returned PASS
-  after198 independent repository tests and17 additional checks, no findings.
-- Run7 identified stock resolved LLMNR5355 as the listener blocker. Reviewed
-  source now recognizes the exact service and persists LLMNR/mDNS disabling.
-  Run9 passed fresh current-source verification and guest baseline again, and
-  identified an SELinux denial on cloud-init-labelled pipes passed to the system
-  bus by systemd-run. Next: use a normal owned native provisioning service with
-  no forwarded cloud-init streams; preserve policy and all container confinement.
-- Fresh API-configured Astra High `/root/nested_devbox_design` completed a
-  read-only design of the required nested DevBox placement against committed
-  source and A11 references. `/workspace/scratch/nested-devbox-design.md`
-  identifies mapping/helper, ancestor seccomp and actual SELinux transitions as
-  measured gates. It proposes an offline real nested engine and reused genuine
-  sealed agent, with separate placement provenance and immutable parent. This
-  scratch handoff cannot substitute for actual nested Fedora/SELinux acceptance.
-  No second implementation builder is active.
-- VPS remains untouched. Root credential reference was available, but this cloud
-  executor has no supported VPS TCP/SSH route. CI is a separate test target.
-  Authenticated jobs, both actual placements, enforced quota/cleanup, tailnet
-  cutover/recovery, session renewal, release enforcement and demonstrator delivery
-  remain incomplete. Main is reported unprotected; no merge/promotion occurred.
+- Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
+  branch `codex/dr10-reconciliation-review`, coordination tree
+  `/workspace/dev-pair`. PR source remains
+  `8bdd19d050dc2fe6012b19052f2af538b77d5705`. Reviewed additional storage
+  source is durably published at supplemental checkpoint
+  `f15c11efbc7213f2d96f9133edf16a530601a05c`; it has no execution trigger.
+  Standards remain `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
+- [Fedora run14](https://github.com/oso-gato/dev-pair/actions/runs/43758085093)
+  passed 254 tests and native service admission, Enforcing Fedora, authenticated
+  inputs, pre/post inspection, complete report framing and outer cleanup.
+  Initialize blocked after 16.811 seconds: status209, with actual init_t write
+  denial on a var_run_t FIFO. No preparation/assembly acceptance. Its single-run
+  scope is closed; there is no active CI run or permission for an unchanged retry.
+- Reviewed offline stock-Codex state and managed-child component is included on
+  the PR. Actual no-network checks passed; independent review verified cleanup
+  failures cannot return success. Authentication, complete tool-path enforcement,
+  Fedora ownership/nesting and session renewal remain separate runtime gates.
+- Storage observation/capacity source `2944ac6`, repaired by `63ed903`, passed
+  fresh Astra High review: 265 tests, independent filesystem and arithmetic checks.
+  Source and tests match the reviewed checkpoint. It provides no hard quota,
+  reservation, deletion or job admission. Unknown Btrfs inode capacity stays
+  unknown. Native hard storage enforcement and safe cleanup remain required.
+- Sole Sol High builder `/root/durable_job_build` is implementing the native
+  relay in `/workspace/dev-pair-native-relay`, separately based on `8bdd19d`.
+  Source design: manager-only standard runtime stream objects, app ownership
+  journal outside that namespace, and immutable same-identity helper creating
+  ordinary anonymous child pipes. Positive bounded completion framing prevents
+  failed startup from masquerading as an accepted payload exit. The pre-freeze
+  suite passed 268 tests; exact candidate and fresh `/root/native_relay_review`
+  verdict are pending. No policy grants, forced contexts or budget increases.
+- Source handoffs are `/workspace/scratch/native-fifo-label-design.md`,
+  `/workspace/scratch/nested-profile-source-research.md` and
+  `/workspace/scratch/storage-admission-design.md`. They are source research,
+  not native acceptance. Installed DNF/script domains, real nested engine/helper
+  mapping and confined child transitions require actual verification.
+- Subagent model/effort choices are accepted API settings: Sol High builder and
+  fresh Astra High review. Backend attestation and coordinator model metadata
+  are unavailable. Each implementation/review/retest slice retains its finite
+  scope and evidence; current relay source slice is 30 minutes before checkpoint.
+- VPS remains untouched; root credential availability was checked without
+  exposing or sending it. This cloud has no verified supported VPS SSH route.
+  Local managed Docker works but lacks the cgroup enforcement needed to replace
+  the bounded Fedora VM runner. No credentials are copied into CI or source.
+- Actual preparation/assembly, both gptbox placements, hard storage/cleanup,
+  authenticated jobs, durable host-test repair, tailnet cutover/recovery,
+  all-session renewal, independent release enforcement and demonstrator delivery
+  remain incomplete. Main branch enforcement is unverified; PR stays draft and
+  unmerged. Continue source repair and real validation within the existing scope;
+  the owner does not coordinate workers or review code.
 
 ## Recorded baseline and authority
 
