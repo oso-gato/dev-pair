@@ -19,8 +19,10 @@ Root controls `/run/dev-pair-command-io/records` for ownership journals and
 Only the owned stream subtree and exact nodes receive restorecon. Both
 matchpathcon and observed `security.selinux` must equal the standard
 `system_u:object_r:init_var_run_t:s0`; an unexpected policy/label blocks.
-Version2 journals bind this fixed split layout. Version1 records and any legacy
-app-root stream directory are preserved and block for deliberate reconciliation. Exclusive creation and protected/nonsymlink ancestors reject
+Version3 journals bind stream and exact-unit profile ownership. Version2 records
+retain stream-only cleanup authority and never acquire ownership of a discovered
+mask; unexplained masks block. Version1 records and legacy app-root streams remain
+preserved for deliberate reconciliation. Exclusive creation and protected/nonsymlink ancestors reject
 collisions. The root-only ownership record persists before allocation; directory
 and node device/inode/type/owner/mode/link proofs persist before any stdin bytes
 or launch. A failure between creation and proof leaves an unproven object that
@@ -56,7 +58,7 @@ engine helpers stopped.
 Stdout stays raw. Helper stderr uses an8-byte header plus data bodies of4096
 bytes (one final partial allowed), followed by exactly one control frame of
 at most256 bytes including its header. Control binds actual payload status,
-observed UID/domain and helper hash. Parent admission requires complete framing,
+observed UID/domain, helper hash and closed profile-proof version1. Parent admission requires complete framing,
 no duplicate/trailing control, and exact agreement for normal nonnegative exits.
 Signaled payloads are rejected independently of caller allowed statuses. Systemd
 can map clean TERM/INT/HUP/PIPE to0 and other service signals to255; neither
@@ -150,9 +152,73 @@ all native paths and actual failed-start/timeout/secret cleanup. Local relay tes
 execute the real helper pump and completion parser; only Fedora manager/UID/label
 admission is injected. They cannot establish SELinux transition compatibility.
 
-The global Fedora timeout-abort drop-in is a separate native-boundary finding:
-transient properties are applied before systemd parses inherited drop-ins. Merely
-requesting kill-mode properties cannot prove those effective settings. A scoped
-prelaunch override/rejection design and effective runtime evidence are required
-before this transport can claim a finite native stop bound on that configuration.
-This source checkpoint does not resolve that inherited-stop-policy gate.
+## Exact transient profile before any payload
+
+Fedora's global `service.d/10-timeout-abort.conf` is parsed after transient fields;
+CLI kill-mode properties alone cannot establish an effective stop bound. The
+controller exclusively creates only
+`/run/systemd/system/<canonical>.service.d/10-timeout-abort.conf`, an empty root
+0644 regular file in a root0755 exact-unit directory. It never changes a prefix
+or global mask. Both directory and file inode/type/mode/owner/link proofs are
+journaled before input or launch. A standard restorecon labels only these owned
+objects; expected matchpathcon and actual labels must agree. Label queries and
+restorecon are batched with the owned streams/helper to fit the existing budget.
+
+The controller reads the manager's bounded UnitPath and accepts only the declared
+system lookup locations (with the validated conventional `/lib` alias). It scans
+applicable exact, dash-prefix and type-global drop-ins/dependencies in every
+location. Unknown configuration, fragments/aliases, symlinks, unsafe ownership,
+extra dependency entries, bounds, unreadability or observed changes block before
+StartTransientUnit. Only the stock vendor basename and the exact owned empty
+mask may exist. Vendor contents are never copied or treated as accepted policy;
+the exact mask must shadow the complete file. This is a conservative scanner,
+not a general systemd configuration interpreter.
+
+A fresh NOT_FOUND/inactive observation is required; loaded inactive units are not
+reused. After exclusive mask-directory creation, its lookup parent's identity
+must be unchanged and its mtime must strictly advance at microsecond resolution.
+A second NOT_FOUND observation refreshes v259's lookup map. UnitPath and applicable
+snapshots are checked again immediately before launch. No per-command reload,
+parent-directory touch, sleep or retry loop is used. This cache sequence is
+source-backed and remains an actual Fedora runtime gate.
+
+The fixed launch profile sets start/stop failure modes to kill, SendSIGKILL=yes,
+FinalKillSignal=SIGKILL, control-group killing, Restart=no, system.slice and the
+existing2GiB/512tasks/100%CPU limits. Root commands retain5s stop grace, maintenance
+contexts10s, image observations1s; observation retains its10s operation and256KiB
+capture path. Start plus active timers remain inside the prior absolute command,
+phase and stricter caller lifetime. No container/SELinux/privilege change occurs.
+
+Before reading stdin or starting the payload, the immutable relay uses a fixed
+read-only selected-property systemctl query with clean environment, measured
+4096-byte anonymous pipes,8KiB combined capture and at most5s inside the original
+deadline. It verifies its MainPID, canonical ID, actual four kernel UID/GID values,
+system.slice cgroup membership, fragment, exact DropInPaths, effective timers,
+kill/resource settings, stdio paths and absence of isolation overrides. It never
+queries Environment, ExecStart/hooks or credential values. The query's pipes and
+buffer replace the later payload pipes/queues rather than coexist with them.
+No policy permission is granted if the read fails under the maintenance UID.
+
+A rejected effective gate emits only a terminal F diagnostic frame (at most256
+bytes): fixed stage/reason, whitelisted property and safe category/numeric value.
+It cannot satisfy successful completion, including accepted numeric exits0/1/4.
+Success still requires the distinct complete C frame with profile-proof version1.
+Prelaunch failures retain fixed admission stage/reason and elapsed time. Probe
+metadata preserves these fields alongside its existing bounded output; no raw
+UnitPath tree, arbitrary exception, journal, environment or credential is emitted.
+
+After exact owned-unit inactivity/not-found, a bounded cgroup.events observation
+must establish populated=0 or absence before cleanup. A durable cleanup intent
+then permits only previously proven missing nodes. The mask is unlinked using a
+verified directory FD and rechecked file identity, and only its exact empty
+owned directory is removed. The journal survives until profile and streams are
+both removed. Unproven creation gaps, foreign replacements, extra entries and
+uncertain native state remain blocked. SIGKILL tests exercise intent, unproven
+mask and proven-mask recovery; no finally-after-crash cleanup is claimed.
+
+Local tests use real filesystem/FIFO/process effects with explicitly injected
+root/manager boundaries. Effective-property mutation tests include all three
+families, MainPID/UID/GID/cgroup, deadlines, resources, stdio and unknown overrides;
+failed gates have no payload/input effects. Native cache discovery, installed
+SELinux policy, stock D-Bus reads, effective timers/cgroups and engine/package
+transitions still require a separately reviewed actual Fedora run.

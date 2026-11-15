@@ -911,10 +911,16 @@ def native_image_capture(source, argv, timeout):
     spec.loader.exec_module(module)
     try:
         run = module.Commands()
+        metadata = {}
+        run.metadata_diagnostic = metadata.update
         with run.phase(timeout, 'dev-pair-ci-observe', native=False):
             return run._call(*argv, timeout=timeout, maximum=262144).encode()
     except module.Blocked:
-        raise ValueError('Native image observation blocked; inspect exact owned transport and security diagnostics') from None
+        detail = 'stage=' + str(metadata.get('admission_stage', 'unavailable')) + ' reason=' + str(metadata.get('admission_reason', 'unavailable'))
+        failure = metadata.get('relay_failure')
+        if failure is not None:
+            detail += ' property=' + failure['property'] + ' observed=' + str(failure['observed'])
+        raise ValueError('Native image observation blocked; ' + detail) from None
 
 
 def image_evidence(expected, projection, state_root, source, end):
@@ -974,7 +980,7 @@ def public_diagnostics(state_root, expected):
             failures = record.get('failures', [])
             selected[name] = {'available_failures': len(failures), 'retained_failures': min(2, len(failures)), 'records': []}
             selected[name]['recent_metadata'] = [{key: item.get(key) for key in
-                    ('operation_id', 'step', 'status', 'outcome', 'accepted_exit', 'allowed_exit_statuses', 'native')}
+                    ('operation_id', 'step', 'status', 'outcome', 'accepted_exit', 'allowed_exit_statuses', 'native', 'elapsed_seconds', 'admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status')}
                     for item in record.get('recent', [])[-4:]]
             for recent, item in zip(selected[name]['recent_metadata'], record.get('recent', [])[-4:]):
                 if item.get('operation') in ('selinux-enforcement', 'resolved-service-identity'):
@@ -988,7 +994,8 @@ def public_diagnostics(state_root, expected):
                          'step': safe_text(item.get('step', 'unavailable'), 80),
                          'outcome': safe_text(item.get('outcome', 'legacy-unknown'), 40),
                          'accepted_exit': item.get('accepted_exit'), 'allowed_exit_statuses': item.get('allowed_exit_statuses'),
-                         'native': item.get('native', {'availability': 'not-recorded'})}
+                         'native': item.get('native', {'availability': 'not-recorded'}),
+                         **{key: item[key] for key in ('elapsed_seconds', 'admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status') if key in item}}
                 for stream in ('stdout', 'stderr'):
                     text = item.get(stream + '_tail', '')
                     entry[stream + '_tail'] = safe_text(text, 1500)

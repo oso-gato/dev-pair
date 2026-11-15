@@ -14,12 +14,28 @@ def install(test, root):
     root.mkdir(mode=0o700)
     (root / 'records').mkdir(mode=0o700)
     (root / 'streams').mkdir(mode=0o700)
+    (root / 'system').mkdir(mode=0o755)
+    def protected(path):
+        path = Path(path)
+        for part in (path, *path.parents):
+            if not part.is_relative_to(root):
+                break
+            if not part.exists() and not part.is_symlink():
+                return None
+            info = part.lstat()
+            if not __import__('stat').S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022:
+                raise ValueError('unsafe synthetic lookup directory')
+        return path
     helper = Path(native_io.__file__).with_name('native_relay.py')
     digest = hashlib.sha256(helper.read_bytes()).hexdigest()
     boundaries = (
         patch.object(native_io, 'ROOT', root),
         patch.object(native_io, 'guard_root', return_value=None),
         patch.object(native_io, 'STREAM_ROOT', root / 'streams'),
+        patch.object(native_io, 'PROFILE_ROOT', root / 'system'),
+        patch.object(native_io, 'protected_directory', side_effect=protected),
+        patch.object(native_io, 'lookup_paths', return_value=(str(root / 'system'),)),
+        patch.object(bootstrap, 'lookup_paths', return_value=(str(root / 'system'),)),
         patch.object(bootstrap, 'stage_relay', return_value=(helper, digest)),
         patch.object(native_io, 'stage_relay', return_value=(helper, digest)),
         patch.object(bootstrap, 'expected_uid', return_value=os.getuid()),
@@ -43,7 +59,7 @@ def launch_payload(original, args, kwargs, payload):
         helper = args[index + 1]
         relay_args = args[index + 2:]
         code = ('import sys;sys.path.insert(0,sys.argv[1]);import native_relay as r;'
-                'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:None;'
+                'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:None;r.verify_profile=lambda args:None;'
                 'sys.argv=["relay",*sys.argv[2:]];raise SystemExit(r.main())')
         payload = [sys.executable, '-c', code, str(Path(helper).parent), *relay_args]
     opened = []

@@ -188,7 +188,7 @@ class NativeIOTests(unittest.TestCase):
     def test_real_controller_sigkill_retains_proven_input_until_exact_restart_recovery(self):
         # The subprocess uses only this synthetic ownership fixture; no native
         # unit or credential is started. Persistence and SIGKILL are real.
-        code = 'import sys,os,time;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import native_io as io;io.ROOT=Path(sys.argv[2]);io.STREAM_ROOT=io.ROOT/"streams";io.guard_root=lambda:None;t=io.NativeTransport(sys.argv[3]);t.setup(b"synthetic-secret");print("ready",flush=True);time.sleep(10)'
+        code = 'import sys,os,time;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import native_io as io;io.ROOT=Path(sys.argv[2]);io.STREAM_ROOT=io.ROOT/"streams";io.PROFILE_ROOT=io.ROOT/"system";io.protected_directory=lambda p:Path(p);io.guard_root=lambda:None;t=io.NativeTransport(sys.argv[3]);t.setup(b"synthetic-secret");print("ready",flush=True);time.sleep(10)'
         original = subprocess.Popen
         process = original([sys.executable, '-c', code, str(Path(io.__file__).parent), str(self.root), UNIT],
                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
@@ -272,7 +272,7 @@ class NativeIOTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Invalid transport ownership record'):
             io.NativeTransport.recover(UNIT)
         self.assertTrue(transport.path.exists())
-        state['version'] = 2; transport.record.write_text(json.dumps(state))
+        state['version'] = 3; transport.record.write_text(json.dumps(state))
         io.NativeTransport.recover(UNIT)
 
     def test_exact_expected_and_observed_standard_labels_both_required(self):
@@ -281,7 +281,7 @@ class NativeIOTests(unittest.TestCase):
         transport = io.NativeTransport(UNIT); transport.setup(None)
         class Control:
             def _call(self, *args, **kwargs):
-                return io.EXPECTED_CONTEXT + '\n'
+                return (io.EXPECTED_CONTEXT + '\n') * (len(args) - 2)
         with patch.object(io.os, 'getxattr', return_value=(io.EXPECTED_CONTEXT + '\0').encode()):
             VERIFY_LABELS(transport, Control(), 1)
         with patch.object(io.os, 'getxattr', return_value=b'system_u:object_r:var_run_t:s0\0'):

@@ -27,13 +27,14 @@ import urllib.request
 import uuid
 
 try:
-    from native_io import NativeTransport, pipe_pair, expected_uid, stage_relay, verify_labels, relay
+    from native_io import NativeTransport, pipe_pair, expected_uid, stage_relay, verify_labels, relay, lookup_paths, configuration_snapshot, verify_inactive_cgroup
 except ModuleNotFoundError:
     _io_spec = importlib.util.spec_from_file_location('dev_pair_native_io', Path(__file__).with_name('native_io.py'))
     _io_module = importlib.util.module_from_spec(_io_spec)
     _io_spec.loader.exec_module(_io_module)
     NativeTransport, pipe_pair = _io_module.NativeTransport, _io_module.pipe_pair
     expected_uid, stage_relay, verify_labels, relay = _io_module.expected_uid, _io_module.stage_relay, _io_module.verify_labels, _io_module.relay
+    lookup_paths, configuration_snapshot, verify_inactive_cgroup = _io_module.lookup_paths, _io_module.configuration_snapshot, _io_module.verify_inactive_cgroup
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
@@ -202,6 +203,7 @@ class Commands:
 
     @staticmethod
     def native_diagnostic(args):
+        args = Commands.native_prefix_args(args)
         unit = next((value[7:] for value in args if value.startswith('--unit=')), None)
         description = next((value[14:] for value in args if value.startswith('--description=')), None)
         if not unit or description != 'dev-pair-owned-' + unit:
@@ -224,6 +226,13 @@ class Commands:
             return {'availability': 'observation-failed', 'unit': unit}
 
     @staticmethod
+    def native_prefix_args(args):
+        if args and args[0] == '/usr/bin/systemd-run':
+            end = next((index for index, value in enumerate(args[1:], 1) if not value.startswith('-')), len(args))
+            return args[:end]
+        return args
+
+    @staticmethod
     def native_args(args, timeout):
         rewritten = []
         for value in args:
@@ -240,6 +249,7 @@ class Commands:
 
     @staticmethod
     def reconcile_native(args, env):
+        args = Commands.native_prefix_args(args)
         # Only fixed controller-created descriptions permit exact-unit cleanup.
         if args and args[0] != '/usr/bin/systemd-run' and not all(value.startswith(('--unit=', '--description=', '--uid=')) for value in args):
             return
@@ -271,6 +281,7 @@ class Commands:
         elif values.get('ActiveState') not in ('inactive', 'failed'):
             raise Blocked('native unit observation failed; no duplicate effects')
         try:
+            verify_inactive_cgroup(unit)
             NativeTransport.recover(unit)
         except ValueError:
             raise Blocked('native transport cleanup unresolved; exact ownership records preserved') from None
@@ -312,7 +323,8 @@ class Commands:
         # Existing user transient units are already native executors. Tighten
         # their ceilings rather than putting them outside the phase budget.
         if args and args[0] == '/usr/bin/systemd-run':
-            args = self.native_args(args, timeout)
+            prefix = self.native_prefix_args(args)
+            args = (*self.native_args(prefix, timeout), *args[len(prefix):])
         elif self.native_prefix:
             if timeout < .001:
                 raise Blocked('native execution budget exhausted')
@@ -338,16 +350,27 @@ class Commands:
         relay_sha = None
         relay_uid = None
         relay_verified = False
+        admission_stage = 'not-native'
+        admission_reason = 'none'
         launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
             if args and args[0] == '/usr/bin/systemd-run':
-                unit = next((value[7:] for value in args if value.startswith('--unit=')), None)
-                if next((value[14:] for value in args if value.startswith('--description=')), None) != 'dev-pair-owned-' + str(unit):
+                boundary = next((index for index, value in enumerate(args[1:], 1) if not value.startswith('-')), len(args))
+                seen_options = set()
+                for value in args[1:boundary]:
+                    option = value.split('=', 2)[0] if not value.startswith('--property=') else '--property=' + value.split('=', 2)[1]
+                    if option in seen_options:
+                        raise Blocked('duplicate native launch option rejected')
+                    seen_options.add(option)
+                    if not value.startswith(('--unit=', '--description=', '--uid=', '--property=', '--service-type=')) and value not in ('--quiet', '--wait', '--collect', '--pipe', '--pty'):
+                        raise Blocked('unknown native launch option rejected')
+                unit = next((value[7:] for value in args[:boundary] if value.startswith('--unit=')), None)
+                if next((value[14:] for value in args[:boundary] if value.startswith('--description=')), None) != 'dev-pair-owned-' + str(unit):
                     raise Blocked('native stream ownership unverified')
-                if any(value.startswith(('--property=StandardInput=', '--property=StandardOutput=', '--property=StandardError=', '--property=TimeoutStartSec=')) for value in args):
+                if any(value.startswith(('--property=StandardInput=', '--property=StandardOutput=', '--property=StandardError=', '--property=TimeoutStartSec=')) for value in args[:boundary]):
                     raise Blocked('caller native transport/startup properties are forbidden')
-                native_limits = [float(value.rsplit('=', 1)[1].removesuffix('s')) for value in args
+                native_limits = [float(value.rsplit('=', 1)[1].removesuffix('s')) for value in args[:boundary]
                                  if value.startswith('--property=RuntimeMaxSec=')]
                 if not native_limits:
                     raise Blocked('finite native lifetime is required')
@@ -357,28 +380,51 @@ class Commands:
                 # unit is a collision, never this attempt's cleanup authority.
                 control = Commands()
                 control._cleanup_deadline = command_end
+                admission_stage = 'manager-paths'
+                paths = lookup_paths(control, self.limit_timeout(timeout))
+                admission_stage = 'configuration-scan'
+                snapshot = configuration_snapshot(paths, unit, end=command_end)
                 observed = control._call('/usr/bin/systemctl', 'show', '--property=LoadState', '--property=ActiveState',
                                          '--property=Description', '--property=User', unit, ok=(0, 1, 4),
                                          timeout=self.limit_timeout(timeout), maximum=4096)
                 values = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
-                expected_user = next((value[6:] for value in args if value.startswith('--uid=')), '')
-                if values.get('LoadState') != 'not-found' and (values.get('Description') != 'dev-pair-owned-' + unit or
-                        values.get('User', '') not in ((expected_user,) if expected_user else ('', 'root')) or
-                        values.get('ActiveState') not in ('inactive', 'failed')):
-                    raise Blocked('native unit collision; existing resources preserved')
+                expected_user = next((value[6:] for value in args[:boundary] if value.startswith('--uid=')), '')
+                if values.get('LoadState') != 'not-found' or values.get('ActiveState') != 'inactive':
+                    raise Blocked('native unit is not pristine; existing resources preserved')
                 # Initializer inventory contains only wrappers constructed here.
                 # Explicit dp-maint context units have their own UID-bound retry
                 # path and protected transport journal, not root-unit authority.
+                admission_stage = 'mask-stage'
                 transport.setup(stdin_data, self.native_register if register_root_wrapper else None)
                 relay_path, relay_sha = stage_relay()
-                relay_uid = expected_uid(args)
+                relay_uid = expected_uid(args[:boundary])
                 decoder = relay.Decoder(maximum)
-                # No wrapped/native command and no forwarded FDs are involved in labeling.
+                admission_stage = 'labels'
+                # One fixed operation labels only owned objects, not shared parents.
                 control._call('/usr/sbin/restorecon', '-F', str(transport.path.parent), str(transport.record.parent),
                               str(transport.record), str(transport.path), *(str(transport.path / name) for name in transport.state['nodes']),
+                              str(relay_path.parent), str(relay_path), str(transport.profile_path), str(transport.profile_path / '10-timeout-abort.conf'),
                               timeout=self.limit_timeout(timeout), maximum=8192)
-                control._call('/usr/sbin/restorecon', '-F', str(relay_path.parent), str(relay_path), timeout=self.limit_timeout(timeout), maximum=4096)
                 verify_labels(transport, control, self.limit_timeout(timeout))
+                admission_stage = 'cache-recheck'
+                after = configuration_snapshot(paths, unit, owned_mask=True, end=command_end)
+                root = str(transport.profile_path.parent)
+                def normalized(rows):
+                    return tuple((row[:5] + (None,)) if row[0] == root else row for row in rows
+                                 if row[0] not in (str(transport.profile_path), str(transport.profile_path / '10-timeout-abort.conf')))
+                if normalized(snapshot) != normalized(after):
+                    raise Blocked('configuration changed during mask staging')
+                before_root = next(row for row in snapshot if row[0] == root)
+                after_root = next(row for row in after if row[0] == root)
+                if before_root[5] != transport.state['profile']['before_us'] or after_root[5] != transport.state['profile']['after_us']:
+                    raise Blocked('lookup parent changed before mask staging')
+                observed = control._call('/usr/bin/systemctl', 'show', '--property=LoadState', '--property=ActiveState',
+                                         transport.canonical, ok=(0, 1, 4), timeout=self.limit_timeout(timeout), maximum=4096)
+                state = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
+                if state.get('LoadState') != 'not-found' or state.get('ActiveState') != 'inactive' or paths != lookup_paths(control, self.limit_timeout(timeout)):
+                    raise Blocked('native cache refresh is not pristine')
+                if after != configuration_snapshot(paths, unit, owned_mask=True, end=command_end):
+                    raise Blocked('configuration changed before native launch')
                 transport.verify()
                 transport.open_streams()
                 remaining = min(self.limit_timeout(timeout), command_end - time.monotonic())
@@ -388,13 +434,40 @@ class Commands:
                 # Reserve its independent finite timer inside the existing wall
                 # budget, rather than relying on the later active-runtime timer.
                 startup = min(5.0, remaining / 2)
-                args = self.native_args(args, remaining - startup)
+                args = (*self.native_args(args[:boundary], remaining - startup), *args[boundary:])
                 payload = next((index for index, value in enumerate(args[1:], 1) if not value.startswith('-')), len(args))
-                prefix = tuple(value for value in args[:payload] if value not in ('--pipe', '--pty'))
+                family = 'root' if transport.canonical.startswith('dev-pair-initialize-') else ('maintenance' if transport.canonical.startswith('dev-pair-gptbox-') else 'observation')
+                fixed = {'TimeoutStopSec': {'root': '5', 'maintenance': '10', 'observation': '1'}[family],
+                         'KillMode': 'control-group', 'MemoryMax': '2G', 'TasksMax': '512', 'CPUQuota': '100%'}
+                prefix = []
+                for value in args[:payload]:
+                    if value in ('--pipe', '--pty'):
+                        continue
+                    if value.startswith('--property='):
+                        key, actual = value.removeprefix('--property=').split('=', 1)
+                        if key in fixed:
+                            if actual != fixed[key]:
+                                raise Blocked('native fixed resource profile mismatch')
+                            continue
+                        if key != 'RuntimeMaxSec':
+                            raise Blocked('unknown native property rejected')
+                    prefix.append(value)
+                if not any(value == '--service-type=exec' for value in prefix):
+                    if any(value.startswith('--service-type=') for value in prefix):
+                        raise Blocked('native service type mismatch')
+                    prefix.append('--service-type=exec')
+                runtime = next(value.rsplit('=', 1)[1].removesuffix('s') for value in prefix if value.startswith('--property=RuntimeMaxSec='))
+                start_us = int(startup * 1000) * 1000
+                runtime_us = round(float(runtime) * 1000000)
                 helper_end = command_end - min(.1, remaining / 2)
+                admission_stage = 'effective-profile'
                 args = (prefix[0], *transport.properties(), '--property=LimitCORE=0',
-                        '--property=TimeoutStartSec=%.3fs' % (int(startup * 1000) / 1000), *prefix[1:],
+                        '--property=TimeoutStartSec=%.3fs' % (start_us / 1000000),
+                        '--property=TimeoutStartFailureMode=kill', '--property=TimeoutStopFailureMode=kill',
+                        '--property=SendSIGKILL=yes', '--property=FinalKillSignal=SIGKILL', '--property=Restart=no', '--property=Slice=system.slice',
+                        *('--property=' + key + '=' + value for key, value in fixed.items()), *prefix[1:],
                         '/usr/bin/python3', '-I', str(relay_path), '--uid', str(relay_uid), '--stdin', str(int(stdin_data is not None)),
+                        '--unit', transport.canonical, '--key', unit, '--profile', family, '--start-us', str(start_us), '--runtime-us', str(runtime_us),
                         '--maximum', str(maximum), '--deadline', str(helper_end), '--helper', relay_sha, '--', *args[payload:])
                 for _ in range(2):
                     launcher_pairs.append(pipe_pair())
@@ -462,10 +535,18 @@ class Commands:
             result = bytes(buffers['stdout']).decode() if input_text is None else ''
             completed = True
             return result
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            known = {'Lookup directory timestamp did not advance': 'lookup-mtime-not-advanced', 'Unknown manager UnitPath': 'manager-paths-rejected',
+                     'Unknown applicable drop-in': 'unknown-drop-in', 'Applicable dependency effects are forbidden': 'dependency-effects',
+                     'Existing native fragment or alias': 'fragment-or-alias', 'Native manager stream context mismatch': 'label-mismatch',
+                     'Runtime configuration parent unavailable': 'runtime-path-unavailable'}
+            admission_reason = known.get(error.args[0] if error.args and type(error.args[0]) is str else '', 'admission-rejected')
+            if isinstance(error, OSError):
+                admission_reason = {2: 'runtime-path-unavailable', 13: 'permission-denied', 17: 'owned-name-collision'}.get(error.errno, 'io-unavailable')
             status = 'failed-or-timed-out'
             raise Blocked('command failed or timed out; output withheld') from None
         except BaseException:
+            admission_reason = 'blocked-or-interrupted'
             if status == 'running' or (not completed and status in ok):
                 status = 'interrupted-or-failed'
             raise
@@ -504,12 +585,18 @@ class Commands:
             if probe and self.diagnostic:
                 actual = process.returncode if process is not None else None
                 self.diagnostic(buffers, actual if actual is not None and actual not in ok else status)
-            elif self.diagnostic or self.metadata_diagnostic:
+            if (not probe and self.diagnostic) or self.metadata_diagnostic:
                 record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
+                if unit is not None:
+                    record['admission_stage'] = admission_stage
+                    record['admission_outcome'] = 'accepted' if completed else 'blocked'
+                    record['admission_reason'] = 'none' if completed else admission_reason
                 if decoder is not None:
+                    if decoder.failure is not None:
+                        record['relay_failure'] = dict(decoder.failure)
                     record['relay_verified'] = relay_verified
                     record['native_exit_status'] = process.returncode if process is not None else None
                     if decoder.control is not None:
@@ -522,7 +609,7 @@ class Commands:
                     record.update(output_bytes=total, capture_limit_bytes=maximum,
                                   **{name + '_tail': bytes(data[-8192:]).decode(errors='replace') for name, data in buffers.items()},
                                   **{name + '_truncated': len(data) > 8192 for name, data in buffers.items()})
-                if self.diagnostic:
+                if self.diagnostic and not probe:
                     self.diagnostic(record)
             if cleanup_error is not None:
                 raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime') from None

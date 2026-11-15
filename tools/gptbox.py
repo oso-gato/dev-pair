@@ -122,6 +122,7 @@ class Gptbox(Bootstrap):
 
     def execute(self, *args, timeout=120, ok=(0,)):
         prefix = [value.replace('RuntimeMaxSec=1800', 'RuntimeMaxSec=' + str(timeout)) for value in self.executor]
+        previous_metadata = self.run.metadata_diagnostic if isinstance(self.run, Commands) else None
         if isinstance(self.run, ProbeCommands):
             def diagnostic(buffers, status):
                 path = self.target + '/diagnostics.json'
@@ -134,12 +135,25 @@ class Gptbox(Bootstrap):
                 if status != 0:
                     prior['failures'] = (prior['failures'] + [entry])[-4:]
                 self.record('diagnostics', prior)
+            def metadata(record):
+                path = self.target + '/diagnostics.json'
+                history = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
+                selected = {key: record[key] for key in ('admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status', 'accepted_exit', 'elapsed_seconds') if key in record}
+                latest = history['recent'][-1] if history['recent'] else None
+                failed = bool(latest is not None and history['failures'] and history['failures'][-1] == latest)
+                if latest is not None:
+                    latest.update(selected)
+                if failed:
+                    history['failures'][-1].update(selected)
+                self.record('diagnostics', history)
             self.run.diagnostic = diagnostic
+            self.run.metadata_diagnostic = metadata
         try:
             return self.run(*prefix, *args, timeout=timeout + 30, ok=ok)
         finally:
             if isinstance(self.run, ProbeCommands):
                 self.run.diagnostic = None
+                self.run.metadata_diagnostic = previous_metadata
 
     def engine(self, *args, timeout=120, ok=(0,)):
         return self.execute(self.wrapper, *args, timeout=timeout, ok=ok)

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 
 ROOT = Path('/run/dev-pair-command-io')
 STREAM_ROOT = Path('/run/systemd/dev-pair-stdio')
@@ -20,12 +21,20 @@ _spec.loader.exec_module(relay)
 
 CAPACITY = 4096
 INPUT_LIMIT = 16384
-UNIT = r'dev-pair-(?:initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}|gptbox-[0-9a-f]{64}(?:\.service)?|ci-observe-[0-9a-f]{16}\.service)'
+UNIT = r'dev-pair-(?:initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}|gptbox-[0-9a-f]{64}|ci-observe-[0-9a-f]{16})(?:\.service)?'
 
 
 def require(value, text):
     if not value:
         raise ValueError(text)
+
+
+def exists_strict(path):
+    try:
+        Path(path).lstat()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def identity(path):
@@ -98,11 +107,120 @@ def stage_relay():
 
 
 def verify_labels(transport, control, timeout):
-    for path in (STREAM_ROOT, transport.path, *(transport.path / name for name in transport.state['nodes'])):
-        expected = control._call('/usr/sbin/matchpathcon', '-n', str(path), timeout=timeout, maximum=4096).strip()
+    streams = (STREAM_ROOT, transport.path, *(transport.path / name for name in transport.state['nodes']))
+    paths = (*streams, transport.profile_path, transport.profile_path / MASK)
+    contexts = control._call('/usr/sbin/matchpathcon', '-n', *(str(path) for path in paths), timeout=timeout, maximum=8192).splitlines()
+    require(len(contexts) == len(paths), 'Native standard context evidence missing')
+    for path, expected in zip(paths, contexts):
         actual = os.getxattr(path, 'security.selinux', follow_symlinks=False).decode().rstrip('\x00\n')
-        require(expected == actual == EXPECTED_CONTEXT, 'Native manager stream context mismatch')
+        require(expected and expected == actual and (path not in streams or actual == EXPECTED_CONTEXT), 'Native manager stream context mismatch')
     transport.verify()
+
+
+PROFILE_ROOT = Path('/run/systemd/system')
+MASK = '10-timeout-abort.conf'
+PROFILE_ID = 'dev-pair-native-v1'
+LOOKUP_PATHS = frozenset('/etc/systemd/system.control /run/systemd/system.control /run/systemd/transient /run/systemd/generator.early /etc/systemd/system /etc/systemd/system.attached /run/systemd/system /run/systemd/system.attached /run/systemd/generator /usr/local/lib/systemd/system /usr/lib/systemd/system /run/systemd/generator.late /lib/systemd/system'.split())
+
+
+def canonical_unit(unit):
+    base = unit.removesuffix('.service')
+    require(re.fullmatch(r'dev-pair-(?:initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}|gptbox-[0-9a-f]{64}|ci-observe-[0-9a-f]{16})', base or ''), 'Invalid canonical native unit')
+    return base + '.service'
+
+
+def protected_directory(path):
+    # Only the distribution's conventional /lib alias is accepted.
+    path = Path(path)
+    if str(path).startswith('/lib/'):
+        require(Path('/lib').is_symlink() and Path('/lib').lstat().st_uid == os.geteuid() and Path('/lib').resolve() == Path('/usr/lib'), 'Unexpected distro alias')
+        path = Path('/usr/lib') / path.relative_to('/lib')
+    missing = False
+    for part in reversed((path, *path.parents)):
+        if missing:
+            break
+        try:
+            info = part.lstat()
+        except FileNotFoundError:
+            missing = True
+            continue
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022, 'Unprotected manager lookup directory')
+    return None if missing else path
+
+
+def lookup_paths(control, timeout):
+    text = control._call('/usr/bin/systemctl', 'show', '--property=UnitPath', timeout=timeout, maximum=8192)
+    require(text.startswith('UnitPath=') and text.count('\n') <= 1, 'Manager UnitPath unavailable')
+    values = text.strip().removeprefix('UnitPath=').split(' ')
+    require(1 <= len(values) <= 24 and len(set(values)) == len(values) and all(value in LOOKUP_PATHS for value in values), 'Unknown manager UnitPath')
+    require(str(PROFILE_ROOT) in values, 'Runtime lookup path unavailable')
+    return tuple(values)
+
+
+def configuration_snapshot(paths, unit, owned_mask=False, end=None):
+    unit = canonical_unit(unit)
+    stem = unit.removesuffix('.service')
+    names = [unit] + [stem[:match.end()] + '.service' for match in re.finditer('-', stem)] + ['service']
+    snapshot = []
+    count, size = 0, 0
+    for value in paths:
+        require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
+        path = protected_directory(value)
+        if path is None:
+            snapshot.append((value, None))
+            continue
+        info = path.lstat()
+        snapshot.append((str(path), info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_mtime_ns // 1000))
+        require(not exists_strict(path / unit), 'Existing native fragment or alias')
+        for name in names:
+            for suffix in ('.d', '.wants', '.requires', '.upholds'):
+                require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
+                directory = path / (name + suffix)
+                if not exists_strict(directory):
+                    continue
+                require(protected_directory(directory) is not None, 'Unknown applicable configuration')
+                before = directory.lstat()
+                entries = []
+                for entry in directory.iterdir():
+                    require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
+                    count += 1; size += len(entry.name.encode())
+                    require(count <= 256 and size <= 16384, 'Applicable configuration inventory bound exceeded')
+                    entries.append(entry)
+                snapshot.append((str(directory), before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_mtime_ns // 1000))
+                require(suffix == '.d' or not entries, 'Applicable dependency effects are forbidden')
+                for entry in entries:
+                    info = entry.lstat()
+                    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022 and info.st_nlink == 1 and info.st_size <= 4096,
+                            'Unprotected applicable configuration')
+                    allowed = entry == Path('/usr/lib/systemd/system/service.d') / MASK or (owned_mask and entry == PROFILE_ROOT / (unit + '.d') / MASK)
+                    require(allowed, 'Unknown applicable drop-in')
+                    if owned_mask and entry == PROFILE_ROOT / (unit + '.d') / MASK:
+                        require(info.st_size == 0 and stat.S_IMODE(info.st_mode) == 0o644, 'Controlled mask changed')
+                    snapshot.append((str(entry), info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns))
+                require(directory.lstat() == before, 'Concurrent configuration mutation')
+    return tuple(snapshot)
+
+
+CGROUP_ROOT = Path('/sys/fs/cgroup/system.slice')
+
+
+def verify_inactive_cgroup(unit):
+    path = CGROUP_ROOT / canonical_unit(unit)
+    if not exists_strict(path):
+        return
+    require(protected_directory(path) is not None, 'Owned cgroup path unverified')
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = os.open('cgroup.events', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, 'rb') as source:
+            require(stat.S_ISREG(os.fstat(source.fileno()).st_mode), 'Owned cgroup events type invalid')
+            data = source.read(1025)
+        require(len(data) <= 1024, 'Owned cgroup evidence bound exceeded')
+        rows = [line.split() for line in data.decode('ascii').splitlines()]
+        require(rows and all(len(row) == 2 and row[0] in ('populated', 'frozen') and row[1] in ('0', '1') for row in rows) and
+                len({row[0] for row in rows}) == len(rows) and dict(rows).get('populated') == '0', 'Owned cgroup remains populated or unavailable')
+    finally:
+        os.close(directory)
 
 
 def pipe_pair():
@@ -122,9 +240,12 @@ class NativeTransport:
     def __init__(self, unit):
         require(re.fullmatch(UNIT, unit or ''), 'Unrecognized owned native transport unit')
         self.unit = unit
+        self.canonical = canonical_unit(unit)
+        self.profile_path = PROFILE_ROOT / (self.canonical + '.d')
         self.path = STREAM_ROOT / unit
         self.record = ROOT / 'records' / (unit + '.json')
-        self.state = {'version': 2, 'unit': unit, 'directory': None, 'nodes': {}, 'cleanup_started': False}
+        self.state = {'version': 3, 'unit': unit, 'directory': None, 'nodes': {}, 'cleanup_started': False,
+                      'profile': {'id': PROFILE_ID, 'directory': None, 'file': None, 'parent': None, 'before_us': None, 'after_us': None}}
         self.readers, self.keepers = {}, []
         self.created_intent = False
 
@@ -153,10 +274,12 @@ class NativeTransport:
         require(stdin_data is None or len(stdin_data) <= INPUT_LIMIT, 'Native stdin byte budget exceeded')
         guard_root()
         require(not (ROOT / self.unit).exists() and not (ROOT / self.unit).is_symlink(), 'Legacy transport retained for explicit reconciliation')
+        require(not exists_strict(self.record.with_suffix('.next')), 'Unproven journal update retained')
         self.save(first=True)  # Intent precedes every allocation and any secret.
         self.created_intent = True
         if register is not None:
             register(self.unit)  # Exclusive intent won; collisions never enter another owner list.
+        self.create_profile()
         self.path.mkdir(mode=0o700)
         self.state['directory'] = identity(self.path)
         self.save()
@@ -187,7 +310,87 @@ class NativeTransport:
             os.close(directory)
         self.verify()
 
+    def create_profile(self):
+        require(protected_directory(PROFILE_ROOT) is not None, 'Runtime configuration parent unavailable')
+        before = PROFILE_ROOT.lstat()
+        self.profile_path.mkdir(mode=0o755)  # Never adopt a preexisting directory.
+        descriptor = os.open(self.profile_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(descriptor)
+            current = self.profile_path.lstat()
+            require((info.st_dev, info.st_ino) == (current.st_dev, current.st_ino), 'Profile creation descriptor mismatch')
+            os.fchmod(descriptor, 0o755)
+        finally:
+            os.close(descriptor)
+        profile = self.state['profile']
+        profile['directory'] = identity(self.profile_path)
+        profile['parent'] = {key: value for key, value in identity(PROFILE_ROOT).items() if key != 'links'}
+        profile['before_us'] = before.st_mtime_ns // 1000
+        profile['after_us'] = PROFILE_ROOT.lstat().st_mtime_ns // 1000
+        self.save()
+        require(profile['after_us'] > profile['before_us'], 'Lookup directory timestamp did not advance')
+        directory = os.open(self.profile_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open(MASK, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o644, dir_fd=directory)
+            try:
+                os.fchmod(fd, 0o644)
+                profile['file'] = identity(self.profile_path / MASK)
+                require((os.fstat(fd).st_dev, os.fstat(fd).st_ino) == (profile['file']['device'], profile['file']['inode']), 'Mask descriptor mismatch')
+                self.save()
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def verify_profile(self):
+        if self.state['version'] == 2:
+            require(not exists_strict(self.profile_path), 'Unowned profile mask retained')
+            return
+        profile = self.state['profile']
+        present = exists_strict(self.profile_path)
+        if profile['directory'] is None:
+            require(not present and profile['file'] is None, 'Unproven profile directory retained')
+            return
+        require({key: value for key, value in identity(PROFILE_ROOT).items() if key != 'links'} == profile['parent'], 'Profile parent changed')
+        if not present and self.state['cleanup_started']:
+            return
+        require(present and identity(self.profile_path) == profile['directory'] and
+                stat.S_ISDIR(profile['directory']['mode']) and stat.S_IMODE(profile['directory']['mode']) == 0o755, 'Profile directory changed')
+        entries = {value.name for value in self.profile_path.iterdir()}
+        require(entries <= {MASK}, 'Foreign profile entry preserved')
+        if profile['file'] is None:
+            require(not entries, 'Unproven profile mask retained')
+            return
+        if not entries and self.state['cleanup_started']:
+            return
+        info = (self.profile_path / MASK).lstat()
+        require(identity(self.profile_path / MASK) == profile['file'] and stat.S_ISREG(info.st_mode) and
+                stat.S_IMODE(info.st_mode) == 0o644 and info.st_nlink == 1 and info.st_size == 0, 'Profile mask changed')
+
+    def cleanup_profile(self):
+        self.verify_profile()
+        if self.state['version'] == 2 or not exists_strict(self.profile_path):
+            return
+        directory = os.open(self.profile_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(directory)
+            expected = self.state['profile']['directory']
+            require((info.st_dev, info.st_ino) == (expected['device'], expected['inode']), 'Profile cleanup descriptor mismatch')
+            if exists_strict(self.profile_path / MASK):
+                current = os.stat(MASK, dir_fd=directory, follow_symlinks=False)
+                expected = self.state['profile']['file']
+                require(expected is not None and (current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_nlink, current.st_size) ==
+                        (expected['device'], expected['inode'], expected['mode'], expected['uid'], expected['links'], 0), 'Profile cleanup file changed')
+                os.unlink(MASK, dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        self.profile_path.rmdir()
+
     def verify(self):
+        self.verify_profile()
         if self.state['cleanup_started'] and not self.path.exists() and not self.path.is_symlink():
             return
         require(self.state['directory'] is not None and identity(self.path) == self.state['directory'] and
@@ -235,7 +438,9 @@ class NativeTransport:
         transport = cls(unit)
         guard_root()
         require(not (ROOT / unit).exists() and not (ROOT / unit).is_symlink(), 'Legacy transport retained for explicit reconciliation')
+        require(not exists_strict(transport.record.with_suffix('.next')), 'Unproven journal update retained')
         if not transport.record.exists() and not transport.record.is_symlink():
+            require(not exists_strict(transport.profile_path), 'Unregistered profile retained')
             require(not transport.path.exists() and not transport.path.is_symlink(), 'Unregistered transport retained')
             return
         recorded = identity(transport.record)
@@ -253,25 +458,41 @@ class NativeTransport:
                 return value
             state = json.loads(source.read(4097), object_pairs_hook=unique)
         require(identity(transport.record) == recorded, 'Transport ownership record replaced')
-        require(type(state) is dict and set(state) == {'version', 'unit', 'directory', 'nodes', 'cleanup_started'} and type(state['version']) is int and state['version'] == 2 and state['unit'] == unit and
+        base = {'version', 'unit', 'directory', 'nodes', 'cleanup_started'}
+        require(type(state) is dict and type(state.get('version')) is int and state['version'] in (2, 3) and
+                set(state) == (base if state['version'] == 2 else base | {'profile'}) and state['unit'] == unit and
                 type(state['cleanup_started']) is bool and type(state['nodes']) is dict and set(state['nodes']) <= {'stdout', 'stderr', 'stdin'} and
                 (state['directory'] is not None or state['nodes'] == {}), 'Invalid transport ownership record')
+        if state['version'] == 3:
+            profile = state['profile']
+            require(type(profile) is dict and set(profile) == {'id', 'directory', 'file', 'parent', 'before_us', 'after_us'} and profile['id'] == PROFILE_ID and
+                    all(profile[key] is None or type(profile[key]) is int and profile[key] >= 0 for key in ('before_us', 'after_us')) and
+                    ((profile['directory'] is None and all(profile[key] is None for key in ('file', 'parent', 'before_us', 'after_us'))) or
+                     (profile['directory'] is not None and profile['parent'] is not None and type(profile['before_us']) is int and type(profile['after_us']) is int)), 'Invalid profile journal')
+            for key in ('directory', 'file', 'parent'):
+                entry = profile[key]
+                require(entry is None or type(entry) is dict and set(entry) == ({'device', 'inode', 'mode', 'uid'} if key == 'parent' else {'device', 'inode', 'mode', 'uid', 'links'}) and
+                        all(type(value) is int and value >= 0 for value in entry.values()), 'Invalid profile identity')
         for entry in ([state['directory']] if state['directory'] is not None else []) + list(state['nodes'].values()):
             require(type(entry) is dict and set(entry) == {'device', 'inode', 'mode', 'uid', 'links'} and all(type(value) is int and value >= 0 for value in entry.values()), 'Invalid persisted transport identity')
         transport.state, transport.record_identity = state, recorded
+        transport.verify_profile()
+        if state['directory'] is None:
+            require(not exists_strict(transport.path), 'Unproven transport directory retained')
+        else:
+            transport.verify()
+        if not state['cleanup_started']:
+            state['cleanup_started'] = True
+            transport.save()
+            recorded = transport.record_identity
         if state['directory'] is None:
             require(not transport.path.exists() and not transport.path.is_symlink(), 'Unproven transport directory retained')
         else:
             transport.verify()
-            # Durable cleanup intent permits resuming only missing previously
-            # proven objects; foreign replacements still fail verification.
-            if not state['cleanup_started']:
-                state['cleanup_started'] = True
-                transport.save()
-                recorded = transport.record_identity
             if transport.path.exists():
                 for name in state['nodes']:
                     (transport.path / name).unlink(missing_ok=True)
                 transport.path.rmdir()
+        transport.cleanup_profile()
         require(identity(transport.record) == recorded, 'Transport ownership record changed')
         transport.record.unlink()
