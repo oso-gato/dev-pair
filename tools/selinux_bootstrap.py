@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
+import subprocess
 import stat
 import sys
 
-from bootstrap import Bootstrap, Blocked, Commands
+from bootstrap import Bootstrap, Blocked
 
 STATE = '/var/lib/dev-pair/selinux-bootstrap'
 INSTALL = '/usr/local/libexec/dev-pair-selinux'
@@ -24,6 +26,8 @@ StartLimitBurst=2
 ExecStart=
 ExecStart=/usr/bin/python3 {HELPER} _relabel --apply
 TimeoutStartSec=35min
+TimeoutStopSec=10s
+KillMode=control-group
 Restart=on-failure
 RestartSec=10s
 '''
@@ -35,6 +39,8 @@ ConditionPathExists={STATE}/intent.json
 Type=oneshot
 ExecStart=/usr/bin/python3 {HELPER} _finalize --apply
 TimeoutStartSec=5min
+TimeoutStopSec=10s
+KillMode=control-group
 [Install]
 WantedBy=multi-user.target
 '''
@@ -60,9 +66,37 @@ def config_mode(content, wanted=None):
                   lambda match: match[1] + wanted + match[2], content, flags=re.M)
 
 
+class Commands:
+    """Bound direct children and their process groups, including manual invocations."""
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
+        environment = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+        try:
+            process = subprocess.Popen(args, env=environment, text=True, stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        except OSError:
+            raise Blocked('SELinux command could not start; output withheld') from None
+        try:
+            output, _ = process.communicate(input=input_text, timeout=timeout)
+        except BaseException as error:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                raise Blocked('SELinux command group cleanup did not complete; recovery required') from None
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise Blocked('SELinux command timed out; process group terminated and child reaped') from None
+            raise
+        if process.returncode not in ok:
+            raise Blocked('SELinux command failed; output withheld')
+        return output
+
+
 class SELinuxBootstrap(Bootstrap):
     def __init__(self, root=Path('/'), run=None):
-        super().__init__(root, run)
+        super().__init__(root, run or Commands())
         self.state = self.path(STATE)
 
     def state_json(self, name, default=None):
@@ -140,7 +174,7 @@ class SELinuxBootstrap(Bootstrap):
             owner = self.run('/usr/bin/rpm', '-q', '--qf', '%{NAME}\n', '-f', unit).strip()
             if owner != 'policycoreutils':
                 raise Blocked('unexpected autorelabel unit package provenance')
-            native = '/usr/sbin/setfiles'
+            native = '/usr/bin/setfiles'
             program = self.protected(native)
             if not program.is_file() or not program.stat().st_mode & 0o111:
                 raise Blocked('native setfiles executable is missing')
@@ -312,6 +346,8 @@ class SELinuxBootstrap(Bootstrap):
                     raise Blocked('configured relabel exclusion covers required system code; preserving it for recovery')
                 excluded.append(path)
         excluded = sorted(set(excluded + readonly))
+        if any(contains(exclude, point) for exclude in excluded for point in writable):
+            raise Blocked('an excluded ancestor would hide an admitted writable filesystem from native relabel')
         if len(excluded) > 128:
             raise Blocked('too many relabel exclusions for initial bootstrap')
         contexts = self.protected('/etc/selinux/targeted/contexts/files/file_contexts')
@@ -326,7 +362,7 @@ class SELinuxBootstrap(Bootstrap):
             self.run('/usr/sbin/genhomedircon', timeout=120)
         plan = self.relabel_plan()
         self.record('relabel-plan', plan)
-        arguments = ['/usr/sbin/setfiles', '-E', '-C', '-F', '-I', '-T', '1']
+        arguments = ['/usr/bin/setfiles', '-E', '-C', '-F', '-I', '-T', '1']
         for path in plan['excluded']:
             arguments.extend(('-e', str(self.path(path))))
         arguments.append(str(self.path('/etc/selinux/targeted/contexts/files/file_contexts')))

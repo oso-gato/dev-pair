@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -56,13 +57,13 @@ class SELinuxTests(unittest.TestCase):
                             ('/proc/self/mounts', 'root / ext4 rw,seclabel 0 0\nproc /proc proc rw,nosuid 0 0\n'),
                             ('/etc/selinux/targeted/contexts/files/file_contexts', 'fixture file contexts'),
                             ('/usr/lib/systemd/system/selinux-autorelabel.service', 'fixture-vendor-unit'),
-                            ('/usr/sbin/setfiles', 'fixture-native-binary-not-runtime-evidence'), ('/proc/cmdline', 'quiet root=UUID=fixture\n'),
+                            ('/usr/bin/setfiles', 'fixture-native-binary-not-runtime-evidence'), ('/proc/cmdline', 'quiet root=UUID=fixture\n'),
                             ('/proc/sys/kernel/random/boot_id', BOOT0), ('/etc/selinux/config', CONFIG),
                             ('/etc/selinux/targeted/policy/policy.33', 'fixture-policy-not-runtime-evidence')]:
             path = self.app.path(name)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(value)
-        self.app.path('/usr/sbin/setfiles').chmod(0o755)
+        self.app.path('/usr/bin/setfiles').chmod(0o755)
         self.patch = patch.object(s.os, 'geteuid', return_value=0)
         self.patch.start()
         self.addCleanup(self.patch.stop)
@@ -102,7 +103,7 @@ class SELinuxTests(unittest.TestCase):
         self.app.relabel()
         self.assertFalse(self.app.path('/.autorelabel').exists())
         self.assertEqual(self.app.state_json('relabel-done')['boot_id'], BOOT1)
-        self.assertTrue(any(call[0][:7] == ('/usr/sbin/setfiles', '-E', '-C', '-F', '-I', '-T', '1') and call[1] == {'timeout': 1800} for call in self.run.calls))
+        self.assertTrue(any(call[0][:7] == ('/usr/bin/setfiles', '-E', '-C', '-F', '-I', '-T', '1') and call[1] == {'timeout': 1800} for call in self.run.calls))
         with self.assertRaises(s.Blocked):
             self.app.finalize()
         self.boot(BOOT2)
@@ -113,7 +114,7 @@ class SELinuxTests(unittest.TestCase):
         self.assertTrue(self.app.state_json('complete'))
         self.assertFalse(self.app.path(s.OVERRIDE).exists())
         self.app.converge(apply=True)
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 1)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/bin/setfiles']), 1)
         self.assertEqual(len([call for call in self.run.calls if call[0] == ('/usr/bin/systemctl', 'reboot')]), 2)
 
     def test_no_reboot_without_explicit_authorization_and_later_resume_is_automatic(self):
@@ -171,7 +172,7 @@ class SELinuxTests(unittest.TestCase):
     def test_failed_relabel_never_records_completion_or_enforces_and_retries_are_bounded(self):
         self.start(reboot=True)
         self.boot(BOOT1)
-        self.run.fail = lambda args: args[0] == '/usr/sbin/setfiles'
+        self.run.fail = lambda args: args[0] == '/usr/bin/setfiles'
         for _ in range(2):
             with self.assertRaises(s.Blocked):
                 self.app.relabel()
@@ -181,12 +182,12 @@ class SELinuxTests(unittest.TestCase):
         self.assertFalse(self.app.state_json('relabel-done'))
         self.assertTrue(self.app.path('/.autorelabel').exists())
         self.assertFalse(any(call[0][0] == '/usr/sbin/setenforce' for call in self.run.calls))
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 2)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/bin/setfiles']), 2)
 
     def test_successful_retry_after_first_relabel_failure_and_marker_remove_interruption(self):
         self.start()
         self.boot(BOOT1)
-        self.run.fail = lambda args: args[0] == '/usr/sbin/setfiles'
+        self.run.fail = lambda args: args[0] == '/usr/bin/setfiles'
         with self.assertRaises(s.Blocked):
             self.app.relabel()
         self.run.fail = None
@@ -198,7 +199,7 @@ class SELinuxTests(unittest.TestCase):
         self.app.remove_marker = original
         self.app.relabel()
         self.assertFalse(self.app.path('/.autorelabel').exists())
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 2)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/bin/setfiles']), 2)
 
     def test_enforcement_command_readback_and_persistent_write_failures_never_disarm(self):
         self.relabel_done()
@@ -320,7 +321,7 @@ class SELinuxTests(unittest.TestCase):
         self.boot(BOOT1)
         original = self.run
         def native_failure(*args, **kwargs):
-            if args[0] == '/usr/sbin/setfiles':
+            if args[0] == '/usr/bin/setfiles':
                 # Real harmless nonzero child stands in for the native relabel syscall boundary.
                 return s.Commands()(sys.executable, '-c', 'import sys; sys.exit(23)', timeout=5)
             return original(*args, **kwargs)
@@ -349,7 +350,7 @@ class SELinuxTests(unittest.TestCase):
         plan = self.app.state_json('relabel-plan')
         self.assertEqual(plan['mounts'], ['/', '/boot', '/mnt/data set'])
         self.assertEqual(plan['excluded'], ['/mnt/keep', '/mnt/read-only'])
-        command = next(call[0] for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles')
+        command = next(call[0] for call in self.run.calls if call[0][0] == '/usr/bin/setfiles')
         self.assertIn(str(self.app.path('/mnt/data set')), command)
         self.assertEqual(command.count('-e'), 2)
         self.assertNotIn('-m', command)
@@ -415,7 +416,7 @@ class SELinuxTests(unittest.TestCase):
         self.app.finalize()
         self.assertTrue(self.app.state_json('complete'))
         self.assertEqual(len(self.app.state_json('boots')['ids']), 4)
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 1)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/bin/setfiles']), 1)
 
     def test_marker_recovery_allowance_is_durable_before_unlink_and_cannot_reset(self):
         self.relabel_done()
@@ -474,6 +475,50 @@ class SELinuxTests(unittest.TestCase):
             path.unlink()
         self.assertFalse(self.app.state_json('complete'))
         self.assertFalse(any(call[0][0] == '/usr/sbin/setenforce' for call in self.run.calls))
+
+    def test_fedora44_merged_sbin_uses_canonical_native_package_path(self):
+        alias = self.app.path('/usr/sbin')
+        self.assertFalse(alias.exists())
+        alias.symlink_to('bin')
+        self.start()
+        self.boot(BOOT1)
+        self.app.relabel()
+        self.assertTrue(self.app.state_json('relabel-done'))
+        self.assertTrue(any(call[0][0] == '/usr/bin/setfiles' for call in self.run.calls))
+        self.assertFalse(any('/usr/sbin/setfiles' in call[0] for call in self.run.calls))
+
+    def test_readonly_or_configured_ancestor_cannot_hide_writable_child(self):
+        self.app.path('/proc/self/mounts').write_text(
+            'root / ext4 rw,seclabel 0 0\n'
+            'parent /opt ext4 ro,seclabel 0 0\n'
+            'child /opt/service ext4 rw,seclabel 0 0\n')
+        with self.assertRaisesRegex(s.Blocked, 'excluded ancestor'):
+            self.app.relabel_plan()
+        self.app.path('/opt').mkdir()
+        self.app.path('/proc/self/mounts').write_text(
+            'root / ext4 rw,seclabel 0 0\nchild /opt/service ext4 rw,seclabel 0 0\n')
+        self.app.path('/etc/selinux/fixfiles_exclude_dirs').write_text('/opt\n')
+        with self.assertRaisesRegex(s.Blocked, 'excluded ancestor'):
+            self.app.relabel_plan()
+
+    def test_timeout_kills_forked_descendant_before_later_write(self):
+        marker = self.root / 'orphan-write'
+        handshake = self.root / 'fork-handshake'
+        code = ('import os,sys,time\nfrom pathlib import Path\n'
+                'child=os.fork()\n'
+                'if child == 0:\n'
+                '    Path(sys.argv[2]).write_text("forked")\n'
+                '    time.sleep(0.6)\n'
+                '    Path(sys.argv[1]).write_text("orphan survived")\n'
+                '    os._exit(0)\n'
+                'time.sleep(60)\n')
+        with self.assertRaisesRegex(s.Blocked, 'process group terminated'):
+            s.Commands()(sys.executable, '-c', code, str(marker), str(handshake), timeout=0.25)
+        self.assertTrue(handshake.exists())
+        time.sleep(0.7)
+        self.assertFalse(marker.exists())
+        self.assertIn('KillMode=control-group', s.DROPIN)
+        self.assertIn('TimeoutStopSec=10s', s.UNIT)
 
     def test_reboot_failures_stay_pending_and_budget_is_bounded(self):
         self.run.fail = lambda args: args == ('/usr/bin/systemctl', 'reboot')

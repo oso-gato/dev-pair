@@ -66,11 +66,16 @@ The transition follows these boundaries:
   the root and system trees, and honors configured exclusions outside those
   required trees. Read-only mounts are explicitly excluded. Conflicting critical
   exclusions, ambiguous overmounts or unsupported paths block without rewriting
-  their configuration. The verified native `setfiles` executable retains its
+  their configuration. Excluded/read-only ancestors of an admitted writable mount block because native
+  exclusions would also skip its descendants. The RPM-verified native
+  `/usr/bin/setfiles` path supports Fedora 44's merged `/usr/sbin -> bin` layout
+  and retains its
   physical/XDEV traversal and non-seclabel mount exclusion; no naive recursive
   host walk or `-m` override is substituted.
 - The fixed native command uses `setfiles -E -C -F -I -T 1`, the targeted file
-  contexts and admitted mount/exclusion arguments, with a thirty-minute limit.
+  contexts and admitted mount/exclusion arguments, with a thirty-minute limit. Command timeouts terminate the entire subprocess
+  group and reap the direct child; both owned units also stop their full control
+  groups with a ten-second stop limit.
   Its actual nonzero/error-count exit blocks completion. A protected plan records
   mounts, exclusions, persistent filesystem UUID/FSROOT/type identities and the
   context inputs, including local/home-directory/substitution and compiled
