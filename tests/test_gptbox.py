@@ -160,6 +160,7 @@ class GptboxTests(unittest.TestCase):
         recipe = (self.engine.build / 'Containerfile').read_text()
         shell = next(line[4:] for line in recipe.splitlines() if line.startswith('RUN '))
         subprocess.run(['/bin/sh', '-n'], input=shell, text=True, check=True, capture_output=True)
+        self.assertIn('/usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec', shell)
         self.assertIn('glibc-all-langpacks', shell)
         self.assertIn('dnf-plugins-core', shell)
         self.assertIn('test -d /usr/share/i18n/charmaps', shell)

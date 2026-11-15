@@ -4,12 +4,12 @@ import os
 import resource
 import sys
 
-OVERLAY_MAX_BYTES = 8 * 1024 ** 3
+OVERLAY_MAX_BYTES = 16 * 1024 ** 3
 
 
 def limit_output_bytes(limit=OVERLAY_MAX_BYTES):
     if type(limit) is not int or not 1 <= limit <= OVERLAY_MAX_BYTES:
-        raise ValueError('file limit cannot exceed the declared 8GiB overlay ceiling')
+        raise ValueError('file limit cannot exceed the declared 16GiB overlay ceiling')
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
 

@@ -19,6 +19,10 @@ import fedora_ci as ci
 import fedora_ci_guest as guest
 
 
+def fixture_inputs():
+    return {**{key: 'c' * length for key, length in guest.INPUT_LENGTHS.items()}, 'source_sha': 'a' * 40, 'payload_bytes': 123}
+
+
 class FedoraCITests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -105,24 +109,25 @@ class FedoraCITests(unittest.TestCase):
         self.assertEqual(observed, {'status': 'unavailable', 'detail': 'diagnostic deadline exceeded'})
 
     def serial_result(self):
-        return {'version': 1, 'source_sha': 'a' * 40, 'guest_sha256': 'b' * 64,
+        return {'version': guest.REPORT_VERSION, 'source_sha': 'a' * 40, 'guest_sha256': 'b' * 64,
+                'inputs': fixture_inputs(), 'initialization': {},
                 'phases': {key: {'status': 'blocked', 'detail': 'synthetic parser test only'} for key in
-                           ('fedora-preflight', 'bootstrap-inspect', 'bootstrap-status', 'bootstrap-prepare', 'maintenance-gptbox')},
+                           guest.GUEST_PHASES},
                 'identity': {}, 'diagnostics': {}}
 
     def test_serial_consumer_requires_one_complete_candidate_bound_result(self):
         report = self.serial_result()
         serial = guest.encode_report(report)
-        self.assertEqual(ci.parse_serial(serial, 'a' * 40, 'b' * 64), report)
-        for malformed in (serial + serial, b'no result', b'console\n' + serial, serial.replace(b'"version": 1', b'"version": true'),
+        self.assertEqual(ci.parse_serial(serial, 'a' * 40, 'b' * 64, fixture_inputs()), report)
+        for malformed in (serial + serial, b'no result', b'console\n' + serial, serial.replace(b'"version": 2', b'"version": true'),
                           serial.replace(b'"source_sha":', b'"version":1,"source_sha":')):
             with self.assertRaises((ci.Blocked, ValueError)):
-                ci.parse_serial(malformed, 'a' * 40, 'b' * 64)
+                ci.parse_serial(malformed, 'a' * 40, 'b' * 64, fixture_inputs())
         with self.assertRaisesRegex(ci.Blocked, 'identity mismatch'):
-            ci.parse_serial(serial, 'c' * 40, 'b' * 64)
+            ci.parse_serial(serial, 'c' * 40, 'b' * 64, fixture_inputs())
         del report['phases']['maintenance-gptbox']
         with self.assertRaisesRegex(ci.Blocked, 'missing guest phases'):
-            ci.parse_serial(guest.encode_report(report), 'a' * 40, 'b' * 64)
+            ci.parse_serial(guest.encode_report(report), 'a' * 40, 'b' * 64, fixture_inputs())
 
     def payload_archive(self, malicious=False):
         payload = self.root / ('payload-bad' if malicious else 'payload')
@@ -165,7 +170,7 @@ class FedoraCITests(unittest.TestCase):
         self.assertNotIn('::error', ci.sanitize(b'::error::untrusted\x1b[31m\x00'))
         self.assertNotIn('\x1b', ci.sanitize(b'bad\x1b[31m'))
         with self.assertRaisesRegex(ci.Blocked, 'invalid payload identity'):
-            ci.seed_data('a' * 39 + '\n', 'b' * 64, 'c' * 64, 'd' * 64)
+            ci.seed_data('a' * 39 + '\n', fixture_inputs(), 'd' * 64)
 
     def test_realistic_runner_temp_uses_short_owned_engine_paths(self):
         old_root = pathlib.Path('/home/runner/work/_temp/dev-pair-fedora-abcdefgh')

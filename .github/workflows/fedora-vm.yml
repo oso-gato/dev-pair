@@ -30,7 +30,7 @@ jobs:
           lfs: false
       - name: Check local code and protocol behavior
         run: python3 -m unittest discover -s tests -q
-      - name: Probe signed Fedora Cloud image
+      - name: Probe signed Fedora bootstrap and maintenance
         env:
           DP_EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
           DP_MERGE_SOURCE: ${{ github.sha }}

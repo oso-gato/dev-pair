@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import selectors
 import signal
 import stat
@@ -436,6 +437,12 @@ class Gptbox(Bootstrap):
                       'rm /tmp/upstream-packages /tmp/resolved-packages; dnf clean all\n'
                       f'COPY --chmod=0555 codex /opt/dev-pair/bin/codex\nCOPY --chmod=0555 distrobox-init /usr/bin/distrobox-init\nCOPY --chmod=0555 runtime.py {RUNTIME}\nCOPY --chmod=0444 inputs.json {BASE}/inputs.json\n'
                       f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA} org.opencontainers.image.revision={revision}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n')
+            lines = recipe.splitlines()
+            # Fixed source-controlled package/locale operation, never submitted
+            # script input. This native inner bound also covers detached RUN
+            # helpers; remaining build/VM budgets can still end sooner.
+            lines[1] = 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec ' + shlex.quote(lines[1][4:])
+            recipe = '\n'.join(lines) + '\n'
             for name, data in {**files, 'inputs.json': json.dumps(inputs, sort_keys=True).encode() + b'\n', 'Containerfile': recipe.encode()}.items():
                 # Binary-safe atomic creation in a protected new build directory.
                 destination = self.path(build) / name

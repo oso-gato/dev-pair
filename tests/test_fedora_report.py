@@ -22,6 +22,10 @@ import fedora_ci as ci
 import fedora_ci_guest as guest
 
 
+def fixture_inputs():
+    return {**{key: 'c' * length for key, length in guest.INPUT_LENGTHS.items()}, 'source_sha': 'a' * 40, 'payload_bytes': 123}
+
+
 class FedoraReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -30,9 +34,10 @@ class FedoraReportTests(unittest.TestCase):
         self.probe = ci.Probe('a' * 40, self.root)
 
     def report(self):
-        return {'version': 1, 'source_sha': 'a' * 40, 'guest_sha256': 'b' * 64,
+        return {'version': guest.REPORT_VERSION, 'source_sha': 'a' * 40, 'guest_sha256': 'b' * 64,
+                'inputs': fixture_inputs(), 'initialization': {},
                 'phases': {name: {'status': 'blocked', 'detail': 'local transport test, no Fedora evidence'} for name in
-                           ('fedora-preflight', 'bootstrap-inspect', 'bootstrap-status', 'bootstrap-prepare', 'maintenance-gptbox')},
+                           guest.GUEST_PHASES},
                 'identity': {}, 'diagnostics': {}}
 
     def writer(self, pipe, data, console=b'', delay=0, held=False, exit_code=0):
@@ -55,7 +60,7 @@ class FedoraReportTests(unittest.TestCase):
                                                 5, 'local FIFO writer', disk_check=False, report_pipe=pipe)
             self.assertEqual(result, frame)
             self.assertIn(b'console\r\n', console)
-            self.assertEqual(ci.parse_serial(result, 'a' * 40, 'b' * 64), self.report())
+            self.assertEqual(ci.parse_serial(result, 'a' * 40, 'b' * 64, fixture_inputs()), self.report())
         with self.assertRaises(OSError):
             os.fstat(reader)
         self.assertFalse(pathlib.Path(str(pipe.base) + '.in').exists())
@@ -75,9 +80,9 @@ class FedoraReportTests(unittest.TestCase):
                 _, result = self.probe.bounded(self.writer(pipe, data), 5, 'invalid local writer',
                                                disk_check=False, report_pipe=pipe)
             with self.assertRaises((ci.Blocked, ValueError)):
-                ci.parse_serial(result, 'a' * 40, 'b' * 64)
+                ci.parse_serial(result, 'a' * 40, 'b' * 64, fixture_inputs())
         with self.assertRaisesRegex(ci.Blocked, 'identity mismatch'):
-            ci.parse_serial(frame, 'c' * 40, 'b' * 64)
+            ci.parse_serial(frame, 'c' * 40, 'b' * 64, fixture_inputs())
         with ci.ReportPipe(self.root) as pipe, contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaisesRegex(ci.Blocked, 'exit 7'):
                 self.probe.bounded(self.writer(pipe, frame, exit_code=7), 5, 'failed writer',
@@ -96,7 +101,7 @@ class FedoraReportTests(unittest.TestCase):
             argv = [sys.executable, '-c', code, str(pipe.base) + '.out', base64.b64encode(frame).decode()]
             _, actual = self.probe.bounded(argv, 5, 'exact cap', disk_check=False, report_pipe=pipe)
             self.assertEqual(actual, frame)
-            self.assertEqual(ci.parse_serial(actual, 'a' * 40, 'b' * 64), report)
+            self.assertEqual(ci.parse_serial(actual, 'a' * 40, 'b' * 64, fixture_inputs()), report)
         with ci.ReportPipe(self.root) as pipe, contextlib.redirect_stdout(io.StringIO()):
             argv = [sys.executable, '-c', code, str(pipe.base) + '.out', base64.b64encode(frame + b'x').decode()]
             with self.assertRaisesRegex(ci.Blocked, 'report frame byte limit'):
@@ -241,13 +246,12 @@ class FedoraReportTests(unittest.TestCase):
             self.assertEqual(events, ['drained'])
             events.append('poweroff')
             return subprocess.CompletedProcess(args[0], 0)
-        argv = ['fedora_ci_guest.py', '--source', 'a' * 40, '--archive-sha256', 'c' * 64,
-                '--bundle-sha256', 'd' * 64, '--guest-sha256', guest.digest(pathlib.Path(guest.__file__))]
+        argv = ['fedora_ci_guest.py', '--source', 'a' * 40, '--inputs-json', json.dumps(fixture_inputs()), '--guest-sha256', guest.digest(pathlib.Path(guest.__file__))]
         try:
             # Stop before Fedora checks rather than fabricating passing host
             # outcomes. main/finalization and the terminal write are real.
             with mock.patch.object(sys, 'argv', argv), \
-                 mock.patch.object(guest, 'stage_source', side_effect=ValueError('transport-only fixture; baseline not run')), \
+                 mock.patch.object(guest, 'baseline', side_effect=ValueError('transport-only fixture; baseline not run')), \
                  mock.patch.object(guest, 'diagnostics', return_value={'fixture': 'no Fedora evidence'}), \
                  mock.patch.object(guest.os, 'open', side_effect=open_terminal), \
                  mock.patch.object(guest.termios, 'tcdrain', side_effect=drain), \
@@ -262,7 +266,7 @@ class FedoraReportTests(unittest.TestCase):
             limit = time.monotonic() + 1
             while not received.endswith(guest.REPORT_END) and time.monotonic() < limit:
                 time.sleep(.01)
-            parsed = ci.parse_serial(bytes(received), 'a' * 40, argv[-1])
+            parsed = ci.parse_serial(bytes(received), 'a' * 40, argv[-1], fixture_inputs())
             self.assertEqual(parsed['phases']['fedora-preflight']['status'], 'blocked')
             self.assertEqual(events, [] if late_failure else ['drained', 'poweroff'])
         finally:
