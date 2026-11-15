@@ -258,6 +258,10 @@ class NonFixturePreparationTests(unittest.TestCase):
         for name in candidate.fedora_oci.FILES: (self.fedora / name).write_bytes(b'UNTRUSTED parser fixture')
         mocked = patch.object(self.subject.fedora_oci, 'verified', synthetic_fedora)
         mocked.start(); self.addCleanup(mocked.stop)
+        fake = b'UNTRUSTED parser fixture'
+        artifacts = {name:(url,len(fake),hashlib.sha256(fake).hexdigest()) for name,(url,_,_) in candidate.fedora_oci.ARTIFACTS.items()}
+        pins = patch.object(candidate.fedora_oci, 'ARTIFACTS', artifacts)
+        pins.start(); self.addCleanup(pins.stop)
 
     def git(self, *args):
         return subprocess.run(

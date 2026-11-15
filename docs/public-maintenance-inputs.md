@@ -1,15 +1,14 @@
 # Verified public maintenance input payload
 
 [public_inputs.py](../tools/public_inputs.py) fetches and verifies the exact public
-Codex0.169.0/Cosign3.1.4/Distrobox1.8.2.5 inputs, creates a current-HEAD
+Codex0.169.0/Cosign3.1.4/Distrobox1.8.2.5 and signed Fedora44 OCI inputs, creates a current-HEAD
 maintenance candidate context using the existing preparation tool, and packages
-it with clean public Git objects and original signature evidence. It does not
-change CI, VM budgets, guest preparation, production bootstrap or runtime
-admission. No login, account, model, VPS or deployment operation is included.
+it with clean public Git objects and original signature evidence. The verified local base is also used by candidate, maintenance and CI-tooling
+construction; it grants no runtime admission and does not increase VM budgets. No login, account, model, VPS or deployment operation is included.
 
 The producer must execute from a committed clean checkout; its own bytes must
 match HEAD. Output/cache paths must be outside that checkout, in operator-owned
-storage. A future CI integration can transfer the compressed payload without
+storage. CI transfers the compressed payload without
 placing another uncompressed 294MB binary into its ISO. The helper still needs
 bounded staging space; it does not prove the present CI overhead allowance fits.
 
@@ -34,7 +33,7 @@ python3 tools/public_inputs.py extract \
 ```
 
 `build` returns source, context, payload and manifest SHA256 identities. The strict
-version-1 manifest records each regular file's size/hash, payload size/hash,
+version-2 manifest records each regular file's size/hash, payload size/hash,
 standards pin and public upstream identities. Unknown fields/versions, duplicate
 fields/paths and unsafe metadata fail closed. The consumer requires an independently
 supplied manifest digest; accepting it from the same untrusted transport is not
@@ -76,8 +75,8 @@ cached artifacts. A clean HOME carries only approved inherited proxy/CA variable
 when networking is needed; their values are never printed or serialized. An
 unavailable trust endpoint blocks verification. Prior `Verified OK` text or parsed
 certificate claims cannot supply a new pass. Distrobox is pinned to
-`40c3cd724faa434aeb0a23e28776665b92de68bd`. Fedora's OCI digest is pinned
-separately; its signature gap remains distinct from signed Cloud-image provenance.
+`40c3cd724faa434aeb0a23e28776665b92de68bd`. The [signed Fedora base](signed-fedora-base.md) uses its separate official Container
+CHECKSUM/key/archive and internal OCI identities; Cloud-image evidence remains separate.
 
 Fetch/build each have a 600-second wall deadline. Downloads enforce exact lengths,
 digests and HTTPS redirects. Fixed child commands have 120-second deadlines,

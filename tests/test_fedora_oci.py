@@ -23,11 +23,11 @@ class FedoraOCI(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def graph(self, *, alter=None):
-        raw = b'fixture rootfs bytes, never extracted'
-        layer = gzip.compress(raw, mtime=0)
+    def graph(self, *, alter=None, gzip_time=0, raw=None, declared_diff=None):
+        raw = b'fixture rootfs bytes, never extracted' if raw is None else raw
+        layer = gzip.compress(raw, mtime=gzip_time)
         h = lambda b: hashlib.sha256(b).hexdigest()
-        config = json.dumps({'os':'linux','architecture':'amd64','rootfs':{'type':'layers','diff_ids':['sha256:'+h(raw)]}}).encode()
+        config = json.dumps({'os':'linux','architecture':'amd64','rootfs':{'type':'layers','diff_ids':['sha256:'+(declared_diff or h(raw))]}}).encode()
         manifest = json.dumps({'schemaVersion':2,'mediaType':'application/vnd.oci.image.manifest.v1+json',
                     'config':{'mediaType':'application/vnd.oci.image.config.v1+json','digest':'sha256:'+h(config),'size':len(config)},
                     'layers':[{'mediaType':'application/vnd.oci.image.layer.v1.tar+gzip','digest':'sha256:'+h(layer),'size':len(layer)}]}).encode()
@@ -101,15 +101,81 @@ class FedoraOCI(unittest.TestCase):
             bad=dict(row);bad.pop(key)
             with self.subTest(key=key),self.assertRaises(ValueError):f.imported([bad])
         plain=self.root/'plain';plain.write_bytes(b'input')
-        calls=[]
-        def engine(*args,**kwargs):
-            calls.append(args)
-            if args[:2]==('image','inspect'):return json.dumps([row])
-            if args[0]=='save':Path(args[args.index('--output')+1]).write_bytes(b'invalid saveback')
-            return ''
-        with self.assertRaises((ValueError,tarfile.TarError)):f.import_image(engine,plain)
-        self.assertEqual([c[0] for c in calls],['load','image','save'])
-        self.assertFalse(any(c[0]=='pull' for c in calls))
+        with self.assertRaises((ValueError,tarfile.TarError)):
+            f.import_image(lambda *args,**kwargs:self.fail('engine reached invalid input'),plain)
+        plain,pins=self.graph()
+        with contextlib.ExitStack() as stack:
+            for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+            stack.enter_context(patch.object(f,'IMAGE','sha256:'+pins['CONFIG']))
+            row['Id']=f.IMAGE;row['Digest']='sha256:'+f.MANIFEST;row['RootFS']={'Layers':['sha256:'+f.DIFF]}
+            calls=[]
+            def engine(*args,**kwargs):
+                calls.append(args)
+                if args[:2]==('image','inspect'):return json.dumps([row])
+                if args[0]=='save':Path(args[args.index('--output')+1]).write_bytes(b'invalid saveback')
+                return ''
+            with self.assertRaises((ValueError,tarfile.TarError)):f.import_image(engine,plain)
+            self.assertEqual([c[0] for c in calls],['load','image','save'])
+            self.assertFalse(any(c[0]=='pull' for c in calls))
+
+    def test_extended_headers_and_optional_directory_transport_are_bounded(self):
+        path,pins=self.graph(alter=lambda entries:[v for v in entries if v[1] is not None])
+        self.parse(path,pins)
+        raw=path.read_bytes()
+        for kind in (tarfile.GNUTYPE_LONGNAME,tarfile.GNUTYPE_LONGLINK,tarfile.XHDTYPE,tarfile.XGLTYPE):
+            node=tarfile.TarInfo('././@LongLink');node.type=kind;node.size=11
+            altered=self.root/('extended-'+kind.decode()+'.tar')
+            altered.write_bytes(node.tobuf(format=tarfile.GNU_FORMAT)+b'index.json\0'+bytes(501)+raw)
+            with self.subTest(kind=kind),self.assertRaises(ValueError):self.parse(altered,pins)
+
+    def test_expired_verification_and_real_owned_child_timeout(self):
+        for seconds in (0,-1,121,float('inf'),float('nan')):
+            with self.assertRaises(ValueError):
+                with f.verified(self.root,seconds=seconds):pass
+        from public_inputs import command
+        work=self.root/'command';work.mkdir();(work/'home').mkdir()
+        import sys
+        code='import os,time;os.fork();time.sleep(5)'
+        started=time.monotonic()
+        with self.assertRaisesRegex(ValueError,'deadline'):
+            command([sys.executable,'-c',code],work,timeout=.05)
+        self.assertLess(time.monotonic()-started,2)
+
+    def test_capture_deadline_inherits_and_restores_earliest_real_timer(self):
+        import signal
+        import public_inputs
+        previous=signal.getsignal(signal.SIGALRM)
+        for outer,inner in ((.05,.2),(.2,.05)):
+            signal.signal(signal.SIGALRM,signal.SIG_IGN)
+            signal.setitimer(signal.ITIMER_REAL,outer)
+            started=time.monotonic()
+            try:
+                with patch.object(public_inputs,'capture_regular',side_effect=lambda *a,**k:time.sleep(.3)):
+                    with self.assertRaisesRegex(ValueError,'deadline'):
+                        with f.verified(self.root,seconds=inner):pass
+                self.assertLess(time.monotonic()-started,.15)
+                self.assertEqual(signal.getsignal(signal.SIGALRM),signal.SIG_IGN)
+                if outer > inner:
+                    remaining=signal.getitimer(signal.ITIMER_REAL)[0]
+                    self.assertGreater(remaining,0);self.assertLess(remaining,outer)
+            finally:
+                signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,previous)
+
+    def test_export_recompression_is_explicit_derivation_not_source_equality(self):
+        source,pins=self.graph()
+        derived,changed=self.graph(gzip_time=1)
+        self.assertEqual(pins['CONFIG'],changed['CONFIG'])
+        self.assertNotEqual(pins['LAYER'],changed['LAYER'])
+        with contextlib.ExitStack() as stack:
+            for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+            with self.assertRaises(ValueError):f.parse_oci(derived,time.monotonic()+2)
+            proof=f.parse_oci(derived,time.monotonic()+2,derived=True)
+            self.assertEqual(proof['config_sha256'],pins['CONFIG'])
+            self.assertEqual(proof['diff_id_sha256'],pins['DIFF'])
+            self.assertEqual(proof['manifest_sha256'],changed['MANIFEST'])
+            self.assertEqual(proof['compressed_layer_sha256'],changed['LAYER'])
+            wrong,_=self.graph(raw=b'changed rootfs',declared_diff=pins['DIFF'])
+            with self.assertRaises(ValueError):f.parse_oci(wrong,time.monotonic()+2,derived=True)
 
     def test_real_gpg_rejects_altered_signed_checksum(self):
         # Public Fedora key and CHECKSUM are small committed fixtures; no network.

@@ -45,7 +45,7 @@ WORK_LIMIT = 1536 * MIB
 FILE_LIMIT = 2048
 MANIFEST_LIMIT = 256 * 1024
 EXTRACTION_SECONDS = 120
-VERIFICATION = 'strict-cosign-keyless; Cosign bootstrap is official HTTPS plus pinned digest; no runtime/model admission'
+VERIFICATION = 'strict-cosign-keyless; Fedora signed-CHECKSUM/OCI verification is separately required; Cosign bootstrap is official HTTPS plus pinned digest; no runtime/model admission'
 PROXY_ENV = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy',
              'all_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE')
 
@@ -126,7 +126,7 @@ def workspace_bytes(root):
     return total
 
 
-def command(argv, work, *, timeout=120, network=False, input_file=None, output_file=None, file_limit=SOURCE_LIMIT):
+def command(argv, work, *, timeout=120, network=False, input_file=None, output_file=None, file_limit=SOURCE_LIMIT, workspace_reserve=0):
     """Fixed-controller argv only; no shell, inherited credentials or loaders."""
     def limits():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -145,7 +145,7 @@ def command(argv, work, *, timeout=120, network=False, input_file=None, output_f
         try:
             while selector.get_map():
                 require(time.monotonic() - started < timeout, 'public input command deadline exceeded')
-                require(workspace_bytes(work) <= WORK_LIMIT, 'public input workspace budget exceeded')
+                require(workspace_bytes(work) + workspace_reserve <= WORK_LIMIT, 'public input workspace budget exceeded')
                 for key, _ in selector.select(timeout=.1):
                     data = os.read(key.fileobj.fileno(), 16384)
                     if not data:
@@ -154,7 +154,7 @@ def command(argv, work, *, timeout=120, network=False, input_file=None, output_f
                     buffers[key.data].extend(data)
                     require(sum(map(len, buffers.values())) <= MIB, 'public input command output limit exceeded')
             require(process.wait(timeout=5) == 0, 'public input command failed; bounded output retained only by caller')
-            require(workspace_bytes(work) <= WORK_LIMIT, 'public input workspace budget exceeded')
+            require(workspace_bytes(work) + workspace_reserve <= WORK_LIMIT, 'public input workspace budget exceeded')
             return bytes(buffers['stdout']), bytes(buffers['stderr'])
         finally:
             selector.close()
@@ -378,6 +378,9 @@ def build_within_limit(cache, distrobox, output):
                        'verification_output_sha256': hashlib.sha256(proof[0] + proof[1]).hexdigest(),
                        'note': VERIFICATION}
             (retained / 'receipt.json').write_bytes(canonical(receipt))
+            require(workspace_bytes(work) + 160 * MIB <= WORK_LIMIT, 'Fedora verification workspace reserve unavailable')
+            with fedora_oci.verified(work) as (plain, fedora_proof):
+                (retained / 'fedora-verification.json').write_bytes(canonical(fedora_proof))
             tree = work / 'payload'
             tree.mkdir()
             clean_checkout(repo, revision, tree / 'dev-pair', work)
@@ -395,17 +398,18 @@ def build_within_limit(cache, distrobox, output):
             inputs.write_text(json.dumps(manifest))
             preparation = command([sys.executable, '-I', str(tree / 'dev-pair/tools/candidate.py'), 'prepare',
                                    '--manifest', str(inputs), '--binary', str(binary), '--fedora-inputs', str(work), '--output', str(tree / 'context')],
-                                  work, file_limit=CODEX_BYTES + MIB)[0]
+                                  work, file_limit=CODEX_BYTES + MIB, workspace_reserve=160*MIB)[0]
             context = json.loads(preparation)
             evidence = tree / 'evidence'
             evidence.mkdir()
             shutil.copyfile(retained / 'codex.sigstore', evidence / 'codex.sigstore')
             shutil.copyfile(retained / 'cosign-verification.txt', evidence / 'cosign-verification.txt')
             shutil.copyfile(retained / 'receipt.json', evidence / 'verification-receipt.json')
+            shutil.copyfile(retained / 'fedora-verification.json', evidence / 'fedora-verification.json')
             files = inventory(tree)
             payload = output / 'maintenance-inputs.tar.gz'
             write_payload(tree, files, payload)
-            record = {'version': 1, 'kind': 'verified-public-maintenance-inputs', 'source_sha': revision,
+            record = {'version': 2, 'kind': 'verified-public-maintenance-inputs', 'fedora': dict(fedora_oci.PROVENANCE), 'source_sha': revision,
                       'standards_sha': STANDARDS, 'distrobox_sha': DBX_SOURCE, 'context_sha256': context['context_sha256'],
                       'artifacts': {name: {'url': url, 'bytes': size, 'sha256': sha} for name, (url, size, sha) in ARTIFACTS.items()},
                       'payload': {'sha256': digest(payload), 'bytes': payload.stat().st_size}, 'files': files,
@@ -435,9 +439,10 @@ def cleanup_failed_build(output):
 def validate_manifest(obj):
     def keys(value, names):
         require(type(value) is dict and set(value) == set(names.split()), 'missing or unknown manifest fields')
-    keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification')
-    require(type(obj['version']) is int and obj['version'] == 1 and obj['kind'] == 'verified-public-maintenance-inputs',
+    keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification fedora')
+    require(type(obj['version']) is int and obj['version'] == 2 and obj['kind'] == 'verified-public-maintenance-inputs',
             'unsupported public-input manifest version/kind')
+    require(obj['fedora'] == fedora_oci.PROVENANCE, 'signed Fedora provenance mismatch')
     require(re.fullmatch('[0-9a-f]{40}', obj['source_sha']) and obj['standards_sha'] == STANDARDS and
             obj['distrobox_sha'] == DBX_SOURCE and re.fullmatch('[0-9a-f]{64}', obj['context_sha256']), 'manifest identity mismatch')
     require(canonical(obj['artifacts']) == canonical({name: {'url': url, 'bytes': size, 'sha256': sha}
@@ -462,7 +467,7 @@ def validate_manifest(obj):
         total += item['bytes']
     require(names == sorted(set(names)) and total <= EXPANSION_LIMIT, 'duplicate/unsorted/oversized payload inventory')
     required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile', *fedora_oci.FILES)}
-    required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json'}
+    required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json', 'evidence/fedora-verification.json'}
     for repo in ('dev-pair', 'distrobox'):
         required |= {repo + '/.git/' + name for name in ('HEAD', 'config', 'shallow', 'refs/heads/public-input')}
     require(required <= set(names), 'incomplete maintenance payload')

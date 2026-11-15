@@ -4,10 +4,12 @@ import gzip
 import hashlib
 import json
 import lzma
+import math
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import tarfile
 import tempfile
@@ -92,15 +94,52 @@ def _signature(work, end):
     return status.decode('ascii')
 
 
-def parse_oci(plain, end):
+def _headers(plain, end):
+    # tarfile silently consumes GNU/PAX pseudo-members before returning a member.
+    # Validate every raw header first, within the same finite transport bound.
+    with open(plain, 'rb') as source:
+        length = os.fstat(source.fileno()).st_size
+        require(0 < length <= PLAIN_LIMIT and length % 512 == 0, 'invalid OCI tar length')
+        count = 0
+        while source.tell() < length:
+            _tick(end)
+            block = source.read(512)
+            require(len(block) == 512, 'truncated OCI header')
+            if block == bytes(512):
+                zeros = 512
+                while True:
+                    _tick(end); tail = source.read(MIB)
+                    if not tail: break
+                    zeros += len(tail); require(not any(tail), 'nonzero OCI trailing bytes')
+                require(zeros >= 1024, 'missing OCI tar terminator')
+                return
+            member = tarfile.TarInfo.frombuf(block, 'utf-8', 'strict')
+            count += 1
+            require(count <= 16 and member.type in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE),
+                    'OCI unsupported extended/nonregular header or entry count')
+            require(0 <= member.size <= PLAIN_LIMIT, 'OCI raw member size exceeded')
+            target = source.tell() + ((member.size + 511) // 512) * 512
+            require(target <= length, 'truncated OCI raw member')
+            source.seek(target)
+        raise ValueError('missing OCI tar terminator')
+
+
+def parse_oci(plain, end, *, derived=False):
     """Inspect an outer OCI transport; never extract or follow rootfs members."""
+    _headers(plain, end)
     blobs = {}; metadata = {}; seen = set(); count = 0
     with tarfile.open(plain, 'r:') as archive:
         for member in archive:
             _tick(end); count += 1; require(count <= 16, 'OCI entry count exceeded')
             name = member.name
-            require(name not in seen and name in ('blobs', 'blobs/sha256', 'index.json', 'oci-layout',
-                    *('blobs/sha256/' + value for value in (MANIFEST, CONFIG, LAYER))), 'unknown/duplicate OCI path')
+            if name == '.':
+                require(member.isdir() and member.size == 0 and name not in seen, 'invalid OCI root directory')
+                seen.add(name); continue
+            if name.startswith('./'): name = name[2:]
+            known = name in ('blobs', 'blobs/sha256', 'index.json', 'oci-layout')
+            blob = re.fullmatch(r'blobs/sha256/[0-9a-f]{64}', name)
+            require(name not in seen and (known or blob and (derived or name.rsplit('/', 1)[1] in (MANIFEST, CONFIG, LAYER))),
+                    'unknown/duplicate OCI path')
             seen.add(name)
             require(not member.pax_headers and not member.issparse(), 'OCI extended/sparse header denied')
             if name in ('blobs', 'blobs/sha256'):
@@ -112,30 +151,33 @@ def parse_oci(plain, end):
             if name.startswith('blobs/'):
                 require(name.rsplit('/', 1)[1] == value, 'OCI blob hash mismatch')
                 blobs['sha256:' + value] = (member, size)
-            if name != 'blobs/sha256/' + LAYER:
-                require(size <= 256 * 1024, 'OCI metadata size exceeded')
-                with archive.extractfile(member) as stream: metadata[name] = _json(stream.read())
-        require(seen == {'blobs', 'blobs/sha256', 'index.json', 'oci-layout',
-                        *('blobs/sha256/' + value for value in (MANIFEST, CONFIG, LAYER))}, 'missing OCI descriptor/blob')
-        require(metadata['oci-layout'] == {'imageLayoutVersion':'1.0.0'}, 'unsupported OCI layout')
-        index = metadata['index.json']; require(set(index) == {'schemaVersion','mediaType','manifests'} and index['schemaVersion'] == 2
+            if size <= 256 * 1024:
+                with archive.extractfile(member) as stream: metadata[name] = stream.read()
+        require({'index.json','oci-layout'} <= seen and len(blobs) == 3, 'missing OCI descriptor/blob')
+        require(_json(metadata['oci-layout']) == {'imageLayoutVersion':'1.0.0'}, 'unsupported OCI layout')
+        index = _json(metadata['index.json'])
+        require(set(index) == {'schemaVersion','mediaType','manifests'} and index['schemaVersion'] == 2
                 and index['mediaType'] == 'application/vnd.oci.image.index.v1+json'
-                and len(index['manifests']) == 1, 'unsupported OCI index')
-        def descriptor(item, digest, media):
+                and type(index['manifests']) is list and len(index['manifests']) == 1, 'unsupported OCI index')
+        def descriptor(item, media, wanted=None):
             require(type(item) is dict and set(item) <= {'mediaType','digest','size','annotations'}
-                    and item.get('digest') == 'sha256:' + digest and item.get('mediaType') == media
-                    and type(item.get('size')) is int and item['size'] == blobs['sha256:' + digest][1], 'OCI descriptor mismatch')
-        descriptor(index['manifests'][0], MANIFEST, 'application/vnd.oci.image.manifest.v1+json')
-        manifest = metadata['blobs/sha256/' + MANIFEST]
+                    and type(item.get('digest')) is str and re.fullmatch(r'sha256:[0-9a-f]{64}',item['digest'])
+                    and item['digest'] in blobs and item.get('mediaType') == media
+                    and type(item.get('size')) is int and item['size'] == blobs[item['digest']][1]
+                    and (wanted is None or item['digest'] == 'sha256:'+wanted), 'OCI descriptor mismatch')
+            return item['digest'].removeprefix('sha256:')
+        manifest_id = descriptor(index['manifests'][0], 'application/vnd.oci.image.manifest.v1+json', None if derived else MANIFEST)
+        manifest = _json(metadata['blobs/sha256/' + manifest_id])
         require(set(manifest) <= {'schemaVersion','mediaType','config','layers','annotations'} and manifest['schemaVersion'] == 2
                 and manifest['mediaType'] == 'application/vnd.oci.image.manifest.v1+json'
-                and len(manifest['layers']) == 1, 'unsupported OCI manifest')
-        descriptor(manifest['config'], CONFIG, 'application/vnd.oci.image.config.v1+json')
-        descriptor(manifest['layers'][0], LAYER, 'application/vnd.oci.image.layer.v1.tar+gzip')
-        config = metadata['blobs/sha256/' + CONFIG]
+                and type(manifest['layers']) is list and len(manifest['layers']) == 1, 'unsupported OCI manifest')
+        descriptor(manifest['config'], 'application/vnd.oci.image.config.v1+json', CONFIG)
+        layer_id = descriptor(manifest['layers'][0], 'application/vnd.oci.image.layer.v1.tar+gzip', None if derived else LAYER)
+        require(set(blobs) == {'sha256:'+manifest_id,'sha256:'+CONFIG,'sha256:'+layer_id}, 'unreferenced OCI blob')
+        config = _json(metadata['blobs/sha256/' + CONFIG])
         require(config['os'] == 'linux' and config['architecture'] == 'amd64'
                 and config['rootfs'] == {'type':'layers','diff_ids':['sha256:' + DIFF]}, 'OCI platform/rootfs mismatch')
-        with archive.extractfile(blobs['sha256:' + LAYER][0]) as stream, gzip.GzipFile(fileobj=stream) as expanded:
+        with archive.extractfile(blobs['sha256:' + layer_id][0]) as stream, gzip.GzipFile(fileobj=stream) as expanded:
             size, value = _hash(expanded, DIFF_LIMIT, end)
         require(size == DIFF_BYTES and value == DIFF, 'OCI rootfs diff identity mismatch')
         with open(plain, 'rb') as tail:
@@ -144,27 +186,52 @@ def parse_oci(plain, end):
                 _tick(end); data = tail.read(MIB)
                 if not data: break
                 require(not any(data), 'nonzero OCI trailing bytes')
-    return dict(PROVENANCE)
+    return (dict(PROVENANCE) if not derived else {'manifest_sha256':manifest_id, 'config_sha256':CONFIG,
+            'compressed_layer_sha256':layer_id, 'diff_id_sha256':DIFF,
+            'derivation':'storage export gzip recompression allowed; exact source config bytes and rootfs diff stream required'})
+
+
+@contextlib.contextmanager
+def _wall_deadline(end):
+    now = time.monotonic()
+    previous = signal.getitimer(signal.ITIMER_REAL)
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_end = now + previous[0] if previous[0] else None
+    if previous_end is not None: end = min(end, previous_end)
+    def expired(signum, frame):
+        raise ValueError('Fedora OCI verification deadline exceeded')
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, max(.000001, end-now))
+    try:
+        yield
+        _tick(end)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_end is not None:
+            signal.setitimer(signal.ITIMER_REAL, max(.000001, previous_end-time.monotonic()), previous[1])
 
 
 @contextlib.contextmanager
 def verified(source, *, seconds=120):
     """Private captured bytes, fixed pin first, signature before decoding; owned cleanup."""
     from public_inputs import capture_regular
+    require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 120, 'invalid Fedora verification budget')
     end = time.monotonic() + seconds
     with tempfile.TemporaryDirectory(prefix='dev-pair-fedora-') as temporary:
         work = Path(temporary); (work/'home').mkdir()
-        for name, (_, size, expected) in ARTIFACTS.items():
+        with _wall_deadline(end):
+            for name, (_, size, expected) in ARTIFACTS.items():
+                _tick(end)
+                _, actual = capture_regular(Path(source)/name, size, exact_size=size, destination=work/name)
+                require(actual == expected, 'Fedora public input identity mismatch')
+            status = _signature(work, end)
+            plain = work / 'base.oci.tar'
+            with lzma.open(work/FILES[0], 'rb') as src, open(plain, 'xb') as out:
+                _hash(src, PLAIN_LIMIT, end, out)
+            proof = parse_oci(plain, end)
+            proof.update(signature_status=status, plain_bytes=plain.stat().st_size)
             _tick(end)
-            _, actual = capture_regular(Path(source)/name, size, exact_size=size, destination=work/name)
-            require(actual == expected, 'Fedora public input identity mismatch')
-        status = _signature(work, end)
-        plain = work / 'base.oci.tar'
-        with lzma.open(work/FILES[0], 'rb') as src, open(plain, 'xb') as out:
-            _hash(src, PLAIN_LIMIT, end, out)
-        proof = parse_oci(plain, end)
-        proof.update(signature_status=status, plain_bytes=plain.stat().st_size)
-        _tick(end)
         plain.chmod(0o444); work.chmod(0o755)  # exact public image, readable by dp-maint only after verification
         yield plain, proof
 
@@ -173,6 +240,7 @@ def imported(rows):
     """No conversion is presumed: immutable config, manifest and layer diff must match."""
     require(type(rows) is list and len(rows) == 1, 'ambiguous imported Fedora image')
     item = rows[0]
+    require(type(item) is dict and type(item.get('Id')) is str and type(item.get('RootFS')) is dict, 'malformed imported Fedora inspection')
     require(item.get('Id','').removeprefix('sha256:') == CONFIG
             and item.get('Digest') == 'sha256:' + MANIFEST
             and item.get('ManifestType') == 'application/vnd.oci.image.manifest.v1+json'
@@ -185,7 +253,9 @@ def imported(rows):
 def import_image(engine, plain, uid=None, seconds=120):
     """Local-only import and save-back proof; failed imports may retain store data."""
     from public_inputs import capture_regular
+    require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 120, 'invalid Fedora import budget')
     end = time.monotonic() + seconds
+    parse_oci(plain, end)  # Invalid local sources never reach even the first engine call.
     def call(*args):
         _tick(end)
         return engine(*args, timeout=max(.001, end-time.monotonic()))
@@ -199,7 +269,8 @@ def import_image(engine, plain, uid=None, seconds=120):
     call('save', '--format=oci-archive', '--output', str(export), IMAGE)
     captured = plain.parent / 'captured-import.oci.tar'
     capture_regular(export, PLAIN_LIMIT, destination=captured)
-    parse_oci(captured, end)
-    record['verification'] = 'Save-back OCI graph manifest/config/compressed-layer/diff_id equality; no format conversion accepted'
+    record['saveback'] = parse_oci(captured, end, derived=True)
+    record['conversion'] = 'source manifest/config retained on load; storage save gzip representation derived and fully rehashed'
+    record['verification'] = 'Source archive chain plus exported config-byte/rootfs-diff equality and full derived descriptor/blob graph'
     record['failure_recovery'] = 'Import is nontransactional; unreferenced store layers may remain, no broad prune/removal'
     return record

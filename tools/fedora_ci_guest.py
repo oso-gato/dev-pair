@@ -28,7 +28,7 @@ import tty
 
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 REPORT_LIMIT = 65536
-REPORT_VERSION = 4
+REPORT_VERSION = 5
 GUEST_PHASES = ('fedora-preflight', 'guest-inputs', 'bootstrap-inspect', 'bootstrap-status',
                 'bootstrap-prepare', 'maintenance-gptbox', 'bootstrap-post-inspect', 'bootstrap-post-status')
 INPUT_LENGTHS = {'controller_sha256': 64, 'source_sha': 40, 'helper_sha256': 64, 'fedora_helper_sha256': 64, 'manifest_sha256': 64, 'payload_sha256': 64,

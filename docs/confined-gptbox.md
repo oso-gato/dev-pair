@@ -29,15 +29,16 @@ candidate source changes: manifests now use the approved per-role workspace,
 state/cache classes and a separate protected credential namespace.
 
 The first implementation accepts exactly the inspected amd64 Fedora44 manifest
-`sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e`,
+`sha256:f1e66cdd6eff2c9ccad192f8865af9be6d69b46b3f13329d2975a2d61a1296c5`,
 Codex0.169.0 binary SHA256
 `b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b`,
 and upstream Distrobox1.8.2.5 commit
 `40c3cd724faa434aeb0a23e28776665b92de68bd`. The coordination handoff verified
 that Codex binary using strict Cosign3.1.4 issuer/workflow/repository/tag/source
 constraints and transparency checks; its official source is
-`d32063f96c2dff1dc96af839b3952abb6acfeda4`. Fedora registry/config digest and
-architecture were inspected; a Fedora image signature was not established.
+`d32063f96c2dff1dc96af839b3952abb6acfeda4`. The [official signed release archive](signed-fedora-base.md) now authenticates
+the Fedora base; exact import/save-back identity and actual signed package refresh
+remain native execution gates. The old registry image signature was not established.
 This adapter checks those exact reviewed byte identities, existing candidate
 integrity/Git provenance and exact upstream Git objects; it does not fabricate
 new upstream verification or silently accept another release. Transfer the

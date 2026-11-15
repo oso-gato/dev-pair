@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
 spec = importlib.util.spec_from_file_location('bootstrap', ROOT / 'tools/bootstrap.py')
 b = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(b)
@@ -32,7 +33,7 @@ class Fake:
         self.password_inputs = []
         self.password_set = False
 
-    def __call__(self, *args, ok=(0,), input_text=None):
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
         self.calls.append(args)
         if self.fail and self.fail(args):
             raise b.Blocked('injected command failure (output withheld)')
@@ -409,7 +410,8 @@ class BootstrapTests(unittest.TestCase):
         (repo / 'tools').mkdir(parents=True, exist_ok=True)
         source = repo / 'tools/candidate.py'
         source.write_bytes((ROOT / 'tools/candidate.py').read_bytes())
-        for arguments in [('init', '--quiet'), ('add', 'tools/candidate.py'),
+        (repo / 'tools/fedora_oci.py').write_bytes((ROOT / 'tools/fedora_oci.py').read_bytes())
+        for arguments in [('init', '--quiet'), ('add', 'tools'),
                           ('-c', 'user.name=Offline fixture', '-c', 'user.email=fixture@example.invalid',
                            '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
                            'commit', '--allow-empty', '--quiet', '-m', 'Synthetic verifier source')]:
@@ -418,6 +420,8 @@ class BootstrapTests(unittest.TestCase):
         tool = importlib.util.module_from_spec(tool_spec)
         tool_spec.loader.exec_module(tool)
         self.app.candidate_tool = lambda: tool
+        import fedora_input_fixture
+        fedora_input_fixture.install(self)
         binary = self.root / 'synthetic-ELF-NOT-CODEX'
         data = bytearray(64)
         data[:6] = b'\x7fELF\x02\x01'
@@ -426,15 +430,15 @@ class BootstrapTests(unittest.TestCase):
         sha = subprocess.run(['/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD'], check=True, text=True, capture_output=True).stdout.strip()
         m = {'kind': 'fixture' if fixture else 'operator-verified-inputs', 'source_sha': sha,
              'standards_sha': b.STANDARDS,
-             'fedora': {'image': 'registry.fedoraproject.org/fedora:44@sha256:' + hashlib.sha256(b'SYNTHETIC NOT FEDORA').hexdigest(),
-                        'verification': 'SYNTHETIC OFFLINE TEST - no upstream acceptance'},
+             'fedora': ({'image': 'registry.fedoraproject.org/fedora:44@sha256:' + hashlib.sha256(b'SYNTHETIC NOT FEDORA').hexdigest(),
+                        'verification': 'SYNTHETIC OFFLINE TEST - no upstream acceptance'} if fixture else dict(tool.fedora_oci.PROVENANCE)),
              'codex': {'version': '9876.5.4',
                        'source': 'https://github.com/openai/codex/releases/download/rust-v9876.5.4/codex-x86_64-unknown-linux-musl.tar.gz',
                        'sha256': hashlib.sha256(data).hexdigest(), 'verification': 'SYNTHETIC OFFLINE TEST - no upstream acceptance'},
              'role': role, 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
              'mounts': {key: (f'/var/lib/dev-pair/credentials/{role}/offline-test' if key == 'credentials' else f'/var/lib/dev-pair/{role}/' + {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}[key] + '/offline-test') for key in ('workspace', 'state', 'cache', 'credentials')}}
         out = self.root / 'context'
-        result = tool.prepare(m, binary, out, fixture=fixture)
+        result = tool.prepare(m, binary, out, fixture=fixture, fedora_inputs=self.root)
         return out, result['context_sha256']
 
     def test_real_verifier_build_handoff_and_artifact_replay(self):
@@ -451,7 +455,9 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(all('--uid=dp-maint' in a for a in engine))
         self.assertTrue(all('--property=KillMode=control-group' in a for a in engine))
         build = next(a for a in engine if 'build' in a)
-        self.assertIn('--network=none', build)
+        self.assertIn('--network=slirp4netns:allow_host_loopback=false', build)
+        self.assertIn('--pull=never', build)
+        self.assertFalse(any('pull' in call for call in self.fake.calls))
         self.assertIn('--pull=never', build)
         self.assertEqual(result['image_id'], 'sha256:' + 'a' * 64)
         self.assertFalse(result['distrobox_assembled'])

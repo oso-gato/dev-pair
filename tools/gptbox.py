@@ -178,7 +178,8 @@ class Gptbox(Bootstrap):
         storage = '/var/lib/dev-pair/maintenance/images'
         self.directory(storage, owner='dp-maint')
         self.wrapper = str(self.path(CONTROL + '/bin/podman'))
-        script = (f'#!/bin/sh\nexec /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox '
+        script = (f'#!/bin/sh\nif [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={fedora_oci.PLAIN_LIMIT}:{fedora_oci.PLAIN_LIMIT} /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox --storage-driver=vfs --events-backend=file "$@"; fi\n'
+                  f'exec /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox '
                   '--storage-driver=vfs --events-backend=file "$@"\n')
         self.atomic(CONTROL + '/bin/podman', script, mode=0o555)
         self.atomic(CONTROL + '/distrobox-enter', self.scripts['distrobox-enter'].decode(), mode=0o555)
@@ -488,7 +489,7 @@ class Gptbox(Bootstrap):
                         raise Blocked('actual Distrobox entry returned unexpected Codex identity')
                     self.engine('stop', '--time=10', runtime_id)
                 result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
-                          'distrobox_sha': DBX_SHA, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
+                          'distrobox_sha': DBX_SHA, 'fedora_base': imported, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
                           'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
                           'model_access': 'not verified', 'nested_placement': 'not verified',
                           'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}

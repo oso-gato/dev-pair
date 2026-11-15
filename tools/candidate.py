@@ -174,7 +174,14 @@ def _verify_content(context, expected_context_sha256, fixture=False):
     for name in names:
         path = root / name
         require(stat.S_ISREG(path.lstat().st_mode), 'context: only regular files permitted')
-        files[name] = path.read_bytes()
+        if name in fedora_oci.ARTIFACTS and not fixture:
+            from public_inputs import capture_regular
+            _, size, expected = fedora_oci.ARTIFACTS[name]
+            data, actual = capture_regular(path, size, exact_size=size)
+            require(actual == expected, 'context Fedora signed artifact identity mismatch')
+            files[name] = data
+        else:
+            files[name] = path.read_bytes()
     recorded = json.loads(files.pop('candidate.json'))
     result = context_record(files, fixture)
     require(result['context_sha256'] == expected_context_sha256,
@@ -185,11 +192,12 @@ def _verify_content(context, expected_context_sha256, fixture=False):
     require(files['Containerfile'] == recipe(m), 'recipe does not match recorded inputs')
     check_binary(m, files['codex'], fixture)
     if not fixture:
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix='candidate-fedora-') as temporary:
-            captured = pathlib.Path(temporary)
-            for name in fedora_oci.FILES: (captured / name).write_bytes(files[name])
-            with fedora_oci.verified(captured): pass
+        # The producer verifies signatures/OCI graph. Admission binds these very
+        # captured bytes to the reviewed signed-artifact pins without requiring
+        # GPG before initial host provisioning. Import verifies the chain afresh.
+        for name, (_, size, expected) in fedora_oci.ARTIFACTS.items():
+            require(len(files[name]) == size and digest(files[name]) == expected,
+                    'context Fedora signed artifact identity mismatch')
     return result, m
 
 

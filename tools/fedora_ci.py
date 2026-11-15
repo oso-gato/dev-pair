@@ -760,7 +760,7 @@ class Probe:
         require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source, 'checkout differs from exact PR head')
         require(not run_small(['/usr/bin/git', '-C', str(self.repo), 'status', '--porcelain']), 'source checkout must be clean')
         for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo',
-                        '/usr/bin/timeout', '/usr/bin/du', '/usr/bin/slirp4netns'):
+                        '/usr/bin/timeout', '/usr/bin/du', '/usr/bin/slirp4netns', '/usr/bin/prlimit'):
             require(pathlib.Path(command).is_file(), 'required preinstalled runner tool unavailable: ' + command)
         require(os.cpu_count() >= 2, 'at least two CPUs required')
         mem = int(re.search(r'^MemTotal:\s+(\d+) kB$', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
@@ -798,7 +798,13 @@ class Probe:
         for name, (url, size, expected) in fedora_oci.ARTIFACTS.items():
             download(url, signed / name, size, exact_size=size, expected_sha=expected)
         with fedora_oci.verified(signed) as (plain, proof):
-            base_proof = fedora_oci.import_image(lambda *args, **kw: self.helper(list(args), **kw), plain)
+            def local_image(*args, **kwargs):
+                if args[0] != 'save': return self.helper(list(args), **kwargs)
+                prefix = list(self.podman)
+                index = prefix.index('/usr/bin/podman')
+                prefix[index:index] = ['/usr/bin/prlimit', '--fsize=' + str(fedora_oci.PLAIN_LIMIT) + ':' + str(fedora_oci.PLAIN_LIMIT)]
+                return self.bounded(prefix + list(args), kwargs.get('timeout', 120), 'bounded OCI save-back')
+            base_proof = fedora_oci.import_image(local_image, plain)
         self.report['signed_container_base'] = base_proof
         build = self.root / 'tool-build'
         build.mkdir()

@@ -131,14 +131,14 @@ class PublicInputsTests(unittest.TestCase):
             path = tree / 'context' / name
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(b'explicit parser fixture, no admissible Codex binary')
-        for name in ('codex.sigstore', 'cosign-verification.txt', 'verification-receipt.json'):
+        for name in ('codex.sigstore', 'cosign-verification.txt', 'verification-receipt.json', 'fedora-verification.json'):
             path = tree / 'evidence' / name
             path.parent.mkdir(exist_ok=True)
             path.write_text('parser fixture, not signature evidence')
         files = inputs.inventory(tree)
         payload = self.root / 'payload.gz'
         inputs.write_payload(tree, files, payload)
-        record = {'version': 1, 'kind': 'verified-public-maintenance-inputs', 'source_sha': 'a' * 40,
+        record = {'version': 2, 'kind': 'verified-public-maintenance-inputs', 'fedora': dict(inputs.fedora_oci.PROVENANCE), 'source_sha': 'a' * 40,
                   'standards_sha': inputs.STANDARDS, 'distrobox_sha': inputs.DBX_SOURCE, 'context_sha256': 'b' * 64,
                   'artifacts': {name: {'url': url, 'bytes': size, 'sha256': sha} for name, (url, size, sha) in inputs.ARTIFACTS.items()},
                   'payload': {'sha256': inputs.digest(payload), 'bytes': payload.stat().st_size}, 'files': files,
@@ -262,7 +262,7 @@ class PublicInputsTests(unittest.TestCase):
 
     def test_consumer_rejects_unknown_schema_and_unexpected_git_metadata(self):
         tree, payload, manifest, record = self.fixture_payload()
-        for key, value in (('version', True), ('version', 2), ('unknown', 'claim')):
+        for key, value in (('version', True), ('version', 3), ('version', 1), ('unknown', 'claim')):
             changed = copy.deepcopy(record)
             changed[key] = value
             with self.assertRaises(ValueError):
