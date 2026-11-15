@@ -1578,3 +1578,16 @@ stable overhead1655304192bytes; tool image
 Evidence: `/workspace/artifacts/fedora-ci-run-43746428844.log` and sibling
 `-report.json`. Runner AWS7.0.0-1014-aws/image20261111.127.1, Podman4.9.3,
 initialfree94983086080bytes/RAM16464306176bytes. No VPS or production mutation.
+
+
+Native executor builder is active in `/workspace/dev-pair-fedora-native`, branch
+`codex/fedora-native-executor`, from `6cf2bdd`. Source/test changes are in progress;
+no candidate is yet admitted. The agreed design stages protected fixed inputs,
+uses standard restorecon contexts, sends no cloud-init standard-stream FDs into
+the service, and verifies actual root/MainPID/cgroup/context plus independently
+bound unit/script/controller/input identities. Avoid circular unit/manifest
+hashes and cloud-final self-waits. A bounded selected-property startup observation
+should distinguish a queued request from actual execution without journal export.
+Fresh `/root/fedora_native_executor_review` has the governing sources and run9 AVC;
+review begins only after an immutable candidate. No policy or confinement change,
+new hosted run, VPS access or production deployment has occurred in this slice.
