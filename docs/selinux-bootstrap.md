@@ -46,8 +46,9 @@ The transition follows these boundaries:
 
 - Inspect Fedora 44, systemd, the boot ID, live mode, persistent mode, targeted
   policy and kernel arguments. Reject disabled/foreign LSM arguments,
-  `enforcing=0`, and any boot argument that prevents the required permissive
-  transition. Do not edit the bootloader. Preserve an already-enforcing host;
+  `enforcing=0`, any persistent `autorelabel` word trigger (including
+  `autorelabel=0` and a forced autorelabel target), and arguments preventing the
+  required permissive transition. Do not edit the bootloader. Preserve an already-enforcing host;
   no downgrade, relabel or setup reboot is requested for that path.
 - For Disabled or Permissive, install signature-checked Fedora policy/tools,
   confirm targeted policy exists, and bind the reviewed code target. A
@@ -60,15 +61,35 @@ The transition follows these boundaries:
   config/marker write before requesting reboot. Use `restorecon` on installed
   code, managed state/configuration and units; no global labeling exception or
   disabled container label separation is introduced.
-- On a different permissive boot, the checked helper runs fixed
-  `fixfiles -F -T 1 restore` arguments with a thirty-minute command limit.
-  It records completion and the actual relabel boot ID only after success and
-  managed-path relabeling. It then removes/fsyncs its marker and requests the
-  next authorized reboot. Failed or interrupted relabels retain the marker;
-  at most two full attempts are allowed, with systemd restart limits. Reboot
-  commands have at most three attempts per boot. Exhaustion is a real recovery
-  blocker, never a repeated reboot loop or an implicit permanent permissive
-  configuration.
+- On a different permissive boot, the helper selects writable `seclabel`
+  mounts from the actual mount inventory, requires writable labeled coverage of
+  the root and system trees, and honors configured exclusions outside those
+  required trees. Read-only mounts are explicitly excluded. Conflicting critical
+  exclusions, ambiguous overmounts or unsupported paths block without rewriting
+  their configuration. The verified native `setfiles` executable retains its
+  physical/XDEV traversal and non-seclabel mount exclusion; no naive recursive
+  host walk or `-m` override is substituted.
+- The fixed native command uses `setfiles -E -C -F -I -T 1`, the targeted file
+  contexts and admitted mount/exclusion arguments, with a thirty-minute limit.
+  Its actual nonzero/error-count exit blocks completion. A protected plan records
+  mounts, exclusions, persistent filesystem UUID/FSROOT/type identities and the
+  context inputs, including local/home-directory/substitution and compiled
+  companions. Successful completion binds that plan, method, code and relabel
+  boot ID. Finalization rejects changed persistent identities, exclusion config
+  or context inputs, while new noncritical transient tmpfs mounts such as
+  `/run/user/0` do not invalidate persistent relabel evidence. No `fixfiles` shell-wrapper exit is
+  accepted. Managed-path relabeling must also succeed before the helper
+  removes/fsyncs its marker and requests the next authorized reboot.
+- Failed or interrupted relabels retain the marker; at most two full attempts
+  are allowed, with systemd restart limits. Reboot commands have at most three
+  attempts per boot and six total; the incomplete transition admits at most four
+  distinct boots. A crash after durable native completion but before marker
+  removal can consume one protected extra-boot allowance, recorded before
+  cleanup. It removes only the exact owned marker, requests at most that one
+  extra boot, and then uses normal-boot finalization. The allowance cannot reset
+  after another crash. Unexpected relabel-target reentry without an owned marker
+  blocks. Exhaustion is a recovery blocker, never a reboot loop or an implicit
+  permanent permissive configuration.
 - A narrow normal-boot service automatically verifies the installed code,
   checked completion and a boot ID distinct from both the original and relabel
   boots. Only then does it call `setenforce 1`, require live Enforcing readback,
@@ -76,13 +97,18 @@ The transition follows these boundaries:
   temporary override and disables itself only after that success. Failure keeps
   the transition incomplete; cleanup after recorded success can be retried.
 
-The override deliberately replaces the vendor script's unchecked `fixfiles`
-call; disappearance of `/.autorelabel` alone is never success. Reference unit
+The override deliberately replaces the vendor script and the `fixfiles restore`
+wrapper: Fedora 44's upstream 3.11 wrapper can report success after a failed
+`setfiles` call or an empty filesystem list. Direct checked native execution
+avoids that lost status. Disappearance of `/.autorelabel` alone is never success. Reference unit
 and script inspection used the Fedora `policycoreutils` f44 packaging sources:
 `https://src.fedoraproject.org/rpms/policycoreutils/raw/f44/f/selinux-autorelabel`
-and the corresponding `.service`, `.target` and mark-service files. Those
-references describe vendor behavior; signature-checked packages supply target
-code. The A11 historical implementation informed the transition design only;
+and the corresponding `.service`, `.target`, mark-service and generator files.
+Native behavior was inspected at
+`https://raw.githubusercontent.com/SELinuxProject/selinux/3.11/policycoreutils/setfiles/setfiles.c`
+and `libselinux/src/selinux_restorecon.c`; the wrapper defect is in
+`policycoreutils/scripts/fixfiles` at that same revision. Those references describe
+vendor behavior; signature-checked, RPM-verified packages supply target code. The A11 historical implementation informed the transition design only;
 its suppressed enforcement failures and broader policy were not imported.
 
 A failed early autorelabel boot may remain in the dedicated relabel target;

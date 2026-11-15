@@ -95,7 +95,10 @@ class SELinuxBootstrap(Bootstrap):
             raise Blocked('only Fedora 44 initial SELinux setup is supported')
         if self.text('/proc/1/comm').strip() != 'systemd':
             raise Blocked('host systemd PID 1 is required')
-        args = self.text('/proc/cmdline').split()
+        command_line = self.text('/proc/cmdline')
+        if re.search(r'\bautorelabel\b', command_line):
+            raise Blocked('persistent kernel autorelabel trigger would loop; bootloader changes are not automatic')
+        args = command_line.split()
         for arg in args:
             if ((arg.startswith('selinux=') and arg != 'selinux=1')
                     or (arg.startswith('enforcing=') and arg != 'enforcing=1')
@@ -137,9 +140,15 @@ class SELinuxBootstrap(Bootstrap):
             owner = self.run('/usr/bin/rpm', '-q', '--qf', '%{NAME}\n', '-f', unit).strip()
             if owner != 'policycoreutils':
                 raise Blocked('unexpected autorelabel unit package provenance')
+            native = '/usr/sbin/setfiles'
+            program = self.protected(native)
+            if not program.is_file() or not program.stat().st_mode & 0o111:
+                raise Blocked('native setfiles executable is missing')
+            if self.run('/usr/bin/rpm', '-q', '--qf', '%{NAME}\n', '-f', native).strip() != 'policycoreutils':
+                raise Blocked('unexpected native setfiles package provenance')
             verification = self.run('/usr/bin/rpm', '-V', '--nomtime', '-f', unit, ok=(0, 1))
-            if any(line.rstrip().endswith(unit) for line in verification.splitlines()):
-                raise Blocked('installed signed autorelabel unit has changed')
+            if any(line.rstrip().endswith((unit, native)) for line in verification.splitlines()):
+                raise Blocked('installed signed autorelabel unit or native setfiles has changed')
 
     def restore_labels(self):
         paths = [INSTALL, STATE, '/etc/selinux/config', OVERRIDE, FINALIZER]
@@ -182,12 +191,198 @@ class SELinuxBootstrap(Bootstrap):
         self.protected(OVERRIDE)
         self.protected(FINALIZER)
 
-    def reboot(self, intent, boot):
+    def observe_transition_boot(self, intent, boot):
+        if self.state_json('complete'):
+            return
+        record = self.state_json('boots', {'ids': [intent['origin_boot_id']]})
+        ids = record.get('ids')
+        if not isinstance(ids, list) or not ids or ids[0] != intent['origin_boot_id']:
+            raise Blocked('invalid transition boot history')
+        if boot not in ids:
+            if len(ids) >= 4:
+                raise Blocked('total initial-transition boot budget exhausted; recovery required')
+            ids.append(boot)
+        self.record('boots', {'ids': ids})
+
+    def context_identity(self):
+        base = '/etc/selinux/targeted/contexts/files/file_contexts'
+        identity = {}
+        for suffix in ('', '.bin', '.local', '.local.bin', '.homedirs', '.homedirs.bin', '.subs', '.subs_dist'):
+            path = self.protected(base + suffix)
+            if path.exists() and not path.is_file():
+                raise Blocked('file-context input must be a protected regular file')
+            identity[suffix or 'main'] = hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+        if identity['main'] is None:
+            raise Blocked('targeted file-context specification is missing')
+        return identity
+
+    def relabel_plan(self):
+        # Match Fedora's rw+seclabel filesystem selection. setfiles 3.11 itself
+        # uses physical traversal, XDEV and non-seclabel exclusions; do not pass -m.
+        mounts = {}
+        text = self.text('/proc/self/mounts')
+        if not text or len(text) > 1048576:
+            raise Blocked('mount inventory is unavailable or over limit')
+        for line in text.splitlines():
+            fields = line.split()
+            if len(fields) != 6:
+                raise Blocked('malformed mount inventory')
+            point = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[1])
+            options = set(fields[3].split(','))
+            if (not point.startswith('/') or '..' in Path(point).parts
+                    or any(ord(char) < 32 or ord(char) == 127 for char in point)
+                    or any(char in point for char in '*?[]\\')):
+                raise Blocked('unsafe mountpoint in inventory')
+            entry = {'type': fields[2], 'options': sorted(options)}
+            if point in mounts and mounts[point] != entry:
+                raise Blocked('overmounted filesystem needs explicit inspection')
+            mounts[point] = entry
+        if len(mounts) > 1024:
+            raise Blocked('mount inventory exceeds initial bootstrap scope')
+        writable, readonly = [], []
+        for point, entry in mounts.items():
+            options = set(entry['options'])
+            if 'seclabel' in options:
+                if any(option.startswith(('context=', 'fscontext=', 'defcontext=')) for option in options):
+                    raise Blocked('context-mounted filesystem requires explicit inspection')
+                if 'rw' in options and 'ro' not in options:
+                    writable.append(point)
+                elif 'ro' in options and 'rw' not in options:
+                    readonly.append(point)
+                else:
+                    raise Blocked('ambiguous labeled filesystem access mode')
+        if '/' not in writable:
+            raise Blocked('writable seclabel root filesystem is required for checked full relabel')
+        critical = ('/usr', '/etc', '/var', '/root', '/home', '/boot')
+        def contains(parent, child):
+            return parent == '/' or child == parent or child.startswith(parent.rstrip('/') + '/')
+        for path in critical:
+            covering = max((point for point in mounts if contains(point, path)), key=len)
+            if covering not in writable:
+                raise Blocked('a required system tree is not on a writable labeled filesystem')
+        for point in mounts:
+            # EFI's vfat mount has no security.selinux xattrs and is handled by
+            # the native non-seclabel exclusion. Other mounted system subtrees
+            # cannot disappear from a claimed checked OS relabel.
+            if (point != '/boot/efi' and any(contains(root, point) for root in critical)
+                    and point not in writable):
+                raise Blocked('mounted system subtree cannot be covered by checked relabel')
+        persistent = {}
+        for point in sorted(writable + readonly):
+            if mounts[point]['type'] in ('tmpfs', 'devtmpfs', 'ramfs'):
+                continue
+            if len(persistent) >= 64:
+                raise Blocked('too many persistent filesystems for bounded initial bootstrap')
+            raw = self.run('/usr/bin/findmnt', '--json', '--output', 'UUID,FSROOT',
+                           '--mountpoint', str(self.path(point)), timeout=5)
+            rows = json.loads(raw).get('filesystems', [])
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+                raise Blocked('cannot establish persistent filesystem identity')
+            uuid, fsroot = rows[0].get('uuid'), rows[0].get('fsroot')
+            if (not isinstance(uuid, str) or not re.fullmatch(r'[0-9A-Fa-f-]{8,128}', uuid)
+                    or not isinstance(fsroot, str) or not fsroot.startswith('/')
+                    or '..' in Path(fsroot).parts or any(ord(char) < 32 for char in fsroot)):
+                raise Blocked('persistent filesystem UUID or filesystem-root identity is unavailable')
+            persistent[point] = {'uuid': uuid.lower(), 'fsroot': fsroot,
+                                 'type': mounts[point]['type'], 'writable': point in writable}
+        for path in critical:
+            covering = max((point for point in mounts if contains(point, path)), key=len)
+            if covering not in persistent or not persistent[covering]['writable']:
+                raise Blocked('required system trees must have persistent writable label coverage')
+        for point in mounts:
+            if (point != '/boot/efi' and any(contains(root, point) for root in critical)
+                    and not any(contains(cache, point) for cache in ('/var/tmp', '/var/run', '/var/lock'))
+                    and point not in persistent):
+                raise Blocked('transient mount cannot shadow required system code or durable state')
+        excluded = []
+        file = self.protected('/etc/selinux/fixfiles_exclude_dirs')
+        if file.exists():
+            if file.stat().st_size > 16384:
+                raise Blocked('relabel exclusion configuration exceeds initial scope')
+            for line in file.read_text().splitlines():
+                path = line.strip()
+                # Preserve vendor semantics for comments, relative and absent directories.
+                if not path or path.startswith('#') or not path.startswith('/'):
+                    continue
+                if '..' in Path(path).parts or any(ord(char) < 32 for char in path):
+                    raise Blocked('unsafe configured relabel exclusion')
+                if not self.path(path).is_dir():
+                    continue
+                if any(contains(path, root) or contains(root, path) for root in critical):
+                    raise Blocked('configured relabel exclusion covers required system code; preserving it for recovery')
+                excluded.append(path)
+        excluded = sorted(set(excluded + readonly))
+        if len(excluded) > 128:
+            raise Blocked('too many relabel exclusions for initial bootstrap')
+        contexts = self.protected('/etc/selinux/targeted/contexts/files/file_contexts')
+        if not contexts.is_file() or not contexts.stat().st_size:
+            raise Blocked('targeted file-context specification is missing')
+        return {'method': 'checked-setfiles', 'mounts': sorted(writable), 'excluded': excluded,
+                'persistent_filesystems': persistent, 'contexts': self.context_identity(),
+                'exclusion_config_sha256': hashlib.sha256(file.read_bytes()).hexdigest() if file.exists() else None}
+
+    def checked_relabel(self):
+        if self.path('/usr/sbin/genhomedircon').exists():
+            self.run('/usr/sbin/genhomedircon', timeout=120)
+        plan = self.relabel_plan()
+        self.record('relabel-plan', plan)
+        arguments = ['/usr/sbin/setfiles', '-E', '-C', '-F', '-I', '-T', '1']
+        for path in plan['excluded']:
+            arguments.extend(('-e', str(self.path(path))))
+        arguments.append(str(self.path('/etc/selinux/targeted/contexts/files/file_contexts')))
+        arguments.extend(str(self.path(path)) for path in plan['mounts'])
+        # Native setfiles aggregates actual errors and counted skipped errors in
+        # its exit status. Fedora's fixfiles restore wrapper overwrites that status.
+        self.run(*arguments, timeout=1800)
+        return plan
+
+    def verify_completion(self, intent, done):
+        plan = self.state_json('relabel-plan', {})
+        boot = done.get('boot_id')
+        if (not isinstance(boot, str) or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', boot)
+                or done.get('method') != 'checked-setfiles' or done.get('code_sha256') != intent['code_sha256']
+                or done.get('boot_id') == intent['origin_boot_id']
+                or done.get('plan_sha256') != hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()):
+            raise Blocked('checked native relabel evidence is missing or inconsistent')
+
+    def recover_marker_reboot(self, intent, done, boot):
+        self.verify_completion(intent, done)
+        if boot in (intent['origin_boot_id'], done['boot_id']):
+            raise Blocked('marker recovery requires a distinct later boot')
+        recovery = self.state_json('marker-recovery')
+        if recovery is None:
+            marker = self.protected('/.autorelabel')
+            if not marker.exists() or marker.read_text() != '-F\n':
+                raise Blocked('unexpected later relabel-target boot without an owned marker')
+            recovery = {'boot_id': boot, 'relabel_boot_id': done['boot_id'],
+                        'code_sha256': intent['code_sha256']}
+            # Consume the single extra-boot allowance before marker removal or reboot.
+            self.record('marker-recovery', recovery)
+        if (recovery.get('boot_id') != boot or recovery.get('relabel_boot_id') != done['boot_id']
+                or recovery.get('code_sha256') != intent['code_sha256']):
+            raise Blocked('post-relabel marker recovery allowance is exhausted')
+        self.remove_marker()
+        return self.reboot(intent, boot, recovery=True)
+
+    def reboot(self, intent, boot, recovery=False):
+        self.observe_transition_boot(intent, boot)
+        done = self.state_json('relabel-done')
+        expected_boot = done.get('boot_id') if done else intent['origin_boot_id']
+        if done:
+            self.verify_completion(intent, done)
+        if recovery:
+            allowance = self.state_json('marker-recovery', {})
+            if not done or allowance != {'boot_id': boot, 'relabel_boot_id': done['boot_id'], 'code_sha256': intent['code_sha256']}:
+                raise Blocked('no matching consumed marker-recovery allowance')
+            expected_boot = boot
+        if self.state_json('complete') or boot != expected_boot:
+            raise Blocked('unexpected transition phase cannot request another reboot')
         if not intent.get('reboot_authorized'):
             return {'phase': 'pending-explicit-reboot', 'boot_id': boot}
         counts = self.state_json('reboots', {})
         attempts = counts.get(boot, 0)
-        if not isinstance(attempts, int) or attempts >= 3:
+        if (not isinstance(attempts, int) or any(not isinstance(value, int) or value < 0 for value in counts.values())
+                or attempts >= 3 or sum(counts.values()) >= 6):
             raise Blocked('reboot retry budget exhausted for this boot; inspect recovery route')
         counts[boot] = attempts + 1
         self.record('reboots', counts)
@@ -204,6 +399,7 @@ class SELinuxBootstrap(Bootstrap):
             intent = self.state_json('intent')
             if intent:
                 self.verify_installed(intent)
+                self.observe_transition_boot(intent, observed['boot_id'])
                 if expected and expected != intent.get('code_sha256'):
                     raise Blocked('changed transition code requires separately reviewed recovery')
                 if reboot and not intent.get('reboot_authorized'):
@@ -213,10 +409,16 @@ class SELinuxBootstrap(Bootstrap):
                     return self.finish()
                 done = self.state_json('relabel-done')
                 if done:
+                    self.verify_completion(intent, done)
                     if observed['boot_id'] == done['boot_id']:
                         self.remove_marker()
                         return self.reboot(intent, observed['boot_id'])
+                    recovery = self.state_json('marker-recovery', {})
+                    if self.path('/.autorelabel').exists() or recovery.get('boot_id') == observed['boot_id']:
+                        return self.recover_marker_reboot(intent, done, observed['boot_id'])
                     return self.finalize()
+                if observed['boot_id'] != intent['origin_boot_id']:
+                    raise Blocked('unexpected boot without checked relabel completion; no rearming or reboot')
                 attempt = self.state_json('relabel-attempt', {})
                 if attempt.get('count', 0) >= 2:
                     raise Blocked('checked relabel retry budget exhausted; recovery required')
@@ -293,13 +495,18 @@ class SELinuxBootstrap(Bootstrap):
             if not intent:
                 raise Blocked('checked relabel has no protected intent')
             self.verify_installed(intent)
+            self.observe_transition_boot(intent, observed['boot_id'])
             if self.state_json('complete'):
                 raise Blocked('completed transition cannot consume a future relabel request; recover stale override')
             if observed['boot_id'] == intent['origin_boot_id'] or observed['live'] != 'Permissive':
                 raise Blocked('relabel requires a different, permissive boot; no mode downgrade')
             if observed['persistent'] != 'permissive' or not observed['policy_present']:
                 raise Blocked('permissive targeted relabel configuration is missing')
-            if self.state_json('relabel-done'):
+            done = self.state_json('relabel-done')
+            if done:
+                self.verify_completion(intent, done)
+                if done.get('boot_id') != observed['boot_id']:
+                    return self.recover_marker_reboot(intent, done, observed['boot_id'])
                 self.remove_marker()
                 return self.reboot(intent, observed['boot_id'])
             attempt = self.state_json('relabel-attempt', {})
@@ -309,10 +516,11 @@ class SELinuxBootstrap(Bootstrap):
                 raise Blocked('managed relabel marker missing or changed')
             self.record('relabel-attempt', {'boot_id': observed['boot_id'], 'count': attempt.get('count', 0) + 1})
             self.event('checked-full-relabel', 'begin')
-            # Fixed arguments, no sourced config/marker commands; nonzero/timeout never records success.
-            self.run('/usr/sbin/fixfiles', '-F', '-T', '1', 'restore', timeout=1800)
+            # No sourced config/marker commands or unchecked shell wrapper.
+            plan = self.checked_relabel()
             self.restore_labels()
-            self.record('relabel-done', {'boot_id': observed['boot_id'], 'code_sha256': intent['code_sha256']})
+            self.record('relabel-done', {'boot_id': observed['boot_id'], 'code_sha256': intent['code_sha256'],
+                                         'method': plan['method'], 'plan_sha256': hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()})
             self.event('checked-full-relabel', 'complete')
             self.remove_marker()
             return self.reboot(intent, observed['boot_id'])
@@ -324,6 +532,13 @@ class SELinuxBootstrap(Bootstrap):
         if not intent or not done:
             raise Blocked('checked relabel completion is missing; permissive state is insufficient')
         self.verify_installed(intent)
+        self.observe_transition_boot(intent, observed['boot_id'])
+        self.verify_completion(intent, done)
+        recorded_plan = self.state_json('relabel-plan')
+        current_plan = self.relabel_plan()
+        for field in ('persistent_filesystems', 'contexts', 'exclusion_config_sha256'):
+            if current_plan.get(field) != recorded_plan.get(field):
+                raise Blocked('persistent filesystem or labeling policy changed after relabel; no enforcement')
         if (done.get('code_sha256') != intent['code_sha256'] or done.get('boot_id') == intent['origin_boot_id']
                 or observed['boot_id'] in (intent['origin_boot_id'], done.get('boot_id'))):
             raise Blocked('enforcement requires a distinct post-relabel boot and matching checked evidence')

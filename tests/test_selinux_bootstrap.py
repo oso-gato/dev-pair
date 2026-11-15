@@ -26,11 +26,16 @@ class Runner:
         self.mode = 'Disabled'
         self.fail = None
         self.enforce_works = True
+        self.mount_uuid = {}
+        self.mount_root = {}
 
     def __call__(self, *args, ok=(0,), **kwargs):
         self.calls.append((args, kwargs))
         if self.fail and self.fail(args):
             raise s.Blocked('injected command failure')
+        if args[0] == '/usr/bin/findmnt':
+            return json.dumps({'filesystems': [{'uuid': self.mount_uuid.get(args[-1], '12345678-1234-1234-1234-123456789abc'),
+                                                'fsroot': self.mount_root.get(args[-1], '/')} ]})
         if args[:3] == ('/usr/bin/rpm', '-q', '--qf'):
             return 'policycoreutils\n'
         if args == ('/usr/sbin/getenforce',):
@@ -48,12 +53,16 @@ class SELinuxTests(unittest.TestCase):
         self.app = s.SELinuxBootstrap(self.root, self.run)
         for name, value in [('/etc/os-release', 'ID=fedora\nVERSION_ID=44\n'),
                             ('/proc/1/comm', 'systemd\n'),
-                            ('/usr/lib/systemd/system/selinux-autorelabel.service', 'fixture-vendor-unit'), ('/proc/cmdline', 'quiet root=UUID=fixture\n'),
+                            ('/proc/self/mounts', 'root / ext4 rw,seclabel 0 0\nproc /proc proc rw,nosuid 0 0\n'),
+                            ('/etc/selinux/targeted/contexts/files/file_contexts', 'fixture file contexts'),
+                            ('/usr/lib/systemd/system/selinux-autorelabel.service', 'fixture-vendor-unit'),
+                            ('/usr/sbin/setfiles', 'fixture-native-binary-not-runtime-evidence'), ('/proc/cmdline', 'quiet root=UUID=fixture\n'),
                             ('/proc/sys/kernel/random/boot_id', BOOT0), ('/etc/selinux/config', CONFIG),
                             ('/etc/selinux/targeted/policy/policy.33', 'fixture-policy-not-runtime-evidence')]:
             path = self.app.path(name)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(value)
+        self.app.path('/usr/sbin/setfiles').chmod(0o755)
         self.patch = patch.object(s.os, 'geteuid', return_value=0)
         self.patch.start()
         self.addCleanup(self.patch.stop)
@@ -93,7 +102,7 @@ class SELinuxTests(unittest.TestCase):
         self.app.relabel()
         self.assertFalse(self.app.path('/.autorelabel').exists())
         self.assertEqual(self.app.state_json('relabel-done')['boot_id'], BOOT1)
-        self.assertIn((('/usr/sbin/fixfiles', '-F', '-T', '1', 'restore'), {'timeout': 1800}), self.run.calls)
+        self.assertTrue(any(call[0][:7] == ('/usr/sbin/setfiles', '-E', '-C', '-F', '-I', '-T', '1') and call[1] == {'timeout': 1800} for call in self.run.calls))
         with self.assertRaises(s.Blocked):
             self.app.finalize()
         self.boot(BOOT2)
@@ -104,7 +113,7 @@ class SELinuxTests(unittest.TestCase):
         self.assertTrue(self.app.state_json('complete'))
         self.assertFalse(self.app.path(s.OVERRIDE).exists())
         self.app.converge(apply=True)
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/fixfiles']), 1)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 1)
         self.assertEqual(len([call for call in self.run.calls if call[0] == ('/usr/bin/systemctl', 'reboot')]), 2)
 
     def test_no_reboot_without_explicit_authorization_and_later_resume_is_automatic(self):
@@ -126,7 +135,7 @@ class SELinuxTests(unittest.TestCase):
         self.assertFalse(self.app.path(s.OVERRIDE).exists())
 
     def test_kernel_conflicts_bad_config_missing_policy_and_bad_digest_block(self):
-        for argument in ('selinux=0', 'enforcing=0', 'enforcing=1', 'lsm=landlock,apparmor', 'security=apparmor'):
+        for argument in ('selinux=0', 'enforcing=0', 'enforcing=1', 'lsm=landlock,apparmor', 'security=apparmor', 'autorelabel', 'autorelabel=0', 'systemd.unit=selinux-autorelabel.target'):
             self.app.path('/proc/cmdline').write_text(argument)
             with self.assertRaises(s.Blocked):
                 self.start()
@@ -162,7 +171,7 @@ class SELinuxTests(unittest.TestCase):
     def test_failed_relabel_never_records_completion_or_enforces_and_retries_are_bounded(self):
         self.start(reboot=True)
         self.boot(BOOT1)
-        self.run.fail = lambda args: args[0] == '/usr/sbin/fixfiles'
+        self.run.fail = lambda args: args[0] == '/usr/sbin/setfiles'
         for _ in range(2):
             with self.assertRaises(s.Blocked):
                 self.app.relabel()
@@ -172,12 +181,12 @@ class SELinuxTests(unittest.TestCase):
         self.assertFalse(self.app.state_json('relabel-done'))
         self.assertTrue(self.app.path('/.autorelabel').exists())
         self.assertFalse(any(call[0][0] == '/usr/sbin/setenforce' for call in self.run.calls))
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/fixfiles']), 2)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 2)
 
     def test_successful_retry_after_first_relabel_failure_and_marker_remove_interruption(self):
         self.start()
         self.boot(BOOT1)
-        self.run.fail = lambda args: args[0] == '/usr/sbin/fixfiles'
+        self.run.fail = lambda args: args[0] == '/usr/sbin/setfiles'
         with self.assertRaises(s.Blocked):
             self.app.relabel()
         self.run.fail = None
@@ -189,7 +198,7 @@ class SELinuxTests(unittest.TestCase):
         self.app.remove_marker = original
         self.app.relabel()
         self.assertFalse(self.app.path('/.autorelabel').exists())
-        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/fixfiles']), 2)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 2)
 
     def test_enforcement_command_readback_and_persistent_write_failures_never_disarm(self):
         self.relabel_done()
@@ -305,6 +314,166 @@ class SELinuxTests(unittest.TestCase):
         with self.assertRaises(s.Blocked):
             self.start()
         self.assertFalse(self.app.state_json('intent'))
+
+    def test_native_setfiles_failure_cannot_be_hidden_by_successful_cleanup(self):
+        self.start(reboot=True)
+        self.boot(BOOT1)
+        original = self.run
+        def native_failure(*args, **kwargs):
+            if args[0] == '/usr/sbin/setfiles':
+                # Real harmless nonzero child stands in for the native relabel syscall boundary.
+                return s.Commands()(sys.executable, '-c', 'import sys; sys.exit(23)', timeout=5)
+            return original(*args, **kwargs)
+        self.app.run = native_failure
+        with self.assertRaises(s.Blocked):
+            self.app.relabel()
+        self.assertFalse(self.app.state_json('relabel-done'))
+        self.assertFalse(self.app.state_json('complete'))
+        self.assertTrue(self.app.path('/.autorelabel').exists())
+        self.assertEqual(len([call for call in self.run.calls if call[0] == ('/usr/bin/systemctl', 'reboot')]), 1)
+        self.assertFalse(any(call[0][0] == '/usr/sbin/fixfiles' for call in self.run.calls))
+
+    def test_mount_selection_honors_seclabel_rw_exclusions_and_escaped_space(self):
+        for directory in ('/mnt/keep', '/mnt/read-only', '/mnt/data set'):
+            self.app.path(directory).mkdir(parents=True)
+        self.app.path('/proc/self/mounts').write_text(
+            'root / ext4 rw,seclabel 0 0\n'
+            'boot /boot ext4 rw,seclabel 0 0\n'
+            'data /mnt/data\\040set xfs rw,seclabel 0 0\n'
+            'disk /mnt/read-only ext4 ro,seclabel 0 0\n'
+            'proc /proc proc rw,nosuid 0 0\n')
+        self.app.path('/etc/selinux/fixfiles_exclude_dirs').write_text('# keep\nrelative\n/absent\n/mnt/keep\n')
+        self.start()
+        self.boot(BOOT1)
+        self.app.relabel()
+        plan = self.app.state_json('relabel-plan')
+        self.assertEqual(plan['mounts'], ['/', '/boot', '/mnt/data set'])
+        self.assertEqual(plan['excluded'], ['/mnt/keep', '/mnt/read-only'])
+        command = next(call[0] for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles')
+        self.assertIn(str(self.app.path('/mnt/data set')), command)
+        self.assertEqual(command.count('-e'), 2)
+        self.assertNotIn('-m', command)
+        self.assertEqual(self.app.state_json('relabel-done')['method'], 'checked-setfiles')
+
+    def test_no_root_label_coverage_readonly_critical_mount_or_critical_exclusion_blocks(self):
+        self.app.path('/proc/self/mounts').write_text('root / ext4 rw 0 0\n')
+        with self.assertRaises(s.Blocked):
+            self.app.relabel_plan()
+        self.app.path('/proc/self/mounts').write_text('root / ext4 rw,seclabel 0 0\nusr /usr ext4 ro,seclabel 0 0\n')
+        with self.assertRaises(s.Blocked):
+            self.app.relabel_plan()
+        self.app.path('/proc/self/mounts').write_text('root / ext4 rw,seclabel 0 0\nusr /usr/lib squashfs ro 0 0\n')
+        with self.assertRaises(s.Blocked):
+            self.app.relabel_plan()
+        self.app.path('/proc/self/mounts').write_text('root / ext4 rw,seclabel 0 0\nusr /usr/lib tmpfs rw,seclabel 0 0\n')
+        with self.assertRaises(s.Blocked):
+            self.app.relabel_plan()
+        self.app.path('/proc/self/mounts').write_text('root / ext4 rw,seclabel 0 0\nefi /boot/efi vfat ro 0 0\n')
+        self.app.relabel_plan()
+        self.app.path('/etc/selinux/fixfiles_exclude_dirs').write_text('/etc\n')
+        with self.assertRaises(s.Blocked):
+            self.app.relabel_plan()
+
+    def test_unexpected_later_relabel_boot_never_reboots_again(self):
+        self.start(reboot=True)
+        self.boot(BOOT1)
+        self.app.relabel()
+        before = len([call for call in self.run.calls if call[0] == ('/usr/bin/systemctl', 'reboot')])
+        for digit in ('2', '3', '4', '5', '6', '7'):
+            identity = digit * 8 + '-' + digit * 4 + '-' + digit * 4 + '-' + digit * 4 + '-' + digit * 12
+            self.boot(identity)
+            with self.assertRaises(s.Blocked):
+                self.app.relabel()
+        self.assertEqual(len([call for call in self.run.calls if call[0] == ('/usr/bin/systemctl', 'reboot')]), before)
+        self.assertLessEqual(len(self.app.state_json('boots')['ids']), 4)
+
+    def test_total_reboot_budget_cannot_reset_across_boots(self):
+        self.start(reboot=True)
+        intent = self.app.state_json('intent')
+        self.boot(BOOT1)
+        self.app.relabel()
+        self.app.record('reboots', {BOOT0: 3, BOOT1: 3})
+        with self.assertRaisesRegex(s.Blocked, 'budget'):
+            self.app.reboot(intent, BOOT1)
+        self.assertEqual(sum(self.app.state_json('reboots').values()), 6)
+
+    def test_post_done_marker_crash_consumes_only_one_extra_boot_and_auto_finalizes(self):
+        self.start(reboot=True)
+        self.boot(BOOT1)
+        original = self.app.remove_marker
+        self.app.remove_marker = lambda: (_ for _ in ()).throw(OSError('injected marker unlink crash'))
+        with self.assertRaises(OSError):
+            self.app.relabel()
+        self.assertTrue(self.app.state_json('relabel-done'))
+        self.assertTrue(self.app.path('/.autorelabel').exists())
+        self.app.remove_marker = original
+        self.boot(BOOT2)
+        self.app.relabel()
+        self.assertEqual(self.app.state_json('marker-recovery')['boot_id'], BOOT2)
+        self.assertFalse(self.app.path('/.autorelabel').exists())
+        self.boot('33333333-3333-3333-3333-333333333333')
+        self.app.finalize()
+        self.assertTrue(self.app.state_json('complete'))
+        self.assertEqual(len(self.app.state_json('boots')['ids']), 4)
+        self.assertEqual(len([call for call in self.run.calls if call[0][0] == '/usr/sbin/setfiles']), 1)
+
+    def test_marker_recovery_allowance_is_durable_before_unlink_and_cannot_reset(self):
+        self.relabel_done()
+        self.app.path('/.autorelabel').write_text('-F\n')
+        self.boot(BOOT2)
+        original = self.app.remove_marker
+        self.app.remove_marker = lambda: (_ for _ in ()).throw(OSError('injected recovery crash'))
+        with self.assertRaises(OSError):
+            self.app.relabel()
+        self.assertEqual(self.app.state_json('marker-recovery')['boot_id'], BOOT2)
+        self.app.remove_marker = original
+        self.boot('33333333-3333-3333-3333-333333333333')
+        with self.assertRaises(s.Blocked):
+            self.app.relabel()
+        self.assertEqual(self.app.state_json('marker-recovery')['boot_id'], BOOT2)
+        self.assertTrue(self.app.path('/.autorelabel').exists())
+
+    def test_malformed_done_evidence_never_removes_marker_or_reboots(self):
+        self.start(reboot=True)
+        self.boot(BOOT1)
+        self.app.record('relabel-done', {'method': 'checked-setfiles'})
+        before = self.app.text('/.autorelabel')
+        with self.assertRaises(s.Blocked):
+            self.app.converge(apply=True)
+        self.assertEqual(self.app.text('/.autorelabel'), before)
+        self.assertEqual(len([call for call in self.run.calls if call[0] == ('/usr/bin/systemctl', 'reboot')]), 1)
+
+    def test_new_transient_mount_after_relabel_is_allowed_but_new_persistent_mount_blocks(self):
+        self.relabel_done()
+        self.boot(BOOT2)
+        mounts = self.app.path('/proc/self/mounts')
+        mounts.write_text(mounts.read_text() + 'tmpfs /run/user/0 tmpfs rw,seclabel 0 0\n')
+        self.app.finalize()
+        self.assertTrue(self.app.state_json('complete'))
+
+    def test_changed_persistent_identity_subvolume_or_context_companion_blocks(self):
+        self.relabel_done()
+        self.boot(BOOT2)
+        root = str(self.app.path('/'))
+        for field in (self.run.mount_uuid, self.run.mount_root):
+            field[root] = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' if field is self.run.mount_uuid else '/different-subvolume'
+            with self.assertRaises(s.Blocked):
+                self.app.finalize()
+            field.clear()
+        mounts = self.app.path('/proc/self/mounts')
+        original = mounts.read_text()
+        mounts.write_text(original + 'disk /mnt/new ext4 rw,seclabel 0 0\n')
+        with self.assertRaises(s.Blocked):
+            self.app.finalize()
+        mounts.write_text(original)
+        for suffix in ('.local', '.homedirs', '.subs', '.subs_dist', '.bin'):
+            path = self.app.path('/etc/selinux/targeted/contexts/files/file_contexts' + suffix)
+            path.write_text('changed policy input')
+            with self.assertRaises(s.Blocked):
+                self.app.finalize()
+            path.unlink()
+        self.assertFalse(self.app.state_json('complete'))
+        self.assertFalse(any(call[0][0] == '/usr/sbin/setenforce' for call in self.run.calls))
 
     def test_reboot_failures_stay_pending_and_budget_is_bounded(self):
         self.run.fail = lambda args: args == ('/usr/bin/systemctl', 'reboot')
