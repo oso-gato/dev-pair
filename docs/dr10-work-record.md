@@ -1493,3 +1493,30 @@ is rejected before assignment and accepted afterward. Although201 repository
 tests pass, this violates the diagnostic-only no-budget-relaxation boundary.
 Candidate a742b98 is not published or executed. Review is consolidating findings;
 repair must preserve the original source runner semantics while adding metadata.
+
+
+The diagnostic review finalized CHANGES REQUIRED with that single P2 dispatch/
+capture-budget finding; all201 repository and11 other independent checks passed.
+Evidence: `/workspace/artifacts/fedora-prepare-failure-review-a742b98/review.json`.
+The sole builder repaired it in `7aa5ebae9f01f6f6d849f6c0285cffb641f6259a`,
+integrated byte-identically as `0dd70a5`. A separate Commands metadata hook keeps
+ProbeCommands.diagnostic unchanged and preserves original source dispatch,
+1048576-byte capture, timeout and cleanup semantics. A real actual-initializer
+source_check regression passes32-byte normal output and rejects1100000-byte
+output, preserving callbacks and withholding stream content. Builder202 tests
+passed35.064s; coordinator202 tests passed32.772s. Fresh API-configured Astra High
+`/root/fedora_diagnostic_budget_review` is reviewing the combined exact repair.
+No diagnostic candidate has yet been published or executed on Fedora.
+
+
+Fresh Astra High `/root/fedora_diagnostic_budget_review` returned PASS for exact
+`7aa5ebae9f01f6f6d849f6c0285cffb641f6259a`, no material findings. All 202 tests
+passed in 32.899s, with 24 independent checks. The actual source_check comparison
+reproduced the parent regression and proved repaired Commands dispatch: exactly
+1 MiB passes, 1 MiB+1 and 1.1 MB reject. Callback restoration, normal and failed
+status, exceptions, timeout, invalid UTF-8, sensitive stdin, orphan cleanup,
+native ownership/deadline and guest projection passed. Integration source bytes
+match. Evidence: `/workspace/artifacts/fedora-diagnostic-budget-review-7aa5eba/review.json`.
+This admits the next bounded diagnostic run only; the original Fedora preparation
+cause remains unknown. The run consumes the first of two repair attempts in the
+current hosted batch, with all resource/network/secrecy limits unchanged.
