@@ -87,6 +87,23 @@ class FedoraCITests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'deadline'):
             guest.capture([sys.executable, '-c', 'import time;time.sleep(5)'], timeout=.1)
 
+    def test_listener_inventory_is_bounded_diagnostic_with_explicit_failure(self):
+        def captured(argv, timeout):
+            self.assertEqual(timeout, 15)
+            if argv[0] == '/usr/bin/ss':
+                self.assertEqual(argv, ['/usr/bin/ss', '-H', '-lntup'])
+                return 1, b'x' * 4000 + b'\nlocal parser fixture only\n'
+            return 0, b''
+        with mock.patch.object(guest, 'capture', side_effect=captured):
+            observed = guest.diagnostics()['listener_inventory']
+        self.assertEqual(observed['exit_status'], 1)
+        self.assertEqual(len(observed['tail']), 3000)
+        self.assertTrue(observed['tail'].startswith('[truncated] '))
+        self.assertTrue(observed['tail'].endswith('local parser fixture only\n'))
+        with mock.patch.object(guest, 'capture', side_effect=ValueError('diagnostic deadline exceeded')):
+            observed = guest.diagnostics()['listener_inventory']
+        self.assertEqual(observed, {'status': 'unavailable', 'detail': 'diagnostic deadline exceeded'})
+
     def serial_result(self):
         return {'version': 1, 'source_sha': 'a' * 40, 'guest_sha256': 'b' * 64,
                 'phases': {key: {'status': 'blocked', 'detail': 'synthetic parser test only'} for key in

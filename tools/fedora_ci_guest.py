@@ -189,6 +189,7 @@ def baseline():
 def diagnostics():
     observed = {}
     for name, argv in (
+            ('listener_inventory', ['/usr/bin/ss', '-H', '-lntup']),
             ('startup_errors', ['/usr/bin/journalctl', '-b', '-p', 'err', '--no-pager', '-n', '30']),
             ('selinux_avcs', ['/usr/sbin/ausearch', '-m', 'AVC,USER_AVC', '-ts', 'boot', '--raw']),
             ('rpm_baseline', ['/usr/bin/rpm', '-q', 'kernel-core', 'selinux-policy-targeted', 'systemd', 'cloud-init', 'podman'])):
