@@ -1730,3 +1730,36 @@ Strict-config alone accepts unknown requirement keys. Same-owner bubblewrap
 fixtures cannot prove distinct root/job sticky ownership; direct binary
 reinvocation remains a loader-boundary design issue. No authentication, model
 call, true session resume or Fedora placement is claimed. Artifact1.4MiB,116files.
+
+
+### November16, 2026, 03:13 HKT — measured daemon-reload timeout
+
+[Run11](https://github.com/oso-gato/dev-pair/actions/runs/43750769082), job132923988447,
+published7284e77, passed220tests32.832s, signed/fresh public inputs, isolated
+networking and outer cleanup. The diagnostic goal succeeded: complete validated
+failure witness766bytes SHA256
+`df13ad6c983d4101e213d246590226716c2b4ef5b2e31ff111608d2e9e6b6732` identifies
+reload-manager timeout after5235ms, UID/EUID0, zero stderr. Script/request/unit
+installation and restorecon therefore completed; native service start was not
+reached. Dedicated report remained zero bytes and no guest-phase pass is accepted.
+Evidence: `/workspace/artifacts/fedora-ci-run-43750769082.log` and sibling
+`-controller.json`. This closes the one-run diagnostic scope.
+
+Measured failure justifies reallocating the fixed daemon-reload operation from
+5seconds to at most30seconds, still clipped to the original shared60-second
+admission deadline. All other caps, totalVM/service/resource budgets and security
+settings remain fixed. Sole Sol builder has a10-minute source/test slice from
+7284e77; fresh Astra High `/root/native_reload_budget_review` independently reviews
+its immutable result before one bounded hosted retest. A timed-out manager call
+does not prove a policy failure or guarantee30seconds will suffice. No policy
+change or unbounded retry is authorized.
+
+Additional offline stock Codex evidence identifies a minimal child boundary:
+managed restrictive read grants, explicit product writes, disabled networking
+and cleared child environment denied synthetic credential/supervisor-state reads
+while allowing product writes. Symlink/proc aliases failed. Even direct child
+Codex reinvocation requesting danger-full-access inherited the existing denial.
+Use exact measured profile rather than blanket CODEX_HOME denial, which conflicts
+with the stock helper directory. Actual agent tool-path wiring and Fedora/
+Distrobox execution remain unverified. No model/auth/network calls. Evidence:
+`/workspace/artifacts/codex-offline-child-boundary/REPORT.txt` and hash manifest.
