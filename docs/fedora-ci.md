@@ -8,8 +8,8 @@ Tooling construction reached its RPM report, with a stable overhead sample of
 1025351680 bytes. Monitoring then recorded GNU du exit1, no stdout total and an
 owned overlay `fts_read failed ... No such file or directory` error. This proves
 run4's failure cause; run3's oversized diagnostics remain unidentified. Cleanup
-passed. A bounded exact-error retry repair is underway, with absent totals never
-accepted as zero. No Fedora guest boot has occurred.
+passed. The exact-error retry repair passes 148 integrated tests and fresh review,
+awaiting runner retest; absent totals are never accepted as zero. No Fedora guest boot has occurred.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and

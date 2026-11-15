@@ -993,3 +993,14 @@ required for any provisional result and a stable total for phase completion.
 Unknown, permission, I/O and foreign-path errors remain immediate blockers.
 Fresh review precedes run5. Reassess after that result rather than silently
 continuing an unbounded CI repair loop. Independent source work remains possible.
+
+The fatal-traversal correction returned as
+`bf1d4a6f5ea72f0c7dac19cabf6eafce0055671b`, integrated as
+`a891946e4cd3ec6470b48b82c7635d0725304108`. All 148 integrated tests pass.
+Fresh Astra-configured High `/root/fedora_ci_fts_review` returned scoped PASS
+after all 25 CI tests plus independent foreign-prefix/traversal/mixed-error/
+permission/over-cap checks. Absent totals remain None, all-missing attempts
+block, maximum usable totals remain conservative and stable completion is
+required. All capture, scan, storage and component bounds are unchanged.
+Publish run5 as the final runtime attempt in the current repair batch; inspect
+its actual phases and explicitly reassess any further runtime work.
