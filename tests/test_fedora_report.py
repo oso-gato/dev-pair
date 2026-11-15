@@ -32,6 +32,8 @@ class FedoraReportTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = pathlib.Path(self.tmp.name)
         self.probe = ci.Probe('a' * 40, self.root)
+        self.probe.handoff = fixture_inputs()
+        self.probe.guest_sha = 'b' * 64
 
     def report(self):
         return {'version': guest.REPORT_VERSION, 'source_sha': 'a' * 40, 'guest_sha256': 'b' * 64,
@@ -50,6 +52,26 @@ class FedoraReportTests(unittest.TestCase):
         return [sys.executable, '-c', code, str(pipe.base) + '.out', base64.b64encode(data).decode(),
                 base64.b64encode(console).decode(), str(delay), 'hold' if held else 'no-hold',
                 str(self.root / 'escaped-writer'), str(exit_code)]
+
+    def test_real_console_failure_witness_is_retained_before_tail_with_empty_dedicated_pipe(self):
+        expected = fixture_inputs()
+        error = guest.ExecutorStagingError('restore-contexts', FileNotFoundError(2, 'test-only failure'), time.monotonic())
+        value = {'version': 1, 'operation': 'native-executor-staging', 'outcome': 'blocked',
+                 'source_sha': expected['source_sha'], 'controller_sha256': expected['controller_sha256'],
+                 'guest_sha256': 'b' * 64, 'requested_unit_sha256': ci.sha256(guest.service_unit(expected, 'b' * 64).encode()),
+                 'staging': error.fields, 'startup_properties': error.startup}
+        witness = guest.STARTUP_MARKER + json.dumps(value).encode() + b'\r\n'
+        with ci.ReportPipe(self.root) as pipe:
+            console, result = self.probe.bounded(self.writer(pipe, b'', b'boot\n' + witness + b'shutdown\n' * 5000),
+                                                5, 'local diagnostic-only writer', disk_check=False, report_pipe=pipe)
+        self.assertEqual(result, b'')
+        self.assertNotIn(guest.STARTUP_MARKER, console[-24000:])
+        retained = self.probe.report['startup_failure_witness']
+        self.assertEqual(retained['availability'], 'validated-failure-only')
+        self.assertEqual(base64.b64decode(retained['retained_base64']), witness)
+        self.assertEqual(self.probe.report['dedicated_report_witness']['retained_bytes'], 0)
+        with self.assertRaises(ci.Blocked):
+            ci.parse_serial(result, 'a' * 40, 'b' * 64, expected)
 
     def test_real_delayed_fragmented_fifo_writer_with_concurrent_console(self):
         frame = guest.encode_report(self.report())

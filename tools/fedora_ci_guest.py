@@ -110,12 +110,12 @@ def verify_executor_profile(observed):
 def executor_file(path, data, mode):
     path = pathlib.Path(path)
     require(path.is_absolute(), 'Executor file path must be absolute')
-    for parent in reversed(path.parents):
+    for position, parent in enumerate(reversed(path.parents)):
         if not parent.exists():
             parent.mkdir(mode=0o755)
         info = parent.lstat()
-        require(stat.S_ISDIR(info.st_mode) and not parent.is_symlink() and info.st_uid == 0 and not info.st_mode & 0o022,
-                'Executor path must be root-owned and protected')
+        if not (stat.S_ISDIR(info.st_mode) and not parent.is_symlink() and info.st_uid == 0 and not info.st_mode & 0o022):
+            raise ExecutorPathError(position, info)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
     with os.fdopen(fd, 'wb') as stream:
         os.fchmod(stream.fileno(), mode)
@@ -125,45 +125,140 @@ def executor_file(path, data, mode):
 
 
 def executor_control(argv, end):
-    # No cloud-init pipe FD is forwarded, including on start failure. No output
-    # or journal is captured here; subsequent service evidence is structured.
-    result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            env=SAFE_ENV, close_fds=True, start_new_session=True, timeout=remaining(end, 5))
-    require(result.returncode == 0, 'Fixed executor control operation rejected with exit' + str(result.returncode))
+    # Only these pre-credential fixed public operations may retain stderr. It
+    # goes to an owned size-limited regular file, never a forwarded stream pipe.
+    public = argv in (
+        ['/usr/sbin/restorecon', '-F', str(SERVICE_SCRIPT.parent), str(SERVICE_SCRIPT), str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT)],
+        ['/usr/bin/systemctl', 'daemon-reload'], ['/usr/bin/systemctl', '--no-block', 'start', SERVICE_NAME])
+    with contextlib.ExitStack() as stack:
+        stderr = subprocess.DEVNULL
+        limit = None
+        if public:
+            info = SERVICE_REQUEST.parent.lstat()
+            require(stat.S_ISDIR(info.st_mode) and not SERVICE_REQUEST.parent.is_symlink() and info.st_uid == os.geteuid() and not info.st_mode & 0o022,
+                    'Unsafe executor diagnostic directory')
+            stderr = stack.enter_context(tempfile.TemporaryFile(dir=SERVICE_REQUEST.parent))
+            require(stat.S_ISREG(os.fstat(stderr.fileno()).st_mode) and stat.S_IMODE(os.fstat(stderr.fileno()).st_mode) == 0o600, 'Unsafe executor diagnostic file')
+            def limit():
+                resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+        def diagnostic():
+            if not public:
+                return None
+            stderr.seek(0)
+            data = stderr.read(4097)
+            require(len(data) <= 4096, 'Executor diagnostic file bound exceeded')
+            return {'captured_bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+                    'capture_limit_reached': len(data) == 4096, 'tail': safe_text(data, 768), 'tail_truncated': len(data) > 768}
+        try:
+            result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+                                    env=SAFE_ENV, close_fds=True, start_new_session=True, preexec_fn=limit, timeout=remaining(end, 5))
+        except subprocess.TimeoutExpired as error:
+            error.public_diagnostic = diagnostic()
+            raise
+        if result.returncode != 0:
+            raise ExecutorControlError(result.returncode, diagnostic())
+
+
+STAGING_OPERATIONS = ('root-identity', 'script-snapshot', 'source-identity', 'render-unit', 'launcher-context',
+                      'install-script', 'install-request', 'install-unit', 'restore-contexts', 'reload-manager',
+                      'start-service', 'observe-startup')
+STARTUP_MARKER = b'DP_NATIVE_START_BLOCKED '
+
+
+class ExecutorControlError(ValueError):
+    def __init__(self, status, diagnostic=None):
+        super().__init__('Fixed executor control operation rejected')
+        self.status = status
+        self.public_diagnostic = diagnostic
+
+
+class ExecutorPathError(ValueError):
+    def __init__(self, position, info):
+        super().__init__('Executor path must be root-owned and protected')
+        self.metadata = {'position': position, **path_metadata(info)}
+
+
+def path_metadata(info):
+    return {'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode),
+            'type': stat.S_IFMT(info.st_mode), 'bytes': info.st_size}
+
+
+class ExecutorStagingError(ValueError):
+    def __init__(self, operation, error, started):
+        super().__init__('Fixed staging operation rejected: ' + operation)
+        self.fields = {'step': operation, 'kind': 'validation', 'errno': None, 'exit_status': None,
+                       'elapsed_ms': min(60000, max(0, int((time.monotonic() - started) * 1000))),
+                       'uid': os.getuid(), 'euid': os.geteuid()}
+        self.startup = error.fields if isinstance(error, ExecutorStartupError) else {'availability': 'unavailable'}
+        if isinstance(error, ExecutorControlError):
+            self.fields.update(kind='control-exit', exit_status=error.status)
+        elif isinstance(error, subprocess.TimeoutExpired):
+            self.fields['kind'] = 'timeout'
+        elif isinstance(error, OSError):
+            self.fields.update(kind='os-error', errno=error.errno)
+        elif isinstance(error, ExecutorStartupError):
+            self.fields.update(kind='startup-observation', exit_status=error.query_exit_status)
+        if isinstance(error, ExecutorPathError):
+            self.fields['path_metadata'] = error.metadata
+        if getattr(error, 'public_diagnostic', None) is not None:
+            self.fields['control_diagnostic'] = error.public_diagnostic
 
 
 def stage_executor(expected, guest_sha):
-    require(os.getuid() == os.geteuid() == 0, 'Native provisioning staging requires root')
-    end = time.monotonic() + GUEST_ADMISSION_SECONDS
-    script = read_bytes(pathlib.Path(__file__), 1024 ** 2)
-    require(hashlib.sha256(script).hexdigest() == guest_sha, 'Staging script differs from controller target')
-    unit = service_unit(expected, guest_sha).encode()
-    request = {'version': 1, 'source_sha': expected['source_sha'], 'inputs': expected, 'guest_sha256': guest_sha,
-               'unit_sha256': hashlib.sha256(unit).hexdigest(), 'launcher_context': observed_context(pathlib.Path('/proc/self/attr/current').read_text()),
-               'admission_deadline': end}
-    executor_file(SERVICE_SCRIPT, script, 0o444)
-    executor_file(SERVICE_REQUEST, json.dumps(request, sort_keys=True).encode() + b'\n', 0o600)
-    executor_file(SERVICE_UNIT, unit, 0o644)
-    executor_control(['/usr/sbin/restorecon', '-F', str(SERVICE_SCRIPT.parent), str(SERVICE_SCRIPT),
-                      str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT)], end)
-    executor_control(['/usr/bin/systemctl', 'daemon-reload'], end)
-    executor_control(['/usr/bin/systemctl', '--no-block', 'start', SERVICE_NAME], end)
-    observe_executor_start(end)
-    return request
+    started = time.monotonic()
+    end = started + GUEST_ADMISSION_SECONDS
+    operation = 'root-identity'
+    try:
+        require(os.getuid() == os.geteuid() == 0, 'Native provisioning staging requires root')
+        operation = 'script-snapshot'
+        script = read_bytes(pathlib.Path(__file__), 1024 ** 2)
+        operation = 'source-identity'
+        require(hashlib.sha256(script).hexdigest() == guest_sha, 'Staging script differs from controller target')
+        operation = 'render-unit'
+        unit = service_unit(expected, guest_sha).encode()
+        operation = 'launcher-context'
+        context = observed_context(pathlib.Path('/proc/self/attr/current').read_text())
+        request = {'version': 1, 'source_sha': expected['source_sha'], 'inputs': expected, 'guest_sha256': guest_sha,
+                   'unit_sha256': hashlib.sha256(unit).hexdigest(), 'launcher_context': context, 'admission_deadline': end}
+        operation = 'install-script'
+        executor_file(SERVICE_SCRIPT, script, 0o444)
+        operation = 'install-request'
+        executor_file(SERVICE_REQUEST, json.dumps(request, sort_keys=True).encode() + b'\n', 0o600)
+        operation = 'install-unit'
+        executor_file(SERVICE_UNIT, unit, 0o644)
+        operation = 'restore-contexts'
+        executor_control(['/usr/sbin/restorecon', '-F', str(SERVICE_SCRIPT.parent), str(SERVICE_SCRIPT),
+                          str(SERVICE_REQUEST.parent), str(SERVICE_REQUEST), str(SERVICE_UNIT)], end)
+        operation = 'reload-manager'
+        executor_control(['/usr/bin/systemctl', 'daemon-reload'], end)
+        operation = 'start-service'
+        executor_control(['/usr/bin/systemctl', '--no-block', 'start', SERVICE_NAME], end)
+        operation = 'observe-startup'
+        observe_executor_start(end)
+        return request
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        raise ExecutorStagingError(operation, error, started) from None
 
 
 class ExecutorStartupError(ValueError):
-    def __init__(self, fields):
+    def __init__(self, fields, query_exit_status=None):
         super().__init__('Native startup observation failed')
         self.fields = fields
+        self.query_exit_status = query_exit_status
+
+
+def startup_properties():
+    return tuple(dict.fromkeys(('MainPID', 'User', 'ActiveState', 'LoadState', 'Result', 'ExecMainCode',
+                               'ExecMainStatus', 'FragmentPath', *executor_profile())))
 
 
 def observe_executor_start(end):
     # A plain selected-property query forwards no stream FDs over D-Bus.
     # Its stdout goes to an owned bounded regular file, not a cloud-init pipe.
     stop = min(end, time.monotonic() + 5)
-    properties = tuple(dict.fromkeys(('MainPID', 'User', 'ActiveState', 'LoadState', 'Result', 'ExecMainCode', 'ExecMainStatus', 'FragmentPath', *executor_profile())))
+    properties = startup_properties()
     observed = {}
+    query_exit_status = None
     while time.monotonic() < stop:
         parent = SERVICE_REQUEST.parent
         info = parent.lstat()
@@ -178,6 +273,7 @@ def observe_executor_start(end):
             output.seek(0)
             data = output.read(4097)
             require(len(data) <= 4096, 'Native startup property byte limit exceeded')
+        query_exit_status = result.returncode
         observed = dict(line.split('=', 1) for line in data.decode('utf-8').splitlines() if '=' in line)
         if result.returncode == 0 and observed.get('ActiveState') == 'active':
             if (observed.get('User') == 'root' and observed.get('FragmentPath') == str(SERVICE_UNIT) and
@@ -191,13 +287,52 @@ def observe_executor_start(end):
         if observed.get('ActiveState') == 'failed' or observed.get('LoadState') in ('error', 'bad-setting', 'not-found'):
             break
         time.sleep(min(.05, max(0, stop - time.monotonic())))
-    raise ExecutorStartupError({key: safe_text(observed.get(key, 'unavailable'), 100) for key in properties})
+    raise ExecutorStartupError({key: safe_text(observed.get(key, 'unavailable'), 64) for key in properties}, query_exit_status)
+
+
+def validate_startup_witness(value, expected, guest_sha):
+    # This is failure evidence only. It supplies no native process or phase pass.
+    keys = {'version', 'operation', 'outcome', 'source_sha', 'controller_sha256', 'guest_sha256',
+            'requested_unit_sha256', 'startup_properties', 'staging'}
+    require(type(value) is dict and set(value) == keys and type(value['version']) is int and value['version'] == 1 and
+            value['operation'] == 'native-executor-staging' and value['outcome'] == 'blocked', 'Invalid startup witness envelope')
+    require(value['source_sha'] == expected['source_sha'] and value['controller_sha256'] == expected['controller_sha256'] and
+            value['guest_sha256'] == guest_sha and value['requested_unit_sha256'] == hashlib.sha256(service_unit(expected, guest_sha).encode()).hexdigest(),
+            'Startup witness target mismatch')
+    metadata = value['staging']
+    required = {'step', 'kind', 'errno', 'exit_status', 'elapsed_ms', 'uid', 'euid'}
+    require(type(metadata) is dict and required <= set(metadata) <= required | {'path_metadata', 'control_diagnostic'} and
+            metadata['step'] in STAGING_OPERATIONS and metadata['kind'] in ('validation', 'control-exit', 'timeout', 'os-error', 'startup-observation', 'unavailable') and
+            type(metadata['elapsed_ms']) is int and 0 <= metadata['elapsed_ms'] <= 60000 and
+            all(type(metadata[key]) is int and 0 <= metadata[key] < 2 ** 32 for key in ('uid', 'euid')) and
+            (metadata['errno'] is None or type(metadata['errno']) is int and 0 <= metadata['errno'] < 65536) and
+            (metadata['exit_status'] is None or type(metadata['exit_status']) is int and -128 <= metadata['exit_status'] <= 255), 'Invalid fixed staging metadata')
+    if 'path_metadata' in metadata:
+        path = metadata['path_metadata']
+        require(type(path) is dict and set(path) == {'position', 'uid', 'gid', 'mode', 'type', 'bytes'} and
+                all(type(item) is int and 0 <= item < 2 ** 63 for item in path.values()) and path['position'] < 16 and
+                path['mode'] <= 0o7777 and path['type'] in (stat.S_IFDIR, stat.S_IFREG, stat.S_IFLNK, stat.S_IFCHR, stat.S_IFBLK, stat.S_IFIFO, stat.S_IFSOCK),
+                'Invalid selected path metadata')
+    if 'control_diagnostic' in metadata:
+        diagnostic = metadata['control_diagnostic']
+        require(type(diagnostic) is dict and set(diagnostic) == {'captured_bytes', 'sha256', 'capture_limit_reached', 'tail', 'tail_truncated'} and
+                type(diagnostic['captured_bytes']) is int and 0 <= diagnostic['captured_bytes'] <= 4096 and
+                type(diagnostic['sha256']) is str and re.fullmatch('[0-9a-f]{64}', diagnostic['sha256']) and
+                type(diagnostic['capture_limit_reached']) is bool and type(diagnostic['tail_truncated']) is bool and
+                type(diagnostic['tail']) is str and len(diagnostic['tail']) <= 768 and
+                metadata['step'] in ('restore-contexts', 'reload-manager', 'start-service') and metadata['kind'] in ('control-exit', 'timeout') and
+                value['startup_properties'] == {'availability': 'unavailable'}, 'Invalid fixed public control diagnostic')
+    properties = value['startup_properties']
+    require(type(properties) is dict and (properties == {'availability': 'unavailable'} or
+            set(properties) == set(startup_properties()) and all(type(item) is str and len(item) <= 64 and all(32 <= ord(c) < 127 for c in item) for item in properties.values())),
+            'Invalid selected startup properties')
+    return value
 
 
 def write_startup_failure(witness):
     # A failure-only console witness is never a native result or console salvage.
     # Missing dedicated report still fails controller admission.
-    data = ('DP_NATIVE_START_BLOCKED ' + json.dumps(witness, sort_keys=True, ensure_ascii=True) + '\n').encode()
+    data = STARTUP_MARKER + json.dumps(witness, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode() + b'\n'
     require(len(data) <= 4096, 'Startup witness byte limit exceeded')
     fd = os.open('/dev/ttyS0', os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK | os.O_NOFOLLOW)
     try:
@@ -695,11 +830,12 @@ def main():
         try:
             stage_executor(expected, args.guest_sha256)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            write_startup_failure({'operation': 'native-executor-staging', 'outcome': 'blocked',
+            write_startup_failure({'version': 1, 'operation': 'native-executor-staging', 'outcome': 'blocked',
                                    'source_sha': args.source, 'controller_sha256': expected['controller_sha256'],
                                    'guest_sha256': args.guest_sha256,
                                    'requested_unit_sha256': hashlib.sha256(service_unit(expected, args.guest_sha256).encode()).hexdigest(),
-                                   'startup_properties': error.fields if isinstance(error, ExecutorStartupError) else {'availability': 'unavailable'}})
+                                   'startup_properties': error.startup if isinstance(error, ExecutorStagingError) else error.fields if isinstance(error, ExecutorStartupError) else {'availability': 'unavailable'},
+                                   'staging': error.fields if isinstance(error, ExecutorStagingError) else {'step': 'observe-startup', 'kind': 'unavailable', 'errno': None, 'exit_status': None, 'elapsed_ms': 0, 'uid': os.getuid(), 'euid': os.geteuid()}})
         return
     phases = {name: {'status': 'blocked', 'detail': 'Prerequisite not completed'} for name in GUEST_PHASES}
     report = {'version': REPORT_VERSION, 'source_sha': args.source, 'guest_sha256': args.guest_sha256,

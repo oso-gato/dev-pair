@@ -80,7 +80,7 @@ class FedoraExecutorTests(unittest.TestCase):
             write.assert_not_called()
         with mock.patch.object(guest.os, 'getuid', return_value=0), mock.patch.object(guest.os, 'geteuid', return_value=0), \
                 mock.patch.object(guest, 'executor_file') as write:
-            with self.assertRaisesRegex(ValueError, 'controller target'):
+            with self.assertRaisesRegex(guest.ExecutorStagingError, 'source-identity'):
                 guest.stage_executor(inputs(), 'b' * 64)
             write.assert_not_called()
 
@@ -128,6 +128,7 @@ class FedoraExecutorTests(unittest.TestCase):
             with self.assertRaises(guest.ExecutorStartupError) as caught:
                 guest.observe_executor_start(time.monotonic() + 10)
         self.assertEqual(caught.exception.fields['ExecMainStatus'], '203')
+        self.assertEqual(caught.exception.query_exit_status, 0)
         argv = ['guest.py', '--stage-systemd', '--source', 'a' * 40, '--inputs-json', json.dumps(inputs()), '--guest-sha256', 'b' * 64]
         with mock.patch.object(sys, 'argv', argv), mock.patch.object(guest, 'stage_executor', side_effect=caught.exception), \
                 mock.patch.object(guest, 'write_startup_failure') as witness, mock.patch.object(guest, 'write_report') as report:
@@ -135,6 +136,135 @@ class FedoraExecutorTests(unittest.TestCase):
         report.assert_not_called()
         self.assertEqual(witness.call_args.args[0]['outcome'], 'blocked')
         self.assertEqual(witness.call_args.args[0]['startup_properties']['ExecMainStatus'], '203')
+
+    def staging_fixture(self):
+        stack = __import__('contextlib').ExitStack()
+        stack.enter_context(mock.patch.object(guest.os, 'getuid', return_value=0))
+        stack.enter_context(mock.patch.object(guest.os, 'geteuid', return_value=0))
+        stack.enter_context(mock.patch.object(guest.pathlib.Path, 'read_text', return_value='system_u:system_r:cloud_init_t:s0\x00'))
+        self.addCleanup(stack.close)
+        return stack
+
+    def test_real_missing_control_executable_records_fixed_step_and_errno_without_exception_text(self):
+        self.staging_fixture()
+        actual_control = guest.executor_control
+        def missing(args, end):
+            actual_control([str(self.root / 'synthetic-secret-not-an-executable')], end)
+        with mock.patch.object(guest, 'executor_file'), mock.patch.object(guest, 'executor_control', side_effect=missing):
+            with self.assertRaises(guest.ExecutorStagingError) as caught:
+                guest.stage_executor(inputs(), guest.digest(Path(guest.__file__)))
+        self.assertEqual(caught.exception.fields['step'], 'restore-contexts')
+        self.assertEqual(caught.exception.fields['kind'], 'os-error')
+        self.assertEqual(caught.exception.fields['errno'], 2)
+        self.assertNotIn('synthetic-secret', json.dumps(caught.exception.fields))
+
+    def test_real_control_exit_and_timeout_keep_status_but_discard_output_and_arguments(self):
+        for code, kind, status in (("print('synthetic-secret');raise SystemExit(7)", 'control-exit', 7),
+                                   ("import time;print('synthetic-secret');time.sleep(2)", 'timeout', None)):
+            started = time.monotonic()
+            try:
+                guest.executor_control([sys.executable, '-c', code], started + .1)
+            except (ValueError, subprocess.SubprocessError) as error:
+                classified = guest.ExecutorStagingError('reload-manager', error, started)
+            else:
+                self.fail('Real bounded control did not reject')
+            self.assertEqual(classified.fields['kind'], kind)
+            self.assertEqual(classified.fields['exit_status'], status)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertNotIn('synthetic-secret', json.dumps(classified.fields))
+
+    def test_real_untrusted_parent_metadata_preserves_denial_without_raw_path(self):
+        self.staging_fixture()
+        with mock.patch.object(guest, 'SERVICE_SCRIPT', self.root / 'guest.py'):
+            with self.assertRaises(guest.ExecutorStagingError) as caught:
+                guest.stage_executor(inputs(), guest.digest(Path(guest.__file__)))
+        metadata = caught.exception.fields
+        self.assertEqual(metadata['step'], 'install-script')
+        self.assertEqual(metadata['kind'], 'validation')
+        self.assertIn('path_metadata', metadata)
+        self.assertNotIn(str(self.root), json.dumps(metadata))
+        self.assertFalse((self.root / 'guest.py').exists())
+
+    def test_fixed_public_control_stderr_uses_real_bounded_regular_file_and_ordinary_commands_stay_withheld(self):
+        original = subprocess.run
+        request = self.root / 'request.json'
+        code = "import os; os.write(2,b'fixed public control failure\\n'+b'x'*900);raise SystemExit(7)"
+        def real_child(args, **kwargs):
+            self.assertTrue(stat.S_ISREG(os.fstat(kwargs['stderr'].fileno()).st_mode))
+            self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
+            return original([sys.executable, '-c', code], **kwargs)
+        with mock.patch.object(guest, 'SERVICE_REQUEST', request), mock.patch.object(guest.subprocess, 'run', side_effect=real_child):
+            with self.assertRaises(guest.ExecutorControlError) as caught:
+                guest.executor_control(['/usr/bin/systemctl', 'daemon-reload'], time.monotonic() + 5)
+        diagnostic = caught.exception.public_diagnostic
+        self.assertEqual(caught.exception.status, 7)
+        self.assertEqual(diagnostic['captured_bytes'], 929)
+        self.assertTrue(diagnostic['tail_truncated'])
+        self.assertLessEqual(len(diagnostic['tail']), 768)
+        self.assertEqual(list(self.root.iterdir()), [])
+        error = guest.ExecutorStagingError('reload-manager', caught.exception, time.monotonic())
+        self.assertEqual(error.fields['control_diagnostic'], diagnostic)
+
+    def test_fixed_control_real_child_cannot_grow_diagnostic_beyond_native_file_ceiling(self):
+        original = subprocess.run
+        def oversized(args, **kwargs):
+            return original([sys.executable, '-c', "import os;os.write(2,b'x'*10000);raise SystemExit(7)"], **kwargs)
+        with mock.patch.object(guest, 'SERVICE_REQUEST', self.root / 'request.json'), mock.patch.object(guest.subprocess, 'run', side_effect=oversized):
+            with self.assertRaises(guest.ExecutorControlError) as caught:
+                guest.executor_control(['/usr/bin/systemctl', 'daemon-reload'], time.monotonic() + 5)
+        self.assertEqual(caught.exception.public_diagnostic['captured_bytes'], 4096)
+        self.assertTrue(caught.exception.public_diagnostic['capture_limit_reached'])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_main_staging_failure_keeps_exact_fixed_operation_and_no_sensitive_exception(self):
+        self.staging_fixture()
+        argv = ['guest.py', '--stage-systemd', '--source', 'a' * 40, '--inputs-json', json.dumps(inputs()),
+                '--guest-sha256', guest.digest(Path(guest.__file__))]
+        with mock.patch.object(sys, 'argv', argv), mock.patch.object(guest, 'executor_file', side_effect=PermissionError(13, 'synthetic-secret', '/private/synthetic-secret')), \
+                mock.patch.object(guest, 'write_startup_failure') as capture, mock.patch.object(guest, 'write_report') as report:
+            guest.main()
+        value = capture.call_args.args[0]
+        guest.validate_startup_witness(value, inputs(), argv[-1])
+        self.assertEqual(value['staging']['step'], 'install-script')
+        self.assertEqual(value['staging']['errno'], 13)
+        self.assertNotIn('synthetic-secret', json.dumps(value))
+        report.assert_not_called()
+
+    def test_maximum_escaped_selected_failure_witness_fits_unchanged_console_cap(self):
+        expected = inputs()
+        error = guest.ExecutorStartupError({key: '"' * 64 for key in guest.startup_properties()}, 0)
+        failure = guest.ExecutorStagingError('observe-startup', error, time.monotonic() - 60)
+        failure.fields['path_metadata'] = {'position': 15, 'uid': 4294967295, 'gid': 4294967295,
+                                           'mode': 0o7777, 'type': stat.S_IFDIR, 'bytes': 2 ** 63 - 1}
+        value = {'version': 1, 'operation': 'native-executor-staging', 'outcome': 'blocked',
+                 'source_sha': expected['source_sha'], 'controller_sha256': expected['controller_sha256'],
+                 'guest_sha256': 'b' * 64, 'requested_unit_sha256': hashlib.sha256(guest.service_unit(expected, 'b' * 64).encode()).hexdigest(),
+                 'staging': failure.fields, 'startup_properties': failure.startup}
+        guest.validate_startup_witness(value, expected, 'b' * 64)
+        data = guest.STARTUP_MARKER + json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(',', ':')).encode() + b'\n'
+        self.assertLessEqual(len(data), 4096)
+        self.assertEqual(ci.startup_witness(data, expected, 'b' * 64)['diagnostic'], value)
+
+    def test_failure_witness_survives_shutdown_tail_and_cannot_supply_a_report(self):
+        expected = inputs()
+        failure = guest.ExecutorStagingError('restore-contexts', FileNotFoundError(2, 'synthetic-secret'), time.monotonic())
+        value = {'version': 1, 'operation': 'native-executor-staging', 'outcome': 'blocked',
+                 'source_sha': expected['source_sha'], 'controller_sha256': expected['controller_sha256'],
+                 'guest_sha256': 'b' * 64, 'requested_unit_sha256': hashlib.sha256(guest.service_unit(expected, 'b' * 64).encode()).hexdigest(),
+                 'staging': failure.fields, 'startup_properties': failure.startup}
+        encoded = guest.STARTUP_MARKER + json.dumps(value).encode() + b'\r\n'
+        console = b'boot\n' + encoded + b'shutdown\n' * 5000
+        captured = ci.startup_witness(console, expected, 'b' * 64)
+        self.assertEqual(captured['availability'], 'validated-failure-only')
+        self.assertEqual(captured['diagnostic'], value)
+        self.assertEqual(__import__('base64').b64decode(captured['retained_base64']), encoded)
+        self.assertNotIn(guest.STARTUP_MARKER, console[-24000:])
+        with self.assertRaises(ci.Blocked):
+            ci.parse_serial(encoded, expected['source_sha'], 'b' * 64, expected)
+        for bad in (console + encoded, encoded[:50], encoded.replace(b'"blocked"', b'"pass"'),
+                    encoded.replace(expected['source_sha'].encode(), b'f' * 40), guest.STARTUP_MARKER + b'x' * 4096 + b'\n', guest.STARTUP_MARKER + b'[' * 1500 + b']' * 1500 + b'\n'):
+            self.assertNotEqual(ci.startup_witness(bad, expected, 'b' * 64)['availability'], 'validated-failure-only')
+        self.assertNotIn('synthetic-secret', json.dumps(captured))
 
     def test_captured_proc_context_terminator_is_normalized_but_malformed_or_cloud_init_proof_rejects(self):
         self.assertEqual(guest.observed_context('system_u:system_r:cloud_init_t:s0\x00'), 'system_u:system_r:cloud_init_t:s0')

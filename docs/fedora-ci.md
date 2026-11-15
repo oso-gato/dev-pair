@@ -81,6 +81,24 @@ contains adopted standards identities, never private standards text.
    only a bounded console diagnostic and requests shutdown; it cannot replace a report.
    Staged files persist only inside the disposable VM. Observation files are bounded
    anonymous owned regular files and close on every query exit.
+   Staging failure diagnostics identify a fixed operation (root/source/context checks,
+   each file installation, restorecon, reload, start or observation), numeric errno,
+   actual control/query exit status or timeout, real/effective UID and elapsed time. A rejected parent
+   exports only its component index and UID/GID/mode/type/size; no raw path, exception,
+   argv or environment is exported. Only the three exact pre-credential public
+   restorecon/reload/start operations may retain stderr, in an owned anonymous
+   regular file with a native4096-byte file ceiling; stdout remains null and no
+   stream is forwarded. Failure evidence exports a768-character tail, captured
+   byte count/hash and explicit capture-ceiling/tail-truncation flags; it does not
+   claim bytes beyond the ceiling were observed. Other commands remain withheld.
+   No journal is queried. Manager property values retain
+   explicit64-character tails within the unchanged4096-byte console witness cap.
+   The controller scans its already bounded console before tail truncation, verifies
+   the witness schema and exact source/controller/script/unit targets, and retains
+   the complete validated failure bytes and hash. Missing/partial/ambiguous witnesses
+   remain unavailable diagnostics. This path never supplies phase or native executor
+   acceptance and does not replace the dedicated report. Run10's generic staging
+   failure does not establish a package, permission, label or drop-in cause.
    Observe actual Fedora44, Enforcing policy, systemd/cgroupv2 and >=8GiB free.
    Admit the public inputs and run actual pre-initialization inspect/status.
    Generate a disposable password only inside the root guest in a private0700

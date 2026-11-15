@@ -24,7 +24,7 @@ import time
 import urllib.request
 
 from fedora_ci_guest import (REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS,
-                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor)
+                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor, STARTUP_MARKER, validate_startup_witness)
 import public_inputs as public
 
 GIB = 1024 ** 3
@@ -431,6 +431,31 @@ def seed_data(source, inputs, guest_sha):
             'runcmd:\n  - ' + json.dumps(command) + '\n')
 
 
+def startup_witness(console, expected_inputs, expected_guest):
+    # Scan the already aggregate-bounded console before diagnostic tail truncation.
+    # Neither a valid failure witness nor any console bytes can satisfy parse_serial.
+    count = console.count(STARTUP_MARKER)
+    evidence = {'availability': 'absent' if not count else 'ambiguous' if count != 1 else 'invalid', 'markers': count}
+    if count != 1:
+        return evidence
+    start = console.index(STARTUP_MARKER)
+    window = console[start:start + 4097]
+    end = window.find(b'\n')
+    if end < 0 or end + 1 > 4096:
+        evidence['availability'] = 'partial-or-excessive'
+        return evidence
+    data = window[:end + 1]
+    evidence.update(bytes=len(data), sha256=sha256(data))
+    try:
+        value = json.loads(data[len(STARTUP_MARKER):], object_pairs_hook=unique_object)
+        evidence['diagnostic'] = validate_startup_witness(value, expected_inputs, expected_guest)
+        evidence['availability'] = 'validated-failure-only'
+        evidence['retained_base64'] = base64.b64encode(data).decode()
+    except (ValueError, UnicodeError, TypeError, RecursionError):
+        pass
+    return evidence
+
+
 def parse_serial(data, expected_source, expected_guest, expected_inputs):
     # Treat serial assertions as candidate-controlled test evidence. Require
     # one complete result, exact identities and every requested phase.
@@ -693,6 +718,7 @@ class Probe:
             process.stdout.close()
             if report_pipe is not None:
                 report_pipe.release_keeper()
+                self.report['startup_failure_witness'] = startup_witness(bytes(log), self.handoff, self.guest_sha)
                 self.report['dedicated_report_witness'] = report_witness(bytes(report_pipe.data), report_pipe.overflow)
                 self.report['dedicated_report_witness']['aggregate_limit_exceeded'] = self.log_used > LOG_LIMIT
                 self.report['dedicated_report_witness']['executor_exit_status'] = process.poll()
