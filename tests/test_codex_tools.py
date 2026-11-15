@@ -124,12 +124,69 @@ class OfflineTools(unittest.TestCase):
             self.assertIsNotNone(process.poll())
 
     def test_real_subreaper_stops_and_reaps_detached_owned_descendant(self):
-        code=('import sys,subprocess,ctypes,time,os;sys.path.insert(0,sys.argv[1]);import codex_tools as t;'
-              'assert ctypes.CDLL(None).prctl(36,1,0,0,0)==0;'
-              'p=subprocess.Popen([sys.executable,"-c","import os,time;pid=os.fork();os._exit(0) if pid else None;os.setsid();time.sleep(10)"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);'
-              'p.wait(timeout=2);t.reap_owned(time.monotonic()+2);print("reaped")')
-        result=subprocess.run([sys.executable,'-c',code,str(Path(t.__file__).parent)],capture_output=True,timeout=4)
-        self.assertEqual((result.returncode,result.stdout),(0,b'reaped\n'))
+        # Handshake proves a real detached/adopted child before cleanup.
+        # Scope this positive fixture's process inventory to that kernel task;
+        # the separate exhaustion test covers the unchanged global scan bound.
+        code = """
+import ctypes, os, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import codex_tools as t
+assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
+read_fd, write_fd = os.pipe()
+child = ('import os,time,sys;pid=os.fork();os._exit(0) if pid else None;'
+         'os.setsid();os.write(int(sys.argv[1]),str(os.getpid()).encode()+bytes([10]));'
+         'os.close(int(sys.argv[1]));time.sleep(10)')
+p = subprocess.Popen([sys.executable, '-I', '-c', child, str(write_fd)],
+                     pass_fds=(write_fd,), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+os.close(write_fd)
+owned_pid = int(os.read(read_fd, 64))
+os.close(read_fd)
+p.wait(timeout=2)
+assert owned_pid != p.pid and os.getsid(owned_pid) == owned_pid
+with open('/proc/' + str(owned_pid) + '/status') as source:
+    parents = [line.split()[1] for line in source if line.startswith('PPid:')]
+assert parents == [str(os.getpid())], parents
+real_scandir = t.os.scandir
+def owned_inventory(path):
+    assert path == '/proc'
+    return real_scandir('/proc/' + str(owned_pid) + '/task')
+t.os.scandir = owned_inventory
+t.reap_owned(time.monotonic() + 2)
+assert not os.path.exists('/proc/' + str(owned_pid))
+try:
+    os.waitpid(-1, os.WNOHANG)
+except ChildProcessError:
+    print('reaped')
+else:
+    raise AssertionError('owned child remains')
+"""
+        result = subprocess.run([sys.executable, '-I', '-c', code,
+                                 str(Path(t.__file__).parent)],
+                                env={'PATH': '/usr/bin:/bin', 'LANG': 'C'},
+                                capture_output=True, timeout=4)
+        self.assertEqual((result.returncode, result.stdout), (0, b'reaped\n'),
+                         result.stderr.decode(errors='replace'))
+
+    def test_shared_process_inventory_exhaustion_blocks_without_foreign_signal(self):
+        class Inventory:
+            def __init__(self): self.consumed = 0; self.closed = False
+            def __enter__(self): return self
+            def __exit__(self, *args): self.closed = True
+            def __iter__(self):
+                for i in range(9000):
+                    self.consumed += 1
+                    yield type('Entry', (), {'name': str(i + 1)})()
+        inventory = Inventory()
+        with patch.object(t.os, 'waitpid', return_value=(0, 0)), \
+             patch.object(t.os, 'scandir', return_value=inventory), \
+             patch.object(t.os, 'pidfd_open', side_effect=PermissionError), \
+             patch.object(t.signal, 'pidfd_send_signal') as send:
+            with self.assertRaisesRegex(ValueError, 'owned process inventory exceeded'):
+                t.reap_owned(time.monotonic() + 2)
+        self.assertEqual(inventory.consumed, 8193)
+        self.assertTrue(inventory.closed)
+        send.assert_not_called()
 
     def test_regular_bounded_snapshot_rejects_fifo_oversize_and_expiry(self):
         path=self.root/'data';path.write_bytes(b'abc')
