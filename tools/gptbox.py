@@ -405,7 +405,7 @@ class Gptbox(Bootstrap):
                 stage = image_id(self.engine('create', '--name=' + stage_name, '--label=dev-pair.context=' + expected, '--timeout=' + str(ASSEMBLY_LIFETIME), '--restart=no',
                     '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private', '--userns=private', '--cap-add=SYS_ADMIN',
                     '--security-opt=no-new-privileges', '--security-opt=label=type:container_engine_t',
-                    '--memory=2g', '--pids-limit=512', '--cpus=1', '--tmpfs=/run:rw,nosuid,nodev,mode=0755', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777',
+                    '--memory=2g', '--pids-limit=512', '--cpus=1', '--tmpfs=/run:rw,nosuid,nodev,mode=0755,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,notmpcopyup',
                     '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--entrypoint=/usr/bin/distrobox-init', base,
                     *INIT[1:], '--', FINAL_HOOK))
                 self.inspect_container(stage, base, runtime=False)
@@ -432,7 +432,7 @@ class Gptbox(Bootstrap):
                 runtime_id = image_id(self.engine('create', '--name=' + runtime_name, '--label=dev-pair.context=' + expected, '--timeout=' + str(RUNTIME_LIFETIME), '--restart=no', '--read-only', '--read-only-tmpfs=false', '--user=1000:1000',
                     '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                     '--network=none', '--pid=private', '--ipc=private', '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1',
-                    '--no-hosts', '--no-hostname', '--dns=none', '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700', '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700',
+                    '--no-hosts', '--no-hostname', '--dns=none', '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
                     '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
                     *mount_args, '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
                 self.inspect_container(runtime_id, sealed)

@@ -80,7 +80,12 @@ unsafe fallback creation has no installed create helper. Readiness requires a
 new inspected `State.StartedAt` on each cycle, unchanged during the wait, and logs
 scoped with `--since` to that actual start; a previous marker cannot pass restart.
 Exact inspected `HostConfig.Tmpfs` paths/options are restricted to `/run` and
-`/tmp`, separately from bind-mount inspection. Native OCI lifetime limits are
+`/tmp`, separately from bind-mount inspection. Both assembly and runtime
+explicitly request `notmpcopyup` so scratch mounts do not copy image contents.
+Upstream Podman consumes that option before OCI generation, suppresses its
+usual `tmpcopyup` default and adds `rprivate`; the guard accepts the resulting
+inspected options while retaining the exact path/security/ownership policy.
+Native OCI lifetime limits are
 900seconds for staging and180seconds per probe start, with automatic restart
 disabled and `Config.Timeout` inspected. They bound orphan candidates even if
 Podman/conmon moves them outside the transient client's cgroup.

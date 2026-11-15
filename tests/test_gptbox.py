@@ -85,6 +85,8 @@ class Engine:
                            for target, (source, rw) in (self.app.mounts.items() if runtime else [])]}
             if runtime:
                 self.saved_runtime = copy.deepcopy(self.containers[identity])
+            else:
+                self.saved_stage = copy.deepcopy(self.containers[identity])
             return identity
         if command[0] == 'inspect':
             identity = command[-1]
@@ -305,6 +307,30 @@ class GptboxTests(unittest.TestCase):
         logs = [call for call, _ in self.engine.calls if 'logs' in call]
         self.assertIn('--since=' + row['State']['StartedAt'], logs[-1])
         self.assertTrue(all(any(value.startswith('--since=') for value in call) for call in logs))
+
+    def test_explicit_no_copy_tmpfs_matches_actual_upstream_normalization(self):
+        self.assemble()
+        # Podman a6a942f... pkg/util/mount_opts.go:150-159 consumes
+        # notmpcopyup (not passed to OCI), and :216-238 appends rprivate
+        # while suppressing the default tmpcopyup. Inspector joins those OCI
+        # options into HostConfig.Tmpfs. Exercise that exact normalized shape.
+        creates = [call for call, _ in self.engine.calls if 'create' in call]
+        for command in creates:
+            options = [value for value in command if value.startswith('--tmpfs=')]
+            self.assertEqual(len(options), 2)
+            self.assertTrue(all(value.endswith(',notmpcopyup') for value in options))
+        for runtime, identity, image, original in (
+                (False, STAGE, BASE, self.engine.saved_stage),
+                (True, RUNTIME, SEALED, self.engine.saved_runtime)):
+            row = copy.deepcopy(original)
+            row['HostConfig']['Tmpfs'] = {path: value + ',rprivate' for path, value in row['HostConfig']['Tmpfs'].items()}
+            self.engine.containers[identity] = row
+            self.app.inspect_container(identity, image, runtime=runtime)
+            # Unexpected copying is outside the explicitly constructed policy;
+            # extra destinations and unsafe options remain rejected as before.
+            row['HostConfig']['Tmpfs']['/run'] += ',tmpcopyup'
+            with self.assertRaisesRegex(g.Blocked, 'undeclared tmpfs option'):
+                self.app.inspect_container(identity, image, runtime=runtime)
 
     def test_preview_and_low_storage_leave_engine_unchanged(self):
         before = len(self.engine.calls)
