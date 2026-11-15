@@ -10,7 +10,7 @@ the underlying errors were not retained, so ordinary disappearance is not yet
 proven to be the cause. Owned cleanup passed. No completed tooling image or
 Fedora boot is claimed. The previous path-length and directory-order defects
 were repaired and passed this real runner. Free disk was 94978641920 bytes,
-RAM 16464302080 bytes and Podman4.9.3. A bounded diagnostic repair is underway.
+RAM 16464302080 bytes and Podman4.9.3. The bounded diagnostic candidate passes 146 integrated tests and fresh review; its next hosted run must identify the actual error.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and

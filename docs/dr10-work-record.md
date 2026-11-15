@@ -957,3 +957,19 @@ The measured runner capacity is sufficient to consider an explicit later
 proposal; no current limit changed. Existing 900s assembly/180s runtime bounds
 remain fixed, and any longer full-test VM deadline stays inside the 60-minute
 workflow with reserved cleanup time.
+
+The bounded diagnostic candidate returned as
+`397e38db12d4401a14158c3a5b56930c45042f25`, integrated as
+`adff56e5087bd448fb794b1f2af42d6af9ce05c8`. All 146 integrated tests pass.
+Fresh Astra-configured High `/root/fedora_ci_diag_review` returned scoped PASS
+with 23 affected tests, an actual five-second quiet-child deadline/kill probe
+and exact-64KiB simultaneous two-pipe capture. The diagnostic cap, strict owned
+ENOENT-only acceptance, resource reserves and final stable traversal remain
+unchanged. Root-side GNU timeout bounds privileged scans independently of the
+controller; actual privileged behavior remains a hosted check. Bounded counters,
+retained-line classes, truncation flags and tails now reach the sanitized report.
+This is an evidence-producing candidate, not an assertion of a runtime fix.
+A deterministic large-output test uses already-deleted argv operands; it does
+not reproduce the production recursive traversal or identify run3's errors.
+Publish run4 to collect actual cause, then use at most the one remaining
+repair/run in this batch before coordinator reassessment.
