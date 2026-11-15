@@ -899,3 +899,14 @@ authorized one bounded ten-minute path/early-cleanup correction followed by
 fresh affected review and a new exact-candidate CI run. The single Sol builder
 paused the extension plan for this repair. Preserve unique owned storage,
 resource accounting and limited cleanup; no host-wide paths or pruning.
+
+The runtime path correction returned as
+`7d130edd94905b81a68ac77c67268fbb9620b522`, integrated as
+`7da3087c037e1292a7fc067a5c388f843f911274`. All 140 integrated tests pass.
+Fresh Astra-configured High `/root/fedora_ci_path_review` returned scoped PASS
+after all 17 affected tests plus independent path/mount boundaries. It confirmed
+byte-identical integrated implementation/tests, unique short owned storage and
+accounting, and cleanup refusing changed identity, uncertain engine removal,
+remaining external containers or mounts. Preflight-only failure now removes its
+owned scratch without depending on working engine configuration. No guest/runtime
+pass follows from those local tests; publish a second exact-candidate run.

@@ -5,8 +5,9 @@
 for an exact public candidate. The [first actual CI run](https://github.com/oso-gato/dev-pair/actions/runs/43729422976)
 passed all 136 tests but blocked during runner preflight: Podman rejected a
 runroot pathname longer than 50 characters, and cleanup repeated that error.
-No image download, build or Fedora guest boot occurred. A bounded path/cleanup
-repair is in progress. Local signature, parsing, process/file-bound and source
+No image download, build or Fedora guest boot occurred. The path/cleanup
+repair passes 140 integrated local tests and fresh affected review; its actual
+runner retest is next. Local signature, parsing, process/file-bound and source
 staging tests are not Fedora evidence; stock Cloud boot remains unverified.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
