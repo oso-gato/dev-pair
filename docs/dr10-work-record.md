@@ -2,7 +2,7 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 07:21 HKT. Chronological records below retain
+Updated November 16, 2026, 07:33 HKT. Chronological records below retain
 prior evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
@@ -2448,3 +2448,45 @@ actual closed failure code and complete report. No unchanged retry, policy
 exception, forced context, credential/model call, VPS mutation, release
 promotion or budget increase. Signed OCI base integration remains a separate
 unreviewed source checkpoint; it is not part of this native test.
+
+### November 16, 2026, 07:33 HKT — native root relay passes; discovery remains
+
+[Run18](https://github.com/oso-gato/dev-pair/actions/runs/43774325634), job
+132997023529, source `932c296177710346ac53be4815e37a194f835817`, passed
+337 hosted tests in42.935 seconds. Actual root native commands now pass typed
+property/FD admission and relay framing: the last four retained operations
+(service restart, resolved process identity, a withheld operation and listener
+inventory) all have accepted_exit=true and relay_verified=true. Source
+verification completed all inputs. This establishes those actual root command
+boundaries; it does not establish dp-maint, assembly or all package transitions.
+
+Initialization ran268.25 seconds and blocked at resolved-discovery. There are
+zero retained command failures. After accepted service restart, resolved has
+new PID1619 and still listens on public TCP/UDP5355; this matches the source's
+persistent-discovery rejection. The exact protected exception was not exported.
+The8743-byte report frame SHA256 is
+`4e4986c081b24c38f4e655ea79464ced6ce8cfa9a3efde746538cb63bd50ca4b`.
+Enforcing Fedora44, native parent, authenticated input, pre/post inspection,
+password absence, full framing and outer teardown passed. Detailed native
+cleanup remains unverified; preparation/package count and assembly are not
+accepted. The same bounded setfiles_t/var_lib_t:file denial remains; absence
+outside that projection is not claimed. Artifacts:
+`/workspace/artifacts/fedora-ci-run-43774325634{.log,-controller.json,-report.json,-request.json}`.
+This one-run scope is closed with no unchanged retry.
+
+Bounded source diagnosis found a concrete DAC risk: the provisioning unit has
+UMask=0077, while atomic() creates a new resolved.conf.d using mkdir(mode0755)
+without an explicit final directory mode. A new directory therefore becomes
+0700, even though the configuration file is explicitly0644. Root cat-config
+can read it while the named resolved account cannot traverse it. Exact local
+reproduction, parser behavior and a narrowly scoped directory fix are under
+research; native directory-mode evidence was not captured, so run18 attribution
+remains provisional. Keep the global private umask and discovery denial intact.
+
+Signed-base implementation separately verified the cached official archive with
+the production verifier in2.024 seconds. Tagged Podman source shows OCI save
+recompresses layers; the candidate therefore needs explicit derived manifest/
+layer identities while retaining exact authenticated config and complete diffID.
+Original compressed-hash equality is not a supported save guarantee. This is
+source/cached-input progress, not native import acceptance. The sole builder
+continues toward its finite07:44:20 HKT checkpoint and fresh exact review.
