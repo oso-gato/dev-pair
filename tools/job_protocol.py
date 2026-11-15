@@ -21,6 +21,11 @@ VERSION = 1
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 RECIPE = 'local-json-message-v1'
 MAX_MESSAGE = 65536
+# Requests reserve three quarters of the envelope for executor diagnostics,
+# per-check actual/verdict fields, identity and reconciliation evidence. These
+# are canonical encoded byte budgets (including JSON escaping), not characters.
+MAX_REQUEST_BYTES = 16384
+MAX_RECONCILIATION_BYTES = 8192
 
 
 def require(ok, message):
@@ -190,7 +195,9 @@ def validate(obj, kind=None):
         fields(obj['cleanup'], 'status diagnostics')
         require(obj['cleanup']['status'] in ('complete', 'not-needed', 'unresolved'), 'invalid cleanup')
         text(obj['cleanup']['diagnostics'])
-    require(len(canonical(obj).encode()) <= MAX_MESSAGE, 'message exceeds protocol byte limit')
+    size_limit = MAX_REQUEST_BYTES if kind == 'request' else MAX_MESSAGE
+    require(len(canonical(obj).encode()) <= size_limit,
+            'request exceeds response-reserving byte limit' if kind == 'request' else 'message exceeds protocol byte limit')
     return obj
 
 
@@ -470,6 +477,8 @@ class Ledger:
         text(diagnostic)
         references(evidence)
         require(evidence, 'reconciliation requires an inspection evidence reference')
+        require(len(canonical({'diagnostics': diagnostic, 'evidence': evidence}).encode()) <= MAX_RECONCILIATION_BYTES,
+                'reconciliation diagnostics/evidence exceed reserved byte budget')
         with self.transaction():
             status = self.status(request_id)
             require(status['state'] == 'in-flight', 'only in-flight attempts require reconciliation')

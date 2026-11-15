@@ -216,6 +216,63 @@ class DurableJobsTests(unittest.TestCase):
         self.assertIn('budget exhausted', self.send('submit', request, ok=False))
         self.assertEqual(len(self.cli('inspect', 'job-one')['requests']), 1)
 
+    def test_utf8_near_limit_requests_always_fit_blocked_and_reconciled_results(self):
+        artifact, cp, request = self.inputs(message='ready')
+        self.send('job', self.job)
+        self.send('checkpoint', cp)
+        # Reproduce the old 65KB request dead-end: non-ASCII expectations expand
+        # under canonical JSON escaping before per-check result fields are added.
+        request['checks'] = [{'id': 'check-' + str(i), 'expected': 'é' * 668} for i in range(16)]
+        before = self.cli('events')
+        oversized = self.root / 'oversized-request.json'
+        oversized.write_text(protocol.canonical(request))
+        self.assertIn('response-reserving', self.cli('submit', oversized, ok=False))
+        self.assertEqual(self.cli('events'), before)
+        # Find the actual accepted byte boundary, not an implementation-shaped
+        # fixed expected count, then exercise independent CLI executor/consumer.
+        last = None
+        for length in range(1, 669):
+            probe = copy.deepcopy(request)
+            for check in probe['checks']:
+                check['expected'] = 'é' * length
+            try:
+                protocol.validate(probe, 'request')
+            except ValueError:
+                break
+            last = probe
+        self.assertIsNotNone(last)
+        self.assertGreater(len(protocol.canonical(last).encode()), protocol.MAX_REQUEST_BYTES - 100)
+        self.send('submit', last)
+        blocked = self.cli('execute-local', last['request_id'], '--artifact', artifact)
+        self.assertEqual(blocked['status'], 'blocked')
+        self.assertEqual(len(blocked['checks']), 16)
+        self.assertEqual([c['expected'] for c in blocked['checks']], [c['expected'] for c in last['checks']])
+        self.assertLessEqual(len(protocol.canonical(blocked).encode()), protocol.MAX_MESSAGE)
+        self.assertEqual(self.cli('consume', last['request_id'])['progress'], 'blocked')
+        # A second near-limit request is durably reserved then opened by a
+        # separate reconciliation process, as after a controller interruption.
+        last['request_id'] = 'request-interrupted-large'
+        self.send('submit', last)
+        db = protocol.Ledger(self.state)
+        try:
+            attempt, _ = db.begin(last['request_id'])
+        finally:
+            db.close()
+        diagnostic, evidence = 'é' * 500, ['inspection:' + 'é' * 500]
+        self.assertIn('reserved byte budget', self.cli('reconcile', last['request_id'],
+                      '--diagnostic', 'é' * 2000, '--evidence', evidence[0], ok=False))
+        self.assertEqual(self.cli('status', last['request_id'])['state'], 'in-flight')
+        reconciled = self.cli('reconcile', last['request_id'], '--diagnostic', diagnostic, '--evidence', evidence[0])
+        self.assertEqual(reconciled['status'], 'blocked')
+        self.assertEqual(reconciled['attempt_id'], attempt)
+        self.assertEqual(reconciled['diagnostics'], diagnostic)
+        self.assertEqual(reconciled['evidence'], evidence)
+        self.assertEqual(len(reconciled['checks']), 16)
+        self.assertLessEqual(len(protocol.canonical(reconciled).encode()), protocol.MAX_MESSAGE)
+        _, fresh_cp, _ = self.inputs('after-large-reconciliation', 'ready')
+        self.send('checkpoint', fresh_cp)
+        self.assertEqual(self.cli('inspect', 'job-one')['checkpoint_id'], fresh_cp['checkpoint_id'])
+
     def test_private_filesystem_boundary_and_fifo_rejection(self):
         self.state.mkdir(mode=0o755)
         self.state.chmod(0o755)

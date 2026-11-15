@@ -45,6 +45,12 @@ and real boundary validation before jobs are enabled.
 Version `1` has strict `job`, `checkpoint`, `request` and `result` envelopes.
 Unknown versions, message kinds and fields, including nested fields, fail closed;
 duplicate JSON keys, duplicate check IDs and oversized messages are rejected.
+All envelopes are capped at 65536 canonical JSON bytes. Requests have a smaller
+16384-byte cap, reserving space for every per-check result, executor identity,
+diagnostics and recovery evidence. Reconciliation diagnostics plus evidence have
+an 8192-byte encoded budget validated before any state change; callers must use
+bounded diagnostics and durable evidence references. Budgets count JSON escaping
+and UTF-8 bytes, preserving accepted identities and expectations without truncation.
 The database schema version is checked independently. Job selection records the
 explicit model/effort/runtime intent as `unverified-record-only`; recording it
 neither invokes nor authenticates an agent. Reusing a job ID with changed
