@@ -1530,3 +1530,9 @@ Allow a short bounded event-delivery interval, then if still absent use one
 same-candidate PR-reopen trigger (already declared in the unchanged workflow).
 Do not rerun old-source run8 or push speculative source changes to fabricate a
 new result. Record actual executor identity once a new run exists.
+
+
+[Run9](https://github.com/oso-gato/dev-pair/actions/runs/43746428844) subsequently
+appeared for exact `c5cef5fb8c2d22d35cc1bb8e945cae4aa1244f9b` and is running.
+No PR close/reopen or other retrigger was performed. This is the first diagnostic
+repair run in the bounded batch; outcome remains pending. Source stays frozen.
