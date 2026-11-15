@@ -3,6 +3,9 @@ import importlib.util
 import hashlib
 from types import SimpleNamespace
 import json
+import io
+import pty
+import urllib.error
 import os
 from pathlib import Path
 import subprocess
@@ -25,12 +28,26 @@ class Fake:
         self.fail = None
         self.node = {'BackendState': 'NeedsLogin'}
         self.image = None
+        self.password_inputs = []
+        self.password_set = False
 
-    def __call__(self, *args, ok=(0,)):
+    def __call__(self, *args, ok=(0,), input_text=None):
         self.calls.append(args)
         if self.fail and self.fail(args):
             raise b.Blocked('injected command failure (output withheld)')
         exe = Path(args[0]).name
+        if exe == 'chpasswd':
+            self.password_inputs.append(input_text)
+            self.password_set = True
+        if exe == 'passwd':
+            return 'core P 2026-11-15 0 99999 7 -1\n' if self.password_set else 'core L 2026-11-15 0 99999 7 -1\n'
+        if exe == 'hostnamectl' and args[1] == '--static':
+            return 'erebus\n'
+        if exe == 'sudo':
+            if args[-1] in ('dp-maint', 'dp-dev'):
+                self.assert_no_sudo_expected = ok == (1,)
+                return ''
+            return 'Matching Defaults entries for core: authenticate\n    (ALL) PASSWD: ALL\n'
         if exe == 'systemd-run':
             operation = args[args.index('--storage-driver=vfs') + 1:]
             if operation[:2] == ('image', 'inspect'):
@@ -101,7 +118,7 @@ class BootstrapTests(unittest.TestCase):
         self.addCleanup(self.env.stop)
 
     def prepare(self):
-        return self.app.prepare('operator', KEY, ['192.0.2.9/32'])
+        return self.app.prepare('core', KEY, ['192.0.2.9/32'], password='fixture-password-not-a-secret')
 
     def secret(self):
         p = self.root / 'secret'
@@ -128,8 +145,8 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(len(self.app.text('/etc/subuid').splitlines()), 2)
         self.assertFalse(any('podman' == Path(c[0]).name for c in self.fake.calls))
         self.assertFalse(self.app.path('/etc/ssh/sshd_config').exists())
-        self.assertEqual(self.app.path('/etc/ssh/dev-pair-keys/operator').stat().st_mode & 0o777, 0o644)
-        self.assertIn('Match User operator', self.app.text('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf'))
+        self.assertEqual(self.app.path('/etc/ssh/dev-pair-keys/core').stat().st_mode & 0o777, 0o644)
+        self.assertIn('Match User core', self.app.text('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf'))
 
     def test_interrupted_prepare_resumes_without_duplicate_accounts(self):
         self.fake.fail = lambda a: Path(a[0]).name == 'nft' and '-f' in a
@@ -143,7 +160,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(self.app.status()['prepared'])
 
     def test_conflicting_key_source_user_and_subids_fail_closed(self):
-        self.fake.accounts['operator'] = 'operator:x:1001:1001::/home/operator:/bin/bash\n'
+        self.fake.accounts['core'] = 'core:x:1001:1001::/home/core:/bin/bash\n'
         with self.assertRaisesRegex(b.Blocked, 'existing account'):
             self.prepare()
         self.assertFalse(any(Path(a[0]).name == 'useradd' for a in self.fake.calls))
@@ -156,7 +173,7 @@ class BootstrapTests(unittest.TestCase):
     def test_changed_inputs_fail_before_commands_after_preflight(self):
         self.prepare()
         with self.assertRaisesRegex(b.Blocked, 'conflicting managed file'):
-            self.app.prepare('operator', KEY + 'different', ['192.0.2.9/32'])
+            self.app.prepare('core', KEY, ['192.0.2.10/32'])
 
     def test_current_ssh_source_must_be_allowed(self):
         with patch.dict(os.environ, {'SSH_CONNECTION': '192.0.2.10 30000 192.0.2.2 22'}):
@@ -456,24 +473,24 @@ class BootstrapTests(unittest.TestCase):
         for expected in (digest, '1' * 64):
             with self.subTest(expected=expected):
                 with self.assertRaises(b.Blocked):
-                    self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, expected)
+                    self.app.prepare('core', KEY, ['192.0.2.9/32'], context, expected, password='fixture-password-not-a-secret')
                 self.assert_no_host_mutation()
         with patch.object(b.platform, 'machine', return_value='aarch64'):
             with self.assertRaisesRegex(b.Blocked, 'x86_64'):
-                self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+                self.app.prepare('core', KEY, ['192.0.2.9/32'], context, digest, password='fixture-password-not-a-secret')
         self.assert_no_host_mutation()
         for file in context.iterdir():
             file.unlink()
         context.rmdir()
         context, digest = self.context(fixture=True)
         with self.assertRaises(b.Blocked):
-            self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+            self.app.prepare('core', KEY, ['192.0.2.9/32'], context, digest, password='fixture-password-not-a-secret')
         self.assert_no_host_mutation()
 
     def test_corrected_hash_retry_and_minimal_git_prerequisite_before_binding(self):
         context, digest = self.context()
         with self.assertRaises(b.Blocked):
-            self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, '1' * 64)
+            self.app.prepare('core', KEY, ['192.0.2.9/32'], context, '1' * 64, password='fixture-password-not-a-secret')
         self.assert_no_host_mutation()
         original = self.fake.__call__
         def prerequisite(*args, **kwargs):
@@ -483,7 +500,7 @@ class BootstrapTests(unittest.TestCase):
             return original(*args, **kwargs)
         self.app.run = prerequisite
         with patch.object(b.shutil, 'disk_usage', return_value=SimpleNamespace(free=10 * 1024 ** 3)):
-            self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+            self.app.prepare('core', KEY, ['192.0.2.9/32'], context, digest, password='fixture-password-not-a-secret')
         dnf = [call for call in self.fake.calls if Path(call[0]).name == 'dnf']
         self.assertEqual(dnf[0][-2:], ('install', 'git-core'))
         self.assertTrue(self.app.path(b.STATE + '/prepared').exists())
@@ -493,7 +510,7 @@ class BootstrapTests(unittest.TestCase):
         tool = self.app.candidate_tool()
         with patch.object(tool, 'check_source', side_effect=ValueError('source mismatch')):
             with self.assertRaisesRegex(b.Blocked, 'source verification'):
-                self.app.prepare('operator', KEY, ['192.0.2.9/32'], context, digest)
+                self.app.prepare('core', KEY, ['192.0.2.9/32'], context, digest, password='fixture-password-not-a-secret')
         self.assertFalse(self.app.path(b.STATE + '/desired.json').exists())
         dnf = [call for call in self.fake.calls if Path(call[0]).name == 'dnf']
         self.assertEqual(len(dnf), 1)
@@ -677,10 +694,262 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
         self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
 
+    def test_core_password_stdin_and_completed_retry_never_relocks_or_resets(self):
+        self.prepare()
+        self.assertEqual(self.fake.password_inputs, ['core:fixture-password-not-a-secret\n'])
+        self.app.prepare('core', KEY, ['192.0.2.9/32'])
+        self.app.prepare('core', KEY, ['192.0.2.9/32'], password='different-ignored-on-completed-retry')
+        self.assertEqual(len(self.fake.password_inputs), 1)
+        locks = [call[-1] for call in self.fake.calls if call[:2] == ('/usr/sbin/usermod', '--lock')]
+        self.assertNotIn('core', locks)
+        self.assertEqual(set(locks), {'dp-maint', 'dp-dev'})
+        for call in self.fake.calls:
+            self.assertFalse(any('fixture-password' in arg for arg in call))
+        for path in self.app.state.iterdir():
+            if path.is_file():
+                self.assertNotIn('fixture-password', path.read_text())
+        sudo = self.app.text('/etc/sudoers.d/dev-pair-operator')
+        self.assertIn('core ALL=(ALL) PASSWD: ALL', sudo)
+        self.assertNotIn('NOPASSWD', sudo)
+        self.assertNotIn('dp-maint', sudo)
+        self.assertNotIn('dp-dev', sudo)
+        self.assertTrue(self.fake.assert_no_sudo_expected)
+        self.fake.password_set = False
+        with self.assertRaisesRegex(b.Blocked, 'not usable'):
+            self.app.prepare('core', KEY, ['192.0.2.9/32'])
+        self.assertEqual(len(self.fake.password_inputs), 1)
+
+    def test_fedora_historical_ps_password_status_is_usable_but_np_lk_are_not(self):
+        self.prepare()
+        original = self.fake.__call__
+        status = 'PS'
+        def run(*args, **kwargs):
+            if args[:2] == ('/usr/bin/passwd', '-S'):
+                return f'core {status} 2026-11-15 0 99999 7 -1\n'
+            return original(*args, **kwargs)
+        self.app.run = run
+        self.app.prepare('core', KEY, ['192.0.2.9/32'])
+        for status in ('NP', 'LK', 'L', ''):
+            with self.assertRaisesRegex(b.Blocked, 'not usable'):
+                self.app.prepare('core', KEY, ['192.0.2.9/32'])
+
+    def test_password_marker_write_failure_retries_without_locking_core(self):
+        original = self.app.atomic
+        def fail(path, *args, **kwargs):
+            if path.endswith('/operator-password-set'):
+                raise OSError('injected disk error')
+            return original(path, *args, **kwargs)
+        self.app.atomic = fail
+        with self.assertRaises(OSError):
+            self.prepare()
+        self.assertTrue(self.fake.password_set)
+        self.assertFalse(self.app.path(b.STATE + '/operator-password-set').exists())
+        self.app.atomic = original
+        self.prepare()
+        self.assertEqual(len(self.fake.password_inputs), 2)
+        self.assertEqual(len([call for call in self.fake.calls if Path(call[0]).name == 'useradd']), 3)
+        self.assertFalse(any(call[:2] == ('/usr/sbin/usermod', '--lock') and call[-1] == 'core'
+                             for call in self.fake.calls))
+
+    def test_chpasswd_failure_has_no_completion_and_corrected_retry_works(self):
+        self.fake.fail = lambda args: Path(args[0]).name == 'chpasswd'
+        with self.assertRaises(b.Blocked):
+            self.prepare()
+        self.assertFalse(self.app.path(b.STATE + '/operator-password-set').exists())
+        self.assertFalse(self.app.path('/etc/sudoers.d/dev-pair-operator').exists())
+        self.fake.fail = None
+        self.prepare()
+        self.assertTrue(self.app.status()['prepared'])
+
+    def test_operator_keys_atomic_rotation_and_interruption_preserve_previous_keys(self):
+        self.prepare()
+        target = '/etc/ssh/dev-pair-keys/core'
+        changed = KEY.replace('fixtureonly', 'fixturechanged')
+        original = self.app.atomic
+        def fail(path, *args, **kwargs):
+            if path == target:
+                raise OSError('injected rename failure')
+            return original(path, *args, **kwargs)
+        self.app.atomic = fail
+        with self.assertRaises(OSError):
+            self.app.prepare('core', changed, ['192.0.2.9/32'])
+        self.assertEqual(self.app.text(target), KEY)
+        self.app.atomic = original
+        self.app.prepare('core', changed, ['192.0.2.9/32'])
+        self.assertEqual(self.app.text(target), changed)
+        self.assertEqual(len(self.fake.password_inputs), 1)
+        self.app.path(target).write_text('unauthorized root-side drift')
+        with self.assertRaisesRegex(b.Blocked, 'conflicts'):
+            self.app.prepare('core', KEY, ['192.0.2.9/32'])
+        self.assertEqual(self.app.text(target), 'unauthorized root-side drift')
+
+    def test_hostname_time_and_mosh_are_prepared_without_claiming_acceptance(self):
+        self.prepare()
+        self.assertIn('preserve_hostname: true', self.app.text('/etc/cloud/cloud.cfg.d/99-dev-pair-hostname.cfg'))
+        self.assertIn(('/usr/bin/hostnamectl', 'set-hostname', 'erebus'), self.fake.calls)
+        self.assertIn(('/usr/bin/systemctl', 'enable', '--now', 'chronyd.service'), self.fake.calls)
+        rules = self.app.text('/etc/dev-pair/bootstrap.nft').splitlines()
+        self.assertIn('add rule inet dev_pair_bootstrap input iifname "tailscale0" udp dport 60000-61000 accept', rules)
+        self.assertLess(rules.index('add rule inet dev_pair_bootstrap input iifname != "tailscale0" udp dport 60000-61000 drop'),
+                        rules.index('add rule inet dev_pair_bootstrap input ct state established,related accept'))
+        self.assertEqual(self.app.status()['runtime_acceptance'], 'not verified')
+
+    def test_mosh_reservation_preserves_existing_ranges_and_handles_reapply(self):
+        proc = self.app.path('/proc/sys/net/ipv4/ip_local_reserved_ports')
+        proc.parent.mkdir(parents=True)
+        proc.write_text('1024,58000-60001,62000-62002\n')
+        self.prepare()
+        expected = 'net.ipv4.ip_local_reserved_ports = 1024,58000-61000,62000-62002\n'
+        self.assertEqual(self.app.text('/etc/sysctl.d/90-dev-pair-mosh.conf'), expected)
+        proc.write_text('1024,58000-61000,62000-62002\n')
+        self.prepare()
+        self.assertEqual(self.app.text('/etc/sysctl.d/90-dev-pair-mosh.conf'), expected)
+
+    def test_failed_fetch_does_not_touch_existing_keys_or_execute_prepare(self):
+        self.prepare()
+        before = self.app.text('/etc/ssh/dev-pair-keys/core')
+        self.fake.calls.clear()
+        argv = ['bootstrap.py', 'prepare', '--apply', '--gptbox-context', '/unused',
+                '--expected-context-sha256', 'a' * 64, '--bootstrap-source', '192.0.2.9/32']
+        with patch.object(sys, 'argv', argv), patch.object(b, 'Bootstrap', return_value=self.app), \
+                patch.object(b, 'github_keys', side_effect=b.Blocked('fetch failed')), \
+                patch.object(sys, 'stderr', io.StringIO()):
+            self.assertEqual(b.main(), 2)
+        self.assertEqual(self.app.text('/etc/ssh/dev-pair-keys/core'), before)
+        self.assertFalse(self.fake.calls)
+
+    def test_active_mosh_listener_is_only_accepted_for_managed_core_executable(self):
+        self.prepare()
+        process = self.app.path('/proc/72')
+        process.mkdir()
+        (process / 'exe').symlink_to('/usr/bin/mosh-server')
+        (process / 'status').write_text('Uid: 1001 1001 1001 1001\n')
+        line = 'udp UNCONN 0 0 0.0.0.0:60001 0.0.0.0:* users:(("mosh-server",pid=72,fd=3))'
+        original = self.fake.__call__
+        def run(*args, **kwargs):
+            return line if args[:2] == ('/usr/bin/ss', '-H') else original(*args, **kwargs)
+        self.app.run = run
+        self.app.preflight()
+        (process / 'status').write_text('Uid: 0 0 0 0\n')
+        with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
+            self.app.preflight()
+
     def test_finalize_always_blocks_without_reading_fake_evidence(self):
         proc = subprocess.run([sys.executable, str(ROOT / 'tools/bootstrap.py'), 'finalize'], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2)
         self.assertIn('not implemented', proc.stderr)
+
+class OperatorInputTests(unittest.TestCase):
+    def test_password_input_constraints_and_real_command_stdin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / 'password'
+            with patch.object(b, 'checked_file', return_value=file):
+                for invalid in ('', 'two\nlines', 'colon:break', 'carriage\r', 'a' * 1025):
+                    file.write_text(invalid)
+                    with self.assertRaises(b.Blocked):
+                        b.operator_password(str(file))
+                file.write_text('synthetic-stdin-value\n')
+                self.assertEqual(b.operator_password(str(file)), 'synthetic-stdin-value')
+        # Execute a harmless real child reading stdin, rather than only asserting a mock call.
+        result = b.Commands()(sys.executable, '-c', 'import sys; print(len(sys.stdin.read()))',
+                              input_text='synthetic-stdin-value')
+        self.assertEqual(result.strip(), str(len('synthetic-stdin-value')))
+        with patch.object(b.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, 'synthetic-stdin-value', 'synthetic-stdin-value')) as run:
+            with self.assertRaises(b.Blocked) as error:
+                b.Commands()('/usr/sbin/chpasswd', input_text='core:synthetic-stdin-value\n')
+            self.assertEqual(run.call_args.args[0], ('/usr/sbin/chpasswd',))
+            self.assertEqual(run.call_args.kwargs['input'], 'core:synthetic-stdin-value\n')
+            self.assertNotIn('synthetic-stdin-value', str(error.exception))
+
+    def test_profile_interactive_tty_reconnect_and_noninteractive_protocols(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            identity = directory / 'identity'
+            identity.write_text('#!/bin/sh\necho core\n')
+            identity.chmod(0o700)
+            tmux = directory / 'tmux'
+            tmux.write_text('#!/bin/sh\nprintf "ATTACHED:%s\\n" "$*"\n')
+            tmux.chmod(0o700)
+            profile = directory / 'profile'
+            profile.write_text(b.OPERATOR_PROFILE.replace('/usr/bin/id', str(identity)).replace('/usr/bin/tmux', str(tmux)))
+            command = '. ' + str(profile) + '; printf PROTOCOL-UNCHANGED'
+            for interactive in (False, True):
+                args = ['/bin/bash', '--noprofile', '--norc', '-ic' if interactive else '-c', command]
+                plain = subprocess.run(args, capture_output=True, text=True, env={'PATH': '/usr/bin'})
+                self.assertEqual(plain.stdout, 'PROTOCOL-UNCHANGED')
+            master, slave = pty.openpty()
+            try:
+                proc = subprocess.Popen(['/bin/bash', '--noprofile', '--norc', '-ic', command],
+                                        stdin=slave, stdout=slave, stderr=slave, env={'PATH': '/usr/bin'})
+                proc.wait(timeout=5)
+                os.close(slave)
+                slave = None
+                output = b''
+                while True:
+                    try:
+                        chunk = os.read(master, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    output += chunk
+                self.assertIn(b'ATTACHED:new-session -A -s dev-pair-core', output)
+                self.assertNotIn(b'PROTOCOL-UNCHANGED', output)
+            finally:
+                os.close(master)
+                if slave is not None:
+                    os.close(slave)
+
+
+class GitHubKeyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.keys = []
+        for kind in ('ed25519', 'rsa'):
+            key = Path(cls.tmp.name) / kind
+            subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', kind, '-N', '', '-f', str(key)], check=True)
+            cls.keys.append(key.with_suffix('.pub').read_text())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_all_valid_key_types_imported_and_invalid_payloads_fail_as_a_whole(self):
+        combined = ''.join(self.keys + self.keys[:1]).encode()
+        accepted = b.validate_public_keys(combined)
+        self.assertEqual(len(accepted.splitlines()), 2)
+        self.assertTrue(accepted.startswith('ssh-ed25519 '))
+        self.assertIn('\nssh-rsa ', accepted)
+        for invalid in (b'', b'x' * (b.KEYS_MAX_BYTES + 1), b'<html>oops</html>',
+                        b'command="touch /tmp/no" ' + self.keys[0].encode(),
+                        self.keys[0].encode() + b'ssh-ed25519 AAAA\n',
+                        self.keys[0].encode().replace(b'ssh-ed25519', b'ssh-rsa', 1)):
+            with self.assertRaises(b.Blocked):
+                b.validate_public_keys(invalid)
+
+    def test_https_fetch_retries_size_redirect_bounds_and_preserves_existing_keyfile(self):
+        class Response(io.BytesIO):
+            status = 200
+            def geturl(self):
+                return b.KEYS_URL
+        payload = ''.join(self.keys).encode()
+        opener = SimpleNamespace(open=lambda *args, **kwargs: Response(payload))
+        with patch.object(b.urllib.request, 'build_opener', return_value=opener):
+            self.assertEqual(len(b.github_keys().splitlines()), 2)
+        with patch.object(b.urllib.request, 'build_opener', return_value=opener):
+            with patch.object(opener, 'open', side_effect=urllib.error.URLError('secret external detail')) as fetch:
+                with self.assertRaises(b.Blocked) as error:
+                    b.github_keys()
+                self.assertEqual(fetch.call_count, 3)
+                self.assertNotIn('secret external', str(error.exception))
+                for args in fetch.call_args_list:
+                    self.assertEqual(args.kwargs['timeout'], 5)
+                    self.assertEqual(args.args[0].full_url, b.KEYS_URL)
+            with patch.object(opener, 'open', return_value=Response(b'x' * (b.KEYS_MAX_BYTES + 1))):
+                with self.assertRaises(b.Blocked):
+                    b.github_keys()
+        self.assertIsNone(b.NoRedirect().redirect_request(None, None, 302, 'redirect', {}, 'https://other.example/keys'))
 
 if __name__ == '__main__':
     unittest.main()

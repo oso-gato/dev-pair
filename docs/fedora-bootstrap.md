@@ -30,14 +30,29 @@ them with explicitly authorized executor source CIDRs before execution.
 ```sh
 sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/bootstrap.py inspect
 sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/bootstrap.py prepare \
-  --operator devpair-admin --public-key-file /root/operator.pub \
+  --operator core --password-file /root/core-password \
   --gptbox-context /root/maintenance-context --expected-context-sha256 TRUSTED_CONTEXT_SHA256 \
   --bootstrap-source 192.0.2.9/32 --bootstrap-source 2001:db8::9/128
 ```
 
 `prepare` and `enroll` default to read-only inspection. Only `--apply` performs
-changes. Public keys must be one valid unoptioned Ed25519 key in a root-owned
-file with no writable or symlink path components. Root, Fedora44, x86_64/aarch64,
+changes. First preparation requires an external root-owned 0600 password file,
+with no symlinks or group/world-writable path components. Supply the password
+through the executor's secure secret channel, never in a command argument,
+environment variable, transcript or repository. It must contain one nonempty
+line (optional final LF), no colon/control characters, and at most 1024
+characters. Keep it outside transferred source/context and remove it through
+that channel once setup is confirmed. The tool does not delete external secrets.
+Keys come only from `https://github.com/oso-gato.keys`: no local-key substitute,
+redirect or proxy. Fetch uses normal TLS certificate validation, up to three
+attempts, a five-second socket timeout, a twenty-second read deadline per
+attempt, and a 256KiB body limit. At most 256 unoptioned Ed25519, RSA, ECDSA or
+OpenSSH security-key entries are accepted; every entry must pass base64/type
+and actual `ssh-keygen` parsing. Validation has a twenty-second deadline plus
+at most five seconds for the final key check. Empty, malformed, over-limit,
+redirected or failed responses leave previously admitted keys untouched.
+Comments are discarded and duplicates collapse; every distinct admitted key
+is imported. Key validation/fetch also occurs during read-only preview. Root, Fedora44, x86_64/aarch64,
 host systemd PID1, enforcing SELinux, valid existing OpenSSH on port22, and an
 otherwise vanilla listener inventory are mandatory. Competing active firewalld
 or nftables services and foreign nft tables are rejected without disabling them.
@@ -64,7 +79,7 @@ handoff value, not an executable sample pin. The CLI rejects missing inputs.
 
 ```sh
 sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/bootstrap.py prepare --apply \
-  --operator devpair-admin --public-key-file /root/operator.pub \
+  --operator core --password-file /root/core-password \
   --gptbox-context /root/maintenance-context --expected-context-sha256 TRUSTED_CONTEXT_SHA256 \
   --bootstrap-source 192.0.2.9/32 --bootstrap-source 2001:db8::9/128
 sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/bootstrap.py status
@@ -80,17 +95,52 @@ Network/package failure may leave installed prerequisites; reapply reconciles
 that partial state. This is authorized initial platform provisioning, not
 permission for product jobs to install into a running host.
 
-The named operator gets a private group, locked password and explicit
-passwordless sudo administration. This is the human/operator recovery identity,
-never the maintenance agent's identity. Its admitted public key is root-owned
-under `/etc/ssh/dev-pair-keys`, readable for OpenSSH authentication and outside
-the user's writable home. A named-user Match block requires public-key auth;
-`sshd -t` and effective `sshd -T -C` settings must pass before reload. Existing
-root/global authentication policy is retained. The new fragment is removed on
-initial validation failure; an already admitted fragment is preserved on retry.
+The fixed human operator `core` gets a private group and password-gated sudo;
+its password also supports authorized provider-console login. `chpasswd` receives
+the password only on stdin, with child output withheld. Neither plaintext nor
+password hash is recorded in state, argv or images. The protected completion
+marker is written only after `passwd -S` reports a usable password. Before that
+marker, a failed/interrupted attempt may retry the externally supplied input.
+After the marker exists, `--password-file` is optional and rerunning prepare
+never resets or relocks `core`; any supplied password is ignored. An unexpectedly
+locked/unusable account blocks for separately scoped recovery. Password rotation
+is an explicit operator action, not an implicit consequence of prepare.
+
+The imported keys remain root-owned under `/etc/ssh/dev-pair-keys/core`, outside
+`core`'s writable home. A protected hash intent permits atomic key rotation and
+retry on either side of an interrupted rename; conflicting unmanaged changes
+block. Password and initial SSH stay available if fetching/validation fails.
+The named-user Match block requires public-key authentication and denies
+password/keyboard-interactive SSH even though the local password is usable.
+`sshd -t` and effective `sshd -T -C` settings must pass before reload. Full sudo
+syntax and effective core policy are checked for password bypass. Existing
+root/global authentication policy is retained pending verified cutover. The new
+SSH fragment is removed on initial validation failure; an admitted fragment is
+preserved on retry. No existing unmanaged account is automatically adopted.
+
+Signed Fedora `mosh`, `tmux` and `chrony` packages are installed. Interactive
+`core` Bash sessions with terminal input/output attach the durable
+`dev-pair-core` tmux session; reconnect returns to that session. Remote commands,
+scp/sftp and mosh's noninteractive SSH startup retain their normal protocol.
+Use `mosh core@TAILSCALE_IP` from an authorized tailnet client; plain SSH remains
+supported. The guard allows mosh UDP60000–61000 only through `tailscale0` and
+explicitly drops that range on other interfaces before established-state
+acceptance. A managed sysctl reserves those ports from outbound ephemeral
+allocation, preserving/merging existing reserved ranges; drift that conflicts
+with its root-owned configuration blocks rather than overwriting foreign state.
+Only an actual managed-core `/usr/bin/mosh-server` listener in that range is
+accepted on reapply. This terminal continuity does not prove agent job recovery,
+container replacement or restart acceptance.
+
+`hostnamectl` sets and observes the persistent lowercase `erebus` hostname;
+a cloud-init `preserve_hostname: true` drop-in prevents normal provider-name
+replacement. Chronyd is enabled/started and queried. Configuration/daemon
+observation is not evidence that synchronization or reboot persistence passed.
+These mechanisms were informed by A11's pinned host reference; historical
+bootstrap code/policy was not copied or executed.
 
 `dp-maint` and `dp-dev` are separate locked, nologin runtime accounts with private
-groups, no sudo membership and explicit SSH denial. Each receives 65536
+groups, no sudo grants (checked using `sudo -l`) and explicit SSH denial. Each receives 65536
 nonoverlapping subordinate UIDs/GIDs, beginning at 1000000 and 1065536; overlap or
 existing conflicting users/configuration fails. Linger permits future systemd
 user supervision. User-slice limits are 2GiB memory, 512 tasks and 100% CPU per
@@ -104,7 +154,7 @@ Those controls must be implemented before jobs start.
 
 An atomic nftables batch owns only `inet dev_pair_bootstrap`, with default-drop
 input and forwarding. It permits established connections, loopback, SSH22 from
-the explicit bootstrap CIDRs and `tailscale0`, Tailscale UDP41641, ICMP and DHCP.
+the explicit bootstrap CIDRs and `tailscale0`, tailnet-only mosh, Tailscale UDP41641, ICMP and DHCP.
 It neither flushes other tables nor launches applications. A root-owned systemd
 unit reapplies the guard at boot and is required before tailscaled starts.
 The forward drop intentionally prevents bridge/subnet forwarding; a later
@@ -176,8 +226,12 @@ sudo /usr/bin/python3 /root/dev-pair-bootstrap-source/tools/bootstrap.py enroll 
   --auth-key-file /root/tailscale-enrollment.key --tailnet example.ts.net
 sudo tailscale ip -4
 # From a separately authorized tailnet client, using its private SSH key:
-ssh devpair-admin@TAILSCALE_IP
-sudo -n true
+ssh core@TAILSCALE_IP
+# In that core session: clear cached sudo credentials, then verify a password is required.
+sudo -k
+sudo -n true  # must fail
+sudo -v       # enter the external core password through the terminal
+sudo true
 ```
 
 `--tailnet` must equal the intended tailnet's exact `CurrentTailnet.Name`.
@@ -276,3 +330,19 @@ Official sources checked in this development task:
 [Tailscale SSH authentication](https://tailscale.com/kb/1193/tailscale-ssh),
 [nftables base-chain semantics](https://wiki.nftables.org/wiki-nftables/index.php/Configuring_chains).
 Package-page existence is not a verified installation on the target.
+
+## Required host acceptance for operator access
+
+Independent review and an authorized designated Fedora target must still prove:
+all owner account keys can authenticate, password/keyboard-interactive SSH is
+rejected, `core` console password works, sudo refuses without a password and
+succeeds with it, both runtime accounts remain locked/nologin without sudo,
+noninteractive SSH/scp/sftp and mosh negotiation are intact, reconnect over mosh
+and SSH resumes the same tmux work, public/unauthorized UDP is rejected even
+with prior conntrack state, and tailnet loss exposes no fallback. Reboot must
+retain `erebus`, the guard, reservation and tmux configuration; chronyd must
+actually synchronize. Existing final root retirement/recovery evidence remains
+required. A previously prepared candidate from the former arbitrary-operator/
+NOPASSWD schema is not migrated automatically; protected desired/configuration
+conflicts require a separately reviewed migration. No deployed host exists in
+the local evidence for either schema.

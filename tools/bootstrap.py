@@ -1,9 +1,11 @@
 #!/usr/bin/python3
 """Explicit Fedora Cloud 44 host preparation; never launches submitted code or apps."""
 import argparse
+import base64
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import ipaddress
 import importlib.util
 import shutil
@@ -17,12 +19,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
 PACKAGES = ('podman', 'distrobox', 'passt', 'fuse-overlayfs', 'container-selinux',
-            'policycoreutils', 'shadow-utils', 'sudo', 'openssh-server', 'nftables', 'git-core', 'util-linux')
+            'policycoreutils', 'shadow-utils', 'sudo', 'openssh-server', 'nftables', 'git-core', 'util-linux',
+            'mosh', 'tmux', 'chrony')
 REPO = '''[tailscale-stable]
 name=Tailscale stable
 baseurl=https://pkgs.tailscale.com/stable/fedora/$basearch
@@ -36,9 +41,11 @@ GUARD = '''# dev-pair bootstrap v1; owns only this table, never flushes other ru
 add table inet dev_pair_bootstrap
 flush table inet dev_pair_bootstrap
 add chain inet dev_pair_bootstrap input { type filter hook input priority -10; policy drop; }
+add rule inet dev_pair_bootstrap input iifname != "tailscale0" udp dport 60000-61000 drop
 add rule inet dev_pair_bootstrap input ct state established,related accept
 add rule inet dev_pair_bootstrap input iifname "lo" accept
 add rule inet dev_pair_bootstrap input iifname "tailscale0" tcp dport 22 accept
+add rule inet dev_pair_bootstrap input iifname "tailscale0" udp dport 60000-61000 accept
 {bootstrap_rules}
 add rule inet dev_pair_bootstrap input udp dport 41641 accept
 add rule inet dev_pair_bootstrap input meta l4proto { icmp, ipv6-icmp } accept
@@ -62,15 +69,29 @@ Requires=dev-pair-bootstrap-guard.service
 After=dev-pair-bootstrap-guard.service
 '''
 
+# Only Bash's interactive profile path enters tmux. Remote commands, scp/sftp and
+# mosh's SSH startup run noninteractive shells and must retain their protocol.
+OPERATOR_PROFILE = """# dev-pair core reconnect; installed by authorized bootstrap
+case $- in
+  *i*)
+    if [ "$(/usr/bin/id -un)" = core ] && [ -z "${TMUX:-}" ] && [ -t 0 ] && [ -t 1 ]; then
+        exec /usr/bin/tmux new-session -A -s dev-pair-core
+    fi
+    ;;
+esac
+"""
+KEYS_URL = 'https://github.com/oso-gato.keys'
+KEYS_MAX_BYTES = 262144
+
 class Blocked(Exception):
     pass
 
 class Commands:
-    def __call__(self, *args, ok=(0,)):
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
         # No caller PATH, shell, environment auth keys, or captured daemon output in errors.
         env = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
         try:
-            p = subprocess.run(args, env=env, text=True, capture_output=True, timeout=900)
+            p = subprocess.run(args, env=env, text=True, input=input_text, capture_output=True, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired):
             raise Blocked(f'{Path(args[0]).name} failed or timed out; inspect locally (output withheld)') from None
         if p.returncode not in ok:
@@ -92,13 +113,87 @@ def checked_file(path, *, secret=False):
         raise Blocked('secret file must have mode 0600 or stricter')
     return p
 
-def public_key(path):
-    p = checked_file(path)
-    key = p.read_text().strip()
-    if '\n' in key or not re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,2}(?: [^\r\n]+)?', key):
-        raise Blocked('provide exactly one unoptioned ssh-ed25519 public key')
-    Commands()('/usr/bin/ssh-keygen', '-l', '-f', str(p))
-    return key + '\n'
+def validate_public_keys(payload):
+    """Admit the complete GitHub response or nothing; no authorized_keys options."""
+    try:
+        if not payload or len(payload) > KEYS_MAX_BYTES:
+            raise ValueError()
+        text = payload.decode('ascii')
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines or len(lines) > 256:
+            raise ValueError()
+        admitted = []
+        deadline = time.monotonic() + 20
+        for line in lines:
+            if time.monotonic() >= deadline:
+                raise ValueError()
+            if len(line) > 16384 or any(ord(c) < 32 or ord(c) == 127 for c in line):
+                raise ValueError()
+            fields = line.split()
+            kind = fields[0]
+            if (len(fields) < 2 or kind not in ('ssh-ed25519', 'ssh-rsa',
+                    'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521',
+                    'sk-ssh-ed25519@openssh.com', 'sk-ecdsa-sha2-nistp256@openssh.com')):
+                raise ValueError()
+            blob = base64.b64decode(fields[1], validate=True)
+            length = int.from_bytes(blob[:4], 'big')
+            if length != len(kind) or blob[4:4 + length] != kind.encode():
+                raise ValueError()
+            # ssh-keygen checks the full public-key structure, beyond the type header.
+            with tempfile.NamedTemporaryFile(mode='w') as key:
+                key.write(line + '\n')
+                key.flush()
+                Commands()('/usr/bin/ssh-keygen', '-l', '-f', key.name, timeout=5)
+            normalized = kind + ' ' + fields[1]
+            if normalized not in admitted:
+                admitted.append(normalized)
+        return '\n'.join(admitted) + '\n'
+    except (ValueError, UnicodeError, IndexError, Blocked):
+        raise Blocked('GitHub keys response failed validation; existing keys preserved') from None
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def github_keys():
+    # No proxy credentials, redirects, custom TLS policy, unbounded body or forever retry.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(KEYS_URL, headers={'User-Agent': 'dev-pair-bootstrap'})
+            deadline = time.monotonic() + 20
+            with opener.open(request, timeout=5) as response:
+                if response.status != 200 or response.geturl() != KEYS_URL:
+                    raise ValueError()
+                chunks, size = [], 0
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError()
+                    chunk = response.read1(min(16384, KEYS_MAX_BYTES + 1 - size))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > KEYS_MAX_BYTES:
+                        raise ValueError()
+            return validate_public_keys(b''.join(chunks))
+        except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+            if attempt == 2:
+                raise Blocked('bounded GitHub HTTPS fetch failed; existing keys preserved') from None
+    raise AssertionError('unreachable')
+
+
+def operator_password(path):
+    password = checked_file(path, secret=True).read_bytes().decode('utf-8')
+    # Exactly one line. Never accept chpasswd separators/control bytes or empty passwords.
+    password = password.removesuffix('\n')
+    if (not password or len(password) > 1024 or ':' in password
+            or any(ord(c) < 32 or ord(c) == 127 for c in password)):
+        raise Blocked('operator password file must contain one nonempty line without control characters or colon')
+    return password
+
 
 def validate_sources(sources):
     try:
@@ -201,10 +296,28 @@ class Bootstrap:
                 proto == 'udp' and (port in ('68', '546', '41641') or (local and port in ('53', '123', '323'))))
             if not allowed and proto == 'tcp':
                 allowed = self.peerapi_listener(line, host.strip('[]'))
+            if not allowed and proto == 'udp' and port.isdigit() and 60000 <= int(port) <= 61000:
+                allowed = self.mosh_listener(line)
             if not allowed:
                 raise Blocked('unexpected listener: host is not vanilla; inspect inventory before proceeding')
         return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': 'Enforcing',
                 'phase': 'temporary-bootstrap', 'ssh_cutover': 'not implemented'}
+
+    def mosh_listener(self, line):
+        match = re.search(r'users:\(\("mosh-server",pid=(\d+),', line)
+        if not match or not self.path(f'{STATE}/identity-core.json').exists():
+            return False
+        pid = match.group(1)
+        try:
+            if str(self.path(f'/proc/{pid}/exe').readlink()) != '/usr/bin/mosh-server':
+                return False
+            wanted = self.run('/usr/bin/id', '-u', 'core').strip()
+            uid = re.search(r'^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)$',
+                            self.text(f'/proc/{pid}/status'), re.M)
+            return bool(uid and wanted.isdigit() and int(wanted) >= 1000
+                        and all(value == wanted for value in uid.groups()))
+        except (OSError, Blocked):
+            return False
 
     def peerapi_listener(self, line, host):
         # Permit only root's actual official tailscaled executable on this node's own IP.
@@ -314,7 +427,8 @@ class Bootstrap:
         fields = account.split(':')
         if len(fields) != 7 or fields[5:] != [f'/home/{name}', shell] or int(fields[2]) < 1000:
             raise Blocked('account configuration conflicts')
-        self.run('/usr/sbin/usermod', '--lock', name)
+        if name != 'core':
+            self.run('/usr/sbin/usermod', '--lock', name)
         groups = self.run('/usr/bin/id', '-nG', name).split()
         if groups != [name]:
             raise Blocked('managed account must have only its private primary group')
@@ -339,14 +453,84 @@ class Bootstrap:
                                 mode=0o644, expected=content)
             self.run('/usr/bin/loginctl', 'enable-linger', name)
 
+    def password_operator(self, password):
+        marker = f'{STATE}/operator-password-set'
+        if not self.path(marker).exists():
+            # An interruption after chpasswd can safely reapply the same external input.
+            self.run('/usr/sbin/chpasswd', input_text='core:' + password + '\n')
+        observed = self.run('/usr/bin/passwd', '-S', 'core').split()
+        # shadow-utils uses P; Fedora's historical passwd/libuser uses PS.
+        # Both mean a set, unlocked password; L/LK/NP and absent output fail.
+        if len(observed) < 2 or observed[0] != 'core' or observed[1] not in ('P', 'PS'):
+            raise Blocked('core password is not usable; recovery required')
+        self.atomic(marker, 'password configured; value remains external\n')
+
+    def host_identity(self):
+        # cloud-init must not restore a provider hostname on the next boot.
+        self.atomic('/etc/cloud/cloud.cfg.d/99-dev-pair-hostname.cfg',
+                    '#cloud-config\npreserve_hostname: true\n', mode=0o644)
+        self.run('/usr/bin/hostnamectl', 'set-hostname', 'erebus')
+        if self.run('/usr/bin/hostnamectl', '--static').strip() != 'erebus':
+            raise Blocked('persistent hostname observation failed')
+        self.run('/usr/bin/systemctl', 'enable', '--now', 'chronyd.service')
+        self.run('/usr/bin/chronyc', 'tracking')
+        self.reserve_mosh_ports()
+        # Daemon observation is not proof of synchronized time; acceptance uses real host evidence.
+        self.atomic('/etc/profile.d/90-dev-pair-core-tmux.sh', OPERATOR_PROFILE, mode=0o644)
+
+    def reserve_mosh_ports(self):
+        # The early public mosh drop also covers established UDP. Reserve its port
+        # range so unrelated outbound clients do not receive replies in that range.
+        ranges = []
+        for entry in self.text('/proc/sys/net/ipv4/ip_local_reserved_ports').strip().split(','):
+            if not entry:
+                continue
+            if not re.fullmatch(r'[0-9]+(?:-[0-9]+)?', entry):
+                raise Blocked('invalid existing reserved port ranges')
+            endpoints = [int(value) for value in entry.split('-')]
+            low, high = endpoints[0], endpoints[-1]
+            if not 1 <= low <= high <= 65535:
+                raise Blocked('invalid existing reserved port ranges')
+            ranges.append((low, high))
+        ranges.append((60000, 61000))
+        merged = []
+        for low, high in sorted(ranges):
+            if merged and low <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+            else:
+                merged.append((low, high))
+        value = ','.join(str(low) if low == high else f'{low}-{high}' for low, high in merged)
+        self.atomic('/etc/sysctl.d/90-dev-pair-mosh.conf',
+                    'net.ipv4.ip_local_reserved_ports = ' + value + '\n', mode=0o644)
+        self.run('/usr/sbin/sysctl', '-p', str(self.path('/etc/sysctl.d/90-dev-pair-mosh.conf')))
+
+    def operator_keys(self, name, key):
+        target = f'/etc/ssh/dev-pair-keys/{name}'
+        marker = f'{STATE}/operator-keys.json'
+        prior = self.text(marker)
+        hashes = json.loads(prior) if prior else {}
+        current = self.text(target)
+        current_hash = hashlib.sha256(current.encode()).hexdigest() if current else None
+        if current and current_hash not in (hashes.get('previous'), hashes.get('wanted')):
+            raise Blocked('operator key file conflicts with protected import record')
+        intent = json.dumps({'previous': current_hash, 'wanted': hashlib.sha256(key.encode()).hexdigest()}, sort_keys=True) + '\n'
+        self.atomic(marker, intent, expected=prior or None)
+        # Validation/fetch was completed before any of these files are touched. The intent
+        # admits both sides of an interrupted rename, so retry can finish without key loss.
+        self.atomic(target, key, mode=0o644, expected=current or None)
+
     def ssh_operator(self, name, key):
         self.directory('/etc/ssh/dev-pair-keys', mode=0o755)
-        self.atomic(f'/etc/ssh/dev-pair-keys/{name}', key, mode=0o644)
+        self.operator_keys(name, key)
         self.run('/usr/sbin/restorecon', '-RF', str(self.path('/etc/ssh/dev-pair-keys')))
         # This named human operator has explicit administration authority; runtime users do not.
-        sudo = f'{name} ALL=(ALL) NOPASSWD: ALL\n'
+        sudo = f'Defaults:{name} authenticate,!rootpw,!targetpw,!runaspw\n{name} ALL=(ALL) PASSWD: ALL\n'
         self.atomic('/etc/sudoers.d/dev-pair-operator', sudo, mode=0o440)
         self.run('/usr/sbin/visudo', '-cf', str(self.path('/etc/sudoers.d/dev-pair-operator')))
+        self.run('/usr/sbin/visudo', '-c')
+        effective_sudo = self.run('/usr/bin/sudo', '-l', '-U', name)
+        if any(token in effective_sudo for token in ('NOPASSWD', '!authenticate')):
+            raise Blocked('effective core sudo policy bypasses password authentication')
         ssh = (f'# dev-pair bootstrap: only the named operator; initial root route retained\n'
                'DenyUsers dp-maint dp-dev\n'
                f'Match User {name}\n    AuthorizedKeysFile /etc/ssh/dev-pair-keys/{name}\n'
@@ -370,7 +554,7 @@ class Bootstrap:
                 self.path(target).unlink(missing_ok=True)
             raise
 
-    def prepare(self, name, key, sources, gptbox_context=None, expected_context=None):
+    def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None):
         if gptbox_context is not None and (not isinstance(expected_context, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_context)):
             raise Blocked('a separately trusted context SHA256 is required before preparation')
         sources = validate_sources(sources)
@@ -382,8 +566,8 @@ class Bootstrap:
                 raise Blocked('invalid current SSH source') from None
             if not any(remote in ipaddress.ip_network(c) for c in sources):
                 raise Blocked('current SSH source is outside declared bootstrap CIDRs')
-        if not re.fullmatch(r'[a-z][a-z0-9-]{2,24}', name) or name in ('dp-maint', 'dp-dev'):
-            raise Blocked('invalid named operator')
+        if name != 'core' or (password is None and not self.path(f'{STATE}/operator-password-set').exists()):
+            raise Blocked('core operator and securely supplied password are required')
         self.preflight()
         if gptbox_context is not None:
             self.check_gptbox_inputs(gptbox_context, expected_context)
@@ -401,14 +585,18 @@ class Bootstrap:
                                   'source_baseline': SOURCE_BASELINE,
                                   'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                                   'gptbox_context_sha256': expected_context, 'operator': name,
-                                  'key_sha256': hashlib.sha256(key.encode()).hexdigest(), 'bootstrap_sources': sources}, sort_keys=True) + '\n'
+                                  'keys_source': KEYS_URL, 'bootstrap_sources': sources}, sort_keys=True) + '\n'
             self.atomic(f'{STATE}/desired.json', desired)
             self.step('packages', lambda: self.run('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1',
                        '--setopt=localpkg_gpgcheck=1', '--disablerepo=*', '--enablerepo=fedora',
                        '--enablerepo=updates', 'install', *PACKAGES))
-            self.step('operator', lambda: (self.identity(name, '/bin/bash'), self.ssh_operator(name, key)))
+            self.step('operator', lambda: (self.identity(name, '/bin/bash'), self.password_operator(password),
+                                         self.ssh_operator(name, key)))
+            self.step('host-identity-time', self.host_identity)
             for who, begin, role in [('dp-maint', 1000000, 'maintenance'), ('dp-dev', 1065536, 'development')]:
                 self.step(who, lambda who=who, begin=begin: self.identity(who, '/usr/sbin/nologin', begin))
+                # sudo -l exits 1 only when this user has no permitted commands.
+                self.run('/usr/bin/sudo', '-l', '-U', who, ok=(1,))
                 self.directory(f'/var/lib/dev-pair/{role}', owner=who)
                 for directory in ('workspaces', 'checkpoints', 'evidence', 'deliverables', 'builds', 'cache', 'state'):
                     self.directory(f'/var/lib/dev-pair/{role}/{directory}', owner=who)
@@ -729,8 +917,8 @@ def main():
     prep.add_argument('--apply', action='store_true', help='perform host changes; absent means inspect only')
     prep.add_argument('--gptbox-context', required=True, help='real maintenance-role context; fixtures denied')
     prep.add_argument('--expected-context-sha256', required=True, help='trusted handoff digest outside context')
-    prep.add_argument('--operator', required=True)
-    prep.add_argument('--public-key-file', required=True)
+    prep.add_argument('--operator', choices=('core',), default='core')
+    prep.add_argument('--password-file', help='protected root-owned core console/sudo password file; never an argv value')
     prep.add_argument('--bootstrap-source', action='append', required=True, help='explicit IPv4/IPv6 CIDR; repeatable')
     en = sub.add_parser('enroll')
     en.add_argument('--apply', action='store_true', help='enroll; absent means inspect only')
@@ -745,12 +933,19 @@ def main():
             result = b.preflight()
         elif args.stage == 'prepare':
             if args.apply:
-                result = b.prepare(args.operator, public_key(args.public_key_file), args.bootstrap_source,
-                                   args.gptbox_context, args.expected_context_sha256)
+                password = operator_password(args.password_file) if args.password_file else None
+                keys = github_keys()
+                result = b.prepare(args.operator, keys, args.bootstrap_source,
+                                   args.gptbox_context, args.expected_context_sha256, password=password)
             else:
                 result = {**b.preflight(), 'preview': 'prepare', 'sources': validate_sources(args.bootstrap_source)}
                 b.check_gptbox_inputs(args.gptbox_context, args.expected_context_sha256)
-                public_key(args.public_key_file)
+                if args.password_file:
+                    operator_password(args.password_file)
+                elif not b.path(f'{STATE}/operator-password-set').exists():
+                    raise Blocked('first preparation requires --password-file')
+                github_keys()
+                result['operator'] = 'core; GitHub keys validated; console/sudo password supplied externally'
                 if b.path('/usr/bin/git').exists():
                     b.validate_gptbox_context(args.gptbox_context, args.expected_context_sha256)
                     result['gptbox_context'] = 'content and source verified read-only; build not executed'
