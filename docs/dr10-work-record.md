@@ -860,3 +860,25 @@ network/model calls or admission. In particular, writable session metadata and
 mutable skill/plugin discovery must not be mistaken for inert state. Its design
 handoff will be evaluated against A4/A5 before any implementation or runtime
 claim. The single Sol implementation worker remains assigned to the CI repair.
+
+The second CI correction returned as
+`e25fdaaa816bf8694e9dd27de6c3b9d9d4f15e8c`, integrated as
+`c3450ead41f301586e3dc25767a02330a7d6f4a2`. The integrated suite passes
+136 tests and the CI files are byte-identical to the reviewed branch. Fresh
+`/root/fedora_ci_final_churn_review` returned scoped PASS: all 13 CI tests,
+the previous captured GNU du witness, independent malformed/foreign/error
+rejections and bounded conservative accounting passed. It did not repeat the
+full suite. No remaining material source finding was reported in this scope.
+The review used accepted API configuration `gpt-6-astra` / `high`; an initial
+claim that selection was unavailable was explicitly corrected by the reviewer.
+There was no unsupported-selection error or evidence of another model. Actual
+backend attestation and coordinator model metadata remain unavailable.
+
+Publish this reviewed workflow checkpoint to the existing draft PR and observe
+the first exact-head standard public-runner execution. Its explicit prepare/
+assembly blockers mean exit 2 is expected even after a successful baseline;
+report actual phases rather than treating that exit as either full acceptance
+or proof that boot failed. The single Sol builder is preparing a bounded
+read-only extension plan while baseline evidence is collected. No VPS access,
+paid runner, credentials, model invocation, release or merge is authorized by
+this CI probe. Existing project authority and requirements remain unchanged.
