@@ -821,3 +821,22 @@ was disproved on the actual CLI worker path, not assumed safe from fixtures.
 The source findings are closed; authenticated transport, actual pair recovery
 and host execution remain separate gates. Publish the reviewed local-protocol
 checkpoint while the independently scoped CI harness continues.
+
+The first CI route candidate returned as
+`ddcb2b1a47e910cf10882b8a9835d8a7c9c9ee50`, integrated as `5c3ada4`.
+Its exact-head PR workflow and signed-image QEMU controller perform actual
+Fedora boot/preflight and read-only bootstrap inspection/status when launched;
+prepare and maintenance assembly are explicitly unimplemented phases, so the
+checkpoint intentionally returns exit 2 even if baseline checks pass. No CI
+execution has occurred. The integrated suite passes 132 tests; the builder and
+reviewer tested 131 on their branch without the separate ledger size regression.
+
+Fresh Astra High `/root/fedora_ci_review` returned changes required for two P2
+defects: ordinary concurrent file removal makes GNU du return an error that
+aborts otherwise healthy tooling, and legacy GitHub `##[command]` syntax survives
+the current log sanitizer, including raw structured-report fields. Both were
+reproduced; signature and process-limit tests passed. The Sol builder owns one
+bounded correction batch for race-aware conservative storage measurement and
+safe output across every log/report path. Fresh affected review must precede
+workflow publication and the first observed CI run. Neither the dormant source
+nor local fixtures count as a Fedora boot result.
