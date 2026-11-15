@@ -1167,3 +1167,22 @@ path and truthful partial completion/reapply behavior. Actual SELinux/rootless
 failures must drive scoped diagnosis; no label-disable, privileged, host-socket
 or seccomp-disable fallback is authorized. Complete the report-channel review
 and its exact-candidate run before enabling this new test scope.
+
+
+Dedicated report transport candidate
+`6988c1a2aa73ca25801bf21248d3e52112a950ae` was integrated byte-for-byte as
+`fd46663`. The coordinator independently passed all 171 tests and whitespace
+checks. The eight new tests exercise real FIFO/PTY/process behavior, including
+fragmentation, concurrent console output, exact/overflow limits, malformed and
+failed results, held writers, validated pipe ownership and bounded terminal
+write/drain behavior. No actual QEMU/Fedora result is claimed for this change yet.
+
+The guest writes one bounded raw115200 frame directly to ttyS1 under a 30-second
+write/drain deadline; ttyS0 remains diagnostics. QEMU receives an owned0600 FIFO
+pair, and the controller drains both streams under existing aggregate bounds,
+checks the complete source/script-bound frame and retains byte-preserving bounded
+failure evidence. Network, storage, component/native lifetimes and phase scope
+are unchanged. Fresh Astra High `/root/fedora_report_transport_review` is reviewing
+this exact source before publication; all helper and transport changes remain
+local pending that verdict. The builder is reading the next integration design
+without editing while review completes.
