@@ -688,3 +688,24 @@ execution-budget exhaustion, exact tmpfs validation and current-start readiness.
 No third build attempt, privilege increase or host operation is authorized by
 these corrections. A new Astra High session will review the exact repaired
 candidate; the earlier review cannot be reused as approval.
+
+The repair returned as `ed9b8f3c8956589565d93a63f4a159e4815df94d`, integrated as
+`d5903f2`. All 110 tests pass locally and independently. Fresh Astra High
+`/root/gptbox_repair_review` confirmed production inputs using the real verified
+binary/context, native timeout plumbing to conmon, two-build/two-cleanup limits,
+tmpfs injection/ownership rejection and current-start log filtering. It found
+one compatibility regression: Podman normally appends `tmpcopyup` to tmpfs
+options, but the new allowlist rejects it before assembly. The second bounded
+repair cycle addresses that normalization contract and its regression fixture;
+another fresh scoped review is required before source publication.
+
+A separate local Fedora VM feasibility check investigated software emulation,
+not just KVM availability. The workspace has sufficient nominal resources
+(16GiB memory ceiling, four CPU quota, approximately 59GiB free disk), but no
+QEMU binaries, `sudo` executable or managed `cloud-agent-packages` helper. No
+supported installation grant or existing project VM route was found; no package
+installation, image download or guest boot was attempted. Thus neither a local
+Fedora VM result nor VPS validation exists. Missing KVM alone was not treated as
+proof that software emulation is impossible. The current environment remains
+the same configured instance, with the root credential reference reported ready;
+its value was neither displayed nor sent to the VPS.
