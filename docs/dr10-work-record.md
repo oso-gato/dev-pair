@@ -2,7 +2,7 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 07:06 HKT. Chronological records below retain
+Updated November 16, 2026, 07:13 HKT. Chronological records below retain
 prior evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
@@ -27,9 +27,11 @@ prior evidence and owner decisions.
   while retaining real adoption, pidfd termination and reaping. Production
   cleanup can still block at its global inventory limit; every cleanup failure
   remains blocking. Main source/tests match the tested candidate exactly.
-- One changed-candidate Fedora test is admitted under the unchanged limits
-  recorded below. No unchanged retry, policy exception, credentials, VPS action
-  or release promotion is included. PR remains draft and unmerged.
+- Run17 at `25c9808` passed333 hosted tests in43.308 seconds, then blocked
+  at cache-recheck before the first command started. The new typed relay gate
+  was not exercised. Exact internal cause is under bounded source diagnosis;
+  its scope is closed. No unchanged retry, policy exception, credentials, VPS
+  action or release promotion is included. PR remains draft and unmerged.
 - Sole Sol High builder `/root/durable_job_build` works separately in
   `/workspace/dev-pair-signed-base` on verified signed Fedora OCI input,
   candidate identity, local import and authenticated package refresh. Its source
@@ -2381,3 +2383,36 @@ maintenance assembly. Stop on the first failure and return concrete diagnostics.
 No unchanged retry, wider policy, forced context, secret/model call, VPS change,
 production promotion or budget increase follows. The registry digest's signature
 limitation remains disclosed; signed archive integration is separate pending work.
+
+### November 16, 2026, 07:13 HKT — run17 prelaunch recheck failure
+
+[Run17](https://github.com/oso-gato/dev-pair/actions/runs/43773033253), job
+132992966768, source `25c9808bd3f370f248f54a9df0abec05181671ba`, passed
+all333 hosted tests in43.308 seconds. Actual enforcing Fedora44, systemd259.5,
+policy43.3, kernel6.19.10, native provisioning admission, authenticated inputs,
+pre/post inspection, password absence, complete framing and outer teardown
+passed. The8235-byte frame SHA256 is
+`cb303156972a1ef8026e4c54429bb84a41ee4d26e11549f97e6b1a8386238948`.
+
+Initialization blocked after13.564 seconds. The first getenforce operation
+rejected its cache-recheck after1.417 seconds, before a native unit started.
+There is no relay failure or payload output; the new typed-property/FD gate
+was not exercised. Public metadata retains only admission-rejected, so the
+precise internal condition is not established. Do not label it the prior
+setter-only failure or claim the query correction passed on Fedora.
+
+The bounded audit projection again contains one setfiles_t/var_lib_t:file
+read/write denial and no malformed, truncated or omitted records within that
+projection. Detailed native cleanup remains unverified; outer cleanup and
+password absence passed. Btrfs quota_flags remain empty and no preparation,
+package or maintenance assembly is accepted. Artifacts:
+`/workspace/artifacts/fedora-ci-run-43773033253{.log,-controller.json,-report.json,-request.json}`.
+The one-run scope is closed with no unchanged retry.
+
+Read-only source diagnosis is assigned to `/root/transient_profile_design`
+for ten minutes from07:12 HKT; the sole builder continues signed base work
+until an actionable repair is identified. In particular, configuration
+snapshot timestamps and closed failure diagnostics need investigation without
+loosening the lookup/profile checks. Cleanup-fixture independent PASS receipt:
+`/workspace/artifacts/subreaper-repair-review-186b9d1e52786eaf0631ab23393410b3dd70aa84/review.json`,
+SHA256 `9fce8c4a3b54bb38351481203d7b81e74e4c329c679c606bc3c88509917b2999`.
