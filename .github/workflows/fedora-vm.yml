@@ -1,0 +1,37 @@
+name: Fedora 44 VM probe
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fedora-vm-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  fedora-vm:
+    if: >-
+      github.repository == 'oso-gato/dev-pair' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact public candidate
+        # Official actions/checkout v4.3.1, independently resolved from upstream.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - name: Check local code and protocol behavior
+        run: python3 -m unittest discover -s tests -q
+      - name: Probe signed Fedora bootstrap and maintenance
+        env:
+          DP_EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
+          DP_MERGE_SOURCE: ${{ github.sha }}
+        run: python3 tools/fedora_ci.py --expected-source "$DP_EXPECTED_SOURCE"
