@@ -624,3 +624,23 @@ ordinary nonoverlapping pseudo mounts and EFI handling. No permissions or
 runtime scope expand. Further material findings require another explicit
 checkpoint rather than an unbounded repair loop. No source PASS or Fedora
 readiness is claimed for 47acb75 while this finding remains open.
+
+### Reviewed bootstrap checkpoint
+
+The bounded native-exclusion correction returned as
+`061137eb4d8e18567ae21f44ee0f72fb3869d8ad`, integrated as
+`dc735ef6259b00e5fd01aa2e089094931bc885f6`. Fresh Astra High
+`/root/selinux_exclusion_review` returned scoped source PASS against 47acb75:
+all 100 tests passed independently; native 3.11 behavior and additional
+read-only/non-seclabel ancestor, EFI and adjacent-path probes agree with the
+guard. Rejection preserves the relabel marker, produces no completion evidence
+and invokes no labeling command. Earlier canonical-path, timeout and access
+repairs retain their recorded independent evidence. No actual Fedora labeling,
+reboot, SSH login or container confinement has been exercised.
+
+Publish this reviewed source checkpoint to draft PR #13 without merging or
+claiming runtime approval. A separate Sol High gptbox assembly/probe adapter
+slice continues in an isolated worktree and is not part of this checkpoint.
+Its runtime constructor must preserve genuine upstream Distrobox initialization
+and entry, controlled source/artifact identities and enforced boundaries; it
+cannot substitute a successful version probe for authenticated job admission.
