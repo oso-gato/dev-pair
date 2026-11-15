@@ -100,6 +100,7 @@ class Commands:
     deadline = None
     native_prefix = None
     diagnostic = None
+    metadata_diagnostic = None
     native_register = None
     _cleanup_deadline = None
     current_step = 'unscoped'
@@ -377,18 +378,21 @@ class Commands:
                     process.stdin.close()
                 process.stdout.close()
                 process.stderr.close()
-            if self.diagnostic:
+            if self.diagnostic or self.metadata_diagnostic:
                 record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
                 if not completed or type(status) is int and status != 0:
                     record['native'] = self.native_diagnostic(args)
+                if self.metadata_diagnostic:
+                    self.metadata_diagnostic(dict(record))
                 if public:
                     record.update(output_bytes=total, capture_limit_bytes=1048576,
                                   **{name + '_tail': bytes(data[-8192:]).decode(errors='replace') for name, data in buffers.items()},
                                   **{name + '_truncated': len(data) > 8192 for name, data in buffers.items()})
-                self.diagnostic(record)
+                if self.diagnostic:
+                    self.diagnostic(record)
             if cleanup_error is not None:
                 raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime') from None
 

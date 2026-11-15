@@ -607,13 +607,14 @@ class Gptbox(Bootstrap):
             self.run.native_register = register
             preparation.run.diagnostic = diagnostic
             def source_check():
-                previous = self.run.diagnostic
-                def source_diagnostic(buffers, status):
+                previous = self.run.metadata_diagnostic
+                def source_diagnostic(metadata):
+                    status = metadata['status']
                     diagnostic({'operation': 'withheld', 'operation_id': 'source-git-read',
                                 'step': 'adapter-source-and-upstream', 'status': status,
-                                'accepted_exit': status == 0, 'outcome': 'accepted' if status == 0 else 'rejected'})
-                self.run.diagnostic = source_diagnostic
+                                'accepted_exit': metadata['accepted_exit'], 'outcome': metadata['outcome']})
                 try:
+                    self.run.metadata_diagnostic = source_diagnostic
                     self.source_stage = 'input-content'
                     self.inputs(context, expected, upstream, revision)
                     record['source_verification'] = {'stage': 'all-inputs', 'outcome': 'complete'}
@@ -621,7 +622,7 @@ class Gptbox(Bootstrap):
                     record['source_verification'] = {'stage': getattr(self, 'source_stage', 'unavailable'), 'outcome': 'blocked-or-interrupted'}
                     raise
                 finally:
-                    self.run.diagnostic = previous
+                    self.run.metadata_diagnostic = previous
                     save()
             prepare_started = time.monotonic()
             adapter_started = None

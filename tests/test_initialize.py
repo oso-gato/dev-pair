@@ -352,6 +352,43 @@ class InitializeTests(unittest.TestCase):
         self.assertNotIn('synthetic-secret-path', json.dumps(record))
         self.assertIsNone(self.app.run.diagnostic)
 
+    def test_actual_source_check_keeps_commands_limit_dispatch_and_restores_metadata(self):
+        run = self.app.run
+        self.assertIsInstance(run, g.ProbeCommands)
+        previous_metadata = lambda metadata: None
+        run.metadata_diagnostic = previous_metadata
+        self.assertIsNone(run.diagnostic)
+        observed = []
+        def source_child(size):
+            def inputs(*args):
+                # This is the production source_check closure reached from
+                # initialize/prepare. Only the external Git boundary is replaced
+                # by a real harmless child; no Fedora/source acceptance claimed.
+                self.assertIsNone(run.diagnostic)
+                self.assertIsNot(run.metadata_diagnostic, previous_metadata)
+                value = run(sys.executable, '-c', 'import os;os.write(1,b"s"*' + str(size) + ')', timeout=3)
+                observed.append(len(value))
+                return {}, {}
+            return inputs
+        with patch.object(self.app, 'inputs', side_effect=source_child(32)):
+            self.assertEqual(self.initialize()['phase'], 'complete')
+        self.assertEqual(observed, [32])
+        self.assertIs(run.metadata_diagnostic, previous_metadata)
+        self.assertIsNone(run.diagnostic)
+        with patch.object(self.app, 'inputs', side_effect=source_child(1100000)):
+            with self.assertRaisesRegex(b.Blocked, 'output byte budget'):
+                self.initialize()
+        self.assertEqual(observed, [32])
+        self.assertIs(run.metadata_diagnostic, previous_metadata)
+        self.assertIsNone(run.diagnostic)
+        record = json.loads(self.app.text(b.STATE + '/initialize.json'))
+        self.assertEqual(record['prepare'], 'blocked')
+        diagnostic = json.loads(self.app.text(b.STATE + '/prepare-diagnostics.json'))
+        self.assertFalse(diagnostic['failures'][-1]['accepted_exit'])
+        self.assertEqual(diagnostic['failures'][-1]['operation_id'], 'source-git-read')
+        self.assertNotIn('stdout_tail', diagnostic['failures'][-1])
+        self.assertNotIn('stderr_tail', diagnostic['failures'][-1])
+
     def test_native_root_unit_is_recorded_before_spawn_and_runs_clean_environment(self):
         run = b.Commands()
         run.native_prefix = 'dev-pair-initialize-prepare-12345678'

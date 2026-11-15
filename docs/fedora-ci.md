@@ -158,7 +158,9 @@ lines and at most two public failure records per preparation/adapter, with
 bounded1500-character stream tails, original counts and truncation flags. Fixed
 operation/prepare-step IDs distinguish accepted nonzero exits from rejected
 commands; recent metadata remains available when a later Python source gate fails.
-Source/context/upstream verification exports fixed stage/outcome only, never raw
+Source metadata uses a separate observer, preserving the original1MiB Commands
+dispatch, deadlines and cleanup. Source/context/upstream verification exports
+fixed stage/outcome only, never raw
 Git paths/configuration/output. Failed owned native commands additionally query
 only bounded unit state/result/exit fields; a collected or unstarted unit is
 explicitly unavailable, never inferred successful. SELinux enforcement is a
