@@ -282,7 +282,7 @@ class Commands:
             raise Blocked('native unit observation failed; no duplicate effects')
         try:
             verify_inactive_cgroup(unit)
-            NativeTransport.recover(unit)
+            NativeTransport.recover(unit, deadline=control._cleanup_deadline)
         except ValueError:
             raise Blocked('native transport cleanup unresolved; exact ownership records preserved') from None
 
@@ -375,7 +375,7 @@ class Commands:
                 if not native_limits:
                     raise Blocked('finite native lifetime is required')
                 command_end = min(command_end, started + min(native_limits))
-                transport = NativeTransport(unit)
+                transport = NativeTransport(unit, deadline=command_end)
                 # Observe before allocation/registration: an existing busy/foreign
                 # unit is a collision, never this attempt's cleanup authority.
                 control = Commands()

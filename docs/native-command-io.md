@@ -172,7 +172,12 @@ extra dependency entries, bounds, unreadability or observed changes block before
 StartTransientUnit. Only the stock vendor basename and the exact owned empty
 mask may exist. Vendor contents are never copied or treated as accepted policy;
 the exact mask must shadow the complete file. This is a conservative scanner,
-not a general systemd configuration interpreter.
+not a general systemd configuration interpreter. All three directory inventories
+use context-managed streaming os.scandir rather than Path.iterdir/list/set
+materialization. Configuration count/name-byte/deadline limits apply as entries
+arrive; profile and stream verification stop at the first foreign/duplicate name.
+The same command deadline, or existing bounded reconciliation deadline, applies
+to owned verification. Iterators close on success, rejection and interruption.
 
 A fresh NOT_FOUND/inactive observation is required; loaded inactive units are not
 reused. After exclusive mask-directory creation, its lookup parent's identity

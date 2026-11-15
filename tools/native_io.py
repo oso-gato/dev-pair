@@ -37,6 +37,19 @@ def exists_strict(path):
         return False
 
 
+def bounded_names(path, allowed, reason, end=None):
+    require(end is None or time.monotonic() < end, 'Transport verification deadline exceeded')
+    present = set()
+    with os.scandir(path) as entries:
+        for entry in entries:
+            require(end is None or time.monotonic() < end, 'Transport verification deadline exceeded')
+            # Do not retain an unknown name or consume the rest of its directory.
+            require(entry.name in allowed and entry.name not in present, reason)
+            present.add(entry.name)
+    require(end is None or time.monotonic() < end, 'Transport verification deadline exceeded')
+    return present
+
+
 def identity(path):
     info = path.lstat()
     require(info.st_uid == os.geteuid() and not stat.S_ISLNK(info.st_mode) and info.st_nlink >= 1, 'Transport ownership/type changed')
@@ -180,23 +193,25 @@ def configuration_snapshot(paths, unit, owned_mask=False, end=None):
                     continue
                 require(protected_directory(directory) is not None, 'Unknown applicable configuration')
                 before = directory.lstat()
-                entries = []
-                for entry in directory.iterdir():
-                    require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
-                    count += 1; size += len(entry.name.encode())
-                    require(count <= 256 and size <= 16384, 'Applicable configuration inventory bound exceeded')
-                    entries.append(entry)
                 snapshot.append((str(directory), before.st_dev, before.st_ino, before.st_mode, before.st_uid, before.st_mtime_ns // 1000))
-                require(suffix == '.d' or not entries, 'Applicable dependency effects are forbidden')
-                for entry in entries:
-                    info = entry.lstat()
-                    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022 and info.st_nlink == 1 and info.st_size <= 4096,
-                            'Unprotected applicable configuration')
-                    allowed = entry == Path('/usr/lib/systemd/system/service.d') / MASK or (owned_mask and entry == PROFILE_ROOT / (unit + '.d') / MASK)
-                    require(allowed, 'Unknown applicable drop-in')
-                    if owned_mask and entry == PROFILE_ROOT / (unit + '.d') / MASK:
-                        require(info.st_size == 0 and stat.S_IMODE(info.st_mode) == 0o644, 'Controlled mask changed')
-                    snapshot.append((str(entry), info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns))
+                # Path.iterdir eagerly materializes directory contents on supported
+                # CPython versions. Consume the kernel iterator under the bounds.
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
+                        count += 1; size += len(entry.name.encode())
+                        require(count <= 256 and size <= 16384, 'Applicable configuration inventory bound exceeded')
+                        require(suffix == '.d', 'Applicable dependency effects are forbidden')
+                        path_entry = directory / entry.name
+                        allowed = path_entry == Path('/usr/lib/systemd/system/service.d') / MASK or (owned_mask and path_entry == PROFILE_ROOT / (unit + '.d') / MASK)
+                        require(allowed, 'Unknown applicable drop-in')
+                        info = entry.stat(follow_symlinks=False)
+                        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and not info.st_mode & 0o022 and info.st_nlink == 1 and info.st_size <= 4096,
+                                'Unprotected applicable configuration')
+                        if owned_mask and path_entry == PROFILE_ROOT / (unit + '.d') / MASK:
+                            require(info.st_size == 0 and stat.S_IMODE(info.st_mode) == 0o644, 'Controlled mask changed')
+                        snapshot.append((str(path_entry), info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_size, info.st_mtime_ns))
+                require(end is None or time.monotonic() < end, 'Configuration admission deadline exceeded')
                 require(directory.lstat() == before, 'Concurrent configuration mutation')
     return tuple(snapshot)
 
@@ -237,7 +252,8 @@ def pipe_pair():
 
 
 class NativeTransport:
-    def __init__(self, unit):
+    def __init__(self, unit, deadline=None):
+        self.deadline = deadline
         require(re.fullmatch(UNIT, unit or ''), 'Unrecognized owned native transport unit')
         self.unit = unit
         self.canonical = canonical_unit(unit)
@@ -358,8 +374,7 @@ class NativeTransport:
             return
         require(present and identity(self.profile_path) == profile['directory'] and
                 stat.S_ISDIR(profile['directory']['mode']) and stat.S_IMODE(profile['directory']['mode']) == 0o755, 'Profile directory changed')
-        entries = {value.name for value in self.profile_path.iterdir()}
-        require(entries <= {MASK}, 'Foreign profile entry preserved')
+        entries = bounded_names(self.profile_path, {MASK}, 'Foreign profile entry preserved', self.deadline)
         if profile['file'] is None:
             require(not entries, 'Unproven profile mask retained')
             return
@@ -396,8 +411,8 @@ class NativeTransport:
         require(self.state['directory'] is not None and identity(self.path) == self.state['directory'] and
                 stat.S_ISDIR(self.state['directory']['mode']) and stat.S_IMODE(self.state['directory']['mode']) == 0o700,
                 'Transport directory identity changed or unproven')
-        present = {p.name for p in self.path.iterdir()}
-        require(present <= set(self.state['nodes']) and (self.state['cleanup_started'] or present == set(self.state['nodes'])), 'Unknown or unproven transport entry preserved')
+        present = bounded_names(self.path, set(self.state['nodes']), 'Unknown or unproven transport entry preserved', self.deadline)
+        require(self.state['cleanup_started'] or present == set(self.state['nodes']), 'Unknown or unproven transport entry preserved')
         for name, expected in self.state['nodes'].items():
             if self.state['cleanup_started'] and name not in present:
                 continue
@@ -433,9 +448,9 @@ class NativeTransport:
                 '--property=StandardOutput=file:' + str(self.path / 'stdout'), '--property=StandardError=file:' + str(self.path / 'stderr'))
 
     @classmethod
-    def recover(cls, unit):
+    def recover(cls, unit, deadline=None):
         # Caller must first prove this exact native unit inactive/not-found.
-        transport = cls(unit)
+        transport = cls(unit, deadline=deadline)
         guard_root()
         require(not (ROOT / unit).exists() and not (ROOT / unit).is_symlink(), 'Legacy transport retained for explicit reconciliation')
         require(not exists_strict(transport.record.with_suffix('.next')), 'Unproven journal update retained')
