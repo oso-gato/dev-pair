@@ -1953,3 +1953,36 @@ be inspected before admitting a concrete profile; a narrowly scoped dedicated
 domain remains an engineering possibility, not an accepted policy change. No
 unavoidable owner exception was established. Native nesting, storage enforcement,
 authentication, renewal and delivery acceptance remain outstanding.
+
+### November 16, 2026, 04:26 HKT — reviewed transport and one Fedora retest
+
+The original transport review returned CHANGES REQUIRED for NIO-1 only, with
+242 independently passing tests. Evidence:
+`/workspace/artifacts/native-command-io-review-ce3ecb7/review.json`, SHA256
+`0fe957b7f97f34d21a294f8e3e072e3293cb299a8e41dc7df4a66e969a275352`.
+Sol High repair `3fdaedb03f4db93f7ebca67379e0f07971b981cc` is integrated
+byte-identically as `5fce36f`. Only Commands-created root wrappers enter the
+initializer inventory. Explicit dp-maint transports retain protected journals
+and existing exact-context, UID-bound recovery; no grammar or user check widens.
+The builder passed 243 tests in 39.620 seconds; combined integration passed
+254 tests in 38.210 seconds.
+
+Fresh Astra High `/root/native_io_retry_review` returned PASS for that exact
+repair, independently passing 243 tests in 41.260 seconds. Its real FIFO checks
+cover interrupted integrated retry, actual SIGKILL after persisted sensitive
+input but before launch for both root and dp-maint, recovery before new payload
+execution, wrong-user rejection and foreign replacement preservation. Evidence:
+`/workspace/artifacts/native-io-retry-review-3fdaedb03f4db93f7ebca67379e0f07971b981cc/review.json`,
+SHA256 `02dc1848af4e35b7f3d363b63ba1a6ebf54f0b5675f825df747c5ab364d3eab2`.
+This admits a bounded Fedora test, not production or native-runtime acceptance.
+
+Publish the combined reviewed offline-state and transport work to the requested
+PR13 branch. One changed-candidate Fedora retest is admitted under the existing
+60-minute hosted job / 3300-second controller envelope (setup 540, VM 2640,
+cleanup 120 seconds), guest 6 GiB/2 CPUs/32 GiB virtual disk and outer
+8 GiB/3 CPUs/1024 PIDs. Existing 16 GiB overlay, 4 GiB overhead, 3 GiB host
+reserve, 8 GiB guest reserve and output/report ceilings remain unchanged. The
+test must establish actual manager-opened command behavior, protected recovery
+and the existing preparation/assembly checks, returning exact diagnostics on
+failure. No unchanged retry, policy relaxation, secret/model use, VPS mutation,
+release promotion or added execution budget follows from this admission.
