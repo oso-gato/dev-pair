@@ -41,6 +41,15 @@ invalid-image errors cannot count as denial. Failed actions and actual partial
 product effects are retained. The denied cwd request may execute confined at the
 HOME fallback; its actual cwd and absolute-target denial remain visible.
 
+Each action record retains its emitted call kind and the actual returned output
+kind. The pinned stock source maps `function_call` to `function_call_output` and
+`custom_tool_call` to `custom_tool_call_output` (`core/src/tools/context.rs`,
+`function_tool_response`, and `parallel.rs`, `failure_response`, at source
+`d32063f96c2dff1dc96af839b3952abb6acfeda4`). Every returned output, including
+replayed history, must match its issued ID and kind. Unknown, orphan, duplicate
+or cross-kind outputs cannot advance the sequence or pass an action. Older
+reports without these fields do not establish observed wire kinds.
+
 Actual request tool inventories are hashed and classified from completed checks.
 Unknown/unexercised surfaces block inventory closure and overall status, even when
 all fourteen actions pass. In the observed direct-tool fixture, goals,

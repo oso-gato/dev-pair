@@ -39,6 +39,54 @@ class OfflineTools(unittest.TestCase):
             other=self.sequence();other.request(self.body())
             with self.assertRaises(ValueError):other.request(self.body(items))
 
+    def test_exact_wire_kinds_reject_cross_kind_unknown_orphan_and_duplicates(self):
+        for ident, expected in (('patch-deny', 'custom_tool_call_output'),
+                                ('image-deny', 'function_call_output')):
+            for kind in ('function_call_output', 'custom_tool_call_output',
+                         'future_tool_output', 'message', None):
+                seq = self.sequence(ident)
+                seq.request(self.body())
+                item = {'type': kind, 'call_id': ident,
+                        'output': 'Permission denied (os error 13)'}
+                if kind == expected:
+                    seq.request(self.body([item]))
+                    self.assertTrue(seq.records[0]['pass'])
+                    self.assertEqual(seq.records[0]['emitted_call_kind'], seq.planned[0]['kind'])
+                    self.assertEqual(seq.records[0]['returned_output_kind'], expected)
+                else:
+                    before = (seq.index, seq.action_end, seq.meter.used)
+                    with self.assertRaises(ValueError):
+                        seq.request(self.body([item]))
+                    self.assertEqual((seq.index, seq.action_end, seq.meter.used), before)
+                    self.assertEqual(seq.records, [])
+                    self.assertFalse(seq.finished)
+
+    def test_replayed_history_also_requires_unique_bound_output_kinds(self):
+        planned = [next(a for a in t.actions(12345) if a['id'] == ident)
+                   for ident in ('patch-deny', 'image-deny')]
+        first = {'type': 'custom_tool_call_output', 'call_id': 'patch-deny',
+                 'output': 'Permission denied (os error 13)'}
+        last = {'type': 'function_call_output', 'call_id': 'image-deny',
+                'output': 'Permission denied (os error 13)'}
+        for historical in ([dict(first, type='function_call_output')],
+                           [first, first], [dict(first, call_id='orphan')],
+                           [dict(first, type='future_tool_output')]):
+            seq = t.Sequence(planned, self.root, time.monotonic() + 2)
+            seq.request(self.body())
+            seq.request(self.body([first]))
+            with self.assertRaises(ValueError):
+                seq.request(self.body(historical + [last]))
+            self.assertEqual(seq.index, 2)
+            self.assertEqual(len(seq.records), 1)
+            self.assertFalse(seq.finished)
+        seq = t.Sequence(planned, self.root, time.monotonic() + 2)
+        seq.request(self.body())
+        seq.request(self.body([first]))
+        seq.request(self.body([first, last]))
+        self.assertTrue(seq.finished)
+        self.assertEqual([r['returned_output_kind'] for r in seq.records],
+                         ['custom_tool_call_output', 'function_call_output'])
+
     def test_invalid_image_and_unsupported_tool_text_are_never_denial_evidence(self):
         for ident,text in (('image-deny','invalid image data'),('patch-deny','unsupported tool'),('shell-deny','/credentials/marker /state/codex/marker /state/sqlite/marker')):
             seq=self.sequence(ident)

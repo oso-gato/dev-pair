@@ -245,6 +245,12 @@ def tool_inventory(value):
     return sorted(names)
 
 
+OUTPUT_KINDS = {
+    'function_call': 'function_call_output',
+    'custom_tool_call': 'custom_tool_call_output',
+}
+
+
 class Sequence:
     def __init__(self,planned,root,end,meter=None):
         self.planned=planned;self.root=Path(root);self.end=end;self.meter=meter or Meter();self.action_end=min(end,time.monotonic()+ACTION_SECONDS)
@@ -275,7 +281,7 @@ class Sequence:
             require(len(encoded)==2 and encoded[0].startswith('data:image/') and sha(base64.b64decode(encoded[1],validate=True))==sha(self.path('/job/src/valid.png').read_bytes()),'allowed image content mismatch')
         elif ident.startswith('image-'):require(not has_image(item) and 'Permission denied (os error 13)' in text,'valid forbidden image did not fail access')
         elif ident=='login-deny':require(not self.path('/job/src/login-ran').exists() and 'login shell is disabled by config' in text,'requested login was not rejected')
-        return {'id':ident,'pass':True,'tool':action['name'],'output':item.get('output'),'output_sha256':sha(canonical(item.get('output'))),
+        return {'id':ident,'pass':True,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':item.get('type'),'output':item.get('output'),'output_sha256':sha(canonical(item.get('output'))),
                 'partial_product_exists':self.path('/job/src/partial-patch').exists(),'protected_unchanged':True}
 
     def request(self,body):
@@ -283,8 +289,15 @@ class Sequence:
         require(type(body)is dict and body.get('model')==MODEL and isinstance(body.get('input'),list),'unexpected model/request input')
         names=tool_inventory(body.get('tools'));self.inventories.append({'sha256':sha(canonical(body['tools'])),'names':names})
         outputs=[v for v in body['input'] if isinstance(v,dict) and v.get('type') in ('function_call_output','custom_tool_call_output')]
-        issued={v['id'] for v in self.planned[:self.index]}
-        require(all(v.get('call_id') in issued for v in outputs),'orphan tool output')
+        issued={v['id']:v for v in self.planned[:self.index]}
+        for item in body['input']:
+            if isinstance(item,dict) and 'call_id' in item:
+                require(item.get('type') in (*OUTPUT_KINDS, *OUTPUT_KINDS.values()),'unknown tool call/output kind')
+            if isinstance(item,dict) and isinstance(item.get('type'),str) and item['type'].endswith('_output'):
+                require(item['type'] in OUTPUT_KINDS.values(),'unknown tool output kind')
+        require(all(type(v.get('call_id')) is str and v['call_id'] in issued for v in outputs),'orphan tool output')
+        require(len(outputs)==len({v['call_id'] for v in outputs}),'duplicate tool output')
+        require(all(v['type']==OUTPUT_KINDS[issued[v['call_id']]['kind']] for v in outputs),'cross-kind tool output')
         if self.index:
             action=self.planned[self.index-1];matches=[v for v in outputs if v.get('call_id')==action['id']]
             require(len(matches)==1,'missing/duplicate matching tool output')
@@ -292,12 +305,13 @@ class Sequence:
             try:
                 self.records.append(self.oracle(action,matches[0]))
             except ValueError as error:
-                self.records.append({'id':action['id'],'pass':False,'tool':action['name'],'output':matches[0].get('output'),'check_error':str(error),'partial_product_exists':self.path('/job/src/partial-patch').exists()})
+                self.records.append({'id':action['id'],'pass':False,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':matches[0]['type'],'output':matches[0].get('output'),'check_error':str(error),'partial_product_exists':self.path('/job/src/partial-patch').exists()})
                 raise
         rid='offline-response-'+str(self.index)
         events=[{'type':'response.created','response':{'id':rid}}]
         if self.index<len(self.planned):
             action=self.planned[self.index]
+            require(action.get('kind') in OUTPUT_KINDS,'unknown planned tool call kind')
             item={'type':action['kind'],'name':action['name'],'call_id':action['id']}
             item.update({'arguments':json.dumps(action['arguments'])} if action['kind']=='function_call' else {'input':action['input']})
             events.append({'type':'response.output_item.done','item':item});self.index+=1
