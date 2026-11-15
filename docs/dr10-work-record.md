@@ -2,7 +2,7 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 06:28 HKT. This section summarizes the current state;
+Updated November 16, 2026, 06:36 HKT. This section summarizes the current state;
 chronological records below retain earlier evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
@@ -10,7 +10,7 @@ chronological records below retain earlier evidence and owner decisions.
   `/workspace/dev-pair`. Published source `574ba6a` passed all310 hosted tests
   and reached the relay in enforcing Fedora during run16. It blocked before
   payload execution because a queried stdio path property is not readable.
-  A source-backed property/FD-identity correction is being designed. Previously
+  A source-backed property/FD-identity correction is under implementation. Previously
   separate reviewed storage is included. Supplemental checkpoint
   `f15c11efbc7213f2d96f9133edf16a530601a05c` retains earlier reviewed work.
   Standards remain `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
@@ -40,8 +40,12 @@ chronological records below retain earlier evidence and owner decisions.
   Its review found TP-1, eager directory enumeration before inventory limits.
   Repair `d58237e`, integrated as `a18e81b`, passed fresh Astra High review:
   299 tests and eight adversarial checks. Combined integration passes 310 tests.
-  Sole Sol High builder `/root/durable_job_build` has resumed the independent
-  offline-tool work from WIP `692956f`; it is not admitted.
+  Offline tool candidate `01b753d`, integrated as `f6ed824`, passed independent
+  review for its partial component scope; combined integration passes318 tests.
+  Actual14 tool actions and9 baseline checks passed; seven exposed tool names
+  remain unclosed. Sole Sol High builder `/root/durable_job_build` now works in
+  `/workspace/dev-pair-readable-profile` on exact Get queries and FD binding;
+  fresh `/root/native_property_review` is prepared.
   No policy grants, forced contexts or budget increases are included.
 - Source handoffs are `/workspace/scratch/native-fifo-label-design.md`,
   `/workspace/scratch/nested-profile-source-research.md` and
@@ -2303,3 +2307,44 @@ no host capability or managed-policy change. Its report still blocks complete
 inventory closure for other exposed tools, and exact candidate/review remain
 pending. Source design for those remaining surfaces is
 `/workspace/scratch/codex-tool-inventory-closure-design.md`.
+
+### November 16, 2026, 06:36 HKT — reviewed partial tool component and native query work
+
+Sol High offline candidate `01b753df248774c7c820e84512bad16638e097b4`,
+integrated as `f6ed824`, adds the separate synthetic Responses fixture, tests
+and guide. Builder312 tests passed in46.278 seconds. Fresh Astra High
+`/root/codex_tool_boundary_review` independently passed312 tests in47.098
+seconds and reproduced all14 stock-tool actions plus the9 existing baseline
+checks in3.4 seconds,16 HTTP requests/connections and43,745 captured bytes.
+Owned cleanup completed. Combined integration passes318 tests in50.397 seconds.
+Evidence:
+`/workspace/artifacts/codex-tool-boundary-review-01b753df248774c7c820e84512bad16638e097b4/review.json`,
+SHA256 `6f6adfecfbefb911d9e84ddb4589e98c67a5dde9593f43e7aa6ce91445adcb68`.
+
+PASS applies to this partial validation component. Its actual overall probe
+status remains BLOCKED because create_goal/get_goal/update_goal,
+request_user_input, tool_search, web_search and write_stdin lack complete
+coverage. Synthetic API-key transport, local endpoint and frozen gpt-5.5 model
+metadata are explicit fixture deltas, not a real model/account or a change to
+the Sol/Astra development-session selections. UID/GID1000, one-ID mappings,
+private loopback, zero execution capabilities and NNP were observed. Setup-only
+capabilities stayed inside an unprivileged namespace; no host authority or
+managed permission was added.
+
+The reviewer retained one nonblocking hardening note: call IDs are checked,
+but function/custom returned output kinds are not matched to emitted kinds,
+and reports omit the actual returned item.type. The exact cross-kind acceptance
+reproduction is preserved. Do not claim that stronger protocol evidence exists;
+queue its small repair before inventory-closure expansion. Current real action
+effects and incomplete-inventory status remain the component evidence.
+
+The sole builder's next25-minute slice began around06:31 HKT in
+`/workspace/dev-pair-readable-profile`, baseline `f6ed824`, implementing the
+source-backed native design. Fresh Astra reviewer confirmed all35 readable
+properties, interfaces, typed JSON semantics and GetUnit's status-access check.
+An independent local systemd257 private-bus probe confirmed method/property
+JSON shape and ordered multi-property output in0.023 seconds,484 bytes, with
+daemon/child reaping and directory cleanup. Evidence:
+`/workspace/artifacts/native-property-local-json-probe.json`. This supplements
+v259 source; actual Fedora259 root/dp-maint access remains a runtime gate.
+No new hosted run is admitted until the exact native correction is reviewed.
