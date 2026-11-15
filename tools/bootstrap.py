@@ -264,7 +264,17 @@ class Bootstrap:
         if self.text('/proc/1/comm').strip() != 'systemd':
             raise Blocked('host PID 1 must be systemd')
         if self.run('/usr/sbin/getenforce').strip() != 'Enforcing':
-            raise Blocked('SELinux must already be enforcing')
+            raise Blocked('SELinux must be enforcing; run selinux_bootstrap.py initial convergence first')
+        transition = self.path('/var/lib/dev-pair/selinux-bootstrap')
+        if (transition / 'intent.json').exists():
+            try:
+                complete = json.loads((transition / 'complete.json').read_text())
+                modes = re.findall(r'^\s*SELINUX\s*=\s*["\']?([^#\s"\']+)',
+                                   self.text('/etc/selinux/config'), re.M)
+                if not isinstance(complete, dict) or complete.get('phase') != 'enforcing' or modes != ['enforcing']:
+                    raise ValueError()
+            except (OSError, ValueError):
+                raise Blocked('checked initial SELinux transition is incomplete; workloads remain blocked') from None
         repos = self.path('/etc/yum.repos.d')
         if repos.exists():
             for repo in repos.glob('*.repo'):

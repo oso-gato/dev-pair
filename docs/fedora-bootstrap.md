@@ -17,6 +17,14 @@ not adapted or executed here.
 
 ## Preconditions and preview
 
+Run the separate [initial SELinux convergence](selinux-bootstrap.md) first when
+the provider image is Disabled or Permissive. It stages a checked full relabel
+and automatically finalizes across explicitly authorized setup reboots. Existing
+Enforcing hosts are preserved; permissive mode alone is insufficient. Normal
+prepare refuses an incomplete recorded transition even if live enforcement has
+already been enabled. These are source capabilities with no Fedora runtime
+acceptance yet.
+
 The authorized executor verifies the designated host SSH fingerprint through an
 independent trusted channel, inventories disks/data/services and confirms a usable
 provider-console recovery route. Keep the original session open throughout.
