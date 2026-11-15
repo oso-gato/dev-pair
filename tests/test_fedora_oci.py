@@ -135,7 +135,7 @@ class FedoraOCI(unittest.TestCase):
         from public_inputs import command
         work=self.root/'command';work.mkdir();(work/'home').mkdir()
         import sys
-        code='import os,time;os.fork();time.sleep(5)'
+        code='import time;time.sleep(5)'
         started=time.monotonic()
         with self.assertRaisesRegex(ValueError,'deadline'):
             command([sys.executable,'-c',code],work,timeout=.05)
