@@ -53,8 +53,10 @@ characters. Keep it outside transferred source/context and remove it through
 that channel once setup is confirmed. The tool does not delete external secrets.
 Keys come only from `https://github.com/oso-gato.keys`: no local-key substitute,
 redirect or proxy. Fetch uses normal TLS certificate validation, up to three
-attempts, a five-second socket timeout, a twenty-second read deadline per
-attempt, and a 256KiB body limit. At most 256 unoptioned Ed25519, RSA, ECDSA or
+attempts, each in a disposable isolated Python child with a hard twenty-five-
+second parent timeout covering DNS, TLS, headers and body. Inside it, a five-
+second socket timeout, twenty-second read deadline and 256KiB body limit also
+apply. At most 256 unoptioned Ed25519, RSA, ECDSA or
 OpenSSH security-key entries are accepted; every entry must pass base64/type
 and actual `ssh-keygen` parsing. Validation has a twenty-second deadline plus
 at most five seconds for the final key check. Empty, malformed, over-limit,
@@ -104,7 +106,10 @@ that partial state. This is authorized initial platform provisioning, not
 permission for product jobs to install into a running host.
 
 The fixed human operator `core` gets a private group and password-gated sudo;
-its password also supports authorized provider-console login. `chpasswd` receives
+its password also supports authorized provider-console login. Before unlocking
+the new account, preparation installs, validates and reloads the effective
+key-only SSH policy. A later password/marker failure retains that restriction,
+so the initial global SSH password setting cannot expose the newly set password. `chpasswd` receives
 the password only on stdin, with child output withheld. Neither plaintext nor
 password hash is recorded in state, argv or images. The protected completion
 marker is written only after `passwd -S` reports a usable password. Before that

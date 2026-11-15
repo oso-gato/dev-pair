@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -733,6 +734,102 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaisesRegex(b.Blocked, 'not usable'):
                 self.app.prepare('core', KEY, ['192.0.2.9/32'])
 
+    def test_ssh_key_only_policy_is_reloaded_before_password_unlock_and_survives_marker_failure(self):
+        original = self.app.atomic
+        def fail(path, *args, **kwargs):
+            if path.endswith('/operator-password-set'):
+                raise OSError('injected completion failure')
+            return original(path, *args, **kwargs)
+        self.app.atomic = fail
+        with self.assertRaises(OSError):
+            self.prepare()
+        self.assertTrue(self.fake.password_set)
+        self.assertIn('PasswordAuthentication no', self.app.text('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf'))
+        reload_index = self.fake.calls.index(('/usr/bin/systemctl', 'reload', 'sshd.service'))
+        unlock_index = self.fake.calls.index(('/usr/sbin/chpasswd',))
+        self.assertLess(reload_index, unlock_index)
+        self.assertFalse(self.app.path(b.STATE + '/operator-password-set').exists())
+
+    def test_each_initial_policy_failure_window_prevents_password_unlock(self):
+        original = self.app.atomic
+        def fail(path, *args, **kwargs):
+            if path.endswith('/operator-keys.json'):
+                raise OSError('injected key intent failure')
+            return original(path, *args, **kwargs)
+        self.app.atomic = fail
+        with self.assertRaises(OSError):
+            self.prepare()
+        self.assertFalse(self.fake.password_set)
+        self.app.atomic = original
+        for command in ('restorecon', 'visudo', 'sudo', 'sshd'):
+            self.fake.fail = lambda args, command=command: Path(args[0]).name == command
+            with self.assertRaises(b.Blocked):
+                self.prepare()
+            self.assertFalse(self.fake.password_set)
+        self.fake.fail = lambda args: args[:2] == ('/usr/bin/systemctl', 'reload')
+        with self.assertRaises(b.Blocked):
+            self.prepare()
+        self.assertFalse(self.fake.password_set)
+        self.assertFalse(self.fake.password_inputs)
+
+    def test_blocked_dns_child_is_killed_by_deadline_and_existing_keys_are_preserved(self):
+        self.prepare()
+        before = self.app.text('/etc/ssh/dev-pair-keys/core')
+        self.fake.calls.clear()
+        original = subprocess.run
+        attempts = []
+        def blocking_dns(command, **kwargs):
+            attempts.append(command)
+            script = ('import runpy,socket,sys,time\n'
+                      'target,marker=sys.argv[1:3]\n'
+                      'def blocked_dns(*a,**k):\n'
+                      '    with open(marker,"a") as output: output.write("DNS entered\\n")\n'
+                      '    time.sleep(120)\n'
+                      'socket.getaddrinfo=blocked_dns\n'
+                      'sys.argv=[target,"_fetch-github-keys"]\n'
+                      'runpy.run_path(target,run_name="__main__")')
+            return original([sys.executable, '-I', '-c', script, str(ROOT / 'tools/bootstrap.py'),
+                             str(self.root / 'dns-handshake')], **kwargs)
+        argv = ['bootstrap.py', 'prepare', '--apply', '--gptbox-context', '/unused',
+                '--expected-context-sha256', 'a' * 64, '--bootstrap-source', '192.0.2.9/32']
+        start = time.monotonic()
+        with patch.object(sys, 'argv', argv), patch.object(b, 'Bootstrap', return_value=self.app), \
+                patch.object(b.subprocess, 'run', side_effect=blocking_dns), \
+                patch.object(b, 'KEYS_FETCH_TIMEOUT', 0.4), patch.object(sys, 'stderr', io.StringIO()):
+            self.assertEqual(b.main(), 2)
+        self.assertLess(time.monotonic() - start, 4)
+        self.assertEqual((self.root / 'dns-handshake').read_text().splitlines(), ['DNS entered'] * 3)
+        self.assertEqual(len(attempts), 3)
+        self.assertTrue(all(command[-1] == '_fetch-github-keys' for command in attempts))
+        self.assertEqual(self.app.text('/etc/ssh/dev-pair-keys/core'), before)
+        self.assertFalse(self.fake.calls)
+
+    @unittest.skipUnless(Path('/usr/sbin/sshd').exists(), 'sshd parser unavailable')
+    def test_real_sshd_effective_policy_rejects_password_after_unlocked_marker_failure(self):
+        host = self.root / 'test-host-key'
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(host)], check=True)
+        config = self.root / 'test-sshd.conf'
+        base = ('HostKey ' + str(host) + '\nPasswordAuthentication yes\n'
+                'KbdInteractiveAuthentication yes\nPubkeyAuthentication yes\n')
+        config.write_text(base)
+        command = ['/usr/sbin/sshd', '-T', '-f', str(config), '-C', 'user=core,host=bootstrap,addr=192.0.2.2']
+        baseline = subprocess.run(command, text=True, capture_output=True, check=True).stdout
+        self.assertIn('passwordauthentication yes', baseline.splitlines())
+        original = self.app.atomic
+        def fail(path, *args, **kwargs):
+            if path.endswith('/operator-password-set'):
+                raise OSError('injected completion failure')
+            return original(path, *args, **kwargs)
+        self.app.atomic = fail
+        with self.assertRaises(OSError):
+            self.prepare()
+        self.assertTrue(self.fake.password_set)
+        config.write_text(base + 'Include ' + str(self.app.path('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf')) + '\n')
+        effective = subprocess.run(command, text=True, capture_output=True, check=True).stdout.splitlines()
+        self.assertIn('authenticationmethods publickey', effective)
+        self.assertIn('passwordauthentication no', effective)
+        self.assertIn('kbdinteractiveauthentication no', effective)
+
     def test_password_marker_write_failure_retries_without_locking_core(self):
         original = self.app.atomic
         def fail(path, *args, **kwargs):
@@ -756,7 +853,9 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaises(b.Blocked):
             self.prepare()
         self.assertFalse(self.app.path(b.STATE + '/operator-password-set').exists())
-        self.assertFalse(self.app.path('/etc/sudoers.d/dev-pair-operator').exists())
+        self.assertTrue(self.app.path('/etc/sudoers.d/dev-pair-operator').exists())
+        self.assertIn('PasswordAuthentication no', self.app.text('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf'))
+        self.assertFalse(self.fake.password_set)
         self.fake.fail = None
         self.prepare()
         self.assertTrue(self.app.status()['prepared'])
@@ -936,19 +1035,19 @@ class GitHubKeyTests(unittest.TestCase):
         payload = ''.join(self.keys).encode()
         opener = SimpleNamespace(open=lambda *args, **kwargs: Response(payload))
         with patch.object(b.urllib.request, 'build_opener', return_value=opener):
-            self.assertEqual(len(b.github_keys().splitlines()), 2)
+            self.assertEqual(len(b.validate_public_keys(b.fetch_github_response()).splitlines()), 2)
         with patch.object(b.urllib.request, 'build_opener', return_value=opener):
             with patch.object(opener, 'open', side_effect=urllib.error.URLError('secret external detail')) as fetch:
                 with self.assertRaises(b.Blocked) as error:
-                    b.github_keys()
-                self.assertEqual(fetch.call_count, 3)
+                    b.fetch_github_response()
+                self.assertEqual(fetch.call_count, 1)
                 self.assertNotIn('secret external', str(error.exception))
                 for args in fetch.call_args_list:
                     self.assertEqual(args.kwargs['timeout'], 5)
                     self.assertEqual(args.args[0].full_url, b.KEYS_URL)
             with patch.object(opener, 'open', return_value=Response(b'x' * (b.KEYS_MAX_BYTES + 1))):
                 with self.assertRaises(b.Blocked):
-                    b.github_keys()
+                    b.fetch_github_response()
         self.assertIsNone(b.NoRedirect().redirect_request(None, None, 302, 'redirect', {}, 'https://other.example/keys'))
 
 if __name__ == '__main__':

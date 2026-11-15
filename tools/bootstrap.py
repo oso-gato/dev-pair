@@ -82,6 +82,8 @@ esac
 """
 KEYS_URL = 'https://github.com/oso-gato.keys'
 KEYS_MAX_BYTES = 262144
+KEYS_FETCH_TIMEOUT = 25
+KEYS_FETCH_ATTEMPTS = 3
 
 class Blocked(Exception):
     pass
@@ -157,32 +159,45 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def github_keys():
-    # No proxy credentials, redirects, custom TLS policy, unbounded body or forever retry.
+def fetch_github_response():
+    """One bounded-body request, executed only inside the disposable fetch child."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
-    for attempt in range(3):
-        try:
-            request = urllib.request.Request(KEYS_URL, headers={'User-Agent': 'dev-pair-bootstrap'})
-            deadline = time.monotonic() + 20
-            with opener.open(request, timeout=5) as response:
-                if response.status != 200 or response.geturl() != KEYS_URL:
+    try:
+        request = urllib.request.Request(KEYS_URL, headers={'User-Agent': 'dev-pair-bootstrap'})
+        deadline = time.monotonic() + 20
+        with opener.open(request, timeout=5) as response:
+            if response.status != 200 or response.geturl() != KEYS_URL:
+                raise ValueError()
+            chunks, size = [], 0
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError()
+                chunk = response.read1(min(16384, KEYS_MAX_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+                if size > KEYS_MAX_BYTES:
                     raise ValueError()
-                chunks, size = [], 0
-                while True:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError()
-                    chunk = response.read1(min(16384, KEYS_MAX_BYTES + 1 - size))
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                    size += len(chunk)
-                    if size > KEYS_MAX_BYTES:
-                        raise ValueError()
-            return validate_public_keys(b''.join(chunks))
-        except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
-            if attempt == 2:
-                raise Blocked('bounded GitHub HTTPS fetch failed; existing keys preserved') from None
-    raise AssertionError('unreachable')
+        return b''.join(chunks)
+    except (OSError, urllib.error.URLError, http.client.HTTPException, ValueError):
+        raise Blocked('GitHub HTTPS request failed; output withheld') from None
+
+
+def github_keys():
+    # A disposable process gives DNS/TLS/header/body work a wall-clock deadline.
+    # Socket timeouts alone do not bound libc DNS resolution. No inherited auth,
+    # Python startup hooks or proxy environment reaches the reviewed child.
+    command = [sys.executable, '-I', str(Path(__file__).resolve()), '_fetch-github-keys']
+    env = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+    for attempt in range(KEYS_FETCH_ATTEMPTS):
+        try:
+            result = subprocess.run(command, env=env, capture_output=True, timeout=KEYS_FETCH_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            result = None
+        if result is not None and result.returncode == 0:
+            return validate_public_keys(result.stdout)
+    raise Blocked('bounded GitHub HTTPS fetch failed; existing keys preserved')
 
 
 def operator_password(path):
@@ -600,8 +615,8 @@ class Bootstrap:
             self.step('packages', lambda: self.run('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1',
                        '--setopt=localpkg_gpgcheck=1', '--disablerepo=*', '--enablerepo=fedora',
                        '--enablerepo=updates', 'install', *PACKAGES))
-            self.step('operator', lambda: (self.identity(name, '/bin/bash'), self.password_operator(password),
-                                         self.ssh_operator(name, key)))
+            self.step('operator', lambda: (self.identity(name, '/bin/bash'), self.ssh_operator(name, key),
+                                         self.password_operator(password)))
             self.step('host-identity-time', self.host_identity)
             for who, begin, role in [('dp-maint', 1000000, 'maintenance'), ('dp-dev', 1065536, 'development')]:
                 self.step(who, lambda who=who, begin=begin: self.identity(who, '/usr/sbin/nologin', begin))
@@ -923,6 +938,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='stage', required=True)
     sub.add_parser('inspect')
+    sub.add_parser('_fetch-github-keys', help=argparse.SUPPRESS)
     prep = sub.add_parser('prepare')
     prep.add_argument('--apply', action='store_true', help='perform host changes; absent means inspect only')
     prep.add_argument('--gptbox-context', required=True, help='real maintenance-role context; fixtures denied')
@@ -938,6 +954,9 @@ def main():
     sub.add_parser('finalize')
     args = p.parse_args()
     try:
+        if args.stage == '_fetch-github-keys':
+            sys.stdout.buffer.write(fetch_github_response())
+            return 0
         b = Bootstrap()
         if args.stage == 'inspect':
             result = b.preflight()
