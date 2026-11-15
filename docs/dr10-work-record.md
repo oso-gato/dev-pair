@@ -1238,3 +1238,29 @@ review begins only at the exact new candidate. In particular, adapter transient
 systemd units are outside a parent process group: native remaining deadlines and
 owned-unit reconciliation must cover them explicitly. No new privilege, auth,
 job, enrollment or cutover scope is granted.
+
+
+CI run6 completed at b8ac722. All 174 tests, signed Cloud image, tooling, source
+payload, real TCG boot, complete dedicated report, Fedora preflight, bootstrap
+status and cleanup passed. Guest: Fedora44 kernel6.19.10-300.fc44.x86_64,
+SELinux Enforcing, systemd PID1, cgroupv2, cloud_init_t executor and
+11590758400 free root bytes. The dedicated frame was 3905 bytes, exactly one
+begin/end marker, no overflow, executor exit0, SHA256
+`ff4f3a92d27c61fc12175df64221a4521f12eda23c3c42ec94b1f32d79ee6a46`.
+Tool image `sha256:ae9a9405eff0fbc52ebdefb1c0763b120962c616e21e0dc41804dae399312418`;
+stable non-overlay overhead1029308416 bytes. Complete logs/report are retained
+under `/workspace/artifacts/fedora-ci-run-43736703953*`.
+
+Bootstrap inspect genuinely blocked on an unexpected listener; the current report
+has no socket inventory, so the exact listener remains unknown. No allowlist or
+host-vanilla requirement is relaxed. Prepare and assembly remain intentionally
+blocked and were not attempted. This is actual component evidence, not a working
+platform or Hostinger acceptance.
+
+Coordinator reassessment permits one narrow diagnostic follow-up: the same Sol
+builder temporarily preserves its larger bootstrap WIP and adds bounded `ss -H
+-lntup` guest diagnostics in an isolated candidate. Fresh Astra High
+`/root/fedora_listener_diagnostic_review` checks it before one inspection-only
+CI run. No network, package provisioning, listener admission or resource changes
+are included; the exact inventory must precede any listener-policy repair. The
+first-bootstrap source slice resumes afterward without a second builder.
