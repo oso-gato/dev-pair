@@ -49,6 +49,9 @@
 **DR2.6** The [public maintenance-input helper](docs/public-maintenance-inputs.md) verifies pinned Codex/Cosign/Distrobox inputs and creates a compressed current-HEAD context/source handoff with sanitized Git objects and separate integrity manifests. Actual run8 completed fresh strict producer verification and admitted that exact source/context in the Fedora guest. Every changed source requires a matching new handoff and verification; historical receipts do not admit a changed candidate. This helper grants no agent/model or runtime admission.
 
 <a id="platform-and-agents"></a>
+<a id="dr2-7"></a>
+**DR2.7** The [offline Codex state acceptance component](docs/codex-offline-state.md) exercises the pinned stock binary with generated managed policy, seeded immutable bundled skills, complete writable state directories and restricted child processes. Actual no-network checks verify configuration rejection, SQLite/index behavior and child credential/state-read denial, including direct binary reinvocation. Independent review verified cleanup failures return blocked. These local checks do not admit authentication, Fedora/gptbox execution, distinct-owner credential protection, all agent tool paths or session renewal; those remain runtime gates.
+
 <a id="dr3"></a>
 ## DR3 — Platform and agents
 

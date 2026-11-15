@@ -1895,3 +1895,30 @@ transfer while preserving nonseekable bounded output. Actual SELinux path access
 remains unverified. IO ownership must be persisted before secret/launch, with
 collision preservation and scoped crash reconciliation; Python finally cannot
 claim SIGKILL cleanup. No new hosted run or global policy change is admitted yet.
+
+
+### November16, 2026, 03:49 HKT — offline component reviewed and checkpointed
+
+State repair `9e57e37aa1fb83b33b8506baddc0571c19c9e0c1` is integrated
+byte-identically as03bff83. Builder232tests33.526s; coordinator combined235tests
+35.809s passed. Fresh Astra High `/root/codex_state_cleanup_review` returned PASS:
+11focused tests, actualstock9check success, and injected cleanup failure after
+real fixture removal now returns2/blocked while preserving9passedchecks. The
+review independently reproduced old112ec05 returning0/pass under the same fault.
+Evidence: `/workspace/artifacts/codex-state-cleanup-review-9e57e37/review.json`, SHA256
+`a65dff2617bcfe3e9f4f149981d661ccc3f6b791dd5856f425f84bd2bb7e766d`.
+
+The offline component remains runtime_admitted=false: it is not gptbox launch,
+authentication, complete tool-path enforcement, Fedora ownership/nesting or
+session renewal acceptance. Real generated policy/layout/skills identities and
+stock behavioral checks are reusable source capability. Sampled state storage
+limits are explicitly not hard quotas.
+
+This reviewed main-worktree checkpoint is published to the supplemental branch
+`codex/dr10-reviewed-checkpoint`, with no separate PR, workflow trigger or release.
+The sole workflow triggers pull_request only. PR13 stays on its last tested39cc4bc
+while native Commands I/O is repaired in an isolated branch; pushing unrelated
+state work to that PR now would rerun the known unchanged Fedora failure. The
+next reviewed combined candidate returns to the requested PR branch.
+Native I/O builder has a30-minute source/test slice from39cc4bc; fresh independent
+`/root/native_command_io_review` is prepared. No new hosted run yet.
