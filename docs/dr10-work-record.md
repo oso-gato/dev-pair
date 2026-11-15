@@ -840,3 +840,23 @@ bounded correction batch for race-aware conservative storage measurement and
 safe output across every log/report path. Fresh affected review must precede
 workflow publication and the first observed CI run. Neither the dormant source
 nor local fixtures count as a Fedora boot result.
+
+The first CI correction returned as
+`dc595647456eb910bfe39773744fd29862ed3128`, integrated as `d68bb40`.
+The integrated suite passes 135 tests. Fresh Astra High
+`/root/fedora_ci_repair_review` confirmed safe lossless JSON/text output across
+10000 variants, permission/error rejection, bounded maximum-sample storage
+accounting, mandatory stable completion checks and child termination on reserve
+failure. It reproduced one remaining normal-churn form: GNU du reports
+`cannot read directory ... No such file or directory` as well as `cannot access`.
+The second bounded repair cycle admits only that exact owned-path disappearance
+case and extends the real directory-churn regression. Further findings require
+coordinator reassessment; no workflow has been published or executed yet.
+
+Independent Astra High `/root/codex_state_boundary_design` is investigating
+stock Codex 0.169.0's credential/session/configuration paths for the next runtime
+adapter. This is read-only source research, with no real auth files, login,
+network/model calls or admission. In particular, writable session metadata and
+mutable skill/plugin discovery must not be mistaken for inert state. Its design
+handoff will be evaluated against A4/A5 before any implementation or runtime
+claim. The single Sol implementation worker remains assigned to the CI repair.
