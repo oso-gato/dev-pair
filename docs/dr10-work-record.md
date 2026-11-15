@@ -29,9 +29,10 @@ owner decisions remain retained in order.
   after198 independent repository tests and17 additional checks, no findings.
 - Run7 identified stock resolved LLMNR5355 as the listener blocker. Reviewed
   source now recognizes the exact service and persists LLMNR/mDNS disabling.
-  Run8 completed fresh current-source verification and real guest admission, but
-  initialize stopped in preparation after12.103s. Next: identify the withheld
-  command failure without relaxing the fixed resource/network/secret boundary.
+  Run9 passed fresh current-source verification and guest baseline again, and
+  identified an SELinux denial on cloud-init-labelled pipes passed to the system
+  bus by systemd-run. Next: use a normal owned native provisioning service with
+  no forwarded cloud-init streams; preserve policy and all container confinement.
 - Fresh API-configured Astra High `/root/nested_devbox_design` completed a
   read-only design of the required nested DevBox placement against committed
   source and A11 references. `/workspace/scratch/nested-devbox-design.md`
@@ -1536,3 +1537,44 @@ new result. Record actual executor identity once a new run exists.
 appeared for exact `c5cef5fb8c2d22d35cc1bb8e945cae4aa1244f9b` and is running.
 No PR close/reopen or other retrigger was performed. This is the first diagnostic
 repair run in the bounded batch; outcome remains pending. Source stays frozen.
+
+
+Actual [run9](https://github.com/oso-gato/dev-pair/actions/runs/43746428844),
+job132910632631, source `c5cef5fb8c2d22d35cc1bb8e945cae4aa1244f9b`, passed all
+202 tests in 27.424s. Fresh strict public verification, exact guest inputs, TCG
+boot, Enforcing/systemd/cgroup v2, pre/post inspection/status, isolated outer
+network, password absence and outer cleanup passed. Initialization stopped after
+11.905s in host-preflight, before source verification or package/assembly phases.
+
+The first wrapped getenforce was rejected with exit1; its exact public stderr was
+`Failed to start transient service unit: Connection reset by peer`. Native unit
+metadata was explicitly unavailable after collection/no start. The matching AVC
+shows dbus-broker in system_dbusd_t denied write to a fifo_file labelled
+cloud_init_t, permissive=0. This distinguishes the observed executor/FD routing
+blocker from failed SELinux enforcement; direct getenforce/inspection succeeds.
+No policy relaxation or general dbus FIFO permission is justified.
+
+The sole Sol builder has a twenty-minute source slice for a proper native CI
+provisioning executor: cloud-init stages protected exact-target inputs and a
+fixed owned Type=exec service, then starts it nonblocking with null standard
+streams. The service uses the normal Fedora service transition and standard file
+contexts, not SELinuxContext/runcon, explicit unconfined labels, policy modules,
+booleans or permissive mode. It executes the same guest/initialize code and binds
+actual MainPID/cgroup/root/context plus unit/script/controller/input identities.
+Native lifetime/stop remain inside the existing VM and final report envelope.
+Dedicated ttyS1 is the result channel; no arbitrary journal export or inherited
+pipe FDs. Root provisioning is the existing authorized executor, not agent/job
+admission; container profiles remain unchanged. Fresh Astra High
+`/root/fedora_native_executor_review` awaits an immutable candidate. One final
+hosted repair run remains before batch reassessment.
+
+Run9 manifest `7395da7d8175af7eb5889da809084bea1f881ab5edaa4fad8f9d80d1bb24b6a4`;
+payload `6af993b0bdd5fc1ce0a7273b0ab4498d47e9a5d999187bcf628d2613f2f54351`
+121166827bytes; context `9f2decfbde9171afe1aaf5ed840093fb831377eb966c6c30050d5b93076f5e32`.
+Complete report6599bytes SHA256
+`b8cc95bc667669de295e9772d7ce3ed5cd64653c6636c53ec51e9244431b14ac`;
+stable overhead1655304192bytes; tool image
+`sha256:3920a0801d7aaabe86f66945d60009303bf55e466c9955502743097f2dbf37ed`.
+Evidence: `/workspace/artifacts/fedora-ci-run-43746428844.log` and sibling
+`-report.json`. Runner AWS7.0.0-1014-aws/image20261111.127.1, Podman4.9.3,
+initialfree94983086080bytes/RAM16464306176bytes. No VPS or production mutation.
