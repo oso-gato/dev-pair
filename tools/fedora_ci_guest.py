@@ -31,7 +31,7 @@ REPORT_LIMIT = 65536
 REPORT_VERSION = 4
 GUEST_PHASES = ('fedora-preflight', 'guest-inputs', 'bootstrap-inspect', 'bootstrap-status',
                 'bootstrap-prepare', 'maintenance-gptbox', 'bootstrap-post-inspect', 'bootstrap-post-status')
-INPUT_LENGTHS = {'controller_sha256': 64, 'source_sha': 40, 'helper_sha256': 64, 'manifest_sha256': 64, 'payload_sha256': 64,
+INPUT_LENGTHS = {'controller_sha256': 64, 'source_sha': 40, 'helper_sha256': 64, 'fedora_helper_sha256': 64, 'manifest_sha256': 64, 'payload_sha256': 64,
                  'context_sha256': 64, 'distrobox_sha': 40, 'standards_sha': 40,
                  'codex_sha256': 64, 'codex_source_sha': 40}
 GUEST_ADMISSION_SECONDS = 60
@@ -832,6 +832,7 @@ def diagnostics(end=None):
 
 def admit_inputs(payload, expected, destination, timeout=GUEST_ADMISSION_SECONDS):
     require(digest(payload / 'public_inputs.py') == expected['helper_sha256'], 'Public extractor implementation identity mismatch')
+    require(digest(payload / 'fedora_oci.py') == expected['fedora_helper_sha256'], 'Fedora input verifier implementation identity mismatch')
     result = json.loads(command(['/usr/bin/python3', str(payload / 'public_inputs.py'), 'extract',
                          '--manifest', str(payload / 'manifest.json'), '--payload', str(payload / 'maintenance-inputs.tar.gz'),
                          '--expected-manifest-sha256', expected['manifest_sha256'], '--output', str(destination)],

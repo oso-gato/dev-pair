@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import uuid
+import fedora_oci
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 DESTINATIONS = {'workspace': '/work/job', 'state': '/state/codex',
@@ -46,8 +47,11 @@ def validate(m, fixture=False):
             'fixture needs --fixture; production requires operator-verified-inputs')
     token(m['source_sha'], r'[0-9a-f]{40}', 'source SHA')
     require(m['standards_sha'] == STANDARDS, 'standards pin mismatch')
-    keys(m['fedora'], 'image verification', 'fedora')
-    token(m['fedora']['image'], r'registry\.fedoraproject\.org/fedora:44@sha256:[0-9a-f]{64}', 'Fedora 44 digest reference')
+    if fixture:
+        keys(m['fedora'], 'image verification', 'fedora')
+        token(m['fedora']['image'], r'registry\.fedoraproject\.org/fedora:44@sha256:[0-9a-f]{64}', 'fixture image reference')
+    else:
+        require(m['fedora'] == fedora_oci.PROVENANCE, 'exact signed Fedora OCI provenance required')
     keys(m['codex'], 'version source sha256 verification', 'codex')
     token(m['codex']['version'], r'[0-9]+\.[0-9]+\.[0-9]+', 'stable Codex version')
     token(m['codex']['sha256'], r'[0-9a-f]{64}', 'Codex binary SHA256')
@@ -89,6 +93,8 @@ def validate(m, fixture=False):
 def recipe(m):
     # No package downloads, writable-home code, unpinned RUN installation or live patching.
     return (f"FROM {m['fedora']['image']}\n"
+            + ('' if m['kind'] == 'fixture' else 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec \'dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo=\"*\" --enablerepo=fedora --enablerepo=updates upgrade; mkdir -p /usr/lib/dev-pair; rpm -qa --qf \"%{NEVRA}\\n\" | sort > /usr/lib/dev-pair/base-rpms.txt; dnf clean all\'\n')
+            +
             f"LABEL org.opencontainers.image.revision={m['source_sha']}\n"
             f"LABEL dev-pair.standards={STANDARDS}\n"
             f"LABEL dev-pair.role={m['role']}\n"
@@ -108,12 +114,13 @@ def check_binary(m, data, fixture):
 def check_source(m, fixture):
     if not fixture:
         repo = pathlib.Path(__file__).resolve().parents[1]
-        tracked = subprocess.run(
-            ['/usr/bin/git', '-C', str(repo), 'show', m['source_sha'] + ':tools/candidate.py'],
-            check=True, capture_output=True, timeout=10,
-            env={'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'}).stdout
-        require(tracked == pathlib.Path(__file__).read_bytes(),
-                'source SHA does not identify this preparation implementation')
+        for name, path in (('candidate.py', pathlib.Path(__file__)),
+                           ('fedora_oci.py', pathlib.Path(fedora_oci.__file__))):
+            tracked = subprocess.run(
+                ['/usr/bin/git', '-C', str(repo), 'show', m['source_sha'] + ':tools/' + name],
+                check=True, capture_output=True, timeout=10,
+                env={'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'}).stdout
+            require(tracked == path.read_bytes(), 'source SHA does not identify this preparation implementation')
 
 
 def check_binary_and_source(m, data, fixture):
@@ -129,11 +136,16 @@ def context_record(files, fixture):
             'runtime': 'blocked', 'reason': BLOCKER}
 
 
-def prepare(manifest, binary, output, fixture=False):
+def prepare(manifest, binary, output, fixture=False, fedora_inputs=None):
     m = validate(manifest, fixture)
     data = pathlib.Path(binary).read_bytes()
     check_binary_and_source(m, data, fixture)
     files = {'inputs.json': canonical(m), 'codex': data, 'Containerfile': recipe(m)}
+    if not fixture:
+        require(fedora_inputs is not None, 'verified Fedora input directory required')
+        with fedora_oci.verified(fedora_inputs) as (plain, _):
+            for name in fedora_oci.FILES:
+                files[name] = (plain.parent / name).read_bytes()
     result = context_record(files, fixture)
     target = pathlib.Path(output).absolute()
     require(target.parent.resolve() == target.parent, 'symlink output parent denied')
@@ -156,7 +168,8 @@ def _verify_content(context, expected_context_sha256, fixture=False):
     root = pathlib.Path(context).absolute()
     require(root.resolve() == root and root.is_dir(), 'context must be a nonsymlink directory')
     names = {'inputs.json', 'codex', 'Containerfile', 'candidate.json'}
-    require({p.name for p in root.iterdir()} == names, 'context: missing or extra files')
+    if not fixture: names.update(fedora_oci.FILES)
+    require({p.name for p in root.iterdir()} == names, 'context record: missing or extra files')
     files = {}
     for name in names:
         path = root / name
@@ -171,6 +184,12 @@ def _verify_content(context, expected_context_sha256, fixture=False):
     require(files['inputs.json'] == canonical(m), 'noncanonical input manifest')
     require(files['Containerfile'] == recipe(m), 'recipe does not match recorded inputs')
     check_binary(m, files['codex'], fixture)
+    if not fixture:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='candidate-fedora-') as temporary:
+            captured = pathlib.Path(temporary)
+            for name in fedora_oci.FILES: (captured / name).write_bytes(files[name])
+            with fedora_oci.verified(captured): pass
     return result, m
 
 
@@ -222,6 +241,7 @@ def main():
     prep = sub.add_parser('prepare')
     prep.add_argument('--binary', required=True)
     prep.add_argument('--output', required=True)
+    prep.add_argument('--fedora-inputs')
     check = sub.add_parser('verify')
     check.add_argument('--context', required=True)
     check.add_argument('--expected-context-sha256', required=True)
@@ -243,7 +263,7 @@ def main():
         else:
             m = json.loads(pathlib.Path(args.manifest).read_text())
             if args.command == 'prepare':
-                result = prepare(m, args.binary, args.output, args.fixture)
+                result = prepare(m, args.binary, args.output, args.fixture, args.fedora_inputs)
             else:
                 result = plan(m, args.selector, args.model, args.effort, args.resume, args.fixture)
         sys.stdout.buffer.write(canonical(result))

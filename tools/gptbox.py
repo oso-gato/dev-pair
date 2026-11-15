@@ -21,7 +21,8 @@ import candidate
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
-FEDORA = 'registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e'
+import fedora_oci
+FEDORA = fedora_oci.IMAGE
 BASE = '/usr/lib/dev-pair/gptbox'
 RUNTIME = BASE + '/runtime.py'
 CONTROL = '/usr/local/libexec/dev-pair-gptbox'
@@ -87,7 +88,7 @@ class Gptbox(Bootstrap):
         repo = Path(__file__).resolve().parents[1]
         if self.run('/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD').strip() != revision:
             raise Blocked('adapter source HEAD differs from requested exact target')
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py'):
             data = self.protected(Path(__file__).with_name(name)).read_bytes()
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
@@ -397,7 +398,7 @@ class Gptbox(Bootstrap):
                             'tzdata unzip util-linux util-linux-script vte-profile wget wget2-wget which whois words '
                             'xorg-x11-xauth xz zip mesa-dri-drivers mesa-vulkan-drivers vulkan')
             recipe = (f'FROM {FEDORA}\n'
-                      'RUN set -eu; for file in /etc/dnf/dnf.conf /etc/yum.conf; do '
+                      'RUN set -eu; dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates upgrade; for file in /etc/dnf/dnf.conf /etc/yum.conf; do '
                       'if [ -f "$file" ]; then sed -i "/tsflags=nodocs/d" "$file"; fi; done; dnf -q --setopt=gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates list '
                       + dependencies + ' > /tmp/upstream-packages; '
                       'grep -v Packages /tmp/upstream-packages | grep "$(uname -m)" | cut -d" " -f1 > /tmp/resolved-packages; '
@@ -432,7 +433,9 @@ class Gptbox(Bootstrap):
                     os.fsync(output.fileno())
             image_budget = self.run.phase(IMAGE_EXECUTION, 'dev-pair-gptbox-image', native=False) if isinstance(self.run, Commands) else contextlib.nullcontext()
             with image_budget:
-                self.engine('pull', '--policy=missing', FEDORA, timeout=600)
+                with fedora_oci.verified(context) as (plain, proof):
+                    imported = fedora_oci.import_image(self.engine, plain, uid=int(self.run('/usr/bin/id', '-u', 'dp-maint').strip()))
+                self.record('fedora-base', imported)
                 base = image_id(self.engine('build', '--quiet', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
             if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
                 raise Blocked('eight GiB free reserve is required after image construction before actual assembly')
@@ -522,7 +525,7 @@ class Gptbox(Bootstrap):
         self.protected(upstream)
         for name in ('distrobox-init', 'distrobox-enter'):
             self.protected(Path(upstream) / name)
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py'):
             self.protected(Path(__file__).with_name(name))
         if self.path('/usr/bin/git').exists():
             self.inputs(context, expected, upstream, revision)

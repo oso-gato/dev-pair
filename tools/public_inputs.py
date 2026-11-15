@@ -19,12 +19,13 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+import fedora_oci
 
 MIB = 1024 ** 2
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 CODEX_SOURCE = 'd32063f96c2dff1dc96af839b3952abb6acfeda4'
 DBX_SOURCE = '40c3cd724faa434aeb0a23e28776665b92de68bd'
-FEDORA = 'registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e'
+FEDORA = fedora_oci.IMAGE
 RELEASE = 'https://github.com/openai/codex/releases/download/rust-v0.169.0/'
 ARTIFACTS = {
     'codex.tar.gz': (RELEASE + 'codex-x86_64-unknown-linux-musl.tar.gz', 117805733,
@@ -34,6 +35,7 @@ ARTIFACTS = {
     'cosign': ('https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64', 145688404,
                '424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa'),
 }
+ARTIFACTS.update(fedora_oci.ARTIFACTS)
 CODEX_BYTES = 294277432
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
 SOURCE_LIMIT = 32 * MIB
@@ -381,7 +383,7 @@ def build_within_limit(cache, distrobox, output):
             clean_checkout(repo, revision, tree / 'dev-pair', work)
             clean_checkout(pathlib.Path(distrobox), DBX_SOURCE, tree / 'distrobox', work)
             manifest = {'kind': 'operator-verified-inputs', 'source_sha': revision, 'standards_sha': STANDARDS,
-                        'fedora': {'image': FEDORA, 'verification': 'Official digest pinned; Fedora OCI signature not established'},
+                        'fedora': dict(fedora_oci.PROVENANCE),
                         'codex': {'version': '0.169.0', 'source': ARTIFACTS['codex.tar.gz'][0], 'sha256': CODEX_SHA,
                                   'verification': 'Strict Cosign3.1.4 identity/issuer/workflow/repository/ref/source verification passed; evidence in payload'},
                         'role': 'maintenance', 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
@@ -392,7 +394,7 @@ def build_within_limit(cache, distrobox, output):
             inputs = work / 'inputs.json'
             inputs.write_text(json.dumps(manifest))
             preparation = command([sys.executable, '-I', str(tree / 'dev-pair/tools/candidate.py'), 'prepare',
-                                   '--manifest', str(inputs), '--binary', str(binary), '--output', str(tree / 'context')],
+                                   '--manifest', str(inputs), '--binary', str(binary), '--fedora-inputs', str(work), '--output', str(tree / 'context')],
                                   work, file_limit=CODEX_BYTES + MIB)[0]
             context = json.loads(preparation)
             evidence = tree / 'evidence'
@@ -459,7 +461,7 @@ def validate_manifest(obj):
         names.append(item['path'])
         total += item['bytes']
     require(names == sorted(set(names)) and total <= EXPANSION_LIMIT, 'duplicate/unsorted/oversized payload inventory')
-    required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile')}
+    required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile', *fedora_oci.FILES)}
     required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json'}
     for repo in ('dev-pair', 'distrobox'):
         required |= {repo + '/.git/' + name for name in ('HEAD', 'config', 'shallow', 'refs/heads/public-input')}

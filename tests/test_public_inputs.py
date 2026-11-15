@@ -127,7 +127,7 @@ class PublicInputsTests(unittest.TestCase):
                 path = tree / repo / '.git' / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(value)
-        for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile'):
+        for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile', *inputs.fedora_oci.FILES):
             path = tree / 'context' / name
             path.parent.mkdir(exist_ok=True)
             path.write_bytes(b'explicit parser fixture, no admissible Codex binary')

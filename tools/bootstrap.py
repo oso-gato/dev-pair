@@ -41,7 +41,7 @@ SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
 PACKAGES = ('podman', 'distrobox', 'passt', 'fuse-overlayfs', 'container-selinux',
             'policycoreutils', 'shadow-utils', 'sudo', 'openssh-server', 'nftables', 'git-core', 'util-linux',
-            'mosh', 'tmux', 'chrony', 'slirp4netns')
+            'mosh', 'tmux', 'chrony', 'slirp4netns', 'gnupg2')
 REPO = '''[tailscale-stable]
 name=Tailscale stable
 baseurl=https://pkgs.tailscale.com/stable/fedora/$basearch
@@ -1322,7 +1322,7 @@ class Bootstrap:
             self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
             self.directory('/var/lib/dev-pair/artifacts/gptbox', mode=0o755)
             self.directory(stage, mode=0o755)
-            for name in ('inputs.json', 'codex', 'Containerfile', 'candidate.json'):
+            for name in ('inputs.json', 'codex', 'Containerfile', 'candidate.json', *tool.fedora_oci.FILES):
                 data = (source / name).read_bytes()
                 # All four files are public build inputs, never credentials or writable home state.
                 target = self.path(stage) / name
@@ -1386,8 +1386,9 @@ class Bootstrap:
             # Interrupted unrecorded builds are rebuilt from the same protected context.
             if shutil.disk_usage(self.path(storage)).free < 8 * 1024 ** 3:
                 raise Blocked('insufficient free storage reserve for gptbox build')
-            self.run(*base, 'pull', '--policy=always', manifest['fedora']['image'])
-            built_id = self.run(*base, 'build', '--quiet', '--network=none', '--pull=never', '--format=oci',
+            with tool.fedora_oci.verified(self.path(stage)) as (plain, proof):
+                import_proof = tool.fedora_oci.import_image(lambda *args, **kw: self.run(*base, *args, **kw), plain, uid=int(uid))
+            built_id = self.run(*base, 'build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--format=oci',
                      '--label', f'dev-pair.context={expected}', '--tag', tag,
                      '--file', str(self.path(stage) / 'Containerfile'), str(self.path(stage))).strip()
             if not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', built_id):
@@ -1420,7 +1421,8 @@ class Bootstrap:
                   'codex_sha256': manifest['codex']['sha256'], 'image_id': image_id,
                   'local_tag': tag, 'runtime_user': 'dp-maint', 'storage_driver': 'vfs',
                   'launch': 'blocked: stock Distrobox 1.8.2.5 adds privileged, label=disable and host mounts',
-                  'distrobox_assembled': False, 'runtime_validated': False}
+                  'distrobox_assembled': False, 'runtime_validated': False,
+                  'fedora_base': import_proof if not prior else prior.get('fedora_base')}
         self.atomic(record_path, json.dumps(record, sort_keys=True, indent=2) + '\n')
         return record
 
