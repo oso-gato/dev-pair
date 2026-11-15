@@ -29,9 +29,9 @@ owner decisions remain retained in order.
   after198 independent repository tests and17 additional checks, no findings.
 - Run7 identified stock resolved LLMNR5355 as the listener blocker. Reviewed
   source now recognizes the exact service and persists LLMNR/mDNS disabling.
-  Next: publish the reviewed integration and execute current-source verified
-  inputs and shared initialize in CI. Preserve the fixed resource/network/secret
-  boundary and collect exact-candidate runtime evidence before any acceptance.
+  Run8 completed fresh current-source verification and real guest admission, but
+  initialize stopped in preparation after12.103s. Next: identify the withheld
+  command failure without relaxing the fixed resource/network/secret boundary.
 - Fresh API-configured Astra High `/root/nested_devbox_design` completed a
   read-only design of the required nested DevBox placement against committed
   source and A11 references. `/workspace/scratch/nested-devbox-design.md`
@@ -1434,3 +1434,40 @@ its metadata records198 tests plus independent review. Source stays frozen while
 this exact candidate executes; do not publish documentation-only commits that
 cancel/replace its run. The sole Sol builder performs a bounded read-only next-
 slice plan against the nested-placement handoff while awaiting actual diagnostics.
+
+
+Actual [run8](https://github.com/oso-gato/dev-pair/actions/runs/43743748166),
+job132902382113, source `f03c6db16c3a3bc6a34a0517c74bdc4e9bf0ba31`, passed198
+tests27.409s, standard runner checks, signed Cloud image, tooling and fresh strict
+public Codex verification/packaging. Public setup completed in about55s. Complete
+candidate-bound report5455 bytes SHA256
+`5b0cb21eed0bb980d51ac3754b269f28ff52d2f116f6237b47fd355c4127af06` passed.
+Actual Fedora44 kernel6.19.10-300.fc44.x86_64, Enforcing SELinux, systemd/cgroupv2,
+guest input admission, pre/post inspect/status, distinct outer slirp network
+namespace/no published ports, password absence and outer cleanup passed.
+
+Shared initialize exited2 after12.103s in prepare; maintenance remained pending.
+No packages or image completion evidence exists. One recorded non-public command
+returned1 with output withheld, and guest projection omitted its operation/elapsed
+metadata. Stock resolved5355 listeners remain, so persistent discovery convergence
+was not reached. No selected AVC was reported. The cloud-init BrokenPipe trace is
+during shutdown after the guest report, not an established cause of initialization
+failure. Exact failed command/cause is not known from this evidence. Do not infer
+DNF, privilege or SELinux failure or relax those policies. The builder pauses nested
+planning and diagnoses early preparation/native calls; if the source cause is not
+provable, add only fixed bounded command/native-result diagnostics. Fresh Astra
+High `/root/fedora_prepare_failure_review` awaits that exact candidate. Two hosted
+repair attempts remain in the current bounded batch.
+
+Inputs: manifest `a12277de88121709d186111883752698ce17cc37e6b1551656d05397c28178a0`;
+payload `25e46d49490c595feedf57bc34ae0d550e9f9e5d49bb4d6cfbfca7ff527a2be6`
+121156034bytes; context `d65ef3e90a3d7877e5894c22a28ef16132c4f106f268755da1da1b9f07f58e4b`.
+Strict Cosign output was12bytes Verified OK, original output SHA256
+`80a53f76c7ed6969dade3b6ee47cdb753162db7c00be625448999d08bae77ed8`; source-bound
+receipt and original bundle are retained. Tool image
+`sha256:ca05392e6a31f6f03ede3d16e27197ec0472cbce867b44653bcfbd5470cc946e`;
+stable overhead1655279616bytes; guest initial/final free33065336832/33024909312bytes.
+Runner AWS7.0.0-1014-aws/image20261111.127.1, Podman4.9.3/slirp1.2.1,
+initialfree94983139328bytes/RAM16464306176bytes. Evidence:
+`/workspace/artifacts/fedora-ci-run-43743748166.log` and sibling `-report.json`.
+The VPS remains untouched; no authenticated job or full bootstrap is admitted.
