@@ -351,3 +351,36 @@ class NativeIOTests(unittest.TestCase):
             self.assertEqual(records[-1]['native_exit_status'], mapped)
             self.assertEqual(records[-1]['relay']['status'], -15)
             self.assertEqual(list((self.root / 'records').iterdir()), [])
+
+    def test_controller_journal_nodes_match_actual_helper_fds_before_payload(self):
+        original = subprocess.Popen
+        token = 'r.verify_fds=lambda value:setattr(value,"diagnostic_ready",True);'
+        # Preserve actual consumer FD verification; inject only root ownership
+        # because local named FIFOs belong to this unprivileged test user.
+        injection = ('import types;original_stat=r.os.fstat;'
+                     'r.os.fstat=lambda fd:types.SimpleNamespace(**{key:getattr(original_stat(fd),key) for key in '
+                     '("st_mode","st_dev","st_ino","st_nlink","st_size","st_rdev")},st_uid=0);')
+        launches = []
+        def native_process(args, **kwargs):
+            args = list(args)
+            if len(args) > 2 and args[1] == '-c' and token in args[2]:
+                args[2] = args[2].replace(token, injection)
+            return original(args, **kwargs)
+        base = manager(native_process, self.calls)
+        def observed(args, **kwargs):
+            if args[0] == '/usr/bin/systemd-run':
+                state = json.loads((self.root / 'records' / (UNIT + '.json')).read_text())
+                for name, node in state['nodes'].items():
+                    option = '--' + name + '-node'
+                    self.assertEqual(args[args.index(option)+1], str(node['device'])+':'+str(node['inode']))
+                self.assertEqual('--stdin-node' in args, 'stdin' in state['nodes'])
+                launches.append(args)
+            return base(args, **kwargs)
+        for index, data in enumerate((None, '', 'NONCREDENTIAL')):
+            effect = Path(self.tmp.name) / ('fd-effect-' + str(index))
+            script = 'import sys,pathlib;data=sys.stdin.buffer.read();pathlib.Path(sys.argv[1]).write_text(str(len(data)));print("executed")'
+            with patch.object(b.subprocess, 'Popen', side_effect=observed):
+                result = b.Commands()(*PREFIX, sys.executable, '-c', script, str(effect), input_text=data)
+            self.assertEqual(result, 'executed\n' if data is None else '')
+            self.assertEqual(effect.read_text(), str(len(data or '')))
+        self.assertEqual(len(launches), 3)

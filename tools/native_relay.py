@@ -22,6 +22,7 @@ CAPACITY = 4096
 INPUT_LIMIT = 16384
 MAXIMA = (262144, 1048576, 4194304)
 ERROR_STATUS = 250
+QUERY_SECONDS = 5
 HEADER = struct.Struct('!c3sI')
 MAGIC = b'DP1'
 
@@ -132,14 +133,37 @@ def verify_process(expected_uid):
     return 'unconfined_service_t'
 
 
-def verify_fds(has_input):
-    for fd in (1, 2):
+def node_identity(value):
+    import re
+    require(type(value) is str and re.fullmatch(r'(?:0|[1-9][0-9]{0,19}):[1-9][0-9]{0,19}', value))
+    device, inode = map(int, value.split(':'))
+    require(device < 2**64 and 0 < inode < 2**64)
+    return device, inode
+
+
+def verify_fds(args):
+    args.diagnostic_ready = False
+    pairs = [args.stdout_node, args.stderr_node]
+    profile_require(args.stdin_node is not None if args.stdin else args.stdin_node is None, 'FD0')
+    if args.stdin:
+        pairs.append(args.stdin_node)
+    profile_require(len(pairs) == len(set(pairs)), 'FD1')
+    for fd, expected in ((2, args.stderr_node), (1, args.stdout_node)):
         info = os.fstat(fd)
-        require(stat.S_ISFIFO(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
-                fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) == CAPACITY)
+        profile_require((info.st_dev, info.st_ino) == expected and stat.S_ISFIFO(info.st_mode) and info.st_uid == 0 and
+                        stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and
+                        fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_WRONLY and
+                        fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) == CAPACITY, 'FD'+str(fd))
+        if fd == 2:
+            args.diagnostic_ready = True
     info = os.fstat(0)
-    require((stat.S_ISREG(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and info.st_size <= INPUT_LIMIT)
-            if has_input else (stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(1, 3)))
+    profile_require(fcntl.fcntl(0, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY, 'FD0')
+    if args.stdin:
+        profile_require((info.st_dev, info.st_ino) == args.stdin_node and stat.S_ISREG(info.st_mode) and info.st_uid == 0 and
+                        stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and info.st_size <= INPUT_LIMIT and
+                        os.lseek(0, 0, os.SEEK_CUR) == 0, 'FD0')
+    else:
+        profile_require(stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(1, 3), 'FD0')
 
 
 def check_deadline(end):
@@ -251,8 +275,16 @@ def pump(argv, data, maximum, end, control):
                     os.close(fd)
 
 
-PROFILE_PROPERTIES = tuple('Id Transient LoadState Type ActiveState MainPID ControlGroup User Group DropInPaths FragmentPath SourcePath TimeoutStartUSec RuntimeMaxUSec TimeoutStopUSec TimeoutStartFailureMode TimeoutStopFailureMode KillMode SendSIGKILL FinalKillSignal Restart LimitCORE MemoryMax TasksMax CPUQuotaPerSecUSec Slice StandardInput StandardInputFile StandardOutput StandardOutputFile StandardError StandardErrorFile SELinuxContext RootDirectory RootImage PrivateUsers PrivateNetwork NoNewPrivileges'.split())
-PROFILE_KEYS = frozenset(PROFILE_PROPERTIES) | {'ProcUid', 'ProcGid', 'ProcCgroup', 'Query', 'Options', 'Deadline'}
+UNIT_SCHEMA = (('Id','s'), ('Transient','b'), ('LoadState','s'), ('ActiveState','s'),
+               ('FragmentPath','s'), ('SourcePath','s'), ('DropInPaths','as'))
+SERVICE_SCHEMA = (('Type','s'), ('Restart','s'), ('MainPID','u'), ('ControlGroup','s'), ('Slice','s'),
+                  ('User','s'), ('Group','s'), ('TimeoutStartUSec','t'), ('TimeoutStopUSec','t'), ('RuntimeMaxUSec','t'),
+                  ('TimeoutStartFailureMode','s'), ('TimeoutStopFailureMode','s'), ('KillMode','s'), ('SendSIGKILL','b'),
+                  ('FinalKillSignal','i'), ('LimitCORE','t'), ('MemoryMax','t'), ('TasksMax','t'), ('CPUQuotaPerSecUSec','t'),
+                  ('StandardInput','s'), ('StandardOutput','s'), ('StandardError','s'), ('SELinuxContext','(bs)'),
+                  ('RootDirectory','s'), ('RootImage','s'), ('PrivateUsers','b'), ('PrivateNetwork','b'), ('NoNewPrivileges','b'))
+PROFILE_PROPERTIES = tuple(key for key, signature in UNIT_SCHEMA + SERVICE_SCHEMA)
+PROFILE_KEYS = frozenset(PROFILE_PROPERTIES) | {'ProcUid', 'ProcGid', 'ProcCgroup', 'Query', 'Options', 'Deadline', 'FD0', 'FD1', 'FD2', 'GetUnit', 'UnitGet', 'ServiceGet'}
 
 
 class ProfileError(ValueError):
@@ -268,34 +300,64 @@ def profile_require(condition, key, actual='unexpected'):
         raise ProfileError(key, actual)
 
 
-def duration_us(value):
-    from decimal import Decimal
+def typed_record(line, signature, key):
+    try:
+        require(len(line) <= 512)
+        value = json.loads(line, object_pairs_hook=unique)
+        require(type(value) is dict and set(value) == {'type', 'data'} and value['type'] == signature)
+        data = value['data']
+        if signature == 's':
+            require(type(data) is str)
+        elif signature == 'b':
+            require(type(data) is bool)
+        elif signature in ('u', 't', 'i'):
+            low, high = {'u': (0, 2**32-1), 't': (0, 2**64-1), 'i': (-2**31, 2**31-1)}[signature]
+            require(type(data) is int and low <= data <= high)
+        elif signature == 'as':
+            require(type(data) is list and len(data) == 1 and type(data[0]) is str)
+        elif signature == '(bs)':
+            require(type(data) is list and len(data) == 2 and type(data[0]) is bool and type(data[1]) is str)
+        else:
+            raise ValueError()
+        return data
+    except (ValueError, TypeError, RecursionError, UnicodeError):
+        raise ProfileError(key, 'malformed') from None
+
+
+def property_records(raw, schema):
+    lines = raw.splitlines()
+    if len(lines) != len(schema):
+        raise ProfileError('Query', 'missing' if len(lines) < len(schema) else 'unexpected')
+    return {key: typed_record(line, signature, key) for line, (key, signature) in zip(lines, schema)}
+
+
+def unit_object(raw):
     import re
-    units = {'us': 1, 'ms': 1000, 's': 1000000, 'min': 60000000, 'h': 3600000000, 'd': 86400000000}
-    require(type(value) is str and len(value) <= 128)
-    pattern = r'([0-9]+(?:\.[0-9]+)?)\s*(us|ms|min|s|h|d)'
-    matches = list(re.finditer(pattern, value))
-    require(matches and not re.sub(pattern, '', value).strip())
-    total = sum(Decimal(match[1]) * units[match[2]] for match in matches)
-    require(total == int(total) and 0 <= total <= 10**12)
-    return int(total)
+    try:
+        require(len(raw) <= 512)
+        value = json.loads(raw, object_pairs_hook=unique)
+        require(type(value) is dict and set(value) == {'type', 'data'} and value['type'] == 'o' and
+                type(value['data']) is list and len(value['data']) == 1 and type(value['data'][0]) is str)
+        path = value['data'][0]
+        require(re.fullmatch(r'/org/freedesktop/systemd1/unit/[A-Za-z0-9_]+', path) and len(path) <= 384)
+        return path
+    except (ValueError, TypeError, RecursionError, UnicodeError):
+        raise ProfileError('Query', 'malformed') from None
 
 
-def profile_query(unit, end):
-    # Read-only fixed scalar query, before payload and secret input. Its pipes
-    # replace (rather than coexist with) the later payload pipes.
+def query_process(argv, stop, used):
     pairs, process = [], None
     selected = selectors.DefaultSelector()
     buffers = {'stdout': bytearray(), 'stderr': bytearray()}
-    stop = min(end, time.monotonic() + 5)
     try:
-        check_deadline(end)
+        if time.monotonic() >= stop:
+            raise ProfileError('Query', 'timeout')
         for _ in range(2):
             pairs.append(pipe_pair())
         for reader, writer in pairs:
             os.set_blocking(reader, False)
-        process = subprocess.Popen(['/usr/bin/systemctl', 'show', '--all', *('--property=' + key for key in PROFILE_PROPERTIES), unit],
-                                   stdin=subprocess.DEVNULL, stdout=pairs[0][1], stderr=pairs[1][1], close_fds=True, start_new_session=True,
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=pairs[0][1], stderr=pairs[1][1],
+                                   close_fds=True, start_new_session=True,
                                    env={'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/'})
         for index, (name, (reader, writer)) in enumerate(zip(('stdout', 'stderr'), pairs)):
             os.close(writer)
@@ -305,32 +367,18 @@ def profile_query(unit, end):
             if time.monotonic() >= stop:
                 raise ProfileError('Query', 'timeout')
             for key, _ in selected.select(min(.1, max(0, stop - time.monotonic()))):
-                chunk = os.read(key.fd, min(4096, 8192 - sum(map(len, buffers.values())) + 1))
+                chunk = os.read(key.fd, min(4096, 8192 - used[0] + 1))
                 if not chunk:
                     selected.unregister(key.fd)
                 else:
-                    buffers[key.data].extend(chunk)
-                    if sum(map(len, buffers.values())) > 8192:
+                    used[0] += len(chunk)
+                    if used[0] > 8192:
                         raise ProfileError('Query', 'output-limit')
+                    buffers[key.data].extend(chunk)
         status = process.wait(timeout=.1)
         if status != 0 or buffers['stderr']:
             raise ProfileError('Query', status if 0 < status <= 255 else 'exit-nonzero')
-        values = {}
-        for line in buffers['stdout'].decode().splitlines():
-            require(len(line) <= 512 and '=' in line)
-            key, value = line.split('=', 1)
-            require(key in PROFILE_PROPERTIES)
-            if key in values:
-                raise ProfileError(key, 'duplicate')
-            values[key] = value
-        missing = [key for key in PROFILE_PROPERTIES if key not in values]
-        if missing:
-            raise ProfileError(missing[0], 'missing')
-        return values
-    except ProfileError:
-        raise
-    except (OSError, ValueError, subprocess.SubprocessError):
-        raise ProfileError('Query', 'malformed') from None
+        return bytes(buffers['stdout'])
     finally:
         selected.close()
         if process is not None:
@@ -344,6 +392,37 @@ def profile_query(unit, end):
                         os.close(fd)
 
 
+def profile_query(unit, end):
+    import re
+    profile_require(type(unit) is str and re.fullmatch(r'dev-pair-(?:initialize-(?:prepare|adapter|cleanup)-[0-9a-f]{8}-[0-9a-f]{8}|gptbox-[0-9a-f]{64}|ci-observe-[0-9a-f]{16})\.service', unit), 'Options')
+    stop, used = min(end, time.monotonic()+QUERY_SECONDS), [0]
+    base = ['/usr/bin/busctl', '--system', '--json=short', '--no-pager']
+    stage = 'GetUnit'
+    try:
+        if time.monotonic() >= stop:
+            raise ProfileError(stage, 'timeout')
+        check_deadline(end)
+        path = unit_object(query_process([*base, 'call', 'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+                                         'org.freedesktop.systemd1.Manager', 'GetUnit', 's', unit], stop, used))
+        result = {}
+        for interface, schema in (('Unit', UNIT_SCHEMA), ('Service', SERVICE_SCHEMA)):
+            stage = interface+'Get'
+            raw = query_process([*base, 'get-property', 'org.freedesktop.systemd1', path, 'org.freedesktop.systemd1.'+interface,
+                                 *(key for key, signature in schema)], stop, used)
+            result.update(property_records(raw, schema))
+        if time.monotonic() >= stop:
+            raise ProfileError('Query', 'timeout')
+        return result
+    except ProfileError as error:
+        if error.key == 'Query':
+            raise ProfileError(stage, error.value) from None
+        raise
+    except OSError:
+        raise ProfileError(stage, 'unavailable') from None
+    except (ValueError, TypeError, RecursionError, subprocess.SubprocessError):
+        raise ProfileError(stage, 'malformed') from None
+
+
 def expected_profile(args):
     import re
     base = args.unit.removesuffix('.service')
@@ -352,19 +431,17 @@ def expected_profile(args):
     family = 'root' if base.startswith('dev-pair-initialize-') else ('maintenance' if base.startswith('dev-pair-gptbox-') else 'observation')
     profile_require(args.profile == family and (args.uid == 0 if family == 'root' else args.uid >= 1000), 'Options')
     profile_require(1000 <= args.start_us <= 5000000 and 1000 <= args.runtime_us <= 2280000000, 'Options')
-    stream = '/run/systemd/dev-pair-stdio/' + args.key
-    return {'Id': args.unit, 'Transient': 'yes', 'LoadState': 'loaded', 'Type': 'exec', 'ActiveState': 'active',
-            'MainPID': str(os.getpid()), 'ControlGroup': '/system.slice/' + args.unit,
-            'DropInPaths': '/run/systemd/system/' + args.unit + '.d/10-timeout-abort.conf',
+    return {'Id': args.unit, 'Transient': True, 'LoadState': 'loaded', 'Type': 'exec', 'ActiveState': 'active',
+            'MainPID': os.getpid(), 'ControlGroup': '/system.slice/' + args.unit,
+            'DropInPaths': ['/run/systemd/system/' + args.unit + '.d/10-timeout-abort.conf'],
             'FragmentPath': '/run/systemd/transient/' + args.unit, 'SourcePath': '',
             'TimeoutStartUSec': args.start_us, 'RuntimeMaxUSec': args.runtime_us,
             'TimeoutStopUSec': {'root': 5000000, 'maintenance': 10000000, 'observation': 1000000}[family],
             'TimeoutStartFailureMode': 'kill', 'TimeoutStopFailureMode': 'kill', 'KillMode': 'control-group',
-            'SendSIGKILL': 'yes', 'FinalKillSignal': '9', 'Restart': 'no', 'LimitCORE': '0',
-            'MemoryMax': '2147483648', 'TasksMax': '512', 'CPUQuotaPerSecUSec': 1000000, 'Slice': 'system.slice',
-            'StandardInput': 'file' if args.stdin else 'null', 'StandardInputFile': stream + '/stdin' if args.stdin else '',
-            'StandardOutput': 'file', 'StandardOutputFile': stream + '/stdout', 'StandardError': 'file', 'StandardErrorFile': stream + '/stderr',
-            'SELinuxContext': '', 'RootDirectory': '', 'RootImage': '', 'PrivateUsers': 'no', 'PrivateNetwork': 'no', 'NoNewPrivileges': 'no'}
+            'SendSIGKILL': True, 'FinalKillSignal': 9, 'Restart': 'no', 'LimitCORE': 0,
+            'MemoryMax': 2147483648, 'TasksMax': 512, 'CPUQuotaPerSecUSec': 1000000, 'Slice': 'system.slice',
+            'StandardInput': 'file' if args.stdin else 'null', 'StandardOutput': 'file', 'StandardError': 'file',
+            'SELinuxContext': [False, ''], 'RootDirectory': '', 'RootImage': '', 'PrivateUsers': False, 'PrivateNetwork': False, 'NoNewPrivileges': False}
 
 
 def verify_profile(args):
@@ -372,14 +449,7 @@ def verify_profile(args):
     values = profile_query(args.unit, args.deadline)
     for key, value in expected.items():
         actual = values.get(key)
-        if type(value) is int:
-            try:
-                observed = duration_us(actual)
-            except ValueError:
-                raise ProfileError(key) from None
-            profile_require(observed == value, key, observed)
-        else:
-            profile_require(actual == value, key, int(actual) if actual and actual.isdigit() and len(actual) <= 12 else ('unexpected-path' if key.endswith(('Path', 'Paths', 'File')) or key == 'ControlGroup' else actual))
+        profile_require(type(actual) is type(value) and actual == value, key, actual if type(actual) in (int, str) else 'unexpected')
     import pwd
     account = pwd.getpwuid(args.uid)
     user = ('', 'root') if args.profile == 'root' else ('dp-maint',)
@@ -417,12 +487,15 @@ def main():
         class Parser(argparse.ArgumentParser):
             def error(self, message):
                 raise ValueError('invalid relay arguments')
-        parser = Parser(add_help=False)
+        parser = Parser(add_help=False, allow_abbrev=False)
         parser.add_argument('--unit', required=True)
         parser.add_argument('--key', required=True)
         parser.add_argument('--profile', choices=('root', 'maintenance', 'observation'), required=True)
         parser.add_argument('--start-us', type=int, required=True)
         parser.add_argument('--runtime-us', type=int, required=True)
+        parser.add_argument('--stdout-node', type=node_identity, required=True)
+        parser.add_argument('--stderr-node', type=node_identity, required=True)
+        parser.add_argument('--stdin-node', type=node_identity)
         parser.add_argument('--uid', type=int, required=True)
         parser.add_argument('--stdin', type=int, choices=(0, 1), required=True)
         parser.add_argument('--maximum', type=int, choices=MAXIMA, required=True)
@@ -430,13 +503,13 @@ def main():
         parser.add_argument('--helper', required=True)
         parser.add_argument('argv', nargs=argparse.REMAINDER)
         option_end = sys.argv.index('--') if '--' in sys.argv else len(sys.argv)
-        options = [value for value in sys.argv[1:option_end] if value.startswith('--')]
+        options = [value.split('=', 1)[0] for value in sys.argv[1:option_end] if value.startswith('--')]
         require(len(options) == len(set(options)))
         args = parser.parse_args()
         require(args.argv and args.argv[0] == '--' and args.helper == hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
         check_deadline(args.deadline)
         domain = verify_process(args.uid)
-        verify_fds(args.stdin == 1)
+        verify_fds(args)
         verify_profile(args)
         check_deadline(args.deadline)  # Before any secret byte is read.
         data = None
@@ -458,8 +531,9 @@ def main():
             return ERROR_STATUS
         return status
     except ProfileError as error:
-        with contextlib.suppress(Exception):
-            failure_frame(error, args.deadline)
+        if 'args' in locals() and getattr(args, 'diagnostic_ready', False):
+            with contextlib.suppress(Exception):
+                failure_frame(error, args.deadline)
         return ERROR_STATUS
     except BaseException:
         return ERROR_STATUS  # No exception/argv/environment/input/traceback export.

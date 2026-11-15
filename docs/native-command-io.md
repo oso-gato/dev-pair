@@ -194,18 +194,38 @@ contexts10s, image observations1s; observation retains its10s operation and256Ki
 capture path. Start plus active timers remain inside the prior absolute command,
 phase and stricter caller lifetime. No container/SELinux/privilege change occurs.
 
-Before reading stdin or starting the payload, the immutable relay uses a fixed
-read-only selected-property systemctl query with clean environment, measured
-4096-byte anonymous pipes,8KiB combined capture and at most5s inside the original
-deadline. It verifies its MainPID, canonical ID, actual four kernel UID/GID values,
-system.slice cgroup membership, fragment, exact DropInPaths, effective timers,
-kill/resource settings, stdio paths and absence of isolation overrides. It never
-queries Environment, ExecStart/hooks or credential values. The query's pipes and
-buffer replace the later payload pipes/queues rather than coexist with them.
-No policy permission is granted if the read fails under the maintenance UID.
+Before reading stdin or starting the payload, the immutable relay uses three
+fixed stock busctl --system --json=short invocations: Manager.GetUnit, seven
+exact Unit Properties.Get names, then28 exact Service names. All three share
+one5s deadline clipped to the original deadline and one8192-byte stdout+stderr
+cap. Each uses clean environment and measured4096-byte anonymous pipes. There
+is no GetAll, introspection, show fallback or caller-supplied property/interface.
+The bounded typed JSON parser rejects duplicate/missing/extra records, wrong
+signatures/widths, boolean/integer coercion, and method/property shape confusion.
+Method replies wrap their values in an outer array; property data is direct.
+SELinuxContext must be the exact (bs) value [false,""], not an empty string.
+
+The gate verifies MainPID, canonical ID, all four kernel UID/GID values,
+system.slice membership, fragment, single exact DropInPaths array, timers,
+kill/resource settings, readable stdio modes and absent isolation overrides.
+No Environment, ExecStart/hooks, StandardInputData or credential value is queried.
+The pipes/buffer replace later payload resources. Missing busctl or read access
+blocks; no policy exception or new package is introduced.
+
+The *File names are setters without readable getters in audited v259. Instead
+the controller re-verifies its existing journal and passes only bounded decimal
+device:inode pairs for the two distinct output nodes and optional regular input.
+The helper fstats its inherited FD0/1/2 against those exact pairs, retaining root
+owner/mode/link/type/capacity checks, O_WRONLY outputs, O_RDONLY input/null and
+zero regular-input offset. No-input requires kernel /dev/null. It never traverses
+the root0700 stream paths or reads the journal. Swapped/replaced/duplicated
+objects fail even when other metadata matches. These nonsecret expected pairs
+never enter diagnostics. FD2 is verified first; when that failure channel itself
+is unproven, the helper emits no F frame and cannot emit successful completion.
 
 A rejected effective gate emits only a terminal F diagnostic frame (at most256
-bytes): fixed stage/reason, whitelisted property and safe category/numeric value.
+bytes): fixed stage/reason, whitelisted property/query group/FD and safe category.
+GetUnit/UnitGet/ServiceGet distinguish failed query groups without raw output.
 It cannot satisfy successful completion, including accepted numeric exits0/1/4.
 Success still requires the distinct complete C frame with profile-proof version1.
 Prelaunch failures retain fixed admission stage/reason and elapsed time. Probe
@@ -227,3 +247,10 @@ families, MainPID/UID/GID/cgroup, deadlines, resources, stdio and unknown overri
 failed gates have no payload/input effects. Native cache discovery, installed
 SELinux policy, stock D-Bus reads, effective timers/cgroups and engine/package
 transitions still require a separately reviewed actual Fedora run.
+
+The parent controller's existing systemctl show operations still perform GetAll
+internally, even when their printed columns are selected. This correction does
+not claim a no-sensitive-property-read contract for those other paths; their
+audit/migration is a declared separate limitation. The independent local private
+session-bus probe used installed systemd257.13 and verified JSON shape/order only.
+It did not contact a host bus and is not Fedora259, SELinux or native acceptance.

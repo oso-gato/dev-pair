@@ -461,6 +461,10 @@ class Commands:
                 runtime_us = round(float(runtime) * 1000000)
                 helper_end = command_end - min(.1, remaining / 2)
                 admission_stage = 'effective-profile'
+                transport.verify()
+                nodes = transport.state['nodes']
+                node_args = tuple(value for name in ('stdout', 'stderr', 'stdin') if name in nodes
+                                  for value in ('--'+name+'-node', str(nodes[name]['device'])+':'+str(nodes[name]['inode'])))
                 args = (prefix[0], *transport.properties(), '--property=LimitCORE=0',
                         '--property=TimeoutStartSec=%.3fs' % (start_us / 1000000),
                         '--property=TimeoutStartFailureMode=kill', '--property=TimeoutStopFailureMode=kill',
@@ -468,7 +472,7 @@ class Commands:
                         *('--property=' + key + '=' + value for key, value in fixed.items()), *prefix[1:],
                         '/usr/bin/python3', '-I', str(relay_path), '--uid', str(relay_uid), '--stdin', str(int(stdin_data is not None)),
                         '--unit', transport.canonical, '--key', unit, '--profile', family, '--start-us', str(start_us), '--runtime-us', str(runtime_us),
-                        '--maximum', str(maximum), '--deadline', str(helper_end), '--helper', relay_sha, '--', *args[payload:])
+                        *node_args, '--maximum', str(maximum), '--deadline', str(helper_end), '--helper', relay_sha, '--', *args[payload:])
                 for _ in range(2):
                     launcher_pairs.append(pipe_pair())
                 process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=launcher_pairs[0][1],

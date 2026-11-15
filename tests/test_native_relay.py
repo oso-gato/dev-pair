@@ -16,12 +16,12 @@ import native_relay as r
 HELPER = Path(r.__file__)
 SHA = hashlib.sha256(HELPER.read_bytes()).hexdigest()
 CODE = ('import sys;sys.path.insert(0,sys.argv[1]);import native_relay as r;'
-        'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:None;r.verify_profile=lambda args:None;'
+        'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:setattr(value,"diagnostic_ready",True);r.verify_profile=lambda args:None;'
         'sys.argv=["relay",*sys.argv[2:]];raise SystemExit(r.main())')
 
 
 def launch(script, *, data=None, maximum=262144, seconds=2):
-    args = [sys.executable, '-c', CODE, str(HELPER.parent), '--uid', str(os.getuid()),
+    args = [sys.executable, '-c', CODE, str(HELPER.parent), '--stdout-node','0:1','--stderr-node','0:2','--uid', str(os.getuid()),
             '--unit', 'dev-pair-gptbox-' + 'a'*64 + '.service', '--key', 'dev-pair-gptbox-' + 'a'*64 + '.service',
             '--profile', 'maintenance', '--start-us', '1000000', '--runtime-us', '1000000', '--stdin', str(int(data is not None)), '--maximum', str(maximum),
             '--deadline', str(time.monotonic() + seconds), '--helper', SHA, '--', sys.executable, '-c', script]
@@ -244,7 +244,7 @@ class RelayTests(unittest.TestCase):
             code = ('import time;time.sleep(.15);' + CODE.replace(
                 'sys.argv=["relay",*sys.argv[2:]];',
                 'original_read=r.os.read;r.os.read=lambda *a: (__import__("pathlib").Path(' + repr(str(marker)) + ').write_text("read"),original_read(*a))[1];sys.argv=["relay",*sys.argv[2:]];'))
-            args = [sys.executable, '-c', code, str(HELPER.parent), '--uid', str(os.getuid()),
+            args = [sys.executable, '-c', code, str(HELPER.parent), '--stdout-node','0:1','--stderr-node','0:2','--uid', str(os.getuid()),
                     '--unit', 'dev-pair-gptbox-' + 'a'*64 + '.service', '--key', 'dev-pair-gptbox-' + 'a'*64 + '.service', '--profile', 'maintenance', '--start-us', '1000000', '--runtime-us', '1000000', '--stdin', '1', '--maximum', '262144', '--deadline', str(time.monotonic() + .05),
                     '--helper', SHA, '--', sys.executable, '-c', 'print("must-not-launch")']
             result = subprocess.run(args, input=b'NONCREDENTIAL', capture_output=True, timeout=2)
@@ -256,7 +256,7 @@ class RelayTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             marker = Path(temp) / 'late'
             code = 'import time;time.sleep(.15);' + CODE
-            args = [sys.executable, '-c', code, str(HELPER.parent), '--uid', str(os.getuid()),
+            args = [sys.executable, '-c', code, str(HELPER.parent), '--stdout-node','0:1','--stderr-node','0:2','--uid', str(os.getuid()),
                     '--unit', 'dev-pair-gptbox-' + 'a'*64 + '.service', '--key', 'dev-pair-gptbox-' + 'a'*64 + '.service', '--profile', 'maintenance', '--start-us', '1000000', '--runtime-us', '1000000', '--stdin', '0', '--maximum', '262144', '--deadline', str(time.monotonic() + .25),
                     '--helper', SHA, '--', sys.executable, '-c',
                     'import time;from pathlib import Path;time.sleep(.2);Path(' + repr(str(marker)) + ').write_text("escaped")']

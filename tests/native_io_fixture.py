@@ -59,14 +59,18 @@ def launch_payload(original, args, kwargs, payload):
         helper = args[index + 1]
         relay_args = args[index + 2:]
         code = ('import sys;sys.path.insert(0,sys.argv[1]);import native_relay as r;'
-                'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:None;r.verify_profile=lambda args:None;'
+                'r.verify_process=lambda uid:"unconfined_service_t";r.verify_fds=lambda value:setattr(value,"diagnostic_ready",True);r.verify_profile=lambda args:None;'
                 'sys.argv=["relay",*sys.argv[2:]];raise SystemExit(r.main())')
         payload = [sys.executable, '-c', code, str(Path(helper).parent), *relay_args]
     opened = []
     def stream(name, mode):
         value = next(v.split('=', 2)[2] for v in args if v.startswith('--property=' + name + '='))
         if value == 'null':
-            return subprocess.DEVNULL
+            # systemd opens its null input O_RDONLY; Popen's DEVNULL opens
+            # O_RDWR and would hide an important access-mode distinction.
+            result = open('/dev/null', 'rb', buffering=0)
+            opened.append(result)
+            return result
         assert value.startswith('file:')
         result = open(value[5:], mode, buffering=0)
         opened.append(result)

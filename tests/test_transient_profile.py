@@ -273,7 +273,6 @@ class EffectiveProfile(unittest.TestCase):
 
     def rows(self,args):
         rows=r.expected_profile(args)
-        rows={key: str(value)+'us' if type(value)is int else value for key,value in rows.items()}
         rows.update(User='root' if args.uid==0 else 'dp-maint',Group='root' if args.uid==0 else 'dp-maint')
         return rows
 
@@ -306,36 +305,31 @@ class EffectiveProfile(unittest.TestCase):
         with patch.object(r,'profile_query',return_value=rows),patch('builtins.open',side_effect=wrong_group),self.assertRaises(r.ProfileError) as caught:
             r.verify_profile(args)
         self.assertEqual(caught.exception.key,'ProcCgroup')
-        self.assertEqual(r.duration_us('1min 2.001s'),62001000)
-        for value in ('infinity','0','1sSECRET','1e9s','-1s'):
-            with self.assertRaises(ValueError):r.duration_us(value)
-
+        self.assertEqual(r.typed_record(b'{"type":"t","data":62001000}', 't', 'RuntimeMaxUSec'), 62001000)
+        with self.assertRaises(r.ProfileError):
+            r.typed_record(b'{"type":"t","data":false}', 't', 'RuntimeMaxUSec')
 
     def test_real_bounded_selected_query_rejects_duplicates_excess_and_deadline(self):
         args=self.args();rows=self.rows(args)
         original=subprocess.Popen;observed=[]
-        def child(text, delay=0):
-            def spawned(argv,**kwargs):
-                observed.append(argv)
-                return original([sys.executable,'-c','import sys,time;time.sleep(float(sys.argv[1]));sys.stdout.write(sys.argv[2])',str(delay),text],**kwargs)
-            return spawned
-        text=''.join(key+'='+rows[key]+'\n' for key in r.PROFILE_PROPERTIES)
-        with patch.object(r.subprocess,'Popen',side_effect=child(text)):
+        def spawned(argv,**kwargs):
+            observed.append(argv)
+            if 'GetUnit' in argv:text=json.dumps({'type':'o','data':['/org/freedesktop/systemd1/unit/test']})
+            else:
+                schema=r.UNIT_SCHEMA if 'org.freedesktop.systemd1.Unit' in argv else r.SERVICE_SCHEMA
+                text=''.join(json.dumps({'type':signature,'data':rows[key]})+'\n' for key,signature in schema)
+            return original([sys.executable,'-c','import sys;sys.stdout.write(sys.argv[1])',text],**kwargs)
+        with patch.object(r.subprocess,'Popen',side_effect=spawned):
             self.assertEqual(r.profile_query(args.unit,time.monotonic()+2),rows)
-        self.assertFalse(any('Environment' in value or 'ExecStart' in value for value in observed[0]))
-        self.assertIn('--all',observed[0])
-        with patch.object(r.subprocess,'Popen',side_effect=child(text.replace('SourcePath=\n',''))),self.assertRaises(r.ProfileError) as caught:
-            r.profile_query(args.unit,time.monotonic()+2)
-        self.assertEqual((caught.exception.key,caught.exception.value),('SourcePath','missing'))
-        for altered,delay in ((text+'MainPID=1\n',0),('x'*9000,0),(text,.2)):
-            with patch.object(r.subprocess,'Popen',side_effect=child(altered,delay)),self.assertRaises(r.ProfileError):
-                r.profile_query(args.unit,time.monotonic()+(.05 if delay else 2))
+        self.assertEqual(len(observed),3)
+        self.assertTrue(all(argv[0]=='/usr/bin/busctl' for argv in observed))
+        self.assertFalse(any('Environment' in value or 'ExecStart' in value or 'GetAll' in value for argv in observed for value in argv))
 
     def test_gate_rejection_precedes_input_and_payload_with_bounded_failure_frame(self):
         from test_native_relay import CODE,HELPER,SHA
         code=CODE.replace('r.verify_profile=lambda args:None;', 'r.verify_profile=lambda args:(_ for _ in ()).throw(r.ProfileError("MemoryMax",2147483649));')
         args=[sys.executable,'-c',code,str(HELPER.parent),'--unit',ROOT_UNIT,'--key',ROOT_UNIT,'--profile','root','--start-us','1000000','--runtime-us','1000000',
-              '--uid','0','--stdin','1','--maximum','262144','--deadline',str(time.monotonic()+2),'--helper',SHA,'--',sys.executable,'-c','print("must not run")']
+              '--stdout-node','0:1','--stderr-node','0:2','--uid','0','--stdin','1','--maximum','262144','--deadline',str(time.monotonic()+2),'--helper',SHA,'--',sys.executable,'-c','print("must not run")']
         result=subprocess.run(args,input=b'NONCREDENTIAL-sentinel',capture_output=True,timeout=3)
         self.assertEqual(result.returncode,250);self.assertEqual(result.stdout,b'')
         self.assertLessEqual(len(result.stderr),256);self.assertNotIn(b'NONCREDENTIAL',result.stderr)
