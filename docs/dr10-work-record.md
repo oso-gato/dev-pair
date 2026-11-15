@@ -1471,3 +1471,25 @@ Runner AWS7.0.0-1014-aws/image20261111.127.1, Podman4.9.3/slirp1.2.1,
 initialfree94983139328bytes/RAM16464306176bytes. Evidence:
 `/workspace/artifacts/fedora-ci-run-43743748166.log` and sibling `-report.json`.
 The VPS remains untouched; no authenticated job or full bootstrap is admitted.
+
+
+Diagnostic candidate `a742b98158839eb8f10be64d5c966badd069ab0e` is integrated
+byte-identically as `ac29f00`. Builder201 tests passed34.584s; coordinator201 tests
+passed30.983s. Five files add fixed operation/preparation-step identity,
+accepted-versus-rejected exit outcomes, source-verification runner/stage evidence,
+bounded native service properties with explicit missing/collected state, and
+narrow public enforcement/resolved output. Arbitrary argv, Git output/config,
+exceptions, environment, journals and sensitive-stdin output remain withheld.
+Allowed exits, execution order, budgets and permissions are unchanged. This is a
+diagnostic candidate, not a proved repair of run8's unknown cause. Fresh Astra
+High `/root/fedora_prepare_failure_review` is reviewing the exact immutable
+candidate; no hosted execution or publication has occurred for it.
+
+
+Fresh diagnostic review reproduced a budget regression: assigning the source-
+verification runner's probe diagnostic callback switches it from Commands'
+1048576-byte path to ProbeCommands'4194304-byte path. A real1100000-byte child
+is rejected before assignment and accepted afterward. Although201 repository
+tests pass, this violates the diagnostic-only no-budget-relaxation boundary.
+Candidate a742b98 is not published or executed. Review is consolidating findings;
+repair must preserve the original source runner semantics while adding metadata.
