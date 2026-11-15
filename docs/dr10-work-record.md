@@ -14,11 +14,12 @@ owner decisions remain retained in order.
   real Fedora VM booted/shut down under TCG; guest report framing was rejected.
   Partial preflight/status text is not complete accepted evidence. Cleanup passed.
 - One API-configured Sol High builder, `/root/durable_job_build`, is implementing
-  verified public-input transfer in `/workspace/dev-pair-fedora-inputs`. The first review found input snapshot/deadline flaws; the builder is repairing
-  them for fresh Astra High `/root/public_inputs_snapshot_review`. No
-  provider backend attestation or coordinator model metadata is available.
-- Next: complete/review input helper, then implement/review dedicated bounded
-  guest result transport using `/workspace/scratch/fedora-ci-serial-plan.md`.
+  dedicated bounded VM report transport from coordination commit c9a47ef.
+  The public-input helper repair passed fresh Astra High review at 62eb1f6,
+  integrated as 921654d; all 163 integration tests pass. No provider backend
+  attestation or coordinator model metadata is available.
+- Next: complete/review dedicated bounded guest result transport using
+  `/workspace/scratch/fedora-ci-serial-plan.md`.
   Only then authorize the next exact-candidate CI run and integrate real guest
   prepare/maintenance assembly. Preserve finite budgets and existing gates.
 - VPS remains untouched. Root credential reference was available, but this cloud
@@ -1126,3 +1127,20 @@ This binds the consumer to 62eb1f6 and the payload to its recorded db27f3a
 producer; it does not upgrade either to runtime acceptance. Original signature
 receipts remain unchanged; no network cryptography was repeated. Fresh Astra
 High review is in progress. Nothing in this checkpoint was pushed or deployed.
+
+
+Fresh Astra High `/root/public_inputs_snapshot_review` returned PASS on exact
+62eb1f6 with no new findings. Independent cross-process replacement tests,
+same-inode mutation/growth rejection and a real blocking-first-open deadline
+(0.150 seconds) passed, as did all 15 affected tests and retained-payload/context
+verification. Evidence: `/workspace/artifacts/public-inputs-review-62eb1f6/review.json`.
+This closes both prior consumer findings without changing production identities.
+
+The sole Sol High builder now owns a separate twenty-minute dedicated report-
+transport slice from c9a47ef, preserving current VM resource/phase limits and
+implementing the source-backed FIFO plan. Fresh reviewer
+`/root/fedora_report_transport_review` was accepted by the local agent API with
+`gpt-6-astra` / `high`, fresh context. The exact candidate will receive independent
+review before one reassessed hosted run; two repair cycles maximum before another
+checkpoint. No private policy, credentials, model calls or host deployment enter
+this test. API settings are configuration evidence, not backend attestation.
