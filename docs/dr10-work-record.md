@@ -2,13 +2,14 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 06:08 HKT. This section summarizes the current state;
+Updated November 16, 2026, 06:16 HKT. This section summarizes the current state;
 chronological records below retain earlier evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), requested
   branch `codex/dr10-reconciliation-review`, coordination tree
-  `/workspace/dev-pair`. Publish the reviewed combined source through `a18e81b`
-  and this documentation to PR13 for one bounded Fedora retest. Previously
+  `/workspace/dev-pair`. Reviewed combined source `c5f9c6e` reached run15, whose
+  sole failure was a test-only local-path assumption before the VM stage.
+  Publish portable fixture repair `42bd4c3` and this record for one retest. Previously
   separate reviewed storage is included. Supplemental checkpoint
   `f15c11efbc7213f2d96f9133edf16a530601a05c` retains earlier reviewed work.
   Standards remain `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
@@ -17,7 +18,8 @@ chronological records below retain earlier evidence and owner decisions.
   inputs, pre/post inspection, complete report framing and outer cleanup.
   Initialize blocked after 16.811 seconds: status209, with actual init_t write
   denial on a var_run_t FIFO. No preparation/assembly acceptance. Its single-run
-  scope is closed; the new reviewed candidate receives one separate retest below.
+  scope is closed. Run15's scope is also closed without executing Fedora; the
+  reviewed test repair receives one separate retest below.
 - Reviewed offline stock-Codex state and managed-child component is included on
   the PR. Actual no-network checks passed; independent review verified cleanup
   failures cannot return success. Authentication, complete tool-path enforcement,
@@ -2215,3 +2217,40 @@ The archive integration is queued at
 `/workspace/scratch/signed-fedora-base-build-handoff.md`. This native candidate
 still uses its recorded registry digest with the separately disclosed signature
 limitation; the signed archive does not retroactively authenticate that input.
+
+### November 16, 2026, 06:16 HKT — CI fixture portability repaired
+
+[Run15](https://github.com/oso-gato/dev-pair/actions/runs/43767618602), job
+132976166750, source `c5f9c6effebf23322d8be3eaa54b8a842d837c9f`, stopped
+in the local test step: 310 tests in 42.055 seconds, one error. The staging
+fixture created its temporary directory under literal `/workspace`, absent on
+the GitHub runner. The other309 tests passed; the Fedora stage was skipped.
+No VM, native initialization or new runtime verdict exists for this run.
+Its single-run scope is closed; log:
+`/workspace/artifacts/fedora-ci-run-43767618602.log`.
+
+Sol High one-line test-only repair
+`6cf378e33779815ec324aea8cb9decd85acd3eb6`, integrated as `42bd4c3`, uses
+the resolved checkout as its protected temporary parent. It changes no
+production source or assertions. The affected16-test suite passed both from
+the checkout and from `/tmp`. Fresh Astra High
+`/root/relay_fixture_portability_review` independently archived the exact
+candidate and passed those16 tests from `/tmp` in1.846 seconds, preserving
+actual ancestry, modes, exclusive creation, immutable collisions and symlink
+rejection. Evidence:
+`/workspace/artifacts/relay-fixture-portability-review-6cf378e33779815ec324aea8cb9decd85acd3eb6/review.json`,
+SHA256 `836777cee1cab79ed09b6055ab62bcdf7d9fb56ae2fba14805d0272648db02d9`.
+
+One new changed-candidate hosted attempt is admitted after that actual failure
+and reviewed repair. All limits and permitted effects in the06:08 HKT scope
+remain unchanged. This is not an unchanged retry or a waiver of local tests;
+the hosted workflow reruns all310 tests before it can start Fedora. No
+production, VPS, model/auth or security-policy authority is added.
+
+Offline tool work was checkpointed at WIP
+`bf355e8647f815a1346044f49c9df4e5112e4f10` for the short detour and has
+resumed. Actual mapped-UID0 stock execution failed before HTTP/tool dispatch
+because its filesystem helper could not set a nested UID map. The baseline
+UID1000 checks and cleanup passed. A setup-only single-identity namespace
+refinement is being investigated within the remaining source/experiment limits;
+no managed policy or tool-coverage verdict is weakened to obtain a pass.
