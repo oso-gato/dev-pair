@@ -362,6 +362,82 @@ class FedoraCITests(unittest.TestCase):
         argv = capture.call_args.args[1]
         self.assertEqual(argv[:7], ['sudo', '-n', '/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s', '/usr/bin/du'])
 
+    def test_captured_fatal_fts_witness_retries_without_inventing_totals(self):
+        captured_root = pathlib.Path('/tmp/dpvm-0n1yt9k2')
+        captured = subprocess.CompletedProcess([], 1, b'',
+            b'/usr/bin/du: fts_read failed: /tmp/dpvm-0n1yt9k2/graph/overlay: No such file or directory\n')
+        self.assertEqual(ci.parse_du(captured_root, captured), (None, True))
+        fatal = subprocess.CompletedProcess([], 1, b'',
+            ('/usr/bin/du: fts_read failed: ' + str(self.root / 'graph/overlay') + ': No such file or directory\n').encode())
+        complete = subprocess.CompletedProcess([], 0, ('4096\t' + str(self.root) + '\n').encode(), b'')
+        partial = subprocess.CompletedProcess([], 1, ('8192\t' + str(self.root) + '\n').encode(),
+            ("du: cannot access '" + str(self.root / 'gone') + "': No such file or directory\n").encode())
+        with mock.patch.object(ci, 'capture_du', side_effect=[fatal, complete]) as capture:
+            sample = ci.measure_storage(self.root, sudo=False)
+            self.assertEqual((sample['bytes'], sample['missing_total_samples'], sample['usable_samples']), (4096, 1, 1))
+            self.assertFalse(sample['provisional'])
+            self.assertEqual(capture.call_count, 2)
+        with mock.patch.object(ci, 'capture_du', side_effect=[partial, fatal, complete]):
+            self.assertEqual(ci.measure_storage(self.root, sudo=False)['bytes'], 8192)
+        with mock.patch.object(ci, 'capture_du', side_effect=[partial, fatal, fatal]):
+            provisional = ci.measure_storage(self.root, live=True, sudo=False)
+            self.assertEqual((provisional['bytes'], provisional['missing_total_samples']), (8192, 2))
+            self.assertTrue(provisional['provisional'])
+        with mock.patch.object(ci, 'capture_du', return_value=fatal) as capture:
+            with self.assertRaisesRegex(ci.StorageMeasurementBlocked, 'no usable total') as caught:
+                ci.measure_storage(self.root, live=True, sudo=False)
+            self.assertEqual(capture.call_count, 3)
+            self.assertIsNone(caught.exception.diagnostics['max_observed_bytes'])
+            self.assertEqual(caught.exception.diagnostics['missing_total_samples'], 3)
+            self.assertEqual(caught.exception.diagnostics['retained_line_types']['fatal_fts_enoent'], 1)
+        with mock.patch.object(ci, 'capture_du', side_effect=[partial, fatal, fatal]):
+            with self.assertRaisesRegex(ci.StorageMeasurementBlocked, 'did not stabilize'):
+                ci.measure_storage(self.root, sudo=False)
+        bad = [subprocess.CompletedProcess([], 0, b'', b''),
+               subprocess.CompletedProcess([], 1, b'', partial.stderr),
+               subprocess.CompletedProcess([], 1, b'\n', fatal.stderr)]
+        for error in (b'Permission denied', b'Input/output error'):
+            bad.append(subprocess.CompletedProcess([], 1, b'', fatal.stderr.replace(b'No such file or directory', error)))
+        bad.append(subprocess.CompletedProcess([], 1, b'', fatal.stderr.replace(str(self.root).encode(), b'/outside')))
+        for result in bad:
+            with mock.patch.object(ci, 'capture_du', return_value=result) as capture:
+                with self.assertRaises(ci.StorageMeasurementBlocked):
+                    ci.measure_storage(self.root, live=True, sudo=False)
+                self.assertEqual(capture.call_count, 1)
+
+    def test_real_gnu_du_overlay_root_churn_never_turns_missing_summary_into_zero(self):
+        graph = self.root / 'graph'
+        graph.mkdir()
+        overlay = graph / 'overlay'
+        stop = threading.Event()
+        def churn():
+            while not stop.is_set():
+                shutil.rmtree(overlay, ignore_errors=True)
+                overlay.mkdir(exist_ok=True)
+                for index in range(30):
+                    directory = overlay / str(index)
+                    directory.mkdir()
+                    (directory / 'x').touch()
+        worker = threading.Thread(target=churn)
+        worker.start()
+        try:
+            for _ in range(100):
+                actual = ci.capture_du(self.root, ['/usr/bin/du', '--summarize', '--block-size=1',
+                                                '--one-file-system', str(self.root)])
+                size, incomplete = ci.parse_du(self.root, actual)
+                if size is None:
+                    self.assertTrue(incomplete)
+                    self.assertIn(b'fts_read failed:', actual.stderr)
+                else:
+                    self.assertGreater(size, 0)
+        finally:
+            stop.set()
+            worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+        stable = ci.measure_storage(self.root, sudo=False)
+        self.assertFalse(stable['provisional'])
+        self.assertGreater(stable['bytes'], 0)
+
     def test_real_removed_recreated_directories_and_exact_read_directory_enoent(self):
         # The same FTS race has two proven GNU forms. Exercise the exact
         # read-directory variant deterministically, then real directory churn;

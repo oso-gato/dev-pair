@@ -114,6 +114,11 @@ partial/truncated flags and bounded stdout/stderr tails in `DP_REPORT`.
 Truncated counts describe only the retained prefix; they do not establish the
 cause of omitted diagnostics. The observed CI cap failure remains unclassified
 until an actual run returns this evidence; no capture-budget increase is implied.
+The separately observed fatal `fts_read failed` owned-path ENOENT can omit the
+summary entirely. Only that exact scoped error permits retry without a total;
+the sample is explicitly missing, never zero. The same three-attempt bound
+applies, preserving the maximum usable count. All-missing attempts block even
+during live monitoring, and completion still requires an error-free total.
 
 Before VM boot, free host disk must cover the complete 8GiB overlay maximum plus
 3GiB host reserve. The guest's 12GiB virtual disk is thin provisioned, not a

@@ -219,14 +219,18 @@ def du_disappearance(root, line):
     match = re.fullmatch(rb"(?:/usr/bin/)?du: cannot (access|read directory) '([^'\r\n]+)': No such file or directory", line)
     if match is not None and match[2].startswith(os.fsencode(root) + b'/') and b'..' not in match[2].split(b'/'):
         return match[1].decode()
+    fatal = re.fullmatch(rb'(?:/usr/bin/)?du: fts_read failed: ([^\r\n]+): No such file or directory', line)
+    if fatal is not None and fatal[1].startswith(os.fsencode(root) + b'/') and b'..' not in fatal[1].split(b'/'):
+        return 'fts_read'
     return None
 
 
 def du_diagnostics(root, result, seen=None, truncated=False):
-    counts = {'access_enoent': 0, 'read_directory_enoent': 0, 'other': 0}
+    counts = {'access_enoent': 0, 'read_directory_enoent': 0, 'fatal_fts_enoent': 0, 'other': 0}
     for line in result.stderr.splitlines():
         kind = du_disappearance(root, line)
-        counts['access_enoent' if kind == 'access' else 'read_directory_enoent' if kind else 'other'] += 1
+        field = {'access': 'access_enoent', 'read directory': 'read_directory_enoent', 'fts_read': 'fatal_fts_enoent'}.get(kind, 'other')
+        counts[field] += 1
     return {'exit_status': result.returncode, 'capture_limit_bytes': DU_CAPTURE_LIMIT,
             'stdout_bytes_seen': (seen or {}).get('stdout', len(result.stdout)),
             'stderr_bytes_seen': (seen or {}).get('stderr', len(result.stderr)),
@@ -304,15 +308,20 @@ def parse_du(root, result):
 def validate_du(root, result):
     require(len(result.stdout) + len(result.stderr) <= DU_CAPTURE_LIMIT, 'storage measurement diagnostic limit exceeded')
     summary = re.fullmatch(rb'([0-9]+)\t' + re.escape(os.fsencode(root)) + rb'\n', result.stdout)
-    require(summary is not None, 'invalid storage measurement summary')
     if result.returncode == 0:
+        require(summary is not None, 'invalid storage measurement summary')
         require(not result.stderr, 'unexpected storage measurement diagnostics')
         return int(summary[1]), False
     require(result.returncode == 1 and result.stderr, 'storage measurement failed')
     # Accept only GNU du's precise ENOENT traversal race, beneath this owned
     # root. Permission, I/O, mount, sudo and unrecognized errors stay blockers.
-    for line in result.stderr.splitlines():
-        require(du_disappearance(root, line) is not None, 'storage measurement has non-disappearance errors')
+    kinds = [du_disappearance(root, line) for line in result.stderr.splitlines()]
+    require(all(kind is not None for kind in kinds), 'storage measurement has non-disappearance errors')
+    if summary is None:
+        require(result.stdout == b'' and 'fts_read' in kinds, 'invalid storage measurement summary')
+        # A fatal traversal race supplies no total. It is retryable evidence,
+        # never zero bytes or an independently usable measurement.
+        return None, True
     return int(summary[1]), True
 
 
@@ -321,23 +330,37 @@ def measure_storage(root, live=False, sudo=True, attempts=3):
     argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s',
             '/usr/bin/du', '--summarize', '--block-size=1',
             '--one-file-system', '--exclude=guest.qcow2', str(root)]
-    maximum = 0
+    maximum = None
+    usable = missing = 0
     for attempt in range(attempts):
-        result = capture_du(root, argv)
-        size, vanished = parse_du(root, result)
-        maximum = max(maximum, size)
-        if maximum > OVERHEAD_LIMIT:
+        try:
+            result = capture_du(root, argv)
+            size, vanished = parse_du(root, result)
+        except StorageMeasurementBlocked as exc:
+            exc.diagnostics.update(attempts=attempt + 1, usable_samples=usable,
+                                   missing_total_samples=missing, max_observed_bytes=maximum)
+            raise
+        if size is None:
+            missing += 1
+        else:
+            usable += 1
+            maximum = size if maximum is None else max(maximum, size)
+        context = {'attempts': attempt + 1, 'usable_samples': usable,
+                   'missing_total_samples': missing, 'max_observed_bytes': maximum}
+        if maximum is not None and maximum > OVERHEAD_LIMIT:
             raise StorageMeasurementBlocked('capacity blocked: tooling/source overhead limit exceeded',
-                                            {**du_diagnostics(root, result), 'max_observed_bytes': maximum})
+                                            {**du_diagnostics(root, result), **context})
         if not vanished:
-            return {'bytes': maximum, 'provisional': False, 'attempts': attempt + 1}
+            return {'bytes': maximum, 'provisional': False, **context}
     # Live churn can produce valid but incomplete traversals. Keep the largest
     # observed count; it is provisional, never a completed-phase validation.
+    if maximum is None:
+        raise StorageMeasurementBlocked('storage measurement produced no usable total within bounded retries',
+                                        {**du_diagnostics(root, result), **context})
     if not live:
         raise StorageMeasurementBlocked('storage measurement did not stabilize within bounded retries',
-                                        {**du_diagnostics(root, result), 'attempts': attempts,
-                                         'max_observed_bytes': maximum})
-    return {'bytes': maximum, 'provisional': True, 'attempts': attempts}
+                                        {**du_diagnostics(root, result), **context})
+    return {'bytes': maximum, 'provisional': True, **context}
 
 
 def tooling_recipe():
