@@ -1623,3 +1623,40 @@ transition/profile and preparation remain pending. No unknown global drop-in,
 policy exception or confinement relaxation is accepted by this verdict. After
 the actual result, close/reassess the batch against the concrete blocker or
 passing evidence and continue independent authorized work where possible.
+
+
+### November 16, 2026, 02:57 HKT — native staging failure and batch closure
+
+Published reviewed source `e5e95bba9798433833c8121e4a9c072c8afa58eb` ran
+[Fedora run10](https://github.com/oso-gato/dev-pair/actions/runs/43749265408),
+job132919348236. All211 tests passed26.835s. Signed Cloud-image verification,
+fresh strict public-input verification, tooling, observed isolated networking and
+outer cleanup passed. The guest booted but native executor staging failed before
+selected service properties were available. The failure-only console witness
+reported native-executor-staging/blocked and availability=unavailable; the
+controller's console-tail truncation cut off its beginning. Dedicated report
+contained zero bytes, so no guest phase is accepted. Executor exit0 is not a pass.
+The later cloud-init BrokenPipe accompanies shutdown and does not establish the
+staging cause. No package preparation or maintenance assembly is established.
+
+This closes the three-run preparation batch (runs8–10). It resolved run8's
+missing command identity and diagnosed run9's cloud-init pipe denial, but the
+new native executor has not passed staging. There is no evidence yet identifying
+a vendor drop-in, missing executable, path ownership or SELinux cause for run10.
+No unchanged retry is authorized. Sole Sol High builder `/root/durable_job_build`
+is performing a bounded15-minute source/local diagnosis and narrow fixed-operation
+diagnostics repair before a fresh independent review and explicit run reassessment.
+Resource, security and credential boundaries remain unchanged; VPS untouched.
+
+Run10 input manifest `5e770a077350117dbd0bb64107f7220bc24e7b6c479b9c5b84e61cc9eed0ef81`;
+payload `57a35ecc0272667706de4a5c6c17744f181762c32132a0cb785e5235fbb0b3d7`,121187164bytes;
+context `3f88993ac379462d05b760ca3fb9516feda4aa96baec4f2d7b4793e072951627`;
+guest `95f089f6e57b460c30ace6c66fa17f48d025335bde8b42ee188f4703f9345490`.
+Evidence: `/workspace/artifacts/fedora-ci-run-43749265408.log` and sibling
+`-controller.json`. Stable tooling overhead1655398400bytes. No valid guest report.
+
+Independent Astra High `/root/codex_offline_state_probe` is also testing the
+stock Codex state/config boundary offline in scratch, without product edits,
+credentials, login or model calls. Its15-minute/2GiB scope does not overlap the
+sole builder. The API accepted the requested model/effort; backend attestation
+and coordinator actual model metadata remain unavailable.
