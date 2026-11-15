@@ -394,3 +394,26 @@ These are synthetic state/command fixtures, not live Tailscale/Fedora evidence.
 No host, provider credential, image build, push or deployment occurred. This
 bounded repair needs fresh affected independent review of its exact commit;
 further substantive work requires a new bounded assessment.
+
+### Narrow official-schema correction
+
+The final affected review reproduced normal disconnected status with
+`CurrentTailnet: null`, defined by the official Tailscale schema at
+[`v1.82.5/ipn/ipnstate/ipnstate.go#L66-L68`](https://github.com/tailscale/tailscale/blob/v1.82.5/ipn/ipnstate/ipnstate.go#L66-L68).
+The coordinator authorized one further ten-minute bounded correction of that
+actual upstream-data mismatch. Nullable CurrentTailnet and Self are now
+normalized as absent identity fields. Fresh NeedsLogin and eligible same-intent
+Stopped attempts can enroll with those null fields; Running nodes without the
+expected tailnet name or actual node ID still fail closed. No source/runtime
+admission or schema CLI bypass was added.
+
+Resumed unverified Running intent normalization and persistence now sit inside
+the existing full cleanup transaction. A failed actual intent write therefore
+disconnects the unverified node, just like a failed node-completion write. Tests
+cover legitimate nullable disconnected states, Running null tailnet/Self denial
+and an injected fsync failure after an actual reconciled intent write. All **53
+local tests** pass, along with compilation and whitespace checks. No host,
+Tailscale, Podman, secret, push or deployment operation occurred. The schema
+citation supports fixture accuracy; it does not establish live Fedora behavior.
+This narrow correction still requires fresh affected independent review of the
+exact returned commit before publication.

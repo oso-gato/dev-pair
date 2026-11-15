@@ -628,21 +628,19 @@ class Bootstrap:
                     raise Blocked('previous node lost enrollment; explicit recovery required')
                 self.check_node(live, tailnet)
                 return self.status()
-            if self.path(f'{STATE}/enrollment-recovery-required.json').exists():
-                if state == 'Running' and same_intent:
-                    self.disconnect_unverified()
-                raise Blocked('enrollment identity requires explicit recovery/new credentials; automatic retry denied')
-            if state not in ('Running', 'NeedsLogin', 'NoState', 'Stopped'):
-                raise Blocked('unexpected Tailscale state; no automatic reauthentication')
-            if state == 'Stopped' and not same_intent:
-                raise Blocked('stopped unowned enrollment requires explicit recovery')
-            observed_tailnet = live.get('CurrentTailnet', {}).get('Name')
-            if state != 'Running' and observed_tailnet and observed_tailnet != tailnet:
-                if same_intent:
-                    self.require_enrollment_recovery(tailnet)
-                raise Blocked('stopped enrollment tailnet mismatch; explicit recovery/new credentials required')
-            self.atomic(intent, expected)
             try:
+                if self.path(f'{STATE}/enrollment-recovery-required.json').exists():
+                    raise Blocked('enrollment identity requires explicit recovery/new credentials; automatic retry denied')
+                if state not in ('Running', 'NeedsLogin', 'NoState', 'Stopped'):
+                    raise Blocked('unexpected Tailscale state; no automatic reauthentication')
+                if state == 'Stopped' and not same_intent:
+                    raise Blocked('stopped unowned enrollment requires explicit recovery')
+                observed_tailnet, _ = self.identity_fields(live)
+                if state != 'Running' and observed_tailnet and observed_tailnet != tailnet:
+                    if same_intent:
+                        self.require_enrollment_recovery(tailnet)
+                    raise Blocked('stopped enrollment tailnet mismatch; explicit recovery/new credentials required')
+                self.atomic(intent, expected)
                 if state != 'Running':
                     self.step('enroll', lambda: self.run('/usr/bin/tailscale', 'up', '--auth-key=file:' + str(secret),
                              '--accept-routes=false', '--accept-dns=false', '--ssh=false',
@@ -680,10 +678,29 @@ class Bootstrap:
         except OSError:
             pass
 
+    @staticmethod
+    def identity_fields(live):
+        # Official Status uses nullable *TailnetStatus and *PeerStatus fields.
+        current, own = live.get('CurrentTailnet'), live.get('Self')
+        current = {} if current is None else current
+        own = {} if own is None else own
+        if not isinstance(current, dict) or not isinstance(own, dict):
+            raise Blocked('invalid Tailscale identity schema')
+        name, node_id = current.get('Name'), own.get('ID')
+        if any(value is not None and not isinstance(value, str) for value in (name, node_id)):
+            raise Blocked('invalid Tailscale identity fields')
+        return name, node_id
+
     def check_node(self, live, tailnet, disconnect_on_mismatch=True):
-        node = json.dumps({'tailnet': tailnet, 'node_id': live.get('Self', {}).get('ID')}, sort_keys=True) + '\n'
+        try:
+            observed_tailnet, node_id = self.identity_fields(live)
+        except Blocked:
+            if disconnect_on_mismatch:
+                self.disconnect_unverified()
+            raise
+        node = json.dumps({'tailnet': tailnet, 'node_id': node_id}, sort_keys=True) + '\n'
         previous = self.text(f'{STATE}/node.json')
-        if (live.get('CurrentTailnet', {}).get('Name') != tailnet or not live.get('Self', {}).get('ID')
+        if (observed_tailnet != tailnet or not node_id
                 or (previous and previous != node)):
             try:
                 self.require_enrollment_recovery(tailnet)

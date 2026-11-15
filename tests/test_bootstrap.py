@@ -615,6 +615,68 @@ class BootstrapTests(unittest.TestCase):
         self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
         self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
 
+    def test_nullable_fresh_needslogin_and_same_intent_stopped_enroll(self):
+        self.prepare()
+        self.fake.node = {'BackendState': 'NeedsLogin', 'CurrentTailnet': None, 'Self': None}
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+            self.assertTrue(self.app.path(b.STATE + '/node.json').exists())
+            # Independent synthetic stopped-unverified attempt with the same recorded intent.
+            self.app.path(b.STATE + '/node.json').unlink()
+            self.fake.node = {'BackendState': 'Stopped', 'CurrentTailnet': None, 'Self': None}
+            self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertEqual(self.fake.node['BackendState'], 'Running')
+        self.assertTrue(self.app.path(b.STATE + '/node.json').exists())
+        self.assertEqual(len([call for call in self.fake.calls if call[:2] == ('/usr/bin/tailscale', 'up')]), 2)
+
+    def test_nullable_running_identity_is_unverified_and_disconnected(self):
+        self.prepare()
+        self.app.atomic(b.STATE + '/enrollment-intent.json', json.dumps({'tailnet': 'example.ts.net'}, sort_keys=True) + '\n')
+        for field in ('CurrentTailnet', 'Self'):
+            with self.subTest(field=field):
+                self.fake.node = {'BackendState': 'Running', 'CurrentTailnet': {'Name': 'example.ts.net'},
+                                  'Self': {'ID': 'interrupted-node'}}
+                self.fake.node[field] = None
+                # Reset only synthetic fixture between independent schema cases.
+                self.app.path(b.STATE + '/enrollment-recovery-required.json').unlink(missing_ok=True)
+                with patch.object(b, 'checked_file', return_value=self.secret()):
+                    with self.assertRaisesRegex(b.Blocked, 'identity mismatch'):
+                        self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+                self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+                self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
+        self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
+
+    def test_resumed_running_actual_intent_write_failure_disconnects(self):
+        self.prepare()
+        intent = b.STATE + '/enrollment-intent.json'
+        self.app.atomic(intent, json.dumps({'tailnet': 'example.ts.net'}, sort_keys=True) + '\n')
+        self.fake.node = {'BackendState': 'Running', 'CurrentTailnet': {'Name': 'example.ts.net'},
+                          'Self': {'ID': 'interrupted-node'}}
+        original_run, original_atomic = self.fake.__call__, self.app.atomic
+        wrote_intent = False
+        def status_loses_intent(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            if args[:2] == ('/usr/bin/tailscale', 'status'):
+                # Simulate loss after the protected same-intent read, so reconciliation must write.
+                self.app.path(intent).unlink(missing_ok=True)
+            return result
+        def failed_intent_write(path, *args, **kwargs):
+            nonlocal wrote_intent
+            if path == intent:
+                self.assertFalse(self.app.path(path).exists())
+                original_atomic(path, *args, **kwargs)
+                wrote_intent = True
+                raise OSError('synthetic fsync failure after actual intent write')
+            return original_atomic(path, *args, **kwargs)
+        self.app.run, self.app.atomic = status_loses_intent, failed_intent_write
+        with patch.object(b, 'checked_file', return_value=self.secret()):
+            with self.assertRaises(OSError):
+                self.app.enroll(str(self.root / 'secret'), 'example.ts.net')
+        self.assertTrue(wrote_intent)
+        self.assertEqual(self.fake.node['BackendState'], 'Stopped')
+        self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
+        self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
+
     def test_finalize_always_blocks_without_reading_fake_evidence(self):
         proc = subprocess.run([sys.executable, str(ROOT / 'tools/bootstrap.py'), 'finalize'], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2)

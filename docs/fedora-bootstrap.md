@@ -181,6 +181,13 @@ sudo -n true
 ```
 
 `--tailnet` must equal the intended tailnet's exact `CurrentTailnet.Name`.
+The [official Tailscale status schema](https://github.com/tailscale/tailscale/blob/v1.82.5/ipn/ipnstate/ipnstate.go#L66-L68)
+permits `CurrentTailnet: null` while disconnected. Nullable `CurrentTailnet` and
+`Self` identity fields are normalized as absent; this permits a normal initial
+NeedsLogin enrollment or eligible stopped retry. A Running node still needs both
+the expected non-null tailnet name and actual node ID before acceptance. Intent
+reconciliation/persistence for a resumed unverified Running node remains inside
+the disconnect-on-failure transaction.
 The node ID is recorded and must remain consistent on retry. An unrelated
 already-running node is never adopted. A successful-but-wrong tailnet is taken
 down before reporting failure; the initial SSH route stays in place and external
