@@ -205,6 +205,37 @@ class FedoraExecutorTests(unittest.TestCase):
         error = guest.ExecutorStagingError('reload-manager', caught.exception, time.monotonic())
         self.assertEqual(error.fields['control_diagnostic'], diagnostic)
 
+    def test_real_scaled_reload_allocation_and_shared_deadline_without_general_timeout_override(self):
+        original_run, original_remaining = subprocess.run, guest.remaining
+        allocations = []
+        marker = self.root / 'completed'
+        def scale(end, maximum):
+            allocations.append(maximum)
+            return original_remaining(end, maximum / 100)
+        def child(args, **kwargs):
+            # Preserve the actual computed timeout and FD/cleanup contract;
+            # substitute a harmless local process for the fixed system command.
+            return original_run([sys.executable, '-c',
+                                 "import pathlib,time,sys;print('synthetic-secret');time.sleep(.12);pathlib.Path(sys.argv[1]).write_text('completed')",
+                                 str(marker)], **kwargs)
+        with mock.patch.object(guest, 'SERVICE_REQUEST', self.root / 'request.json'), \
+                mock.patch.object(guest, 'remaining', side_effect=scale), mock.patch.object(guest.subprocess, 'run', side_effect=child):
+            started = time.monotonic()
+            guest.executor_control(['/usr/bin/systemctl', 'daemon-reload'], started + 2)
+            self.assertTrue(marker.exists())
+            self.assertGreater(time.monotonic() - started, .1)
+            marker.unlink()
+            for args, seconds in ((['/usr/bin/systemctl', '--no-block', 'start', guest.SERVICE_NAME], 2),
+                                  (['/usr/bin/systemctl', 'daemon-reload', '--extra'], 2),
+                                  (['systemctl', 'daemon-reload'], 2),
+                                  (['/usr/bin/systemctl', 'daemon-reload'], .04)):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    guest.executor_control(args, time.monotonic() + seconds)
+            self.assertEqual(allocations, [30, 5, 5, 5, 30])
+        time.sleep(.15)
+        self.assertFalse(marker.exists(), 'Timed-out real child performed a late effect')
+        self.assertEqual(list(self.root.iterdir()), [], 'Diagnostic anonymous file leaked')
+
     def test_fixed_control_real_child_cannot_grow_diagnostic_beyond_native_file_ceiling(self):
         original = subprocess.run
         def oversized(args, **kwargs):

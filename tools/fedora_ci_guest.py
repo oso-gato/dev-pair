@@ -125,6 +125,9 @@ def executor_file(path, data, mode):
 
 
 def executor_control(argv, end):
+    # Measured TCG daemon-reload exceeded5s. Only this exact fixed operation
+    # gets30s; every allocation remains clipped to the original admission end.
+    maximum_seconds = 30 if argv == ['/usr/bin/systemctl', 'daemon-reload'] else 5
     # Only these pre-credential fixed public operations may retain stderr. It
     # goes to an owned size-limited regular file, never a forwarded stream pipe.
     public = argv in (
@@ -151,7 +154,7 @@ def executor_control(argv, end):
                     'capture_limit_reached': len(data) == 4096, 'tail': safe_text(data, 768), 'tail_truncated': len(data) > 768}
         try:
             result = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
-                                    env=SAFE_ENV, close_fds=True, start_new_session=True, preexec_fn=limit, timeout=remaining(end, 5))
+                                    env=SAFE_ENV, close_fds=True, start_new_session=True, preexec_fn=limit, timeout=remaining(end, maximum_seconds))
         except subprocess.TimeoutExpired as error:
             error.public_diagnostic = diagnostic()
             raise

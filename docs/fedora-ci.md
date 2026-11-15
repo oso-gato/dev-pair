@@ -91,7 +91,13 @@ contains adopted standards identities, never private standards text.
    stream is forwarded. Failure evidence exports a768-character tail, captured
    byte count/hash and explicit capture-ceiling/tail-truncation flags; it does not
    claim bytes beyond the ceiling were observed. Other commands remain withheld.
-   No journal is queried. Manager property values retain
+   Exact `systemctl daemon-reload` has a30s maximum, clipped to the same original
+   shared60s admission deadline. Run11 observed this fixed operation time out after
+   5235ms with empty stderr on TCG; that identifies a deadline failure, not a policy
+   or D-Bus cause. Restore/start control caps remain5s and startup observation5s;
+   no caller-selected timeout or additional VM/service time is introduced. Reload
+   remains explicit so changed unit installation is not dependent on manager cache
+   state. No journal is queried. Manager property values retain
    explicit64-character tails within the unchanged4096-byte console witness cap.
    The controller scans its already bounded console before tail truncation, verifies
    the witness schema and exact source/controller/script/unit targets, and retains
