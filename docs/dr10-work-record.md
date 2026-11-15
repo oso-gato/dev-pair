@@ -2014,3 +2014,43 @@ manager runtime labeling path; no unchanged retry, policy bypass or SELinux-mode
 change is authorized by this failure. The sole Sol builder is preparing a small
 independent read-only storage measurement/admission component while diagnosis
 proceeds. Hard filesystem enforcement and cleanup remain separate future gates.
+
+### November 16, 2026, 04:49 HKT — storage source reviewed and checkpointed
+
+Sol High storage candidate `2944ac650e9708459b7da0c6c3e4e3d1b4860a22`
+adds bounded read-only inventory and pure peak-capacity arithmetic. Fresh Astra
+review found one P2: unreserved existing growth was not constrained to its full
+declared existing maximum. Review evidence:
+`/workspace/artifacts/storage-admission-review-2944ac6/review.json`, SHA256
+`277e05222c64c8e5da009b979279f14a774db749a1ad1f18d21cac09e704a8aa`.
+Repair `63ed9032fa8e22c882282f127bb654b338624948` rejects contradictory
+inputs and clarifies full-maximum semantics without double-charging materialized
+capacity. These commits are integrated as `af46ad2` and `e012be1`; all source and
+test bytes match the reviewed repair (other differences are documentation).
+
+Fresh Astra High `/root/storage_capacity_fix_review` returned PASS, with
+265 tests in 41.486 seconds, 38 independent named checks and 2000 valid-input
+differential cases. The valid existing-20-GiB / remainder-1-GiB case retains
+20 GiB managed maximum and charges only 1 GiB additional guest growth. Unknown
+capacity differs from measured zero availability and remains blocked. Evidence:
+`/workspace/artifacts/storage-capacity-fix-review-63ed9032fa8e22c882282f127bb654b338624948/review.json`,
+SHA256 `3de717bd7b6461baa72306215766c1c6c8ab996a3faa8ae7f0d1043610f2c1c3`.
+The actual local read-only sample is
+`/workspace/artifacts/storage-observation-local.json`, SHA256
+`64c7358ef5ca41156fca106680e81ae257407fd339f4830f1e9b98b319628c10`.
+
+This is source capability only: no allocation, quota, mount, cleanup action,
+reservation or job admission. Preserve the reviewed combined checkpoint on
+`codex/dr10-reviewed-checkpoint`; PR13 remains on tested `8bdd19d` until the
+next reviewed native correction, avoiding another unchanged Fedora failure.
+
+The source-backed native correction design is
+`/workspace/scratch/native-fifo-label-design.md`: manager-only stream objects
+use the stock verified manager runtime type; an immutable in-unit relay gives
+transitioned commands ordinary anonymous pipes. Journal records stay outside
+the manager namespace. A path move alone is insufficient for passwd/chronyc
+domains. The relay must prove completion through bounded child-stderr framing,
+because a numerical exit alone could mistake failed startup for an accepted
+nonzero payload result. No policy grants or forced process labels are proposed.
+The sole Sol builder works from `8bdd19d` in a separate native-relay worktree;
+fresh Astra High review is prepared. No new Fedora run is admitted yet.

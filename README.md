@@ -52,6 +52,8 @@
 <a id="dr2-7"></a>
 **DR2.7** The [offline Codex state acceptance component](docs/codex-offline-state.md) exercises the pinned stock binary with generated managed policy, seeded immutable bundled skills, complete writable state directories and restricted child processes. Actual no-network checks verify configuration rejection, SQLite/index behavior and child credential/state-read denial, including direct binary reinvocation. Independent review verified cleanup failures return blocked. These local checks do not admit authentication, Fedora/gptbox execution, distinct-owner credential protection, all agent tool paths or session renewal; those remain runtime gates.
 
+**DR2.8** The [storage observation component](docs/storage-observation.md) measures bounded filesystem usage and checks explicit peak-capacity arithmetic. Independent review verified sparse-growth accounting and reserve boundaries. Unknown measurements block; matching samples do not prove quiescence, reserve capacity or enforce quotas. Hard storage limits and safe cleanup remain required before jobs can run.
+
 <a id="dr3"></a>
 ## DR3 — Platform and agents
 
