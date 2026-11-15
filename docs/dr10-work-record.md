@@ -671,3 +671,20 @@ built or started here, and no host was contacted or changed. The next action is
 fresh exact-candidate review, bounded Sol repairs if needed, then the authorized
 Fedora assembly/failure/repair/retest gate when a supported executor route exists.
 Do not promote this source checkpoint or substitute fixtures for that gate.
+
+The exact 588ecab review returned **changes required**, despite 107 passing
+tests. Production input validation unpacked the inherited helper's three-value
+return into two variables; the reviewer reproduced rejection using the actual
+verified Codex binary/context. Separate Podman conmon/container scopes outlive
+the transient client unit, so they need native lifetime limits. A second-attempt
+cleanup failure also became unrecoverable because budget rejection preceded
+resource reconciliation. Podman's separate `HostConfig.Tmpfs` escaped the mount
+guard, and accumulated logs could satisfy readiness using an earlier start's
+marker. The adapter has not been published while these findings are open.
+
+The existing Sol High builder owns one bounded repair batch: direct production
+input regression, finite native container lifetime, cleanup-only recovery after
+execution-budget exhaustion, exact tmpfs validation and current-start readiness.
+No third build attempt, privilege increase or host operation is authorized by
+these corrections. A new Astra High session will review the exact repaired
+candidate; the earlier review cannot be reused as approval.
