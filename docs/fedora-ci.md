@@ -3,12 +3,13 @@
 [The pull-request workflow](../.github/workflows/fedora-vm.yml) and
 [controller](../tools/fedora_ci.py) implement an initial real-VM execution route
 for an exact public candidate. The [first actual CI run](https://github.com/oso-gato/dev-pair/actions/runs/43729422976)
-passed all 136 tests but blocked during runner preflight: Podman rejected a
-runroot pathname longer than 50 characters, and cleanup repeated that error.
-No image download, build or Fedora guest boot occurred. The path/cleanup
-repair passes 140 integrated local tests and fresh affected review; its actual
-runner retest is next. Local signature, parsing, process/file-bound and source
-staging tests are not Fedora evidence; stock Cloud boot remains unverified.
+passed all 136 tests but Podman rejected its long runroot pathname. The reviewed
+short-path/cleanup repair then ran in [run 2](https://github.com/oso-gato/dev-pair/actions/runs/43729968336):
+all 140 tests, actual runner preflight and cleanup passed. Measured resources were
+91541061632 free disk bytes and 16760348672 RAM bytes with Podman4.9.3. A subsequent
+tmp-directory initialization-order defect blocked before any image download or
+Fedora boot; its narrow repair is underway. Local tests remain distinct from
+Fedora runtime evidence.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and
