@@ -251,6 +251,51 @@ class InitializeTests(unittest.TestCase):
                     except ProcessLookupError:
                         pass
 
+    def test_failed_probe_launcher_with_closed_pipes_cleans_and_retains_exit_status(self):
+        original = b.subprocess.Popen
+        prefix = ('/usr/bin/systemd-run', '--unit=dev-pair-failed-probe',
+                  '--description=dev-pair-owned-dev-pair-failed-probe', '--property=RuntimeMaxSec=180')
+        for unresolved in (False, True):
+            marker = Path(self.tmp.name) / ('closed-pipe-probe-' + str(unresolved))
+            processes, records = [], []
+            def spawned(args, **kwargs):
+                process = original(args[args.index(sys.executable):], **kwargs)
+                processes.append(process)
+                return process
+            script = ('import os,time,pathlib,sys; os.write(2,b"public failure fixture\\n"); '
+                      'pid=os.fork(); os._exit(9) if pid else None; '
+                      'os.close(1); os.close(2); time.sleep(.25); '
+                      'pathlib.Path(sys.argv[1]).write_text("escaped")')
+            run = g.ProbeCommands()
+            run.diagnostic = lambda buffers, status: records.append({'status': status, 'stderr': bytes(buffers['stderr'])})
+            try:
+                with patch.object(b.subprocess, 'Popen', side_effect=spawned), \
+                        patch.object(run, 'reconcile_native', side_effect=b.Blocked('foreign unit preserved') if unresolved else None) as reconcile:
+                    with self.assertRaisesRegex(b.Blocked, 'cleanup-unresolved' if unresolved else 'interrupted-or-failed'):
+                        run(*prefix, sys.executable, '-c', script, str(marker), timeout=2)
+                    self.assertEqual(processes[0].poll(), 9)
+                    reconcile.assert_called_once()
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]['status'], 9)
+                    self.assertIn(b'public failure fixture', records[0]['stderr'])
+                time.sleep(.3)
+                self.assertFalse(marker.exists())
+            finally:
+                for process in processes:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        for status in (0, 9):
+            records = []
+            run = g.ProbeCommands()
+            run.diagnostic = lambda buffers, observed: records.append(observed)
+            with patch.object(run, 'reconcile_native') as reconcile:
+                output = run(sys.executable, '-c', 'import sys;print("allowed fixture");sys.exit(' + str(status) + ')', ok=(0, 9))
+                self.assertEqual(output, 'allowed fixture\n')
+                self.assertEqual(records, [status])
+                reconcile.assert_not_called()
+
     def test_native_root_unit_is_recorded_before_spawn_and_runs_clean_environment(self):
         run = b.Commands()
         run.native_prefix = 'dev-pair-initialize-prepare-12345678'

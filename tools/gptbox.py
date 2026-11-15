@@ -86,6 +86,9 @@ class ProbeCommands(Commands):
             if time.monotonic() >= deadline:
                 raise TimeoutError()
             self.limit_timeout(timeout)
+            if process.returncode not in ok:
+                raise Blocked('probe command exited with disallowed status')
+            output = bytes(buffers['stdout']).decode('utf-8')
         except BaseException:
             cleanup = 'interrupted-or-failed'
             try:
@@ -93,7 +96,9 @@ class ProbeCommands(Commands):
                     self.interrupt(process, args, environment)
             except (Blocked, OSError, subprocess.SubprocessError):
                 cleanup = 'cleanup-unresolved'
-            self.diagnostic(buffers, cleanup)
+            actual_status = process.returncode if process is not None else None
+            status = actual_status if actual_status is not None and actual_status not in ok else cleanup
+            self.diagnostic(buffers, status)
             raise Blocked('probe command failed or timed out; bounded protected diagnostics retained; ' + cleanup) from None
         finally:
             selector.close()
@@ -101,9 +106,7 @@ class ProbeCommands(Commands):
                 process.stdout.close()
                 process.stderr.close()
         self.diagnostic(buffers, process.returncode)
-        if process.returncode not in ok:
-            raise Blocked('probe command failed; bounded protected diagnostics retained')
-        return bytes(buffers['stdout']).decode('utf-8')
+        return output
 
 
 class Gptbox(Bootstrap):
