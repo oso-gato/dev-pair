@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Read-only Fedora VM baseline probe, launched by NoCloud without credentials."""
 import argparse
+import array
+import fcntl
 import hashlib
 import json
 import os
@@ -8,11 +10,75 @@ import pathlib
 import platform
 import selectors
 import shutil
+import signal
+import stat
 import subprocess
 import tarfile
 import time
+import termios
+import tty
 
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
+REPORT_LIMIT = 65536
+REPORT_BEGIN = b'DP_FEDORA_REPORT_V1\n'
+REPORT_END = b'\nDP_FEDORA_REPORT_END\n'
+REPORT_FRAME_LIMIT = REPORT_LIMIT + len(REPORT_BEGIN) + len(REPORT_END)
+REPORT_WRITE_SECONDS = 30
+
+
+def encode_report(report):
+    data = json.dumps(report, sort_keys=True, ensure_ascii=True).encode()
+    require(0 < len(data) <= REPORT_LIMIT, 'Guest report JSON exceeds byte limit')
+    return REPORT_BEGIN + data + REPORT_END
+
+
+def write_report(report, path='/dev/ttyS1', timeout=REPORT_WRITE_SECONDS):
+    """Write one raw, drained frame directly; never use cloud-init stdout."""
+    def expired(signum, frame):
+        raise ValueError('Dedicated guest report deadline exceeded')
+    old_handler = signal.signal(signal.SIGALRM, expired)
+    old_timer = signal.setitimer(signal.ITIMER_REAL, timeout)
+    started = time.monotonic()
+    fd = None
+    selector = selectors.DefaultSelector()
+    try:
+        data = encode_report(report)
+        fd = os.open(path, os.O_WRONLY | os.O_NOCTTY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        require(stat.S_ISCHR(os.fstat(fd).st_mode), 'Dedicated report output must be a terminal device')
+        tty.setraw(fd, termios.TCSANOW)
+        attributes = termios.tcgetattr(fd)
+        attributes[2] |= termios.CLOCAL | termios.CREAD
+        attributes[2] &= ~getattr(termios, 'CRTSCTS', 0)
+        attributes[4] = attributes[5] = termios.B115200
+        termios.tcsetattr(fd, termios.TCSANOW, attributes)
+        selector.register(fd, selectors.EVENT_WRITE)
+        offset = 0
+        while offset < len(data):
+            require(time.monotonic() - started < timeout, 'Dedicated guest report deadline exceeded')
+            if not selector.select(timeout=min(.1, max(0, timeout - (time.monotonic() - started)))):
+                continue
+            try:
+                offset += os.write(fd, data[offset:])
+            except (BlockingIOError, InterruptedError):
+                continue
+        # Bound native tcdrain as well: an ignored CTS or stuck driver must not
+        # indefinitely delay shutdown. Explicit raw115200 preserves CR/LF bytes.
+        queued = array.array('i', [0])
+        while True:
+            fcntl.ioctl(fd, termios.TIOCOUTQ, queued, True)
+            if queued[0] == 0:
+                break
+            require(time.monotonic() - started < timeout, 'Dedicated guest report drain deadline exceeded')
+            time.sleep(.01)
+        termios.tcdrain(fd)
+    finally:
+        selector.close()
+        if fd is not None:
+            os.close(fd)
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if old_timer[0]:
+            signal.setitimer(signal.ITIMER_REAL, max(.000001, old_timer[0] - (time.monotonic() - started)), old_timer[1])
 
 
 def require(condition, message):
@@ -166,10 +232,12 @@ def main():
         phases['fedora-preflight'] = {'status': 'blocked', 'detail': safe_text(exc)}
     finally:
         report['diagnostics'] = diagnostics()
-        # One explicit serial message, not an interactive console login or
-        # password-bearing cloud-init log. The VM has no NIC or listener forwarding.
-        print('DP_FEDORA_RESULT ' + json.dumps(report, sort_keys=True), flush=True)
-        subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=10)
+        # ttyS0 remains diagnostic console only. Failed dedicated delivery has
+        # no console fallback and cannot become a passing controller report.
+        try:
+            write_report(report)
+        finally:
+            subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=10)
 
 
 if __name__ == '__main__':

@@ -95,9 +95,9 @@ class FedoraCITests(unittest.TestCase):
 
     def test_serial_consumer_requires_one_complete_candidate_bound_result(self):
         report = self.serial_result()
-        serial = b'boot output\r\nDP_FEDORA_RESULT ' + json.dumps(report).encode() + b'\r\n'
+        serial = guest.encode_report(report)
         self.assertEqual(ci.parse_serial(serial, 'a' * 40, 'b' * 64), report)
-        for malformed in (serial + serial, b'no result', serial.replace(b'"version": 1', b'"version": true'),
+        for malformed in (serial + serial, b'no result', b'console\n' + serial, serial.replace(b'"version": 1', b'"version": true'),
                           serial.replace(b'"source_sha":', b'"version":1,"source_sha":')):
             with self.assertRaises((ci.Blocked, ValueError)):
                 ci.parse_serial(malformed, 'a' * 40, 'b' * 64)
@@ -105,7 +105,7 @@ class FedoraCITests(unittest.TestCase):
             ci.parse_serial(serial, 'c' * 40, 'b' * 64)
         del report['phases']['maintenance-gptbox']
         with self.assertRaisesRegex(ci.Blocked, 'missing guest phases'):
-            ci.parse_serial(b'DP_FEDORA_RESULT ' + json.dumps(report).encode() + b'\n', 'a' * 40, 'b' * 64)
+            ci.parse_serial(guest.encode_report(report), 'a' * 40, 'b' * 64)
 
     def payload_archive(self, malicious=False):
         payload = self.root / ('payload-bad' if malicious else 'payload')

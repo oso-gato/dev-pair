@@ -8,8 +8,10 @@ tooling image construction and source transfer. The Fedora VM actually booted
 and powered off under TCG in approximately 95 seconds. The controller rejected
 the guest report framing; the retained tail contains only partial preflight/status
 results, which cannot satisfy the complete candidate-bound report contract.
-Cleanup passed. Stable tooling/source overhead was 1029046272 bytes. Structured
-report transport is under read-only diagnosis before another runtime attempt.
+Cleanup passed. Stable tooling/source overhead was 1029046272 bytes. A dedicated
+second-serial report transport is now implemented and locally tested; it still
+requires independent review and a fresh Fedora run. Historical console fragments
+are not upgraded into complete phase results.
 
 This checkpoint intentionally stops after boot, enforcing-Fedora/systemd/source
 preflight and actual read-only `bootstrap inspect`/`status`. Preparation and
@@ -82,7 +84,9 @@ would require private standards retrieval or credentials.
    guest has no network access and no credentials. It boots the actual signed
    Fedora kernel, systemd and SELinux policy; stock non-Enforcing state blocks
    rather than silently invoking the separate SELinux transition matrix.
-7. Collect a single versioned, candidate/script-bound serial result. Guest checks
+7. Collect a single versioned, candidate/script-bound result on dedicated ttyS1.
+   ttyS0 remains diagnostic console only; no console substring can satisfy report
+   admission. Guest checks
    Fedora44/x86_64, systemd PID1, Enforcing SELinux, active policy, cgroup v2 and
    >=8GiB guest free space. Run genuine read-only bootstrap inspect/status, with
    actual command errors, startup journal/AVCs and baseline RPM identities.
@@ -141,6 +145,40 @@ workflow-command controls are escaped, tails are bounded, and truncation is
 explicit. No qcow2, complete filesystem, environment or credential directory is
 uploaded. `DP_PHASE`, `DP_SERIAL_TAIL`, `DP_REPORT` and the job summary distinguish
 the exact attempted phases; fixture/local-test results never become Fedora passes.
+
+## Dedicated report channel
+
+Before starting QEMU, the controller creates an owned protected `result.in` and
+`result.out` FIFO pair (`0600`) under the already scoped disks mount. It checks
+type, ownership, mode and opened inode identity, and requires the fallback base
+`result` to remain absent. QEMU receives a second `-serial pipe:/disks/result`;
+no listener, broader mount, privilege or network change is added. A nonblocking
+reader and controller-held writer prevent misleading startup EOF.
+
+The guest writes directly to `/dev/ttyS1`, configured raw at115200 baud with
+hardware flow control disabled. One frame contains `DP_FEDORA_REPORT_V1` plus LF,
+at most65536 JSON bytes, and the fixed LF/`DP_FEDORA_REPORT_END`/LF footer. The
+producer and consumer use the same constants from the hash-bound guest source.
+Short writes and EAGAIN are handled; queue draining and native `tcdrain` share a
+finite30-second write deadline before poweroff is requested. Failure never falls
+back to cloud-init stdout, and partial output cannot pass framing validation.
+
+The controller concurrently drains console and result streams under the unchanged
+aggregate8MiB limit. The report has its own JSON-plus-fixed-framing cap; reads
+take at most the remaining allowance plus one overflow-detection byte. A result
+requires executor exit0 and exactly one complete frame with the existing schema,
+duplicate-key, source/script and phase checks. Extra bytes, duplicate frames,
+partial records and legacy console markers are rejected. EOF alone never decides
+completion. After executor exit, a one-second bounded drain handles buffered data
+and held-open writers; local descendant groups and controller descriptors are
+closed, while native container timeout/removal still bounds root conmon scopes.
+
+`DP_REPORT` retains a safe structured witness on success/failure: retained byte
+count/hash, cap/overflow flags, marker counts, exact head/tail hex and base64 for
+the entire bounded report capture. CR/LF and malformed bytes therefore survive
+console-tail truncation without emitting workflow commands. No unbounded console
+dump is retained, and no truncated frame is accepted. FIFO/PTY/process tests prove
+local transport behavior, not actual Fedora UART or hosted-runtime acceptance.
 
 Podman4.9 requires its runroot path to fit within 50 characters. All probe state,
 graph/runroot/tmp paths and disks therefore share one uniquely owned short

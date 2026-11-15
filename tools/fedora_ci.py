@@ -5,6 +5,7 @@ This controller never installs packages into the runner or launches agents.
 Full bootstrap/maintenance assembly is explicitly blocked in this first slice.
 """
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
@@ -21,6 +22,8 @@ import sys
 import tempfile
 import time
 import urllib.request
+
+from fedora_ci_guest import REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
@@ -390,16 +393,17 @@ def seed_data(source, archive_sha, bundle_sha, guest_sha):
 def parse_serial(data, expected_source, expected_guest):
     # Treat serial assertions as candidate-controlled test evidence. Require
     # one complete result, exact identities and every requested phase.
-    matches = re.findall(rb'^DP_FEDORA_RESULT ([^\r\n]+)\r?$', data, re.M)
-    require(len(matches) == 1, 'missing or ambiguous completed Fedora serial result')
-    require(len(matches[0]) <= 65536, 'guest result exceeds byte limit')
+    require(len(data) <= REPORT_FRAME_LIMIT and data.startswith(REPORT_BEGIN) and data.endswith(REPORT_END) and
+            data.count(REPORT_BEGIN) == data.count(REPORT_END) == 1, 'missing, partial or ambiguous dedicated Fedora report frame')
+    body = data[len(REPORT_BEGIN):-len(REPORT_END)]
+    require(0 < len(body) <= REPORT_LIMIT, 'guest result exceeds byte limit')
     def unique(items):
         value = {}
         for key, item in items:
             require(key not in value, 'duplicate guest result field')
             value[key] = item
         return value
-    result = json.loads(matches[0], object_pairs_hook=unique)
+    result = json.loads(body, object_pairs_hook=unique)
     require(type(result) is dict and set(result) == {'version', 'source_sha', 'guest_sha256', 'phases', 'identity', 'diagnostics'}, 'invalid guest result shape')
     require(type(result['version']) is int and result['version'] == 1 and
             result['source_sha'] == expected_source and result['guest_sha256'] == expected_guest,
@@ -411,6 +415,76 @@ def parse_serial(data, expected_source, expected_guest):
                 phase['status'] in ('pass', 'fail', 'blocked') and type(phase['detail']) is str and
                 len(phase['detail']) <= 4000, 'invalid guest phase')
     return result
+
+
+def report_witness(data, overflow=False):
+    complete = (not overflow and 0 < len(data) - len(REPORT_BEGIN) - len(REPORT_END) <= REPORT_LIMIT and
+                data.startswith(REPORT_BEGIN) and data.endswith(REPORT_END) and
+                data.count(REPORT_BEGIN) == data.count(REPORT_END) == 1)
+    return {'retained_bytes': len(data), 'sha256': sha256(data), 'overflow': overflow,
+            'framing_complete': complete,
+            'frame_limit_bytes': REPORT_FRAME_LIMIT, 'begin_markers': data.count(REPORT_BEGIN),
+            'end_markers': data.count(REPORT_END), 'starts_with_begin': data.startswith(REPORT_BEGIN),
+            'ends_with_end': data.endswith(REPORT_END), 'head_hex': data[:128].hex(), 'tail_hex': data[-128:].hex(),
+            'retained_base64': base64.b64encode(data).decode('ascii')}
+
+
+class ReportPipe:
+    """One controller-owned pipe pair; QEMU must never fall back to base."""
+    def __init__(self, directory):
+        self.directory = directory
+        self.base = directory / 'result'
+        self.reader = self.keeper = None
+        self.paths = {}
+        self.data = bytearray()
+        self.overflow = False
+
+    def __enter__(self):
+        info = self.directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not self.directory.is_symlink() and info.st_uid == os.getuid() and
+                not info.st_mode & 0o022, 'report pipe directory must be owned and protected')
+        require(not os.path.lexists(self.base), 'QEMU report fallback base must be absent')
+        try:
+            for suffix in ('.in', '.out'):
+                path = pathlib.Path(str(self.base) + suffix)
+                os.mkfifo(path, 0o600)
+                info = path.lstat()
+                self.paths[path] = (info.st_dev, info.st_ino)
+                require(stat.S_ISFIFO(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+                        'report pipe must be owned nonsymlink FIFO0600')
+            output = pathlib.Path(str(self.base) + '.out')
+            self.reader = os.open(output, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            self.keeper = os.open(output, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            for fd in (self.reader, self.keeper):
+                info = os.fstat(fd)
+                require(stat.S_ISFIFO(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and
+                        (info.st_dev, info.st_ino) == self.paths[output], 'report pipe changed while opening')
+            require(not os.path.lexists(self.base), 'QEMU report fallback base appeared')
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def release_keeper(self):
+        if self.keeper is not None:
+            os.close(self.keeper)
+            self.keeper = None
+
+    def close(self):
+        self.release_keeper()
+        if self.reader is not None:
+            os.close(self.reader)
+            self.reader = None
+        for path, identity in self.paths.items():
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISFIFO(info.st_mode) and (info.st_dev, info.st_ino) == identity:
+                path.unlink()
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class Probe:
@@ -432,6 +506,8 @@ class Probe:
                        'limits': {'overlay_bytes': OVERLAY_LIMIT, 'host_reserve_bytes': HOST_RESERVE,
                                   'overhead_bytes': OVERHEAD_LIMIT, 'log_bytes': LOG_LIMIT,
                                   'storage_diagnostic_bytes': DU_CAPTURE_LIMIT,
+                                  'report_json_bytes': REPORT_LIMIT, 'report_frame_bytes': REPORT_FRAME_LIMIT,
+                                  'report_write_seconds': REPORT_WRITE_SECONDS,
                                   'container_seconds': CONTAINER_SECONDS, 'guest_virtual_bytes': 12 * GIB,
                                   'cpus': 3, 'memory_bytes': 8 * GIB, 'guest_cpus': 2, 'guest_memory_bytes': 6 * GIB},
                        'hostinger_acceptance': False, 'job_admission': False}
@@ -465,7 +541,7 @@ class Probe:
             self.report['storage_measurement_failure'] = exc.diagnostics
             raise
 
-    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None):
+    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None):
         """Bound logs/time and watch storage while a native child runs."""
         log = bytearray()
         started = time.monotonic()
@@ -477,11 +553,20 @@ class Probe:
                                    stdin=subprocess.DEVNULL, env=SAFE_ENV, start_new_session=True,
                                    preexec_fn=child_limits)
         selector = selectors.DefaultSelector()
-        selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(process.stdout, selectors.EVENT_READ, 'console')
+        if report_pipe is not None:
+            selector.register(report_pipe.reader, selectors.EVENT_READ, 'report')
+        exited = None
+        next_storage = 0
         try:
-            while selector.get_map():
-                require(time.monotonic() - started < timeout, name + ' deadline exceeded')
-                if disk_check:
+            while selector.get_map() or process.poll() is None:
+                now = time.monotonic()
+                require(now - started < timeout, name + ' deadline exceeded')
+                if process.poll() is not None and exited is None:
+                    exited = now
+                    if report_pipe is not None:
+                        report_pipe.release_keeper()
+                if disk_check and exited is None and now >= next_storage:
                     check_capacity(self.root)
                     # Rootful Podman owns private storage directories. Measure
                     # via a fixed read-only privileged tool, never silently skip
@@ -489,26 +574,44 @@ class Probe:
                     measurement = self.storage_measurement(live=True)
                     if measurement['provisional']:
                         self.report['provisional_storage_samples'] = self.report.get('provisional_storage_samples', 0) + 1
-                for key, _ in selector.select(timeout=1):
-                    data = os.read(key.fileobj.fileno(), 65536)
+                    next_storage = time.monotonic() + 1
+                events = selector.select(timeout=.1 if report_pipe is not None else 1)
+                for key, _ in events:
+                    maximum = min(65536, max(1, LOG_LIMIT - self.log_used + 1))
+                    if key.data == 'report':
+                        maximum = min(maximum, REPORT_FRAME_LIMIT - len(report_pipe.data) + 1)
+                    descriptor = key.fileobj if isinstance(key.fileobj, int) else key.fileobj.fileno()
+                    try:
+                        data = os.read(descriptor, maximum)
+                    except BlockingIOError:
+                        continue
                     if not data:
                         selector.unregister(key.fileobj)
                         continue
                     self.log_used += len(data)
+                    if key.data == 'report':
+                        report_pipe.data.extend(data)
+                        report_pipe.overflow = len(report_pipe.data) > REPORT_FRAME_LIMIT
+                        require(not report_pipe.overflow, 'dedicated report frame byte limit exceeded (truncated)')
                     require(self.log_used <= LOG_LIMIT, 'aggregate diagnostic byte limit exceeded (truncated)')
-                    log.extend(data)
+                    if key.data == 'console':
+                        log.extend(data)
+                # Executor completion, not FIFO EOF, bounds final draining. A
+                # held writer cannot keep this controller alive indefinitely.
+                if report_pipe is not None and exited is not None and time.monotonic() - exited >= 1:
+                    break
             process.wait(timeout=5)
             require(process.returncode == 0, name + ' failed with exit ' + str(process.returncode))
             if disk_check:
                 check_capacity(self.root)
                 self.report['last_stable_overhead_bytes'] = self.storage_measurement()['bytes']
-            return bytes(log)
+            return (bytes(log), bytes(report_pipe.data)) if report_pipe is not None else bytes(log)
         except BaseException:
             # Podman/conmon scopes may outlive the CLI; cleanup also force-removes
             # only our named container. Native --timeout limits the VM itself.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
+            except (ProcessLookupError, PermissionError):
                 pass
             process.wait(timeout=5)
             emit_text('', bytes(log), 12000)
@@ -516,6 +619,17 @@ class Probe:
         finally:
             selector.close()
             process.stdout.close()
+            if report_pipe is not None:
+                report_pipe.release_keeper()
+                self.report['dedicated_report_witness'] = report_witness(bytes(report_pipe.data), report_pipe.overflow)
+                self.report['dedicated_report_witness']['aggregate_limit_exceeded'] = self.log_used > LOG_LIMIT
+                self.report['dedicated_report_witness']['executor_exit_status'] = process.poll()
+                # Native container timeout/removal covers root conmon scopes;
+                # local unprivileged descendant writers are killed here too.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
 
     def helper(self, args, timeout=60, **kwargs):
         self.engine_activity = True  # version-only preflight never starts resources
@@ -648,13 +762,14 @@ class Probe:
             args += ['--device=/dev/kvm', '--group-add=' + str(pathlib.Path('/dev/kvm').stat().st_gid)]
         args += [self.image, '/usr/local/bin/dp-qemu-entry.py', '-machine', 'q35,accel=' + accel,
                  '-cpu', 'host' if accel == 'kvm' else 'max', '-smp', '2', '-m', '6144',
-                 '-display', 'none', '-serial', 'stdio', '-monitor', 'none', '-no-reboot',
+                 '-display', 'none', '-serial', 'stdio', '-serial', 'pipe:/disks/result', '-monitor', 'none', '-no-reboot',
                  '-nic', 'none', '-drive', 'file=/disks/guest.qcow2,if=virtio,format=qcow2,cache=none',
                  '-drive', 'file=/disks/seed.iso,media=cdrom,readonly=on,format=raw',
                  '-drive', 'file=/disks/payload.iso,media=cdrom,readonly=on,format=raw']
-        serial = self.helper(args, timeout=300 if accel == 'kvm' else 900)
-        emit_text('DP_SERIAL_TAIL\n', serial, 24000)
-        guest = parse_serial(serial, self.source, self.guest_sha)
+        with ReportPipe(self.root / 'disks') as report_pipe:
+            console, report_data = self.helper(args, timeout=300 if accel == 'kvm' else 900, report_pipe=report_pipe)
+        emit_text('DP_SERIAL_TAIL\n', console, 24000)
+        guest = parse_serial(report_data, self.source, self.guest_sha)
         self.report['guest'] = guest
         self.phase('fedora-boot', 'pass', 'Real signed Fedora Cloud image booted and emitted a complete candidate-bound serial result using ' + accel)
         for name, phase in guest['phases'].items():
