@@ -910,3 +910,16 @@ accounting, and cleanup refusing changed identity, uncertain engine removal,
 remaining external containers or mounts. Preflight-only failure now removes its
 owned scratch without depending on working engine configuration. No guest/runtime
 pass follows from those local tests; publish a second exact-candidate run.
+
+Second actual run `43729968336`, job `132860040954`, source
+`d6caa4fd767436c19c915ce49e39e7487a6efd5f`, passed all 140 tests and
+actual runner capability checks: Podman4.9.3, 91541061632 free bytes,
+16760348672 RAM bytes, Ubuntu24.04.5/image20261111.370.1. The short-path
+repair worked and owned-scratch cleanup passed. A subsequent initialization
+ordering defect blocked: the version command created the configured tmp directory
+before the controller's exclusive mkdir. No image/guest execution occurred.
+Logs: https://github.com/oso-gato/dev-pair/actions/runs/43729968336 and
+`/workspace/artifacts/fedora-ci-run-43729968336.log`. The coordinator authorized
+a five-minute narrow initialization-order repair with a realistic regression,
+fresh review and third exact-candidate run. Measured capacity supports later
+engineering reassessment of CI sizing; no limits have been silently enlarged.
