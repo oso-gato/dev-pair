@@ -170,6 +170,7 @@ class PreparationTests(unittest.TestCase):
         for role, placement in [('maintenance', 'host -> maintenance gptbox'),
                                 ('development', 'host -> DevBox -> development gptbox')]:
             self.m['role'] = role
+            self.m['mounts'] = {name: (f'/var/lib/dev-pair/credentials/{role}/fixture' if name == 'credentials' else f'/var/lib/dev-pair/{role}/' + {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}[name] + '/fixture') for name in ('workspace', 'state', 'cache', 'credentials')}
             p = candidate.plan(self.m, 'agentbox', 'gpt-6.1-sol', 'high', sid, True)
             self.assertEqual(p['placement'], placement)
             self.assertEqual(p['runtime'], 'blocked')
@@ -238,7 +239,7 @@ class NonFixturePreparationTests(unittest.TestCase):
                 'verification': evidence},
             'role': 'development', 'provider': 'gptbox',
             'model': 'gpt-6.1-sol', 'effort': 'high',
-            'mounts': {name: '/var/lib/dev-pair/jobs/synthetic-offline-test/' + name
+            'mounts': {name: (f'/var/lib/dev-pair/credentials/development/synthetic-offline-test' if name == 'credentials' else '/var/lib/dev-pair/development/' + {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}[name] + '/synthetic-offline-test')
                        for name in ('workspace', 'state', 'cache', 'credentials')},
         }
 

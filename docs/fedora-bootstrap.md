@@ -359,3 +359,9 @@ required. A previously prepared candidate from the former arbitrary-operator/
 NOPASSWD schema is not migrated automatically; protected desired/configuration
 conflicts require a separately reviewed migration. No deployed host exists in
 the local evidence for either schema.
+
+A separate [confined maintenance gptbox assembly/probe path](confined-gptbox.md)
+now implements an owned constructor with genuine upstream init/entry. It is not
+called automatically by prepare and has no real Fedora/OCI acceptance yet.
+Stock unsafe Distrobox creation remains blocked; authenticated agent, model,
+nested placement and complete first-bootstrap acceptance remain pending.

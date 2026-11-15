@@ -71,9 +71,12 @@ def validate(m, fixture=False):
         token(raw, r'/[a-zA-Z0-9_./-]+', f'{name} path')
         path = pathlib.Path(raw)
         require(str(path) == raw and '..' not in path.parts, 'noncanonical path')
-        # Only dedicated job data under this namespace; no arbitrary host paths/sockets.
-        require(raw.startswith('/var/lib/dev-pair/jobs/') and len(path.parts) >= 7,
-                'mount source must be a dedicated job leaf under /var/lib/dev-pair/jobs')
+        # Match A4.3's separate role-owned classes; credentials stay outside agent data.
+        directory = {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}
+        prefix = (f'/var/lib/dev-pair/credentials/{m["role"]}/' if name == 'credentials'
+                  else f'/var/lib/dev-pair/{m["role"]}/{directory[name]}/')
+        require(raw.startswith(prefix) and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', raw[len(prefix):]),
+                'mount source must be one dedicated job leaf in its approved role/storage class')
         # Even nonexistent paths must not resolve through existing symlink parents.
         require(path.resolve() == path, 'symlink mount source denied')
         for other in roots:

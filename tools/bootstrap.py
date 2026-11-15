@@ -27,7 +27,7 @@ SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
 PACKAGES = ('podman', 'distrobox', 'passt', 'fuse-overlayfs', 'container-selinux',
             'policycoreutils', 'shadow-utils', 'sudo', 'openssh-server', 'nftables', 'git-core', 'util-linux',
-            'mosh', 'tmux', 'chrony')
+            'mosh', 'tmux', 'chrony', 'slirp4netns')
 REPO = '''[tailscale-stable]
 name=Tailscale stable
 baseurl=https://pkgs.tailscale.com/stable/fedora/$basearch

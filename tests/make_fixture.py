@@ -19,7 +19,7 @@ manifest = {
               'sha256': hashlib.sha256(binary).hexdigest(),
               'verification': 'FIXTURE ONLY: hash of fixture bytes, not official Codex'},
     'role': 'development', 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
-    'mounts': {name: '/var/lib/dev-pair/jobs/fixture/' + name
+    'mounts': {name: (f'/var/lib/dev-pair/credentials/development/fixture' if name == 'credentials' else '/var/lib/dev-pair/development/' + {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}[name] + '/fixture')
                for name in ('workspace', 'state', 'cache', 'credentials')},
 }
 (root / 'inputs.fixture.json').write_text(json.dumps(manifest, indent=2) + '\n')

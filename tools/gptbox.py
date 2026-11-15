@@ -1,0 +1,440 @@
+#!/usr/bin/python3
+"""Actual confined maintenance Distrobox assembly and probe-only controlled entry."""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+from bootstrap import Bootstrap, Blocked, STATE
+from selinux_bootstrap import Commands
+import candidate
+
+DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
+CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
+FEDORA = 'registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e'
+BASE = '/usr/lib/dev-pair/gptbox'
+RUNTIME = BASE + '/runtime.py'
+CONTROL = '/usr/local/libexec/dev-pair-gptbox'
+ROOT = STATE + '/gptbox-adapter'
+INIT = ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt', '--init', '0']
+FINAL_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' finalize'
+FROZEN_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' frozen'
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def image_id(value):
+    value = value.strip().removeprefix('sha256:')
+    if not re.fullmatch(r'[0-9a-f]{64}', value):
+        raise Blocked('engine returned no immutable image/container identity')
+    return value
+
+
+class ProbeCommands(Commands):
+    """Bounded diagnostics only for credential-free assembly/probe operations."""
+    diagnostic = None
+
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
+        if self.diagnostic is None:
+            return super().__call__(*args, ok=ok, input_text=input_text, timeout=timeout)
+        if input_text is not None:
+            raise Blocked('probe diagnostics cannot accept stdin credentials or prompts')
+        environment = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+        process = subprocess.Popen(args, env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+        selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+        deadline, total = time.monotonic() + timeout, 0
+        try:
+            while selector.get_map():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError()
+                for key, _ in selector.select(min(0.2, max(0, deadline - time.monotonic()))):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    total += len(chunk)
+                    if total > 4194304:
+                        raise Blocked('probe output budget exceeded')
+                    buffers[key.data].extend(chunk)
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            self.diagnostic(buffers, 'interrupted-or-failed')
+            raise Blocked('probe command failed or timed out; bounded protected diagnostics retained') from None
+        finally:
+            selector.close()
+            process.stdout.close()
+            process.stderr.close()
+        self.diagnostic(buffers, process.returncode)
+        if process.returncode not in ok:
+            raise Blocked('probe command failed; bounded protected diagnostics retained')
+        return bytes(buffers['stdout']).decode('utf-8')
+
+
+class Gptbox(Bootstrap):
+    def __init__(self, root=Path('/'), run=None):
+        super().__init__(root, run or ProbeCommands())
+
+    def protected(self, path):
+        path = Path(path)
+        if not path.is_absolute():
+            raise Blocked('absolute reviewed input path required')
+        for item in [path, *path.parents]:
+            info = item.lstat()
+            if item.is_symlink() or info.st_uid != (0 if self.root == Path('/') else os.getuid()) or info.st_mode & 0o022:
+                raise Blocked('input/control path must be owned, protected and nonsymlink')
+            if item == self.root:
+                break
+        return path
+
+    def source(self, revision):
+        if not re.fullmatch(r'[0-9a-f]{40}', revision or ''):
+            raise Blocked('full reviewed adapter source revision required')
+        repo = Path(__file__).resolve().parents[1]
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py'):
+            data = self.protected(Path(__file__).with_name(name)).read_bytes()
+            recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
+            if recorded.encode() != data:
+                raise Blocked('adapter revision does not identify executing source')
+
+    def inputs(self, context, expected, upstream, revision):
+        self.protected(context)
+        for file in Path(context).iterdir():
+            self.protected(file)
+        _, manifest = self.check_gptbox_inputs(context, expected)
+        candidate.verify(context, expected)
+        if (manifest['role'] != 'maintenance' or manifest['fedora']['image'] != FEDORA
+                or manifest['codex']['version'] != '0.169.0' or manifest['codex']['sha256'] != CODEX_SHA):
+            raise Blocked('first adapter accepts only the independently verified pinned maintenance inputs')
+        self.source(revision)
+        upstream = self.protected(upstream)
+        scripts = {}
+        for name in ('distrobox-init', 'distrobox-enter'):
+            path = self.protected(upstream / name)
+            recorded = self.run('/usr/bin/git', '-C', str(upstream), 'show', DBX_SHA + ':' + name)
+            if recorded.encode() != path.read_bytes():
+                raise Blocked('upstream Distrobox script does not match exact Git object')
+            scripts[name] = path.read_bytes()
+        return manifest, scripts
+
+    def execute(self, *args, timeout=120, ok=(0,)):
+        prefix = [value.replace('RuntimeMaxSec=1800', 'RuntimeMaxSec=' + str(timeout)) for value in self.executor]
+        if isinstance(self.run, ProbeCommands):
+            def diagnostic(buffers, status):
+                path = self.target + '/diagnostics.json'
+                prior = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
+                entry = {'status': status, 'scope': 'credential-free assembly/probe',
+                         **{name + '_tail': bytes(data[-16384:]).decode('utf-8', errors='replace') for name, data in buffers.items()}}
+                prior['recent'] = (prior['recent'] + [entry])[-4:]
+                if status != 0:
+                    prior['failures'] = (prior['failures'] + [entry])[-4:]
+                self.record('diagnostics', prior)
+            self.run.diagnostic = diagnostic
+        try:
+            return self.run(*prefix, *args, timeout=timeout + 30, ok=ok)
+        finally:
+            if isinstance(self.run, ProbeCommands):
+                self.run.diagnostic = None
+
+    def engine(self, *args, timeout=120, ok=(0,)):
+        return self.execute(self.wrapper, *args, timeout=timeout, ok=ok)
+
+    def setup_executor(self, retry=False):
+        uid = self.run('/usr/bin/id', '-u', 'dp-maint').strip()
+        if not uid.isdigit() or int(uid) < 1000:
+            raise Blocked('invalid maintenance runtime UID')
+        self.uid = uid
+        self.gid = self.run('/usr/bin/id', '-g', 'dp-maint').strip()
+        if not self.gid.isdigit() or int(self.gid) < 1000:
+            raise Blocked('invalid maintenance primary GID')
+        self.directory('/usr/local/libexec', mode=0o755)
+        self.directory(CONTROL, mode=0o755)
+        self.directory(CONTROL + '/home', mode=0o755)
+        self.directory(CONTROL + '/bin', mode=0o755)
+        self.directory(CONTROL + '/empty-hooks', mode=0o755)
+        if any(self.path(CONTROL + '/empty-hooks').iterdir()) or any(self.path(CONTROL + '/home').iterdir()):
+            raise Blocked('controller home/hooks contain undeclared parent integration')
+        self.atomic(CONTROL + '/containers.conf', '[containers]\nnetns="private"\n[engine]\nevents_logger="file"\n', mode=0o444)
+        storage = '/var/lib/dev-pair/maintenance/images'
+        self.directory(storage, owner='dp-maint')
+        self.wrapper = str(self.path(CONTROL + '/bin/podman'))
+        script = (f'#!/bin/sh\nexec /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox '
+                  '--storage-driver=vfs --events-backend=file "$@"\n')
+        self.atomic(CONTROL + '/bin/podman', script, mode=0o555)
+        self.atomic(CONTROL + '/distrobox-enter', self.scripts['distrobox-enter'].decode(), mode=0o555)
+        self.run('/usr/sbin/restorecon', '-RF', str(self.path(CONTROL)))
+        self.run('/usr/bin/systemctl', 'start', f'user@{uid}.service')
+        self.unit = 'dev-pair-gptbox-' + self.target.rsplit('/', 1)[-1] + '.service'
+        status = self.run('/usr/bin/systemctl', 'show', '--property=User', '--property=ActiveState', self.unit, ok=(0, 1, 4))
+        values = dict(line.split('=', 1) for line in status.splitlines() if '=' in line)
+        if values.get('ActiveState') in ('active', 'activating', 'deactivating', 'reloading'):
+            if not retry or values.get('User') != 'dp-maint':
+                raise Blocked('context executor is still busy; explicit bounded retry required')
+            self.run('/usr/bin/systemctl', 'stop', self.unit, timeout=30)
+            after = self.run('/usr/bin/systemctl', 'show', '--property=ActiveState', self.unit, ok=(0, 1, 4))
+            if any(value in after for value in ('=active', '=activating', '=deactivating', '=reloading')):
+                raise Blocked('prior context executor has not stopped; no cleanup or duplicate operation')
+        self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--quiet', '--wait', '--pipe', '--collect', '--service-type=exec',
+                         '--uid=dp-maint', '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=10',
+                         '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
+                         '--property=CPUQuota=100%', '/usr/bin/env', '-i', 'PATH=' + str(self.path(CONTROL + '/bin')) + ':/usr/bin:/usr/sbin:/bin',
+                         'HOME=' + str(self.path(CONTROL + '/home')), 'USER=gpt', 'LOGNAME=gpt',
+                         'XDG_RUNTIME_DIR=/run/user/' + uid, 'CONTAINERS_CONF=' + str(self.path(CONTROL + '/containers.conf')),
+                         'DBX_CONTAINER_MANAGER=podman']
+
+    def record(self, name, value):
+        path = self.target + '/' + name + '.json'
+        self.atomic(path, json.dumps(value, sort_keys=True) + '\n', expected=self.text(path) or None)
+
+    def inspect_container(self, identity, sealed, runtime=True):
+        rows = json.loads(self.engine('inspect', '--type=container', identity))
+        if not isinstance(rows, list) or len(rows) != 1:
+            raise Blocked('ambiguous engine inspection')
+        item = rows[0]
+        host, config = item['HostConfig'], item['Config']
+        if image_id(item['Id']) != identity or image_id(item['Image']) != sealed:
+            raise Blocked('container identity/image mismatch')
+        if host.get('Privileged') or any('label=disable' in str(value) or 'unconfined' in str(value) for value in host.get('SecurityOpt', [])):
+            raise Blocked('privilege or confinement bypass in inspected container')
+        network_ok = host.get('NetworkMode') == 'none' if runtime else host.get('NetworkMode') in ('slirp4netns', 'slirp4netns:allow_host_loopback=false')
+        if host.get('PidMode') != 'private' or host.get('IpcMode') != 'private' or host.get('UTSMode') != 'private' or not network_ok:
+            raise Blocked('host/shared namespaces are not admitted')
+        if host.get('UsernsMode') not in (('private', 'keep-id') if runtime else ('private',)):
+            raise Blocked('host user namespace is not admitted')
+        if runtime:
+            if (not host.get('ReadonlyRootfs') or config.get('User') != '1000:1000'
+                    or host.get('CapAdd') or item.get('EffectiveCaps') != [] or item.get('BoundingCaps') != []
+                    or not any('no-new-privileges' in str(value) for value in host.get('SecurityOpt', []))):
+                raise Blocked('runtime code/privilege policy mismatch')
+            if not re.fullmatch(r'system_u:system_r:container_t:s0:c[0-9]+,c[0-9]+', item.get('ProcessLabel', '')):
+                raise Blocked('effective confined SELinux process label missing')
+            if not item.get('MountLabel', '').startswith('system_u:object_r:container_file_t:s0:'):
+                raise Blocked('effective SELinux mount label missing')
+            mappings = item.get('HostConfig', {}).get('IDMappings') or item.get('IDMappings', {})
+            # Probe also proves writable bind ownership. Mapping metadata must show keep-id.
+            for key, host_id in (('UidMap', self.uid), ('GidMap', self.gid)):
+                values = mappings.get(key, [])
+                if not any(value in ('1000:0:1', '1000:' + host_id + ':1') for value in values):
+                    raise Blocked('keep-id mapping for writable service-account data is not proven')
+            if (host.get('Memory') != 2147483648 or host.get('PidsLimit') != 256
+                    or host.get('NanoCpus') != 1000000000):
+                raise Blocked('runtime resource budget mismatch')
+            if config.get('Labels', {}).get('manager') != 'distrobox' or config.get('Labels', {}).get('distrobox.unshare_groups') != '0':
+                raise Blocked('actual Distrobox entry metadata mismatch')
+        if not runtime:
+            if (host.get('Memory') != 2147483648 or host.get('PidsLimit') != 512 or host.get('NanoCpus') != 1000000000
+                    or ':container_engine_t:s0:' not in item.get('ProcessLabel', '')):
+                raise Blocked('isolated assembly budget/confinement mismatch')
+        actual = {}
+        for mount in item.get('Mounts', []):
+            if mount.get('Type') == 'tmpfs' and mount.get('Destination') in ('/run', '/tmp'):
+                continue
+            if mount.get('Type') != 'bind':
+                raise Blocked('undeclared mount type')
+            actual[mount['Destination']] = (mount['Source'], bool(mount.get('RW')))
+        if actual != (self.mounts if runtime else {}):
+            raise Blocked('unexpected/missing host bind mount')
+        return item
+
+    def enter(self, identity, sealed, operation):
+        if operation not in ('probe', 'version'):
+            raise Blocked('job/auth/model execution is not admitted')
+        before = self.inspect_container(identity, sealed)
+        if before['State']['Status'] != 'running':
+            raise Blocked('entry requires an already running exact target; no auto-create/start fallback')
+        output = self.execute(str(self.path(CONTROL + '/distrobox-enter')),
+                          '--name', identity, '--no-tty', '--no-workdir', '--clean-path', '--',
+                          '/usr/bin/python3', RUNTIME, 'entry', operation, timeout=30)
+        self.inspect_container(identity, sealed)
+        return output
+
+    def ready(self, identity, sealed):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            observed = self.inspect_container(identity, sealed)
+            if observed['State']['Status'] != 'running':
+                raise Blocked('frozen Distrobox initializer exited before readiness')
+            if 'container_setup_done' in self.engine('logs', '--tail=20', identity, timeout=5).splitlines():
+                return
+            time.sleep(0.2)
+        raise Blocked('frozen Distrobox readiness deadline exceeded')
+
+    def recover_resources(self, expected):
+        record = json.loads(self.text(self.target + '/resources.json', '{}'))
+        if not record:
+            return
+        for name, wanted_image in record.items():
+            if not re.fullmatch(r'dp-gptbox-[ar]-' + expected[:16] + r'-[12]', name):
+                raise Blocked('resource recovery name is outside bounded target')
+            raw = self.engine('inspect', '--type=container', name, ok=(0, 125))
+            rows = json.loads(raw) if raw.strip() else []
+            if not rows:
+                continue
+            if (not isinstance(rows, list) or len(rows) != 1
+                    or rows[0]['Config'].get('Labels', {}).get('dev-pair.context') != expected
+                    or image_id(rows[0]['Image']) != wanted_image):
+                raise Blocked('foreign container collision preserved during recovery')
+            self.engine('rm', '--force', image_id(rows[0]['Id']))
+
+    def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
+        self.preflight()
+        manifest, self.scripts = self.inputs(context, expected, upstream, revision)
+        if not apply:
+            return {'preview': True, 'changes': False, 'job_admission': False,
+                    'operation': 'genuine Distrobox assembly, seal, boundary/version entry and restart probes'}
+        if not self.path(STATE + '/prepared').exists():
+            raise Blocked('normal host preparation must complete first')
+        with self.lock():
+            if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
+                raise Blocked('eight GiB free reserve is required before assembly')
+            self.target = ROOT + '/' + expected
+            self.directory(self.target, mode=0o755)
+            previous = json.loads(self.text(self.target + '/attempt.json', '{}'))
+            if previous and (previous.get('source_sha') != revision or previous.get('context_sha256') != expected):
+                raise Blocked('changed assembly target requires separately reviewed recovery')
+            self.setup_executor(retry=bool(previous and retry))
+            if self.path(self.target + '/result.json').exists():
+                result = json.loads(self.text(self.target + '/result.json'))
+                rows = json.loads(self.engine('image', 'inspect', result['assembled_image_id']))
+                if len(rows) != 1 or image_id(rows[0]['Id']) != result['assembled_image_id']:
+                    raise Blocked('recorded assembled image is unavailable')
+                return {**result, 'reused_completed_evidence': True}
+            if previous and not retry:
+                raise Blocked('incomplete attempt requires explicit --retry; evidence remains intact')
+            count = previous.get('count', 0) + 1
+            if count > 2:
+                raise Blocked('two-attempt assembly budget exhausted; recovery required')
+            if previous:
+                self.recover_resources(expected)
+            self.record('attempt', {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'count': count})
+            self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
+            self.directory('/var/lib/dev-pair/artifacts/gptbox-adapter', mode=0o755)
+            self.directory('/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected, mode=0o755)
+            build = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/build'
+            self.directory(build, mode=0o755)
+            runtime = Path(__file__).with_name('gptbox_runtime.py').read_bytes()
+            files = {'codex': Path(context, 'codex').read_bytes(), 'distrobox-init': self.scripts['distrobox-init'],
+                     'runtime.py': runtime}
+            inputs = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
+                      'files': {'/opt/dev-pair/bin/codex': sha(files['codex']), '/usr/bin/distrobox-init': sha(files['distrobox-init']), RUNTIME: sha(runtime)}}
+            recipe = (f'FROM {FEDORA}\nRUN dnf -y --setopt=gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates install python3 shadow-utils sudo util-linux procps-ng findutils bash coreutils curl openssh-clients bc bzip2 diffutils gnupg2 hostname less lsof man-db pigz pinentry iputils rsync time tree unzip wget xorg-x11-xauth zip tzdata glibc-langpack-en && dnf clean all\n'
+                      f'COPY --chmod=0555 codex /opt/dev-pair/bin/codex\nCOPY --chmod=0555 distrobox-init /usr/bin/distrobox-init\nCOPY --chmod=0555 runtime.py {RUNTIME}\nCOPY --chmod=0444 inputs.json {BASE}/inputs.json\n'
+                      f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman\n')
+            for name, data in {**files, 'inputs.json': json.dumps(inputs, sort_keys=True).encode() + b'\n', 'Containerfile': recipe.encode()}.items():
+                # Binary-safe atomic creation in a protected new build directory.
+                destination = self.path(build) / name
+                if destination.exists():
+                    if destination.is_symlink() or destination.read_bytes() != data or stat.S_IMODE(destination.stat().st_mode) != 0o444:
+                        raise Blocked('staged adapter build bytes conflict')
+                    continue
+                descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o444)
+                with os.fdopen(descriptor, 'wb') as output:
+                    os.fchmod(output.fileno(), 0o444)
+                    output.write(data)
+                    output.flush()
+                    os.fsync(output.fileno())
+            self.engine('pull', '--policy=missing', FEDORA, timeout=600)
+            base = image_id(self.engine('build', '--quiet', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=1800))
+            stage = runtime_id = None
+            stage_name, runtime_name = 'dp-gptbox-a-' + expected[:16] + '-' + str(count), 'dp-gptbox-r-' + expected[:16] + '-' + str(count)
+            self.record('resources', {stage_name: base})
+            try:
+                stage = image_id(self.engine('create', '--name=' + stage_name, '--label=dev-pair.context=' + expected,
+                    '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private', '--userns=private', '--cap-add=SYS_ADMIN',
+                    '--security-opt=no-new-privileges', '--security-opt=label=type:container_engine_t',
+                    '--memory=2g', '--pids-limit=512', '--cpus=1', '--tmpfs=/run:rw,nosuid,nodev', '--tmpfs=/tmp:rw,nosuid,nodev',
+                    '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--entrypoint=/usr/bin/distrobox-init', base,
+                    *INIT[1:], '--', FINAL_HOOK))
+                self.inspect_container(stage, base, runtime=False)
+                output = self.engine('start', '--attach', stage, timeout=900)
+                attestation = json.loads(output.strip().splitlines()[-1])
+                if (attestation.get('kind') != 'genuine-distrobox-assembled'
+                        or attestation.get('inputs_sha256') != sha(json.dumps(inputs, sort_keys=True).encode() + b'\n')
+                        or attestation.get('source_sha') != revision or attestation.get('uid') != 1000 or attestation.get('gid') != 1000):
+                    raise Blocked('actual upstream finalizer attestation is missing or mismatched')
+                self.record('assembly-attestation', attestation)
+                stopped = json.loads(self.engine('inspect', '--type=container', stage))[0]
+                if stopped['State'].get('ExitCode') != 0 or stopped['State'].get('Running'):
+                    raise Blocked('actual upstream assembly did not exit successfully')
+                sealed = image_id(self.engine('commit', '--pause=false', stage))
+                self.record('resources', {stage_name: base, runtime_name: sealed})
+                # A separate immutable runtime, never the writable assembly container.
+                self.mounts = {}
+                mount_args = []
+                for directory, destination in (('workspaces', '/work/job'), ('state', '/state'), ('cache', '/cache/job')):
+                    source = '/var/lib/dev-pair/maintenance/' + directory + '/gptbox-probe'
+                    self.directory(source, owner='dp-maint')
+                    self.mounts[destination] = (str(self.path(source)), True)
+                    mount_args += ['--volume', str(self.path(source)) + ':' + destination + ':rw,Z']
+                runtime_id = image_id(self.engine('create', '--name=' + runtime_name, '--label=dev-pair.context=' + expected, '--read-only', '--read-only-tmpfs=false', '--user=1000:1000',
+                    '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                    '--network=none', '--pid=private', '--ipc=private', '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1',
+                    '--no-hosts', '--no-hostname', '--dns=none', '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000', '--tmpfs=/tmp:rw,nosuid,nodev',
+                    '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
+                    *mount_args, '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
+                self.inspect_container(runtime_id, sealed)
+                for cycle in range(2):
+                    self.engine('start', runtime_id)
+                    self.ready(runtime_id, sealed)
+                    observed = json.loads(self.enter(runtime_id, sealed, 'probe'))
+                    if observed.get('boundary_probe') != 'passed':
+                        raise Blocked('runtime boundary probe did not pass')
+                    if self.enter(runtime_id, sealed, 'version').strip() != 'codex-cli 0.169.0':
+                        raise Blocked('actual Distrobox entry returned unexpected Codex identity')
+                    self.engine('stop', '--time=10', runtime_id)
+                result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
+                          'distrobox_sha': DBX_SHA, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
+                          'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
+                          'model_access': 'not verified', 'nested_placement': 'not verified',
+                          'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}
+            except BaseException:
+                self.record('failure', {'status': 'blocked-or-interrupted', 'job_admission': False,
+                                       'diagnostics': 'bounded protected diagnostics.json; collect additional scoped audit AVCs externally'})
+                raise
+            finally:
+                for identity in (runtime_id, stage):
+                    if identity:
+                        self.engine('rm', '--force', identity)
+            self.record('result', result)
+            return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('stage', choices=('assemble',))
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--retry', action='store_true', help='reconcile and retry one incomplete exact target; at most two attempts')
+    parser.add_argument('--context', required=True)
+    parser.add_argument('--expected-context-sha256', required=True)
+    parser.add_argument('--distrobox-source', required=True)
+    parser.add_argument('--source-sha', required=True)
+    args = parser.parse_args()
+    try:
+        result = Gptbox().assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
+        print(json.dumps(result, indent=2))
+        return 0
+    except (Blocked, OSError, ValueError, KeyError, subprocess.SubprocessError):
+        print('gptbox operation blocked; no job/runtime admission; inspect protected evidence locally', file=sys.stderr)
+        return 2
+
+if __name__ == '__main__':
+    sys.exit(main())

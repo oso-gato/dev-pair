@@ -66,7 +66,9 @@ Set `kind` to `operator-verified-inputs`. Required evidence and identities:
   There is no Claude fallback or implicit resume/latest model. Changed selection
   requires a separate explicit migration; this tool offers no migration command.
 - `mounts`: four distinct, nonoverlapping canonical source leaves under
-  `/var/lib/dev-pair/jobs/<job>/`: `workspace`, `state`, `cache`, `credentials`.
+  `/var/lib/dev-pair/<role>/{workspaces,state,cache}/<job>`, with separate protected
+  credentials under `/var/lib/dev-pair/credentials/<role>/<job>`. Each source is
+  one dedicated job leaf; the former `/var/lib/dev-pair/jobs` namespace is rejected.
   For actual use the authorized executor must provision and inspect ownership,
   symlinks, mount topology and role-specific credential scope. Path syntax does
   not prove permissions or that a directory's contents are safe.

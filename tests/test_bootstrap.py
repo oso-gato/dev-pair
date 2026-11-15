@@ -339,7 +339,7 @@ class BootstrapTests(unittest.TestCase):
                        'source': 'https://github.com/openai/codex/releases/download/rust-v9876.5.4/codex-x86_64-unknown-linux-musl.tar.gz',
                        'sha256': hashlib.sha256(data).hexdigest(), 'verification': 'SYNTHETIC OFFLINE TEST - no upstream acceptance'},
              'role': role, 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
-             'mounts': {key: '/var/lib/dev-pair/jobs/offline-test/' + key for key in ('workspace', 'state', 'cache', 'credentials')}}
+             'mounts': {key: (f'/var/lib/dev-pair/credentials/{role}/offline-test' if key == 'credentials' else f'/var/lib/dev-pair/{role}/' + {'workspace': 'workspaces', 'state': 'state', 'cache': 'cache'}[key] + '/offline-test') for key in ('workspace', 'state', 'cache', 'credentials')}}
         out = self.root / 'context'
         result = tool.prepare(m, binary, out, fixture=fixture)
         return out, result['context_sha256']
