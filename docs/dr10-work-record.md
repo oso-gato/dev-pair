@@ -1108,3 +1108,21 @@ Fresh `/root/public_inputs_snapshot_review` awaits its exact fix. The retained
 pre-fix payload is evidence for its recorded source only, not an admitted release
 or an assertion that the new consumer boundary already passed. No CI/runtime
 change or further hosted execution accompanies this helper yet.
+
+
+The input-consumer repair is committed as
+`62eb1f6fa884c9c902cbb226b9a9751f94858868`, integrated byte-for-byte as
+`921654d`. The coordinator independently ran all 163 tests successfully. Both
+transfer inputs now use one bounded regular-file capture; manifest parsing and
+payload expansion consume the exact hashed capture, under a deadline beginning
+before input admission. Tests reproduce replacement races and reject actual
+FIFOs/devices, symlinks and oversized files, exercise a real admission timeout,
+and reach Codex member validation with explicitly non-production fixtures.
+
+The repaired consumer extracted the retained 257-file payload in 3.531 seconds
+and the unchanged candidate verifier passed local context integrity. Evidence:
+`/workspace/artifacts/public-inputs-db27f3a-jcqaoe7x/repaired-consumer-62eb1f6-result.json`.
+This binds the consumer to 62eb1f6 and the payload to its recorded db27f3a
+producer; it does not upgrade either to runtime acceptance. Original signature
+receipts remain unchanged; no network cryptography was repeated. Fresh Astra
+High review is in progress. Nothing in this checkpoint was pushed or deployed.
