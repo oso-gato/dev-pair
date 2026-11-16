@@ -1,4 +1,6 @@
 import copy
+import contextlib
+from unittest.mock import patch
 import importlib.util
 import hashlib
 import json
@@ -9,6 +11,7 @@ import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
 spec = importlib.util.spec_from_file_location('candidate', ROOT / 'tools/candidate.py')
 candidate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(candidate)
@@ -210,8 +213,10 @@ class NonFixturePreparationTests(unittest.TestCase):
         self.script = self.repo / 'tools/candidate.py'
         self.source = (ROOT / 'tools/candidate.py').read_bytes()
         self.script.write_bytes(self.source)
+        (self.repo / 'tools/fedora_oci.py').write_bytes((ROOT / 'tools/fedora_oci.py').read_bytes())
+        (self.repo / 'tools/public_inputs.py').write_bytes((ROOT / 'tools/public_inputs.py').read_bytes())
         self.git('init', '--quiet')
-        self.git('add', 'tools/candidate.py')
+        self.git('add', 'tools')
         self.git('commit', '--quiet', '-m', 'Synthetic matching source for offline tests')
         matching_sha = self.git('rev-parse', 'HEAD')
         spec = importlib.util.spec_from_file_location('synthetic_candidate', self.script)
@@ -230,8 +235,7 @@ class NonFixturePreparationTests(unittest.TestCase):
             'kind': 'operator-verified-inputs',
             'source_sha': matching_sha,
             'standards_sha': candidate.STANDARDS,
-            'fedora': {'image': 'registry.fedoraproject.org/fedora:44@sha256:' + digest,
-                       'verification': evidence},
+            'fedora': dict(candidate.fedora_oci.PROVENANCE),
             'codex': {
                 'version': '9876.5.4',
                 'source': 'https://github.com/openai/codex/releases/download/rust-v9876.5.4/codex-x86_64-unknown-linux-musl.tar.gz',
@@ -243,6 +247,23 @@ class NonFixturePreparationTests(unittest.TestCase):
                        for name in ('workspace', 'state', 'cache', 'credentials')},
         }
 
+        @contextlib.contextmanager
+        def synthetic_fedora(source, **kwargs):
+            root = pathlib.Path(source) if source else self.root / 'synthetic-fedora'
+            root.mkdir(exist_ok=True)
+            for name in candidate.fedora_oci.FILES:
+                if not (root / name).exists(): (root / name).write_bytes(b'UNTRUSTED parser fixture')
+            yield root / 'plain.oci.tar', {}
+        self.fedora = self.root / 'synthetic-fedora'
+        self.fedora.mkdir()
+        for name in candidate.fedora_oci.FILES: (self.fedora / name).write_bytes(b'UNTRUSTED parser fixture')
+        mocked = patch.object(self.subject.fedora_oci, 'verified', synthetic_fedora)
+        mocked.start(); self.addCleanup(mocked.stop)
+        fake = b'UNTRUSTED parser fixture'
+        artifacts = {name:(url,len(fake),hashlib.sha256(fake).hexdigest()) for name,(url,_,_) in candidate.fedora_oci.ARTIFACTS.items()}
+        pins = patch.object(candidate.fedora_oci, 'ARTIFACTS', artifacts)
+        pins.start(); self.addCleanup(pins.stop)
+
     def git(self, *args):
         return subprocess.run(
             ['git', '-C', str(self.repo), '-c', 'user.name=Offline regression test',
@@ -252,19 +273,29 @@ class NonFixturePreparationTests(unittest.TestCase):
 
     def test_matching_real_git_source_prepares_but_never_admits_synthetic_inputs(self):
         out = self.root / 'context'
-        result = self.subject.prepare(self.m, self.binary, out)
+        result = self.subject.prepare(self.m, self.binary, out, fedora_inputs=self.fedora)
         self.assertEqual(result['kind'], 'prepared-not-runtime-validated')
         self.assertEqual(result['runtime'], 'blocked')
         self.assertIn('Operator supplies upstream verification', result['provenance'])
         recorded = json.loads((out / 'inputs.json').read_text())
         self.assertEqual(recorded, self.m)
-        self.assertIn('SYNTHETIC UNTRUSTED', recorded['fedora']['verification'])
+        self.assertEqual(recorded['fedora'], candidate.fedora_oci.PROVENANCE)
         self.assertEqual((out / 'codex').read_bytes(), self.binary.read_bytes())
         self.assertIn(self.m['source_sha'], (out / 'Containerfile').read_text())
         self.assertEqual(result['files_sha256']['codex'], self.m['codex']['sha256'])
         verified = self.subject.verify(out, result['context_sha256'])
         self.assertEqual(verified['verification'], 'local-context-integrity-only')
         self.assertEqual(verified['runtime'], 'blocked')
+
+    def test_actual_executed_public_dependency_must_match_recorded_source(self):
+        dependency = self.repo / 'tools/public_inputs.py'
+        dependency.write_bytes(dependency.read_bytes() + b'\nDIRTY_DEPENDENCY_EXECUTED = True\n')
+        spec = importlib.util.spec_from_file_location('dirty_public_dependency_fixture', dependency)
+        executed = importlib.util.module_from_spec(spec); spec.loader.exec_module(executed)
+        self.assertTrue(executed.DIRTY_DEPENDENCY_EXECUTED)
+        with patch.object(self.subject.fedora_oci, '_public_inputs', return_value=executed):
+            with self.assertRaisesRegex(ValueError, 'source SHA'):
+                self.subject.check_source(self.m, False)
 
     def test_existing_git_source_with_different_implementation_is_rejected(self):
         self.script.write_bytes(self.source + b'\n# Different synthetic source revision\n')
@@ -274,14 +305,14 @@ class NonFixturePreparationTests(unittest.TestCase):
         self.script.write_bytes(self.source)
         out = self.root / 'mismatch-context'
         with self.assertRaisesRegex(ValueError, 'does not identify'):
-            self.subject.prepare(self.m, self.binary, out)
+            self.subject.prepare(self.m, self.binary, out, fedora_inputs=self.fedora)
         self.assertFalse(out.exists())
 
     def test_missing_git_object_and_missing_source_file_are_rejected(self):
         out = self.root / 'missing-context'
         self.m['source_sha'] = '0' * 40
         with self.assertRaises(subprocess.CalledProcessError):
-            self.subject.prepare(self.m, self.binary, out)
+            self.subject.prepare(self.m, self.binary, out, fedora_inputs=self.fedora)
         self.assertFalse(out.exists())
         self.git('rm', '--quiet', 'tools/candidate.py')
         self.git('commit', '--quiet', '-m', 'Synthetic revision without preparation source')
@@ -290,7 +321,7 @@ class NonFixturePreparationTests(unittest.TestCase):
         self.script.parent.mkdir(parents=True, exist_ok=True)
         self.script.write_bytes(self.source)
         with self.assertRaises(subprocess.CalledProcessError):
-            self.subject.prepare(self.m, self.binary, out)
+            self.subject.prepare(self.m, self.binary, out, fedora_inputs=self.fedora)
         self.assertFalse(out.exists())
 
     def test_matching_hash_wrong_architecture_or_non_elf_is_rejected(self):
@@ -303,7 +334,7 @@ class NonFixturePreparationTests(unittest.TestCase):
                 self.m['codex']['sha256'] = hashlib.sha256(data).hexdigest()
                 out = self.root / name
                 with self.assertRaisesRegex(ValueError, 'x86_64 ELF'):
-                    self.subject.prepare(self.m, self.binary, out)
+                    self.subject.prepare(self.m, self.binary, out, fedora_inputs=self.fedora)
                 self.assertFalse(out.exists())
 
     def test_non_fixture_placeholder_image_digest_and_version_are_rejected(self):
@@ -311,7 +342,7 @@ class NonFixturePreparationTests(unittest.TestCase):
             m = copy.deepcopy(self.m)
             if name == 'digest':
                 m['fedora']['image'] = 'registry.fedoraproject.org/fedora:44@sha256:' + '0' * 64
-                error = 'placeholder image digest'
+                error = 'exact signed Fedora OCI provenance'
             else:
                 m['codex']['version'] = '0.0.0'
                 m['codex']['source'] = m['codex']['source'].replace('9876.5.4', '0.0.0')

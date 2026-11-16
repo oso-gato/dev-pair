@@ -1,7 +1,7 @@
 # Local candidate preparation (A12.12(1), partial)
 
 This is an offline preparation tool, not a working installation or a Distrobox
-launcher. Python 3 and Git suffice. No image has been built here. No Fedora,
+launcher. Python 3 and Git suffice for fixtures; real preparation also requires GnuPG. No image has been built here. No Fedora,
 Podman, Distrobox, SELinux, authentication or remote-model acceptance is claimed.
 `launch` always exits 2. `plan` prints a **blocked proposal**, including Codex argv,
 without running it. Both maintenance-on-host and development-inside-DevBox are
@@ -40,20 +40,19 @@ boundary tests.
 
 ## Supply real inputs without inventing pins
 
-Create a private JSON manifest with the same **exact** fields as the fixture,
-replacing every fixture identity. Do not commit credentials or private evidence.
+Create a private JSON manifest with the same root fields as the fixture,
+replacing fixture identities and using the production Fedora object below. Do not commit credentials or private evidence.
 Set `kind` to `operator-verified-inputs`. Required evidence and identities:
 
 - `source_sha`: the exact Git commit containing this preparation implementation.
   Preparation checks its own bytes against `git show <SHA>:tools/candidate.py`.
   Record the final reviewed source revision in the host request separately.
 - `standards_sha`: `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
-- `fedora.image`: `registry.fedoraproject.org/fedora:44@sha256:<actual digest>`.
-  An authorized operator must resolve the official Fedora 44 x86_64 manifest,
-  inspect `/etc/os-release`/architecture, and record registry inspection and
-  available signature/attestation results in `fedora.verification` (evidence
-  reference, not a bare assertion). The inspected first adapter inputs and the
-  remaining image-signature gap are recorded in [the adapter guide](confined-gptbox.md).
+- `fedora`: the exact closed provenance object in `fedora_oci.PROVENANCE`,
+  including archive/CHECKSUM/key/signer and manifest/config/layer/diff identities.
+  Real preparation additionally requires `--fedora-inputs /VERIFIED/CACHE` with
+  the three fixed public input files. It verifies the signed archive and OCI
+  graph before creating the context. See [signed Fedora base](signed-fedora-base.md).
 - `codex.version`: actual official **stable** numeric version, not the local
   `0.167.0-alpha.4` executor CLI. `codex.source` must be the matching official
   `https://github.com/openai/codex/releases/download/rust-v<VERSION>/codex-x86_64-unknown-linux-musl.tar.gz`.

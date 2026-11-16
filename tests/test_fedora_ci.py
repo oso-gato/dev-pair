@@ -141,7 +141,7 @@ class FedoraCITests(unittest.TestCase):
         report = self.serial_result()
         serial = guest.encode_report(report)
         self.assertEqual(ci.parse_serial(serial, 'a' * 40, 'b' * 64, fixture_inputs()), report)
-        for malformed in (serial + serial, b'no result', b'console\n' + serial, serial.replace(b'"version": 4', b'"version": true'),
+        for malformed in (serial + serial, b'no result', b'console\n' + serial, serial.replace(('"version": '+str(guest.REPORT_VERSION)).encode(), b'"version": true'),
                           serial.replace(b'"source_sha":', b'"version":1,"source_sha":')):
             with self.assertRaises((ci.Blocked, ValueError)):
                 ci.parse_serial(malformed, 'a' * 40, 'b' * 64, fixture_inputs())

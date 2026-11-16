@@ -21,7 +21,8 @@ import candidate
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
-FEDORA = 'registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e'
+import fedora_oci
+FEDORA = fedora_oci.IMAGE
 BASE = '/usr/lib/dev-pair/gptbox'
 RUNTIME = BASE + '/runtime.py'
 CONTROL = '/usr/local/libexec/dev-pair-gptbox'
@@ -87,7 +88,7 @@ class Gptbox(Bootstrap):
         repo = Path(__file__).resolve().parents[1]
         if self.run('/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD').strip() != revision:
             raise Blocked('adapter source HEAD differs from requested exact target')
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py'):
             data = self.protected(Path(__file__).with_name(name)).read_bytes()
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
@@ -118,6 +119,10 @@ class Gptbox(Bootstrap):
             if recorded.encode() != path.read_bytes():
                 raise Blocked('upstream Distrobox script does not match exact Git object')
             scripts[name] = path.read_bytes()
+        self.protected(Path(fedora_oci._public_inputs().__file__))
+        actual = self.run('/usr/bin/git','-C',str(Path(__file__).resolve().parents[1]),'show',revision+':tools/public_inputs.py')
+        if actual.encode() != Path(fedora_oci._public_inputs().__file__).read_bytes():
+            raise Blocked('executing public input dependency differs from reviewed source')
         return manifest, scripts
 
     def execute(self, *args, timeout=120, ok=(0,)):
@@ -177,7 +182,8 @@ class Gptbox(Bootstrap):
         storage = '/var/lib/dev-pair/maintenance/images'
         self.directory(storage, owner='dp-maint')
         self.wrapper = str(self.path(CONTROL + '/bin/podman'))
-        script = (f'#!/bin/sh\nexec /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox '
+        script = (f'#!/bin/sh\nif [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={fedora_oci.SAVE_FILE_LIMIT}:{fedora_oci.SAVE_FILE_LIMIT} /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox --storage-driver=vfs --events-backend=file "$@"; fi\n'
+                  f'exec /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox '
                   '--storage-driver=vfs --events-backend=file "$@"\n')
         self.atomic(CONTROL + '/bin/podman', script, mode=0o555)
         self.atomic(CONTROL + '/distrobox-enter', self.scripts['distrobox-enter'].decode(), mode=0o555)
@@ -397,7 +403,7 @@ class Gptbox(Bootstrap):
                             'tzdata unzip util-linux util-linux-script vte-profile wget wget2-wget which whois words '
                             'xorg-x11-xauth xz zip mesa-dri-drivers mesa-vulkan-drivers vulkan')
             recipe = (f'FROM {FEDORA}\n'
-                      'RUN set -eu; for file in /etc/dnf/dnf.conf /etc/yum.conf; do '
+                      'RUN set -eu; dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates upgrade; for file in /etc/dnf/dnf.conf /etc/yum.conf; do '
                       'if [ -f "$file" ]; then sed -i "/tsflags=nodocs/d" "$file"; fi; done; dnf -q --setopt=gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates list '
                       + dependencies + ' > /tmp/upstream-packages; '
                       'grep -v Packages /tmp/upstream-packages | grep "$(uname -m)" | cut -d" " -f1 > /tmp/resolved-packages; '
@@ -432,8 +438,16 @@ class Gptbox(Bootstrap):
                     os.fsync(output.fileno())
             image_budget = self.run.phase(IMAGE_EXECUTION, 'dev-pair-gptbox-image', native=False) if isinstance(self.run, Commands) else contextlib.nullcontext()
             with image_budget:
-                self.engine('pull', '--policy=missing', FEDORA, timeout=600)
-                base = image_id(self.engine('build', '--quiet', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
+                def reconcile_copy():
+                    if isinstance(self.run, Commands):
+                        self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
+                work = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/image-work'
+                self.directory(work, mode=0o755)
+                with fedora_oci.copy_workspace(self.path(work), uid=int(self.uid), reconcile=reconcile_copy, reserve=8*1024**3) as copy_tmp:
+                    with fedora_oci.verified(context, temporary_parent=self.path(work)) as (plain, proof):
+                        imported = fedora_oci.import_image(lambda *args, **kw: self.execute('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,*args,**kw), plain, uid=int(self.uid))
+                    base = image_id(self.execute('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
+                self.record('fedora-base', imported)
             if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
                 raise Blocked('eight GiB free reserve is required after image construction before actual assembly')
             stage = runtime_id = None
@@ -485,7 +499,7 @@ class Gptbox(Bootstrap):
                         raise Blocked('actual Distrobox entry returned unexpected Codex identity')
                     self.engine('stop', '--time=10', runtime_id)
                 result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
-                          'distrobox_sha': DBX_SHA, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
+                          'distrobox_sha': DBX_SHA, 'fedora_base': imported, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
                           'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
                           'model_access': 'not verified', 'nested_placement': 'not verified',
                           'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}
@@ -522,8 +536,9 @@ class Gptbox(Bootstrap):
         self.protected(upstream)
         for name in ('distrobox-init', 'distrobox-enter'):
             self.protected(Path(upstream) / name)
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py'):
             self.protected(Path(__file__).with_name(name))
+        self.protected(Path(fedora_oci._public_inputs().__file__))
         if self.path('/usr/bin/git').exists():
             self.inputs(context, expected, upstream, revision)
         password = operator_password(password_file) if password_file else None

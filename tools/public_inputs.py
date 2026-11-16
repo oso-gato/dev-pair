@@ -19,12 +19,21 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+try:
+    import fedora_oci
+except ModuleNotFoundError:
+    # -I excludes scriptdir; load only this source-bound immutable sibling.
+    import importlib.util
+    _fedora_spec = importlib.util.spec_from_file_location('fedora_oci', pathlib.Path(__file__).with_name('fedora_oci.py'))
+    fedora_oci = importlib.util.module_from_spec(_fedora_spec)
+    sys.modules['fedora_oci'] = fedora_oci
+    _fedora_spec.loader.exec_module(fedora_oci)
 
 MIB = 1024 ** 2
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 CODEX_SOURCE = 'd32063f96c2dff1dc96af839b3952abb6acfeda4'
 DBX_SOURCE = '40c3cd724faa434aeb0a23e28776665b92de68bd'
-FEDORA = 'registry.fedoraproject.org/fedora:44@sha256:48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e'
+FEDORA = fedora_oci.IMAGE
 RELEASE = 'https://github.com/openai/codex/releases/download/rust-v0.169.0/'
 ARTIFACTS = {
     'codex.tar.gz': (RELEASE + 'codex-x86_64-unknown-linux-musl.tar.gz', 117805733,
@@ -34,6 +43,7 @@ ARTIFACTS = {
     'cosign': ('https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64', 145688404,
                '424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa'),
 }
+ARTIFACTS.update(fedora_oci.ARTIFACTS)
 CODEX_BYTES = 294277432
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
 SOURCE_LIMIT = 32 * MIB
@@ -43,7 +53,7 @@ WORK_LIMIT = 1536 * MIB
 FILE_LIMIT = 2048
 MANIFEST_LIMIT = 256 * 1024
 EXTRACTION_SECONDS = 120
-VERIFICATION = 'strict-cosign-keyless; Cosign bootstrap is official HTTPS plus pinned digest; no runtime/model admission'
+VERIFICATION = 'strict-cosign-keyless; Fedora signed-CHECKSUM/OCI verification is separately required; Cosign bootstrap is official HTTPS plus pinned digest; no runtime/model admission'
 PROXY_ENV = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy',
              'all_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE')
 
@@ -124,7 +134,7 @@ def workspace_bytes(root):
     return total
 
 
-def command(argv, work, *, timeout=120, network=False, input_file=None, output_file=None, file_limit=SOURCE_LIMIT):
+def command(argv, work, *, timeout=120, network=False, input_file=None, output_file=None, file_limit=SOURCE_LIMIT, workspace_reserve=0):
     """Fixed-controller argv only; no shell, inherited credentials or loaders."""
     def limits():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -143,7 +153,7 @@ def command(argv, work, *, timeout=120, network=False, input_file=None, output_f
         try:
             while selector.get_map():
                 require(time.monotonic() - started < timeout, 'public input command deadline exceeded')
-                require(workspace_bytes(work) <= WORK_LIMIT, 'public input workspace budget exceeded')
+                require(workspace_bytes(work) + workspace_reserve <= WORK_LIMIT, 'public input workspace budget exceeded')
                 for key, _ in selector.select(timeout=.1):
                     data = os.read(key.fileobj.fileno(), 16384)
                     if not data:
@@ -152,7 +162,7 @@ def command(argv, work, *, timeout=120, network=False, input_file=None, output_f
                     buffers[key.data].extend(data)
                     require(sum(map(len, buffers.values())) <= MIB, 'public input command output limit exceeded')
             require(process.wait(timeout=5) == 0, 'public input command failed; bounded output retained only by caller')
-            require(workspace_bytes(work) <= WORK_LIMIT, 'public input workspace budget exceeded')
+            require(workspace_bytes(work) + workspace_reserve <= WORK_LIMIT, 'public input workspace budget exceeded')
             return bytes(buffers['stdout']), bytes(buffers['stderr'])
         finally:
             selector.close()
@@ -217,16 +227,19 @@ class HTTPSOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch(output):
+def fetch(output, fedora_cache=None):
     with wall_limit(600):
-        return fetch_within_limit(output)
+        return fetch_within_limit(output, fedora_cache)
 
 
-def fetch_within_limit(output):
+def fetch_within_limit(output, fedora_cache=None):
     output = private_directory(output)
     try:
         opener = urllib.request.build_opener(HTTPSOnly())
         for name, (url, size, expected) in ARTIFACTS.items():
+            if fedora_cache is not None and name in fedora_oci.ARTIFACTS:
+                snapshot(pathlib.Path(fedora_cache)/name,output/name,size,expected)
+                continue
             started = time.monotonic()
             copied = 0
             with opener.open(url, timeout=20) as response, open(output / name, 'xb') as dst:
@@ -376,12 +389,15 @@ def build_within_limit(cache, distrobox, output):
                        'verification_output_sha256': hashlib.sha256(proof[0] + proof[1]).hexdigest(),
                        'note': VERIFICATION}
             (retained / 'receipt.json').write_bytes(canonical(receipt))
+            require(workspace_bytes(work) + 160 * MIB <= WORK_LIMIT, 'Fedora verification workspace reserve unavailable')
+            with fedora_oci.verified(work) as (plain, fedora_proof):
+                (retained / 'fedora-verification.json').write_bytes(canonical(fedora_proof))
             tree = work / 'payload'
             tree.mkdir()
             clean_checkout(repo, revision, tree / 'dev-pair', work)
             clean_checkout(pathlib.Path(distrobox), DBX_SOURCE, tree / 'distrobox', work)
             manifest = {'kind': 'operator-verified-inputs', 'source_sha': revision, 'standards_sha': STANDARDS,
-                        'fedora': {'image': FEDORA, 'verification': 'Official digest pinned; Fedora OCI signature not established'},
+                        'fedora': dict(fedora_oci.PROVENANCE),
                         'codex': {'version': '0.169.0', 'source': ARTIFACTS['codex.tar.gz'][0], 'sha256': CODEX_SHA,
                                   'verification': 'Strict Cosign3.1.4 identity/issuer/workflow/repository/ref/source verification passed; evidence in payload'},
                         'role': 'maintenance', 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
@@ -392,18 +408,19 @@ def build_within_limit(cache, distrobox, output):
             inputs = work / 'inputs.json'
             inputs.write_text(json.dumps(manifest))
             preparation = command([sys.executable, '-I', str(tree / 'dev-pair/tools/candidate.py'), 'prepare',
-                                   '--manifest', str(inputs), '--binary', str(binary), '--output', str(tree / 'context')],
-                                  work, file_limit=CODEX_BYTES + MIB)[0]
+                                   '--manifest', str(inputs), '--binary', str(binary), '--fedora-inputs', str(work), '--output', str(tree / 'context')],
+                                  work, file_limit=CODEX_BYTES + MIB, workspace_reserve=160*MIB)[0]
             context = json.loads(preparation)
             evidence = tree / 'evidence'
             evidence.mkdir()
             shutil.copyfile(retained / 'codex.sigstore', evidence / 'codex.sigstore')
             shutil.copyfile(retained / 'cosign-verification.txt', evidence / 'cosign-verification.txt')
             shutil.copyfile(retained / 'receipt.json', evidence / 'verification-receipt.json')
+            shutil.copyfile(retained / 'fedora-verification.json', evidence / 'fedora-verification.json')
             files = inventory(tree)
             payload = output / 'maintenance-inputs.tar.gz'
             write_payload(tree, files, payload)
-            record = {'version': 1, 'kind': 'verified-public-maintenance-inputs', 'source_sha': revision,
+            record = {'version': 2, 'kind': 'verified-public-maintenance-inputs', 'fedora': dict(fedora_oci.PROVENANCE), 'source_sha': revision,
                       'standards_sha': STANDARDS, 'distrobox_sha': DBX_SOURCE, 'context_sha256': context['context_sha256'],
                       'artifacts': {name: {'url': url, 'bytes': size, 'sha256': sha} for name, (url, size, sha) in ARTIFACTS.items()},
                       'payload': {'sha256': digest(payload), 'bytes': payload.stat().st_size}, 'files': files,
@@ -433,9 +450,10 @@ def cleanup_failed_build(output):
 def validate_manifest(obj):
     def keys(value, names):
         require(type(value) is dict and set(value) == set(names.split()), 'missing or unknown manifest fields')
-    keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification')
-    require(type(obj['version']) is int and obj['version'] == 1 and obj['kind'] == 'verified-public-maintenance-inputs',
+    keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification fedora')
+    require(type(obj['version']) is int and obj['version'] == 2 and obj['kind'] == 'verified-public-maintenance-inputs',
             'unsupported public-input manifest version/kind')
+    require(obj['fedora'] == fedora_oci.PROVENANCE, 'signed Fedora provenance mismatch')
     require(re.fullmatch('[0-9a-f]{40}', obj['source_sha']) and obj['standards_sha'] == STANDARDS and
             obj['distrobox_sha'] == DBX_SOURCE and re.fullmatch('[0-9a-f]{64}', obj['context_sha256']), 'manifest identity mismatch')
     require(canonical(obj['artifacts']) == canonical({name: {'url': url, 'bytes': size, 'sha256': sha}
@@ -459,8 +477,8 @@ def validate_manifest(obj):
         names.append(item['path'])
         total += item['bytes']
     require(names == sorted(set(names)) and total <= EXPANSION_LIMIT, 'duplicate/unsorted/oversized payload inventory')
-    required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile')}
-    required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json'}
+    required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile', *fedora_oci.FILES)}
+    required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json', 'evidence/fedora-verification.json'}
     for repo in ('dev-pair', 'distrobox'):
         required |= {repo + '/.git/' + name for name in ('HEAD', 'config', 'shallow', 'refs/heads/public-input')}
     require(required <= set(names), 'incomplete maintenance payload')
@@ -550,6 +568,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     fetch_parser = sub.add_parser('fetch')
+    fetch_parser.add_argument('--fedora-cache', type=pathlib.Path)
     fetch_parser.add_argument('--output', required=True, type=pathlib.Path)
     build_parser = sub.add_parser('build')
     build_parser.add_argument('--cache', required=True, type=pathlib.Path)
@@ -562,7 +581,7 @@ def main():
     consumer.add_argument('--output', required=True, type=pathlib.Path)
     args = parser.parse_args()
     if args.command == 'fetch':
-        result = fetch(args.output)
+        result = fetch(args.output, args.fedora_cache)
     elif args.command == 'build':
         result = build(args.cache, args.distrobox_source, args.output)
     else:

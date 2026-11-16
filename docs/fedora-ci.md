@@ -43,10 +43,12 @@ contains adopted standards identities, never private standards text.
    image length583729152 and image SHA256
    `28680fe5b371a5a82ebf43a31926e086a168e59949d03969c5093e7071f90b7f`.
 3. Build QEMU/ISO tooling inside disposable Podman storage from the pinned Fedora44
-   OCI digest `48f4a2b507ad36a6a8bb83646ee81164aff80a62be06d03b143b80594d2b558e`.
+   [signed official OCI archive](signed-fedora-base.md), using only its verified
+   immutable local config ID after load/save-back verification (`--pull=never`).
    RPM GPG checking, actual NEVRAs/RPM hashes and immutable image identity remain
-   mandatory. The OCI signature is still unverified; live RPM repositories are
-   a reproducibility limit. Empty auth/hooks prevent credential inheritance.
+   mandatory. The exact signed April release archive replaces the unsigned-provenance
+   November registry selection; signed package refresh runs only during disposable
+   candidate construction. Live RPM repositories remain a reproducibility limit. Empty auth/hooks prevent credential inheritance.
 4. Invoke the current [public input helper](public-maintenance-inputs.md) `fetch`
    and `build` as bounded children. Build must perform actual strict Cosign3.1.4
    verification of pinned Codex0.169.0 and use exact Distrobox1.8.2.5 Git objects.
@@ -150,7 +152,7 @@ network namespace from the runner are inspected and reported. The requested
 loopback-denial option is recorded separately from normalized engine mode.
 
 This permits fixed public artifacts/keys, Sigstore metadata, signed Fedora and
-Tailscale packages and the pinned Fedora registry input. It is **not a destination
+Tailscale packages and the signed official Fedora Container archive. It is **not a destination
 ACL** or proof that all private/routable runner addresses are unreachable.
 No proxy/account credentials are passed. Missing networking support blocks;
 there is no runner package/firewall installation or host-network fallback.
@@ -179,7 +181,7 @@ Setup shares one absolute deadline; each child is clipped to remaining time.
 The VM envelope reserves boot180+admission60+initialize2280+cleanup45+final60
 (2625s), with15s margin; the external VM deadline is authoritative. Missing time
 blocks rather than borrowing cleanup reserve. Native staging900s and runtime180s
-remain unchanged; image pull/build share600s. The fixed staging dependency/locale
+remain unchanged; image import/build share600s. The fixed staging dependency/locale
 RUN has its own native540s timeout and10s forced termination. This bounds that
 work when a build helper escapes its client unit; it does not prove every engine
 helper stopped, or extend an already shorter remaining image/VM budget.
@@ -246,3 +248,8 @@ The [native stream transport](native-command-io.md) also covers the final dp-mai
 image observation. Same-run security diagnostics retain bounded structured
 no-comm USER_AVC records without exporting audit paths/proctitles/arguments.
 Root filesystem type and selected quota flags are diagnostic-only observations.
+
+Report version5 additionally binds the public Fedora verifier dependency hash;
+public-input manifest version2 carries exact signed Fedora source provenance.
+Older report/input contracts are rejected. No console fallback or guest phase
+acceptance is added. Native import/refresh under existing budgets remains unproved.
