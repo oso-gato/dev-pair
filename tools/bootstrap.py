@@ -1386,17 +1386,26 @@ class Bootstrap:
             # Interrupted unrecorded builds are rebuilt from the same protected context.
             if shutil.disk_usage(self.path(storage)).free < 8 * 1024 ** 3:
                 raise Blocked('insufficient free storage reserve for gptbox build')
-            with tool.fedora_oci.verified(self.path(stage)) as (plain, proof):
-                def local_image(*args, **kwargs):
-                    prefix = list(base)
-                    if args[0] == 'save':
+            def reconcile_copy():
+                if isinstance(self.run, Commands):
+                    self.run.reconcile_native(('--unit=dev-pair-gptbox-'+expected+'.service','--description=dev-pair-owned-dev-pair-gptbox-'+expected+'.service','--uid=dp-maint'), {})
+            work = '/var/lib/dev-pair/artifacts/gptbox-image-work/' + expected
+            self.directory('/var/lib/dev-pair/artifacts/gptbox-image-work', mode=0o755)
+            self.directory(work, mode=0o755)
+            with tool.fedora_oci.copy_workspace(self.path(work), uid=int(uid), reconcile=reconcile_copy, reserve=8*1024**3) as copy_tmp:
+                with tool.fedora_oci.verified(self.path(stage), temporary_parent=self.path(work)) as (plain, proof):
+                    def local_image(*args, **kwargs):
+                        prefix = list(base)
                         index = prefix.index('/usr/bin/podman')
-                        prefix[index:index] = ['/usr/bin/prlimit', '--fsize=' + str(tool.fedora_oci.PLAIN_LIMIT) + ':' + str(tool.fedora_oci.PLAIN_LIMIT)]
-                    return self.run(*prefix, *args, **kwargs)
-                import_proof = tool.fedora_oci.import_image(local_image, plain, uid=int(uid))
-            built_id = self.run(*base, 'build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--format=oci',
-                     '--label', f'dev-pair.context={expected}', '--tag', tag,
-                     '--file', str(self.path(stage) / 'Containerfile'), str(self.path(stage))).strip()
+                        prefix[index:index] = ['TMPDIR='+str(copy_tmp)]
+                        if args[0] == 'save':
+                            index = prefix.index('/usr/bin/podman')
+                            prefix[index:index] = ['/usr/bin/prlimit', '--fsize=' + str(tool.fedora_oci.SAVE_FILE_LIMIT) + ':' + str(tool.fedora_oci.SAVE_FILE_LIMIT)]
+                        return self.run(*prefix, *args, **kwargs)
+                    import_proof = tool.fedora_oci.import_image(local_image, plain, uid=int(uid))
+                built_id = local_image('build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--format=oci',
+                         '--label', f'dev-pair.context={expected}', '--tag', tag,
+                         '--file', str(self.path(stage) / 'Containerfile'), str(self.path(stage))).strip()
             if not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', built_id):
                 raise Blocked('gptbox build returned no unambiguous immutable image ID')
             inspect = self.run(*base, 'image', 'inspect', built_id)

@@ -22,7 +22,15 @@ def synthetic_import(engine, plain, uid=None, seconds=120):
 def install(test):
     fake = b'UNTRUSTED SYNTHETIC INPUT, NOT FEDORA'
     artifacts = {name:(url,len(fake),hashlib.sha256(fake).hexdigest()) for name,(url,_,_) in fedora_oci.ARTIFACTS.items()}
-    for item in (patch.object(fedora_oci, 'ARTIFACTS', artifacts),
+    for item in (patch.object(fedora_oci, 'copy_workspace', synthetic_copy),
+                 patch.object(fedora_oci, 'ARTIFACTS', artifacts),
                  patch.object(fedora_oci, 'verified', synthetic_verified),
                  patch.object(fedora_oci, 'import_image', synthetic_import)):
         item.start(); test.addCleanup(item.stop)
+
+
+@contextlib.contextmanager
+def synthetic_copy(parent, **kwargs):
+    root=Path(parent)/'image-copy';root.mkdir(exist_ok=True)
+    try:yield root
+    finally:root.rmdir()

@@ -46,8 +46,9 @@ recompresses them; original gzip/manifest equality is therefore not assumed.
 The derived gzip and manifest identities are recorded separately, requiring exact
 source config bytes and the complete original uncompressed rootfs diff stream.
 Only this gzip representation derivation is supported; changed content, zstd or
-uncompressed exports block. Transport tar directory metadata can differ. Save alone gets an80MiB native
-`prlimit` file ceiling; package/image writes retain their existing limits.
+uncompressed exports block. Transport tar directory metadata can differ. Save alone gets a192MiB native per-file `prlimit` ceiling, admitting the
+188,336,128-byte immediately unlinked storage spool. Final output admission
+remains80MiB before capture/decoding; package/image writes retain their limits.
 No global signature-policy relaxation, registry fallback or broad prune occurs.
 
 Signed Fedora/updates RPM refresh is explicit in every disposable candidate's
@@ -65,3 +66,27 @@ limits still govern. A failed Podman load is nontransactional and can retain
 unreferenced store data. Only private owned temporary files are automatically
 removed; no rollback or crash-finally claim is made. Uncertain import/derivation,
 capacity, package freshness, cleanup or native capability blocks acceptance.
+
+Repair ownership/accounting: verification temporaries now live inside the
+producer work tree, native context artifact stage or CI owned scratch. Image
+copying gets a separate0700 writable leaf, while verified source remains
+controller-owned under0755 parents with0444 files. An exclusive0600 ownership
+record binds the exact leaf/parent inode and actor. A retry reconciles the exact
+owned executor before reclaiming only that proven leaf; foreign/unproven or
+uncertain workers preserve it. SIGKILL may retain this recorded leaf for later
+reconciliation; no finally-after-crash claim is made.
+
+Every actual image operation receives explicit TMPDIR after environment clearing.
+Podman4.9.3/5.8.1 tagged source routes TMPDIR to BigFilesTemporaryDir; --tmpdir
+alone is not used as proof. CI uses a fixed root-side timeout and preserves scratch
+if an image-copy worker's termination is uncertain. Its live measurement charges
+an additional192MiB for the unlinked spool; du alone cannot observe it. The lease
+requires the existing free reserve plus768MiB for bounded coexisting base input,
+copy layout, output/capture and spool before starting. Guest8GiB reserve and
+CI4GiB-overhead/3GiB-host ceilings remain unchanged. Driver/candidate peaks and
+actual native cleanup still require measured acceptance.
+
+The actual executing public_inputs.py dependency is included in exact source
+and protection checks. CI seeds the payload cache from its already verified
+Fedora artifact copies; stale bytes reject without overwrite or network fallback.
+No artifact is downloaded twice merely to transfer the same authenticated input.

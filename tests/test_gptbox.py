@@ -175,6 +175,14 @@ class GptboxTests(unittest.TestCase):
         self.assertFalse(self.engine.containers)
         self.assertEqual(self.app.assert_ready_identity, RUNTIME)
         command_lists = [call[0] for call in self.engine.calls]
+        for call in command_lists:
+            if call[0] == '/usr/bin/systemd-run' and any(operation in call for operation in ('load','save','build')):
+                temp = [value for value in call if value.startswith('TMPDIR=')]
+                self.assertEqual(len(temp),1)
+                self.assertIn('/image-work/image-copy',temp[0])
+                self.assertGreater(call.index(temp[0]),call.index('-i'))
+        wrapper = Path(self.app.wrapper).read_text()
+        self.assertIn(str(g.fedora_oci.SAVE_FILE_LIMIT),wrapper)
         creates = [call for call in command_lists if 'create' in call]
         self.assertEqual(len(creates), 2)
         self.assertTrue(any('--network=slirp4netns:allow_host_loopback=false' in call for call in creates))
@@ -363,7 +371,7 @@ class ProductionInputContractTests(unittest.TestCase):
             repo = root / 'reviewed-adapter-source'
             tools = repo / 'tools'
             tools.mkdir(parents=True)
-            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py'):
+            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py'):
                 (tools / name).write_bytes((ROOT / 'tools' / name).read_bytes())
             upstream = root / 'synthetic-upstream-NOT-DISTROBOX'
             upstream.mkdir()
@@ -408,7 +416,9 @@ class ProductionInputContractTests(unittest.TestCase):
             # Redirect only physical module location/external trust pins; preserve
             # production helper implementation and its actual three-value return.
             bootstrap_module = sys.modules[adapter.Bootstrap.__module__]
-            with patch.object(bootstrap_module, '__file__', str(tools / 'bootstrap.py')), \
+            public_dependency = module('production_public_dependency_fixture', tools / 'public_inputs.py')
+            with patch.object(adapter.fedora_oci, '_public_inputs', return_value=public_dependency), \
+                    patch.object(bootstrap_module, '__file__', str(tools / 'bootstrap.py')), \
                     patch.object(adapter, 'candidate', preparation), \
                     patch.object(adapter, 'CODEX_SHA', manifest['codex']['sha256']), \
                     patch.object(adapter, 'DBX_SHA', upstream_sha):

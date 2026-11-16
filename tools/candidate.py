@@ -123,7 +123,8 @@ def check_source(m, fixture):
     if not fixture:
         repo = pathlib.Path(__file__).resolve().parents[1]
         for name, path in (('candidate.py', pathlib.Path(__file__)),
-                           ('fedora_oci.py', pathlib.Path(fedora_oci.__file__))):
+                           ('fedora_oci.py', pathlib.Path(fedora_oci.__file__)),
+                           ('public_inputs.py', pathlib.Path(fedora_oci._public_inputs().__file__))):
             tracked = subprocess.run(
                 ['/usr/bin/git', '-C', str(repo), 'show', m['source_sha'] + ':tools/' + name],
                 check=True, capture_output=True, timeout=10,

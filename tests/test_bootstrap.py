@@ -411,6 +411,7 @@ class BootstrapTests(unittest.TestCase):
         source = repo / 'tools/candidate.py'
         source.write_bytes((ROOT / 'tools/candidate.py').read_bytes())
         (repo / 'tools/fedora_oci.py').write_bytes((ROOT / 'tools/fedora_oci.py').read_bytes())
+        (repo / 'tools/public_inputs.py').write_bytes((ROOT / 'tools/public_inputs.py').read_bytes())
         for arguments in [('init', '--quiet'), ('add', 'tools'),
                           ('-c', 'user.name=Offline fixture', '-c', 'user.email=fixture@example.invalid',
                            '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null',
@@ -456,6 +457,12 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(all('--property=KillMode=control-group' in a for a in engine))
         build = next(a for a in engine if 'build' in a)
         self.assertIn('--network=slirp4netns:allow_host_loopback=false', build)
+        for call in engine:
+            if any(operation in call for operation in ('load','save','build')):
+                temp = [value for value in call if value.startswith('TMPDIR=')]
+                self.assertEqual(len(temp),1)
+                self.assertIn('gptbox-image-work',temp[0])
+                self.assertGreater(call.index(temp[0]),call.index('-i'))
         self.assertIn('--pull=never', build)
         self.assertFalse(any('pull' in call for call in self.fake.calls))
         self.assertIn('--pull=never', build)

@@ -227,16 +227,19 @@ class HTTPSOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch(output):
+def fetch(output, fedora_cache=None):
     with wall_limit(600):
-        return fetch_within_limit(output)
+        return fetch_within_limit(output, fedora_cache)
 
 
-def fetch_within_limit(output):
+def fetch_within_limit(output, fedora_cache=None):
     output = private_directory(output)
     try:
         opener = urllib.request.build_opener(HTTPSOnly())
         for name, (url, size, expected) in ARTIFACTS.items():
+            if fedora_cache is not None and name in fedora_oci.ARTIFACTS:
+                snapshot(pathlib.Path(fedora_cache)/name,output/name,size,expected)
+                continue
             started = time.monotonic()
             copied = 0
             with opener.open(url, timeout=20) as response, open(output / name, 'xb') as dst:
@@ -565,6 +568,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
     fetch_parser = sub.add_parser('fetch')
+    fetch_parser.add_argument('--fedora-cache', type=pathlib.Path)
     fetch_parser.add_argument('--output', required=True, type=pathlib.Path)
     build_parser = sub.add_parser('build')
     build_parser.add_argument('--cache', required=True, type=pathlib.Path)
@@ -577,7 +581,7 @@ def main():
     consumer.add_argument('--output', required=True, type=pathlib.Path)
     args = parser.parse_args()
     if args.command == 'fetch':
-        result = fetch(args.output)
+        result = fetch(args.output, args.fedora_cache)
     elif args.command == 'build':
         result = build(args.cache, args.distrobox_source, args.output)
     else:

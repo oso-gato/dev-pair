@@ -592,6 +592,7 @@ class Probe:
         require(all(len(os.fsencode(root / name)) <= 50 for name in ('graph', 'runroot', 'tmp')),
                 'scratch engine paths exceed Podman 50-byte runroot compatibility limit')
         self.scratch_identity = (info.st_dev, info.st_ino)
+        self.image_copy_active = False
         self.engine_activity = False
         self.report = {'version': REPORT_VERSION, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
                        'controller_sha256': file_hash(pathlib.Path(__file__)),
@@ -632,7 +633,11 @@ class Probe:
 
     def storage_measurement(self, live=False):
         try:
-            return measure_storage(self.root, live=live)
+            measurement = measure_storage(self.root, live=live)
+            reserve = fedora_oci.UNLINKED_RESERVE if self.image_copy_active else 0
+            require(measurement['bytes'] + reserve <= OVERHEAD_LIMIT, 'capacity blocked: image-copy unlinked spool reserve exceeds overhead')
+            measurement['unlinked_spool_reserve_bytes'] = reserve
+            return measurement
         except StorageMeasurementBlocked as exc:
             self.report['storage_measurement_failure'] = exc.diagnostics
             raise
@@ -797,24 +802,43 @@ class Probe:
         signed.mkdir()
         for name, (url, size, expected) in fedora_oci.ARTIFACTS.items():
             download(url, signed / name, size, exact_size=size, expected_sha=expected)
-        with fedora_oci.verified(signed) as (plain, proof):
-            def local_image(*args, **kwargs):
-                if args[0] != 'save': return self.helper(list(args), **kwargs)
-                prefix = list(self.podman)
-                index = prefix.index('/usr/bin/podman')
-                prefix[index:index] = ['/usr/bin/prlimit', '--fsize=' + str(fedora_oci.PLAIN_LIMIT) + ':' + str(fedora_oci.PLAIN_LIMIT)]
-                return self.bounded(prefix + list(args), kwargs.get('timeout', 120), 'bounded OCI save-back')
-            base_proof = fedora_oci.import_image(local_image, plain)
-        self.report['signed_container_base'] = base_proof
-        build = self.root / 'tool-build'
-        build.mkdir()
-        (build / 'Containerfile').write_text(tooling_recipe())
-        shutil.copyfile(self.repo / 'tools/fedora_ci_qemu.py', build / 'qemu_entry.py')
-        (self.root / 'empty-auth.json').write_text('{"auths":{}}\n')
-        self.image = self.helper(['build', '--pull=never', '--http-proxy=false', '--authfile=' + str(self.root / 'empty-auth.json'),
-                                  '--memory=2g', '--cpu-quota=200000', '--force-rm',
-                                  '--ulimit=fsize=2147483648:2147483648', '--iidfile=' + str(self.root / 'tool-image'),
-                                  '--file=' + str(build / 'Containerfile'), str(build)], timeout=600)
+        def reconcile_copy():
+            require(not self.image_copy_active, 'image copy worker termination unresolved; owned scratch preserved')
+        def remove_copy(path):
+            run_small(['sudo','-n','/bin/rm','-rf','--',str(path)],timeout=20)
+        with fedora_oci.copy_workspace(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as copy_tmp:
+            with fedora_oci.verified(signed, temporary_parent=self.root) as (plain, proof):
+                def local_image(*args, **kwargs):
+                    prefix = list(self.podman)
+                    index = prefix.index('/usr/bin/podman')
+                    seconds = min(kwargs.get('timeout',120),self.phase_end-time.monotonic() if self.phase_end else 120)
+                    require(seconds > 0,'image copy deadline exhausted')
+                    extra = ['/usr/bin/env','-i','PATH=/usr/bin:/bin','TMPDIR='+str(copy_tmp),
+                             '/usr/bin/timeout','--signal=TERM','--kill-after=1s',str(seconds)+'s']
+                    if args[0]=='save': extra += ['/usr/bin/prlimit','--fsize='+str(fedora_oci.SAVE_FILE_LIMIT)+':'+str(fedora_oci.SAVE_FILE_LIMIT)]
+                    prefix[index:index]=extra
+                    self.image_copy_active=True
+                    # The unlinked source spool cannot appear in du; charge it
+                    # independently before launch and throughout observation.
+                    try:
+                        self.storage_measurement()
+                    except BaseException:
+                        self.image_copy_active=False  # The worker has not been launched.
+                        raise
+                    value=self.bounded(prefix+list(args),seconds,'owned image copy')
+                    self.image_copy_active=False
+                    return value
+                base_proof = fedora_oci.import_image(local_image, plain)
+            self.report['signed_container_base'] = base_proof
+            build = self.root / 'tool-build'
+            build.mkdir()
+            (build / 'Containerfile').write_text(tooling_recipe())
+            shutil.copyfile(self.repo / 'tools/fedora_ci_qemu.py', build / 'qemu_entry.py')
+            (self.root / 'empty-auth.json').write_text('{"auths":{}}\n')
+            self.image = local_image('build', '--pull=never', '--http-proxy=false', '--authfile=' + str(self.root / 'empty-auth.json'),
+                                      '--memory=2g', '--cpu-quota=200000', '--force-rm',
+                                      '--ulimit=fsize=2147483648:2147483648', '--iidfile=' + str(self.root / 'tool-image'),
+                                      '--file=' + str(build / 'Containerfile'), str(build), timeout=600)
         self.image = run_small(['sudo', '-n', '/usr/bin/cat', str(self.root / 'tool-image')]).decode().strip()
         require(re.fullmatch('sha256:[0-9a-f]{64}', self.image), 'tool image ID missing')
         packages = self.helper(self.run_args('/usr/bin/cat', mounts=False) + [self.image, '/tool-rpms.txt', '/tool-rpm-sha256.txt'])
@@ -830,7 +854,7 @@ class Probe:
         helper = self.repo / 'tools/public_inputs.py'
         cache = self.root / 'public-cache'
         handoff = self.root / 'public-handoff'
-        self.bounded([sys.executable, str(helper), 'fetch', '--output', str(cache)], PUBLIC_SECONDS, 'fixed public input download')
+        self.bounded([sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)], PUBLIC_SECONDS, 'fixed public input download')
         try:
             output = self.bounded([sys.executable, str(helper), 'build', '--cache', str(cache),
                                   '--distrobox-source', str(cache / 'distrobox'), '--output', str(handoff)], PUBLIC_SECONDS, 'strict public input verification/build')
@@ -941,6 +965,7 @@ class Probe:
         info = self.root.lstat()
         require(stat.S_ISDIR(info.st_mode) and not self.root.is_symlink() and info.st_uid == os.getuid() and
                 (info.st_dev, info.st_ino) == self.scratch_identity, 'scratch identity changed; cleanup refused')
+        require(not self.image_copy_active, 'image copy worker unresolved; owned scratch preserved')
         if self.engine_activity:
             result = subprocess.run(self.podman + ['rm', '--force', '--all'], capture_output=True, env=SAFE_ENV, timeout=20)
             require(result.returncode == 0, 'engine cleanup failed; owned scratch preserved for reconciliation: ' +

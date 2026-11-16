@@ -214,6 +214,7 @@ class NonFixturePreparationTests(unittest.TestCase):
         self.source = (ROOT / 'tools/candidate.py').read_bytes()
         self.script.write_bytes(self.source)
         (self.repo / 'tools/fedora_oci.py').write_bytes((ROOT / 'tools/fedora_oci.py').read_bytes())
+        (self.repo / 'tools/public_inputs.py').write_bytes((ROOT / 'tools/public_inputs.py').read_bytes())
         self.git('init', '--quiet')
         self.git('add', 'tools')
         self.git('commit', '--quiet', '-m', 'Synthetic matching source for offline tests')
@@ -285,6 +286,16 @@ class NonFixturePreparationTests(unittest.TestCase):
         verified = self.subject.verify(out, result['context_sha256'])
         self.assertEqual(verified['verification'], 'local-context-integrity-only')
         self.assertEqual(verified['runtime'], 'blocked')
+
+    def test_actual_executed_public_dependency_must_match_recorded_source(self):
+        dependency = self.repo / 'tools/public_inputs.py'
+        dependency.write_bytes(dependency.read_bytes() + b'\nDIRTY_DEPENDENCY_EXECUTED = True\n')
+        spec = importlib.util.spec_from_file_location('dirty_public_dependency_fixture', dependency)
+        executed = importlib.util.module_from_spec(spec); spec.loader.exec_module(executed)
+        self.assertTrue(executed.DIRTY_DEPENDENCY_EXECUTED)
+        with patch.object(self.subject.fedora_oci, '_public_inputs', return_value=executed):
+            with self.assertRaisesRegex(ValueError, 'source SHA'):
+                self.subject.check_source(self.m, False)
 
     def test_existing_git_source_with_different_implementation_is_rejected(self):
         self.script.write_bytes(self.source + b'\n# Different synthetic source revision\n')

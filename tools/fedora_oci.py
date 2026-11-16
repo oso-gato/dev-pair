@@ -40,6 +40,9 @@ PROVENANCE = {'image': IMAGE, 'verification': 'Fedora44 signed release CHECKSUM;
               'layer_sha256': LAYER, 'diff_id_sha256': DIFF, 'signer': FINGERPRINT,
               'checksum_sha256': CHECKSUM_SHA, 'key_sha256': KEY_SHA}
 PLAIN_LIMIT = 80 * MIB
+SAVE_FILE_LIMIT = 192 * MIB
+UNLINKED_RESERVE = 192 * MIB
+IMPORT_PEAK_RESERVE = 768 * MIB
 DIFF_LIMIT = 192 * MIB
 DIFF_BYTES = 188336128
 
@@ -226,12 +229,12 @@ def _wall_deadline(end):
 
 
 @contextlib.contextmanager
-def verified(source, *, seconds=120):
+def verified(source, *, seconds=120, temporary_parent=None):
     """Private captured bytes, fixed pin first, signature before decoding; owned cleanup."""
     capture_regular = _public_inputs().capture_regular
     require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 120, 'invalid Fedora verification budget')
     end = time.monotonic() + seconds
-    with tempfile.TemporaryDirectory(prefix='dev-pair-fedora-') as temporary:
+    with tempfile.TemporaryDirectory(prefix='dev-pair-fedora-', dir=temporary_parent or source) as temporary:
         work = Path(temporary); (work/'home').mkdir()
         with _wall_deadline(end):
             for name, (_, size, expected) in ARTIFACTS.items():
@@ -287,3 +290,51 @@ def import_image(engine, plain, uid=None, seconds=120):
     record['verification'] = 'Source archive chain plus exported config-byte/rootfs-diff equality and full derived descriptor/blob graph'
     record['failure_recovery'] = 'Import is nontransactional; unreferenced store layers may remain, no broad prune/removal'
     return record
+
+
+@contextlib.contextmanager
+def copy_workspace(parent, *, uid=None, reconcile, remove=None, reserve=0):
+    parent = Path(parent).absolute()
+    require(parent.resolve() == parent, 'image copy parent symlink denied')
+    info = parent.stat()
+    require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022,
+            'image copy parent must be controller owned')
+    require(shutil.disk_usage(parent).free >= reserve + IMPORT_PEAK_RESERVE, 'image copy peak/reserve capacity blocked')
+    path, record = parent/'image-copy', parent/'image-copy-owner.json'
+    actor = os.getuid() if uid is None else uid
+    for ancestor in (parent, *parent.parents):
+        node = ancestor.lstat()
+        require(stat.S_ISDIR(node.st_mode) and node.st_mode & (0o100 if node.st_uid==actor else 0o001),
+                'image copy actor cannot traverse intended parent')
+    def identity(target):
+        value = target.lstat()
+        require(stat.S_ISDIR(value.st_mode) and value.st_uid == actor and stat.S_IMODE(value.st_mode) == 0o700,
+                'image copy directory ownership changed')
+        return [value.st_dev,value.st_ino,value.st_uid,value.st_gid,value.st_mode]
+    def recorded():
+        fd=os.open(record,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as stream:
+            node=os.fstat(stream.fileno())
+            require(stat.S_ISREG(node.st_mode) and node.st_uid==os.getuid() and node.st_nlink==1
+                    and stat.S_IMODE(node.st_mode)==0o600 and node.st_size<=2048,'image copy proof invalid')
+            return json.loads(stream.read(2049),object_pairs_hook=unique)
+    def cleanup():
+        require(recorded()==proof and identity(path)==proof['identity'],'image copy ownership proof changed')
+        reconcile()  # Must establish the exact executor stopped; failure preserves the leaf.
+        require(identity(path)==proof['identity'],'image copy directory replaced during reconciliation')
+        (remove or shutil.rmtree)(path)
+        record.unlink()
+    if path.exists() or path.is_symlink() or record.exists() or record.is_symlink():
+        require(path.exists() and record.exists(),'unproven image copy allocation preserved')
+        proof=recorded()
+        require(type(proof) is dict and set(proof)=={'version','parent','identity'} and proof['version']==1
+                and proof['parent']==[info.st_dev,info.st_ino] and proof['identity']==identity(path), 'foreign image copy proof')
+        cleanup()
+    path.mkdir(mode=0o700);path.chmod(0o700)
+    if uid is not None:os.chown(path,uid,-1)
+    proof={'version':1,'parent':[info.st_dev,info.st_ino],'identity':identity(path)}
+    fd=os.open(record,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as stream:
+        os.fchmod(stream.fileno(),0o600);stream.write(json.dumps(proof,sort_keys=True).encode()+b'\n');stream.flush();os.fsync(stream.fileno())
+    try:yield path
+    finally:cleanup()
