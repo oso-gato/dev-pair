@@ -232,12 +232,23 @@ def _wall_deadline(end):
 
 
 @contextlib.contextmanager
-def verified(source, *, seconds=120, temporary_parent=None):
+def _verification_tree(parent, leased):
+    if leased:
+        # The recorded ancestor owns child cleanup, after executor reconciliation.
+        # TemporaryDirectory's destructor must not run before that proof.
+        yield tempfile.mkdtemp(prefix='dev-pair-fedora-', dir=parent)
+    else:
+        with tempfile.TemporaryDirectory(prefix='dev-pair-fedora-', dir=parent) as temporary:
+            yield temporary
+
+
+@contextlib.contextmanager
+def verified(source, *, seconds=120, temporary_parent=None, leased=False):
     """Private captured bytes, fixed pin first, signature before decoding; owned cleanup."""
     capture_regular = _public_inputs().capture_regular
     require(type(seconds) in (int, float) and math.isfinite(seconds) and 0 < seconds <= 120, 'invalid Fedora verification budget')
     end = time.monotonic() + seconds
-    with tempfile.TemporaryDirectory(prefix='dev-pair-fedora-', dir=temporary_parent or source) as temporary:
+    with _verification_tree(temporary_parent or source, leased) as temporary:
         work = Path(temporary); (work/'home').mkdir()
         with _wall_deadline(end):
             for name, (_, size, expected) in ARTIFACTS.items():

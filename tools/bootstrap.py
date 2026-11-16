@@ -1535,7 +1535,7 @@ class Bootstrap:
             if shutil.disk_usage(self.path(storage)).free < 8 * 1024 ** 3:
                 raise Blocked('insufficient free storage reserve for gptbox build')
             with tool.fedora_oci.image_workspaces(self.path(work), uid=int(uid), reconcile=reconcile_copy, reserve=8*1024**3) as (copy_tmp, verification_root):
-                with tool.fedora_oci.verified(self.path(stage), temporary_parent=verification_root) as (plain, proof):
+                with tool.fedora_oci.verified(self.path(stage), temporary_parent=verification_root, leased=True) as (plain, proof):
                     def local_image(*args, **kwargs):
                         prefix = list(base)
                         index = prefix.index('/usr/bin/podman')

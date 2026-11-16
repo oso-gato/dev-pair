@@ -455,7 +455,7 @@ class Gptbox(Bootstrap):
                 work = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/image-work'
                 self.directory(work, mode=0o755)
                 with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=reconcile_copy, reserve=8*1024**3) as (copy_tmp, verification_root):
-                    with fedora_oci.verified(context, temporary_parent=verification_root) as (plain, proof):
+                    with fedora_oci.verified(context, temporary_parent=verification_root, leased=True) as (plain, proof):
                         imported = fedora_oci.import_image(lambda *args, **kw: self.execute('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,*args,**kw), plain, uid=int(self.uid))
                     base = image_id(self.execute('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
                 self.record('fedora-base', imported)

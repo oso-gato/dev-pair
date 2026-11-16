@@ -161,3 +161,17 @@ class SignedBaseRepair(unittest.TestCase):
         with patch.object(f.shutil,'disk_usage',return_value=SimpleNamespace(free=0)):
             f.recover_workspaces(self.parent,reconcile=lambda:calls.append('stopped'))
         self.assertEqual(calls,['stopped','stopped']);self.assertEqual(list(self.parent.iterdir()),[])
+
+    def test_leased_verification_child_survives_until_exact_executor_reconciles(self):
+        seen=[]
+        def unresolved():
+            seen.append((self.parent/'verification-work').exists())
+            raise RuntimeError('executor still uncertain')
+        with self.assertRaises(RuntimeError):
+            with f.copy_workspace(self.parent,reconcile=unresolved,verification=True) as verifying:
+                with f._verification_tree(verifying,True) as child:
+                    child=Path(child);(child/'public-input').write_text('still owned')
+                self.assertTrue((child/'public-input').exists())
+        self.assertEqual(seen,[True]);self.assertTrue((child/'public-input').exists())
+        f.recover_workspaces(self.parent,reconcile=lambda:seen.append('stopped'))
+        self.assertFalse(child.exists())
