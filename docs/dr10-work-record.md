@@ -2,61 +2,58 @@
 
 ## Latest continuation checkpoint
 
-Updated November 16, 2026, 07:46 HKT. Chronological records below retain
+Updated November 16, 2026, 08:14 HKT. Chronological records below retain
 prior evidence and owner decisions.
 
 - Continue draft [PR13](https://github.com/oso-gato/dev-pair/pull/13), branch
   `codex/dr10-reconciliation-review`, coordination tree `/workspace/dev-pair`.
-  Published candidate `932c296`; current documentation checkpoint `52b80c4` is
-  retained on `codex/dr10-reviewed-checkpoint`. Standards remain exact
-  `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
-- Run18 passed337 hosted tests in42.935 seconds and actual root native typed
-  property/FD/relay checks on enforcing Fedora44. Source verification completed;
-  pre/post inspection, full report and outer cleanup passed. Initialization
-  blocked at resolved-discovery after268.25 seconds because the restarted daemon
-  retained5355 listeners. No native dp-maint, package or image acceptance follows.
-  Run18 is closed; no active CI or unchanged retry.
-- Exact atomic() reproduction under provisioning UMask0077 creates the public
-  resolved configuration directory as0700 and its file0644. Root can read it,
-  the daemon cannot traverse it. Native mode was not recorded, so actual run18
-  attribution remains provisional. Sole Sol High builder works on scoped
-  directory/label/diagnostic repair in `/workspace/dev-pair-resolved-directory-repair`,
-  base52b80c4, source window07:39:20–07:51:20 HKT. Candidate `84d4122`, integrated as `9d4c64b`, passed344 tests but review
-  found a malformed-witness report failure. Narrow repair `5f79dc2`, integrated
-  as `7fb59a2`, passed fresh affected review:27 tests and20 independent checks.
-  Native verification awaits the repaired signed-base integration.
-- Signed-base source `914a954` is frozen separately in
-  `/workspace/dev-pair-signed-base` and on remote
-  `codex/signed-fedora-base-checkpoint`.344 tests pass; actual signature checks,
-  producer/consumer and extracted isolated-Python verification pass. Payload
-  is191,666,279 bytes, expanded371,233,612 bytes,293 files, within unchanged
- 192/384MiB ceilings. This is not native import or runtime acceptance.
-- Independent signed-base review requires four repairs: save's80MiB process
-  cap conflicts with its188MB uncompressed spool; temporary/unlinked allocation
-  accounting and owned cleanup are incomplete; an executed sibling is missing
-  from source binding; CI fetches the same Fedora input twice. Evidence:
-  `/workspace/artifacts/signed-base-review-914a954/review.json`, SHA256
-  `a957200989d32ca80c2e7eb31793841018d14cc2dc6a12826bafaec1e1e19b1e`.
-  After the narrow resolved repair, the sole builder addresses this batch in a
-  finite20-minute source slice, then fresh independent affected review. No
-  source/policy/limit waiver or native publication of914 is admitted.
-- Reviewed offline Codex components pass14 actual tool actions plus9 baseline
-  checks with synthetic credentials/private local transport. Complete inventory
-  stays BLOCKED for seven exposed tools; next source handoff is
-  `/workspace/scratch/codex-next-inventory-build-handoff.md`. Production cleanup
-  still has an8192-process census cap; test-only repair does not remove it.
-- Reviewed storage observation/arithmetic provides no hard reservations, quotas,
-  deletion or job admission. Actual preparation/assembly, both gptbox placements,
-  hard storage/cleanup, complete tool/credential isolation, authenticated jobs,
-  durable host-test repair, tailnet cutover/recovery, all-session renewal,
-  enforced independent releases and demonstrator delivery remain incomplete.
-- API selections are Sol High builder and fresh Astra High reviewers. Backend
-  attestation and coordinator metadata are unavailable. VPS remains untouched;
-  root credential reference was checked without disclosure or sending it. This
-  managed cloud has no verified supported VPS SSH route. Local Docker lacks
-  the cgroup enforcement needed for the bounded Fedora VM. No CI/Docker/tunnel
-  workaround, real credential/model call or production promotion is included.
-  The owner does not review code or coordinate workers; PR stays draft/unmerged.
+  Published source remains `932c296`; no active CI. Reviewed native-only
+  checkpoint `713829b` is retained on `codex/dr10-reviewed-checkpoint`.
+  Standards remain exact `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
+- Latest native run18 passed337 hosted tests and actual root typed-property/FD/
+  relay checks on enforcing Fedora44, source verification, reporting and outer
+  cleanup. It blocked at resolved-discovery after268.25 seconds with5355 listeners.
+  Scope is closed; no unchanged retry or dp-maint/package/image acceptance.
+- Resolved source `84d4122` and one-line report repair `5f79dc2` passed fresh
+  independent review: original344 tests,89 affected+18 checks; final repair27
+  affected+20 checks. They are integrated as `9d4c64b`/`7fb59a2`. Local mode proof
+  fixes the reproduced0077-umask directory defect; actual Fedora mode/label/daemon
+  behavior still awaits testing. Unproven old0700 paths are preserved/blocked.
+- Signed-base repairs `049a582` plus `9947579` are integrated locally via
+  `296af23`/`07c55c1`, without conflict. Combined363 tests pass in57.444 seconds.
+  This integration is not published to the PR and does not have signed-path
+  approval. Exact component352 tests and real cached producer/consumer/isolated
+  context checks pass; payload191,679,296 bytes, expanded371,266,948 bytes fit
+  unchanged192/384MiB. Original GPG long-path failure and corrected dearmor/
+  explicit-keyring proof are retained; signer/trust is unchanged.
+- Fresh review closes SB1(save/spool cap), SB3(executed sibling binding) and
+  SB4(cache reuse), but SB2-R1 remains: SIGKILL leaves141,119,921 bytes of verified
+  temporary work; exhausted-attempt cleanup-only skips image work; new capacity
+  admission precedes old-owned reclaim. Receipt:
+  `/workspace/artifacts/signed-base-repair-review-9947579/review.json`, SHA256
+  `a9caab11033225a3e8e3d1b47dbf0e9b5f22f8377317d6908f0a758e0710869e`.
+- Sole Sol High builder repairs this bounded cleanup batch in
+  `/workspace/dev-pair-signed-base`, baseline994,08:13:34–08:28:34 HKT. Fresh
+  `/root/signed_cleanup_review` prepares affected review. Both controller verifier
+  and actor copy leaves need proven ownership/recovery, exact executor stop,
+  retry/cleanup-only coverage and old reclaim before new admission. No broad
+  deletion or budget change. One combined Fedora run follows only after review
+  and integration checks pass; no run is currently admitted.
+- Offline inventory expansion is paused clean before edits in
+  `/workspace/dev-pair-tool-inventory`, branch `codex/offline-tool-inventory`,
+  baseline07c55c1, about32 minutes of its source slice remaining. Handoff:
+  `/workspace/scratch/codex-next-inventory-build-handoff.md`. Existing14 actual
+  actions+9 baseline checks pass; seven tool names remain unclosed. No new
+  stock experiment or model/auth call has occurred for the expansion.
+- Hard storage/cleanup, actual maintenance assembly, true nested development
+  gptbox, complete tool/credential isolation, authenticated jobs, durable host
+  repair, tailnet cutover/recovery, all-session renewal, enforced releases and
+  demonstrator delivery remain incomplete. Source tests are not runtime proof.
+- Sol High/fresh Astra High are accepted API selections; backend attestation and
+  coordinator metadata are unavailable. VPS remains untouched, credential values
+  undisclosed/unsent. No verified supported VPS SSH route; local Docker lacks
+  required cgroup enforcement. No CI/Docker/tunnel workaround or production
+  promotion. The owner does not review code or coordinate workers.
 
 ## Recorded baseline and authority
 
@@ -2534,3 +2531,44 @@ checkpoint08:09:14 HKT. Fresh repair reviewer `/root/signed_base_repair_review`
 is prepared. Actual CI host uses Podman4.9.3; Fedora guest uses5.8.1, so source
 semantics and eventual native evidence must cover both instead of transferring
 one version's behavior. No active CI, VPS action or production admission.
+
+### November 16, 2026, 08:14 HKT — signed integration and remaining recovery defect
+
+Candidate `994757957be295f66a88aa28d765b2b39ede5d3e`, built from914 through
+049, passed352 tests in57.233 seconds and actual strict Cosign/Fedora checks,
+producer/consumer and extracted Python-I context verification. The producer
+first exposed GPG's agent socket limit in long owned staging paths. The corrected
+public-key dearmor/explicit keyring needs no import agent, retains exact pinned
+key and VALIDSIG, and passes real long-path crypto/graph verification. Original
+failure stderr and both pipeline receipts remain in
+`/workspace/artifacts/signed-repair-994757957be295f66a88aa28d765b2b39ede5d3e/`.
+Payload191679296 bytes, expanded371266948 bytes,294 files; manifest SHA256
+`2957ca99797b8a99191382a1bda0709fcb03b38a7411c32b3876b56a8ffc2303`,
+payload `2aad232ed094924ce2b4942025cf7377812a29af2739d23092b6b34a9bd5e660`,
+context `b72700b5f1cd6ec5fa8f889edd667a0009f8ca44ef7f7add56fd1843199f285c`.
+
+Local integration `296af23` merged the signed repair with reviewed native work
+without conflicts;362 tests passed in54.326 seconds. Crypto follow-up994 is
+integrated as `07c55c1`; final combined363 tests pass in57.444 seconds. Logs:
+`/workspace/artifacts/signed-resolved-{combined-tests,crypto-tests,final-combined-tests}.log`.
+These results do not override the independent interrupted-cleanup finding.
+
+Fresh Astra `/root/signed_base_repair_review` passed145 affected tests in16.890
+seconds and independently checked cached crypto, actual pipeline hashes, source
+binding, output/spool boundaries, ownership and cache reuse. SB1/3/4 close at
+source/local level. Actual SIGKILL/retry still leaves141119921 bytes in an
+unrecorded verifier sibling, while only the copy lease is reclaimed. The existing
+cleanup-only branch also skips the image-work lease, and its new768MiB capacity
+gate runs before reclaim of valid previous work. Receipt:
+`/workspace/artifacts/signed-base-repair-review-9947579/review.json`, SHA256
+`a9caab11033225a3e8e3d1b47dbf0e9b5f22f8377317d6908f0a758e0710869e`.
+Independent fixtures were reclaimed after evidence capture. No native execution
+or source mutation occurred in review.
+
+Repair remains within original SB2/R7.12 scope: record both disposable classes,
+stop the exact executor before owned cleanup, cover retry and cleanup-only, and
+reclaim eligible previous work before admitting new allocation. Preserve source,
+cache, evidence and foreign/unproven paths. Sole-builder source window is
+08:13:34–08:28:34 HKT; fresh affected reviewer `/root/signed_cleanup_review`.
+The offline inventory branch is paused clean, not abandoned. No active CI and no
+new native authorization until the repaired exact candidate and integration pass.
