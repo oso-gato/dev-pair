@@ -96,8 +96,11 @@ def _signature(work, end):
     command = _public_inputs().command
     home = work / 'gpg'; home.mkdir(mode=0o700)
     gpg = ['/usr/bin/gpg', '--batch', '--no-options', '--no-autostart', '--no-auto-key-retrieve', '--homedir', str(home)]
-    command(gpg + ['--import', str(work / FILES[2])], work, timeout=max(.001, end-time.monotonic()))
-    status, _ = command(gpg + ['--status-fd=1', '--verify', str(work / FILES[1])], work,
+    keyring = home / 'fedora44.gpg'
+    # Public-key dearmor/verify needs no agent socket (whose Unix path would
+    # otherwise limit controller-owned nested staging paths).
+    command(gpg + ['--dearmor', '--output', str(keyring), str(work / FILES[2])], work, timeout=max(.001, end-time.monotonic()))
+    status, _ = command(gpg + ['--no-default-keyring', '--keyring', str(keyring), '--status-fd=1', '--verify', str(work / FILES[1])], work,
                         timeout=max(.001, end-time.monotonic()))
     require(re.findall(rb'^\[GNUPG:\] VALIDSIG ([A-F0-9]{40}) ', status, re.M) == [FINGERPRINT.encode()],
             'Fedora OCI signer mismatch')

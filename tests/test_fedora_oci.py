@@ -192,6 +192,16 @@ class FedoraOCI(unittest.TestCase):
                               capture_output=True,timeout=3,env={'PATH':'/usr/bin:/bin'})
         self.assertEqual((result.returncode,result.stdout),(0,b'bound\n'),result.stderr)
 
+    def test_real_signature_with_long_owned_home_needs_no_agent_socket(self):
+        work=self.root/('long-owned-staging-'*7);work.mkdir();(work/'home').mkdir()
+        data=Path(__file__).parent/'data/fedora44'
+        shutil.copyfile(data/'container-key.asc',work/f.FILES[2])
+        shutil.copyfile(data/'container-CHECKSUM',work/f.FILES[1])
+        self.assertGreater(len(str(work/'gpg')),108)
+        status=f._signature(work,time.monotonic()+10)
+        self.assertIn('VALIDSIG '+f.FINGERPRINT,status)
+        self.assertFalse(any(node.name.startswith('S.gpg-agent') for node in (work/'gpg').iterdir()))
+
     def test_real_gpg_rejects_altered_signed_checksum(self):
         # Public Fedora key and CHECKSUM are small committed fixtures; no network.
         data=Path(__file__).parent/'data/fedora44'
