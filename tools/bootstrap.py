@@ -1525,16 +1525,17 @@ class Bootstrap:
         else:
             # A writable image-store label/tag is never a completion/provenance record.
             # Interrupted unrecorded builds are rebuilt from the same protected context.
-            if shutil.disk_usage(self.path(storage)).free < 8 * 1024 ** 3:
-                raise Blocked('insufficient free storage reserve for gptbox build')
             def reconcile_copy():
                 if isinstance(self.run, Commands):
                     self.run.reconcile_native(('--unit=dev-pair-gptbox-'+expected+'.service','--description=dev-pair-owned-dev-pair-gptbox-'+expected+'.service','--uid=dp-maint'), {})
             work = '/var/lib/dev-pair/artifacts/gptbox-image-work/' + expected
             self.directory('/var/lib/dev-pair/artifacts/gptbox-image-work', mode=0o755)
             self.directory(work, mode=0o755)
-            with tool.fedora_oci.copy_workspace(self.path(work), uid=int(uid), reconcile=reconcile_copy, reserve=8*1024**3) as copy_tmp:
-                with tool.fedora_oci.verified(self.path(stage), temporary_parent=self.path(work)) as (plain, proof):
+            tool.fedora_oci.recover_workspaces(self.path(work),uid=int(uid),reconcile=reconcile_copy)
+            if shutil.disk_usage(self.path(storage)).free < 8 * 1024 ** 3:
+                raise Blocked('insufficient free storage reserve for gptbox build')
+            with tool.fedora_oci.image_workspaces(self.path(work), uid=int(uid), reconcile=reconcile_copy, reserve=8*1024**3) as (copy_tmp, verification_root):
+                with tool.fedora_oci.verified(self.path(stage), temporary_parent=verification_root) as (plain, proof):
                     def local_image(*args, **kwargs):
                         prefix = list(base)
                         index = prefix.index('/usr/bin/podman')

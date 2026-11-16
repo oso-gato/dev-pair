@@ -806,8 +806,8 @@ class Probe:
             require(not self.image_copy_active, 'image copy worker termination unresolved; owned scratch preserved')
         def remove_copy(path):
             run_small(['sudo','-n','/bin/rm','-rf','--',str(path)],timeout=20)
-        with fedora_oci.copy_workspace(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as copy_tmp:
-            with fedora_oci.verified(signed, temporary_parent=self.root) as (plain, proof):
+        with fedora_oci.image_workspaces(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as (copy_tmp, verification_root):
+            with fedora_oci.verified(signed, temporary_parent=verification_root) as (plain, proof):
                 def local_image(*args, **kwargs):
                     prefix = list(self.podman)
                     index = prefix.index('/usr/bin/podman')

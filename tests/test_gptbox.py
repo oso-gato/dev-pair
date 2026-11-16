@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import gptbox as g
 
+REAL_COPY_WORKSPACE = g.fedora_oci.copy_workspace
+REAL_RECOVER_WORKSPACES = g.fedora_oci.recover_workspaces
 EXPECTED = 'a' * 64
 SOURCE = '1' * 40
 BASE = 'b' * 64
@@ -156,6 +158,28 @@ class GptboxTests(unittest.TestCase):
 
     def assemble(self, retry=False):
         return self.app.assemble(self.context, EXPECTED, '/unused', SOURCE, apply=True, retry=retry)
+
+    def test_exhausted_cleanup_only_reclaims_recorded_image_work(self):
+        self.app.target=g.ROOT+'/'+EXPECTED
+        self.app.directory(self.app.target,mode=0o755)
+        self.app.record('attempt',{'source_sha':SOURCE,'context_sha256':EXPECTED,'distrobox_sha':g.DBX_SHA,'count':2})
+        work=self.app.path('/var/lib/dev-pair/artifacts/gptbox-adapter/'+EXPECTED+'/image-work')
+        work.mkdir(parents=True);work.chmod(0o755)
+        for verification in (False,True):
+            with self.assertRaises(RuntimeError):
+                with REAL_COPY_WORKSPACE(work,reconcile=lambda:(_ for _ in ()).throw(RuntimeError()),verification=verification) as leaf:
+                    (leaf/'residue').write_text('interrupted own work')
+        original=self.app.run
+        def run(*args,**kwargs):
+            if args[:2]==('/usr/bin/id','-u'):return str(os.getuid())+'\n'
+            return original(*args,**kwargs)
+        self.app.run=run
+        with patch.object(g.fedora_oci,'copy_workspace',REAL_COPY_WORKSPACE), \
+             patch.object(g.fedora_oci,'recover_workspaces',REAL_RECOVER_WORKSPACES):
+            with self.assertRaisesRegex(g.Blocked,'build budget exhausted'):self.assemble(retry=True)
+        self.assertEqual(list(work.iterdir()),[])
+        self.assertFalse(any('build' in args for args,kw in self.engine.calls))
+        self.assertEqual(json.loads(self.app.text(self.app.target+'/cleanup-only.json'))['phase'],'complete')
 
     def test_real_command_path_assembles_seals_probes_restarts_cleans_and_never_admits_jobs(self):
         result = self.assemble()

@@ -337,6 +337,15 @@ class Gptbox(Bootstrap):
                 raise Blocked('foreign container collision preserved during recovery')
             self.engine('rm', '--force', image_id(rows[0]['Id']))
 
+    def recover_image_work(self, expected):
+        work = self.path('/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/image-work')
+        if not work.exists() and not work.is_symlink(): return
+        self.protected(work)
+        def reconcile():
+            if isinstance(self.run, Commands):
+                self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
+        fedora_oci.recover_workspaces(work,uid=int(self.uid),reconcile=reconcile)
+
     def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
         self.preflight()
         manifest, self.scripts = self.inputs(context, expected, upstream, revision)
@@ -377,10 +386,12 @@ class Gptbox(Bootstrap):
                 cleanup = {'count': cleanup['count'] + 1, 'phase': 'begin', 'build_attempts': previous['count']}
                 self.record('cleanup-only', cleanup)
                 self.recover_resources(expected)
+                self.recover_image_work(expected)
                 self.record('cleanup-only', {**cleanup, 'phase': 'complete'})
                 raise Blocked('build budget exhausted; exact owned resources cleaned without another build')
             if previous:
                 self.recover_resources(expected)
+                self.recover_image_work(expected)
             if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
                 raise Blocked('eight GiB free reserve is required before assembly')
             self.record('attempt', {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'count': count})
@@ -443,8 +454,8 @@ class Gptbox(Bootstrap):
                         self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
                 work = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/image-work'
                 self.directory(work, mode=0o755)
-                with fedora_oci.copy_workspace(self.path(work), uid=int(self.uid), reconcile=reconcile_copy, reserve=8*1024**3) as copy_tmp:
-                    with fedora_oci.verified(context, temporary_parent=self.path(work)) as (plain, proof):
+                with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=reconcile_copy, reserve=8*1024**3) as (copy_tmp, verification_root):
+                    with fedora_oci.verified(context, temporary_parent=verification_root) as (plain, proof):
                         imported = fedora_oci.import_image(lambda *args, **kw: self.execute('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,*args,**kw), plain, uid=int(self.uid))
                     base = image_id(self.execute('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
                 self.record('fedora-base', imported)

@@ -296,22 +296,23 @@ def import_image(engine, plain, uid=None, seconds=120):
 
 
 @contextlib.contextmanager
-def copy_workspace(parent, *, uid=None, reconcile, remove=None, reserve=0):
+def copy_workspace(parent, *, uid=None, reconcile, remove=None, reserve=0, verification=False, cleanup_only=False):
     parent = Path(parent).absolute()
     require(parent.resolve() == parent, 'image copy parent symlink denied')
     info = parent.stat()
     require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022,
             'image copy parent must be controller owned')
-    require(shutil.disk_usage(parent).free >= reserve + IMPORT_PEAK_RESERVE, 'image copy peak/reserve capacity blocked')
-    path, record = parent/'image-copy', parent/'image-copy-owner.json'
-    actor = os.getuid() if uid is None else uid
+    name = 'verification-work' if verification else 'image-copy'
+    mode = 0o755 if verification else 0o700
+    path, record = parent/name, parent/(name+'-owner.json')
+    actor = os.getuid() if verification or uid is None else uid
     for ancestor in (parent, *parent.parents):
         node = ancestor.lstat()
         require(stat.S_ISDIR(node.st_mode) and node.st_mode & (0o100 if node.st_uid==actor else 0o001),
                 'image copy actor cannot traverse intended parent')
     def identity(target):
         value = target.lstat()
-        require(stat.S_ISDIR(value.st_mode) and value.st_uid == actor and stat.S_IMODE(value.st_mode) == 0o700,
+        require(stat.S_ISDIR(value.st_mode) and value.st_uid == actor and stat.S_IMODE(value.st_mode) == mode,
                 'image copy directory ownership changed')
         return [value.st_dev,value.st_ino,value.st_uid,value.st_gid,value.st_mode]
     def recorded():
@@ -333,11 +334,32 @@ def copy_workspace(parent, *, uid=None, reconcile, remove=None, reserve=0):
         require(type(proof) is dict and set(proof)=={'version','parent','identity'} and proof['version']==1
                 and proof['parent']==[info.st_dev,info.st_ino] and proof['identity']==identity(path), 'foreign image copy proof')
         cleanup()
-    path.mkdir(mode=0o700);path.chmod(0o700)
-    if uid is not None:os.chown(path,uid,-1)
+    if cleanup_only:
+        yield None
+        return
+    require(shutil.disk_usage(parent).free >= reserve + IMPORT_PEAK_RESERVE, 'image copy peak/reserve capacity blocked')
+    path.mkdir(mode=mode);path.chmod(mode)
+    if not verification and uid is not None:os.chown(path,uid,-1)
     proof={'version':1,'parent':[info.st_dev,info.st_ino],'identity':identity(path)}
     fd=os.open(record,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
     with os.fdopen(fd,'wb') as stream:
         os.fchmod(stream.fileno(),0o600);stream.write(json.dumps(proof,sort_keys=True).encode()+b'\n');stream.flush();os.fsync(stream.fileno())
     try:yield path
     finally:cleanup()
+
+
+
+def recover_workspaces(parent, *, uid=None, reconcile, remove=None):
+    # Both prior leases are reclaimed before admission for any new allocation.
+    for verification in (False, True):
+        with copy_workspace(parent,uid=uid,reconcile=reconcile,remove=remove,
+                            verification=verification,cleanup_only=True):
+            pass
+
+
+@contextlib.contextmanager
+def image_workspaces(parent, *, uid=None, reconcile, remove=None, reserve=0):
+    recover_workspaces(parent,uid=uid,reconcile=reconcile,remove=remove)
+    with copy_workspace(parent,uid=uid,reconcile=reconcile,remove=remove,reserve=reserve) as copying:
+        with copy_workspace(parent,reconcile=reconcile,remove=remove,reserve=reserve,verification=True) as verifying:
+            yield copying,verifying

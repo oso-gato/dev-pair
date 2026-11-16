@@ -90,3 +90,14 @@ The actual executing public_inputs.py dependency is included in exact source
 and protection checks. CI seeds the payload cache from its already verified
 Fedora artifact copies; stale bytes reject without overwrite or network fallback.
 No artifact is downloaded twice merely to transfer the same authenticated input.
+
+Interrupted-work recovery also records a controller-owned0755
+`verification-work` ancestor. Its random verification children stay0700 until
+signature/graph verification succeeds; only then is the public input child
+traversable with0444 source bytes. The actor's0700 `image-copy` leaf remains
+separate. After the exact executor is reconciled, retry reclaims both proven
+leases before checking capacity for a new peak. The exhausted-attempt
+cleanup-only route reaches the same recovery without starting another build.
+Unknown/foreign leases and legacy unrecorded siblings remain preserved; names
+alone never authorize deletion. This supplies next-recovery behavior, not a
+finally-after-SIGKILL guarantee or a claim that native helper cleanup is proven.

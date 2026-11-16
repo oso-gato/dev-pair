@@ -120,3 +120,44 @@ class SignedBaseRepair(unittest.TestCase):
             probe.bounded=bounded
             with self.assertRaises(Stop):probe.payload()
         for url,_,_ in fedora.values():self.assertEqual(urls.count(url),1)
+
+    def test_real_sigkill_reclaims_recorded_verifier_and_copy_before_new_capacity(self):
+        import selectors,signal
+        # Portable source suite uses real parser work; the separately recorded
+        # cached experiment below exercises all141MB signed verifier bytes.
+        code=('import sys,time;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import fedora_oci as f;'
+              '\nwith f.image_workspaces(Path(sys.argv[2]),reconcile=lambda:None) as (copy,verify):\n'
+              ' (copy/"copy-marker").write_bytes(b"owned")\n'
+              ' (verify/"private-incomplete").mkdir(mode=0o700)\n'
+              ' (verify/"private-incomplete"/"partial").write_bytes(b"owned verification")\n'
+              ' print("ready",flush=True);time.sleep(20)\n')
+        process=subprocess.Popen([sys.executable,'-c',code,str(Path(f.__file__).parent),str(self.parent)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        selected=selectors.DefaultSelector();selected.register(process.stdout,selectors.EVENT_READ)
+        try:
+            self.assertTrue(selected.select(3));self.assertEqual(process.stdout.readline(),b'ready\n')
+            os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=2)
+        finally:
+            selected.close()
+            if process.poll() is None:os.killpg(process.pid,signal.SIGKILL);process.wait(timeout=2)
+            process.stdout.close();process.stderr.close()
+        self.assertTrue((self.parent/'verification-work/private-incomplete/partial').exists())
+        (self.parent/'foreign').write_text('preserved')
+        from types import SimpleNamespace
+        calls=[]
+        with patch.object(f.shutil,'disk_usage',return_value=SimpleNamespace(free=0)):
+            with self.assertRaisesRegex(ValueError,'capacity'):
+                with f.image_workspaces(self.parent,reconcile=lambda:calls.append('stopped')):pass
+        self.assertEqual(calls,['stopped','stopped'])
+        self.assertEqual(list(self.parent.iterdir()),[self.parent/'foreign'])
+
+    def test_cleanup_only_reclaims_both_leases_without_new_allocation(self):
+        def uncertain():raise RuntimeError('executor unresolved')
+        for verification in (False,True):
+            with self.assertRaises(RuntimeError):
+                with f.copy_workspace(self.parent,reconcile=uncertain,verification=verification) as directory:
+                    (directory/'marker').write_text('preserved until stopped')
+        from types import SimpleNamespace
+        calls=[]
+        with patch.object(f.shutil,'disk_usage',return_value=SimpleNamespace(free=0)):
+            f.recover_workspaces(self.parent,reconcile=lambda:calls.append('stopped'))
+        self.assertEqual(calls,['stopped','stopped']);self.assertEqual(list(self.parent.iterdir()),[])
