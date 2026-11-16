@@ -2,6 +2,51 @@
 
 ## Latest continuation checkpoint
 
+### Owner-requested pause — November 16, 2026, 08:29 HKT
+
+Arthur requested a prompt, durable pause to conserve tokens. Do not resume
+implementation, tests, agents, CI or deployment until Arthur explicitly resumes.
+This pause supersedes the active-work instructions in the older checkpoint below.
+
+- Local integrated source is `d04a17a7a8390b97082a52d7dea80d7b88cd645c` on
+  `codex/dr10-reconciliation-review`; final cleanup commits are integrated as
+  `feecfd1` and `d04a17a`. PR13 remains draft at published `932c296`; no new CI
+  run or deployment was started. The worktree was clean before this record.
+- Exact signed component `7b6a83aa76d45f98d08ad6450b2195788f959bde` completed
+  356 tests in55.868s, cached strict-signature producer/consumer and extracted
+  Python-I verification. Actual SIGKILL/reap/recovery reclaimed141,120,089 bytes.
+  Evidence: `/workspace/artifacts/signed-recovery-7b6a83aa76d45f98d08ad6450b2195788f959bde/evidence.json`.
+- Fresh Astra High review returned `PASS_SOURCE_LOCAL`, no findings, closing
+  SB-2-R1/R2:149 affected tests,42 process/recovery assertions and4 foreign
+  ownership checks. Receipt:
+  `/workspace/artifacts/signed-stop-order-review-7b6a83a/review.json`, SHA256
+  `d226c90ddac4080ed7de0cd851d98b9e16126087d578735fbef0ed9f0f2ed1d8`.
+  Native container/image-store cleanup remains unverified.
+- Previously launched combined suite completed366 tests in57.180s at `feecfd1`.
+  It predates the final `d04a17a` change: no final combined-suite acceptance is
+  claimed. Log: `/workspace/artifacts/signed-cleanup-resolved-combined-tests.log`.
+  No additional tests were started for the pause.
+- Offline inventory remains a separate worktree at `07c55c1`, clean when checked
+  at the pause. The builder was instructed to stop follow-on work and preserve
+  its exact state/budget. No new inventory experiment is claimed.
+- On explicit resume: read the final pause handoff and this record; inspect
+  worktree/process state; verify the final integrated delta with appropriate
+  checks; only after passing checks record and publish one bounded Fedora19
+  attempt under existing limits. Resume inventory only within its remaining
+  allocation. Native assembly, hard storage/cleanup, true nested gptbox,
+  complete tool/credential isolation, jobs, host repair, tailnet recovery,
+  renewal, release enforcement and the demonstrator remain outstanding.
+- VPS untouched; no credentials displayed/sent. No supported SSH route has
+  been verified. Model selections are API-recorded Sol High/Astra High, without
+  backend attestation. Existing product/security decisions and budgets remain.
+
+Final pause handoff: `/workspace/artifacts/dr10-paused-handoff-20261116-0029.json`.
+Builder was interrupted after stop instructions; inventory checkout remains clean.
+A scoped process check found no task-matching execution. Preserve at most28 minutes
+of inventory source allocation on resume; exact resumed usage was not acknowledged.
+
+### Prior active checkpoint (historical)
+
 Updated November 16, 2026, 08:14 HKT. Chronological records below retain
 prior evidence and owner decisions.
 
