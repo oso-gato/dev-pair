@@ -3,12 +3,14 @@
 import argparse
 import base64
 import contextlib
+import copy
 import ctypes
 import errno
 import fcntl
 import hashlib
 import http.server
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -346,6 +348,7 @@ class Sequence:
     def __init__(self,planned,root,end,meter=None):
         self.planned=planned;self.root=Path(root);self.end=end;self.meter=meter or Meter();self.action_end=min(end,time.monotonic()+ACTION_SECONDS)
         self.index=0;self.requests=0;self.records=[];self.inventories=[];self.error=None;self.finished=False
+        self.wall_started=time.time()
         self.emitted={};self.returned={};self.definitions={};self.discovered=set()
         self.goal_context=None;self.last_outputs=[];self.last_request_identity=None
         self.thread_id=None;self.pty_id=None;self.pty_retired=False;self.pty_completion_added=False
@@ -387,11 +390,13 @@ class Sequence:
         require(len(own)<=1,'multiple thread goals')
         return own[0] if own else None
 
-    def observe_goal_context(self,item):
+    def observe_goal_context(self,item,create_output=None):
         # Stock goal creation injects named untrusted supervisor context, not an
         # output of a model-issued tool call. Accept only that exact source form
         # after the actual create result and read-only database oracle agree.
-        require(set(item)=={'type','name','namespace','output'} and item['type']=='function_call_output'
+        base={'type','name','namespace','output'}
+        envelope={'id','internal_chat_message_metadata_passthrough'}
+        require(set(item)==base|envelope and item['type']=='function_call_output'
                 and item['name']=='goal_objective' and item['namespace']=='agent'
                 and item['output']==GOAL_OBJECTIVE,'unknown uncorrelated supervisor context')
         require(self.goal_identity is not None,'goal context has no established create result')
@@ -401,6 +406,25 @@ class Sequence:
         if self.goal_context is None:
             require(self.index and self.planned[self.index-1]['id']=='goal-create' and own['status']=='active',
                     'goal context was not caused by correlated creation')
+            if set(item)==base|envelope:
+                require(type(create_output)is dict and create_output.get('type')=='function_call_output'
+                        and create_output.get('call_id')=='goal-create','goal context missing correlated history envelope')
+                def stamped(value):
+                    ident=value.get('id');metadata=value.get('internal_chat_message_metadata_passthrough')
+                    require(type(ident)is str and re.fullmatch(r'fco_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',ident),
+                            'invalid goal context history ID')
+                    require(type(metadata)is dict and set(metadata)=={'turn_id','create_time'}
+                            and type(metadata['turn_id'])is str and re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',metadata['turn_id'])
+                            and type(metadata['create_time'])in (int,float) and math.isfinite(metadata['create_time'])
+                            and self.wall_started-ACTION_SECONDS <= metadata['create_time'] <= min(self.wall_started+SECONDS,time.time()+ACTION_SECONDS),
+                            'invalid goal context history metadata')
+                    return ident,metadata
+                context_id,context_metadata=stamped(item);create_id,create_metadata=stamped(create_output)
+                require(context_id!=create_id and context_metadata['turn_id']==create_metadata['turn_id']
+                        and abs(context_metadata['create_time']-create_metadata['create_time'])<=ACTION_SECONDS,
+                        'goal context does not match correlated history turn')
+                require(context_id not in {value.get('id') for value in self.last_outputs if value.get('call_id') is not None},
+                        'goal context history ID collides with an issued result')
             self.meter.add(len(canonical(item['output'])))
             self.goal_context={'item':item,'sha256':digest,'thread_id':self.thread_id,'goal_id':own['goal_id'],
                                'caused_by_call_id':'goal-create','kind':'source-bound-untrusted-supervisor-context'}
@@ -511,6 +535,22 @@ class Sequence:
                 'emitted_item':self.emitted.get(ident),'returned_item':item,'partial_product_exists':self.path('/job/src/partial-patch').exists(),'protected_unchanged':True,**(extra if 'extra' in locals() else {})}
 
     def request(self,body):
+        # Oracles may establish provisional identity or insert the one finite
+        # completion poll. Commit those admissions only after the whole request,
+        # including source-bound supervisor context, validates.
+        fields=('index','finished','action_end','emitted','returned','planned','discovered','goal_identity','goal_context',
+                'metadata_products','pty_id','pty_retired','pty_completion_added')
+        before={name:copy.deepcopy(getattr(self,name)) for name in fields};count=len(self.records)
+        try:return self._request(body)
+        except BaseException as error:
+            staged=self.records[count:];del self.records[count:]
+            for name,value in before.items():setattr(self,name,value)
+            if staged:
+                failed=dict(staged[-1]);failed.update({'pass':False,'check_error':str(error)[:300],'request_admission':'rolled-back'})
+                self.records.append(failed)
+            raise
+
+    def _request(self,body):
         require(not self.finished,'request after finite sequence finished')
         require(time.monotonic()<self.action_end,'tool action deadline exceeded')
         require(type(body)is dict and body.get('model')==MODEL and isinstance(body.get('input'),list),'unexpected model/request input')
@@ -548,7 +588,8 @@ class Sequence:
                 self.records.append({'id':action['id'],'pass':False,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':matches[0]['type'],'emitted_item':self.emitted.get(action['id']),
                                      'returned_item':matches[0],'output':payload,'check_error':str(error),'partial_product_exists':self.path('/job/src/partial-patch').exists()})
                 raise
-        for item in context:self.observe_goal_context(item)
+        create_output=next((item for item in outputs if item.get('call_id')=='goal-create'),None)
+        for item in context:self.observe_goal_context(item,create_output)
         rid='offline-response-'+str(self.index)
         events=[{'type':'response.created','response':{'id':rid}}]
         if self.index<len(self.planned):

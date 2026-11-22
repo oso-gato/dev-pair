@@ -371,12 +371,12 @@ class InventoryExtension(unittest.TestCase):
         planned=[a for a in t.inventory_actions() if a['id'] in ('goal-create','goal-duplicate')]
         seq=t.Sequence(planned,self.root,time.monotonic()+5)
         seq.observe_cli(t.canonical({'type':'thread.started','thread_id':thread}));seq.metadata_products=seq.products()
-        context={'type':'function_call_output','namespace':'agent','name':'goal_objective','output':t.GOAL_OBJECTIVE}
+        context=self.stamped_context()
         with self.assertRaisesRegex(ValueError,'established create'):seq.observe_goal_context(context)
         seq.request(self.body())
         with sqlite3.connect(path) as db:db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',(thread,'owned',t.GOAL_OBJECTIVE,'active',None,0,0,2,2))
         payload={'goal':{'threadId':thread,'objective':t.GOAL_OBJECTIVE,'status':'active','tokensUsed':0,'timeUsedSeconds':0}}
-        result=self.result('goal-create',json.dumps(payload))
+        result=self.stamped_create(json.dumps(payload))
         seq.request(self.body([context,result]))
         self.assertEqual(seq.goal_context['caused_by_call_id'],'goal-create');self.assertEqual(seq.goal_context['goal_id'],'owned')
         seq.observe_goal_context(context)
@@ -394,3 +394,46 @@ class InventoryExtension(unittest.TestCase):
             self.assertIsNone(seq.goal_context);self.assertFalse(seq.finished)
             self.assertEqual(seq.last_outputs,items+[last])
             self.assertIsNotNone(seq.last_request_identity)
+
+    def stamped_context(self):
+        return {'type':'function_call_output','namespace':'agent','name':'goal_objective','output':t.GOAL_OBJECTIVE,
+                'id':'fco_00000000-0000-7000-8000-000000000001',
+                'internal_chat_message_metadata_passthrough':{'turn_id':'00000000-0000-7000-8000-000000000003','create_time':time.time()}}
+
+    def stamped_create(self,text):
+        return {'type':'function_call_output','call_id':'goal-create','output':text,
+                'id':'fco_00000000-0000-7000-8000-000000000002',
+                'internal_chat_message_metadata_passthrough':{'turn_id':'00000000-0000-7000-8000-000000000003','create_time':time.time()}}
+
+    def test_stamped_context_forgery_rolls_back_admission_and_preserves_actual_goal_row(self):
+        import sqlite3
+        path=self.database();thread='00000000-0000-7000-8000-000000000004'
+        def prepared():
+            with sqlite3.connect(path) as db:db.execute('DELETE FROM thread_goals WHERE thread_id=?',(thread,))
+            seq=t.Sequence([a for a in t.inventory_actions() if a['id']=='goal-create'],self.root,time.monotonic()+5)
+            seq.observe_cli(t.canonical({'type':'thread.started','thread_id':thread}));seq.metadata_products=seq.products();seq.request(self.body())
+            with sqlite3.connect(path) as db:db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',(thread,'actual-owned',t.GOAL_OBJECTIVE,'active',None,0,0,2,2))
+            payload={'goal':{'threadId':thread,'objective':t.GOAL_OBJECTIVE,'status':'active','tokensUsed':0,'timeUsedSeconds':0}}
+            return seq,self.stamped_create(json.dumps(payload))
+        mutations=[lambda c:c.update(id=None),lambda c:c.update(id='fco_not-uuid'),
+                   lambda c:c.update(id='fco_00000000-0000-7000-8000-000000000002'),
+                   lambda c:c['internal_chat_message_metadata_passthrough'].update(turn_id='00000000-0000-7000-8000-000000000005'),
+                   lambda c:c['internal_chat_message_metadata_passthrough'].update(extra='forged'),
+                   lambda c:c['internal_chat_message_metadata_passthrough'].update(create_time=float('nan')),
+                   lambda c:c['internal_chat_message_metadata_passthrough'].update(create_time=True),
+                   lambda c:c['internal_chat_message_metadata_passthrough'].update(create_time=time.time()+1000),
+                   lambda c:c.update(call_id=None)]
+        for mutate in mutations:
+            seq,result=prepared();context=self.stamped_context();mutate(context)
+            with self.subTest(mutate=mutate),self.assertRaises(ValueError):seq.request(self.body([context,result]))
+            self.assertIsNone(seq.goal_identity);self.assertIsNone(seq.goal_context);self.assertFalse(seq.finished)
+            self.assertEqual(seq.returned,{});self.assertEqual(seq.index,1)
+            self.assertFalse(any(record.get('pass') for record in seq.records))
+            # Actual stock/supervisor effects are observations, never undone by
+            # a rejected request's fixture bookkeeping rollback.
+            self.assertEqual(t.goal_rows(path,thread_id=thread)[0]['goal_id'],'actual-owned')
+            self.assertEqual(seq.last_outputs,[context,result])
+        seq,result=prepared();context=self.stamped_context()
+        seq.request(self.body([context,result]));self.assertTrue(seq.finished);self.assertIsNotNone(seq.goal_context)
+        changed=json.loads(json.dumps(context));changed['internal_chat_message_metadata_passthrough']['create_time']+=.01
+        with self.assertRaisesRegex(ValueError,'replay changed'):seq.observe_goal_context(changed)

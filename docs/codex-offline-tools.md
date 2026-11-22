@@ -84,10 +84,17 @@ context item (`context-fragments/src/additional_context.rs` and
 `ext/goal/src/tool.rs` at the same pinned source). The fixture recognizes only
 `function_call_output` with omitted call ID, namespace `agent`, name
 `goal_objective` and the exact planned objective, first alongside a correlated
-successful create result and its actual thread/database identity. It records
-this supervisor context separately and permits only unchanged replay. Other
-uncorrelated items block. A protocol rejection retains bounded complete output
-items, request hash/size and issued IDs for diagnosis under the existing caps.
+successful create result and its actual thread/database identity. The durable
+history boundary (`core/src/session/mod.rs`) adds its `fco_` UUIDv7 and the
+two-field turn-ID/creation-time metadata. The fixture checks exactly those six
+fields, distinct result IDs, the same valid turn as the correlated create output
+and finite timestamps within the experiment/action bounds. It records this
+supervisor context separately and permits only unchanged replay. Other
+uncorrelated items block. Acceptance bookkeeping is staged for the whole request;
+failed context validation keeps actual database/file effects and failure evidence
+while rolling back provisional passing records and identities. A protocol
+rejection retains bounded complete output items, request hash/size and issued IDs
+for diagnosis under the existing caps.
 
 Actual request tool inventories are hashed and classified from completed checks.
 Unknown/unexercised surfaces block inventory closure and overall status, even when
