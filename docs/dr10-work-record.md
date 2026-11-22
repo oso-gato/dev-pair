@@ -2,6 +2,81 @@
 
 ## Latest continuation checkpoint
 
+### November 22, 2026, 19:45 HKT — reviewed role-directory batching integration
+
+- Native [run23](https://github.com/oso-gato/dev-pair/actions/runs/45014587567),
+  exact `032391a1d996c317222f7246996dfefbbcd2f163`, passed 428 hosted tests
+  in 71.763 seconds, signed inputs, all nine tooling stages with exit zero,
+  enforcing Fedora boot and resolved discovery checks. Actual maintenance sudo
+  denial passed: complete 52-byte exact text, empty stderr, payload/native zero
+  and verified relay. Guest sudo was 1.9.17, release 7.p2.fc44, x86_64;
+  provenance remains package-only with `policy_plugin_verified=false`.
+- Initialization blocked after 621.061 seconds in the subsequent role-directory
+  ownership lookup sequence. The latest lookup launcher was killed (-9) with
+  relay verification false; raw argv and the primary exception were withheld.
+  That status may reflect controller cleanup after another error. The existing
+  prepare ceiling is 600 seconds, but expiry remains a source-supported
+  hypothesis, not a proved primary cause. Development sudo denial was not
+  reached. Outer cleanup passed; guest cleanup remains unverified. No prepared
+  or assembled image proof followed; host package inventory was not retained.
+  This native scope is closed. Evidence:
+  `/workspace/artifacts/fedora-ci-run-45014587567-controller.json`, `-report.json`
+  and `.log`; bounded diagnosis:
+  `/workspace/artifacts/resume-20261122/run23-prepare-budget-diagnosis.json`.
+- Reviewed source `bfd8252b3a8220c7748f1936398d1cd07d08585b` resolves each
+  fixed role's checked canonical UID/GID once after its account/private-group/
+  sudo checks. Both IDs bind to that verified role before eight existing
+  descriptor operations. The pair is local to one contiguous batch under the
+  bootstrap lock; no global/persistent owner or admission cache, direct NSS
+  bypass or cross-role/retry reuse exists. Existing leaves require exact
+  mode/UID/GID and reject symlink/foreign conflicts without adoption. Ordinary
+  directory callers still resolve fresh. Lookups decrease from 32 to four,
+  avoiding 28 native launches; future runtime fit is not promised.
+- Fixed role lookup IDs and directory substeps retain bounded counts. A typed
+  prepare-budget witness snapshots configured/effective/elapsed time,
+  `deadline_reached_at_exit` and `timer_fired` before later adapter/cleanup
+  phases. Only the existing actual SIGALRM handler sets the last bit. Elapsed
+  time or crossing the deadline alone is not labeled the primary failure cause.
+  Public timing/owner evidence is bound to the same checked source/context;
+  malformed/nonfinite/wrong-target values cannot yield admitted evidence.
+  Raw errors, argv, account output and reusable ID values remain withheld.
+- Seven new filesystem/timer/projection tests, 63 bootstrap and 16 initialize
+  tests passed. The exact immutable source passed 436 full tests in 71.642
+  seconds; log SHA256
+  `180012c68ebb839ab76b07bdfe0c3aab0d2b39e045b90723e068d76437a5e5bf`.
+  Builder receipt `/workspace/artifacts/role-batch-bfd8252/evidence.json`, SHA256
+  `8493ce3b5c80d0bd136646a81d4d0b7e7aab5f77a63951256a7769fa252d6103`.
+  Fresh Astra High review passed 141 checks with no findings:
+  `/workspace/artifacts/role-batch-review-bfd8252/review.json`, SHA256
+  `ec385ca0e98c655fea0d2f905e5fc7d304c5eed6df1a89bfd8e281958e2e00a6`.
+- Main fast-forwarded exactly from `032391a` to reviewed `bfd8252`; source tree
+  `bd8f3789af52aedd47816dad31976b38700e440a` matched before documentation.
+  Only README DR2.5 and this checkpoint change afterward. Exact tree/Markdown
+  delta/link checks suffice for this documentation-only commit; the already
+  passing immutable-source full suite is not repeated. Integration receipt:
+  `/workspace/artifacts/integration-role-batch-20261122/evidence.json`.
+- One changed-candidate native24 attempt is recorded for the same bounded
+  configuration/mode/label/listener, restricted-role, signed preparation,
+  maintenance assembly and owned-cleanup scope as execution reaches. CI must
+  build and verify fresh exact published-HEAD inputs. Keep hosted 60 minutes;
+  controller 3300 seconds (setup 540, VM 2640, cleanup 120), tooling 540/kill 10
+  seconds and prepare 600 seconds; guest 6 GiB/2 CPU/32 GiB virtual;
+  outer 8 GiB/3 CPU/1024 PIDs; overlay 16 GiB, overhead 4 GiB, host reserve
+  3 GiB, guest reserve 8 GiB; logs 8 MiB/report 64 KiB. No unchanged retry,
+  real auth/model call, VPS operation, privilege/confinement/network/storage
+  exception or production promotion is included. Cleanup uncertainty stays
+  failure; no missing runtime gate is waived.
+- The separate session fixture is not integrated here. Its one stock641
+  experiment stopped at a history metadata guard after nine baseline passes
+  and complete cleanup, with no accepted checkpoint/resume; actual session or
+  marker effects remain unverified, not established zero. The rejected wire
+  shape was not retained. Metadata repair `73ba2e2` passed source tests and is
+  under fresh review; it has no new stock proof or runtime admission.
+- A12 model/effort selections remain API-recorded Sol High and fresh Astra High
+  local workers, with backend attestation unavailable. Full tool/provider,
+  distinct-owner/storage, image/assembly/nested, authenticated-session/renewal,
+  host recovery, tailnet, release and designated-host acceptance remain open.
+
 ### November 22, 2026, 18:51 HKT — reviewed ledger recovery and sudo oracle integration
 
 - Native [run22](https://github.com/oso-gato/dev-pair/actions/runs/45011104016),
