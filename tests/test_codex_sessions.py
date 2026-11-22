@@ -43,18 +43,19 @@ class SessionsTests(unittest.TestCase):
         self.assertEqual(actual.returncode,0,actual.stderr)
         return actual.stdout.decode()
 
-    def first(self,label):
+    def first(self,label,preamble=()):
         self.observed(label)
-        first=message(s.prompt(label,'first',NONCE));self.j.request(body([first]))
+        first=message(s.prompt(label,'first',NONCE));contexts=copy.deepcopy(list(preamble))+[first]
+        self.j.request(body(contexts))
         issued=copy.deepcopy(self.j.turn['issued']);output=self.run_action(issued)
         returned={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(output)}
-        self.j.request(body([first,issued,returned]))
+        self.j.request(body(contexts+[issued,returned]))
         self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
         return issued,returned
 
     def history(self,label):
         entry=self.j.entries[label]
-        return [message(entry['context']),copy.deepcopy(entry['call']),copy.deepcopy(entry['output']),
+        return copy.deepcopy(entry['user_context'])+[copy.deepcopy(entry['call']),copy.deepcopy(entry['output']),
                 message(s.prompt(label,'resume',NONCE))]
 
     def test_two_same_cwd_sessions_bound_to_retained_history_and_real_progress(self):
@@ -93,6 +94,59 @@ class SessionsTests(unittest.TestCase):
             self.assertIsNone(self.j.turn['issued'])
             self.assertEqual(self.j.entries,before)
         self.assertEqual(len(self.j.records),2)
+
+    def test_sr1_observed_ordered_context_rejects_mutations_and_exact_resume_works(self):
+        preamble=[message('actual first preamble'),message('actual second preamble')]
+        self.first('alpha',preamble);self.first('beta')
+        entry=self.j.entries['alpha'];expected=copy.deepcopy(preamble)+[message(s.prompt('alpha','first',NONCE))]
+        self.assertEqual(entry['user_context'],expected)
+        self.assertEqual(self.j.records[0]['context_sha256'],t.sha(t.canonical(expected)))
+        self.assertNotEqual(self.j.records[0]['context_sha256'],t.sha(s.prompt('alpha','first',NONCE).encode()))
+        valid=self.history('alpha');variants=[]
+        for index in (0,2):
+            for text in ('unobserved prefix ', ' unobserved suffix'):
+                changed=copy.deepcopy(valid)
+                changed[index]['content'][0]['text']=text+changed[index]['content'][0]['text']+text
+                variants.append(changed)
+        variants.append(valid[:1]+[message('injected prior user message')]+valid[1:])
+        variants.append(valid[1:])
+        variants.append([valid[1],valid[0],*valid[2:]])
+        variants.append([valid[0],*valid])
+        changed=copy.deepcopy(valid);changed[0]['id']='changed-history-id';variants.append(changed)
+        changed=copy.deepcopy(valid);changed[-1]['content'][0]['text']+=' suffix';variants.append(changed)
+        for items in variants:
+            self.observed('alpha','resume');before=copy.deepcopy(self.j.entries)
+            with self.assertRaises(ValueError):self.j.request(body(items))
+            self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+            self.assertEqual(self.j.entries,before)
+        self.observed('alpha','resume');self.j.request(body(valid))
+        issued=copy.deepcopy(self.j.turn['issued']);output=self.run_action(issued)
+        returned={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(output)}
+        self.j.request(body(valid+[issued,returned]))
+        self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
+        self.assertEqual(s.marker(self.root,'alpha',('first','resume'),NONCE)['lines'],2)
+        self.assertEqual(self.j.records[-1]['context_sha256'],t.sha(t.canonical(expected+[message(s.prompt('alpha','resume',NONCE))])))
+
+    def test_sr1_first_result_retains_observation_and_does_not_undo_actual_effect(self):
+        self.observed('alpha');contexts=[message('observed preamble'),message(s.prompt('alpha','first',NONCE))]
+        self.j.request(body(contexts));retained=copy.deepcopy(self.j.turn['user_context'])
+        issued=copy.deepcopy(self.j.turn['issued']);output=self.run_action(issued)
+        returned={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(output)}
+        contexts[0]['content'][0]['text']='changed after first request'
+        with self.assertRaises(ValueError):self.j.request(body(contexts+[issued,returned]))
+        self.assertEqual(self.j.turn['user_context'],retained)
+        self.assertIsNone(self.j.turn['returned']);self.assertFalse(self.j.entries)
+        self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
+
+    def test_sr1_first_prompt_is_complete_exact_message_not_substring(self):
+        expected=s.prompt('alpha','first',NONCE)
+        cases=[[message('prefix '+expected)],[message(expected+' suffix')],
+               [message(expected),message(expected)], [message(expected),message('extra after prompt')],
+               [{'type':'message','role':'user','content':[{'type':'input_text','text':expected},{'type':'input_text','text':'extra'}]}]]
+        for items in cases:
+            self.observed('alpha')
+            with self.assertRaises(ValueError):self.j.request(body(items))
+            self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
 
     def test_extra_tool_output_cannot_be_hidden_by_one_matching_json_line(self):
         self.observed('alpha');first=message(s.prompt('alpha','first',NONCE))
@@ -207,7 +261,7 @@ class SessionsTests(unittest.TestCase):
         database=self.root/'state/sqlite/state_5.sqlite';database.parent.mkdir(parents=True)
         rollout=self.root/'state/codex/sessions/fixture.jsonl';rollout.parent.mkdir(parents=True)
         rows=[{'type':'session_meta','payload':{'id':IDS['alpha'],'cwd':'/job'}},
-              {'type':'response_item','payload':message(entry['context'])},
+              *({'type':'response_item','payload':item} for item in entry['user_context']),
               {'type':'response_item','payload':entry['call']},
               {'type':'response_item','payload':entry['output']}]
         rollout.write_bytes(b'\n'.join(t.canonical(v) for v in rows)+b'\n')

@@ -36,8 +36,14 @@ Every completed process is terminated/reaped before starting a fresh process.
 `exec resume UUID` uses each exact observed UUID; names, --last, cwd selection,
 fabricated rollout/session records and fresh-thread substitutions cannot count.
 Before emitting continuation work, the server requires the actual resumed request
-to carry the correct prior user context and exact previously observed call/result
-pair in order, with the other session excluded. Unknown/orphan/duplicate/reordered
+to carry the exact complete ordered user-message sequence independently observed
+in the first request, plus one exact new continuation prompt, and the exact
+previously observed call/result pair in order. First-result requests must retain
+the same observed context too. The expected prompt is a separate exact full-message
+binding, never a substring or a substitute for observed history. No metadata
+normalization is performed; any needed normalization requires pinned-source proof.
+Reported context hashes derive from the observed message sequence. The other
+session is excluded. Unknown/orphan/duplicate/reordered
 call outputs or changed history reject without committing acceptance bookkeeping.
 Then one fixed command appends the session's second distinct marker; complete
 successful output and filesystem bytes must match exactly. Both first actions

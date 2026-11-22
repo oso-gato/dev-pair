@@ -111,6 +111,28 @@ def input_texts(inputs):
     return result
 
 
+def user_context(inputs):
+    """Retain complete observed ordered messages; no metadata normalization."""
+    result = []
+    optional = {'id','status','phase','encrypted_content','internal_chat_message_metadata_passthrough'}
+    for index,item in enumerate(inputs):
+        if type(item) is not dict or item.get('role') != 'user':continue
+        require(item.get('type') == 'message' and {'type','role','content'} <= set(item) <=
+                {'type','role','content'} | optional, 'unknown user-context envelope')
+        content = item['content']
+        require(type(content) is list and 0 < len(content) <= 32 and all(type(part) is dict and
+                set(part) == {'type','text'} and part['type'] == 'input_text' and type(part['text']) is str
+                for part in content), 'unknown user-context content')
+        result.append((index,copy.deepcopy(item)))
+    require(result and len(canonical([item for _,item in result])) <= t.BODY_BYTES,
+            'missing or excessive observed user context')
+    return result
+
+
+def exact_prompt_message(item, expected):
+    return item['content'] == [{'type':'input_text','text':expected}]
+
+
 class Journey:
     """Evidence is retained from first turns, never supplied by a resume caller."""
     def __init__(self, root, end, meter, nonce):
@@ -128,7 +150,8 @@ class Journey:
         else:
             require(label in self.entries and expected_uuid == self.entries[label]['uuid'], 'resume UUID not bound to retained checkpoint')
         self.turn = {'label': label, 'phase': phase, 'expected_uuid': expected_uuid, 'uuid': None,
-                     'issued': None, 'returned': None, 'finished': False, 'started': 0, 'completed': 0}
+                     'issued': None, 'returned': None, 'finished': False, 'started': 0, 'completed': 0,
+                     'user_context':None}
         self.cli_ready.clear(); self.action_end = min(self.end, time.monotonic() + t.ACTION_SECONDS)
 
     def observe_cli(self, raw):
@@ -174,19 +197,31 @@ class Journey:
         encoded = canonical(body); require(len(encoded) <= t.BODY_BYTES, 'request body exceeded')
         self.meter.add(len(encoded)); self.last_request = {'sha256': sha(encoded), 'bytes': len(encoded)}
         require(self.cli_ready.wait(max(0, min(t.ACTION_SECONDS, self.action_end-time.monotonic()))), 'request before actual CLI session identity')
-        label, phase = turn['label'], turn['phase']; inputs = body['input']; texts = input_texts(inputs)
+        label, phase = turn['label'], turn['phase']; inputs = body['input']; observed = user_context(inputs)
+        contexts = [item for _,item in observed]
         own = prompt(label,'first',self.nonce); current = prompt(label,phase,self.nonce)
-        own_positions = [i for i,text in texts if own in text]
-        require(len(own_positions) == 1, 'prior session context absent or duplicated')
+        own_positions = [i for i,item in observed if exact_prompt_message(item,own)]
+        require(len(own_positions) == 1, 'exact prior prompt absent or duplicated')
+        if phase == 'first':
+            require(exact_prompt_message(contexts[-1],own), 'first prompt must be the exact final user message')
+            if turn['user_context'] is not None:
+                require(canonical(contexts) == canonical(turn['user_context']), 'first-result user context changed')
+        else:
+            retained = self.entries[label]['user_context']
+            require(len(contexts) == len(retained)+1 and canonical(contexts[:-1]) == canonical(retained),
+                    'prior ordered user context changed/injected/removed')
+            require(exact_prompt_message(contexts[-1],current), 'continuation prompt must be an exact new user message')
+            if turn['user_context'] is not None:
+                require(canonical(contexts) == canonical(turn['user_context']), 'continuation user context changed')
         other = next(value for value in LABELS if value != label)
         require(('OFFLINE_SESSION_' + other.upper() + '_') not in encoded.decode(), 'cross-session context present')
         allowed = {}
         if phase == 'resume':
             entry = self.entries[label]
-            current_positions = [i for i,text in texts if current in text]
-            require(len(current_positions) == 1 and own_positions[0] < current_positions[0], 'continuation context order invalid')
+            current_positions = [observed[-1][0]]
             first_call, first_output = self.pair(inputs, entry['issued'])
-            require(own_positions[0] < first_call[0] < first_output[0] < current_positions[0] and
+            require(all(i < first_call[0] for i,_ in observed[:-1]) and
+                    own_positions[0] < first_call[0] < first_output[0] < current_positions[0] and
                     canonical(first_call[1]) == canonical(entry['call']) and canonical(first_output[1]) == canonical(entry['output']),
                     'restored history not identical to independently observed first turn')
             allowed[entry['issued']['call_id']] = entry['issued']
@@ -199,6 +234,7 @@ class Journey:
         pending = None
         if turn['issued'] is not None:
             call, output = self.pair(inputs, turn['issued'])
+            require(all(i < call[0] for i,_ in observed), 'user context moved across current action')
             require(call[0] > (current_positions[0] if phase == 'resume' else own_positions[0]), 'new action precedes current context')
             _, status, payload = t.terminal_header(output[1]['output'])
             require(status == 0 and payload == '\n'+canonical(progress(label,phase,self.nonce)).decode()+'\n',
@@ -211,6 +247,7 @@ class Journey:
         # All incoming evidence is checked before acceptance bookkeeping changes.
         rid = 'session-fixture-' + label + '-' + phase + ('-final' if pending else '-action')
         events = [{'type':'response.created','response':{'id':rid}}]
+        if turn['user_context'] is None:turn['user_context'] = copy.deepcopy(contexts)
         if pending is None:
             issued = action(label,phase,self.nonce); turn['issued'] = issued
             events.append({'type':'response.output_item.done','item':issued})
@@ -228,9 +265,11 @@ class Journey:
                 turn['started'] == turn['completed'] == 1 and turn['returned'] is not None, 'process exited without complete bound progress')
         label, phase = turn['label'], turn['phase']
         if phase == 'first':
-            self.entries[label] = {'uuid':turn['uuid'], 'context':prompt(label,'first',self.nonce),
+            self.entries[label] = {'uuid':turn['uuid'], 'expected_prompt':prompt(label,'first',self.nonce),
+                                  'user_context':copy.deepcopy(turn['user_context']),
                                   'issued':copy.deepcopy(turn['issued']), **copy.deepcopy(turn['returned'])}
-        self.records.append({'label':label,'phase':phase,'uuid':turn['uuid'], 'context_sha256':sha(prompt(label,phase,self.nonce).encode()),
+        self.records.append({'label':label,'phase':phase,'uuid':turn['uuid'], 'context_sha256':sha(canonical(turn['user_context'])),
+                             'user_context_count':len(turn['user_context']),
                              'call_sha256':sha(canonical(turn['returned']['call'])), 'output_sha256':sha(canonical(turn['returned']['output'])),
                              'progress':turn['returned']['effect'], 'pass':True})
 
@@ -282,7 +321,9 @@ def rollout_proof(root, row, entry):
     meta=rows[0];require(meta.get('type')=='session_meta' and meta.get('payload',{}).get('id')==ident and
                         meta['payload'].get('cwd')=='/job', 'rollout metadata is not actual bound session')
     items=[r.get('payload') for r in rows if r.get('type')=='response_item']
-    texts=input_texts(items);require(any(entry['context'] in text for _,text in texts), 'rollout prior context absent')
+    contexts=[item for _,item in user_context(items)]
+    require(canonical(contexts[:len(entry['user_context'])]) == canonical(entry['user_context']),
+            'rollout observed prior user context changed')
     calls=[i for i in items if type(i)is dict and i.get('type')=='function_call' and i.get('call_id')==entry['issued']['call_id']]
     outputs=[i for i in items if type(i)is dict and i.get('type')=='function_call_output' and i.get('call_id')==entry['issued']['call_id']]
     require(len(calls)==len(outputs)==1 and all(calls[0].get(k)==v for k,v in entry['issued'].items()) and
