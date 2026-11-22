@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import shutil
 import subprocess
 import sys
@@ -85,12 +86,42 @@ class Backend:
         return ''.join(f"event: {item['type']}\ndata: {json.dumps(item)}\n\n" for item in messages).encode()
 
 
+class RoleHandler(tools.Handler):
+    def parse_request(self):
+        self.server.http_requests += 1
+        parsed = super().parse_request()
+        if parsed and self.command == 'GET' and self.headers.get('Upgrade', '').lower() == 'websocket':
+            self.server.websocket_upgrades += 1
+        return parsed
+
+
+class RoleServer(tools.FixtureServer):
+    def __init__(self, address, backend):
+        self.connections = 0
+        self.http_requests = 0
+        self.websocket_upgrades = 0
+        self.sequence = backend
+        super().__init__(address, RoleHandler)
+
+    def snapshot(self):
+        return {'connections': self.connections, 'requests': self.http_requests,
+                'websocket_upgrades': self.websocket_upgrades, 'body_requests': self.sequence.bodies}
+
+    def drain(self):
+        # After serving stops, account for connections queued before the last
+        # CLI exited, including bare connections and rejected HTTP methods.
+        self.timeout = 0
+        for _ in range(tools.REQUESTS + 1):
+            if not select.select([self], [], [], 0)[0]:
+                return
+            self.handle_request()
+        raise RuntimeError('role fixture listener did not drain within its connection limit')
+
+
 def launch(host_netns):
     net = tools.private_loopback(host_netns)
     backend = Backend()
-    with tools.FixtureServer(('127.0.0.1', PORT), tools.Handler) as server:
-        server.connections = 0
-        server.sequence = backend
+    with RoleServer(('127.0.0.1', PORT), backend) as server:
         thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .05}, daemon=True)
         thread.start()
         try:
@@ -115,25 +146,30 @@ def launch(host_netns):
             saved = json.loads((operation / 'result.json').read_bytes())
             uuid = result['session_uuid']
             rollouts = list(Path('/state/codex/sessions').rglob(f'*{uuid}.jsonl'))
-            tools.require(result == saved and result['runtime_admitted'] is False and
+            tools.require(result == saved and result['runtime_admitted'] is False and result['owned_cleanup'] == 'reaped' and
                           result['events_sha256'] == digest(events) and ANSWER.encode() in events and
                           len(rollouts) == 1 and ANSWER.encode() in rollouts[0].read_bytes(),
                           'missing completed agent message or durable stock session')
-            tools.require(backend.bodies == 1 and 1 <= backend.requests <= 3 and backend.error is None,
+            before = server.snapshot()
+            tools.require(before['body_requests'] == 1 and before['requests'] == backend.requests and
+                          1 <= before['requests'] <= 3 and backend.error is None,
                           'wrong Responses traffic')
             negative = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
                                       timeout=4, env={'PATH': '/usr/bin:/bin'})
-            tools.require(negative.returncode == 2 and not negative.stdout and backend.bodies == 1,
-                          'duplicate operation was not suppressed')
-            print(json.dumps({'result': result, 'loopback': net, 'requests': backend.requests,
-                              'body_requests': backend.bodies, 'connections': server.connections,
-                              'managed_startup_observed': True, 'stock_rollout_verified': True,
-                              'duplicate_exit': negative.returncode, 'duplicate_request_delta': 0,
-                              'listener_stopped': True}, sort_keys=True))
         finally:
             server.shutdown()
             thread.join(timeout=2)
             tools.require(not thread.is_alive(), 'local listener did not stop')
+        server.drain()
+        after = server.snapshot()
+        deltas = {f'duplicate_{name.removesuffix("s")}_delta': after[name] - value
+                  for name, value in before.items()}
+        tools.require(negative.returncode == 2 and not negative.stdout and backend.error is None and
+                      all(delta == 0 for delta in deltas.values()),
+                      f'duplicate operation was not suppressed: {deltas}, responder error: {backend.error}')
+    print(json.dumps({'result': result, 'loopback': net, **after, **deltas,
+                      'managed_startup_observed': True, 'stock_rollout_verified': True,
+                      'duplicate_exit': negative.returncode, 'listener_stopped': True}, sort_keys=True))
 
 
 def setup(host_netns):

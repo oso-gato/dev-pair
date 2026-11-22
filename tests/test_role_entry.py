@@ -3,12 +3,18 @@ import copy
 import json
 import os
 from pathlib import Path
+import select
+import signal
+import socket
+import subprocess
+import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from role_entry_stock import digest, stage
+from role_entry_stock import Backend, RoleServer, digest, stage
 import gptbox
 import gptbox_runtime as runtime
 
@@ -129,3 +135,138 @@ class ControllerEntryTests(unittest.TestCase):
                 patch.object(self.app, 'execute') as run, self.assertRaisesRegex(gptbox.Blocked, 'durable turn state'):
             self.app.enter('a' * 64, 'b' * 64, 'turn')
         run.assert_called_once()
+
+
+class RoleProcessTests(unittest.TestCase):
+    WORKER = """
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import gptbox_runtime as t
+t.WORK = Path(sys.argv[2])
+t.STATE = t.WORK / 'state'
+t.CODEX_HOME = t.STATE / 'codex'
+t.CODEX = t.WORK / 'child'
+t.TURN_SECONDS = float(sys.argv[3])
+if len(sys.argv) > 4:
+    t.TURN_CLEANUP_SECONDS = 0
+t.verify_files = lambda: {'role': 'maintenance'}
+t.verify_turn_environment = lambda: None
+t.turn_request = lambda role: (dict(operation='turn', role=role, model='gpt-6.2-sol', effort='high',
+                                     endpoint='http://127.0.0.1:39162/v1'), b'fixture', 'synthetic')
+t.STATE.mkdir(mode=0o700)
+try:
+    t.turn()
+except RuntimeError as error:
+    assert str(error) == 'fixed role turn failed', str(error)
+else:
+    raise AssertionError('interrupted turn completed')
+try:
+    os.waitpid(-1, os.WNOHANG)
+except ChildProcessError:
+    pass
+else:
+    raise AssertionError('the turn still owns a child')
+try:
+    t.turn()
+except RuntimeError as error:
+    assert 'already dispatched' in str(error), str(error)
+else:
+    raise AssertionError('the interrupted claim was reused')
+"""
+
+    def test_timeout_and_cancel_reap_the_detached_child_before_returning(self):
+        child = """
+import os, time
+from pathlib import Path
+if os.fork():
+    time.sleep(4)
+    os._exit(0)
+os.setsid()
+Path('ready.pending').write_text(str(os.getpid()))
+Path('ready.pending').replace('ready')
+end = time.monotonic() + 4
+while time.monotonic() < end:
+    if Path('trigger').exists():
+        Path('late-write').touch()
+        break
+    time.sleep(.01)
+"""
+        for cancelled in (None, signal.SIGTERM, signal.SIGINT):
+            with self.subTest(cancelled=cancelled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                executable = root / 'child'
+                executable.write_text(f'#!{sys.executable}\n' + child)
+                executable.chmod(0o700)
+                with subprocess.Popen([sys.executable, '-I', '-c', self.WORKER, str(Path(runtime.__file__).parent),
+                                       directory, '3' if cancelled else '1'], stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, start_new_session=True) as wrapper, \
+                        subprocess.Popen(['/usr/bin/sleep', '7']) as unrelated:
+                    descriptor = None
+                    try:
+                        limit = time.monotonic() + 2
+                        while not (root / 'ready').is_file() and wrapper.poll() is None and time.monotonic() < limit:
+                            time.sleep(.01)
+                        pid = int((root / 'ready').read_text())
+                        descriptor = os.pidfd_open(pid)
+                        self.assertEqual(os.getsid(pid), pid)
+                        if cancelled is not None:
+                            wrapper.send_signal(cancelled)
+                        stdout, stderr = wrapper.communicate(timeout=5)
+                        self.assertEqual((wrapper.returncode, stdout), (0, b''), stderr.decode())
+                        expected = 'cancelled' if cancelled else 'deadline'
+                        self.assertIn(f'({expected}), owned cleanup reaped'.encode(), stderr)
+                        receipt = json.loads((root / 'state/turns/turn/result.json').read_bytes())
+                        self.assertEqual((receipt['status'], receipt['reason'], receipt['owned_cleanup']),
+                                         ('failed-turn', expected, 'reaped'))
+                        self.assertEqual(select.select([descriptor], [], [], 0)[0], [descriptor])
+                        (root / 'trigger').touch()
+                        self.assertFalse((root / 'late-write').exists())
+                        self.assertIsNone(unrelated.poll())
+                    finally:
+                        if wrapper.poll() is None:
+                            wrapper.kill()
+                        if unrelated.poll() is None:
+                            unrelated.terminate()
+                        if descriptor is not None:
+                            try:
+                                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                            finally:
+                                os.close(descriptor)
+
+
+    def test_cleanup_without_confirmation_produces_an_unresolved_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            executable = root / 'child'
+            executable.write_text(f'#!{sys.executable}\n')
+            executable.chmod(0o700)
+            finished = subprocess.run([sys.executable, '-I', '-c', self.WORKER, str(Path(runtime.__file__).parent),
+                                       directory, '2', 'exhausted-cleanup-budget'], capture_output=True, timeout=3)
+            self.assertEqual((finished.returncode, finished.stdout), (0, b''), finished.stderr.decode())
+            self.assertIn(b'(cleanup-failed), owned cleanup unresolved', finished.stderr)
+            receipt = json.loads((root / 'state/turns/turn/result.json').read_bytes())
+            self.assertEqual((receipt['status'], receipt['reason'], receipt['owned_cleanup']),
+                             ('failed-turn', 'cleanup-failed', 'unresolved'))
+
+
+class RoleTransportTests(unittest.TestCase):
+    def test_counts_bare_connections_upgrades_and_rejected_methods(self):
+        backend = Backend()
+        with RoleServer(('127.0.0.1', 0), backend) as server:
+            before = server.snapshot()
+            for request in (
+                b'',
+                b'GET /v1/responses HTTP/1.1\r\nUpgrade: websocket\r\nAuthorization: Bearer '
+                + runtime.OFFLINE_KEY + b'\r\n\r\n',
+                b'DELETE /v1/responses HTTP/1.1\r\n\r\n',
+            ):
+                with socket.create_connection(server.server_address, timeout=1) as client:
+                    client.sendall(request)
+                    client.shutdown(socket.SHUT_WR)
+            server.drain()
+            after = server.snapshot()
+        self.assertEqual({name: after[name] - value for name, value in before.items()},
+                         {'connections': 3, 'requests': 2, 'websocket_upgrades': 1, 'body_requests': 0})
