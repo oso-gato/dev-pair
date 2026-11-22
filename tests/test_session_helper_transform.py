@@ -241,5 +241,61 @@ class HelperTransformTests(unittest.TestCase):
             self.assertEqual(witness['baseline_count'],0 if len(contexts)==1 else 2)
             self.assertIsNone(witness['body'][2]);self.assertEqual(witness['filesystem'],{'status':'unavailable'})
 
+    def test_combined_core_budget_keeps_aggregates_before_optional_fields(self):
+        case,items,old=self.unavailable_resume();entry=case.j.entries['alpha']
+        old=old.replace('</workspace_roots>',''.join('<root>/PRIVATE_ROOT_'+str(i)+'</root>' for i in range(10))+'</workspace_roots>')
+        old=old.replace('type="restricted"','type="restricted" glob_scan_max_depth="4294967295"')
+        old=old.replace('</file_system>',''.join('<entry access="read"><path>/PRIVATE_OLD_'+str(i)+'</path></entry>' for i in range(40))+'</file_system>')
+        old=old.replace('</environment_context>','<status>x</status><error>x</error><environments><environment id="x"><cwd>x</cwd></environment></environments><shell_version>x</shell_version><network enabled="true"><allowed>x</allowed></network><subagents>'+('x'*10000)+'</subagents></environment_context>')
+        entry['user_context'][0]['content']=content(old)
+        path=case.root/'state/codex/sessions/fixture.jsonl';rows=[json.loads(x) for x in path.read_text().splitlines()]
+        rows[1]['payload']['content']=content(old);case.write_rollout(path,rows)
+        row=s.database(case.root,{IDS['alpha']},integrity=True)[IDS['alpha']];case.j.audit_first_rollout(row,'alpha')
+        items[:2]=copy.deepcopy(entry['user_context']);items[0]['content'][0]['text']+=' '
+        new=old.replace('PRIVATE_OLD_','PRIVATE_NEW_').replace('PRIVATE_ROOT_','PRIVATE_NEW_ROOT_').replace('4294967295','4294967294')
+        items[-2]['content']=content(new);items[-1]['content'][0]['text']+='x';items[-1]['id']='PRIVATE_BAD_ID'
+        items[-1].update(encrypted_content='PRIVATE',status='PRIVATE',phase='PRIVATE')
+        items[-1][s.METADATA].update({str(i):'PRIVATE' for i in range(1000)})
+        before=copy.deepcopy((case.j.entries,case.j.turn,case.j.continuations));origins=dict(case.j.helper_origins)
+        with self.assertRaisesRegex(ValueError,'^owned CLI helper binding unavailable$'):case.j.request(body(items))
+        self.assertEqual(before,(case.j.entries,case.j.turn,case.j.continuations));self.assertEqual(origins,case.j.helper_origins)
+        witness=case.j.resume_context_rejection;fs=witness['filesystem']
+        self.assertEqual(fs['status'],'observed');self.assertEqual(fs['counts'],[11,11,42,42,40,40,40])
+        self.assertTrue(fs['truncated']);self.assertNotIn('PRIVATE',json.dumps(witness))
+        for key in ('ordered','multiset','roots','header'):self.assertEqual(fs[key],h.filesystem_witness(content(old),content(new),s.environment_components)[key])
+        # Conservative input-byte maxima dominate reachable entry/user counts.
+        # Exercise every combination of the independent boolean-sized fields,
+        # plus maximum valid depth, field masks, metadata shape and counters.
+        largest=0
+        for bits in range(128):
+            for optional in (False,True):
+                w=copy.deepcopy(witness);f=w['filesystem']
+                for bit,key in enumerate(('old_prefix_present','exact_old_prefix_equal','exact_final_continuation_prompt','original_pair_exact')):
+                    w[key]=bool(bits&(1<<bit))
+                for bit,key in enumerate(('wrapper_equal','complete','truncated'),4):w['components'][key]=bool(bits&(1<<bit))
+                w.update(retained_count=t.BODY_BYTES,observed_count=t.BODY_BYTES,expected_count=t.BODY_BYTES+1,
+                    first_mismatching_original_index=t.BODY_BYTES,baseline_count=128)
+                w['prompt'].update(envelope=(1<<24)-1,metadata=(1<<12)-1,unknown=t.BODY_BYTES,failed=127,id_family='msg-input-uuid',exact_text=bool(bits&1))
+                w['request']['bytes']=t.BODY_BYTES;w['body'][:2]=[t.BODY_BYTES,t.BODY_BYTES]
+                w['environment_checks']=[16383,0 if bits&1 else 16383]
+                w['components'].update(presence=[2047,2047],equal=2047,order=[(1<<44)-1]*2)
+                for index,key in enumerate(w['helper_binding']):w['helper_binding'][key]=bool(bits&(1<<index))
+                f['counts']=[128]*7;f['header']=[[2,2,'4294967295']]*2
+                w['summaries']=[{'optional':'x'*128}] if optional else [];f['details']=[{'optional':'x'*128}] if optional else []
+                s.compact_helper_witness(w);largest=max(largest,len(t.canonical(w)))
+                self.assertLessEqual(len(t.canonical(w)),2048)
+                for key in ('ordered','multiset','roots','header'):self.assertEqual(w['filesystem'][key],f[key])
+                self.assertEqual(w['filesystem']['status'],'observed')
+        self.assertLessEqual(largest,2025)
+        # Helper stage is a separately exported bounded witness; it does not
+        # compete with the resume-context core. Check every supported stage and
+        # the longest publication-failure spelling with maximal request count.
+        for stage in ('ancestry','helper-directory','owned-descriptor','exclusive-lock','binary-alias','recheck','owned-child-helper'):
+            for bits in range(16):
+                helper=copy.deepcopy(case.j.helper_rejection);helper['stage']=stage
+                helper['request']['bytes']=t.BODY_BYTES
+                for bit,key in enumerate(helper['knownness']):helper['knownness'][key]=bool(bits&(1<<bit))
+                self.assertLessEqual(len(t.canonical(helper)),2048)
+
 
 if __name__=='__main__':unittest.main()
