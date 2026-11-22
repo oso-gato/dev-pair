@@ -316,3 +316,13 @@ filesystem changes take priority over omission details; explicit truncation and
 overflow retain aggregate rejection evidence within2KiB. Prefix-based helper
 roles in diagnostics do not establish ownership. This candidate has not run
 stock Codex; copied-executable/process/lock tests are local source evidence only.
+
+
+An unavailable live-helper observation remains the authoritative rejection. The
+fixture now records diagnostic-only filesystem evidence before re-raising that
+same error: an audited retained resume body can be compared with the received
+new fragment even when ownership is unknown. This does not authorize equal-body
+or zero-extra acceptance. First turns have no prior body and explicitly report
+missing-baseline/unavailable; missing, malformed or unsupported bodies remain
+unavailable. First helper/context witnesses retain their original request hashes,
+knownness and at-most2KiB bounded summary; no action or accepted-state change occurs.

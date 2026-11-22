@@ -611,6 +611,46 @@ class Journey:
                      'request':dict(self.last_request) if self.last_request is not None else None}
         self.metadata_rejection=witness
 
+    def record_unavailable_helper_context(self,inputs,observed):
+        """Diagnostic-only input projection; never substitute for the failed binding."""
+        if 'knownness' in self.helper_rejection:return  # Retain the first helper failure and its request binding.
+        phase=self.turn['phase'];label=self.turn['label'];contexts=[item for _,item in observed]
+        entry=self.entries.get(label) if phase=='resume' else None
+        audited=bool(entry is not None and self.first_rollout_audits.get(label)==sha(canonical(entry)))
+        original=[] if entry is None else [item for item in entry['user_context'] if type(item.get(METADATA)) is dict and
+            item[METADATA].get('content_item_kinds')==[ENVIRONMENT_KIND]]
+        old=original[0]['content'] if audited and len(original)==1 else None
+        count=len(entry['user_context']) if entry is not None else 0
+        if phase=='resume':current=contexts[count] if len(contexts)==count+2 else None
+        else:
+            available=[item for item in contexts if type(item.get(METADATA)) is dict and item[METADATA].get('content_item_kinds')==[ENVIRONMENT_KIND]]
+            current=available[0] if len(available)==1 else None
+        new=(current['content'] if type(current) is dict and type(current.get(METADATA)) is dict and
+            current[METADATA].get('content_item_kinds')==[ENVIRONMENT_KIND] else None)
+        known={'helper_available':False,'baseline_audited':audited,'old_body_available':old is not None,'new_body_available':new is not None}
+        self.helper_rejection['knownness']=known
+        if phase!='resume':
+            self.helper_rejection['filesystem']={'status':'unavailable','reason':'missing-baseline'}
+            return
+        if self.resume_context_rejection is not None:return
+        witness=resume_rejection_witness(self,observed,inputs,prompt(label,phase,self.nonce))
+        witness['helper_binding']=known
+        fs=helper.filesystem_witness(old,new,environment_components)
+        witness['filesystem']=fs
+        # Prefer complete aggregate filesystem evidence over redundant entry
+        # summaries and prefix copies; every hash retained is request/source bound.
+        witness['summaries']=[];witness['truncated_summary']=True
+        if witness['exact_old_prefix_equal']:
+            witness.pop('observed_prefix_sha256',None);witness.pop('old_prefix_present',None)
+            witness.pop('first_mismatching_original_index',None)
+        if fs['status']=='observed':
+            while len(canonical(witness))>2048 and fs['details']:
+                fs['details'].pop();fs['truncated']=True
+            if len(canonical(witness))>2048:
+                witness['filesystem']={'status':'overflow','counts':fs['counts'],'checks':fs['checks'],'truncated':True}
+        require(len(canonical(witness))<=2048,'helper rejection witness exceeded bound')
+        self.resume_context_rejection=witness
+
     def request(self, body):
         turn = self.turn
         require(turn is not None and not turn['finished'] and time.monotonic() < self.action_end, 'request outside fixed turn')
@@ -621,7 +661,14 @@ class Journey:
         require(self.cli_ready.wait(max(0, min(t.ACTION_SECONDS, self.action_end-time.monotonic()))), 'request before actual CLI session identity')
         label, phase = turn['label'], turn['phase']; inputs = body['input']; observed = user_context(inputs)
         contexts = [item for _,item in observed]
-        observed_helper=self.observe_helper()
+        try:observed_helper=self.observe_helper()
+        except ValueError:
+            try:self.record_unavailable_helper_context(inputs,observed)
+            except (ValueError,TypeError,KeyError,IndexError,OverflowError,AttributeError):
+                # The original unavailable binding stays authoritative even if
+                # the already-received input cannot support a comparison.
+                if self.helper_rejection is not None:self.helper_rejection.setdefault('filesystem',{'status':'unavailable'})
+            raise
         if observed_helper is not None:self.turn_helper=observed_helper
         own = prompt(label,'first',self.nonce); current = prompt(label,phase,self.nonce)
         own_positions = [i for i,item in observed if exact_prompt_message(item,own)]

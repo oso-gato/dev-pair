@@ -3,6 +3,32 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 00:18 HKT — helper-unavailable filesystem fallback repair
+
+- Review of frozen `e64810a` found a P2 diagnostic gap: unavailable helper binding
+  rejected safely before the filesystem fallback was built. Final review
+  `/workspace/artifacts/session-helper-review-e64810a/review.json`, SHA256
+  `d1e5c42e533fd10dea2af835d48bd14c4cad3f48e447a4a413b77d19d7703ab6`.
+  The original 536-test full pass remains evidence only for that exact base.
+- This narrow repair keeps the identical authoritative helper error and no-action
+  boundary, while building a bounded comparison from already received context
+  and an independently audited retained body. First/missing baselines and invalid
+  filesystem shapes stay explicitly unavailable. Equality is never ownership
+  evidence; original history, helper binding, transform, result and audit gates
+  are unchanged. No extra process/probe, permission, budget or native change.
+- An author evidence-handling mistake reran the independent script in its review
+  directory, overwriting its reproduction JSON. Original failing log, script,
+  review verdict/source remain intact; original JSON bytes were not recoverable
+  and no restoration was fabricated. Integrity incident
+  `/workspace/artifacts/resume-20261122/session-helper-evidence-integrity-incident.json`,
+  SHA256 `98758d7805f69fbc15f38d4b802f0477bec1a714d662a834d011ec8d3b5ed19e`,
+  records original/current hashes. The new output is separate repair evidence,
+  not the original failure. Fresh focused checks and exact review are required;
+  no full suite on this changed candidate is claimed.
+- API-selected GPT-6.1 Sol/high remains backend-unattested. No stock/native/CI,
+  auth/provider/model/VPS/network/main/push action or runtime admission occurs.
+
+
 ### November 23, 2026, 00:07 HKT — strict owned-helper source branch and all-entry fallback
 
 - Isolated source starts from reviewed `8aa45c2`. Finalized diagnosis

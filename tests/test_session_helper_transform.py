@@ -126,5 +126,72 @@ class HelperTransformTests(unittest.TestCase):
         self.assertEqual(summary['counts'][4:],[41,41,41]);self.assertTrue(summary['truncated'])
         self.assertTrue(summary['details']);self.assertIsNone(case.j.turn['issued'])
 
+    def unavailable_resume(self):
+        first,second,old,new,child=self.pair();case=session_fixture.SessionsTests();case.setUp();self.addCleanup(case.doCleanups)
+        path,rows,row,entry,_,_,items=case.environment_resume()
+        entry['user_context'][0]['content']=content(old);rows[1]['payload']['content']=content(old)
+        case.write_rollout(path,rows);case.j.audit_first_rollout(row,'alpha')
+        items[:2]=copy.deepcopy(entry['user_context']);items[-2]['content']=content(new)
+        case.observed('alpha','resume');case.j.helper_binary=self.binary;case.j.helper_origins['alpha']=first
+        original=h.OwnedChild
+        with patch.object(h,'OwnedChild',side_effect=lambda process,end,binary:original(process,end,binary,self.aliases)):case.j.publish_child(child)
+        self.addCleanup(case.j.clear_child)
+        alias=self.directory/'apply_patch';alias.unlink();alias.symlink_to('/PRIVATE_INCOMPATIBLE_EXECUTABLE')
+        return case,items,old
+
+    def test_unavailable_helper_keeps_complete_resume_fallback_and_primary_rejection(self):
+        case,items,old=self.unavailable_resume();retained=copy.deepcopy(case.j.entries)
+        for same in (False,True):
+            current=copy.deepcopy(items)
+            if same:current[-2]['content']=content(old)
+            case.j.resume_context_rejection=None;case.j.helper_rejection=None
+            with self.assertRaisesRegex(ValueError,'^owned CLI helper binding unavailable$'):case.j.request(body(current))
+            self.assertEqual(case.j.entries,retained);self.assertIsNone(case.j.turn['issued']);self.assertIsNone(case.j.turn['user_context'])
+            self.assertFalse(case.j.continuations);self.assertEqual(case.j.helper_rejection['stage'],'binary-alias')
+            witness=case.j.resume_context_rejection;summary=witness['filesystem']
+            self.assertFalse(witness['helper_binding']['helper_available']);self.assertTrue(witness['helper_binding']['baseline_audited'])
+            self.assertEqual(summary['status'],'observed');self.assertEqual(summary['counts'][2:4],[2,2])
+            self.assertEqual(bool(summary['checks'][1]&2),same)
+            self.assertEqual(witness['request'],case.j.last_request);self.assertEqual(witness['harness_sha256'],case.j.harness_sha256)
+            self.assertLessEqual(len(t.canonical(witness)),2048);self.assertNotIn('PRIVATE',json.dumps(witness))
+            first=copy.deepcopy(witness)
+            with self.assertRaises(ValueError):case.j.request(body(current))
+            self.assertEqual(case.j.resume_context_rejection,first)
+
+    def test_unavailable_helper_missing_malformed_or_oversized_body_stays_truthful(self):
+        case,items,old=self.unavailable_resume();variants=[]
+        for value in ('<environment_context><filesystem PRIVATE="SECRET"/></environment_context>',
+                '<!DOCTYPE x [<!ENTITY x "SECRET">]><environment_context/>',
+                '<environment_context><cwd>'+'x'*17000+'</cwd></environment_context>'):
+            changed=copy.deepcopy(items);changed[-2]['content']=content(value);variants.append(changed)
+        variants.append(items[:-2]+[items[-1]])
+        for changed in variants:
+            case.j.resume_context_rejection=None;case.j.helper_rejection=None
+            with self.assertRaisesRegex(ValueError,'^owned CLI helper binding unavailable$'):case.j.request(body(changed))
+            witness=case.j.resume_context_rejection
+            self.assertEqual(witness['filesystem'],{'status':'unavailable'})
+            self.assertLessEqual(len(t.canonical(witness)),2048);self.assertNotIn('SECRET',json.dumps(witness))
+            self.assertIsNone(case.j.turn['issued'])
+        case.j.first_rollout_audits.clear();case.j.resume_context_rejection=None;case.j.helper_rejection=None
+        with self.assertRaises(ValueError):case.j.request(body(items))
+        self.assertFalse(case.j.resume_context_rejection['helper_binding']['old_body_available'])
+        self.assertEqual(case.j.resume_context_rejection['filesystem'],{'status':'unavailable'})
+
+    def test_first_unavailable_helper_never_fabricates_prior_filesystem(self):
+        child=self.start();case=session_fixture.SessionsTests();case.setUp();self.addCleanup(case.doCleanups);case.observed('alpha')
+        case.j.helper_binary=self.binary;original=h.OwnedChild
+        with patch.object(h,'OwnedChild',side_effect=lambda process,end,binary:original(process,end,binary,self.aliases)):case.j.publish_child(child)
+        self.addCleanup(case.j.clear_child);alias=self.directory/'apply_patch';alias.unlink();alias.symlink_to('/PRIVATE_WRONG')
+        environment_item=session_fixture.source_wire(session_fixture.durable_message(environment(str(self.directory)),s.ENVIRONMENT_KIND))
+        inputs=[environment_item,session_fixture.message(s.prompt('alpha','first',NONCE))]
+        with self.assertRaisesRegex(ValueError,'^owned CLI helper binding unavailable$'):case.j.request(body(inputs))
+        self.assertEqual(case.j.helper_origins,{});self.assertIsNone(case.j.turn['issued']);self.assertIsNone(case.j.resume_context_rejection)
+        self.assertEqual(case.j.helper_rejection['filesystem'],{'status':'unavailable','reason':'missing-baseline'})
+        self.assertTrue(case.j.helper_rejection['knownness']['new_body_available'])
+        self.assertFalse(case.j.helper_rejection['knownness']['old_body_available'])
+        first=copy.deepcopy(case.j.helper_rejection)
+        with self.assertRaises(ValueError):case.j.request(body(inputs[-1:]))
+        self.assertEqual(case.j.helper_rejection,first)
+
 
 if __name__=='__main__':unittest.main()
