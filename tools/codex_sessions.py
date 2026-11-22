@@ -368,7 +368,7 @@ def comparison_flag(value,key):
     return bool(value['checks'][1]&(1<<index)) if value['checks'][0]&(1<<index) else None
 
 
-def environment_comparison(journey,contexts,observed,inputs):
+def environment_comparison(journey,contexts,observed,inputs,diagnostic_only=False):
     entry=journey.entries[journey.turn['label']];retained=entry['user_context']
     originals=[item for item in retained if type(item.get(METADATA)) is dict and
                item[METADATA].get('content_item_kinds')==[ENVIRONMENT_KIND]]
@@ -410,14 +410,36 @@ def environment_comparison(journey,contexts,observed,inputs):
     valid=(baseline_valid and new_valid and prompt_valid and audited and positions and comparison['new_message_id_unique'] and
            comparison['current_prompt_id_unique'] and comparison['new_turn_differs_from_old'] and
            comparison['new_turn_matches_current_prompt'] and comparison['exact_environment_content_equal'])
-    if (not valid and journey.helper_binary is not None and journey.owned_child is not None and journey.child_turn is journey.turn and
+    if (not diagnostic_only and not valid and journey.helper_binary is not None and journey.owned_child is not None and journey.child_turn is journey.turn and
             isinstance(journey.turn_helper,helper.Evidence) and journey.turn_helper.owner is journey.owned_child and baseline_valid and new_valid and prompt_valid and audited and positions and
             all(comparison[k] is True for k in ('new_message_id_unique','current_prompt_id_unique','new_turn_differs_from_old','new_turn_matches_current_prompt'))):
         valid=helper.transformed(content(baseline),content(new),journey.helper_origins.get(journey.turn['label']),journey.turn_helper,environment_components)
-    comparison['filesystem']=helper.filesystem_witness(content(baseline),content(new),environment_components)
+    old_body=content(baseline);new_body=content(new)
+    if diagnostic_only:
+        def operand(value):
+            return value if type(value) is list and len(value)==1 and type(value[0]) is dict and set(value[0])=={'type','text'} and value[0]['type']=='input_text' and type(value[0]['text']) is str else None
+        old_body=operand(old_body) if audited else None;new_body=operand(new_body)
+        comparison.update(original_content_bytes=len(canonical(old_body)) if old_body is not None else None,
+            original_content_sha256=sha(canonical(old_body)) if old_body is not None else None,
+            new_content_bytes=len(canonical(new_body)) if new_body is not None else None,
+            new_content_sha256=sha(canonical(new_body)) if new_body is not None else None,
+            exact_environment_content_equal=canonical(old_body)==canonical(new_body) if old_body is not None and new_body is not None else None)
+        if not audited or baseline is None:
+            comparison['baseline_schema']=None;comparison['new_turn_differs_from_old']=None
+        if new is None:
+            for key in ('causal_positions_valid','closed_environment_schema','new_message_id_valid','new_turn_valid'):
+                comparison[key]=None
+    comparison['filesystem']=helper.filesystem_witness(old_body,new_body,environment_components)
     comparison['prompt']=prompt_diagnostic(current,prompt(journey.turn['label'],'resume',journey.nonce))
-    comparison['components']=component_comparison(content(baseline),content(new))
-    return bool(valid),comparison
+    comparison['components']=component_comparison(old_body,new_body)
+    if diagnostic_only:
+        geometry=comparison['components']
+        if old_body is None:geometry['status'][0]='unavailable'
+        if new_body is None:geometry['status'][1]='unavailable'
+        geometry['known']=sum((status=='parsed')<<bit for bit,status in enumerate(geometry['status']))
+        for key in ('presence','order'):
+            geometry[key]=[value if geometry['known']&(1<<bit) else None for bit,value in enumerate(geometry[key])]
+    return bool(valid and not diagnostic_only),comparison
 
 
 RESUME_FIELDS=('type','role','id','content','turn_id','create_time','content_item_kinds','metadata')
@@ -635,11 +657,17 @@ class Journey:
         if self.resume_context_rejection is not None:return
         witness=resume_rejection_witness(self,observed,inputs,prompt(label,phase,self.nonce))
         witness['helper_binding']=known
-        fs=helper.filesystem_witness(old,new,environment_components)
-        witness['filesystem']=fs
-        # Prefer complete aggregate filesystem evidence over redundant entry
-        # summaries and prefix copies; every hash retained is request/source bound.
-        witness['summaries']=[];witness['truncated_summary']=True
+        _,comparison=environment_comparison(self,contexts,observed,inputs,diagnostic_only=True)
+        compact=compact_comparison(comparison)
+        witness['environment_checks']=compact['checks'];witness['baseline_count']=compact['baseline_count']
+        witness['body']=compact['body'];fs=compact['filesystem'];witness['filesystem']=fs
+        geometry=compact['components']
+        witness['components']={key:geometry[key] for key in ('status','known','presence','order','equal','wrapper_equal','complete')}
+        witness['components']['truncated']=bool(geometry['changed']) or geometry['truncated']
+        # One budget keeps the complete core projection and all-entry aggregates.
+        # Redundant per-item summaries and optional target detail yield first.
+        while len(canonical(witness))>2048 and witness['summaries']:
+            witness['summaries'].pop();witness['truncated_summary']=True
         if witness['exact_old_prefix_equal']:
             witness.pop('observed_prefix_sha256',None);witness.pop('old_prefix_present',None)
             witness.pop('first_mismatching_original_index',None)

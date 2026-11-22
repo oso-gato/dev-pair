@@ -3,6 +3,30 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 00:31 HKT — complete unavailable-helper diagnostic preservation
+
+- Fresh review of `c45f0a1` found the remaining P2: filesystem fallback survived,
+  but original component/body and ENV_CHECKS facts were omitted. Final receipt
+  `/workspace/artifacts/session-fallback-review-c45f0a1/review.json`, SHA256
+  `07f5784a1280ad8e9627fc052a17be804312d53f25bc25d20716ba65eb14e12e`.
+- This repair reuses the existing comparison/parser with explicit diagnostic-only
+  execution: helper failure remains authoritative and the transform cannot run.
+  Canonical body lengths/hashes, component knownness/presence/order/equality/
+  wrapper facts, baseline count/audit/schema, causal/ID/turn/schema known/true
+  masks and immutable prefix/pair/request/source bindings coexist with all-entry
+  filesystem aggregates. Missing/unaudited references remain unavailable. One
+  2KiB budget prioritizes the complete core and trims optional detail truthfully.
+- Real wrong-alias, equal/no-extra body, missing/ambiguous/auditless reference,
+  causal/prefix/pair/schema/ID/turn and malformed/overbound inputs are covered
+  without accepted-state/origin/action/result changes. Independent reproducers
+  are copied into the new owned artifact directory and all declared outputs
+  remain there; no original review evidence is executed or overwritten.
+- Focused validation only: the 536-test full pass applies to frozen `e64810a`,
+  not this changed candidate. Fresh exact review remains required. API-selected
+  GPT-6.1 Sol/high is backend-unattested; no stock/native/CI/auth/model/VPS/network,
+  main/push or runtime admission occurs. All original limits remain unchanged.
+
+
 ### November 23, 2026, 00:18 HKT — helper-unavailable filesystem fallback repair
 
 - Review of frozen `e64810a` found a P2 diagnostic gap: unavailable helper binding

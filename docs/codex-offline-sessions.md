@@ -326,3 +326,16 @@ or zero-extra acceptance. First turns have no prior body and explicitly report
 missing-baseline/unavailable; missing, malformed or unsupported bodies remain
 unavailable. First helper/context witnesses retain their original request hashes,
 knownness and at-most2KiB bounded summary; no action or accepted-state change occurs.
+
+
+Unavailable-helper diagnostics reuse `environment_comparison` in an explicit
+non-admitting mode. They retain top-level `body` canonical lengths/hashes,
+`environment_checks` known/true masks in the existing ENV_CHECKS order,
+`baseline_count`, independent prompt/prefix/pair/request/source facts and complete
+filesystem aggregates. `components` retains parse status, known bits (old=1,
+new=2), presence/order/equality/wrapper masks, completeness and honest detail
+truncation. Unaudited/missing old body operands are null/unavailable; new-body
+facts remain independent. No-added-environment operands are unavailable rather
+than invented equal bodies. A single budget preserves this core first, then
+trims optional per-item and filesystem target details within2048 bytes. The
+non-admitting path cannot run the helper transform or authorize any action.

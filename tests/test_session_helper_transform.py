@@ -193,5 +193,53 @@ class HelperTransformTests(unittest.TestCase):
         with self.assertRaises(ValueError):case.j.request(body(inputs[-1:]))
         self.assertEqual(case.j.helper_rejection,first)
 
+    def test_unavailable_fallback_preserves_whole_environment_contract(self):
+        case,items,old=self.unavailable_resume()
+        def rejected(incoming):
+            before=copy.deepcopy((case.j.entries,case.j.turn,case.j.continuations));origins=dict(case.j.helper_origins)
+            case.j.helper_rejection=None;case.j.resume_context_rejection=None
+            with self.assertRaisesRegex(ValueError,'^owned CLI helper binding unavailable$'):case.j.request(body(incoming))
+            self.assertEqual(before,(case.j.entries,case.j.turn,case.j.continuations));self.assertEqual(origins,case.j.helper_origins)
+            witness=case.j.resume_context_rejection
+            self.assertLessEqual(len(t.canonical(witness)),2048);self.assertNotIn('PRIVATE',json.dumps(witness))
+            self.assertFalse(witness['helper_binding']['helper_available'])
+            self.assertEqual(witness['request'],case.j.last_request)
+            self.assertEqual(witness['harness_sha256'],case.j.harness_sha256)
+            return witness
+        def flag(witness,key):return s.comparison_flag({'checks':witness['environment_checks']},key)
+        witness=rejected(items);expected=s.component_comparison(content(old),items[-2]['content'])
+        self.assertEqual(witness['body'],[len(t.canonical(content(old))),len(t.canonical(items[-2]['content'])),t.sha(t.canonical(content(old))),t.sha(t.canonical(items[-2]['content']))])
+        for key in ('status','presence','order','equal','wrapper_equal','complete'):self.assertEqual(witness['components'][key],expected[key])
+        self.assertEqual(witness['components']['known'],3);self.assertTrue(witness['components']['truncated'])
+        self.assertTrue(flag(witness,'causal_positions_valid'));self.assertTrue(flag(witness,'current_prompt_schema'))
+        self.assertFalse(flag(witness,'exact_environment_content_equal'))
+        moved=items[:3]+[items[-2],items[3],items[-1]]
+        self.assertFalse(flag(rejected(moved),'causal_positions_valid'))
+        changed=copy.deepcopy(items);changed[0]['content'][0]['text']+=' '
+        self.assertFalse(rejected(changed)['exact_old_prefix_equal'])
+        changed=copy.deepcopy(items);changed[2]['arguments']='{}'
+        self.assertFalse(flag(rejected(changed),'original_pair_exact'))
+        for target,key,value,check,expected_flag in [(-2,'id',None,'closed_environment_schema',False),
+                (-1,'id','msg_input_'+IDS['alpha'],'current_prompt_schema',False)]:
+            changed=copy.deepcopy(items);changed[target][key]=value;witness=rejected(changed)
+            self.assertIs(flag(witness,check),expected_flag)
+            self.assertEqual(witness['body'][3],t.sha(t.canonical(changed[-2]['content'])))
+        for target,value,check,expected_flag in [(-2,None,'new_turn_valid',False),(-1,IDS['alpha'],'new_turn_matches_current_prompt',False)]:
+            changed=copy.deepcopy(items);changed[target][s.METADATA]['turn_id']=value
+            self.assertIs(flag(rejected(changed),check),expected_flag)
+        case.j.first_rollout_audits.clear();witness=rejected(items)
+        self.assertIsNone(witness['body'][0]);self.assertIsNone(witness['body'][2])
+        self.assertIsNone(flag(witness,'baseline_schema'));self.assertIsNone(flag(witness,'exact_environment_content_equal'))
+        self.assertEqual(witness['components']['status'][0],'unavailable')
+        self.assertIsNone(witness['components']['presence'][0]);self.assertEqual(witness['components']['known'],2)
+        entry=case.j.entries['alpha'];original=copy.deepcopy(entry)
+        for contexts in ([original['user_context'][-1]],[original['user_context'][0],*original['user_context']]):
+            entry.clear();entry.update(copy.deepcopy(original));entry['user_context']=copy.deepcopy(contexts)
+            case.j.first_rollout_audits['alpha']=t.sha(t.canonical(entry))
+            incoming=copy.deepcopy(contexts)+[entry['call'],entry['output'],items[-2],items[-1]]
+            witness=rejected(incoming)
+            self.assertEqual(witness['baseline_count'],0 if len(contexts)==1 else 2)
+            self.assertIsNone(witness['body'][2]);self.assertEqual(witness['filesystem'],{'status':'unavailable'})
+
 
 if __name__=='__main__':unittest.main()
