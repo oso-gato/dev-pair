@@ -158,7 +158,8 @@ class BootstrapTests(unittest.TestCase):
         # observations below remain synthetic, not new Fedora evidence.
         self.inventory = (ROOT / 'tests/data/fedora44/listeners-run7.txt').read_text()
         self.resolved_state = 'LoadState=loaded\nActiveState=active\nUser=systemd-resolve\nMainPID=767\n'
-        for path, value in [('/proc/767/status', 'Uid:\t193\t193\t193\t193\n'),
+        for path, value in [('/proc/767/stat', '767 (systemd-resolve) S '+'0 '*18+'12345 0\n'),
+                            ('/proc/767/status', 'Uid:\t193\t193\t193\t193\n'),
                             ('/proc/767/cgroup', '0::/system.slice/systemd-resolved.service\n'),
                             ('/usr/lib/systemd/systemd-resolved', 'synthetic executable identity only\n')]:
             target = self.app.path(path)

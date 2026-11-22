@@ -1166,8 +1166,20 @@ class Bootstrap:
             tables = self.run('/usr/sbin/nft', 'list', 'tables').splitlines()
             if any(line.strip() != 'table inet dev_pair_bootstrap' for line in tables):
                 raise Blocked('existing nftables rules conflict with vanilla bootstrap')
+        # The identity batch is private to this already captured inventory.
+        # It cannot survive a preflight call, retry, mutation or resolved restart.
+        inventory = self.run('/usr/bin/ss', '-H', '-lntup').splitlines()
+        discovery = [line for line in inventory if len(line.split())>=5 and line.split()[0] in ('tcp','udp')
+            and line.split()[4].rpartition(':')[2]=='5355' and self.resolved_owner(line) is not None]
+        batch = None
+        if len(discovery)>=3 and not self.path(f'{STATE}/prepared').exists():
+            try:
+                batch = self.resolved_service(snapshot=True)
+                if batch is None:raise ValueError()
+            except (Blocked,OSError,ValueError):
+                raise Blocked('unexpected listener: resolved identity unavailable') from None
         # Reject application listeners before creating users, installing packages or changing rules.
-        for line in self.run('/usr/bin/ss', '-H', '-lntup').splitlines():
+        for line in inventory:
             columns = line.split()
             if len(columns) < 5:
                 raise Blocked('cannot parse listener inventory')
@@ -1181,20 +1193,40 @@ class Bootstrap:
                 proto == 'udp' and (port in ('68', '546', '41641') or (local and port in ('53', '123', '323'))))
             if (not allowed and proto in ('tcp', 'udp') and port == '5355'
                     and not self.path(f'{STATE}/prepared').exists()):
-                allowed = self.resolved_listener(line)
+                allowed = self.resolved_listener(line, batch)
             if not allowed and proto == 'tcp':
                 allowed = self.peerapi_listener(line, host.strip('[]'))
             if not allowed and proto == 'udp' and port.isdigit() and 60000 <= int(port) <= 61000:
                 allowed = self.mosh_listener(line)
             if not allowed:
                 raise Blocked('unexpected listener: host is not vanilla; inspect inventory before proceeding')
+        if batch is not None:
+            try:
+                if self.resolved_service(snapshot=True)!=batch:raise ValueError()
+            except (Blocked,OSError,ValueError):
+                raise Blocked('unexpected listener: resolved identity changed') from None
         return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': 'Enforcing',
                 'phase': 'temporary-bootstrap', 'ssh_cutover': 'not implemented'}
 
-    def resolved_service(self):
+    def resolved_process_start(self,pid):
+        # Bounded Linux proc stat: comm may contain spaces and parentheses.
+        with self.path('/proc/'+pid+'/stat').open('rb') as stream:raw=stream.read(4097)
+        if len(raw)>4096:raise Blocked('resolved process identity unavailable')
+        try:
+            text=raw.decode('ascii');end=text.rindex(') ')
+            if not text.startswith(pid+' ('):raise ValueError()
+            fields=text[end+2:].split();start=fields[19]
+            if len(fields)<20 or not re.fullmatch(r'[1-9][0-9]{0,19}',start):raise ValueError()
+            return int(start)
+        except (ValueError,IndexError,UnicodeError):
+            raise Blocked('resolved process identity unavailable') from None
+
+    def resolved_service(self, *, snapshot=False):
         observed = self.run('/usr/bin/systemctl', 'show', '--property=MainPID', '--property=User',
                             '--property=ActiveState', '--property=LoadState', 'systemd-resolved.service', ok=(0, 1, 4))
         fields = dict(line.split('=', 1) for line in observed.splitlines() if '=' in line)
+        if snapshot and (len(observed.splitlines())!=4 or set(fields)!={'MainPID','User','ActiveState','LoadState'}):
+            raise Blocked('resolved service identity incomplete')
         if fields.get('LoadState') == 'not-found' and fields.get('ActiveState') == 'inactive':
             return None
         if fields.get('LoadState') != 'loaded' or fields.get('ActiveState') != 'active' or fields.get('User') != 'systemd-resolve':
@@ -1202,12 +1234,15 @@ class Bootstrap:
         pid = fields.get('MainPID', '')
         if not pid.isdigit() or int(pid) <= 1:
             raise Blocked('systemd-resolved has no valid main process')
+        process_start=self.resolved_process_start(pid) if snapshot else None
         executable = '/usr/lib/systemd/systemd-resolved'
         if str(self.path('/proc/' + pid + '/exe').readlink()) != executable:
             raise Blocked('systemd-resolved executable mismatch')
         binary = self.path(executable)
+        ancestry=[]
         for item in [binary, *binary.parents]:
             info = item.lstat()
+            if snapshot:ancestry.append((info.st_dev,info.st_ino,info.st_mode,info.st_uid,info.st_gid,info.st_nlink,info.st_size,info.st_mtime_ns))
             if item.is_symlink() or info.st_uid != (0 if self.root == Path('/') else os.getuid()) or info.st_mode & 0o022:
                 raise Blocked('systemd-resolved executable path is not protected')
             if item == self.root:
@@ -1220,14 +1255,24 @@ class Bootstrap:
                 or account[2] == '0' or not uid or any(value != account[2] for value in uid.groups())
                 or self.text('/proc/' + pid + '/cgroup').strip() != '0::/system.slice/systemd-resolved.service'):
             raise Blocked('systemd-resolved process owner/cgroup mismatch')
+        if snapshot:
+            if self.resolved_process_start(pid)!=process_start:
+                raise Blocked('resolved process identity changed')
+            return {'pid':pid,'start':process_start,'uid':account[2],'ancestry':tuple(ancestry),
+                'cgroup':'0::/system.slice/systemd-resolved.service','executable':executable}
         return pid
 
-    def resolved_listener(self, line):
+    @staticmethod
+    def resolved_owner(line):
+        owners=re.findall(r'\("([^"\n]+)",pid=(\d+),fd=\d+\)',line)
+        return owners[0][1] if len(owners)==1 and owners[0][0]=='systemd-resolve' else None
+
+    def resolved_listener(self, line, identity=None):
         # The observed Fedora discovery listener is temporary provisioning input,
         # never a general port allowance or post-prepare service policy.
-        owners = re.findall(r'\("([^"\n]+)",pid=(\d+),fd=\d+\)', line)
+        owner=self.resolved_owner(line)
         try:
-            return len(owners) == 1 and owners[0][0] == 'systemd-resolve' and owners[0][1] == self.resolved_service()
+            return owner is not None and owner == (identity['pid'] if identity is not None else self.resolved_service())
         except (Blocked, OSError, ValueError):
             return False
 

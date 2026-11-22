@@ -3,6 +3,26 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 00:53 HKT — ephemeral resolved listener identity batch
+
+- The independent preparation read reduction follows the launcher diagnostic;
+  it does not attribute native30's failure or predict runtime savings. In one
+  already captured preflight inventory, three or more eligible discovery rows
+  use complete fresh resolved-service identities before and after row checks.
+  Both snapshots validate service state/account, UID/cgroup, protected executable
+  ancestry and independently bracketed bounded process-start identity. Every
+  row retains the original owner-count/name/PID predicate; any change blocks.
+- Zero, one and two rows keep their existing query path. The historical four-row
+  fixture reduces identity-query launches from eight to four, as source/fixture
+  evidence only; actual native30 row count was not retained. No identity survives
+  the call, retry, root instance or resolved restart. Configuration/restart,
+  source-admission ordering and all deadlines/resources remain unchanged.
+- Affected tests and the single final combined full suite await the released
+  local process-test slot. The merged session bytes are exactly frozen
+  `1c2ede3`; its separate worktree is untouched. Fresh exact review and separately
+  authorized stock/native proof remain required; no runtime admission follows.
+
+
 ### November 23, 2026, 00:49 HKT — native30 launcher diagnostic source slice
 
 - Actual native30 passed 526 hosted tests and reached the Tailscale signed-package
