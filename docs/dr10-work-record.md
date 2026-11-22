@@ -2,6 +2,86 @@
 
 ## Latest continuation checkpoint
 
+### November 22, 2026, 18:51 HKT — reviewed ledger recovery and sudo oracle integration
+
+- Native [run22](https://github.com/oso-gato/dev-pair/actions/runs/45011104016),
+  exact `724fa89a5a6b6137342a455c3de2ddb83f3fa6ef`, passed 406 hosted tests
+  in 51.105 seconds, signed OCI/Cloud/source verification, all nine tooling
+  markers and tooling timeout status zero. Fedora 44 booted enforcing with
+  systemd 259.5 and kernel 6.19.10. Resolved modes 0755/0644, stock labels and
+  runtime discovery-off checks passed. Preparation then blocked at dp-maint:
+  a relay-verified sudo listing returned zero against the old allowed status one.
+  Actual policy text was withheld; no grants or denial are inferred. Outer
+  cleanup passed; guest cleanup remains unverified. Host package inventory was
+  not retained; prepared maintenance-image proof and assembly were not reached.
+  This native scope is closed. Evidence:
+  `/workspace/artifacts/fedora-ci-run-45011104016-controller.json`, `-report.json`
+  and `.log`. Run22 success does not establish the earlier run21 exit125 cause.
+- Ledger source `9c1eb8b` added SQLite backup and absent-destination restoration,
+  strict read-only schema/history validation, private staging and atomic
+  completion. Its 415 tests and preserved local CLI journey passed, but fresh
+  review found LR-R1: a stale exists observation let an ordinary concurrent
+  opener initialize a restore reservation before its first marker. The rejected
+  candidate and reproduction remain preserved. Repair
+  `63a778892d42898d95e51a47811ef2dc1e81a412` derives ownership solely from
+  exclusive mkdir success; existing private and admission checks remain.
+  It passed 23 affected and 417 full tests, including real competing processes.
+  Fresh Astra High review passed 23 affected, eight race and 11 adversarial
+  checks. Receipt:
+  `/workspace/artifacts/ledger-creation-review-63a7788/review.json`, SHA256
+  `08134a0b2a64377ae0da51bab828b4eea9025b666fbe6e5c20d438598a2f909e`.
+  Builder receipt `/workspace/artifacts/ledger-lrr1-63a7788/evidence.json`, SHA256
+  `80bceab091df350bc9bcbec1419bb308d6538b336cd8482a35c4b0138b80b9f5`.
+  Logical identity, pins, history, results and in-flight state survive local
+  restoration; no host-effect, concurrent failover or full session/platform
+  recovery acceptance follows.
+- Exact upstream sudo 1.9.17p2 source shows that successful no-grants display can
+  return zero. Sudo repair `38a8c8c91eec707fc27965fb295e6be316493c93` requires
+  the complete exact fixed-role C-locale denial bound to verified erebus, empty
+  stderr and supported bounded guest package metadata. Zero alone cannot pass.
+  Native execution retains complete relay identity/control and payload/launcher
+  status agreement. Existing trusted-root standalone preparation retains its
+  fixed direct process, actual waited status and complete pipes, explicitly
+  typed direct with no native exit or relay claim. Execution kind is derived
+  internally; failed native execution cannot fall back to direct.
+- Typed role receipts use stable IDs and closed relay applicability enums;
+  raw policy output remains withheld. Guest NAME/VERSION/RELEASE/ARCH metadata
+  is package-only provenance, with `policy_plugin_verified=false`. Unknown
+  owners, versions or grammar block. No wrapper, privilege or resource/deadline
+  exception was added. Nine new local process/parser tests and 417 full tests
+  passed. The first draft's unsupported 4 KiB relay cap and an intermediate full
+  pass remain preserved; final source retains the existing 1 MiB transport cap.
+  Fresh Astra High review passed 134 affected, eight adversarial and nine
+  regression checks. Receipt:
+  `/workspace/artifacts/sudo-denial-review-38a8c8c/review.json`, SHA256
+  `db113ba6c81f59d1265570278b66ea7ac1394e503fd560b889563e02fcc6517b`.
+  Builder receipt `/workspace/artifacts/sudo-denial-38a8c8c/evidence.json`, SHA256
+  `8bd9f87d3b3a538b7d25ec0eb3d5b0cde115a9567cb338fcc6c9efb889125351`.
+- Reviewed ledger and sudo changes are disjoint from base `724fa89`. Exact merge
+  `56533b5497ac2f386deeef9cb590169ee8537c87` matches computed tree
+  `bad9646610ec8d783b9c188fcde2555c54f94c9b`. Only README DR2.4/DR2.5 and
+  this checkpoint change before one combined full suite on the final head.
+  Component/tree/test receipt:
+  `/workspace/artifacts/integration-ledger-sudo-20261122/`.
+- After a passing combined result, one changed-candidate native23 attempt is
+  recorded under the same bounded scope: configuration/modes/labels/listeners,
+  restricted-role checks, signed preparation, maintenance assembly and owned
+  cleanup as far as execution reaches. CI must build and verify fresh exact
+  published-HEAD inputs. No unchanged retry, real auth/model call, VPS operation,
+  production promotion or security/network/storage exception is included.
+  Limits remain hosted 60 minutes; controller 3300 seconds (setup 540, VM 2640,
+  cleanup 120), tooling 540 seconds/kill 10 seconds; guest 6 GiB/2 CPU/32 GiB
+  virtual; outer 8 GiB/3 CPU/1024 PIDs; overlay 16 GiB, overhead 4 GiB, host
+  reserve 3 GiB, guest reserve 8 GiB; logs 8 MiB/report 64 KiB. Uncertain cleanup
+  remains failure, not waived acceptance.
+- A12 selections remain API-recorded sole builder `gpt-6.1-sol/high` and fresh
+  `gpt-6-astra/high` reviewer/coordinator local subagents; backend attestation
+  and root model/effort remain unavailable. No local product model/auth/native
+  call was made in these source units. Complete tool/provider coverage, hard
+  storage, nested placement, host/session recovery, renewal, tailnet, release
+  and designated-host acceptance remain open. The separate two-session fixture
+  source unit is queued and has not begun.
+
 ### November 22, 2026, 18:08 HKT — reviewed diagnostics and offline inventory integration
 
 - Native [run21](https://github.com/oso-gato/dev-pair/actions/runs/45007529031),
