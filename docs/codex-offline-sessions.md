@@ -37,6 +37,23 @@ python3 tools/session_controller.py --registry /private/controller/session-regis
   --operation turn-alpha-first
 ```
 
+Registry format 2 validates the complete supported SQLite table definitions,
+columns, primary-key indexes and uniqueness before projection or mutation. It
+also checks the full bounded row set, each stored request hash and the single
+logical-session origin/UUID relationship. Unsupported or corrupt schemas and
+contradictory resume records reject; a duplicate ID can never silently omit a
+managed session. Original operation checkpoints remain immutable, while newly
+authorized operations still use the trusted ledger's current checkpoint.
+
+The registry retains descriptors for both the database and lease, persists their
+device/inode identities and compares them with the current paths on reopen,
+reads, mutations and owner entry/exit. Replacing, unlinking or recreating either
+file is an unavailable/conflicting state, never a fresh unlocked lease. Observers
+use the same verified lease inode. Existing format-1 registry files are rejected
+without migration; this does not change the v1 job ledger or its backup schema.
+This is a protected same-UID controller consistency boundary, not a claim against
+arbitrary malicious controller code or production state replacement.
+
 A released owner lease makes active records uncertain in both read-only views.
 Owner loss permits neither automatic adoption nor replay; persisted PIDs are
 only diagnostics. The original deadline and capture meter continue across reads.

@@ -319,3 +319,201 @@ class ControllerTests(unittest.TestCase):
         try:observer.inventory()
         finally:observer.close()
         self.assertEqual(self.registry.path.read_bytes(),before)
+
+class RegistryReviewRepairTests(unittest.TestCase):
+    def test_closed_sql_shapes_columns_constraints_indexes_and_duplicate_ids(self):
+        mutations=[
+            'ALTER TABLE operations ADD COLUMN ignored TEXT',
+            'ALTER TABLE metadata ADD COLUMN ignored TEXT',
+            'CREATE INDEX unexpected ON operations(body)',
+            'CREATE TRIGGER unexpected AFTER INSERT ON operations BEGIN SELECT 1; END',
+        ]
+        for sql in mutations:
+            with self.subTest(sql=sql),tempfile.TemporaryDirectory() as tmp:
+                registry=make_registry(tmp);root=registry.root
+                try:
+                    registry.db.execute(sql)
+                    with self.assertRaises(ValueError):registry.inventory()
+                    with self.assertRaises(ValueError):registry.reserve('new','alpha','fixed',time.monotonic()+2)
+                    with self.assertRaises(ValueError):c.Observer(root)
+                finally:registry.close()
+        for table in ('metadata','operations'):
+            with self.subTest(table=table),tempfile.TemporaryDirectory() as tmp:
+                registry=make_registry(tmp)
+                try:
+                    run_fixed(registry,tmp);rows=registry.db.execute('SELECT * FROM '+table).fetchall()
+                    registry.db.execute('DROP TABLE '+table)
+                    columns='key TEXT,value TEXT NOT NULL' if table=='metadata' else 'id TEXT,body TEXT NOT NULL'
+                    registry.db.execute('CREATE TABLE '+table+'('+columns+')')
+                    if table=='metadata':rows.append(('registry_id',c.canonical('registry-duplicate')))
+                    else:
+                        row=copy.deepcopy(registry.validate_row(rows[0][0],rows[0][1]));row.update(logical_session='beta',uuid=OTHER)
+                        rows.append((rows[0][0],json.dumps(row)))
+                    registry.db.executemany('INSERT INTO '+table+' VALUES (?,?)',rows)
+                    with self.assertRaises(ValueError):registry.inventory()
+                    with self.assertRaises(ValueError):c.Observer(registry.root)
+                finally:registry.close()
+
+    def test_mode_expected_observed_and_logical_uuid_corruption_reject_every_reader(self):
+        mutations=[{'uuid':OTHER},{'uuid':OTHER,'expected_uuid':OTHER},{'mode':'start'},
+                   {'expected_uuid':None},{'state':'completed-turn','cleanup':'not-observed'},
+                   {'state':'reserved'},{'logical_session':'unbound'}, {'mode':'resume','uuid':None}]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as tmp:
+                registry=make_registry(tmp);observer=None
+                try:
+                    run_fixed(registry,tmp);run_fixed(registry,tmp,phase='resume',expected=UUID)
+                    observer=c.Observer(registry.root);row=registry.row('turn-alpha-resume');row.update(mutation)
+                    registry.db.execute('UPDATE operations SET body=? WHERE id=?',(json.dumps(row),'turn-alpha-resume'))
+                    for read in (registry.inventory,lambda:registry.row('turn-alpha-first'),observer.inventory,lambda:observer.reattach('turn-alpha-resume'),lambda:registry.reserve('next','alpha','fixed',time.monotonic()+2,resume=OTHER)):
+                        with self.assertRaises(ValueError):read()
+                    with self.assertRaises(ValueError):c.Observer(registry.root)
+                finally:
+                    if observer:observer.close()
+                    registry.close()
+
+    def test_original_checkpoint_duplicate_new_current_checkpoint_and_valid_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp)
+            try:
+                run_fixed(registry,tmp);first=registry.row('turn-alpha-first')
+                cp=registry.ledger.record('checkpoint','fixed-session-inputs');cp['checkpoint_id']='authorized-new';registry.ledger.checkpoint(cp)
+                duplicate,created=registry.reserve('turn-alpha-first','alpha',s.prompt('alpha','first',NONCE),time.monotonic()-1)
+                self.assertFalse(created);self.assertEqual(duplicate,first)
+                run_fixed(registry,tmp,phase='resume',expected=UUID)
+                self.assertEqual(registry.row('turn-alpha-resume')['checkpoint_id'],'authorized-new')
+                observer=c.Observer(registry.root)
+                try:self.assertEqual(observer.inventory()['sessions'],[{'logical_session':'alpha','uuid':UUID}])
+                finally:observer.close()
+            finally:registry.close()
+
+    def test_held_real_lease_file_replacement_never_allows_another_owner_or_unheld_view(self):
+        for action in ('rename','unlink'):
+            with self.subTest(action=action),tempfile.TemporaryDirectory() as tmp:
+                registry=make_registry(tmp);observer=c.Observer(registry.root)
+                try:
+                    with self.assertRaises(ValueError),registry.owner():
+                        self.assertTrue(observer.owner_held())
+                        if action=='rename':(registry.root/'owner.lock').rename(Path(tmp)/'original.lock')
+                        else:(registry.root/'owner.lock').unlink()
+                        fd=os.open(registry.root/'owner.lock',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)
+                        with self.assertRaises(ValueError):observer.owner_held()
+                        with self.assertRaises(ValueError):observer.inventory()
+                        with self.assertRaises(ValueError):c.Registry(registry.root)
+                    self.assertFalse(registry.owner_active)
+                finally:observer.close();registry.close()
+
+    def test_database_replacement_is_rejected_against_open_and_persisted_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp);observer=c.Observer(registry.root)
+            try:
+                run_fixed(registry,tmp);original=registry.path.read_bytes();replacement=Path(tmp)/'replacement';replacement.write_bytes(original);replacement.chmod(0o600)
+                registry.path.rename(Path(tmp)/'old-database');replacement.rename(registry.path)
+                before=registry.path.read_bytes()
+                for read in (registry.inventory,observer.inventory,lambda:registry.reserve('new','beta','fixed',time.monotonic()+2),lambda:c.Observer(registry.root)):
+                    with self.assertRaises(ValueError):read()
+                self.assertEqual(registry.path.read_bytes(),before)
+            finally:observer.close();registry.close()
+
+    def test_real_process_lease_conflict_and_replacement_authority(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp);root=registry.root;registry.close()
+            code='import sys;sys.path[:0]='+repr([str(Path(__file__).parent),str(Path(c.__file__).parent)])+''';import test_session_controller as f
+r=f.make_registry(sys.argv[1])
+try:
+ try:
+  with r.owner():
+   print('held',flush=True);sys.stdin.readline()
+ except ValueError:print('rejected',flush=True)
+finally:r.close()
+'''
+            child=subprocess.Popen([sys.executable,'-c',code,tmp],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,start_new_session=True)
+            try:
+                self.assertEqual(child.stdout.readline().strip(),'held')
+                second=c.Registry(root);observer=c.Observer(root)
+                try:
+                    self.assertTrue(observer.owner_held())
+                    with self.assertRaisesRegex(ValueError,'busy'):
+                        with second.owner():self.fail('second owner entered')
+                finally:second.close();observer.close()
+                old=Path(tmp)/'original.lock';(root/'owner.lock').rename(old)
+                fd=os.open(root/'owner.lock',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)
+                proof=os.open(old,os.O_RDONLY)
+                try:
+                    with self.assertRaises(BlockingIOError):fcntl.flock(proof,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    with self.assertRaises(ValueError):c.Observer(root)
+                finally:os.close(proof)
+                child.stdin.write('release\n');child.stdin.flush()
+                stdout,stderr=child.communicate(timeout=3);self.assertEqual(child.returncode,0,stderr);self.assertEqual(stdout.strip(),'rejected')
+            finally:
+                if child.poll() is None:os.killpg(child.pid,signal.SIGKILL)
+                child.communicate(timeout=2)
+
+    def test_supported_sql_nullable_keys_and_live_metadata_corruption_cannot_hide_rows(self):
+        for table,key,value in [('operations',None,'{}'),('metadata',None,'"hidden"')]:
+            with self.subTest(table=table),tempfile.TemporaryDirectory() as tmp:
+                registry=make_registry(tmp)
+                try:
+                    registry.db.execute('INSERT INTO '+table+' VALUES (?,?)',(key,value))
+                    registry.db.execute('INSERT INTO '+table+' VALUES (?,?)',(key,value))
+                    with self.assertRaises(ValueError):registry.inventory()
+                    with self.assertRaises(ValueError):registry.reserve('new','alpha','fixed',time.monotonic()+2)
+                    with self.assertRaises(ValueError):c.Observer(registry.root)
+                finally:registry.close()
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp)
+            try:
+                registry.db.execute('UPDATE metadata SET value=? WHERE key=?',(c.canonical('registry-substitute'),'registry_id'))
+                with self.assertRaisesRegex(ValueError,'metadata identity changed'):registry.inventory()
+            finally:registry.close()
+
+    def test_active_owner_cannot_be_closed_or_nested_and_primary_survives_file_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp)
+            try:
+                with registry.owner():
+                    with self.assertRaisesRegex(ValueError,'active'):registry.close()
+                    with self.assertRaisesRegex(ValueError,'nested'):
+                        with registry.owner():self.fail('nested owner entered')
+                    observer=c.Observer(registry.root)
+                    try:self.assertTrue(observer.owner_held())
+                    finally:observer.close()
+                with self.assertRaisesRegex(ValueError,'original fixed primary'),registry.owner():
+                    (registry.root/'owner.lock').unlink()
+                    raise ValueError('original fixed primary')
+            finally:registry.close()
+
+    def test_old_registry_version_is_rejected_without_migration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp);root=registry.root
+            registry.db.execute('PRAGMA user_version=1');registry.close()
+            before=(root/'registry.sqlite3').read_bytes()
+            with self.assertRaises(ValueError):c.Registry(root)
+            self.assertEqual((root/'registry.sqlite3').read_bytes(),before)
+
+
+    def test_stored_request_binding_cannot_relabel_checkpoint_prompt_or_resume(self):
+        for mutation in ({'prompt_sha256':'e'*64},{'prompt_bytes':999},{'checkpoint_id':'substitute'},
+                         {'expected_uuid':OTHER,'uuid':OTHER},{'request_sha256':'0'*64}):
+            with self.subTest(mutation=mutation),tempfile.TemporaryDirectory() as tmp:
+                registry=make_registry(tmp)
+                try:
+                    run_fixed(registry,tmp);run_fixed(registry,tmp,phase='resume',expected=UUID)
+                    row=registry.row('turn-alpha-resume');row.update(mutation)
+                    registry.db.execute('UPDATE operations SET body=? WHERE id=?',(json.dumps(row),'turn-alpha-resume'))
+                    with self.assertRaises(ValueError):registry.inventory()
+                    with self.assertRaises(ValueError):registry.reserve('next','alpha','fixed',time.monotonic()+2,resume=OTHER)
+                finally:registry.close()
+
+
+    def test_outer_handled_exception_does_not_hide_success_path_lease_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            registry=make_registry(tmp)
+            try:
+                try:raise ValueError('outer unrelated handler')
+                except ValueError:
+                    with self.assertRaisesRegex(ValueError,'control-file identity changed'),registry.owner():
+                        (registry.root/'owner.lock').rename(Path(tmp)/'original.lock')
+                        fd=os.open(registry.root/'owner.lock',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);os.close(fd)
+            finally:registry.close()

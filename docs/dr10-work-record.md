@@ -3,6 +3,39 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 03:14 HKT — supervisor SC-R1/2/3 source repair
+
+- The frozen 5d2b73d review found three private-registry integrity defects:
+  unsupported SQL schemas could hide a session behind duplicate IDs, contradictory
+  completed resume rows could substitute a UUID, and a replaced lease file could
+  permit a second owner while the first held the original flock. The original
+  failing receipt and reproducers remain immutable.
+- Registry format 2 validates exact table/column/PK/index contracts and bounded
+  metadata/key uniqueness on open, reads and transactions. Whole-inventory reads
+  enforce state/mode/expected/observed UUID consistency and one logical origin/UUID
+  across all rows. Stored prompt hashes/lengths and canonical request identities
+  detect relabeled checkpoints or resume bindings before admission. New operations
+  still bind new trusted current checkpoints; identical operations keep their old
+  checkpoint and observe-only outcome.
+- Database and lease descriptors remain held; persistent device/inode identities
+  are checked against current paths and held handles. File replacement, unlink or
+  recreation blocks readers and competing owners. Observer lease checks use the
+  verified inode, not a newly opened path or persisted PID. Owner exit retains an
+  existing primary error and rejects otherwise-successful file conflicts. Format-1
+  registries are rejected without migration; ledger-v1/strict backup is unchanged.
+- Real SQLite and held-flock process tests, copied/redirected review reproducers,
+  state-corruption matrices and fixed-adapter/history/helper checks are retained in
+  `/workspace/artifacts/session-registry-repair-20261122/`. The earlier 608-test full
+  pass belongs only to 5d2b73d; this repair uses affected checks, with fresh review
+  and a later combined full suite still required. No stock/native/auth/model or
+  deployment action occurred, and no retrospective fixture acceptance is claimed.
+- All native/bootstrap/image/workflow and original CLI-negative/history/helper/
+  audit code remains unchanged. Private standards remain controller hash receipts
+  only, and actual model/effort/startup consumption and production admission are
+  unverified. API-selected GPT-6.1 Sol/high remains the builder; backend attestation
+  is unavailable. This unit is bounded by 19:04:38–19:24:38 UTC without extension.
+
+
 ### November 23, 2026, 02:57 HKT — private fixed-turn supervisor component
 
 - A source-fixed nonprivileged positive-turn adapter now reserves durable private

@@ -15,7 +15,7 @@ import stat
 import time
 import uuid
 
-VERSION=1
+VERSION=2
 ROWS=32
 BYTES=1048576
 ACTIVE=('reserved','launching','running')
@@ -25,6 +25,8 @@ SHARED={'GOVERNANCE.md':'3cc14e3b86a9920dcbc82a7b08a3a0270bab67bf6cad8262f584aaf
         'ENGINEERING-STANDARDS.md':'8b10a0a16647cb213863d9d7e5af7a20ab06b6a20f6964d9068b08f9f90eb195',
         'REPOSITORY-SETUP.md':'3014148494d56513a9b119bb3265420fb63b407b5f478dfb5197fc35bc1037d4'}
 PUBLIC=('README.md','STANDARDS.md','REQUIREMENTS.md','ARCHITECTURE.md')
+SQL_SCHEMA={'metadata':'CREATE TABLE metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)',
+            'operations':'CREATE TABLE operations (id TEXT PRIMARY KEY,body TEXT NOT NULL)'}
 def require(value,message):
     if not value:raise ValueError(message)
 def canonical(value):return json.dumps(value,sort_keys=True,separators=(',',':'),allow_nan=False)
@@ -88,12 +90,12 @@ def validate_binding(value):
 
 class Registry:
     def __init__(self,directory,binding=None,*,readonly=False):
-        self.db=None;self.fd=None;self.ledger=None
+        self.db=None;self.fd=None;self.ledger=None;self.control_fds={};self.control_nodes=None;self.owner_active=False
         try:self._open(directory,binding,readonly=readonly)
         except BaseException:
             self.close();raise
     def _open(self,directory,binding=None,*,readonly=False):
-        self.root=Path(directory).absolute();self.readonly=readonly;self.db=None;self.fd=None;self.ledger=None
+        self.root=Path(directory).absolute();self.readonly=readonly;self.db=None;self.fd=None;self.ledger=None;self.control_fds={};self.control_nodes=None;self.owner_active=False
         for part in (self.root,*self.root.parents):
             require(not part.is_symlink(),'symlink controller state')
             if part.exists() and part!=self.root:
@@ -112,32 +114,58 @@ class Registry:
         try:self.check_files()
         except Exception:
             self.close();raise
+        for name in ('registry.sqlite3','owner.lock'):
+            self.control_fds[name]=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=self.fd)
+        self.control_nodes={name:{'device':os.fstat(fd).st_dev,'inode':os.fstat(fd).st_ino} for name,fd in self.control_fds.items()}
+        self.check_files()
         uri='file:/proc/self/fd/'+str(self.fd)+'/registry.sqlite3'+('?mode=ro' if readonly else '?mode=rw')
         try:self.db=sqlite3.connect(uri,uri=True,timeout=.1,isolation_level=None)
         except sqlite3.Error:
             self.close();raise ValueError('controller registry rejected') from None
+        self.check_files()
         if not readonly:self.db.execute('PRAGMA synchronous=FULL')
         if created:
             validate_binding(binding)
             self.db.execute('PRAGMA synchronous=FULL');self.db.execute('PRAGMA journal_mode=DELETE')
+            self.initializing=True
             with self.transaction():
-                self.db.execute('CREATE TABLE metadata (key TEXT PRIMARY KEY,value TEXT NOT NULL)')
-                self.db.execute('CREATE TABLE operations (id TEXT PRIMARY KEY,body TEXT NOT NULL)')
-                for key,value in (('version',VERSION),('registry_id','registry-'+uuid.uuid4().hex),('binding',binding),('generation',0)):
+                for sql in SQL_SCHEMA.values():self.db.execute(sql)
+                for key,value in (('version',VERSION),('registry_id','registry-'+uuid.uuid4().hex),('binding',binding),('generation',0),('control_identity',self.control_nodes)):
                     self.db.execute('INSERT INTO metadata VALUES (?,?)',(key,canonical(value)))
-                self.db.execute('PRAGMA user_version=1')
+                self.db.execute('PRAGMA user_version='+str(VERSION))
+            self.initializing=False
         try:
-            schema=self.db.execute("SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
-            require(schema==[('table','metadata'),('table','operations')],'unknown controller schema')
-            require(self.db.execute('PRAGMA user_version').fetchone()[0]==VERSION,'unknown controller version')
-            self.meta={key:loads(value) for key,value in self.db.execute('SELECT key,value FROM metadata')}
-            require(set(self.meta)=={'version','registry_id','binding','generation'} and type(self.meta['version']) is int and self.meta['version']==VERSION,'invalid controller metadata')
+            self.validate_schema()
+            rows=self.db.execute('SELECT key,value FROM metadata LIMIT 6').fetchall()
+            require(len(rows)==5 and len({row[0] for row in rows})==5,'ambiguous controller metadata')
+            self.meta={key:loads(value) for key,value in rows}
+            require(set(self.meta)=={'version','registry_id','binding','generation','control_identity'} and type(self.meta['version']) is int and self.meta['version']==VERSION,'invalid controller metadata')
+            require(canonical(self.meta['control_identity'])==canonical(self.control_nodes),'controller control-file identity changed')
             validate_binding(self.meta['binding']);token(self.meta['registry_id'])
             require(type(self.meta['generation']) is int and self.meta['generation']>=0,'invalid controller generation')
             if binding is not None:require(canonical(binding)==canonical(self.meta['binding']),'controller binding changed')
             self.inventory()
         except Exception:
             self.close();raise ValueError('controller registry rejected') from None
+    def validate_schema(self):
+        require(self.db.execute('PRAGMA user_version').fetchone()[0]==VERSION,'unknown controller version')
+        expected=sorted([('table',name,name,sql) for name,sql in SQL_SCHEMA.items()]+[('index','sqlite_autoindex_'+name+'_1',name,None) for name in SQL_SCHEMA],key=lambda row:row[1])
+        require(self.db.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY name LIMIT 5').fetchall()==expected,'unsupported controller SQL schema')
+        for name,key,value in (('metadata','key','value'),('operations','id','body')):
+            require(self.db.execute('PRAGMA table_xinfo('+name+')').fetchall()==[(0,key,'TEXT',0,None,1,0),(1,value,'TEXT',1,None,0,0)],'unsupported controller columns')
+            index='sqlite_autoindex_'+name+'_1'
+            require(self.db.execute('PRAGMA index_list('+name+')').fetchall()==[(0,index,1,'pk',0)],'unsupported controller uniqueness')
+            require(self.db.execute('PRAGMA index_xinfo('+index+')').fetchall()==[(0,0,key,0,'BINARY',1),(1,-1,None,0,'BINARY',0)],'unsupported controller primary key')
+    def validate_metadata(self):
+        stored=self.db.execute('SELECT key,value FROM metadata LIMIT 6').fetchall()
+        require(len(stored)==5 and len({row[0] for row in stored})==5,'ambiguous controller metadata')
+        current={key:loads(value) for key,value in stored}
+        require(set(current)==set(self.meta),'unknown controller metadata')
+        for key in ('version','registry_id','binding','control_identity'):
+            require(canonical(current[key])==canonical(self.meta[key]),'controller metadata identity changed')
+        require(canonical(current['control_identity'])==canonical(self.control_nodes),'controller control-file identity changed')
+        generation=current['generation'];require(type(generation) is int and 0<=generation<=2147483647,'invalid controller generation')
+        return generation
     def check_files(self):
         node=self.root.lstat();held=os.fstat(self.fd)
         require(stat.S_ISDIR(node.st_mode) and node.st_uid==os.getuid() and stat.S_IMODE(node.st_mode)==0o700 and (node.st_dev,node.st_ino)==self.identity and (held.st_dev,held.st_ino)==self.identity,'controller directory changed')
@@ -147,31 +175,58 @@ class Registry:
         for path in self.root.iterdir():
             private_file(path);total+=path.stat().st_size
         require(total<=BYTES,'controller state byte bound')
+        for name,fd in self.control_fds.items():
+            held=os.fstat(fd);current=os.stat(name,dir_fd=self.fd,follow_symlinks=False)
+            expected=self.control_nodes[name] if self.control_nodes is not None else {'device':held.st_dev,'inode':held.st_ino}
+            require(stat.S_ISREG(current.st_mode) and (current.st_dev,current.st_ino)==(held.st_dev,held.st_ino)==(expected['device'],expected['inode']) and held.st_nlink==1,'controller control-file identity changed')
     def close(self):
+        require(not self.owner_active,'cannot close an active controller owner')
         if self.db is not None:self.db.close();self.db=None
+        for fd in self.control_fds.values():os.close(fd)
+        self.control_fds={}
         if self.fd is not None:os.close(self.fd);self.fd=None
         if self.ledger is not None:self.ledger.close();self.ledger=None
     @contextlib.contextmanager
     def transaction(self):
         require(not self.readonly,'observer cannot mutate');self.check_files();self.db.execute('BEGIN IMMEDIATE')
-        try:yield;self.db.execute('COMMIT')
+        try:
+            if not getattr(self,'initializing',False):
+                self.validate_schema()
+                if hasattr(self,'meta'):self.validate_metadata()
+            yield
+            self.check_files();self.db.execute('COMMIT')
         except BaseException:self.db.execute('ROLLBACK');raise
     @contextlib.contextmanager
     def owner(self):
-        require(not self.readonly,'observer cannot own');self.check_files()
-        fd=os.open(self.root/'owner.lock',os.O_RDWR|os.O_NOFOLLOW)
+        require(not self.readonly and not self.owner_active,'observer or nested owner denied');self.check_files()
+        fd=self.control_fds['owner.lock']
         try:
             try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:raise ValueError('controller owner busy') from None
-            yield
-        finally:os.close(fd)
+            self.owner_active=True;self.check_files()
+            primary_pending=False
+            try:yield
+            except BaseException:
+                primary_pending=True;raise
+            finally:
+                try:self.check_files()
+                except Exception:
+                    if not primary_pending:raise ValueError('controller control-file identity changed') from None
+        finally:
+            if self.owner_active:fcntl.flock(fd,fcntl.LOCK_UN);self.owner_active=False
     def row(self,operation):
-        token(operation);row=self.db.execute('SELECT body FROM operations WHERE id=?',(operation,)).fetchone()
-        if row is None:return None
-        require(len(row[0].encode())<=4096,'controller row byte bound')
-        value=loads(row[0]);keys=set('operation request_sha256 logical_session mode expected_uuid uuid state sequence exit_code capture_complete owner_pid deadline reason checkpoint_id checkpoint_sha256 cleanup launch_handle_observed'.split())
+        token(operation)
+        matches=[row for row in self.inventory()['operations'] if row['operation']==operation]
+        require(len(matches)<=1,'ambiguous controller operation')
+        return matches[0] if matches else None
+    def validate_row(self,operation,body):
+        require(type(body) is str and len(body.encode())<=4096,'controller row byte bound')
+        value=loads(body);keys=set('operation request_sha256 logical_session mode expected_uuid uuid state sequence exit_code capture_complete owner_pid deadline reason checkpoint_id checkpoint_sha256 cleanup launch_handle_observed prompt_sha256 prompt_bytes'.split())
         require(type(value) is dict and set(value)==keys and value['operation']==operation and value['state'] in STATES,'invalid controller operation')
-        digest(value['request_sha256']);token(value['logical_session']);token(value['checkpoint_id']);digest(value['checkpoint_sha256'])
+        digest(value['request_sha256']);token(value['logical_session']);token(value['checkpoint_id']);digest(value['checkpoint_sha256']);digest(value['prompt_sha256'])
+        require(type(value['prompt_bytes']) is int and 0<value['prompt_bytes']<=262144,'invalid stored prompt length')
+        expected=self.request_identity(value['logical_session'],value['prompt_sha256'],value['prompt_bytes'],value['expected_uuid'],{key:value[key] for key in ('checkpoint_id','checkpoint_sha256')})
+        require(value['request_sha256']==expected,'stored operation request binding changed')
         require(value['cleanup'] in ('not-observed','owned-child-reaped','unresolved') and (value['launch_handle_observed'] is None or type(value['launch_handle_observed']) is bool),'invalid controller cleanup observation')
         require(value['mode'] in ('start','resume') and type(value['sequence']) is int and 0<=value['sequence']<=2097152 and value['reason'] in ('none','rejected','owner-loss','cleanup-unresolved'),'invalid controller state')
         for key in ('expected_uuid','uuid'):
@@ -179,6 +234,18 @@ class Registry:
         require(value['exit_code'] is None or type(value['exit_code']) is int and -255<=value['exit_code']<=255,'invalid controller exit')
         require((value['capture_complete'] is None or type(value['capture_complete']) is bool) and type(value['owner_pid']) is int and value['owner_pid']>0 and type(value['deadline']) in (int,float) and 0<value['deadline']<1e12,'invalid controller observation')
         require(value['state']!='completed-turn' or value['uuid'] is not None and value['exit_code']==0 and value['capture_complete'] is True and value['cleanup']=='owned-child-reaped' and value['launch_handle_observed'] is True,'corrupt terminal controller state')
+        require((value['mode']=='start')==(value['expected_uuid'] is None),'controller mode/expected UUID mismatch')
+        require(value['mode']!='resume' or value['uuid'] is None or value['uuid']==value['expected_uuid'],'controller resume UUID contradiction')
+        state=value['state']
+        require(state=='reserved' or value['sequence']>=1,'invalid controller state sequence')
+        require(value['uuid'] is None or value['launch_handle_observed'] is True,'UUID without owned launcher observation')
+        if state=='reserved':require(value['sequence']==0 and value['uuid'] is None and value['launch_handle_observed'] is None and value['cleanup']=='not-observed' and value['reason']=='none','invalid reserved controller state')
+        if state=='launching':require(value['uuid'] is None and value['launch_handle_observed'] is None and value['cleanup']=='not-observed' and value['reason']=='none','invalid launching controller state')
+        if state=='running':require(value['launch_handle_observed'] is True and value['reason']=='none','invalid running controller state')
+        if state in ACTIVE or state=='uncertain':require(value['exit_code'] is None and value['capture_complete'] is None,'invalid incomplete controller result')
+        if state=='uncertain':require(value['reason'] in ('owner-loss','rejected','cleanup-unresolved'),'invalid uncertain controller reason')
+        if state=='failed':require(type(value['exit_code']) is int and value['exit_code']!=0 and value['capture_complete'] is True and value['cleanup']=='owned-child-reaped' and value['launch_handle_observed'] is True and value['reason']=='rejected','invalid failed controller result')
+        if state=='completed-turn':require(value['reason']=='none','invalid completed controller reason')
         return value
     def current_checkpoint(self):
         import job_protocol as p
@@ -195,37 +262,51 @@ class Registry:
         self.check_files();owned=not self.db.in_transaction
         if owned:self.db.execute('BEGIN')
         try:
-            ids=[row[0] for row in self.db.execute('SELECT id FROM operations ORDER BY id LIMIT 33')]
-            require(len(ids)<=ROWS,'controller row bound');rows=[self.row(i) for i in ids]
+            self.validate_schema();generation=self.validate_metadata()
+            stored=self.db.execute('SELECT id,body FROM operations ORDER BY id LIMIT 33').fetchall()
+            ids=[row[0] for row in stored];require(len(ids)<=ROWS and len(set(ids))==len(ids),'controller row bound or duplicate IDs')
+            rows=[]
+            for operation,body in stored:token(operation);rows.append(self.validate_row(operation,body))
             identities={};active=set()
             for row in rows:
                 if row['uuid'] is not None:
                     previous=identities.setdefault(row['uuid'],row['logical_session']);require(previous==row['logical_session'],'corrupt session ownership')
                 if row['state'] in (*ACTIVE,'uncertain'):
                     require(row['logical_session'] not in active,'corrupt active session inventory');active.add(row['logical_session'])
-            generation=loads(self.db.execute("SELECT value FROM metadata WHERE key='generation'").fetchone()[0]);require(type(generation) is int and 0<=generation<=2147483647,'invalid controller generation')
+            origins={}
+            for row in rows:
+                if row['mode']=='start':
+                    require(row['logical_session'] not in origins,'duplicate logical session origin');origins[row['logical_session']]=row
+            for row in rows:
+                origin=origins.get(row['logical_session']);require(origin is not None,'missing logical session origin')
+                if row['mode']=='resume':require(origin['state']=='completed-turn' and row['expected_uuid']==origin['uuid'],'conflicting logical session UUID')
+                if row['uuid'] is not None:require(row['uuid']==origin['uuid'],'substituted logical session UUID')
             sessions=sorted({(r['logical_session'],r['uuid']) for r in rows if r['uuid'] is not None})
             return {'version':VERSION,'registry_id':self.meta['registry_id'],'controller_id':self.meta['binding']['controller_id'],'generation':generation,'operations':rows,'sessions':[{'logical_session':a,'uuid':b} for a,b in sessions],'scope':'all positive operations for this controller; negative fixture probe is separate','runtime_admitted':False}
         finally:
             if owned:self.db.execute('COMMIT')
     def write(self,row):
-        require(len(canonical(row))<=4096,'controller row byte bound')
+        self.validate_row(row['operation'],canonical(row))
         self.db.execute('INSERT OR REPLACE INTO operations VALUES (?,?)',(row['operation'],canonical(row)))
         self.db.execute("UPDATE metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='generation'")
+        self.inventory()
+    def request_identity(self,logical_session,prompt_sha256,prompt_bytes,resume,checkpoint):
+        return sha(canonical({'registry_id':self.meta['registry_id'],'binding':self.meta['binding'],'logical_session':logical_session,'prompt_sha256':prompt_sha256,'prompt_bytes':prompt_bytes,'resume':resume,**checkpoint}).encode())
     def reserve(self,operation,logical_session,prompt,deadline,resume=None):
         token(operation);token(logical_session);require(type(prompt) is str and 0<len(prompt.encode())<=262144,'invalid fixed prompt')
         if resume is not None:session(resume)
         with self.transaction():
+            rows=self.inventory()['operations']
             prior=self.row(operation)
             checkpoint={key:prior[key] for key in ('checkpoint_id','checkpoint_sha256')} if prior is not None else self.current_checkpoint()
-            request=sha(canonical({'registry_id':self.meta['registry_id'],'binding':self.meta['binding'],'logical_session':logical_session,'prompt_sha256':sha(prompt.encode()),'prompt_bytes':len(prompt.encode()),'resume':resume,**checkpoint}).encode())
+            request=self.request_identity(logical_session,sha(prompt.encode()),len(prompt.encode()),resume,checkpoint)
             if prior is not None:require(prior['request_sha256']==request,'operation request collision');return prior,False
             require(type(deadline) in (int,float) and time.monotonic()<deadline<=time.monotonic()+180,'invalid original controller deadline')
-            rows=self.inventory()['operations'];require(len(rows)<ROWS,'controller row bound')
+            require(len(rows)<ROWS,'controller row bound')
             require(not any(r['state'] in (*ACTIVE,'uncertain') and (r['logical_session']==logical_session or resume is not None and r['uuid']==resume) for r in rows),'session already active or uncertain')
             if resume is None:require(not any(r['logical_session']==logical_session for r in rows),'start identity already exists')
             else:require(any(r['logical_session']==logical_session and r['uuid']==resume and r['state']=='completed-turn' for r in rows),'resume not bound to completed owned session')
-            row={'operation':operation,'request_sha256':request,'logical_session':logical_session,'mode':'resume' if resume else 'start','expected_uuid':resume,'uuid':None,'state':'reserved','sequence':0,'exit_code':None,'capture_complete':None,'owner_pid':os.getpid(),'deadline':deadline,'reason':'none','cleanup':'not-observed','launch_handle_observed':None,**checkpoint}
+            row={'operation':operation,'request_sha256':request,'logical_session':logical_session,'mode':'resume' if resume else 'start','expected_uuid':resume,'uuid':None,'state':'reserved','sequence':0,'exit_code':None,'capture_complete':None,'owner_pid':os.getpid(),'deadline':deadline,'reason':'none','cleanup':'not-observed','launch_handle_observed':None,'prompt_sha256':sha(prompt.encode()),'prompt_bytes':len(prompt.encode()),**checkpoint}
             self.write(row);return row,True
     def update(self,operation,**values):
         with self.transaction():
@@ -239,12 +320,12 @@ class Registry:
 class Observer:
     def __init__(self,directory):self.registry=Registry(directory,readonly=True)
     def owner_held(self):
-        self.registry.check_files();fd=os.open('/proc/self/fd/'+str(self.registry.fd)+'/owner.lock',os.O_RDONLY|os.O_NOFOLLOW)
+        self.registry.check_files();fd=self.registry.control_fds['owner.lock']
         try:
             try:fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
             except BlockingIOError:return True
             return False
-        finally:os.close(fd)
+        finally:fcntl.flock(fd,fcntl.LOCK_UN)
     def project(self,row,held):
         if not held and row['state'] in ACTIVE:row.update(state='uncertain',reason='owner-loss')
         return row
