@@ -489,6 +489,77 @@ class SessionsTests(unittest.TestCase):
         self.write_rollout(path,rows);parent=path.parent;stored=parent.with_name('stored');parent.rename(stored);parent.symlink_to(stored)
         with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry)
 
+    def test_resume_witness_distinguishes_changed_missing_reordered_prefix_and_metadata(self):
+        self.first('alpha',[message('first observed'),message('second observed')]);valid=self.history('alpha')
+        variants=[]
+        changed=copy.deepcopy(valid);changed[0]['content'][0]['text']='changed';variants.append((changed,0,1<<3))
+        variants.append((valid[1:],0,None));variants.append(([valid[1],valid[0],*valid[2:]],0,1<<3))
+        changed=copy.deepcopy(valid);changed[0][s.METADATA]={'turn_id':IDS['beta']};variants.append((changed,0,1<<7))
+        for items,index,mask in variants:
+            self.j.resume_context_rejection=None;self.observed('alpha','resume');before=copy.deepcopy(self.j.entries)
+            with self.assertRaises(ValueError):self.j.request(body(items))
+            witness=self.j.resume_context_rejection
+            self.assertFalse(witness['exact_old_prefix_equal']);self.assertEqual(witness['first_mismatching_original_index'],index)
+            self.assertEqual(witness['observed_count'],len(s.user_context(items)));self.assertLessEqual(len(t.canonical(witness)),2048)
+            self.assertEqual(witness['request'],self.j.last_request)
+            if mask is not None:self.assertTrue(witness['summaries'][0]['difference_mask']&mask)
+            self.assertEqual(self.j.entries,before);self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+            self.assertFalse(self.j.turn['finished']);self.assertFalse(self.j.continuations)
+
+    def test_resume_witness_exact_prefix_extra_suffix_remains_rejected_with_position(self):
+        self.first('alpha');valid=self.history('alpha');extra=durable_message('new synthetic context','environments.environment_context')
+        items=valid[:-1]+[source_wire(extra),valid[-1]];self.observed('alpha','resume')
+        with self.assertRaisesRegex(ValueError,'prior ordered user context'):self.j.request(body(items))
+        witness=copy.deepcopy(self.j.resume_context_rejection)
+        self.assertTrue(witness['exact_old_prefix_equal']);self.assertTrue(witness['old_prefix_present'])
+        self.assertTrue(witness['exact_final_continuation_prompt']);self.assertTrue(witness['original_pair_exact'])
+        self.assertEqual(witness['observed_count'],3);self.assertIsNone(witness['first_mismatching_original_index'])
+        self.assertEqual(witness['summaries'][0]['position'],'after-old-output-before-new-prompt')
+        self.assertEqual(witness['summaries'][0]['classification'],'environments.environment_context')
+        self.assertIsNone(witness['summaries'][0]['retained_index']);self.assertIsNone(self.j.turn['issued'])
+        with self.assertRaises(ValueError):self.j.request(body(items))
+        self.assertEqual(self.j.resume_context_rejection,witness)
+        for changed in (items+[copy.deepcopy(items[2])],items[:2]+[items[2],items[1]]+items[3:],
+                        items+[{'type':'function_call_output','call_id':'orphan','output':'SECRET'}]):
+            self.j.resume_context_rejection=None;self.observed('alpha','resume')
+            with self.assertRaises(ValueError):self.j.request(body(changed))
+            self.assertFalse(self.j.resume_context_rejection['original_pair_exact'])
+            self.assertEqual(self.j.resume_context_rejection['summaries'][0]['position'],'unresolved')
+
+    def test_resume_witness_privacy_overflow_preserves_core_hashes(self):
+        self.first('alpha');valid=self.history('alpha');extras=[]
+        for _ in range(12):
+            item=message('SECRET_CONTENT'*20);item[s.METADATA]={'SECRET_KEY':'SECRET_VALUE','content_item_kinds':['SECRET_CLASS']}
+            extras.append(item)
+        items=valid[:-1]+extras+[valid[-1]];self.observed('alpha','resume')
+        with self.assertRaises(ValueError):self.j.request(body(items))
+        witness=self.j.resume_context_rejection;encoded=t.canonical(witness)
+        self.assertLessEqual(len(encoded),2048);self.assertNotIn(b'SECRET',encoded);self.assertNotIn(IDS['alpha'].encode(),encoded)
+        self.assertTrue(witness['truncated_summary']);self.assertLessEqual(len(witness['summaries']),4)
+        self.assertTrue(witness['summaries']);self.assertEqual(witness['observed_count'],14)
+        self.assertTrue(witness['exact_old_prefix_equal']);self.assertEqual(len(witness['observed_sha256']),64)
+        self.assertEqual(len(witness['observed_prefix_sha256']),64);self.assertIsNone(self.j.turn['issued'])
+
+    def test_diagnostic_change_preserves_baseline_acceptance_and_rejection(self):
+        import types
+        self.first('alpha',[message('observed environment')]);entry=copy.deepcopy(self.j.entries)
+        baseline=types.ModuleType('resume_diagnostic_baseline');baseline.__file__=s.__file__
+        source=subprocess.check_output(['git','-C',str(Path(__file__).resolve().parents[1]),'show','22fceee:tools/codex_sessions.py'],text=True)
+        exec(compile(source,s.__file__,'exec'),baseline.__dict__)
+        valid=self.history('alpha');variants=[valid,valid[1:],valid[:-1]+[message('extra'),valid[-1]]]
+        changed=copy.deepcopy(valid);changed[0]['content'][0]['text']='altered';variants.append(changed)
+        changed=copy.deepcopy(valid);changed[-1]['content'][0]['text']+=' suffix';variants.append(changed)
+        changed=copy.deepcopy(valid);changed[2]['arguments']='{}';variants.append(changed)
+        for items in variants:
+            outcomes=[]
+            for module in (baseline,s):
+                journey=module.Journey(self.root,time.monotonic()+10,t.Meter(),NONCE);journey.entries=copy.deepcopy(entry)
+                journey.begin('alpha','resume',IDS['alpha']);journey.observe_cli(t.canonical({'type':'thread.started','thread_id':IDS['alpha']}))
+                journey.observe_cli(t.canonical({'type':'turn.started'}))
+                try:outcomes.append(('accepted',journey.request(body(items))))
+                except ValueError as error:outcomes.append(('rejected',str(error)))
+            self.assertEqual(outcomes[0],outcomes[1])
+
     def test_resume_argv_is_explicit_uuid_not_last_or_cwd_inference(self):
         argv=s.cli_args(12345,'synthetic-context',IDS['alpha'])
         index=argv.index('resume');self.assertEqual(argv[index+1],IDS['alpha'])

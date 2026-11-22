@@ -188,6 +188,76 @@ def durable_user_to_wire(item):
     return projected
 
 
+RESUME_FIELDS=('type','role','id','content','turn_id','create_time','content_item_kinds','metadata')
+RESUME_ENVELOPE=('type','role','id','content',METADATA,'status','phase','encrypted_content')
+RESUME_METADATA=('turn_id','create_time','content_item_kinds','content_item_metadata')
+SHAPE_TYPES=(type(None),bool,int,float,str,list,dict)
+
+
+def shape_mask(item,keys):
+    # Three bits per fixed key: absent=0, otherwise SHAPE_TYPES index+1.
+    return sum((SHAPE_TYPES.index(type(item[key]))+1 if key in item and type(item[key]) in SHAPE_TYPES else 0)
+               <<(3*index) for index,key in enumerate(keys))
+
+
+def context_fields(item):
+    metadata=item.get(METADATA,{})
+    return {**{key:[key in item,item.get(key)] for key in ('type','role','id','content')},
+        **{key:[type(metadata) is dict and key in metadata,metadata.get(key) if type(metadata) is dict else None]
+           for key in ('turn_id','create_time','content_item_kinds')},'metadata':[METADATA in item,item.get(METADATA)]}
+
+
+def resume_rejection_witness(journey,observed,inputs,current):
+    retained=journey.entries[journey.turn['label']]['user_context'];contexts=[item for _,item in observed];count=len(retained)
+    prefix=contexts[:count];mismatch=next((i for i in range(count) if i>=len(contexts) or canonical(contexts[i])!=canonical(retained[i])),None)
+    final=bool(contexts) and exact_prompt_message(contexts[-1],current)
+    entry=journey.entries[journey.turn['label']];call_id=entry['issued']['call_id']
+    calls=[i for i,v in enumerate(inputs) if type(v) is dict and v.get('type')=='function_call' and v.get('call_id')==call_id]
+    outputs=[i for i,v in enumerate(inputs) if type(v) is dict and v.get('type')=='function_call_output' and v.get('call_id')==call_id]
+    pair=(len(calls)==len(outputs)==1 and calls[0]<outputs[0] and
+          canonical(inputs[calls[0]])==canonical(entry['call']) and canonical(inputs[outputs[0]])==canonical(entry['output']))
+    allowed={call_id}
+    if journey.turn['issued'] is not None:allowed.add(journey.turn['issued']['call_id'])
+    pair=pair and all(type(item) is dict and (not ('call_id' in item or str(item.get('type','')).endswith(('_call','_output'))) or
+        item.get('type') in ('function_call','function_call_output') and type(item.get('call_id')) is str and item['call_id'] in allowed) for item in inputs)
+    candidates=[i for i in range(min(count,len(contexts))) if canonical(contexts[i])!=canonical(retained[i])]
+    candidates += list(range(count,len(contexts)-(1 if final else 0)))
+    witness={'stage':'resume-context','label':journey.turn['label'],'phase':'resume',
+        'retained_count':count,'observed_count':len(contexts),'expected_count':count+1,
+        'old_prefix_present':len(contexts)>=count,'exact_old_prefix_equal':canonical(prefix)==canonical(retained),
+        'exact_final_continuation_prompt':final,'first_mismatching_original_index':mismatch,
+        'retained_sha256':sha(canonical(retained)),'observed_sha256':sha(canonical(contexts)),
+        'observed_prefix_sha256':sha(canonical(prefix)),'original_pair_exact':pair,
+        'request':journey.last_request,'harness_sha256':journey.harness_sha256,'codex_source_sha':STOCK_SOURCE,
+        'summaries':[],'truncated_summary':False}
+    for index in candidates[:4]:
+        request_index,item=observed[index];metadata=item.get(METADATA,{})
+        kinds=metadata.get('content_item_kinds') if type(metadata) is dict else None
+        classification=('user.text' if kinds==['user.text'] else 'environments.environment_context' if
+            kinds==['environments.environment_context'] else 'unknown')
+        position='unresolved'
+        if pair and final:
+            position=('before-old-call' if request_index<calls[0] else 'between-old-call-output' if calls[0]<request_index<outputs[0] else
+                'after-old-output-before-new-prompt' if outputs[0]<request_index<observed[-1][0] else
+                'after-new-prompt' if request_index>observed[-1][0] else 'final-prompt')
+        difference=None
+        if index<count:
+            actual=context_fields(item);expected=context_fields(retained[index])
+            difference=sum((canonical(actual[key])!=canonical(expected[key]))<<bit for bit,key in enumerate(RESUME_FIELDS))
+        summary={'request_index':request_index,'retained_index':index if index<count else None,
+            'role':'user','type':'message','content_count':len(item['content']),'classification':classification,
+            'envelope_shape':shape_mask(item,RESUME_ENVELOPE),'metadata_shape':shape_mask(metadata,RESUME_METADATA) if type(metadata) is dict else 0,
+            'unknown_keys':sum(key not in RESUME_ENVELOPE for key in item)+(sum(key not in RESUME_METADATA for key in metadata) if type(metadata) is dict else 0),
+            'difference_mask':difference,'position':position,'sha256':sha(canonical(item)),'bytes':len(canonical(item))}
+        # Keep core counts, booleans and hashes even when summaries cannot fit.
+        witness['summaries'].append(summary)
+        if len(canonical(witness))>2048:witness['summaries'].pop();break
+    witness['truncated_summary']=len(witness['summaries'])<len(candidates)
+    if len(canonical(witness))>2048:
+        witness['summaries']=[];witness['truncated_summary']=bool(candidates)
+    return witness
+
+
 class Journey:
     """Evidence is retained from first turns, never supplied by a resume caller."""
     def __init__(self, root, end, meter, nonce):
@@ -199,7 +269,7 @@ class Journey:
         self.cli_ready = threading.Event()
         self.last_request = None
         self.metadata_rejection = None
-        self.rollout_rejection = None; self.continuations = {}
+        self.rollout_rejection = None; self.continuations = {}; self.resume_context_rejection = None
         self.harness_sha256 = sha(Path(__file__).read_bytes())
 
     def begin(self, label, phase, expected_uuid=None):
@@ -288,6 +358,11 @@ class Journey:
         contexts = [item for _,item in observed]
         own = prompt(label,'first',self.nonce); current = prompt(label,phase,self.nonce)
         own_positions = [i for i,item in observed if exact_prompt_message(item,own)]
+        if phase=='resume' and self.resume_context_rejection is None:
+            retained=self.entries[label]['user_context']
+            if not (len(contexts)==len(retained)+1 and canonical(contexts[:-1])==canonical(retained) and
+                    exact_prompt_message(contexts[-1],current)):
+                self.resume_context_rejection=resume_rejection_witness(self,observed,inputs,current)
         require(len(own_positions) == 1, 'exact prior prompt absent or duplicated')
         if phase == 'first':
             require(exact_prompt_message(contexts[-1],own), 'first prompt must be the exact final user message')
@@ -583,7 +658,7 @@ def worker(args):
             report.update(turns=journey.records,http_requests=journey.requests,http_connections=server.connections if server else 0,
                           transport_error=journey.error,last_request=journey.last_request,captured_bytes=journey.meter.used,
                           observed_session_uuids={k:v['uuid'] for k,v in journey.entries.items()},
-                          history_metadata_rejection=journey.metadata_rejection,rollout_rejection=journey.rollout_rejection)
+                          history_metadata_rejection=journey.metadata_rejection,rollout_rejection=journey.rollout_rejection,resume_context_rejection=journey.resume_context_rejection)
         data=canonical(report)+b'\n';require(len(data)<=t.REPORT_BYTES,'session report exceeded')
         fd=os.open('/result/report.json',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(data)

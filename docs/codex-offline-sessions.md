@@ -135,3 +135,32 @@ binary and state across process restart. This does not prove in-flight operation
 replay safety, all production sessions, authentication, image/version migration,
 replacement/rollback, Fedora/Podman/Distrobox placement, nightly scheduling,
 atomic dispatch freeze, full session/platform recovery or R9/R11 acceptance.
+
+A later reviewed durable-projection candidate passed both first rollout audits,
+including complete projected contexts and exact original call/result pairs. Its
+first explicit alpha UUID resume then failed the unchanged ordered-wire-context
+guard. No continuation action was issued; the exact old-prefix difference or
+possible fresh appended fragment was not retained. That actual failure does not
+prove a particular field or authorize extra context.
+
+Diagnostic-only instrumentation now captures the first resumed-context rejection
+before the same predicate rejects it. The maximum 2 KiB witness retains original,
+observed and prefix counts/hashes, exact-prefix and final-prompt booleans, first
+mismatching original index, and request/harness/source identity. At most four
+compact summaries give fixed shapes/classification, request positions and a
+canonical hash/length. Summaries are omitted as needed to preserve essential core
+evidence; `truncated_summary` says when that happened. No transcript, metadata
+values, arbitrary keys/classifications, call arguments or outputs are exported.
+
+`difference_mask` bits 0 through 7 compare type, role, id, complete content,
+turn_id, create_time, content_item_kinds and complete metadata respectively against
+the matching independently retained entry. New suffix entries have no retained
+index or difference mask. Shape masks use three bits per recognized key: zero
+means absent; codes 1 through 7 mean null, boolean, integer, number, string,
+array and object. Envelope key order is type, role, id, content, metadata, status,
+phase, encrypted_content; metadata key order is turn_id, create_time,
+content_item_kinds, content_item_metadata. Unknown keys contribute only a count.
+Positions are diagnostic only and are unresolved unless the original pair is
+unique, ordered and canonically exact, with no unknown call identity. The
+witness never issues work or advances accepted context, progress or checkpoint
+state. No normalization or optional fresh-context acceptance is added.
