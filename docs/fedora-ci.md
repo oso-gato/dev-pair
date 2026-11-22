@@ -303,3 +303,46 @@ unavailable. Private preparation elapsed time is projected only after the same
 strict checks. Bounded per-role directory counts and fixed lookup/substep IDs
 identify progress without exporting argv, raw ID output or exception strings.
 No time/resource/admission/cleanup ceiling is raised or reset.
+
+
+### Disposable selected-load diagnostic
+
+The source-only native34 follow-up supplies one fixed public diagnostic recipient
+on the existing authenticated public payload ISO. Its exact SHA256 is
+`020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c`;
+the 40-hex primary fingerprint is
+`59CD9CD708EEB010F4A1BB6B83B33B576391877E`. It is a one-day disposable CI input,
+not a release key or production logging interface. The private key stays outside
+source, CI, images, reports and artifacts. Public ISO entries now have explicit
+root UID/GID metadata; their source/context bytes and existing protection checks
+remain unchanged. No host ownership change occurs.
+
+Only the existing exact signed-load selector, observed owned launch, complete
+verified relay, matching maintenance UID and nonzero payload status can seal a
+capsule. A canonical in-memory envelope includes source/context, unique attempt,
+executor unit/UID, status and complete stdout/stderr counts, hashes and lossless
+base64 bytes. Its maximum is 8 KiB; stock GPG encrypts through private pipes with
+an isolated owned temporary home and the sole pinned public recipient. No
+plaintext file, argv, environment, public tail or fallback is written. GPG's
+maximum five seconds is clipped to the original command/phase deadline and
+includes a reserved reap interval; ciphertext is capped at 16 KiB. A cleanup
+uncertainty has its own closed unavailable reason and cannot replace the engine's
+primary failure or existing cleanup result.
+
+A single capsule is retained separately from repeated command records. Guest and
+controller validate its source/context, attempt, recipient, digest/size and
+independently validated selected-load UID/status/control evidence. Actual guest
+serialization still enforces 64 KiB; optional ciphertext is replaced by a typed
+report-budget reason before exceeding that bound. Other limits are unchanged.
+Absent or untrusted recipient, incomplete/oversized payload, no remaining budget
+or encryption failure produces typed unavailable evidence only.
+
+Local synthetic-key roundtrips and fixed-envelope verification do not establish
+Fedora behavior or native34's cause. Before diagnosis, the operator must verify
+the source-bound public capsule and digest, require successful authenticated GPG
+decryption privately, and validate the complete canonical envelope and stream
+hashes/counts against independent selected-load evidence. `verify_plaintext`
+checks these fixed operands in memory and returns only a boolean; it neither
+decrypts nor authorizes a cause claim. Native35 requires fresh source review and
+separate authorization. Production runtime/jobs, authentication, nested placement,
+hard quota, renewal, tailnet and release/deployment gates remain unclosed.

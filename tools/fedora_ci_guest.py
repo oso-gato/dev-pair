@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Secret-free Fedora VM initialization probe, launched by authenticated public payload."""
 import argparse
+import base64
 import contextlib
 import array
 import fcntl
@@ -469,6 +470,12 @@ def validate_executor(value, expected, guest_sha):
 
 def encode_report(report):
     data = json.dumps(report, sort_keys=True, ensure_ascii=True).encode()
+    if len(data)>REPORT_LIMIT:
+        group=report.get('diagnostics',{}).get('public_operations',{}).get('adapter',{})
+        if type(group) is dict and 'sealed_signed_load' in group:
+            group['sealed_signed_load']=sealed_unavailable('report-budget')
+            group.pop('sealed_signed_load_binding',None)
+            data=json.dumps(report,sort_keys=True,ensure_ascii=True).encode()
     require(0 < len(data) <= REPORT_LIMIT, 'Guest report JSON exceeds byte limit')
     return REPORT_BEGIN + data + REPORT_END
 
@@ -1210,6 +1217,29 @@ def launcher_projection(value,context=None):
     except (ValueError,KeyError,TypeError):return unavailable
 
 
+def sealed_unavailable(reason):return {'schema':1,'availability':'unavailable','reason':reason}
+
+def sealed_load_projection(value,expected,payload=None):
+    try:
+        if type(value) is not dict:return sealed_unavailable('invalid')
+        if value.get('availability')=='unavailable':
+            return value if set(value)=={'schema','availability','reason'} and type(value['schema']) is int and value['schema']==1 and value['reason'] in ('not-collected','not-selected','incomplete','too-large','no-budget','recipient-unavailable','encryption-unavailable','encryption-cleanup-unresolved','report-budget','invalid') else sealed_unavailable('invalid')
+        keys={'schema','availability','attempt_id','identity','uid','status','recipient_sha256','fingerprint','ciphertext_bytes','ciphertext_sha256','ciphertext_base64'}
+        if not (set(value)==keys and type(value['schema']) is int and value['schema']==1 and value['availability']=='sealed'):raise ValueError("sealed schema")
+        if not (type(value['attempt_id']) is str and re.fullmatch('[0-9a-f]{32}',value['attempt_id'])):raise ValueError('attempt')
+        identity=value['identity']
+        if not identity=={'source_sha':expected['source_sha'],'context_sha256':expected['context_sha256'],'phase':'maintenance-gptbox'}:raise ValueError('identity')
+        if not (type(payload) is dict and payload.get('availability')=='observed' and payload.get('context_sha256')==expected['context_sha256'] and payload.get('suboperation')=='load' and payload.get('launch_handle_observed') is True and payload.get('control_verified') is True and type(payload.get('uid')) is int and type(payload.get('status')) is int and payload['uid']==value['uid'] and payload['status']==value['status'] and all(row.get('complete') is True for row in payload['streams'].values())):raise ValueError('payload binding')
+        if not (value['recipient_sha256']=='020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c' and value['fingerprint']=='59CD9CD708EEB010F4A1BB6B83B33B576391877E'):raise ValueError("sealed schema")
+        if not (type(value['uid']) is int and 1000<=value['uid']<2**32 and type(value['status']) is int and 1<=value['status']<=255):raise ValueError("sealed schema")
+        if not (type(value['ciphertext_base64']) is str and len(value['ciphertext_base64'])<=21848):raise ValueError("sealed schema")
+        cipher=base64.b64decode(value['ciphertext_base64'],validate=True)
+        if not (type(value['ciphertext_bytes']) is int and 0<len(cipher)<=16384 and len(cipher)==value['ciphertext_bytes'] and hashlib.sha256(cipher).hexdigest()==value['ciphertext_sha256']):raise ValueError("sealed schema")
+        if not (len(json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode())<=24000):raise ValueError("sealed schema")
+        return value
+    except (AssertionError,KeyError,TypeError,ValueError):return sealed_unavailable('invalid')
+
+
 def signed_load_projection(entry,expected,phase='maintenance-gptbox'):
     unavailable={'availability':'unavailable'}
     try:
@@ -1335,6 +1365,12 @@ def public_diagnostics(state_root, expected, source=None):
             failures = record.get('failures', [])
             selected[name] = {'available_failures': len(failures), 'retained_failures': min(2, len(failures)), 'records': []}
             selected[name]['sudo_evidence'] = sudo_public_projection(record)
+            if name=='adapter' and 'sealed_signed_load' in record:
+                binding=record.get('sealed_signed_load_binding',{})
+                payload=signed_load_projection(binding,expected)
+                selected[name]['sealed_signed_load']=sealed_load_projection(record['sealed_signed_load'],expected,payload)
+                if selected[name]['sealed_signed_load'].get('availability')=='sealed':
+                    selected[name]['sealed_signed_load_binding']={key:binding[key] for key in ('step','operation_id','relay_verified','native_exit_status','signed_load_payload','diagnostic_identity')}
             selected[name]['recent_metadata'] = [{key: item.get(key) for key in
                     ('operation_id', 'step', 'status', 'outcome', 'accepted_exit', 'allowed_exit_statuses', 'native', 'elapsed_seconds', 'admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status')}
                     for item in record.get('recent', [])[-4:]]

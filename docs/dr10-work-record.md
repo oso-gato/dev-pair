@@ -3,6 +3,49 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 04:33 HKT — sealed selected-load diagnostic source
+
+- Native34 on reviewed de99a97 completed enforcing Fedora host prerequisites in
+  541.513 seconds under 600, then signed load exited 125 after 54.124 seconds.
+  Complete 2,143-byte stderr remained hash-only and unknown. No prepared image,
+  assembly or storage acceptance resulted; exact owned and outer cleanup passed.
+  Its cause remains unknown. No speculative runtime repair is included here.
+- The fixed public CI recipient is pinned by exact bytes/hash and 40-hex primary
+  fingerprint. Only public material is tracked. The root-held private key was
+  never read, used or copied by this unit. Meaningful local encryption/decryption
+  tests use separately generated, owned, disposable synthetic keys, removed with
+  their owned GPG agent/home. This is not release-key custody evidence.
+- The selected failed signed-load capsule binds source/context, fresh attempt,
+  executor UID/unit, status and complete stream lengths/hashes plus exact bytes.
+  Plaintext stays in memory/pipes; 8 KiB plaintext, 16 KiB ciphertext and five
+  seconds clipped to original remaining command/phase budget remain fixed.
+  Encryption has an internal reap reserve, bounded output and core dumps disabled.
+  No plaintext fallback, new engine/probe query, runtime admission, privilege,
+  network, SELinux, environment or command/resource/time-cap change occurs.
+- One separate capsule plus independent validated load binding passes the closed
+  guest/controller projections. A real 64 KiB serialization guard drops optional
+  ciphertext with a typed reason if necessary. Encryption/unavailable/cleanup
+  diagnostics cannot replace the original payload or native cleanup failure.
+  The existing public ISO now gives all entries deterministic root UID/GID
+  metadata; no host chown occurs and source/context content stays exact.
+- Affected evidence is under `/workspace/artifacts/native-selected-payload-20261122/`.
+  Initial test class/module naming errors and the source-fixture missing new
+  sibling error are retained, followed by green affected checks. The broad
+  affected run passed 119 tests; final capsule checks passed 21 after adding a
+  malformed nesting rejection. No full suite is relabeled: 639 belongs to 84eaf47.
+  Root deferred the next combined full suite to the queued integration repair.
+- Reviewed 78c1355 closed startup replay ordering, but its single changed stock
+  attempt stopped before CLI/listener at missing staged fedora_oci.py. Nine
+  baseline checks passed; no turns, UUIDs, requests or audits were reached.
+  Receipt SHA256 is ae29503f06b24d447f3d63a3d72ffa51a6cb1c6038e13bd8b62bdc034440bfb1.
+  That separate dependency-closure repair is queued; session/registry/ledger,
+  policy and helper bytes stay exactly 78c1355 in this native unit.
+- Allocation is 20:20:34–20:45:34 UTC without extension. API-selected GPT-6.1
+  Sol/high is the builder; backend attestation remains unavailable. No real model,
+  auth, stock, native, network/SSH, CI/push/merge or deployment action occurred.
+  Fresh exact review and separately scoped changed native evidence are required.
+
+
 ### November 23, 2026, 04:16 HKT — startup R1 causal-order repair
 
 - Independent review of frozen 84eaf47 found one high-priority R1: unchanged

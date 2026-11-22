@@ -433,7 +433,7 @@ class ProductionInputContractTests(unittest.TestCase):
             repo = root / 'reviewed-adapter-source'
             tools = repo / 'tools'
             tools.mkdir(parents=True)
-            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py'):
+            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py'):
                 (tools / name).write_bytes((ROOT / 'tools' / name).read_bytes())
             upstream = root / 'synthetic-upstream-NOT-DISTROBOX'
             upstream.mkdir()

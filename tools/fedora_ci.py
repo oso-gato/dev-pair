@@ -23,7 +23,7 @@ import tempfile
 import time
 import urllib.request
 
-from fedora_ci_guest import (REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS,
+from fedora_ci_guest import (sealed_load_projection, REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS,
                              REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor, STARTUP_MARKER, validate_startup_witness, signed_load_projection)
 import public_inputs as public
 import fedora_oci
@@ -536,6 +536,8 @@ def parse_serial(data, expected_source, expected_guest, expected_inputs):
         for name in ('prepare','adapter'):
             group=operations.get(name)
             if type(group) is not dict:continue
+            if 'sealed_signed_load' in group:
+                require(sealed_load_projection(group['sealed_signed_load'],expected_inputs,signed_load_projection(group.get('sealed_signed_load_binding',{}),expected_inputs))==group['sealed_signed_load'], 'Invalid sealed load projection')
             for key in ('records','recent_metadata'):
                 rows=group.get(key,[])
                 if type(rows) is not list:continue
@@ -957,6 +959,11 @@ class Probe:
         for name in ('manifest.json', 'maintenance-inputs.tar.gz'):
             shutil.copyfile(handoff / name, payload / name)
             (payload / name).chmod(0o444)
+        # Disposable public diagnostic recipient, bound to this exact source.
+        recipient=self.repo/'tools/ci/native35-diagnostic-recipient.asc'
+        require(file_hash(recipient)=='020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c', 'Diagnostic recipient mismatch')
+        shutil.copyfile(recipient,payload/'native35-recipient.asc')
+        (payload/'native35-recipient.asc').chmod(0o444)
         shutil.copyfile(helper, payload / 'public_inputs.py')
         (payload / 'public_inputs.py').chmod(0o444)
         shutil.copyfile(self.repo / 'tools/fedora_oci.py', payload / 'fedora_oci.py')
@@ -975,8 +982,8 @@ class Probe:
                     '-quiet', '-output', '/disks/seed.iso', '-volid', 'cidata', '-joliet', '-rock', '/seed'])
         # Base disk is excluded from the source ISO to avoid duplication.
         self.helper(self.run_args('/usr/bin/genisoimage') + [self.image, '-quiet', '-output', '/disks/payload.iso',
-                    '-volid', 'DPPAYLOAD', '-joliet', '-rock', '-graft-points',
-                    'guest.py=/payload/guest.py', 'public_inputs.py=/payload/public_inputs.py', 'fedora_oci.py=/payload/fedora_oci.py',
+                    '-volid', 'DPPAYLOAD', '-joliet', '-rock', '-uid', '0', '-gid', '0', '-graft-points',
+                    'native35-recipient.asc=/payload/native35-recipient.asc', 'guest.py=/payload/guest.py', 'public_inputs.py=/payload/public_inputs.py', 'fedora_oci.py=/payload/fedora_oci.py',
                     'manifest.json=/payload/manifest.json', 'maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz'])
         base_info = json.loads(self.helper(self.run_args('/usr/bin/qemu-img') +
                                           [self.image, 'info', '--output=json', '/payload/base.qcow2']))

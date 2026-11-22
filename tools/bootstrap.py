@@ -39,6 +39,12 @@ except ModuleNotFoundError:
     lookup_paths, configuration_snapshot, verify_inactive_cgroup = _io_module.lookup_paths, _io_module.configuration_snapshot, _io_module.verify_inactive_cgroup
     configuration_mismatch = _io_module.configuration_mismatch
 
+try:
+    import selected_payload
+except ModuleNotFoundError:
+    _seal_spec=importlib.util.spec_from_file_location('selected_payload',Path(__file__).with_name('selected_payload.py'))
+    selected_payload=importlib.util.module_from_spec(_seal_spec);_seal_spec.loader.exec_module(selected_payload)
+
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
@@ -351,10 +357,11 @@ class Commands:
         finally:self._maintenance_launcher_binding=previous
 
     @contextlib.contextmanager
-    def adapter_image_launcher(self,context,uid):
-        previous=self._adapter_image_binding;self._adapter_image_binding=(context,uid)
+    def adapter_image_launcher(self,context,uid,identity=None):
+        previous=self._adapter_image_binding;previous_identity=getattr(self,"_selected_payload_identity",None)
+        self._adapter_image_binding=(context,uid);self._selected_payload_identity=identity
         try:yield
-        finally:self._adapter_image_binding=previous
+        finally:self._adapter_image_binding=previous;self._selected_payload_identity=previous_identity
 
     def adapter_image_selection(self,args,input_text):
         if self.current_step!='candidate-image' or input_text is not None:return None
@@ -1040,7 +1047,7 @@ class Commands:
                     process.stdin.close()
                 process.stdout.close()
                 process.stderr.close()
-            payload=None
+            payload=None;sealed_payload=None
             if signed_load_selected:
                 try:
                     verified=(relay_verified and decoder is not None and decoder.control is not None and
@@ -1051,6 +1058,12 @@ class Commands:
                         complete=bool(verified and capture_complete and cleanup_error is None and payload_eof=={'stdout','stderr'}))
                 except Exception:
                     payload={'availability':'unavailable'};callback_failed=True
+                # Optional sealed CI diagnostic cannot replace payload/cleanup failure.
+                if payload is not None and not completed:
+                    try:
+                        sealed_payload=selected_payload.seal(buffers,payload,getattr(self,'_selected_payload_identity',None),
+                            min(command_end,self.execution_deadline() or command_end))
+                    except Exception:sealed_payload={'schema':1,'availability':'unavailable','reason':'encryption-unavailable'}
             if probe and self.diagnostic:
                 actual = process.returncode if process is not None else None
                 notify(self.diagnostic,buffers,actual if actual is not None and actual not in ok else status)
@@ -1062,6 +1075,7 @@ class Commands:
                           'launcher_handle_observed':process is not None}
                 if failure_witness is not None:record['native_failure']=failure_witness
                 if payload is not None:record['signed_load_payload']=payload
+                if sealed_payload is not None:record['sealed_signed_load']=sealed_payload
                 if sudo_probe is not None:
                     record['sudo_denial'] = sudo_denial_projection(sudo_probe['role'], bytes(buffers['stdout']), bytes(buffers['stderr']),
                         complete=capture_complete and cleanup_error is None,

@@ -91,7 +91,7 @@ class Gptbox(Bootstrap):
         repo = Path(__file__).resolve().parents[1]
         if self.run('/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD').strip() != revision:
             raise Blocked('adapter source HEAD differs from requested exact target')
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py'):
             data = self.protected(Path(__file__).with_name(name)).read_bytes()
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
@@ -159,11 +159,15 @@ class Gptbox(Bootstrap):
                     latest.update(selected)
                 if failed:
                     history['failures'][-1].update(selected)
+                if 'sealed_signed_load' in record and 'sealed_signed_load' not in history:
+                    history['sealed_signed_load']=record['sealed_signed_load']
+                    history['sealed_signed_load_binding']={key:record[key] for key in ('step','operation_id','relay_verified','native_exit_status','signed_load_payload') if key in record}
+                    history['sealed_signed_load_binding']['diagnostic_identity']=getattr(self,'failure_diagnostic_identity',None)
                 self.record('diagnostics', history)
             self.run.diagnostic = diagnostic
             self.run.metadata_diagnostic = metadata
         try:
-            scope=self.run.adapter_image_launcher(self.target.rsplit('/',1)[-1],self.uid) if image_diagnostic and isinstance(self.run,Commands) else contextlib.nullcontext()
+            scope=self.run.adapter_image_launcher(self.target.rsplit('/',1)[-1],self.uid,getattr(self,'failure_diagnostic_identity',None)) if image_diagnostic and isinstance(self.run,Commands) else contextlib.nullcontext()
             previous_step=getattr(self.run,'current_step',None)
             try:
                 if image_diagnostic:self.run.current_step='candidate-image'
@@ -746,7 +750,7 @@ class Gptbox(Bootstrap):
         self.protected(upstream)
         for name in ('distrobox-init', 'distrobox-enter'):
             self.protected(Path(upstream) / name)
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py'):
             self.protected(Path(__file__).with_name(name))
         self.protected(Path(fedora_oci._public_inputs().__file__))
         if self.path('/usr/bin/git').exists():
