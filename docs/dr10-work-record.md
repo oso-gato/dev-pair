@@ -2,6 +2,99 @@
 
 ## Latest continuation checkpoint
 
+### November 22, 2026, 20:48 HKT — reviewed native components and closed native26
+
+- Published PR13 remains draft/open/unmerged at exact
+  `2a32bf675de4914e684904aa45ac9c88aba7ffe6`, tree
+  `5b5ff2fb815c75399590bf01eaa843ec42c465c5`. This isolated checkpoint edits
+  only README DR2.5/DR2.7 and this new entry; executable source is unchanged.
+  Earlier checkpoints and failure history below remain authoritative for their
+  own candidates. This documentation unit does not push or change main.
+- Native [run25](https://github.com/oso-gato/dev-pair/actions/runs/45019784731),
+  source `87b405d`, passed 438 hosted tests in 70.854 seconds, signed inputs,
+  tooling, enforcing Fedora boot and resolved checks. Both exact native sudo
+  denials passed. Both roles completed eight directories using two checked
+  owner lookups each. The actual preparation SIGALRM fired at the unchanged
+  600-second limit: budget elapsed 600.780475434 seconds, protected prepare
+  elapsed 600.782 seconds; initialization elapsed 620.143 seconds. This witness
+  is present at `diagnostics.public_operations.prepare_progress.observations`;
+  an earlier coordinator reading missed that nested field. No reporting fix or
+  credential-failure diagnosis follows. The Tailscale install payload was not
+  launched: the command stopped at native labels admission. Outer cleanup
+  passed; guest cleanup and prepared/assembled image proof remain unverified.
+  Evidence `/workspace/artifacts/fedora-ci-run-45019784731-controller.json`,
+  `-report.json` and `.log`; diagnosis
+  `/workspace/artifacts/resume-20261122/run25-prepare-diagnosis.json`, SHA256
+  `fc83772e8df0f9861c7614a89e8ede494cbeeceb5c3d7ccbd391e773a272e9a6`.
+- Storage candidate `cea5517` had 449 passing local tests but fresh review
+  required R1/R2 repairs. Corrected `187b41ddf56e18b754309992bb786047ffeb30c4`
+  passed 451 local tests and fresh review: existing 256 KiB native transport,
+  strict 16 KiB semantic projection, safe malformed-image-ID reporting. Fixed
+  prepared/postcleanup observations remain aggregate-only point samples; no
+  quota, quiescence, future growth maximum or runtime admission is established.
+  Builder `/workspace/artifacts/storage-r1r2-187b41d/evidence.json`, SHA256
+  `e0efc21171134ae1fa9e64089a5720a06a217a79f3bbaec0ec9609dad1143372`;
+  review `/workspace/artifacts/storage-repair-review-187b41d/review.json`, SHA256
+  `42adb40ce16e9430abc2ad2cb37bab08b73c064bd22ab2ad9e4d5ddda034077b`.
+- Cost candidate `5bcc56c931997860b0aa58625eab1b3319c0a9fa` passed 446 local
+  tests and fresh review. It records fixed-step wall time and received outer
+  command callbacks before ring eviction, without double-counting nested
+  controls. Launcher-handle facts are not payload-start or cleanup proof.
+  Per-attempt reset, source/context/phase binding and the 4 KiB public projection
+  retain all original deadlines/checks. No dominant native cost or fit is known.
+  Builder `/workspace/artifacts/prepare-cost-5bcc56c/evidence.json`, SHA256
+  `a2f59207f86f11f8baa82ea6b27a31701a27b4bc3a0443cb59223c519c1b0a7a`;
+  review `/workspace/artifacts/prepare-cost-review-5bcc56c/review.json`, SHA256
+  `abcc5e23e0688d3e37cb13fba2145ebc84fc94c69b30391e71d5f019f54e7caf`.
+- Exact merge `2a32bf6` matched the automatic component tree and passed 459
+  combined tests in 75.835 seconds plus seven fresh integration checks.
+  Validation `/workspace/artifacts/integration-storage-cost-2a32bf6/evidence.json`,
+  SHA256 `81305ea0241fa3de29791533ebb93ae188609381ce3fa207fd876a9ac5a8d36e`;
+  review `/workspace/artifacts/storage-cost-integration-review-2a32bf6/review.json`,
+  SHA256 `bd636ad73fdc91df6a57f714ac3212f397a60233736ff0eec18970d995563dbc`.
+  These are source/local results, not native maintenance acceptance.
+- The one changed [native26](https://github.com/oso-gato/dev-pair/actions/runs/45023803574)
+  attempt, job `137212299531`, is now CLOSED. On exact `2a32bf6`, 459 hosted
+  tests passed in 60.976 seconds and signed Cloud input verified. Tooling then
+  stopped at the owned local-image runtime-info command, exit 124; OCI runtime
+  details were unavailable/not collected. Cleanup FAILED: image-copy worker
+  unresolved, owned scratch preserved. No Fedora VM, source payload,
+  preparation-cost data or maintenance storage observation was reached. Cause
+  diagnosis is pending; no unchanged retry, promotion or cap increase follows.
+  Evidence `/workspace/artifacts/fedora-ci-run-45023803574-controller.json` and
+  `.log`. Original scope `/workspace/artifacts/native26-scope-2a32bf6.json`.
+- Native26 retained hosted 60 minutes; controller 3300 seconds (setup 540,
+  VM 2640, cleanup 120), tooling 540/kill 10 and prepare 600 seconds;
+  guest 6 GiB/2 CPU/32 GiB virtual; outer 8 GiB/3 CPU/1024 PIDs;
+  overlay 16 GiB, overhead 4 GiB, host reserve 3 GiB and guest reserve 8 GiB;
+  logs 8 MiB/report 64 KiB. No real auth/model, VPS, privilege/confinement,
+  network or storage exception was included. Cleanup uncertainty remains failure.
+- The separate stock `5c99c69` attempt retained a 1192-byte witness: complete
+  old user prefix and original pair exact, exactly one extra environment after
+  old output/before current prompt. Both first turns/markers, checkpoint and
+  first rollout audits passed, but whole environment-body equality was NOT
+  measured; zero continuation actions were issued. Eight requests, 248222
+  captured bytes, 2.453 seconds; owned cleanup completed. Receipt
+  `/workspace/artifacts/session-stock-5c99c69/evidence.json`, SHA256
+  `1192adde09d06dbc1bae59451cac32ad5e41fee897ee421e64c9ed0aeec4a9b9`.
+- Conditional environment repair `844d2fe0b55059e680ec1606157088e4bd6775db`
+  passed 464 local tests in 73.183 seconds, but fresh review is CHANGES_REQUIRED:
+  R1 permits a fresh environment ID to collide with a prior assistant/non-user
+  item. It is frozen, not integrated and not stock-tested. No actual body
+  equality or successful resume is claimed. Builder
+  `/workspace/artifacts/session-environment-844d2fe/evidence.json`, SHA256
+  `c3445c756125041ddabdc236e58ab11e80c024e9864fd0dd4541081b43fddd24`;
+  review `/workspace/artifacts/session-environment-review-844d2fe/review.json`,
+  SHA256 `5957d74c76897183a2b12d9e8a3f2efc26b567d35f10f9d76d41e39292aa38e6`.
+- API selections remain GPT-6.1 Sol High for implementation/validation and fresh
+  GPT-6 Astra High for architecture/review. Backend attestation and standalone
+  Cloud-conversation verification remain unavailable. Hard quotas/safe cleanup,
+  complete tool/provider effects, real authentication, maintenance/nested images,
+  jobs, full-session renewal/recovery, tailnet cutover/independent recovery and
+  enforced releases remain blocked. Hostinger is untouched; a supported root/SSH
+  route remains unavailable. No credential, private standards text, runtime
+  admission or deployment claim is introduced by this checkpoint.
+
 ### November 22, 2026, 19:45 HKT — reviewed role-directory batching integration
 
 - Native [run23](https://github.com/oso-gato/dev-pair/actions/runs/45014587567),
