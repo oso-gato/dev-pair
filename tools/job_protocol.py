@@ -1,7 +1,7 @@
-"""Version 1 local job protocol and trusted-controller recovery ledger.
+"""Version 1 job protocol and trusted-controller recovery ledger.
 
-No transport authentication, agent admission, shell execution or host adapter.
-The filesystem principal that owns this module and ledger is the controller.
+Transport authentication belongs to the local process adapter. The filesystem
+principal that owns this module and ledger is the controller.
 """
 import contextlib
 import base64
@@ -20,6 +20,9 @@ import uuid
 VERSION = 1
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 RECIPE = 'local-json-message-v1'
+APP_PROCESS_BOUNDARY = 'local-app-process'
+# The existing JSON recipe is unchanged from the immediate baseline.
+BASE_JSON_RECIPE_SHA256 = 'cfa3dc15cdeef81852e296bffe6a9d9774cb7fff6aa1708a40454b8e646ff788'
 MAX_MESSAGE = 65536
 # Requests reserve three quarters of the envelope for executor diagnostics,
 # per-check actual/verdict fields, identity and reconciliation evidence. These
@@ -86,6 +89,25 @@ def references(value):
     require(type(value) is list and len(value) <= 32, 'invalid evidence references')
     for item in value:
         text(item)
+
+
+def app_transport(request):
+    values = request['fixtures']
+    require(len(values) == 3, 'application request requires three transport bindings')
+    prefixes = ('controller:', 'development-cert-sha256:', 'maintenance-cert-sha256:')
+    require(all(value.startswith(prefix) for value, prefix in zip(values, prefixes)),
+            'invalid application transport bindings')
+    controller, development, maintenance = [value[len(prefix):] for value, prefix in zip(values, prefixes)]
+    token(controller)
+    digest(development)
+    digest(maintenance)
+    require(development != maintenance, 'distinct test principals required')
+    return controller, development, maintenance
+
+
+def app_environment(request):
+    app_transport(request)
+    return 'Local Linux namespace sandbox over mutually authenticated loopback TLS. ' + ' '.join(request['fixtures'][1:])
 
 
 def candidate(value):
@@ -166,7 +188,7 @@ def validate(obj, kind=None):
                 text(check['diagnostics'])
                 references(check['evidence'])
     if kind == 'request':
-        require(obj['boundary'] in ('local-protocol', 'fedora-host'), 'unsupported boundary')
+        require(obj['boundary'] in ('local-protocol', 'fedora-host', APP_PROCESS_BOUNDARY), 'unsupported boundary')
         text(obj['reason'])
         for name in ('capabilities', 'permitted_effects'):
             require(type(obj[name]) is list and len(obj[name]) <= 16 and
@@ -175,6 +197,8 @@ def validate(obj, kind=None):
                 token(item)
         token(obj['workspace'])  # logical job-owned workspace ID, never a submitted host path
         references(obj['fixtures'])
+        if obj['boundary'] == APP_PROCESS_BOUNDARY:
+            app_transport(obj)
         budgets(obj['budgets'])
         fields(obj['cleanup'], 'plan preserve')
         text(obj['cleanup']['plan'])
@@ -186,7 +210,7 @@ def validate(obj, kind=None):
         fields(obj['executor'], 'controller_id environment boundary implementation_sha256')
         token(obj['executor']['controller_id'])
         text(obj['executor']['environment'])
-        require(obj['executor']['boundary'] == 'local-protocol', 'unverified executor boundary')
+        require(obj['executor']['boundary'] in ('local-protocol', APP_PROCESS_BOUNDARY), 'unverified executor boundary')
         digest(obj['executor']['implementation_sha256'])
         require(obj['status'] == verdict(obj['checks']), 'aggregate verdict mismatch')
         text(obj['diagnostics'])
@@ -204,6 +228,30 @@ def validate(obj, kind=None):
 def verdict(checks):
     states = {check['status'] for check in checks}
     return 'fail' if 'fail' in states else 'blocked' if 'blocked' in states else 'pass'
+
+
+def result_progress(result):
+    if result['status'] == 'pass':
+        return ('process-checks-passed' if result['executor']['boundary'] == APP_PROCESS_BOUNDARY
+                else 'local-checks-passed')
+    return 'repair-required' if result['status'] == 'fail' else 'blocked'
+
+
+def match_result(request, result, controller_id):
+    require(result['executor']['controller_id'] == controller_id, 'controller identity mismatch')
+    require(result['request_id'] == request['request_id'] and result['request_sha256'] == identity(request) and
+            all(result[key] == request[key] for key in ('job_id', 'checkpoint_id', 'candidate', 'test')),
+            'result identity mismatch')
+    require([(c['id'], c['expected']) for c in result['checks']] ==
+            [(c['id'], c['expected']) for c in request['checks']], 'result check mismatch')
+    app_process = request['boundary'] == APP_PROCESS_BOUNDARY
+    expected_boundary = APP_PROCESS_BOUNDARY if app_process else 'local-protocol'
+    require(result['executor']['boundary'] == expected_boundary, 'result boundary mismatch')
+    if app_process:
+        require(app_transport(request)[0] == controller_id and
+                result['executor']['implementation_sha256'] == request['test']['recipe_sha256'] and
+                result['executor']['environment'] == app_environment(request),
+                'result implementation or transport identity mismatch')
 
 
 def envelope(kind, **values):
@@ -339,12 +387,16 @@ class Ledger:
         cp = self.record('checkpoint', obj['checkpoint_id'])
         require(cp['candidate'] == obj['candidate'] and cp['test'] == obj['test'], 'candidate/test mismatch')
 
-    def submit(self, obj):
+    def submit(self, obj, *, authenticated=False):
         validate(obj, 'request')
+        require(obj['boundary'] != APP_PROCESS_BOUNDARY or authenticated,
+                'application request requires authenticated transport')
         with self.transaction():
             old = self.db.execute('SELECT body FROM records WHERE kind=? AND id=?', ('request', obj['request_id'])).fetchone()
             if old:
                 require(old['body'] == canonical(obj), 'ID collision: request mismatch')
+                if authenticated:
+                    self.current(obj)
                 return self.status(obj['request_id'])
             job = self.record('job', obj['job_id'])
             self.current(obj)
@@ -376,14 +428,21 @@ class Ledger:
     def status(self, request_id):
         row = self.db.execute('SELECT * FROM requests WHERE id=?', (request_id,)).fetchone()
         require(row is not None, 'unknown request')
-        return {'request': self.record('request', request_id), 'state': row['state'], 'attempt_id': row['attempt'],
-                'result': validate(loads(row['result']), 'result') if row['result'] else None,
+        request = self.record('request', request_id)
+        result = validate(loads(row['result']), 'result') if row['result'] else None
+        if result is not None:
+            match_result(request, result, self.controller_id)
+            require(row['state'] == 'completed' and row['attempt'] == result['attempt_id'], 'attempt mismatch')
+        return {'request': request, 'state': row['state'], 'attempt_id': row['attempt'], 'result': result,
                 'reconciliation_required': row['state'] == 'in-flight'}
 
-    def begin(self, request_id):
+    def begin(self, request_id, *, authenticated_request=None):
         with self.transaction():
             status = self.status(request_id)
+            self.check_transport(status, authenticated_request)
             if status['state'] == 'completed':
+                if authenticated_request is not None:
+                    self.current(authenticated_request)
                 return None, status['result']
             require(status['state'] == 'pending', 'unresolved in-flight effects require reconciliation; execution refused')
             self.current(status['request'])
@@ -393,6 +452,13 @@ class Ledger:
             self.event('execution-reserved', {'request_id': request_id, 'attempt_id': attempt,
                                              'request_sha256': identity(status['request'])})
         return attempt, None
+
+    def check_transport(self, status, authenticated_request):
+        if authenticated_request is not None:
+            require(status['request'] == authenticated_request, 'ID collision: request mismatch')
+        else:
+            require(status['request']['boundary'] != APP_PROCESS_BOUNDARY,
+                    'application request requires authenticated transport')
 
     def make_result(self, request, attempt, checks, diagnostics, evidence=None):
         return envelope('result', **{name: request[name] for name in
@@ -410,11 +476,7 @@ class Ledger:
             status = self.status(result['request_id'])
             request = status['request']
             require(status['state'] == 'in-flight' and status['attempt_id'] == result['attempt_id'], 'attempt mismatch')
-            require(result['executor']['controller_id'] == self.controller_id, 'controller identity mismatch')
-            require(result['request_sha256'] == identity(request) and all(result[key] == request[key] for key in
-                    ('job_id', 'checkpoint_id', 'candidate', 'test')), 'result identity mismatch')
-            require([(c['id'], c['expected']) for c in result['checks']] ==
-                    [(c['id'], c['expected']) for c in request['checks']], 'result check mismatch')
+            match_result(request, result, self.controller_id)
             self.db.execute('UPDATE requests SET state=?,result=? WHERE id=?', ('completed', canonical(result), result['request_id']))
             self.event('result', result)
         return result
@@ -432,7 +494,9 @@ class Ledger:
         reason = None
         if request['boundary'] != 'local-protocol':
             reason = 'No verified Fedora host executor/transport; host checks remain blocked'
-        elif request['test'] != recipe_identity():
+        elif request['test'] not in (recipe_identity(),
+                                     {'revision': BASE_JSON_RECIPE_SHA256, 'recipe': RECIPE,
+                                      'recipe_sha256': BASE_JSON_RECIPE_SHA256}):
             reason = 'Unsupported or changed trusted local recipe identity'
         elif request['capabilities'] != ['local-json-read'] or request['permitted_effects'] != ['read-artifact', 'write-ledger']:
             reason = 'Requested capability/effects are outside the fixed local controller policy'
@@ -492,6 +556,8 @@ class Ledger:
         with self.transaction():
             status = self.status(request_id)
             require(status['state'] == 'in-flight', 'only in-flight attempts require reconciliation')
+            require(status['request']['boundary'] != APP_PROCESS_BOUNDARY,
+                    'application attempt remains unresolved; inspect the owned scratch without replay')
             # This controller has never dispatched anything beyond its fixed,
             # read-only local recipe. External host effects cannot be reconciled here.
             self.event('reconciliation', {'request_id': request_id, 'attempt_id': status['attempt_id'],
@@ -503,16 +569,20 @@ class Ledger:
             self.event('result', result)
         return result
 
-    def consume(self, request_id):
+    def consume(self, request_id, *, authenticated_request=None):
         with self.transaction():
             status = self.status(request_id)
+            self.check_transport(status, authenticated_request)
             require(status['state'] == 'completed', 'no completed result')
             result = status['result']
             self.current(result)
-            # This advances local protocol progress only, never product acceptance.
-            progress = 'local-checks-passed' if result['status'] == 'pass' else 'repair-required' if result['status'] == 'fail' else 'blocked'
+            progress = result_progress(result)
+            consumed = {'request_id': request_id, 'request_sha256': result['request_sha256'], 'progress': progress}
+            if authenticated_request is not None and self.db.execute(
+                    'SELECT 1 FROM events WHERE event=? AND body=?', ('consumed', canonical(consumed))).fetchone():
+                return {'progress': progress, 'result': result}
             self.db.execute('UPDATE jobs SET state=? WHERE id=?', (progress, result['job_id']))
-            self.event('consumed', {'request_id': request_id, 'request_sha256': result['request_sha256'], 'progress': progress})
+            self.event('consumed', consumed)
         return {'progress': progress, 'result': result}
 
     def inspect(self, job_id):

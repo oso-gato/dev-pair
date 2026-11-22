@@ -204,14 +204,10 @@ def validate_database(path, deadline):
             elif event == 'result':
                 p.validate(obj, 'result')
                 req = record('request', obj['request_id'])
+                p.match_result(req, obj, controller)
                 p.require(obj['request_id'] in requests, 'result before request')
                 row = requests[obj['request_id']]
-                p.require(row['state'] == 'in-flight' and row['attempt'] == obj['attempt_id'] and
-                          obj['request_sha256'] == p.identity(req) and
-                          obj['executor']['controller_id'] == controller and
-                          all(obj[k] == req[k] for k in ('job_id', 'checkpoint_id', 'candidate', 'test')) and
-                          [(c['id'], c['expected']) for c in obj['checks']] ==
-                          [(c['id'], c['expected']) for c in req['checks']], 'result identity mismatch')
+                p.require(row['state'] == 'in-flight' and row['attempt'] == obj['attempt_id'], 'attempt identity mismatch')
                 if reconciliation is not None:
                     p.require(obj['request_id'] == reconciliation['request_id'] and obj['status'] == 'blocked' and
                               obj['diagnostics'] == reconciliation['diagnostics'] and
@@ -223,6 +219,8 @@ def validate_database(path, deadline):
             elif event == 'reconciliation':
                 p.fields(obj, 'request_id attempt_id diagnostics evidence')
                 p.text(obj['diagnostics']); p.references(obj['evidence'])
+                req = record('request', obj['request_id'])
+                p.require(req['boundary'] != p.APP_PROCESS_BOUNDARY, 'unexpected application reconciliation')
                 p.require(obj['request_id'] in requests and obj['evidence'] and
                           requests[obj['request_id']]['state'] == 'in-flight' and
                           requests[obj['request_id']]['attempt'] == obj['attempt_id'],
@@ -236,7 +234,7 @@ def validate_database(path, deadline):
                 p.require(obj['request_id'] in requests and requests[obj['request_id']]['state'] == 'completed',
                           'consumed incomplete request')
                 result = p.loads(requests[obj['request_id']]['result'])
-                progress = {'pass': 'local-checks-passed', 'fail': 'repair-required', 'blocked': 'blocked'}[result['status']]
+                progress = p.result_progress(result)
                 p.require(obj['progress'] == progress and obj['request_sha256'] == p.identity(req),
                           'consumed identity mismatch')
                 jobs[req['job_id']][1] = progress
