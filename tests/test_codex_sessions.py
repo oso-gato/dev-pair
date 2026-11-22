@@ -95,6 +95,84 @@ class SessionsTests(unittest.TestCase):
             self.assertEqual(self.j.entries,before)
         self.assertEqual(len(self.j.records),2)
 
+    def metadata_first(self,label,turn_id):
+        self.observed(label);first=message(s.prompt(label,'first',NONCE));self.j.request(body([first]))
+        issued=copy.deepcopy(self.j.turn['issued']);actual=self.run_action(issued)
+        call=copy.deepcopy(issued);call[s.METADATA]={'turn_id':turn_id}
+        returned={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual),
+                  s.METADATA:{'turn_id':turn_id,'create_time':1700000000.25}}
+        self.j.request(body([first,call,returned]))
+        self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
+        self.assertEqual(t.canonical(self.j.entries[label]['call']),t.canonical(call))
+        self.assertEqual(t.canonical(self.j.entries[label]['output']),t.canonical(returned))
+        return call,returned
+
+    def test_kind_metadata_preserves_dicts_and_new_turn_differs_from_session_and_history(self):
+        turn='33333333-3333-7333-8333-333333333333';new_turn='44444444-4444-7444-8444-444444444444'
+        self.metadata_first('alpha',turn);self.first('beta')  # Existing absent-metadata contract.
+        original=copy.deepcopy(self.j.entries['alpha']);self.observed('alpha','resume')
+        history=self.history('alpha');self.j.request(body(history));issued=copy.deepcopy(self.j.turn['issued'])
+        output=self.run_action(issued);call=copy.deepcopy(issued);call[s.METADATA]={'turn_id':new_turn}
+        result={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(output),
+                s.METADATA:{'turn_id':new_turn,'create_time':1700000001}}
+        self.j.request(body(history+[call,result]));self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
+        self.assertEqual(self.j.entries['alpha'],original);self.assertIsNone(self.j.metadata_rejection)
+        self.assertNotEqual(turn,IDS['alpha']);self.assertNotEqual(new_turn,turn)
+
+    def test_closed_kind_metadata_rejects_null_extras_uuid_and_bad_timestamps(self):
+        issued=s.action('alpha','first',NONCE);turn=IDS['beta']
+        calls=[None,{}, {'turn_id':turn,'create_time':1},{'turn_id':turn,'unknown':'secret'},
+               {'turn_id':'bad'},{'turn_id':None},{'turn_id':True}]
+        outputs=[None,{}, {'turn_id':turn}, {'turn_id':turn,'create_time':1,'executed_tool_calls':[]}]
+        outputs += [{'turn_id':turn,'create_time':value} for value in (True,float('nan'),float('inf'),0,-1,1e12,10**1000,'1')]
+        for kind,variants in [('function_call',calls),('function_call_output',outputs)]:
+            for value in variants:
+                item=copy.deepcopy(issued) if kind=='function_call' else {'type':kind,'call_id':issued['call_id'],'output':'x'}
+                item[s.METADATA]=value
+                with self.assertRaises(s.MetadataRejected):s.history_item(item,issued,kind)
+
+    def test_changed_removed_swapped_or_mismatched_metadata_cannot_replay_history(self):
+        self.metadata_first('alpha',IDS['beta']);self.first('beta')
+        valid=self.history('alpha');variants=[]
+        for index in (1,2):
+            changed=copy.deepcopy(valid);changed[index].pop(s.METADATA);variants.append(changed)
+            changed=copy.deepcopy(valid);changed[index][s.METADATA]['turn_id']=IDS['alpha'];variants.append(changed)
+        changed=copy.deepcopy(valid);changed[1][s.METADATA],changed[2][s.METADATA]=changed[2][s.METADATA],changed[1][s.METADATA];variants.append(changed)
+        changed=copy.deepcopy(valid)
+        for index in (1,2):changed[index][s.METADATA]['turn_id']='55555555-5555-7555-8555-555555555555'
+        variants.append(changed)
+        for values in variants:
+            self.observed('alpha','resume');before=copy.deepcopy(self.j.entries)
+            with self.assertRaises(ValueError):self.j.request(body(values))
+            self.assertIsNone(self.j.turn['issued']);self.assertEqual(self.j.entries,before)
+
+    def test_metadata_shape_witness_is_first_bounded_private_and_has_no_acceptance_effect(self):
+        self.observed('alpha');first=message(s.prompt('alpha','first',NONCE));self.j.request(body([first]))
+        issued=copy.deepcopy(self.j.turn['issued']);actual=self.run_action(issued)
+        call=copy.deepcopy(issued);call[s.METADATA]={'turn_id':IDS['beta'],'SECRET_UNKNOWN_KEY':'SECRET_TRANSCRIPT_VALUE',
+            'executed_tool_calls':[{'arguments':'SECRET_TRANSCRIPT_VALUE'*200}]*20}
+        output={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual)}
+        with self.assertRaises(s.MetadataRejected):self.j.request(body([first,call,output]))
+        witness=copy.deepcopy(self.j.metadata_rejection);encoded=t.canonical(witness)
+        self.assertLessEqual(len(encoded),2048);self.assertNotIn(b'SECRET',encoded);self.assertNotIn(IDS['beta'].encode(),encoded)
+        self.assertEqual(witness['expected_kind'],'function_call');self.assertEqual(witness['item_index'],1)
+        self.assertTrue(witness['issued_call_id_matches']);self.assertEqual(witness['unknown_key_count'],1)
+        self.assertEqual(witness['recognized_keys']['executed_tool_calls'],{'present':True,'type':'array'})
+        self.assertEqual(witness['request'],self.j.last_request);self.assertEqual(witness['harness_sha256'],t.sha(Path(s.__file__).read_bytes()))
+        self.assertFalse(self.j.entries);self.assertFalse(self.j.records);self.assertIsNone(self.j.turn['returned'])
+        self.assertFalse(self.j.turn['finished']);self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
+        call[s.METADATA]=None
+        with self.assertRaises(s.MetadataRejected):self.j.request(body([first,call,output]))
+        self.assertEqual(self.j.metadata_rejection,witness)
+
+    def test_real_local_rejected_metadata_report_keeps_witness_and_existing_effect(self):
+        code="import copy,json,sys\nsys.path.insert(0,sys.argv[1]);import test_codex_sessions as tests\ns=tests.s;t=tests.t;case=tests.SessionsTests();case.setUp()\ntry:\n case.observed('alpha');first=tests.message(s.prompt('alpha','first',tests.NONCE));case.j.request(tests.body([first]))\n issued=copy.deepcopy(case.j.turn['issued']);actual=case.run_action(issued)\n call=copy.deepcopy(issued);call[s.METADATA]={'turn_id':tests.IDS['beta'],'SECRET_KEY':'SECRET_VALUE'}\n output={'type':'function_call_output','call_id':issued['call_id'],'output':tests.terminal(actual)}\n try:case.j.request(tests.body([first,call,output]))\n except s.MetadataRejected:pass\n print(json.dumps({'status':'blocked','witness':case.j.metadata_rejection,'accepted_turns':len(case.j.records),'checkpoints':len(case.j.entries),'actual_marker_lines':s.marker(case.root,'alpha',('first',),tests.NONCE)['lines']}))\nfinally:case.doCleanups()\n"
+        result=subprocess.run([sys.executable,'-c',code,str(Path(__file__).parent)],capture_output=True,text=True,timeout=4)
+        self.assertEqual(result.returncode,0,result.stderr);self.assertLess(len(result.stdout),4096);self.assertNotIn('SECRET',result.stdout)
+        value=json.loads(result.stdout);self.assertEqual(value['status'],'blocked');self.assertEqual(value['accepted_turns'],0)
+        self.assertEqual(value['checkpoints'],0);self.assertEqual(value['actual_marker_lines'],1)
+        self.assertEqual(value['witness']['rejection_stage'],'metadata-schema')
+
     def test_sr1_observed_ordered_context_rejects_mutations_and_exact_resume_works(self):
         preamble=[message('actual first preamble'),message('actual second preamble')]
         self.first('alpha',preamble);self.first('beta')

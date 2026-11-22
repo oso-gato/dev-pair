@@ -52,8 +52,33 @@ and SQLite integrity must hold. A fixed unknown UUID additionally needs a
 source-backed no-rollout error, nonzero status and no model dispatch; generic
 process failure does not prove unknown-session rejection.
 
-Exact resume wire/metadata serialization remains unproven until authorized stock
-validation. An unexpected shape blocks with bounded hashes/partial positive
+One reviewed-candidate stock experiment stopped at the first alpha history
+metadata guard, after nine baseline checks and complete owned cleanup. No bound
+turn/checkpoint/resume was accepted; actual created sessions/marker effects are
+unverified, not established zero. The rejected wire shape was not retained, so
+its exact keys cannot be claimed. Cached pinned source independently shows the
+fixture-issued assistant function call gets `turn_id` without `create_time`;
+function-call outputs additionally get creation time. This source mismatch is a
+likely cause, not observed-wire attribution or proof of subsequent stages.
+
+The repaired closed contract keeps metadata optional. When present, calls require
+exactly `{turn_id}` and outputs exactly `{turn_id, create_time}`. Null/empty,
+unknown/additional keys, malformed UUIDs and invalid/nonfinite/bool timestamps
+reject. Both members of a pair must agree on turn ID when both contain metadata;
+a fresh continuation can have a different turn ID from historical turns and the
+session UUID. Original dictionaries remain intact, with exact canonical replay;
+no metadata stripping or normalization is used. The existence of other upstream
+metadata fields is not permission to accept them.
+
+At most one rejected-metadata shape witness (2 KiB maximum) records fixed
+stage/kind/type enums, item position, recognized-key presence/types, counts,
+validity booleans and request/harness/source hashes. It never records arbitrary
+unknown key names, values, transcripts, arguments or output snippets. Rejection
+changes no acceptance/checkpoint state and never undoes real file effects. The
+witness uses the existing request/report/capture budgets and creates no retry.
+
+Actual repaired resume wire/metadata serialization remains unproven until a
+fresh review and separately authorized changed-candidate stock validation. An unexpected shape blocks with bounded hashes/partial positive
 records; there is no unchanged retry, fallback session or automatic parser
 relaxation. Reports expose actual UUIDs, binding/context/marker/rollout hashes,
 counts and cleanup outcomes, not transcripts. runtime_admitted, real_model,

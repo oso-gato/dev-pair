@@ -25,9 +25,34 @@ CATALOG_SHA = '1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10'
 LABELS = ('alpha', 'beta')
 UNKNOWN = '00000000-0000-4000-8000-000000000001'
 UNCOMMITTED = b'private uncommitted source survives both explicit UUID resumes\n'
+STOCK_SOURCE = 'd32063f96c2dff1dc96af839b3952abb6acfeda4'
+METADATA = 'internal_chat_message_metadata_passthrough'
+METADATA_KEYS = ('turn_id','create_time','content_token_count','content_item_kinds',
+                 'content_item_metadata','cell_id','executed_tool_calls','tool_calls_complete')
 require = t.require
 canonical = t.canonical
 sha = t.sha
+
+
+class MetadataRejected(ValueError):
+    def __init__(self, stage):
+        require(stage in ('metadata-schema','metadata-turn-id','metadata-timestamp','pair-turn-mismatch'),
+                'unsupported metadata rejection stage')
+        self.stage = stage
+        super().__init__('history metadata rejected: '+stage)
+
+
+def valid_timestamp(value):
+    return type(value) in (int,float) and 0 < value < 1e12 and math.isfinite(value)
+
+
+def valid_uuid(value):
+    try:session_uuid(value);return True
+    except ValueError:return False
+
+
+def json_type(value):
+    return {dict:'object',list:'array',str:'string',int:'integer',float:'number',bool:'boolean',type(None):'null'}.get(type(value))
 
 
 def unknown_reason(text):
@@ -90,12 +115,13 @@ def history_item(item, issued, kind):
     if 'id' in item:
         require(type(item['id']) is str and re.fullmatch(r'(?:fc|fco)_[0-9a-f-]{36}', item['id']), 'invalid stamped history ID')
         session_uuid(item['id'].split('_', 1)[1])
-    if 'internal_chat_message_metadata_passthrough' in item:
-        value = item['internal_chat_message_metadata_passthrough']
-        require(type(value) is dict and set(value) == {'turn_id', 'create_time'}, 'unknown history metadata')
-        session_uuid(value['turn_id'])
-        require(type(value['create_time']) in (int, float) and math.isfinite(value['create_time']) and
-                0 < value['create_time'] < 1e12, 'invalid history timestamp')
+    if METADATA in item:
+        value = item[METADATA]
+        expected = {'turn_id'} if kind == 'function_call' else {'turn_id','create_time'}
+        if type(value) is not dict or set(value) != expected:raise MetadataRejected('metadata-schema')
+        if not valid_uuid(value['turn_id']):raise MetadataRejected('metadata-turn-id')
+        if kind == 'function_call_output' and not valid_timestamp(value['create_time']):
+            raise MetadataRejected('metadata-timestamp')
     return item
 
 
@@ -143,6 +169,8 @@ class Journey:
         self.negative_reason_witnessed = False
         self.cli_ready = threading.Event()
         self.last_request = None
+        self.metadata_rejection = None
+        self.harness_sha256 = sha(Path(__file__).read_bytes())
 
     def begin(self, label, phase, expected_uuid=None):
         require(label in LABELS and phase in ('first','resume'), 'unplanned turn')
@@ -186,8 +214,37 @@ class Journey:
         calls = [(i,v) for i,v in enumerate(inputs) if type(v) is dict and v.get('type') == 'function_call' and v.get('call_id') == issued['call_id']]
         outputs = [(i,v) for i,v in enumerate(inputs) if type(v) is dict and v.get('type') == 'function_call_output' and v.get('call_id') == issued['call_id']]
         require(len(calls) == len(outputs) == 1 and calls[0][0] < outputs[0][0], 'missing/duplicate/reordered bound call/result')
-        history_item(calls[0][1], issued, 'function_call'); history_item(outputs[0][1], issued, 'function_call_output')
+        for index,item,kind in ((calls[0][0],calls[0][1],'function_call'),(outputs[0][0],outputs[0][1],'function_call_output')):
+            try:history_item(item,issued,kind)
+            except MetadataRejected as error:
+                self.record_metadata_rejection(item,issued,kind,index,error.stage)
+                raise
+        if METADATA in calls[0][1] and METADATA in outputs[0][1]:
+            if calls[0][1][METADATA]['turn_id'] != outputs[0][1][METADATA]['turn_id']:
+                self.record_metadata_rejection(outputs[0][1],issued,'function_call_output',outputs[0][0],'pair-turn-mismatch')
+                raise MetadataRejected('pair-turn-mismatch')
         return calls[0], outputs[0]
+
+    def record_metadata_rejection(self,item,issued,kind,index,stage):
+        if self.metadata_rejection is not None:return
+        value=item.get(METADATA);is_object=type(value) is dict
+        witness={'availability':'observed-shape','rejection_stage':stage,'expected_kind':kind,
+            'item_index':index if type(index) is int and 0<=index<=t.BODY_BYTES else None,
+            'issued_call_id_matches':item.get('call_id')==issued['call_id'],
+            'metadata_present':METADATA in item,'metadata_type':json_type(value),
+            'metadata_key_count':len(value) if is_object else None,
+            'unknown_key_count':sum(key not in METADATA_KEYS for key in value) if is_object else 0,
+            'recognized_keys':{key:{'present':is_object and key in value,
+                'type':json_type(value[key]) if is_object and key in value else None} for key in METADATA_KEYS},
+            'turn_id_valid':is_object and valid_uuid(value.get('turn_id')),
+            'create_time_valid':is_object and valid_timestamp(value.get('create_time')),
+            'request':dict(self.last_request) if self.last_request is not None else None,
+            'harness_sha256':self.harness_sha256,'codex_source_sha':STOCK_SOURCE}
+        if len(canonical(witness))>2048:
+            witness={'availability':'witness-unavailable','rejection_stage':stage,
+                     'harness_sha256':self.harness_sha256,'codex_source_sha':STOCK_SOURCE,
+                     'request':dict(self.last_request) if self.last_request is not None else None}
+        self.metadata_rejection=witness
 
     def request(self, body):
         turn = self.turn
@@ -426,7 +483,8 @@ def worker(args):
         if journey is not None:
             report.update(turns=journey.records,http_requests=journey.requests,http_connections=server.connections if server else 0,
                           transport_error=journey.error,last_request=journey.last_request,captured_bytes=journey.meter.used,
-                          observed_session_uuids={k:v['uuid'] for k,v in journey.entries.items()})
+                          observed_session_uuids={k:v['uuid'] for k,v in journey.entries.items()},
+                          history_metadata_rejection=journey.metadata_rejection)
         data=canonical(report)+b'\n';require(len(data)<=t.REPORT_BYTES,'session report exceeded')
         fd=os.open('/result/report.json',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(data)
