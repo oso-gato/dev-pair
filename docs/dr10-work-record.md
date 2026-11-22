@@ -3,6 +3,34 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 01:04 HKT — exact missing-UUID encoding and negative witness
+
+- Actual stock `1c2ede3` reached both explicit original-UUID continuations and
+  four verified phase effects, then blocked at the unknown-UUID compound guard.
+  Negative exit/reason/request-delta facts were not retained; final database and
+  durable continuation audits were not reached. The precise failed conjunct and
+  actual cause remain unknown, with no retrospective acceptance.
+- Pinned producer source independently proves two complete typed/terminal
+  missing-rollout encodings for the one fixed UNKNOWN UUID, thread/resume and
+  code -32600. The recognizer adds only those forms. Complete bounded stderr and
+  closed CLI error envelopes are required; unknown methods/IDs/codes/data,
+  extra/control/truncated text and fallback/thread events remain rejected.
+- A witness exists before launch, retains observed handle/capture/request/event
+  facts through exceptions, and publishes every available returned predicate
+  before requiring exact exit 1, no request delta and the bound reason. Unknown
+  facts remain null; natural exit is recorded only after an actual completed
+  wait. Raw stderr/events/exceptions remain withheld. Final UUID-set/integrity
+  and both exact durable continuation audits still precede overall pass.
+- Native source/test bytes remain identical to reviewed `2ed389f`, whose fresh
+  PASS receipt is `/workspace/artifacts/native-launcher-batch-review-2ed389f/review.json`,
+  SHA256 `aa1994510f5d0ce24b4b74e29b7cfbb379137b773899f9d9a37e3dfbe2863980`.
+  This separate source candidate needs affected checks, one final combined full
+  suite and fresh exact review. All 180-second/action/request/capture/report,
+  resource and cleanup bounds are unchanged. API-selected Sol/high remains
+  backend-unattested; no stock/native/CI/auth/model/network/VPS/push/deployment
+  occurs in this unit, and all runtime/release gates remain open.
+
+
 ### November 23, 2026, 00:53 HKT — combined native source freeze and local checks
 
 - Session `1c2ede3` merged exactly into this isolated native worktree; session

@@ -49,7 +49,7 @@ Then one fixed command appends the session's second distinct marker; complete
 successful output and filesystem bytes must match exactly. Both first actions
 remain once, unrelated uncommitted source bytes remain unchanged and the UUID set
 and SQLite integrity must hold. A fixed unknown UUID additionally needs a
-source-backed no-rollout error, nonzero status and no model dispatch; generic
+source-backed no-rollout error, exit exactly 1 and no model dispatch; generic
 process failure does not prove unknown-session rejection.
 
 One reviewed-candidate stock experiment stopped at the first alpha history
@@ -339,3 +339,30 @@ facts remain independent. No-added-environment operands are unavailable rather
 than invented equal bodies. A single budget preserves this core first, then
 trims optional per-item and filesystem target details within2048 bytes. The
 non-admitting path cannot run the helper transform or authorize any action.
+
+
+## Unknown-UUID terminal evidence
+
+The pinned ordinary UUID-resume producer can wrap the fixed missing-rollout
+message in `thread/resume: thread/resume failed: ... (code -32600)`, optionally
+with the terminal `Error: ` prefix. Only those two complete typed forms and the
+previous fixed bare forms are supported. Different UUIDs, methods, codes, data
+suffixes, extra lines, ANSI/control bytes and partial stderr cannot prove the
+reason. The original 4,096-byte stderr retention limit is unchanged.
+
+The negative attempt now records a closed witness before launch and before its
+compound guard: observed launcher handle, returned and independently observed
+natural-exit facts, request counters/delta, bounded stderr count/hash/completeness,
+fixed CLI-event counts, forbidden-event flag and exact reason families. Missing
+facts remain null; a cleanup/interruption exception cannot invent a returned
+status or natural exit. No raw stderr/event/exception values are included. Valid
+reason text cannot override a wrong exit, request delta or forbidden thread event.
+Both final database UUID-set/integrity and exact durable continuation audits still
+have to succeed before overall pass.
+
+Actual stock `1c2ede3` completed both original-UUID continuations and all four
+phase effects, then blocked at the old unknown-UUID compound guard. Its negative
+status/reason/request-delta facts were not retained and its final audits were not
+reached. The source-proven formatter gap is not its established runtime cause.
+This source repair has no stock result; fresh exact review and one separately
+bounded validation remain required. Runtime/job/renewal admission stays false.

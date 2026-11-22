@@ -56,9 +56,27 @@ def json_type(value):
     return {dict:'object',list:'array',str:'string',int:'integer',float:'number',bool:'boolean',type(None):'null'}.get(type(value))
 
 
+UNKNOWN_REASONS={prefix+'no rollout found for '+kind+' id '+UNKNOWN:
+    ('terminal-' if prefix else '')+'bare-'+kind for prefix in ('','Error: ') for kind in ('thread','conversation')}
+UNKNOWN_REASONS.update({prefix+'thread/resume: thread/resume failed: no rollout found for thread id '+UNKNOWN+' (code -32600)':
+    ('terminal-' if prefix else '')+'typed-thread' for prefix in ('','Error: ')})
+
+
+def unknown_reason_family(text):
+    return UNKNOWN_REASONS.get(text,'none') if type(text) is str else 'none'
+
+
 def unknown_reason(text):
-    return type(text) is str and text in {prefix+'no rollout found for '+kind+' id '+UNKNOWN
-        for prefix in ('','Error: ') for kind in ('thread','conversation')}
+    return unknown_reason_family(text)!='none'
+
+
+def stderr_reason_family(raw,complete):
+    if not complete:return None
+    try:text=raw.decode('utf-8')
+    except UnicodeError:return 'none'
+    # A complete terminal line may have its one ordinary LF terminator.
+    # No control stripping, substring, extra lines or partial-buffer proof.
+    return unknown_reason_family(text[:-1] if text.endswith('\n') else text)
 
 
 def session_uuid(value):
@@ -543,7 +561,7 @@ class Journey:
         self.helper_binary=helper_binary;self.owned_child=None;self.child_turn=None;self.child_ready=threading.Event();self.child_lock=threading.Lock()
         self.turn_helper=None;self.helper_origins={};self.helper_rejection=None
         self.entries = {}; self.turn = None; self.records = []; self.wall_started = time.time(); self.negative = False
-        self.negative_reason_witnessed = False
+        self.negative_reason_witnessed = False;self.negative_evidence=None
         self.cli_ready = threading.Event()
         self.last_request = None
         self.metadata_rejection = None
@@ -595,9 +613,25 @@ class Journey:
         require(type(row) is dict and type(row.get('type')) is str, 'malformed stock CLI event')
         turn = self.turn
         if self.negative:
-            require(row['type'] in ('error','turn.failed'), 'unknown UUID started a real/fallback thread')
-            self.negative_reason_witnessed |= unknown_reason(row.get('message')) or unknown_reason(
-                row.get('error',{}).get('message') if type(row.get('error')) is dict else None)
+            witness=self.negative_evidence
+            kind=row['type'];allowed=kind in ('error','turn.failed')
+            if witness is not None:
+                key=kind if kind in ('error','turn.failed','thread.started') else 'other'
+                witness['event_counts'][key]+=1
+                witness['forbidden_thread_event'] |= not allowed
+            require(allowed, 'unknown UUID started a real/fallback thread')
+            if kind=='error':
+                require(set(row)=={'type','message'} and type(row['message']) is str,'malformed negative CLI error')
+                message=row['message']
+            else:
+                require(set(row)=={'type','error'} and type(row['error']) is dict and set(row['error'])=={'message'} and
+                    type(row['error']['message']) is str,'malformed negative CLI failure')
+                message=row['error']['message']
+            family=unknown_reason_family(message)
+            self.negative_reason_witnessed |= family!='none'
+            if witness is not None:
+                witness['cli_event_reason']=self.negative_reason_witnessed
+                if family!='none':witness['cli_reason_family']=family
             return
         require(turn is not None, 'CLI event without planned process')
         if row['type'] == 'thread.started':
@@ -983,10 +1017,13 @@ def cli_args(port, context, resume=None):
 
 
 def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Popen):
+    negative=getattr(journey,'negative_evidence',None) if getattr(journey,'negative',False) else None
+    if negative is not None:negative['launch_handle_observed']=False
     process=popen(argv,env={'PATH':'/usr/bin:/bin','HOME':'/home/gpt','CODEX_HOME':'/state/codex','TMPDIR':'/tmp',
                           'LANG':'C.UTF-8','CODEX_API_KEY':t.SYNTHETIC_KEY},stdin=subprocess.DEVNULL,
                   stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
-    selector=None;line=bytearray();used=0;errors=bytearray();error_bytes=0
+    if negative is not None:negative.update(stage='launched',launch_handle_observed=True)
+    selector=None;line=bytearray();used=0;errors=bytearray();error_bytes=0;stderr_eof=False;stdout_eof=False;natural_exit=None
     try:
         if hasattr(journey,'publish_child'):journey.publish_child(process)
         selector=selectors.DefaultSelector()
@@ -998,23 +1035,73 @@ def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Po
             monitor()
             for key,_ in selector.select(.05):
                 data=os.read(key.fd,min(65536,t.OUTPUT_BYTES-meter.used+1))
-                if not data:selector.unregister(key.fd);continue
-                meter.add(len(data));used+=len(data)
+                if not data:
+                    if key.data=='stderr':stderr_eof=True
+                    if key.data=='stdout':stdout_eof=True
+                    selector.unregister(key.fd);continue
+                used+=len(data)
                 if key.data=='stderr':
                     error_bytes+=len(data);errors.extend(data[:max(0,4096-len(errors))])
+                meter.add(len(data))
                 if key.data=='stdout':
                     line.extend(data);require(all(len(v)<=t.BODY_BYTES for v in line.split(b'\n')),'CLI line budget exceeded')
                     while b'\n' in line:
                         raw,_,rest=line.partition(b'\n');line[:]=rest;journey.observe_cli(raw)
         require(not line,'truncated CLI JSON line')
-        negative_witness = error_bytes <= 4096 and any(unknown_reason(line) for line in errors.decode('utf-8','replace').splitlines())
-        return process.wait(timeout=max(.001,end-time.monotonic())),{'captured_bytes':used,'stderr_bytes':error_bytes,
-            'stderr_sha256':sha(errors) if error_bytes<=4096 else None,'unknown_uuid_reason_witnessed':negative_witness}
+        family=stderr_reason_family(bytes(errors),stderr_eof and error_bytes<=4096)
+        natural_exit=process.wait(timeout=max(.001,end-time.monotonic()))
+        return natural_exit,{'captured_bytes':used,'stderr_bytes':error_bytes,
+            'stderr_sha256':sha(errors) if error_bytes<=4096 else None,'stderr_capture_complete':stderr_eof and error_bytes<=4096,
+            'unknown_uuid_reason_witnessed':family not in (None,'none'),'stderr_reason_family':family}
     finally:
+        if negative is not None:
+            family=stderr_reason_family(bytes(errors),stderr_eof and error_bytes<=4096)
+            negative.update(captured_bytes=used,stderr_bytes=error_bytes,stderr_retained_bytes=len(errors),
+                stderr_sha256=sha(errors) if error_bytes<=4096 else None,stderr_capture_complete=stderr_eof and error_bytes<=4096,
+                stderr_reason=None if family is None else family!='none',stderr_reason_family=family,
+                cli_stream_complete=stdout_eof and not line,natural_exit_observed=natural_exit is not None,natural_exit_code=natural_exit)
         if selector is not None:selector.close()
         try:t.stop(process)
         finally:
             if hasattr(journey,'clear_child'):journey.clear_child()
+
+
+def check_unknown_uuid(report,journey,argv,meter,end,runner=run_turn):
+    before=journey.requests
+    witness={'stage':'attempted','harness_sha256':journey.harness_sha256,'codex_source_sha':STOCK_SOURCE,
+        'helper_source_sha256':journey.helper_sha256,'launch_handle_observed':None,'exit_code':None,'exit_status_valid':None,'natural_exit_observed':None,'natural_exit_code':None,
+        'requests_before':before,'requests_after':None,'request_delta':None,'captured_bytes':None,
+        'stderr_bytes':None,'stderr_retained_bytes':None,'stderr_sha256':None,'stderr_capture_complete':None,
+        'stderr_reason':None,'stderr_reason_family':None,'cli_event_reason':None,'cli_reason_family':None,'matched_reason_family':None,
+        'cli_stream_complete':None,'event_counts':{'error':0,'turn.failed':0,'thread.started':0,'other':0},'forbidden_thread_event':False}
+    report['unknown_uuid_evidence']=witness;journey.negative_evidence=witness
+    journey.negative_reason_witnessed=False
+    try:
+        code,negative=runner(argv,journey,meter,end)
+        witness.update(stage='returned',exit_code=code if type(code) is int and -255<=code<=255 else None,
+            exit_status_valid=type(code) is int and -255<=code<=255,requests_after=journey.requests,request_delta=journey.requests-before,
+            stderr_reason=negative['unknown_uuid_reason_witnessed'] if negative.get('stderr_capture_complete') is True else None,stderr_reason_family=negative.get('stderr_reason_family'),
+            stderr_bytes=negative['stderr_bytes'],stderr_sha256=negative['stderr_sha256'],
+            stderr_capture_complete=negative.get('stderr_capture_complete'),cli_event_reason=journey.negative_reason_witnessed)
+        witness['matched_reason_family']=(witness['stderr_reason_family'] if witness['stderr_reason'] else
+            witness['cli_reason_family'] if witness['cli_event_reason'] else 'none')
+        require(type(code) is int and code==1 and journey.requests==before and not witness['forbidden_thread_event'] and
+                (witness['stderr_reason'] or witness['cli_event_reason']),
+                'unknown UUID rejection reason unproven or model dispatch occurred')
+        report['unknown_uuid_rejected']=True
+    finally:
+        witness['requests_after']=journey.requests;witness['request_delta']=journey.requests-before
+        if witness['stage']!='returned':witness['stage']='exception'
+
+
+def final_session_audits(report,journey,initial,ids,source,root='/'):
+    final=database(root,set(initial)|set(ids.values()),integrity=True)
+    report['sessions']={label:{'uuid':ids[label],'progress':marker(root,label,('first','resume'),journey.nonce),
+        'rollout':rollout_proof(root,final[ids[label]],journey.entries[label],continuation=journey.continuations[label],
+            journey=journey,checkpoint_sha256=report['checkpoint_sha256'])} for label in LABELS}
+    require(source.read_bytes()==UNCOMMITTED,'uncommitted source changed')
+    report['uncommitted_source_sha256']=sha(UNCOMMITTED);report['database_integrity']='ok';report['uuid_set_unchanged']=True
+    report['status']='pass'
 
 
 def worker(args):
@@ -1053,17 +1140,8 @@ def worker(args):
         # Pinned source resolves a UUID directly into thread/resume; an error is
         # propagated rather than selecting --last/name/cwd or starting a thread.
         requests=journey.requests;journey.turn=None;journey.negative=True;journey.action_end=min(args.end,time.monotonic()+t.ACTION_SECONDS)
-        code,negative=run_turn(cli_args(port,'Unknown UUID negative fixture only',UNKNOWN),journey,meter,args.end)
-        require(code==1 and journey.requests==requests and (negative['unknown_uuid_reason_witnessed'] or journey.negative_reason_witnessed),
-                'unknown UUID rejection reason unproven or model dispatch occurred')
-        report['unknown_uuid_rejected']=True;report['unknown_uuid_evidence']=negative
-        final=database('/',set(initial)|set(ids.values()),integrity=True)
-        report['sessions']={label:{'uuid':ids[label],'progress':marker('/',label,('first','resume'),journey.nonce),
-            'rollout':rollout_proof('/',final[ids[label]],journey.entries[label],continuation=journey.continuations[label],
-                journey=journey,checkpoint_sha256=report['checkpoint_sha256'])} for label in LABELS}
-        require(source.read_bytes()==UNCOMMITTED,'uncommitted source changed')
-        report['uncommitted_source_sha256']=sha(UNCOMMITTED);report['database_integrity']='ok';report['uuid_set_unchanged']=True
-        report['status']='pass'
+        check_unknown_uuid(report,journey,cli_args(port,'Unknown UUID negative fixture only',UNKNOWN),meter,args.end)
+        final_session_audits(report,journey,initial,ids,source)
     except Exception as error:report['blocker']=str(error)[:500]
     finally:
         if server is not None:
