@@ -62,6 +62,8 @@ class ToolingDiagnostics(unittest.TestCase):
     def test_marker_projection_requires_whole_executed_lines_order_and_capture_completeness(self):
         echoed=('STEP 2: RUN '+ci.tooling_shell()+'\n"DP_TOOL_STAGE install"\n').encode()
         self.assertEqual(ci.tooling_stage_evidence(echoed)['observed'],[])
+        self.assertEqual(ci.tooling_stage_evidence(b'echoed command\rDP_TOOL_STAGE upgrade\n')['observed'],[])
+        self.assertEqual(ci.tooling_stage_evidence(b'quoted\rDP_TOOL_STAGE timeout-exit 125\n')['timeout_exit_status'],None)
         valid=b''.join(('DP_TOOL_STAGE '+stage+(' 0' if stage=='timeout-exit' else '')+'\n').encode() for stage in ci.TOOL_STAGES)
         self.assertTrue(ci.tooling_stage_evidence(echoed+valid)['all_stages_observed'])
         for raw,key in ((valid+b'DP_TOOL_STAGE upgrade\n','order_invalid'),(b'DP_TOOL_STAGE unknown\n','marker_invalid'),
@@ -90,6 +92,7 @@ class ToolingDiagnostics(unittest.TestCase):
              json.dumps(dict(valid,unknown=True)).encode(),json.dumps(dict(valid,package=None)).encode(),
              json.dumps(dict(valid,path='relative')).encode(),json.dumps(dict(valid,version='x'*2049)).encode(),
              json.dumps(dict(valid,name='')).encode(),b'{"name":"a","name":"b"}']
+        bad += [json.dumps(dict(valid,**{key:'\ud800'})).encode() for key in ('name','path','version','package')]
         for data in bad:
             with self.subTest(data=data[:50]):self.assertEqual(ci.runtime_projection(data)['status'],'unavailable')
         capture=io.StringIO()

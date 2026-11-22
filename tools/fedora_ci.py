@@ -426,10 +426,13 @@ def tooling_recipe():
 
 def tooling_stage_evidence(data, truncated=False):
     observed=[];exit_status=None;last=-1;invalid=False;order_invalid=False;partial=False
-    for line in data.splitlines(keepends=True):
+    if len(data)>LOG_LIMIT:data=data[:LOG_LIMIT];truncated=True
+    lines=data.split(b'\n')
+    for index,line in enumerate(lines):
         if not line.startswith(b'DP_TOOL_STAGE '):continue
-        if not line.endswith(b'\n'):
+        if index==len(lines)-1:
             partial=True;continue
+        line+=b'\n'
         match=re.fullmatch(rb'DP_TOOL_STAGE ([a-z-]+)(?: ([0-9]{1,3}))?\n',line)
         if match is None:
             invalid=True;continue
@@ -454,8 +457,11 @@ def runtime_projection(data):
     if value is None:return unavailable('runtime-not-reported')
     if type(value)is not dict or set(value)!={'name','package','path','version'}:return unavailable('invalid-object-shape')
     if type(value['package'])is not str:return unavailable('invalid-package-type')
-    for key,limit in (('name',128),('path',1024),('version',2048)):
-        if type(value[key])is not str or not 0<len(value[key].encode())<=limit:return unavailable('invalid-runtime-field')
+    try:
+        value['package'].encode()
+        for key,limit in (('name',128),('path',1024),('version',2048)):
+            if type(value[key])is not str or not 0<len(value[key].encode())<=limit:return unavailable('invalid-runtime-field')
+    except UnicodeError:return unavailable('invalid-runtime-encoding')
     if not value['path'].startswith('/') or '\0' in value['path']:return unavailable('invalid-runtime-path')
     result={'status':'observed',**{key:value[key] for key in ('name','path','version')}}
     if len(json.dumps(result).encode())>4096:return unavailable('retained-object-byte-bound')
