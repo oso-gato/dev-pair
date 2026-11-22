@@ -262,3 +262,18 @@ truncated changed-component detail are explicit. Entry summaries yield before
 core bindings; an overflowing component projection becomes unavailable. The
 same original rejection is retained, without action/state advancement. No
 component, omission, XML normalization or date/path stripping affects acceptance.
+
+
+Fresh review of `7298586` found two diagnostic gaps without an acceptance bypass.
+The corrected parser uses an attribute allowlist for each element and a bounded
+child-name set for each active parent. Repeated singleton children are marked
+unsupported/duplicate immediately, including nested network and filesystem
+fields. Source-supported repeated `environment`, workspace `root` and filesystem
+`entry` elements remain supported; each entry has one path/glob/special choice.
+Attributes recognized elsewhere are unsupported on the wrong element. The same
+16 KiB/128-element/depth-eight limits apply without a document tree. Old-turn
+UUID extraction now uses the unique original metadata candidate independently of
+unrelated ID/timestamp/schema errors. Its comparison is known only when both
+UUID operands are valid; baseline schema validity remains mandatory for
+acceptance. Whole body/history/causal/result/final-audit acceptance is unchanged.
+No actual stock success is established by these source diagnostic repairs.

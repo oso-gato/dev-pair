@@ -3,6 +3,29 @@
 ## Latest continuation checkpoint
 
 
+### November 22, 2026, 23:09 HKT — session diagnostic R1/R2 repair
+
+- Frozen `7298586` passed local tests but fresh review required two P2 diagnostic
+  corrections; no acceptance bypass was found. Receipt
+  `/workspace/artifacts/session-prompt-witness-review-7298586/review.json`, SHA256
+  `933d68f5edf763055ec30d08e1ee206d7fca643726c78647a3f820d9c817c8dd`.
+- This separate bounded source repair checks per-element attribute names and
+  per-parent singleton cardinality, retaining legitimate repeated environment,
+  workspace-root and filesystem-entry containers. Nested duplicate/misplaced
+  shapes become incomplete diagnostics. Old-turn UUID comparison now uses its
+  own valid operands even when an unrelated baseline ID/timestamp is invalid;
+  an invalid/missing operand stays unavailable. Baseline validity remains a
+  separate acceptance requirement. No XML feature, normalization or body-delta
+  acceptance is added; first witness, privacy and every fixture/capture cap stay.
+- Original prompt-family correction, N+1/N+2 history/pair/result/final audits and
+  shared inventory remain unchanged. Actual 1df unequal environment/resume proof
+  is still blocked; this candidate has no stock run. Fresh exact-candidate review
+  and separate stock authorization remain required. Native `5013296` stays
+  separately frozen; its cache duplicate-row diagnostic finding is queued, with
+  no native/CI or cross-branch product change in this unit. GPT-6.1 Sol/high is
+  API-selected, backend unattested. No deployment or production admission.
+
+
 ### November 22, 2026, 22:48 HKT — fixed CLI prompt family and bounded context diagnosis
 
 - This isolated session candidate starts from frozen `1df7952`. Its one actual

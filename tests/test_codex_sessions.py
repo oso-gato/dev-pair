@@ -800,7 +800,7 @@ class SessionsTests(unittest.TestCase):
             ('<environment_context><!--PRIVATE--></environment_context>','declaration'),
             ('<?PRIVATE x?><environment_context/>','declaration'),
             ('<environment_context>'+'<environments>'*1000+'</environments>'*1000+'</environment_context>','bytes'),
-            ('<environment_context>'+'<cwd>x</cwd>'*128+'</environment_context>','bounds'),
+            ('<environment_context><environments>'+'<environment id="x"><cwd>x</cwd></environment>'*128+'</environments></environment_context>','bounds'),
             ('<environment_context><cwd>'+'x'*16384+'</cwd></environment_context>','bytes')]
         for text,status in samples:
             result=s.component_comparison([{'type':'input_text','text':'<environment_context/>'}],[{'type':'input_text','text':text}])
@@ -851,6 +851,65 @@ class SessionsTests(unittest.TestCase):
         if 'components' in comparison:self.assertFalse(comparison['components'].get('complete',False))
         else:self.assertEqual(comparison['component_status'],'overflow')
         self.assertIsNone(self.j.turn['issued']);self.assertNotIn('PRIVATE',json.dumps(witness))
+
+    def test_nested_singleton_cardinality_and_attributes_match_each_element(self):
+        def content(text):return [{'type':'input_text','text':'<environment_context>'+text+'</environment_context>'}]
+        negatives=[('<network><allowed>a</allowed><allowed>b</allowed></network>','duplicate'),
+            ('<network><denied>a</denied><denied>b</denied></network>','duplicate'),
+            ('<filesystem><workspace_roots/><workspace_roots/></filesystem>','duplicate'),
+            ('<filesystem><permission_profile><file_system/><file_system/></permission_profile></filesystem>','duplicate'),
+            ('<environments><environment id="a"><cwd>x</cwd><cwd>y</cwd></environment></environments>','duplicate'),
+            ('<filesystem><permission_profile><file_system><entry><path>x</path><glob>y</glob></entry></file_system></permission_profile></filesystem>','shape'),
+            ('<cwd access="write">PRIVATE</cwd>','shape'),('<shell status="unavailable">PRIVATE</shell>','shape'),
+            ('<current_date id="PRIVATE">x</current_date>','shape'),('<network type="PRIVATE"/>','shape'),
+            ('<environments><environment enabled="true"/></environments>','shape'),
+            ('<filesystem enabled="true"/>','shape')]
+        for text,status in negatives:
+            result=s.component_comparison(content(''),content(text))
+            self.assertEqual(result['status'][1],status);self.assertFalse(result['complete'])
+            self.assertIsNone(result['equal']);self.assertNotIn('PRIVATE',json.dumps(result))
+            if status=='duplicate':self.assertEqual(result['duplicates'][1],1)
+        legitimate=('<environments><environment id="a" primary="true"><cwd>/a</cwd><shell>bash</shell></environment>'
+            '<environment id="b" status="unavailable"/></environments>'
+            '<shell_version status="unavailable"/><current_date status="unavailable"/>'
+            '<network enabled="true"><allowed>a</allowed><denied>b</denied></network>'
+            '<filesystem><workspace_roots><root>/a</root><root>/b</root></workspace_roots>'
+            '<permission_profile type="managed"><file_system type="restricted" glob_scan_max_depth="2">'
+            '<entry access="read"><path>/a</path></entry><entry access="deny" escalatable="false"><glob>/b/*</glob></entry>'
+            '</file_system></permission_profile></filesystem>')
+        result=s.component_comparison(content(legitimate),content(legitimate))
+        self.assertTrue(result['complete']);self.assertEqual(result['status'],['parsed','parsed'])
+        self.assertEqual(result['duplicates'],[0,0]);self.assertEqual(result['equal'],(1<<len(s.ENV_COMPONENTS))-1)
+
+    def test_old_turn_comparison_is_independent_but_invalid_baseline_still_rejects(self):
+        _,_,_,entry,_,_,valid=self.environment_resume();original=copy.deepcopy(entry)
+        mutations=[('id','msg_input_'+IDS['alpha']),('id',None),('create_time',True),
+            ('create_time',0),('UNKNOWN_PRIVATE','PRIVATE'),('turn_id',None),('turn_id','invalid'),('turn_id',True)]
+        new_turn=valid[-2][s.METADATA]['turn_id']
+        for key,value in mutations:
+            entry.clear();entry.update(copy.deepcopy(original))
+            if key=='id':entry['user_context'][0]['id']=value
+            else:entry['user_context'][0][s.METADATA][key]=value
+            items=copy.deepcopy(valid);items[:2]=copy.deepcopy(entry['user_context'])
+            self.observed('alpha','resume');observed=s.user_context(items)
+            accepted,comparison=s.environment_comparison(self.j,[item for _,item in observed],observed,items)
+            self.assertFalse(accepted);self.assertFalse(comparison['baseline_schema'])
+            old_turn=entry['user_context'][0][s.METADATA]['turn_id']
+            expected=(new_turn!=old_turn) if s.valid_uuid(old_turn) else None
+            self.assertEqual(comparison['new_turn_differs_from_old'],expected)
+            compact=s.compact_comparison(comparison)
+            self.assertEqual(s.comparison_flag(compact,'new_turn_differs_from_old'),expected)
+            self.assertNotIn('PRIVATE',json.dumps(compact));self.assertIsNone(self.j.turn['issued'])
+        entry.clear();entry.update(copy.deepcopy(original));del entry['user_context'][0][s.METADATA]['turn_id']
+        items=copy.deepcopy(valid);items[:2]=copy.deepcopy(entry['user_context']);observed=s.user_context(items)
+        accepted,comparison=s.environment_comparison(self.j,[item for _,item in observed],observed,items)
+        self.assertFalse(accepted);self.assertIsNone(comparison['new_turn_differs_from_old'])
+        # A valid equal operand is a known false comparison even when unrelated
+        # timestamp validity still forbids baseline acceptance.
+        entry.clear();entry.update(copy.deepcopy(original));entry['user_context'][0][s.METADATA].update(turn_id=new_turn,create_time=True)
+        items[:2]=copy.deepcopy(entry['user_context']);observed=s.user_context(items)
+        accepted,comparison=s.environment_comparison(self.j,[item for _,item in observed],observed,items)
+        self.assertFalse(accepted);self.assertIs(comparison['new_turn_differs_from_old'],False)
 
 
 if __name__=='__main__':unittest.main()

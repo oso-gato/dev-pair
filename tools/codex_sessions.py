@@ -248,7 +248,10 @@ ENV_COMPONENTS=('cwd','status','error','shell','environments','shell_version','c
 ENV_CHILDREN={'environment_context':ENV_COMPONENTS,'environments':('environment',),'environment':('cwd','status','error','shell'),
     'network':('allowed','denied'),'filesystem':('workspace_roots','permission_profile'),'workspace_roots':('root',),
     'permission_profile':('file_system',),'file_system':('entry',),'entry':('path','glob','special')}
-ENV_ATTRIBUTES=('id','primary','status','type','glob_scan_max_depth','access','escalatable','enabled')
+ENV_ATTRIBUTES={'environment':('id','primary','status'),'shell_version':('status',),'current_date':('status',),
+    'network':('enabled',),'permission_profile':('type',),'file_system':('type','glob_scan_max_depth'),
+    'entry':('access','escalatable')}
+ENV_REPEATED=frozenset((('environments','environment'),('workspace_roots','root'),('file_system','entry')))
 
 
 def environment_components(content):
@@ -263,7 +266,7 @@ def environment_components(content):
     if len(raw)>16384:result['status']='bytes';return result
     if b'<!' in raw or b'<?' in raw:result['status']='declaration';return result
     parser=expat.ParserCreate();parser.ordered_attributes=True
-    stack=[];nodes=0;pending=None;start=None;first=None
+    stack=[];children=[];nodes=0;pending=None;start=None;first=None
     def fail(status):result['status']=status;raise ValueError('unsupported diagnostic structure')
     def finish(end):
         nonlocal pending,start
@@ -275,26 +278,31 @@ def environment_components(content):
         nodes+=1
         if nodes>128 or len(stack)>=8:fail('bounds')
         if len(attributes)>16:fail('bounds')
-        unknown_attributes=sum(key not in ENV_ATTRIBUTES for key in attributes[::2])
+        unknown_attributes=sum(key not in ENV_ATTRIBUTES.get(name,()) for key in attributes[::2])
         if unknown_attributes:result['unknown']+=unknown_attributes;fail('shape')
         if not stack:
             if name!='environment_context' or attributes:fail('shape')
         elif name not in ENV_CHILDREN.get(stack[-1],()):
             result['unknown']+=1;fail('shape')
+        if stack:
+            if name in children[-1] and (stack[-1],name) not in ENV_REPEATED:
+                result['duplicates']+=1;fail('duplicate')
+            # The renderer chooses exactly one entry path representation.
+            if stack[-1]=='entry' and children[-1]:fail('shape')
+            children[-1].add(name)
         if len(stack)==1:
             finish(parser.CurrentByteIndex)
             if first is None:first=parser.CurrentByteIndex;result['prefix']=sha(raw[:first])
             index=ENV_COMPONENTS.index(name);bit=1<<index
-            if result['presence']&bit:result['duplicates']+=1
             result['presence']|=bit;result['order']=(result['order']<<4)|(index+1)
             pending=name;start=parser.CurrentByteIndex
-        stack.append(name)
+        stack.append(name);children.append(set())
     def closed(name):
         if len(stack)==1:
             finish(parser.CurrentByteIndex)
             if first is None:result['prefix']=sha(raw[:parser.CurrentByteIndex])
             result['suffix']=sha(raw[parser.CurrentByteIndex:])
-        stack.pop()
+        stack.pop();children.pop()
     parser.StartElementHandler=opened;parser.EndElementHandler=closed
     parser.ExternalEntityRefHandler=lambda *args:0
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
@@ -356,7 +364,8 @@ def environment_comparison(journey,contexts,observed,inputs):
     new_turn=raw_metadata.get('turn_id') if type(raw_metadata) is dict else None
     environment_ids_supported,environment_unique=input_id_unique(inputs,observed[-2][0],new,original_ids)
     prompt_ids_supported,prompt_unique=input_id_unique(inputs,observed[-1][0],current,original_ids)
-    old_turn=baseline[METADATA]['turn_id'] if baseline_valid else None
+    baseline_metadata=baseline.get(METADATA) if type(baseline) is dict else None
+    old_turn=baseline_metadata.get('turn_id') if type(baseline_metadata) is dict else None
     current_metadata=current.get(METADATA) if type(current) is dict else None
     current_turn=current_metadata.get('turn_id') if type(current_metadata) is dict else None
     audited=journey.first_rollout_audits.get(journey.turn['label'])==sha(canonical(entry))
