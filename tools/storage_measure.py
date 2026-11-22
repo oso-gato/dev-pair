@@ -17,7 +17,16 @@ INODES=262144
 DEPTH=64
 ADDRESS_SPACE=256*1024**2
 FDS=256
-REASONS=('none','root-identity','identity-changed','permission','io','unsupported','mount-boundary','entry-limit','inode-limit','depth-limit','deadline','enumeration-disappeared')
+REASONS=(
+    'none','root-identity','identity-changed','permission','io','unsupported','mount-boundary',
+    'mount-id-missing','mount-id-equal','mountinfo-unavailable','mountinfo-row-shape','mountinfo-device',
+    'mountinfo-root-missing','mountinfo-entry-missing','held-root-path-missing','held-entry-path-missing',
+    'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
+    'bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev',
+    'bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev',
+    'entry-reopen-missing','entry-resolve-exdev','entry-limit','inode-limit','depth-limit','deadline',
+    'enumeration-disappeared',
+)
 class ScanError(ValueError):pass
 class NoTotal(ScanError):pass
 
@@ -41,7 +50,10 @@ def _open_entry(parent,name):
         if error.errno!=errno.EXDEV:raise
     # Pin metadata only. A mounted tree is opened for enumeration only after
     # the same-device source is proven to be reachable inside the owned root.
-    return _node(parent,name,same_mount=False),True
+    try:return _node(parent,name,same_mount=False),True
+    except OSError as error:
+        if error.errno==errno.EXDEV:raise ScanError('entry-resolve-exdev') from None
+        raise
 
 def _node_identity(node):
     return node.st_dev,node.st_ino,stat.S_IFMT(node.st_mode)
@@ -53,13 +65,13 @@ def _mount_id(fd):
                 if line.startswith(b'mnt_id:\t'):return line.split()[1]
     except FileNotFoundError:
         pass
-    raise ScanError('mount-boundary')
+    raise ScanError('mount-id-missing')
 
 def _mount_path(field):
     return Path(os.fsdecode(re.sub(rb'\\([0-7]{3})',lambda match:bytes([int(match[1],8)]),field)))
 
 def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound):
-    require(root_id!=mount_id,'mount-boundary')
+    require(root_id!=mount_id,'mount-id-equal')
     mount_ids={root_id,mount_id}
     device_field=f'{os.major(device)}:{os.minor(device)}'.encode()
     paths={}
@@ -69,27 +81,39 @@ def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound):
                 bound()
                 fields=line.split(b' ',5)  # Other whitespace can occur in path fields.
                 if fields[0] in mount_ids:
-                    require(len(fields)==6 and fields[2]==device_field,'mount-boundary')
+                    require(len(fields)==6,'mountinfo-row-shape')
+                    require(fields[2]==device_field,'mountinfo-device')
                     paths[fields[0]]=(_mount_path(fields[3]),_mount_path(fields[4]))
                     if paths.keys()==mount_ids:break
-        root_path=Path(os.readlink(f'/proc/self/fd/{root_fd}'))
-        mounted_path=Path(os.readlink(f'/proc/self/fd/{mounted_fd}'))
     except FileNotFoundError:
-        raise ScanError('mount-boundary') from None
-    require(paths.keys()==mount_ids,'mount-boundary')
+        raise ScanError('mountinfo-unavailable') from None
+    try:root_path=Path(os.readlink(f'/proc/self/fd/{root_fd}'))
+    except FileNotFoundError:raise ScanError('held-root-path-missing') from None
+    try:mounted_path=Path(os.readlink(f'/proc/self/fd/{mounted_fd}'))
+    except FileNotFoundError:raise ScanError('held-entry-path-missing') from None
+    require(root_id in paths,'mountinfo-root-missing')
+    require(mount_id in paths,'mountinfo-entry-missing')
     root_source,root_mountpoint=paths[root_id]
     mounted_source,mountpoint=paths[mount_id]
-    require(mounted_path==mountpoint,'mount-boundary')
+    require(mounted_path==mountpoint,'held-entry-path-mismatch')
     try:
         owned_source=root_source/root_path.relative_to(root_mountpoint)
-        return mounted_source.relative_to(owned_source)
     except ValueError:
-        raise ScanError('mount-boundary') from None
+        raise ScanError('root-path-outside-mount') from None
+    try:return mounted_source.relative_to(owned_source)
+    except ValueError:raise ScanError('bind-source-outside-root') from None
 
-def _verify_bind_source(root_fd,source,expected):
+def _verify_bind_source(root_fd,source,expected,*,after=False):
+    missing,identity_mismatch,resolve_exdev=(
+        ('bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev') if after else
+        ('bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev')
+    )
     try:source_fd=_node(root_fd,source)
-    except FileNotFoundError:raise ScanError('mount-boundary') from None
-    try:require(_node_identity(os.fstat(source_fd))==expected,'mount-boundary')
+    except FileNotFoundError:raise ScanError(missing) from None
+    except OSError as error:
+        if error.errno==errno.EXDEV:raise ScanError(resolve_exdev) from None
+        raise
+    try:require(_node_identity(os.fstat(source_fd))==expected,identity_mismatch)
     finally:os.close(source_fd)
 
 def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPTH,end=None):
@@ -162,12 +186,15 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                 except FileNotFoundError:
                     # A missing mountpoint prevents the final mount and source
                     # checks after its blocks may already have been counted.
-                    if crossed:raise ScanError('mount-boundary') from None
+                    if crossed:raise ScanError('entry-reopen-missing') from None
+                    raise
+                except OSError as error:
+                    if error.errno==errno.EXDEV:raise ScanError('entry-resolve-exdev') from None
                     raise
                 try:
                     require(_node_identity(os.fstat(after))==node_identity,'identity-changed')
                     if crossed:require(_mount_id(after)==mount_id,'identity-changed')
-                    if source is not None:_verify_bind_source(fd,source,node_identity)
+                    if source is not None:_verify_bind_source(fd,source,node_identity,after=True)
                 finally:os.close(after)
         finally:os.close(node_fd)
     def walk(directory,node,depth,through_bind):

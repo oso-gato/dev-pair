@@ -45,6 +45,8 @@ class MeasurementTests(unittest.TestCase):
             self.skipTest('private mount namespace is unavailable')
         self.assertEqual(probe.returncode,0,probe.stderr)
         source=textwrap.dedent('''
+            from contextlib import redirect_stdout
+            from io import StringIO
             import os
             from pathlib import Path
             import subprocess
@@ -53,10 +55,28 @@ class MeasurementTests(unittest.TestCase):
 
             sys.path.insert(0,sys.argv[1])
             import storage_measure as worker
+            import fedora_ci as ci
 
             root=Path(sys.argv[2])
             expected=worker.identity(root.stat())
             scandir=os.scandir
+
+            def check_failure(reason):
+                sha=ci.file_hash(Path(worker.__file__))
+                argv=[worker.__file__,'--root',str(root),'--sha256',sha]
+                for key,value in expected.items():
+                    argv.extend(('--'+key,str(value)))
+                output=StringIO()
+                with patch.object(sys,'argv',argv),redirect_stdout(output):
+                    code=worker.main()
+                assert code==2, (code,output.getvalue())
+                result=subprocess.CompletedProcess([],code,output.getvalue().encode(),b'')
+                try:ci.parse_storage(root,result,expected,sha)
+                except ci.StorageMeasurementBlocked as error:
+                    projected=error.diagnostics['worker']
+                    assert projected['status']=='failed' and projected['allocated_bytes'] is None, projected
+                    assert projected['reason']==reason, projected
+                else:raise AssertionError('mount failure yielded a usable sample')
         ''')+textwrap.dedent(check)
         argv=[*base,'--bind',str(fixture),str(fixture),*map(str,mounts),'--proc','/proc','--dev','/dev','--',
               sys.executable,'-I','-c',source,str(Path(worker.__file__).resolve().parent),str(self.root)]
@@ -102,9 +122,7 @@ class MeasurementTests(unittest.TestCase):
                     if path=='/proc/self/mountinfo':raise FileNotFoundError(path)
                     return real_open(path,*args,**kwargs)
                 with patch('builtins.open',side_effect=missing_mountinfo):
-                    try:worker.scan(root,expected)
-                    except worker.ScanError as error:assert str(error)=='mount-boundary',error
-                    else:raise AssertionError('missing mountinfo allowed a usable sample')
+                    check_failure('mountinfo-unavailable')
                 ''')
 
     def test_same_device_mount_source_must_remain_inside_owned_scratch(self):
@@ -118,9 +136,7 @@ class MeasurementTests(unittest.TestCase):
                 assert os.fstat(fd).st_ino != (root/'mounted').stat().st_ino
                 return scandir(fd)
             with patch.object(worker.os,'scandir',side_effect=owned_only):
-                try:worker.scan(root,expected)
-                except worker.ScanError as error:assert str(error)=='mount-boundary',error
-                else:raise AssertionError('an external same-device bind was accepted')
+                check_failure('bind-source-outside-root')
             ''')
 
     def test_bind_source_replacement_during_enumeration_invalidates_measurement(self):
@@ -137,9 +153,8 @@ class MeasurementTests(unittest.TestCase):
                     exchanged=True
                 return scandir(fd)
             with patch.object(worker.os,'scandir',side_effect=replace_source):
-                try:worker.scan(root,expected)
-                except worker.ScanError as error:assert exchanged and str(error)=='mount-boundary',error
-                else:raise AssertionError('the replaced source was accepted')
+                check_failure('bind-source-after-identity')
+                assert exchanged
             ''')
 
     def test_bind_mountpoint_disappearance_at_final_reopen_denies_a_usable_sample(self):
@@ -162,9 +177,8 @@ class MeasurementTests(unittest.TestCase):
                 return open_node(parent,name,same_mount=same_mount)
             with patch.object(worker.os,'scandir',side_effect=observe_mount), \\
                  patch.object(worker,'_node',side_effect=disappear_on_reopen):
-                try:measured=worker.scan(root,expected)
-                except worker.ScanError as error:assert mounted_enumerated and str(error)=='mount-boundary',error
-                else:raise AssertionError(f'a vanished mountpoint yielded {measured!r}')
+                check_failure('entry-reopen-missing')
+                assert mounted_enumerated
             ''')
 
     def test_controlled_file_churn_never_becomes_a_stable_final_claim(self):
@@ -208,8 +222,10 @@ class MeasurementTests(unittest.TestCase):
             worker.scan(self.root,expected)
     def test_descendant_enoent_only_and_supported_mount_refusal(self):
         (self.root/'file').touch()
-        for number in (errno.EACCES,errno.EPERM,errno.EIO,errno.ELOOP,errno.EXDEV):
+        for number in (errno.EACCES,errno.EPERM,errno.EIO,errno.ELOOP):
             with patch.object(worker,'_node',side_effect=OSError(number,'synthetic')),self.assertRaises(OSError):worker.scan(self.root,self.expected())
+        with patch.object(worker,'_node',side_effect=OSError(errno.EXDEV,'synthetic')),self.assertRaisesRegex(worker.ScanError,'^entry-resolve-exdev$'):
+            worker.scan(self.root,self.expected())
         with patch.object(worker,'_node',side_effect=FileNotFoundError(errno.ENOENT,'synthetic')):
             result=worker.scan(self.root,self.expected());self.assertEqual(result['status'],'provisional');self.assertGreater(result['allocated_bytes'],0)
     def test_parser_no_total_is_never_a_usable_integer_and_typed_failure_survives(self):
@@ -226,9 +242,14 @@ class MeasurementTests(unittest.TestCase):
             if kind=='unknown-failure':value.update(status='failed',reason='PRIVATE',allocated_bytes=None);code=2
             with self.subTest(kind=kind),self.assertRaises(ci.StorageMeasurementBlocked) as seen:ci.parse_storage(self.root,subprocess.CompletedProcess([],code,json.dumps(value).encode(),b''),expected,sha)
             self.assertNotIn('PRIVATE',json.dumps(seen.exception.diagnostics));self.assertNotIn('worker',seen.exception.diagnostics)
-        value=json.loads(worker_result(self.root).stdout);value.update(status='failed',allocated_bytes=None,reason='mount-boundary')
-        with self.assertRaises(ci.StorageMeasurementBlocked) as seen:ci.parse_storage(self.root,subprocess.CompletedProcess([],2,json.dumps(value).encode(),b''),expected,sha)
-        self.assertEqual(seen.exception.diagnostics['worker']['reason'],'mount-boundary')
+        value=json.loads(worker_result(self.root).stdout);value.update(status='failed',allocated_bytes=None)
+        for reason in worker.REASONS:
+            if reason=='none':continue
+            value['reason']=reason
+            result=subprocess.CompletedProcess([],2,json.dumps(value).encode(),b'')
+            with self.subTest(reason=reason):
+                with self.assertRaises(ci.StorageMeasurementBlocked) as seen:ci.parse_storage(self.root,result,expected,sha)
+                self.assertEqual(seen.exception.diagnostics['worker'],value)
     def test_enumeration_disappearance_has_no_total_not_zero(self):
         class Missing:
             def __enter__(self):return self

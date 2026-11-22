@@ -278,7 +278,16 @@ def parse_storage(root,result,expected,worker_sha):
         counters=value['counters'];require(type(counters) is dict and set(counters)=={'entries','unique_inodes','vanished'} and all(type(v) is int and v>=0 for v in counters.values()) and counters['entries']<=524288 and counters['unique_inodes']<=262144 and counters['vanished']<=counters['entries'] and counters['unique_inodes']<=counters['entries']+1,'invalid storage counters')
         status=value['status'];size=value['allocated_bytes']
         if status=='failed':
-            require(result.returncode==2 and size is None and value['reason'] in ('root-identity','identity-changed','permission','io','unsupported','mount-boundary','entry-limit','inode-limit','depth-limit','deadline','enumeration-disappeared'),'invalid worker failure')
+            require(result.returncode==2 and size is None and value['reason'] in (
+                'root-identity','identity-changed','permission','io','unsupported','mount-boundary',
+                'mount-id-missing','mount-id-equal','mountinfo-unavailable','mountinfo-row-shape','mountinfo-device',
+                'mountinfo-root-missing','mountinfo-entry-missing','held-root-path-missing','held-entry-path-missing',
+                'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
+                'bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev',
+                'bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev',
+                'entry-reopen-missing','entry-resolve-exdev','entry-limit','inode-limit','depth-limit','deadline',
+                'enumeration-disappeared',
+            ),'invalid worker failure')
             raise StorageMeasurementBlocked('storage worker reported bounded failure',{**storage_diagnostics(root,result),'worker':value})
         require(status in ('complete','provisional','no-total') and result.returncode==(1 if status=='no-total' else 0),'storage measurement failed or unsupported')
         require((status=='no-total' and size is None and value['reason']=='enumeration-disappeared') or (status in ('complete','provisional') and type(size) is int and 0<=size<2**63 and size%512==0 and value['reason']=='none' and counters['unique_inodes']>=1),'invalid storage measurement total')
