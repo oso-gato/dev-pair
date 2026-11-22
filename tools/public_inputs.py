@@ -400,7 +400,7 @@ def build_within_limit(cache, distrobox, output):
                         'fedora': dict(fedora_oci.PROVENANCE),
                         'codex': {'version': '0.169.0', 'source': ARTIFACTS['codex.tar.gz'][0], 'sha256': CODEX_SHA,
                                   'verification': 'Strict Cosign3.1.4 identity/issuer/workflow/repository/ref/source verification passed; evidence in payload'},
-                        'role': 'maintenance', 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
+                        'role': 'maintenance', 'provider': 'gptbox', 'model': 'gpt-6.2-sol', 'effort': 'high',
                         'mounts': {'workspace': '/var/lib/dev-pair/maintenance/workspaces/bootstrap-probe',
                                    'state': '/var/lib/dev-pair/maintenance/state/bootstrap-probe',
                                    'cache': '/var/lib/dev-pair/maintenance/cache/bootstrap-probe',
