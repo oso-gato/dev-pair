@@ -684,6 +684,50 @@ class SessionsTests(unittest.TestCase):
             self.assertEqual(s.marker(self.root,'alpha',('first','resume'),NONCE)['lines'],2)
         self.j.request(body(items+[issued,output]));self.assertTrue(self.j.turn['finished'])
 
+    def test_audited_prior_nonuser_id_collision_rejects_before_issuance(self):
+        path,rows,row,entry,_,_,valid=self.environment_resume(audit=False)
+        for role,kind in (('assistant','message'),('developer','message'),(None,'reasoning')):
+            for target,flag in ((-2,'new_message_id_unique'),(-1,'current_prompt_id_unique')):
+                prior={'type':kind,'id':valid[target]['id'],'content':[{'type':'output_text','text':'SECRET_PRIOR_BODY'}]}
+                if role is not None:prior['role']=role
+                # Reproduce review: same non-user is present in the actual first
+                # durable audit AND the resumed request. No transcript retention added.
+                self.write_rollout(path,rows+[{'type':'response_item','payload':prior}]);self.j.audit_first_rollout(row,'alpha')
+                items=copy.deepcopy(valid);items.insert(4,copy.deepcopy(prior))
+                before=copy.deepcopy(self.j.entries);self.j.resume_context_rejection=None;self.observed('alpha','resume')
+                with self.assertRaises(ValueError):self.j.request(body(items))
+                self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+                self.assertEqual(self.j.entries,before);self.assertFalse(self.j.continuations)
+                witness=self.j.resume_context_rejection;comparison=witness['environment_comparison']
+                self.assertTrue(comparison['baseline_audited']);self.assertTrue(comparison['history_id_inventory_supported'])
+                self.assertFalse(comparison[flag]);self.assertLessEqual(len(t.canonical(witness)),2048)
+                self.assertNotIn('SECRET',json.dumps(witness));self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
+
+    def test_distinct_nonuser_ids_work_but_result_collision_rejects_without_extra_effect(self):
+        path,rows,row,entry,_,_,valid=self.environment_resume(audit=False)
+        prior={'type':'message','role':'assistant','id':'msg_66666666-6666-7666-8666-666666666666',
+            'content':[{'type':'output_text','text':'Prior fixture response'}]}
+        self.write_rollout(path,rows+[{'type':'response_item','payload':prior}]);self.j.audit_first_rollout(row,'alpha')
+        items=copy.deepcopy(valid);items.insert(4,prior);self.observed('alpha','resume');self.j.request(body(items))
+        issued=copy.deepcopy(self.j.turn['issued']);retained=copy.deepcopy(self.j.turn['user_context']);actual=self.run_action(issued)
+        output={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual)}
+        changed=copy.deepcopy(items);changed[4]['id']=changed[-2]['id']
+        with self.assertRaises(ValueError):self.j.request(body(changed+[issued,output]))
+        self.assertFalse(self.j.resume_context_rejection['environment_comparison']['new_message_id_unique'])
+        self.assertEqual(self.j.turn['issued'],issued);self.assertEqual(self.j.turn['user_context'],retained)
+        self.assertIsNone(self.j.turn['returned']);self.assertEqual(s.marker(self.root,'alpha',('first','resume'),NONCE)['lines'],2)
+        self.j.request(body(items+[issued,output]));self.assertTrue(self.j.turn['finished'])
+
+    def test_id_uniqueness_excludes_only_physical_position_and_fails_unsupported_inventory(self):
+        candidate={'type':'message','id':'candidate'}
+        self.assertEqual(s.input_id_unique([candidate],0,copy.deepcopy(candidate),set()),(True,True))
+        self.assertEqual(s.input_id_unique([candidate,copy.deepcopy(candidate)],0,candidate,set()),(True,False))
+        self.assertEqual(s.input_id_unique([candidate],0,candidate,{'candidate'}),(True,False))
+        for items,index in ((None,0),([],0),([candidate],1),([None,candidate],1),([{},candidate],1),
+                            ([{'id':None},candidate],1),([{'id':True},candidate],1),([{'id':[]},candidate],1)):
+            self.assertEqual(s.input_id_unique(items,index,candidate,set()),(False,False))
+        self.assertEqual(s.input_id_unique([{'id':'other'}],0,candidate,set()),(False,False))
+
     def test_resume_argv_is_explicit_uuid_not_last_or_cwd_inference(self):
         argv=s.cli_args(12345,'synthetic-context',IDS['alpha'])
         index=argv.index('resume');self.assertEqual(argv[index+1],IDS['alpha'])

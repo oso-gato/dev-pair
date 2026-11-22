@@ -205,6 +205,17 @@ def wire_fragment(item,kind,prefix):
         valid_uuid(metadata['turn_id']) and valid_timestamp(metadata['create_time']))
 
 
+def input_id_unique(inputs,index,candidate,retained_ids):
+    """Only this physical position is excluded; equal dictionaries elsewhere count."""
+    supported=(type(inputs) is list and type(index) is int and 0<=index<len(inputs) and
+        type(candidate) is dict and type(candidate.get('id')) is str and
+        all(type(item) is dict and type(item.get('type')) is str and bool(item['type']) and ('id' not in item or type(item['id']) is str and 0<len(item['id'])<=t.BODY_BYTES)
+            for item in inputs))
+    if not supported or canonical(inputs[index])!=canonical(candidate):return False,False
+    value=candidate['id']
+    return True,value not in retained_ids and all(item.get('id')!=value for position,item in enumerate(inputs) if position!=index)
+
+
 def environment_comparison(journey,contexts,observed,inputs):
     entry=journey.entries[journey.turn['label']];retained=entry['user_context']
     originals=[item for item in retained if type(item.get(METADATA)) is dict and
@@ -218,6 +229,8 @@ def environment_comparison(journey,contexts,observed,inputs):
     new_id_valid=bool(new_id_valid and uuid.UUID(new['id'][4:]).version==7 and uuid.UUID(new['id'][4:]).variant==uuid.RFC_4122)
     raw_metadata=new.get(METADATA) if type(new) is dict else None
     new_turn=raw_metadata.get('turn_id') if type(raw_metadata) is dict else None
+    environment_ids_supported,environment_unique=input_id_unique(inputs,observed[-2][0],new,original_ids)
+    prompt_ids_supported,prompt_unique=input_id_unique(inputs,observed[-1][0],current,original_ids)
     old_turn=baseline[METADATA]['turn_id'] if baseline_valid else None
     current_turn=current[METADATA]['turn_id'] if prompt_valid else None
     audited=journey.first_rollout_audits.get(journey.turn['label'])==sha(canonical(entry))
@@ -230,8 +243,9 @@ def environment_comparison(journey,contexts,observed,inputs):
         outputs[0]<observed[-2][0]<observed[-1][0])
     comparison={'stage':'environment-binding' if positions else 'environment-position','original_pair_exact':pair_exact,'causal_positions_valid':positions,'baseline_environment_count':len(originals),'baseline_audited':audited,
         'baseline_schema':baseline_valid,'closed_environment_schema':new_valid,'current_prompt_schema':prompt_valid,
-        'new_message_id_valid':new_id_valid,'new_message_id_unique':bool(new_id_valid and new['id'] not in original_ids and new['id']!=current.get('id')),
-        'current_prompt_id_unique':bool(prompt_valid and current['id'] not in original_ids),
+        'new_message_id_valid':new_id_valid,'history_id_inventory_supported':environment_ids_supported and prompt_ids_supported,
+        'new_message_id_unique':bool(new_id_valid and environment_unique),
+        'current_prompt_id_unique':bool(prompt_valid and prompt_unique),
         'new_turn_valid':valid_uuid(new_turn),'new_turn_differs_from_old':bool(new_valid and baseline_valid and new_turn!=old_turn),
         'new_turn_matches_current_prompt':bool(new_valid and prompt_valid and new_turn==current_turn),
         'exact_environment_content_equal':canonical(content(new))==canonical(content(baseline)) if baseline_valid and new_valid else None,

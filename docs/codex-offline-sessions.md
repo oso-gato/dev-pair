@@ -199,3 +199,14 @@ and hashes. Unsupported baseline/content is null, not zero/equal; summaries yiel
 to essential evidence at the same bound. Unequal or unexplained content remains
 blocked for a separately scoped diagnosis. This source candidate has not run the
 stock journey; fresh review and separate experiment authorization remain required.
+
+Fresh review of the conditional source found an ID collision gap: its initial
+uniqueness set omitted assistant and other non-user items. The repair compares
+each environment and current-prompt ID against every other observed input item's
+present ID, excluding only that candidate's physical request position, plus the
+independently retained original IDs. Equal dictionaries at another position are
+not excluded. Missing/malformed inventory or a malformed present ID cannot
+establish uniqueness; absent optional IDs convey no identity. The same complete
+check drives the bounded witness flags. This adds no full assistant-transcript
+retention, normalization or broader context acceptance. The original zero-extra,
+audited whole-body, turn, causal-order and final-audit rules remain unchanged.
