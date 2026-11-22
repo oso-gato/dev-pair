@@ -2,6 +2,40 @@
 
 ## Latest continuation checkpoint
 
+### November 22, 2026, 17:25 HKT — reviewed tooling repair
+
+- [Run20](https://github.com/oso-gato/dev-pair/actions/runs/45005980108), exact
+  `2011d19`, passed371 hosted tests in44.102s and actual signed OCI import/save-back
+  config, complete diff and descriptor/blob checks on Podman4.9.3. Tooling build
+  STEP2 then failed because netavark was unavailable. The report's cleanup error
+  masked that cause, which remained in raw stderr. Cleanup failed and preserved
+  scratch because worker termination was unresolved; Fedora did not boot.
+  Evidence: `/workspace/artifacts/fedora-ci-run-45005980108-controller.json`
+  and `.log`. This native scope is closed.
+- Exact tagged Buildah/common source supports explicit slirp build networking.
+  Sol repair `6c08bdaed252fc8119b2147f06416d998b6527f4` selects that existing
+  backend with host-loopback access disabled, checks required helper features,
+  records engine activity before launch and retains the first bounded operation
+  failure separately from cleanup uncertainty. It does not clear unresolved
+  failed-worker state or introduce a new privileged recovery executor.
+- Six focused tests pass. The first full377-test run hit one unchanged150ms
+  timing-fixture failure; an exact recheck passed, then one authorized full
+  rerun passed377 tests in55.510s. All three results are preserved in
+  `/workspace/artifacts/run20-tooling-6c08bda/`; the timing sensitivity is not
+  claimed fixed. Fresh Astra High review passed58 affected tests and21 additional
+  checks with no blocking findings. Receipt:
+  `/workspace/artifacts/tooling-primary-review-6c08bda/review.json`, SHA256
+  `9d6bb9443bfe5509a1fa70fe3089d9f1232d09924e60513e39da73020b6403f7`.
+- Main fast-forwarded to the exact reviewed source. Documentation updates only
+  precede one changed-candidate Fedora21 publication. Retain the scope and all
+  time/resource/storage/log limits below, fresh exact-HEAD input verification,
+  no unchanged retry and no production promotion. Native slirp behavior and
+  failed-worker termination/reclamation remain unverified; uncertain cleanup
+  must remain a failure, not a waived gate.
+- Inventory is separate at draft `ead5848`, resumed17:22:20 HKT with1221 seconds
+  remaining and deadline17:42:41 HKT. No stock expansion result or review is yet
+  claimed. The same Sol High builder owns it; no second builder was launched.
+
 ### November 22, 2026, 17:07 HKT — reviewed OCI compatibility repair
 
 - Native [run19](https://github.com/oso-gato/dev-pair/actions/runs/45005098009),
