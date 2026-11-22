@@ -513,6 +513,27 @@ def resume_rejection_witness(journey,observed,inputs,current):
     return witness
 
 
+def compact_helper_witness(witness):
+    """Optional detail yields before the complete rejection/aggregate core."""
+    fs=witness['filesystem']
+    summaries=witness.get('summaries',[])
+    while len(canonical(witness))>2048 and summaries:
+        summaries.pop();witness['truncated_summary']=True
+    if not summaries:witness.pop('summaries',None)
+    if witness['exact_old_prefix_equal']:
+        witness.pop('observed_prefix_sha256',None);witness.pop('old_prefix_present',None)
+        witness.pop('first_mismatching_original_index',None)
+    if fs['status']=='observed':
+        while len(canonical(witness))>2048 and fs.get('details'):
+            fs['details'].pop();fs['truncated']=True
+        if not fs.get('details'):fs.pop('details',None)
+    # These two facts are exactly reconstructible from the retained counters;
+    # omission never discards a measured comparison or filesystem digest.
+    if len(canonical(witness))>2048:
+        for key in ('expected_count','old_prefix_present'):witness.pop(key,None)
+    require(len(canonical(witness))<=2048,'helper rejection witness exceeded bound')
+
+
 class Journey:
     """Evidence is retained from first turns, never supplied by a resume caller."""
     def __init__(self, root, end, meter, nonce, helper_binary=None):
@@ -664,19 +685,7 @@ class Journey:
         geometry=compact['components']
         witness['components']={key:geometry[key] for key in ('status','known','presence','order','equal','wrapper_equal','complete')}
         witness['components']['truncated']=bool(geometry['changed']) or geometry['truncated']
-        # One budget keeps the complete core projection and all-entry aggregates.
-        # Redundant per-item summaries and optional target detail yield first.
-        while len(canonical(witness))>2048 and witness['summaries']:
-            witness['summaries'].pop();witness['truncated_summary']=True
-        if witness['exact_old_prefix_equal']:
-            witness.pop('observed_prefix_sha256',None);witness.pop('old_prefix_present',None)
-            witness.pop('first_mismatching_original_index',None)
-        if fs['status']=='observed':
-            while len(canonical(witness))>2048 and fs['details']:
-                fs['details'].pop();fs['truncated']=True
-            if len(canonical(witness))>2048:
-                witness['filesystem']={'status':'overflow','counts':fs['counts'],'checks':fs['checks'],'truncated':True}
-        require(len(canonical(witness))<=2048,'helper rejection witness exceeded bound')
+        compact_helper_witness(witness)
         self.resume_context_rejection=witness
 
     def request(self, body):

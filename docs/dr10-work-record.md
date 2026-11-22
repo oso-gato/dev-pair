@@ -3,6 +3,32 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 00:44 HKT — preserve aggregate core at the diagnostic cap
+
+- Fresh review of `8679593` retained a P2: a 2,050-byte combined core lost
+  filesystem header and digest families before empty optional fields yielded.
+  The original CHANGES_REQUIRED receipt remains immutable at
+  `/workspace/artifacts/session-contract-review-8679593/review.json`, SHA256
+  `30a21a9786685a91d51c32c880b8ff2cdc910b32712d0ea354478f9ba6754943`.
+- Compaction now omits empty summaries/details and trims optional populated
+  detail before the core. Under pressure it also omits two exactly derivable
+  facts: expected count is retained count plus one; old-prefix presence is
+  observed count at least retained count. Measured body/component/check/hash
+  bindings and all-entry filesystem header/count/digest families remain intact.
+  Existing truncation flags remain truthful. Helper failure and all acceptance,
+  history, origin, action and final-audit behavior are unchanged.
+- The copied independent overflow reproducer and new real owned-child regression
+  cover the original combined failure. Generated bounded counter, field-mask,
+  depth, boolean and optional-field variations exercise the complete core;
+  separate helper-stage witnesses keep their own unchanged bound. Focused checks
+  only apply to this repair. The prior 536-test full pass still applies only to
+  `e64810a`; there is no new full/stock/native proof or runtime admission.
+- API-selected GPT-6.1 Sol/high remains backend-unattested. Native source WIP
+  `1d5ce83` stays paused with 22 minutes 11 seconds remaining; no source, CI,
+  stock, network, authentication, model or VPS execution is added here. Fresh
+  exact review remains required before any separately authorized validation.
+
+
 ### November 23, 2026, 00:31 HKT — complete unavailable-helper diagnostic preservation
 
 - Fresh review of `c45f0a1` found the remaining P2: filesystem fallback survived,
