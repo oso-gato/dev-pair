@@ -64,13 +64,13 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
     def test_actual_mount_namespace_matches_gnu_du_for_owned_alias_cycle_and_foreign_mounts(self):
-        # The space, backslash and newline exercise the mountinfo path quoting.
-        source=self.root/'source space\\name\n'
+        # Include both kernel-escaped and literal mountinfo path characters.
+        source=self.root/'source space\\name\n\t\r\v\f'
         source.mkdir()
         (source/'single').write_bytes(b'x'*8192)
         hard=source/'hard';hard.write_bytes(b'x'*16384);os.link(hard,source/'hard-alias')
         (source/'payload-link').symlink_to('/dev/shm')
-        alias=self.root/'sibling alias';alias.mkdir()
+        alias=self.root/'sibling alias\r\v\f';alias.mkdir()
         single_alias=self.root/'single alias';single_alias.touch()
         cycle=self.root/'ancestor-cycle';cycle.mkdir()
         foreign=self.root/'foreign-dir';foreign.mkdir()
@@ -85,7 +85,7 @@ class MeasurementTests(unittest.TestCase):
                 '''
                 (root/'foreign-dir'/'data').write_bytes(b'x'*32768)
                 assert (root/'foreign-file').stat().st_dev != expected['device']
-                assert (root/'sibling alias').stat().st_ino == (root/'source space\\\\name\\n').stat().st_ino
+                assert (root/'sibling alias\\r\\v\\f').stat().st_ino == (root/'source space\\\\name\\n\\t\\r\\v\\f').stat().st_ino
                 assert (root/'ancestor-cycle').stat().st_ino == expected['inode']
                 def same_device_only(fd):
                     assert os.fstat(fd).st_dev == expected['device']
@@ -141,6 +141,32 @@ class MeasurementTests(unittest.TestCase):
                 except worker.ScanError as error:assert exchanged and str(error)=='mount-boundary',error
                 else:raise AssertionError('the replaced source was accepted')
             ''')
+
+    def test_bind_mountpoint_disappearance_at_final_reopen_denies_a_usable_sample(self):
+        source=self.root/'internal';source.mkdir()
+        (source/'data').write_bytes(b'x'*8192)
+        alias=self.root/'mounted';alias.mkdir()
+        self.isolated_mount_scan(self.root,['--bind',source,alias],'''
+            import errno
+
+            open_node=worker._node
+            mounted_enumerated=False
+            def observe_mount(fd):
+                global mounted_enumerated
+                if Path(os.readlink(f'/proc/self/fd/{fd}')) == root/'mounted':
+                    mounted_enumerated=True
+                return scandir(fd)
+            def disappear_on_reopen(parent,name,*,same_mount=True):
+                if mounted_enumerated and name=='mounted' and not same_mount:
+                    raise FileNotFoundError(errno.ENOENT,'synthetic late mountpoint disappearance')
+                return open_node(parent,name,same_mount=same_mount)
+            with patch.object(worker.os,'scandir',side_effect=observe_mount), \\
+                 patch.object(worker,'_node',side_effect=disappear_on_reopen):
+                try:measured=worker.scan(root,expected)
+                except worker.ScanError as error:assert mounted_enumerated and str(error)=='mount-boundary',error
+                else:raise AssertionError(f'a vanished mountpoint yielded {measured!r}')
+            ''')
+
     def test_controlled_file_churn_never_becomes_a_stable_final_claim(self):
         tree=self.root/'files';tree.mkdir()
         for i in range(1000):(tree/str(i)).touch()

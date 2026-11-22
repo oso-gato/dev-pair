@@ -67,7 +67,7 @@ def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound):
         with open('/proc/self/mountinfo','rb') as info:
             for line in info:
                 bound()
-                fields=line.split(None,5)
+                fields=line.split(b' ',5)  # Other whitespace can occur in path fields.
                 if fields[0] in mount_ids:
                     require(len(fields)==6 and fields[2]==device_field,'mount-boundary')
                     paths[fields[0]]=(_mount_path(fields[3]),_mount_path(fields[4]))
@@ -157,7 +157,13 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
             if directory_node or crossed:
                 # Reopen via the original parent and check the mounted identity
                 # again, including a replacement that reused the same inode.
-                after=_node(directory,name,same_mount=not crossed)
+                try:
+                    after=_node(directory,name,same_mount=not crossed)
+                except FileNotFoundError:
+                    # A missing mountpoint prevents the final mount and source
+                    # checks after its blocks may already have been counted.
+                    if crossed:raise ScanError('mount-boundary') from None
+                    raise
                 try:
                     require(_node_identity(os.fstat(after))==node_identity,'identity-changed')
                     if crossed:require(_mount_id(after)==mount_id,'identity-changed')
