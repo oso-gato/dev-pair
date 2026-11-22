@@ -252,6 +252,10 @@ ENV_ATTRIBUTES={'environment':('id','primary','status'),'shell_version':('status
     'network':('enabled',),'permission_profile':('type',),'file_system':('type','glob_scan_max_depth'),
     'entry':('access','escalatable')}
 ENV_REPEATED=frozenset((('environments','environment'),('workspace_roots','root'),('file_system','entry')))
+ENV_REQUIRED_ATTRIBUTES={'environment':frozenset(('id',)),'network':frozenset(('enabled',)),
+    'permission_profile':frozenset(('type',)),'file_system':frozenset(('type',)),'entry':frozenset(('access',))}
+ENV_REQUIRED_CHILDREN={'environments':frozenset(('environment',)),'workspace_roots':frozenset(('root',)),
+    'filesystem':frozenset(('permission_profile',)),'permission_profile':frozenset(('file_system',))}
 
 
 def environment_components(content):
@@ -266,7 +270,7 @@ def environment_components(content):
     if len(raw)>16384:result['status']='bytes';return result
     if b'<!' in raw or b'<?' in raw:result['status']='declaration';return result
     parser=expat.ParserCreate();parser.ordered_attributes=True
-    stack=[];children=[];nodes=0;pending=None;start=None;first=None
+    stack=[];children=[];forms=[];nodes=0;pending=None;start=None;first=None
     def fail(status):result['status']=status;raise ValueError('unsupported diagnostic structure')
     def finish(end):
         nonlocal pending,start
@@ -280,11 +284,15 @@ def environment_components(content):
         if len(attributes)>16:fail('bounds')
         unknown_attributes=sum(key not in ENV_ATTRIBUTES.get(name,()) for key in attributes[::2])
         if unknown_attributes:result['unknown']+=unknown_attributes;fail('shape')
+        attribute_names=frozenset(attributes[::2])
+        if not ENV_REQUIRED_ATTRIBUTES.get(name,frozenset())<=attribute_names:fail('shape')
+        if name=='environment' and {'status','primary'}<=attribute_names:fail('shape')
         if not stack:
             if name!='environment_context' or attributes:fail('shape')
         elif name not in ENV_CHILDREN.get(stack[-1],()):
             result['unknown']+=1;fail('shape')
         if stack:
+            if stack[-1]=='environment' and 'status' in forms[-1]:fail('shape')
             if name in children[-1] and (stack[-1],name) not in ENV_REPEATED:
                 result['duplicates']+=1;fail('duplicate')
             # The renderer chooses exactly one entry path representation.
@@ -296,14 +304,20 @@ def environment_components(content):
             index=ENV_COMPONENTS.index(name);bit=1<<index
             result['presence']|=bit;result['order']=(result['order']<<4)|(index+1)
             pending=name;start=parser.CurrentByteIndex
-        stack.append(name);children.append(set())
+        stack.append(name);children.append(set());forms.append(attribute_names)
     def closed(name):
+        if not ENV_REQUIRED_CHILDREN.get(name,frozenset())<=children[-1]:fail('shape')
+        if name=='entry' and not children[-1]:fail('shape')
+        if name=='environment' and 'status' not in forms[-1] and 'cwd' not in children[-1]:fail('shape')
         if len(stack)==1:
             finish(parser.CurrentByteIndex)
             if first is None:result['prefix']=sha(raw[:parser.CurrentByteIndex])
             result['suffix']=sha(raw[parser.CurrentByteIndex:])
-        stack.pop();children.pop()
-    parser.StartElementHandler=opened;parser.EndElementHandler=closed
+        stack.pop();children.pop();forms.pop()
+    def text(value):
+        if stack and stack[-1] in ENV_CHILDREN and any(char not in ' \t\r\n' for char in value):fail('shape')
+        if stack and stack[-1] in ('shell_version','current_date') and 'status' in forms[-1] and value:fail('shape')
+    parser.StartElementHandler=opened;parser.EndElementHandler=closed;parser.CharacterDataHandler=text
     parser.ExternalEntityRefHandler=lambda *args:0
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
     try:

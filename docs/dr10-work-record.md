@@ -3,6 +3,54 @@
 ## Latest continuation checkpoint
 
 
+### November 22, 2026, 23:20 HKT — combined fixture foundation and diagnostic closure candidate
+
+- Isolated merge `7bdefd4b59e35743e0e7bcffce394bbb59e4facc` preserves exact
+  parents native `50132963a4d57c6d651e36ba0209ffb41cc7aaa3` and session
+  `6a447a2c418276f56e1ebe536c4de43ddc1cbd4a`. Code matches automatic merge
+  tree `b4855a5e7546a362419f46fb190d73bb5d5170bb`; only this work record
+  needed resolution. Both complete checkpoint sequences are retained below in
+  chronological order. The separate branch sequence was coordination, not a
+  product requirement: the offline fixture foundation is now in this candidate,
+  while runtime/job admission stays false and actual recovery remains blocked.
+- Native review found one P2 in the diagnostic field mask, not admission:
+  unchanged balanced canonical alias rows could be paired with an unmatched row.
+  Repair cancels balanced counts and compares only unique actual surplus pairs;
+  ambiguous multiplicity is unavailable. The exact snapshot rejection, scans,
+  source/context/phase binding and existing 1,536-byte witness limit are unchanged.
+  Review `/workspace/artifacts/relay-directory-cache-review-5013296/review.json`,
+  SHA256 `7bfe0a28731caa8a2521f7875847bc799ac2ae723b5ece8ffbd6acf40ca96b84`.
+- Session review confirmed prior attribute/cardinality and UUID-knownness repairs
+  but required the consolidated structural minimum inventory. Required attributes,
+  mandatory/nonempty children, current/unavailable environment variants and
+  whitespace-only container text are now checked in the existing bounded stream.
+  Legitimate optionals/repeated containers remain supported. Values stay opaque;
+  no XML normalization, body-delta admission or runtime policy is introduced.
+  Review `/workspace/artifacts/session-shape-repair-review-6a447a2/review.json`,
+  SHA256 `b3ec86e03acf245c32899e1b40da2968ee016a962670511a723e784b5a6c07c8`.
+- Actual native28 remains a prelaunch final-cache mismatch after 315.831 seconds,
+  with no 600-second alarm, no dp-maint/image/storage stage, outer cleanup PASS
+  and guest cleanup unverified. The directory-0077 defect is independently
+  source-proven, not attributed to actual run27/28. Actual session1df retains
+  exact old context/pair but unequal 1,169/1,127-byte environment content; no
+  continuation was issued. There is no stock/native run on this combined source.
+- Fresh exact combined review must precede one changed native29 attempt and one
+  separately bounded stock validation on the same candidate. No unchanged retry,
+  limit increase, credentials, CI/VPS or deployment occurs in this source unit.
+  Model API selection remains GPT-6.1 Sol/high, backend unattested; fixture
+  synthetic catalog selection is not provider authentication or a worker backend
+  attestation. Full native assembly/nesting, hard quotas, tool/provider/auth/job
+  coverage, renewal/recovery, tailnet, release enforcement and Hostinger gates stay.
+- Latest retained access evidence shows a ready credential reference and running
+  managed environment, but no-auth SSH was refused before authentication; no
+  password or host inspection/mutation occurred and cause is unknown. Latest
+  release read reports main unprotected and required checks off, with only two
+  historical tag rules and connector administration unavailable. These external
+  prerequisites are not closed by local source tests. Evidence remains
+  `/workspace/artifacts/resume-20261122/ssh-transport-20261122T1430.json` and
+  `/workspace/artifacts/resume-20261122/release-enforcement-current.json`.
+
+
 ### November 22, 2026, 23:09 HKT — session diagnostic R1/R2 repair
 
 - Frozen `7298586` passed local tests but fresh review required two P2 diagnostic

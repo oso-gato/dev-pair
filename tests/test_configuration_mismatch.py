@@ -48,6 +48,22 @@ class ConfigurationMismatch(unittest.TestCase):
             result=n.configuration_mismatch(before,(),UNIT)
             self.assertEqual(result,{'availability':'unavailable'});self.assertNotIn('SECRET',json.dumps(result))
 
+    def test_canonical_alias_rows_cancel_balanced_evidence_before_pairing(self):
+        a=('/usr/lib/systemd/system',1,2,0o40755,0,12345)
+        b=(*a[:-1],12346);c=(a[0],1,3,0o40755,0,12347)
+        root=('/run/systemd/system',1,4,0o40755,0,12345)
+        for before,after in [((b,a,root),(b,c,root)),((a,b,root),(c,b,root)),
+                ((b,b,a,root),(b,c,b,root)),((a,a,b),(a,c,b))]:
+            result=n.configuration_mismatch(before,after,UNIT)
+            self.assertEqual(result['availability'],'observed');self.assertEqual(result['changed_fields'],36)
+            self.assertEqual(result['row_index'],before.index(a));self.assertFalse(result['order_only_equal'])
+            self.assertNotIn('/usr',json.dumps(result))
+        self.assertEqual(n.configuration_mismatch((b,a),(b,),UNIT)['changed_fields'],1)
+        self.assertTrue(n.configuration_mismatch((b,a),(a,b),UNIT)['order_only_equal'])
+        d=(*a[:-1],12348);e=(*c[:-1],12349)
+        for before,after in [((a,d),(c,e)),((a,),(c,e)),((a,d),(c,)),((a,a),(c,))]:
+            self.assertEqual(n.configuration_mismatch(before,after,UNIT),{'availability':'unavailable'})
+
     def test_real_controller_rejects_same_third_snapshot_change_before_launch(self):
         with tempfile.TemporaryDirectory() as temp:
             root=install(self,temp);calls=[];original=b.configuration_snapshot;scans=[]

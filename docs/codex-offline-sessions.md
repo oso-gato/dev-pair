@@ -277,3 +277,17 @@ unrelated ID/timestamp/schema errors. Its comparison is known only when both
 UUID operands are valid; baseline schema validity remains mandatory for
 acceptance. Whole body/history/causal/result/final-audit acceptance is unchanged.
 No actual stock success is established by these source diagnostic repairs.
+
+
+The combined candidate closes the consolidated structural-minimum review finding.
+Environment requires id; a current environment requires cwd, while a status-form
+environment has no children or primary attribute. Network requires enabled;
+permission_profile requires type and one file_system; file_system requires type
+but may have no entries; entry requires access and exactly one path/glob/special.
+Filesystem requires permission_profile. Present environments/workspace_roots
+containers are nonempty, retaining repeated environment/root/entry forms. Empty
+overall context and empty network/file_system remain supported. Structural
+container text is XML whitespace only; leaf values remain opaque. Status forms
+of shell_version/current_date are empty markers. These are bounded shape checks,
+not ID/domain/permission/path/date/attribute-value validation or an acceptance
+oracle. Exact-body/history/result/final-audit admission remains unchanged.

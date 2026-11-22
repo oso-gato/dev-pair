@@ -854,12 +854,12 @@ class SessionsTests(unittest.TestCase):
 
     def test_nested_singleton_cardinality_and_attributes_match_each_element(self):
         def content(text):return [{'type':'input_text','text':'<environment_context>'+text+'</environment_context>'}]
-        negatives=[('<network><allowed>a</allowed><allowed>b</allowed></network>','duplicate'),
-            ('<network><denied>a</denied><denied>b</denied></network>','duplicate'),
-            ('<filesystem><workspace_roots/><workspace_roots/></filesystem>','duplicate'),
-            ('<filesystem><permission_profile><file_system/><file_system/></permission_profile></filesystem>','duplicate'),
+        negatives=[('<network enabled="true"><allowed>a</allowed><allowed>b</allowed></network>','duplicate'),
+            ('<network enabled="true"><denied>a</denied><denied>b</denied></network>','duplicate'),
+            ('<filesystem><workspace_roots><root>a</root></workspace_roots><workspace_roots><root>b</root></workspace_roots><permission_profile type="managed"><file_system type="restricted"/></permission_profile></filesystem>','duplicate'),
+            ('<filesystem><permission_profile type="managed"><file_system type="restricted"/><file_system type="restricted"/></permission_profile></filesystem>','duplicate'),
             ('<environments><environment id="a"><cwd>x</cwd><cwd>y</cwd></environment></environments>','duplicate'),
-            ('<filesystem><permission_profile><file_system><entry><path>x</path><glob>y</glob></entry></file_system></permission_profile></filesystem>','shape'),
+            ('<filesystem><permission_profile type="managed"><file_system type="restricted"><entry access="read"><path>x</path><glob>y</glob></entry></file_system></permission_profile></filesystem>','shape'),
             ('<cwd access="write">PRIVATE</cwd>','shape'),('<shell status="unavailable">PRIVATE</shell>','shape'),
             ('<current_date id="PRIVATE">x</current_date>','shape'),('<network type="PRIVATE"/>','shape'),
             ('<environments><environment enabled="true"/></environments>','shape'),
@@ -910,6 +910,81 @@ class SessionsTests(unittest.TestCase):
         items[:2]=copy.deepcopy(entry['user_context']);observed=s.user_context(items)
         accepted,comparison=s.environment_comparison(self.j,[item for _,item in observed],observed,items)
         self.assertFalse(accepted);self.assertIs(comparison['new_turn_differs_from_old'],False)
+
+    def test_renderer_required_attributes_minima_and_unavailable_variants_are_closed(self):
+        def result(fragment):
+            content=[{'type':'input_text','text':'<environment_context>'+fragment+'</environment_context>'}]
+            return s.component_comparison(content,content)
+        invalid=[
+            '<filesystem><permission_profile type="managed"><file_system type="restricted"><entry access="read"/></file_system></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="managed"/></filesystem>','<filesystem/>','<environments/>',
+            '<filesystem><workspace_roots/><permission_profile type="disabled"><file_system type="unrestricted"/></permission_profile></filesystem>',
+            '<environments><environment><cwd>a</cwd></environment></environments>',
+            '<environments><environment id="a"/></environments>',
+            '<environments><environment id="a" status="unavailable"><cwd>a</cwd></environment></environments>',
+            '<environments><environment id="a" status="unavailable" primary="true"/></environments>',
+            '<network/>','<filesystem><permission_profile><file_system type="restricted"/></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="managed"><file_system/></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="managed"><file_system type="restricted"><entry><path>a</path></entry></file_system></permission_profile></filesystem>',
+            '<shell_version status="unavailable">PRIVATE</shell_version>',
+            '<current_date status="unavailable"> </current_date>']
+        for fragment in invalid:
+            value=result(fragment);self.assertEqual(value['status'],['shape','shape'])
+            self.assertFalse(value['complete']);self.assertIsNone(value['equal']);self.assertNotIn('PRIVATE',json.dumps(value))
+        optional=['',' \n','<network enabled="true"/>',
+            '<filesystem><permission_profile type="managed"><file_system type="restricted"/></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="disabled"><file_system type="unrestricted"/></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="external"><file_system type="external"/></permission_profile></filesystem>',
+            '<environments><environment id="a" status="unavailable"/></environments>',
+            '<shell_version status="unavailable"/><current_date status="unavailable"/>',
+            '<environments><environment id="a" primary="true"><cwd>opaque</cwd></environment><environment id="b" status="opaque"/></environments>',
+            '<filesystem><workspace_roots><root>a</root><root>b</root></workspace_roots><permission_profile type="opaque"><file_system type="opaque"><entry access="opaque"><path>a</path></entry><entry access="opaque"><special>b</special></entry><entry access="opaque"><glob>c</glob></entry></file_system></permission_profile></filesystem>']
+        for fragment in optional:
+            value=result(fragment);self.assertTrue(value['complete']);self.assertEqual(value['status'],['parsed','parsed'])
+            self.assertEqual(value['equal'],(1<<len(s.ENV_COMPONENTS))-1)
+
+    def test_structural_container_text_is_whitespace_only_and_leaf_text_stays_opaque(self):
+        fragments=['PRIVATE<cwd>a</cwd>','<environments>PRIVATE<environment id="a" status="unavailable"/></environments>',
+            '<environments><environment id="a">PRIVATE<cwd>a</cwd></environment></environments>',
+            '<network enabled="true">PRIVATE</network>',
+            '<filesystem>PRIVATE<permission_profile type="managed"><file_system type="restricted"/></permission_profile></filesystem>',
+            '<filesystem><workspace_roots>PRIVATE<root>a</root></workspace_roots><permission_profile type="managed"><file_system type="restricted"/></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="managed">PRIVATE<file_system type="restricted"/></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="managed"><file_system type="restricted">PRIVATE</file_system></permission_profile></filesystem>',
+            '<filesystem><permission_profile type="managed"><file_system type="restricted"><entry access="read">PRIVATE<path>a</path></entry></file_system></permission_profile></filesystem>']
+        for fragment in fragments:
+            content=[{'type':'input_text','text':'<environment_context>'+fragment+'</environment_context>'}]
+            value=s.component_comparison(content,content)
+            self.assertEqual(value['status'],['shape','shape']);self.assertFalse(value['complete']);self.assertNotIn('PRIVATE',json.dumps(value))
+        content=[{'type':'input_text','text':'<environment_context>\n<cwd>PRIVATE &amp; opaque</cwd>\n<subagents>PRIVATE\nopaque</subagents>\n</environment_context>'}]
+        value=s.component_comparison(content,content);self.assertTrue(value['complete']);self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_structural_diagnostics_do_not_change_exact_body_acceptance(self):
+        import types
+        prior=types.ModuleType('prior_session');prior.__file__=s.__file__
+        raw=subprocess.check_output(['git','show','6a447a2c418276f56e1ebe536c4de43ddc1cbd4a:tools/codex_sessions.py'],text=True)
+        exec(compile(raw,s.__file__,'exec'),prior.__dict__)
+        _,_,_,entry,_,_,template=self.environment_resume()
+        for fragment in ('<filesystem/>','<network/>','<environments/>','<cwd>opaque</cwd>',
+                '<filesystem><permission_profile type="managed"><file_system type="restricted"><entry access="read"/></file_system></permission_profile></filesystem>'):
+            retained=copy.deepcopy(entry);content=[{'type':'input_text','text':'<environment_context>'+fragment+'</environment_context>'}]
+            retained['user_context'][0]['content']=content
+            for changed in (False,True):
+                outcomes=[]
+                for module in (prior,s):
+                    journey=module.Journey(self.root,time.monotonic()+10,t.Meter(),NONCE)
+                    journey.entries={'alpha':copy.deepcopy(retained)};journey.first_rollout_audits={'alpha':t.sha(t.canonical(retained))}
+                    journey.begin('alpha','resume',IDS['alpha']);journey.observe_cli(t.canonical({'type':'thread.started','thread_id':IDS['alpha']}));journey.observe_cli(t.canonical({'type':'turn.started'}))
+                    items=copy.deepcopy(template);items[:2]=copy.deepcopy(retained['user_context']);items[-2]['content']=copy.deepcopy(content)
+                    if changed:items[-2]['content'][0]['text']+=' '
+                    try:journey.request(body(items));accepted=True
+                    except ValueError:accepted=False
+                    outcomes.append(accepted)
+                    self.assertEqual(accepted,not changed)
+                    if changed:
+                        self.assertIsNone(journey.turn['issued']);self.assertIsNone(journey.turn['user_context'])
+                        self.assertLessEqual(len(t.canonical(journey.resume_context_rejection)),2048)
+                self.assertEqual(outcomes[0],outcomes[1])
 
 
 if __name__=='__main__':unittest.main()

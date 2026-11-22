@@ -280,7 +280,14 @@ def configuration_mismatch(before,after,unit):
         fields=0
         if not order_only:
             old=next((row for row in before if left[row]>right[row]),None)
-            if old is not None:new=next((row for row in after if row[0]==old[0] and row!=old),None)
+            if old is not None:
+                origins={row for row in before if row[0]==old[0] and left[row]>right[row]}
+                candidates={row for row in after if row[0]==old[0] and right[row]>left[row]}
+                # Balanced alias rows are not replacement evidence. Multiple
+                # distinct surplus pairs cannot establish one changed field set.
+                if len(origins)>1 or len(candidates)>1:return unavailable
+                new=next(iter(candidates),None)
+                if new is not None and left[old]-right[old]!=right[new]-left[new]:return unavailable
             else:new=next(row for row in after if right[row]>left[row])
             if old is None or new is None or len(old)==2 or len(new)==2:fields=1
             else:

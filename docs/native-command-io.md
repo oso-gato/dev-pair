@@ -303,3 +303,11 @@ conventional /lib alias mapped to /usr/lib. Unknown/oversized rows are explicitl
 unavailable; no names or raw metadata are exported. Source/context/phase and
 cache-final-comparison binding, 1,536-byte projection, primary rejection,
 pre-interrupt status, exact cleanup and every deadline/output bound remain.
+
+
+Canonical /lib and /usr/lib aliases can produce duplicate snapshot path rows.
+The comparison witness cancels balanced row counts before choosing a same-path
+surplus counterpart. Only a unique surplus field comparison with matching
+multiplicity is reported; ambiguous duplicates are unavailable. Balanced alias
+rows cannot conceal an inode change by becoming the replacement counterpart.
+The original ordered tuple inequality still blocks, including order-only changes.
