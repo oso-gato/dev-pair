@@ -511,8 +511,15 @@ class Sequence:
                     require(all(type(goal.get(k))is int and 0<=goal[k]<=own[db] for k,db in (('tokensUsed','tokens_used'),('timeUsedSeconds','time_used_seconds'))),'goal wire/database usage mismatch')
                     result['goal_payload']=payload
         elif ident.startswith('search-'):
-            require(set(item)=={'type','call_id','status','execution','tools'} and item.get('status')=='completed'
+            require(set(item)=={'type','call_id','status','execution','tools','id','internal_chat_message_metadata_passthrough'} and item.get('status')=='completed'
                     and item.get('execution')=='client' and type(item.get('tools'))is list,'invalid special search output')
+            metadata=item['internal_chat_message_metadata_passthrough']
+            require(type(item['id'])is str and re.fullmatch(r'tso_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}',item['id'])
+                    and self.goal_context is not None and type(metadata)is dict and set(metadata)=={'turn_id','create_time'}
+                    and metadata['turn_id']==self.goal_context['item']['internal_chat_message_metadata_passthrough']['turn_id']
+                    and type(metadata['create_time'])in (int,float) and math.isfinite(metadata['create_time'])
+                    and self.wall_started-ACTION_SECONDS<=metadata['create_time']<=min(self.wall_started+SECONDS,time.time()+ACTION_SECONDS),
+                    'invalid special search history envelope')
             own=self.goal_state();require(own is not None and own['status']=='complete' and {k:own[k] for k in self.goal_identity}==self.goal_identity,'search changed goal identity/state')
             if ident=='search-positive':
                 found=search_definitions(item['tools']);self.discovered.update(found)

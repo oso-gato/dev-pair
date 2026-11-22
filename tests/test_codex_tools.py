@@ -332,14 +332,22 @@ class InventoryExtension(unittest.TestCase):
         seq.goal_initial=[row for row in seq.goal_initial if row['thread_id']!=thread]
         seq.observe_cli(t.canonical({'type':'thread.started','thread_id':thread}))
         own=seq.goal_state();seq.goal_identity={k:own[k] for k in ('thread_id','goal_id','objective','token_budget','created_at_ms')}
-        seq.metadata_products=seq.products()
-        def output(ident):return {'type':'tool_search_output','call_id':ident,'status':'completed','execution':'client','tools':[]}
+        seq.metadata_products=seq.products();seq.goal_context={'item':self.stamped_context()}
+        def output(ident):return {'type':'tool_search_output','call_id':ident,'status':'completed','execution':'client','tools':[],
+            'id':'tso_00000000-0000-7000-8000-000000000006',
+            'internal_chat_message_metadata_passthrough':{'turn_id':'00000000-0000-7000-8000-000000000003','create_time':time.time()}}
         with self.assertRaisesRegex(ValueError,'expected one evidenced'):seq.oracle(seq.planned[0],output('search-positive'))
         result=seq.oracle(seq.planned[1],output('search-whitespace'))
         self.assertTrue(result['pass']);self.assertFalse(result['handler_validation_witnessed'])
         self.assertEqual(result['coverage'],'bounded-invalid-input/no-definition')
         for altered in (dict(output('search-zero'),execution='server'),dict(output('search-zero'),status='failed'),dict(output('search-zero'),error='invented validator error')):
             with self.assertRaisesRegex(ValueError,'invalid special'):seq.oracle(seq.planned[2],altered)
+        for mutate in (lambda value:value.update(id=None),lambda value:value.update(id='tso_forged'),
+                       lambda value:value['internal_chat_message_metadata_passthrough'].update(turn_id='forged'),
+                       lambda value:value['internal_chat_message_metadata_passthrough'].update(create_time=float('inf')),
+                       lambda value:value['internal_chat_message_metadata_passthrough'].update(extra='unknown')):
+            value=output('search-zero');mutate(value)
+            with self.assertRaisesRegex(ValueError,'history envelope'):seq.oracle(seq.planned[2],value)
         (self.root/'job/src/unplanned-search-effect').write_text('not metadata')
         with self.assertRaisesRegex(ValueError,'changed product'):seq.oracle(seq.planned[2],output('search-zero'))
 
@@ -460,3 +468,24 @@ class InventoryExtension(unittest.TestCase):
         body=self.body([message]);body['tools']=[{'type':'tool_search','execution':'client','description':'Source listing omitted by stock world-state mode'}]
         wire=self.wire_item(seq.request(body));self.assertEqual(wire['call_id'],'search-positive')
         self.assertEqual(seq.search_source['block'],block)
+
+    def test_actual_recorded_search_envelope_replay_and_forged_call_rejection(self):
+        import sqlite3
+        fixture=json.loads((Path(__file__).parent/'data/codex169-tool-search-output.json').read_text())
+        self.assertEqual(fixture['source_sha'],'d32063f96c2dff1dc96af839b3952abb6acfeda4')
+        path=self.database();row=fixture['goal_row'];action=t.inventory_actions()[-3]
+        seq=t.Sequence([action],self.root,time.monotonic()+5)
+        seq.observe_cli(t.canonical({'type':'thread.started','thread_id':row['thread_id']}))
+        seq.metadata_products=seq.products();seq.goal_identity={k:row[k] for k in ('thread_id','goal_id','objective','token_budget','created_at_ms')}
+        seq.goal_context=fixture['goal_context'];seq.wall_started=fixture['returned_item']['internal_chat_message_metadata_passthrough']['create_time']-1
+        with sqlite3.connect(path) as db:db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',tuple(row[k] for k in t.GOAL_COLUMNS))
+        body=self.body([{'type':'message','role':'developer','content':[{'type':'input_text','text':fixture['source_evidence']['block']}]}])
+        body['tools']=[{'type':'tool_search','execution':'client','description':'stock omitted source listing'}]
+        seq.request(body)
+        wrong=dict(fixture['returned_item'],call_id='unissued')
+        with self.assertRaisesRegex(ValueError,'orphan'):seq.request(dict(body,input=[wrong]))
+        self.assertFalse(seq.records)
+        fixed_now=seq.wall_started+2
+        with patch.object(t.time,'time',return_value=fixed_now):seq.request(dict(body,input=[fixture['returned_item']]))
+        self.assertTrue(seq.finished);self.assertTrue(seq.records[0]['pass'])
+        self.assertEqual(seq.records[0]['discovered_names'],['multi_agent_v1.spawn_agent'])

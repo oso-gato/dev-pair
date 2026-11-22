@@ -63,6 +63,10 @@ One valid input request observes rejection under the unchanged current exec/
 Default configuration, followed by subsequent tool work. It does not establish
 interactive answer/client correlation. Three special client `tool_search_call`
 items use object arguments and require correlated `tool_search_output` kinds.
+The actual history-stamped result has seven fields, including a `tso_` UUIDv7
+and the same typed turn/time envelope checked against the completed goal turn.
+The recorded stock output is retained as a replay regression; replay checks do
+not substitute for a fresh stock execution of a changed candidate.
 Positive search requires the actual advertised Multi-agent source and its exact
 cached-source namespace/function schema; the fixture never invokes the discovered
 `spawn_agent`. Complete definitions and every request inventory are retained and
