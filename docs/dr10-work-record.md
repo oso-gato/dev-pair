@@ -2,6 +2,29 @@
 
 ## Latest continuation checkpoint
 
+### November 23, 2026, 06:10 HKT — model migration and storage checkpoint
+
+- The owner explicitly migrated active and resumed development work to
+  `gpt-6.2-sol` / `high` for implementation and host validation and
+  `gpt-6.2-astra` / `high` for coordination and independent review. A12's optional
+  focused work retains `medium` effort with GPT-6.2 Sol. The exact standards pin
+  remains `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
+- The `gpt-6.1-sol` / `high` builder stopped at 22:10:38 UTC after reaping its
+  check. Replacement builder `/root/build_62` uses API-selected `gpt-6.2-sol` /
+  `high`. Independent backend attestation is unavailable. The original
+  21:54:20–22:19:20 UTC allocation applies to both builders.
+- The controller storage worker opens owned scratch entries relative to held
+  descriptors and pins each inode before verifying its parent lookup. Early
+  tests found an inode-recycling gap during file replacement. The earlier
+  failure is preserved. The corrected files passed 56 affected checks in
+  8.425 seconds, including same-filesystem GNU `du` comparisons and controlled
+  churn. The replacement builder verified all four tested file hashes and the
+  test log before completing this documentation change.
+- The native35 abort cause and actual mount-boundary behavior remain unverified.
+  An unresolved image-copy worker still preserves scratch. The exact candidate
+  requires fresh independent review. Evidence is under
+  `/workspace/artifacts/native-storage-worker-20261122/`.
+
 
 ### November 23, 2026, 05:52 HKT — durable per-registry freeze and drain
 

@@ -192,11 +192,16 @@ before preparation, before assembly in shared code, and finally. No reserve is
 lowered. Repository/cache/temporary expansion/ISO duplication count toward4GiB.
 Measured insufficiency, ENOSPC, timeout and capability failures remain blockers.
 
-Storage measurement keeps its proven one-filesystem traversal, 64KiB streaming
-capture and root-side5s+1s deadline. Only exact owned-path ENOENT forms are eligible
-for three retries. Missing totals are never zero; maxima remain enforced and
-completion needs a stable error-free total. Permission/I/O/foreign/unknown errors
-block, retaining bounded diagnostic counts/tails and truncation classifications.
+The source-bound storage worker measures allocated blocks with descriptor-relative
+traversal, hardlink deduplication and the existing `guest.qcow2` basename
+exclusion. Mount crossings block. A descendant disappearance can yield a
+provisional sample or trigger another attempt without contributing a total.
+Across at most three attempts, the largest usable sample counts against the
+same overhead and active-copy reserve. Final measurements require a complete
+scan. Identity, permission, I/O, traversal-limit and timeout failures block.
+The 64 KiB capture limit and root-side 5-second timeout with a 1-second kill
+grace remain in effect. Worker evidence reports typed results and output counts
+and hashes. An unresolved image-copy worker still prevents scratch cleanup.
 
 ## Reports, secrecy and cleanup
 

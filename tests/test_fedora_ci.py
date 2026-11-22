@@ -23,6 +23,12 @@ def fixture_inputs():
     return {**{key: 'c' * length for key, length in guest.INPUT_LENGTHS.items()}, 'source_sha': 'a' * 40, 'payload_bytes': 123}
 
 
+def worker_result(root,size=4096,provisional=False,no_total=False,code=None):
+    node=root.stat();status='no-total' if no_total else 'provisional' if provisional else 'complete'
+    value={'schema':1,'worker_sha256':ci.file_hash(pathlib.Path(ci.__file__).with_name('storage_measure.py')),'root':{'device':node.st_dev,'inode':node.st_ino,'owner':node.st_uid},'status':status,'allocated_bytes':None if no_total else size,'reason':'enumeration-disappeared' if no_total else 'none','counters':{'entries':1,'unique_inodes':1,'vanished':1 if provisional else 0}}
+    return subprocess.CompletedProcess([],1 if no_total else 0 if code is None else code,json.dumps(value).encode(),b'')
+
+
 class FedoraCITests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -324,8 +330,11 @@ class FedoraCITests(unittest.TestCase):
                 _, vanished = ci.parse_du(self.root, result)
                 observed |= vanished
                 # Real live traversal can tolerate only classified ENOENT.
-                measurement = ci.measure_storage(self.root, live=True, sudo=False)
-                self.assertLessEqual(measurement['bytes'], ci.OVERHEAD_LIMIT)
+                try:
+                    measurement = ci.measure_storage(self.root, live=True, sudo=False)
+                    self.assertLessEqual(measurement['bytes'], ci.OVERHEAD_LIMIT)
+                except ci.StorageMeasurementBlocked as failure:
+                    self.assertIn(failure.diagnostics.get('worker',{}).get('reason'),('identity-changed','permission','enumeration-disappeared'))
                 if observed:
                     break
             self.assertTrue(observed, 'real removed/recreated-file race was not exercised')
@@ -339,7 +348,7 @@ class FedoraCITests(unittest.TestCase):
         restricted.chmod(0)
         try:
             if os.geteuid() != 0:
-                with self.assertRaisesRegex(ci.Blocked, 'non-disappearance'):
+                with self.assertRaises(ci.StorageMeasurementBlocked):
                     ci.measure_storage(self.root, live=True, sudo=False)
         finally:
             restricted.chmod(0o700)
@@ -347,7 +356,7 @@ class FedoraCITests(unittest.TestCase):
     def test_storage_retries_do_not_turn_unstable_or_invalid_measurement_into_stable_pass(self):
         output = ('100\t' + str(self.root) + '\n').encode()
         disappearance = ("du: cannot access '" + str(self.root / 'gone') + "': No such file or directory\n").encode()
-        result = subprocess.CompletedProcess([], 1, output, disappearance)
+        result = worker_result(self.root,512,provisional=True)
         with mock.patch.object(ci, 'capture_du', return_value=result) as run:
             self.assertTrue(ci.measure_storage(self.root, live=True, sudo=False)['provisional'])
             self.assertEqual(run.call_count, 3)
@@ -358,7 +367,7 @@ class FedoraCITests(unittest.TestCase):
                       b"du: cannot access '/outside/gone': No such file or directory\n"):
             with self.assertRaises(ci.Blocked):
                 ci.parse_du(self.root, subprocess.CompletedProcess([], 1, output, error))
-        huge = subprocess.CompletedProcess([], 0, (str(ci.OVERHEAD_LIMIT + 1) + '\t' + str(self.root) + '\n').encode(), b'')
+        huge = worker_result(self.root,ci.OVERHEAD_LIMIT+512)
         with mock.patch.object(ci, 'capture_du', return_value=huge):
             with self.assertRaisesRegex(ci.Blocked, 'overhead limit'):
                 ci.measure_storage(self.root, live=True, sudo=False)
@@ -383,8 +392,8 @@ class FedoraCITests(unittest.TestCase):
         detail = caught.exception.diagnostics
         self.assertTrue(detail['truncated'])
         self.assertGreater(detail['stderr_bytes_seen'], ci.DU_CAPTURE_LIMIT)
-        self.assertGreater(detail['retained_line_types']['access_enoent'], 0)
-        self.assertIn('No such file or directory', detail['stderr_tail'])
+        self.assertRegex(detail['stderr_sha256'],r'^[0-9a-f]{64}$')
+        self.assertNotIn('stderr_tail',detail)
         self.assertLess(len(ci.safe_json(detail)), 5000)
         probe = ci.Probe('a' * 40, self.root)
         with mock.patch.object(ci, 'capture_du', side_effect=caught.exception):
@@ -418,10 +427,11 @@ class FedoraCITests(unittest.TestCase):
 
     def test_privileged_measurement_has_fixed_root_side_timeout(self):
         summary = ('4096\t' + str(self.root) + '\n').encode()
-        with mock.patch.object(ci, 'capture_du', return_value=subprocess.CompletedProcess([], 0, summary, b'')) as capture:
+        with mock.patch.object(ci, 'capture_du', return_value=worker_result(self.root)) as capture:
             ci.measure_storage(self.root)
         argv = capture.call_args.args[1]
-        self.assertEqual(argv[:7], ['sudo', '-n', '/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s', '/usr/bin/du'])
+        self.assertEqual(argv[:7], ['sudo','-n','/usr/bin/timeout','--signal=TERM','--kill-after=1s','5s','/usr/bin/prlimit'])
+        self.assertIn('/usr/bin/python3',argv);self.assertIn('-I',argv);self.assertIn('--core=0:0',argv)
 
     def test_captured_fatal_fts_witness_retries_without_inventing_totals(self):
         captured_root = pathlib.Path('/tmp/dpvm-0n1yt9k2')
@@ -433,6 +443,9 @@ class FedoraCITests(unittest.TestCase):
         complete = subprocess.CompletedProcess([], 0, ('4096\t' + str(self.root) + '\n').encode(), b'')
         partial = subprocess.CompletedProcess([], 1, ('8192\t' + str(self.root) + '\n').encode(),
             ("du: cannot access '" + str(self.root / 'gone') + "': No such file or directory\n").encode())
+        fatal=worker_result(self.root,no_total=True)
+        complete=worker_result(self.root,4096)
+        partial=worker_result(self.root,8192,provisional=True)
         with mock.patch.object(ci, 'capture_du', side_effect=[fatal, complete]) as capture:
             sample = ci.measure_storage(self.root, sudo=False)
             self.assertEqual((sample['bytes'], sample['missing_total_samples'], sample['usable_samples']), (4096, 1, 1))
@@ -450,7 +463,7 @@ class FedoraCITests(unittest.TestCase):
             self.assertEqual(capture.call_count, 3)
             self.assertIsNone(caught.exception.diagnostics['max_observed_bytes'])
             self.assertEqual(caught.exception.diagnostics['missing_total_samples'], 3)
-            self.assertEqual(caught.exception.diagnostics['retained_line_types']['fatal_fts_enoent'], 1)
+            self.assertIn('stdout_sha256',caught.exception.diagnostics)
         with mock.patch.object(ci, 'capture_du', side_effect=[partial, fatal, fatal]):
             with self.assertRaisesRegex(ci.StorageMeasurementBlocked, 'did not stabilize'):
                 ci.measure_storage(self.root, sudo=False)

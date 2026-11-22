@@ -263,6 +263,32 @@ def du_diagnostics(root, result, seen=None, truncated=False):
             'stderr_tail': evidence_tail(result.stderr, 2048), 'stdout_tail': evidence_tail(result.stdout, 512)}
 
 
+def storage_diagnostics(root,result,seen=None,truncated=False):
+    return {'schema':1,'exit_status':result.returncode,'capture_limit_bytes':DU_CAPTURE_LIMIT,
+        'stdout_bytes_seen':(seen or {}).get('stdout',len(result.stdout)),'stderr_bytes_seen':(seen or {}).get('stderr',len(result.stderr)),
+        'stdout_sha256':hashlib.sha256(result.stdout).hexdigest(),'stderr_sha256':hashlib.sha256(result.stderr).hexdigest(),
+        'truncated':bool(truncated),'counts_cover':'retained prefix only' if truncated else 'complete captured output'}
+
+def parse_storage(root,result,expected,worker_sha):
+    try:
+        require(len(result.stdout)+len(result.stderr)<=DU_CAPTURE_LIMIT and len(result.stdout)<=2048 and not result.stderr,'storage measurement diagnostics rejected')
+        value=json.loads(result.stdout,object_pairs_hook=unique_object)
+        require(type(value) is dict and set(value)=={'schema','worker_sha256','root','status','allocated_bytes','reason','counters'} and type(value['schema']) is int and value['schema']==1 and value['worker_sha256']==worker_sha and value['root']==expected,'invalid storage worker binding')
+        require(type(value['root']) is dict and all(type(v) is int for v in value['root'].values()),'invalid storage root identity')
+        counters=value['counters'];require(type(counters) is dict and set(counters)=={'entries','unique_inodes','vanished'} and all(type(v) is int and v>=0 for v in counters.values()) and counters['entries']<=524288 and counters['unique_inodes']<=262144 and counters['vanished']<=counters['entries'] and counters['unique_inodes']<=counters['entries']+1,'invalid storage counters')
+        status=value['status'];size=value['allocated_bytes']
+        if status=='failed':
+            require(result.returncode==2 and size is None and value['reason'] in ('root-identity','identity-changed','permission','io','unsupported','mount-boundary','entry-limit','inode-limit','depth-limit','deadline','enumeration-disappeared'),'invalid worker failure')
+            raise StorageMeasurementBlocked('storage worker reported bounded failure',{**storage_diagnostics(root,result),'worker':value})
+        require(status in ('complete','provisional','no-total') and result.returncode==(1 if status=='no-total' else 0),'storage measurement failed or unsupported')
+        require((status=='no-total' and size is None and value['reason']=='enumeration-disappeared') or (status in ('complete','provisional') and type(size) is int and 0<=size<2**63 and size%512==0 and value['reason']=='none' and counters['unique_inodes']>=1),'invalid storage measurement total')
+        require(status!='complete' or counters['vanished']==0,'invalid stable storage sample')
+        require(status!='provisional' or counters['vanished']>0,'invalid provisional storage sample')
+        return size,status!='complete'
+    except StorageMeasurementBlocked:raise
+    except (Blocked,ValueError,KeyError,TypeError,RecursionError) as error:
+        raise StorageMeasurementBlocked('storage worker result rejected',storage_diagnostics(root,result)) from None
+
 def capture_du(root, argv):
     buffers = {'stdout': bytearray(), 'stderr': bytearray()}
     seen = {'stdout': 0, 'stderr': 0}
@@ -288,7 +314,7 @@ def capture_du(root, argv):
         return subprocess.CompletedProcess(argv, process.wait(timeout=1), bytes(buffers['stdout']), bytes(buffers['stderr']))
     except (Blocked, subprocess.SubprocessError) as exc:
         result = subprocess.CompletedProcess(argv, process.poll(), bytes(buffers['stdout']), bytes(buffers['stderr']))
-        failure = StorageMeasurementBlocked(str(exc), du_diagnostics(root, result, seen, truncated=True))
+        failure = StorageMeasurementBlocked(str(exc), storage_diagnostics(root, result, seen, truncated=True))
         raise failure from exc
     finally:
         selector.close()
@@ -348,19 +374,28 @@ def validate_du(root, result):
     return int(summary[1]), True
 
 
-def measure_storage(root, live=False, sudo=True, attempts=3):
+def measure_storage(root, live=False, sudo=True, attempts=3, expected_root=None, worker_sha=None):
     require(type(attempts) is int and 1 <= attempts <= 3, 'invalid storage retry bound')
+    worker=pathlib.Path(__file__).with_name('storage_measure.py')
+    require(not worker.is_symlink() and worker.is_file(),'storage worker source rejected')
+    actual_sha=file_hash(worker);worker_sha=actual_sha if worker_sha is None else worker_sha
+    require(actual_sha==worker_sha,'storage worker source changed')
+    if expected_root is None:
+        try:node=os.stat(root,follow_symlinks=False)
+        except OSError:raise StorageMeasurementBlocked('storage root unavailable',{'schema':1,'worker_sha256':worker_sha,'availability':'not-launched','reason':'root-identity'}) from None
+        expected={'device':node.st_dev,'inode':node.st_ino,'owner':node.st_uid}
+    else:expected=expected_root
     argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s',
-            '/usr/bin/du', '--summarize', '--block-size=1',
-            '--one-file-system', '--exclude=guest.qcow2', str(root)]
+        '/usr/bin/prlimit','--core=0:0','--as=268435456:268435456','--nofile=256:256','--','/usr/bin/python3','-I',str(worker),
+        '--root',str(root),'--device',str(expected['device']),'--inode',str(expected['inode']),'--owner',str(expected['owner']),'--sha256',worker_sha]
     maximum = None
     usable = missing = 0
     for attempt in range(attempts):
         try:
             result = capture_du(root, argv)
-            size, vanished = parse_du(root, result)
+            size, vanished = parse_storage(root,result,expected,worker_sha)
         except StorageMeasurementBlocked as exc:
-            exc.diagnostics.update(attempts=attempt + 1, usable_samples=usable,
+            exc.diagnostics.update(worker_sha256=worker_sha,root_identity=expected,attempts=attempt + 1, usable_samples=usable,
                                    missing_total_samples=missing, max_observed_bytes=maximum)
             raise
         if size is None:
@@ -372,18 +407,18 @@ def measure_storage(root, live=False, sudo=True, attempts=3):
                    'missing_total_samples': missing, 'max_observed_bytes': maximum}
         if maximum is not None and maximum > OVERHEAD_LIMIT:
             raise StorageMeasurementBlocked('capacity blocked: tooling/source overhead limit exceeded',
-                                            {**du_diagnostics(root, result), **context})
+                                            {**storage_diagnostics(root, result), **context})
         if not vanished:
-            return {'bytes': maximum, 'provisional': False, **context}
+            return {'bytes':maximum,'provisional':False,'worker_sha256':worker_sha,'root_identity':expected,**context}
     # Live churn can produce valid but incomplete traversals. Keep the largest
     # observed count; it is provisional, never a completed-phase validation.
     if maximum is None:
         raise StorageMeasurementBlocked('storage measurement produced no usable total within bounded retries',
-                                        {**du_diagnostics(root, result), **context})
+                                        {**storage_diagnostics(root, result), **context})
     if not live:
         raise StorageMeasurementBlocked('storage measurement did not stabilize within bounded retries',
-                                        {**du_diagnostics(root, result), **context})
-    return {'bytes': maximum, 'provisional': True, **context}
+                                        {**storage_diagnostics(root, result), **context})
+    return {'bytes':maximum,'provisional':True,'worker_sha256':worker_sha,'root_identity':expected,**context}
 
 
 TOOL_STAGES = ('run-shell-entered','timeout-launch','payload-entered','upgrade','install','rpm-hash',
@@ -655,6 +690,8 @@ class Probe:
         require(all(len(os.fsencode(root / name)) <= 50 for name in ('graph', 'runroot', 'tmp')),
                 'scratch engine paths exceed Podman 50-byte runroot compatibility limit')
         self.scratch_identity = (info.st_dev, info.st_ino)
+        self.scratch_owner=info.st_uid
+        self.storage_worker_sha=file_hash(self.repo/'tools/storage_measure.py')
         self.image_copy_active = False
         self.engine_activity = False
         self.primary_image_failure = None
@@ -697,7 +734,7 @@ class Probe:
 
     def storage_measurement(self, live=False):
         try:
-            measurement = measure_storage(self.root, live=live)
+            measurement = measure_storage(self.root,live=live,expected_root={'device':self.scratch_identity[0],'inode':self.scratch_identity[1],'owner':self.scratch_owner},worker_sha=self.storage_worker_sha)
             reserve = fedora_oci.UNLINKED_RESERVE if self.image_copy_active else 0
             require(measurement['bytes'] + reserve <= OVERHEAD_LIMIT, 'capacity blocked: image-copy unlinked spool reserve exceeds overhead')
             measurement['unlinked_spool_reserve_bytes'] = reserve
@@ -830,8 +867,10 @@ class Probe:
         require(re.fullmatch('[0-9a-f]{40}', self.source), 'invalid exact source SHA')
         require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source, 'checkout differs from exact PR head')
         require(not run_small(['/usr/bin/git', '-C', str(self.repo), 'status', '--porcelain']), 'source checkout must be clean')
+        require(file_hash(self.repo/'tools/storage_measure.py')==self.storage_worker_sha,'storage worker changed before source admission')
+        self.report['storage_worker_sha256']=self.storage_worker_sha
         for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo',
-                        '/usr/bin/timeout', '/usr/bin/du', '/usr/bin/slirp4netns', '/usr/bin/prlimit'):
+                        '/usr/bin/timeout', '/usr/bin/prlimit', '/usr/bin/python3', '/usr/bin/slirp4netns'):
             require(pathlib.Path(command).is_file(), 'required preinstalled runner tool unavailable: ' + command)
         require(os.cpu_count() >= 2, 'at least two CPUs required')
         mem = int(re.search(r'^MemTotal:\s+(\d+) kB$', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
