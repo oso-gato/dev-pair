@@ -24,6 +24,18 @@ def body(items):return {'model':t.MODEL,'input':items,'tools':[{'type':'function
 def terminal(output):return 'Chunk ID: fixture\nWall time: 0 seconds\nProcess exited with code 0\nOutput:\n'+output
 
 
+def durable_message(text,kind='user.text',ident=IDS['alpha'],turn=IDS['beta'],created=1700000000.25):
+    # Pinned producers persist attribution; non-RLite request preparation removes it.
+    return dict(message(text),id=('msg_input_' if kind=='user.text' else 'msg_')+ident,
+        **{s.METADATA:{'turn_id':turn,'create_time':created,'content_item_kinds':[kind],
+            'content_item_metadata':[{'provenance':{'type':'user'}} if kind=='user.text' else
+                                     {'provenance':{'type':'harness','hook':False}}]}})
+
+
+def source_wire(item):
+    result=copy.deepcopy(item);del result[s.METADATA]['content_item_metadata'];return result
+
+
 class SessionsTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
@@ -333,27 +345,149 @@ class SessionsTests(unittest.TestCase):
         for value in ('authentication failed',expected+' extra','prefix '+expected,expected.replace(s.UNKNOWN,IDS['alpha']),None):
             self.assertFalse(s.unknown_reason(value))
 
-    def test_readonly_database_and_rollout_identity_bind_actual_sources(self):
+    def source_first_rollout(self):
         import sqlite3
-        self.first('alpha');entry=self.j.entries['alpha']
-        database=self.root/'state/sqlite/state_5.sqlite';database.parent.mkdir(parents=True)
-        rollout=self.root/'state/codex/sessions/fixture.jsonl';rollout.parent.mkdir(parents=True)
+        durable=[durable_message('whole observed environment context','environments.environment_context'),
+                 durable_message(s.prompt('alpha','first',NONCE))]
+        wire=[source_wire(item) for item in durable]
+        self.observed('alpha');self.j.request(body(wire));issued=copy.deepcopy(self.j.turn['issued']);actual=self.run_action(issued)
+        call=dict(issued,id='fc_'+IDS['alpha'],**{s.METADATA:{'turn_id':IDS['beta']}})
+        output={'type':'function_call_output','id':'fco_'+IDS['alpha'],'call_id':issued['call_id'],'output':terminal(actual),
+                s.METADATA:{'turn_id':IDS['beta'],'create_time':1700000001.25}}
+        self.j.request(body(wire+[call,output]));self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
+        entry=self.j.entries['alpha'];database=self.root/'state/sqlite/state_5.sqlite';database.parent.mkdir(parents=True)
+        path=self.root/'state/codex/sessions/fixture.jsonl';path.parent.mkdir(parents=True)
         rows=[{'type':'session_meta','payload':{'id':IDS['alpha'],'cwd':'/job'}},
-              *({'type':'response_item','payload':item} for item in entry['user_context']),
-              {'type':'response_item','payload':entry['call']},
-              {'type':'response_item','payload':entry['output']}]
-        rollout.write_bytes(b'\n'.join(t.canonical(v) for v in rows)+b'\n')
+              *({'type':'response_item','payload':item} for item in durable+[call,output])]
+        self.write_rollout(path,rows)
         with sqlite3.connect(database) as db:
             db.execute('CREATE TABLE threads (id TEXT,cwd TEXT,rollout_path TEXT,model_provider TEXT)')
             db.execute('INSERT INTO threads VALUES (?,?,?,?)',(IDS['alpha'],'/job','/state/codex/sessions/fixture.jsonl','openai'))
-        found=s.database(self.root,{IDS['alpha']},integrity=True)
-        self.assertEqual(s.rollout_proof(self.root,found[IDS['alpha']],entry)['uuid'],IDS['alpha'])
+        row=s.database(self.root,{IDS['alpha']},integrity=True)[IDS['alpha']]
+        return path,rows,row,entry
+
+    def write_rollout(self,path,rows):
+        path.write_bytes(b'\n'.join(t.canonical(v) for v in rows)+b'\n')
+
+    def test_readonly_database_and_source_shaped_rollout_identity(self):
+        path,rows,row,entry=self.source_first_rollout();original=copy.deepcopy(rows);wire=copy.deepcopy(entry['user_context'])
+        result=s.rollout_proof(self.root,row,entry)
+        self.assertEqual(result['uuid'],IDS['alpha']);self.assertEqual(rows,original)
+        self.assertEqual(entry['user_context'],wire)
+        self.assertNotEqual(result['raw_user_context_sha256'],result['wire_user_context_sha256'])
+        self.assertEqual(result['projected_user_context_sha256'],result['wire_user_context_sha256'])
         with self.assertRaises(ValueError):s.database(self.root,set())
-        bad=copy.deepcopy(rows);bad[0]['payload']['id']=IDS['beta']
-        rollout.write_bytes(b'\n'.join(t.canonical(v) for v in bad)+b'\n')
-        with self.assertRaises(ValueError):s.rollout_proof(self.root,found[IDS['alpha']],entry)
-        original=rollout.with_suffix('.saved');rollout.rename(original);rollout.symlink_to(original)
-        with self.assertRaises(ValueError):s.rollout_proof(self.root,found[IDS['alpha']],entry)
+        for index,value in ((0,IDS['beta']),(1,'/foreign'),(3,'foreign')):
+            bad=list(row);bad[index]=value
+            with self.assertRaises(ValueError):s.rollout_proof(self.root,bad,entry)
+        bad=copy.deepcopy(rows);bad[0]['payload']['id']=IDS['beta'];self.write_rollout(path,bad)
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry)
+        original_path=path.with_suffix('.saved');path.rename(original_path);path.symlink_to(original_path)
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry)
+
+    def test_closed_durable_projection_rejects_forged_shapes_without_mutation(self):
+        valid=durable_message('entire original message');original=copy.deepcopy(valid)
+        self.assertEqual(s.durable_user_to_wire(valid),source_wire(valid));self.assertEqual(valid,original)
+        cases=[]
+        for key,value in (('turn_id','bad'),('create_time',True),('create_time',float('inf')),
+                          ('content_item_kinds',['unknown']),('content_item_kinds',[]),
+                          ('content_item_metadata',[]),('content_item_metadata',None),
+                          ('content_item_metadata',[{'provenance':{'type':'tool','namespace':'functions'}}]),
+                          ('content_item_metadata',[{'provenance':{'type':'user','extra':'SECRET'}}]),
+                          ('content_item_metadata',[{'provenance':{'type':'user'},'extra':'SECRET'}]),
+                          ('content_item_metadata',[{'provenance':{'type':'harness','hook':False}}])):
+            item=copy.deepcopy(valid);item[s.METADATA][key]=value;cases.append(item)
+        for key in ('turn_id','create_time','content_item_kinds','content_item_metadata'):
+            item=copy.deepcopy(valid);del item[s.METADATA][key];cases.append(item)
+        for key,value in (('role','developer'),('type','function_call'),('id','unprefixed'),('status',None),
+                          ('content',[{'type':'input_text','text':'x','extra':True}]),('SECRET_KEY','SECRET_VALUE')):
+            item=copy.deepcopy(valid);item[key]=value;cases.append(item)
+        item=copy.deepcopy(valid);item[s.METADATA]['SECRET_KEY']='SECRET_VALUE';cases.append(item)
+        env=durable_message('env','environments.environment_context')
+        for hook in (True,0,None):
+            item=copy.deepcopy(env);item[s.METADATA]['content_item_metadata'][0]['provenance']['hook']=hook;cases.append(item)
+        for item in cases:
+            before=copy.deepcopy(item)
+            with self.assertRaises(ValueError):s.durable_user_to_wire(item)
+            self.assertEqual(t.canonical(item),t.canonical(before))
+
+    def test_durable_projection_is_never_applied_to_resumed_wire(self):
+        _,_,_,entry=self.source_first_rollout();before=copy.deepcopy(entry)
+        history=self.history('alpha')
+        history[0][s.METADATA]['content_item_metadata']=[{'provenance':{'type':'harness','hook':False}}]
+        self.observed('alpha','resume')
+        with patch.object(s,'durable_user_to_wire',side_effect=AssertionError('wire normalization attempted')):
+            with self.assertRaisesRegex(ValueError,'prior ordered user context'):self.j.request(body(history))
+        self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+        self.assertEqual(self.j.entries['alpha'],before)
+
+    def test_durable_context_requires_whole_exact_order_and_original_causal_pair(self):
+        path,rows,row,entry=self.source_first_rollout();variants=[]
+        for index in (1,2):
+            for suffix in (' changed',' extra prefix equivalent'):
+                changed=copy.deepcopy(rows);changed[index]['payload']['content'][0]['text']+=suffix;variants.append(changed)
+            for key,value in (('id','msg_input_'+IDS['beta']),('role','developer'),('type','other')):
+                changed=copy.deepcopy(rows);changed[index]['payload'][key]=value;variants.append(changed)
+            for key,value in (('turn_id',IDS['alpha']),('create_time',1700000002.)):
+                changed=copy.deepcopy(rows);changed[index]['payload'][s.METADATA][key]=value;variants.append(changed)
+        variants += [rows[:1]+rows[2:], [rows[0],rows[2],rows[1],*rows[3:]], rows[:2]+[rows[1]]+rows[2:],
+                     rows+[rows[1]], [rows[0],rows[1],rows[3],rows[2],rows[4]],
+                     [*rows[:3],rows[4],rows[3]], rows+[rows[3]], rows+[rows[4]]]
+        for index,key,value in ((3,'arguments','{}'),(4,'output','forged'),(3,'id','fc_'+IDS['beta'])):
+            changed=copy.deepcopy(rows);changed[index]['payload'][key]=value;variants.append(changed)
+        changed=copy.deepcopy(rows);changed[3]['payload'][s.METADATA]['turn_id']=IDS['alpha'];variants.append(changed)
+        changed=copy.deepcopy(rows);changed[4]['payload'][s.METADATA]['SECRET_KEY']='SECRET_VALUE';variants.append(changed)
+        variants.append(rows+[{'type':'response_item','payload':{'type':'function_call_output','call_id':'orphan','output':'x'}}])
+        for changed in variants:
+            before=copy.deepcopy(self.j.entries);self.write_rollout(path,changed)
+            with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry,journey=self.j,checkpoint_sha256='a'*64)
+            self.assertEqual(self.j.entries,before);self.assertEqual(len(self.j.records),1)
+            self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
+
+    def test_final_rollout_binds_later_observed_continuation_without_hiding_extra_users(self):
+        path,rows,row,entry=self.source_first_rollout();self.observed('alpha','resume')
+        durable=durable_message(s.prompt('alpha','resume',NONCE),ident=IDS['beta'],turn=IDS['alpha'],created=1700000002.)
+        wire=source_wire(durable);history=copy.deepcopy(entry['user_context'])+[entry['call'],entry['output'],wire]
+        self.j.request(body(history));issued=copy.deepcopy(self.j.turn['issued']);actual=self.run_action(issued)
+        call=dict(issued,**{s.METADATA:{'turn_id':IDS['alpha']}})
+        output={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual),
+                s.METADATA:{'turn_id':IDS['alpha'],'create_time':1700000003.}}
+        self.j.request(body(history+[call,output]));self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
+        rows += [{'type':'response_item','payload':item} for item in (durable,call,output)]
+        self.write_rollout(path,rows);bound=self.j.continuations['alpha']
+        self.assertEqual(s.rollout_proof(self.root,row,entry,continuation=bound)['uuid'],IDS['alpha'])
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry)  # First audit cannot hide later users.
+        variants=[rows+[rows[1]], rows[:-3]+[rows[-2],rows[-3],rows[-1]],
+                  rows[:3]+[rows[-3]]+rows[3:-3]+rows[-2:]]
+        for changed in variants:
+            self.write_rollout(path,changed)
+            with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry,continuation=bound)
+
+    def test_rollout_rejection_witness_is_bounded_first_private_and_cannot_commit(self):
+        path,rows,row,entry=self.source_first_rollout();before=copy.deepcopy(self.j.entries)
+        rows[1]['payload'][s.METADATA]['SECRET_KEY']='SECRET_VALUE';rows[1]['payload']['content'][0]['text']='SECRET_TEXT'*100
+        self.write_rollout(path,rows)
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry,journey=self.j,checkpoint_sha256='a'*64)
+        witness=copy.deepcopy(self.j.rollout_rejection);encoded=t.canonical(witness)
+        self.assertLessEqual(len(encoded),2048);self.assertNotIn(b'SECRET',encoded)
+        self.assertNotIn(str(path).encode(),encoded);self.assertNotIn(IDS['alpha'].encode(),encoded)
+        self.assertEqual(witness['stage'],'durable-context');self.assertEqual(witness['unknown_key_count'],1)
+        self.assertEqual(witness['checkpoint_sha256'],'a'*64);self.assertEqual(witness['request'],self.j.last_request)
+        self.assertEqual(self.j.entries,before);self.assertEqual(len(self.j.records),1)
+        rows[1]['payload']['content'][0]['text']='another secret';self.write_rollout(path,rows)
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry,journey=self.j)
+        self.assertEqual(self.j.rollout_rejection,witness)
+
+    def test_rollout_local_bounds_identity_and_ancestor_symlink_reject(self):
+        path,rows,row,entry=self.source_first_rollout()
+        for value in (b'x'*(2*1024**2+1), b'x'*(t.BODY_BYTES+1)+b'\n',b'{\n',b''):
+            path.write_bytes(value)
+            with self.assertRaises((ValueError,OSError)):s.rollout_proof(self.root,row,entry)
+        self.write_rollout(path,rows)
+        bad=copy.deepcopy(rows);bad[0]['payload']['cwd']='/foreign';self.write_rollout(path,bad)
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry)
+        self.write_rollout(path,rows);parent=path.parent;stored=parent.with_name('stored');parent.rename(stored);parent.symlink_to(stored)
+        with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry)
 
     def test_resume_argv_is_explicit_uuid_not_last_or_cwd_inference(self):
         argv=s.cli_args(12345,'synthetic-context',IDS['alpha'])

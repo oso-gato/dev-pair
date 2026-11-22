@@ -159,6 +159,35 @@ def exact_prompt_message(item, expected):
     return item['content'] == [{'type':'input_text','text':expected}]
 
 
+def durable_user_to_wire(item):
+    """Only the pinned non-RLite attribution removal; never used on wire input."""
+    require(type(item) is dict and {'type','role','content',METADATA} <= set(item) <=
+            {'type','role','content',METADATA,'id'} and item['type']=='message' and item['role']=='user',
+            'unknown durable user envelope')
+    if 'id' in item:
+        value=item['id']
+        require(type(value) is str and re.fullmatch(r'msg_(?:input_)?[0-9a-f-]{36}',value) and
+                valid_uuid(value.removeprefix('msg_').removeprefix('input_')), 'unknown durable user ID')
+    # Reuse only the strict text-content validator, not any wire normalization.
+    user_context([item])
+    metadata=item[METADATA]
+    require(type(metadata) is dict and set(metadata)=={'turn_id','create_time','content_item_kinds','content_item_metadata'}
+            and valid_uuid(metadata['turn_id']) and valid_timestamp(metadata['create_time']),
+            'unknown durable user metadata')
+    kinds=metadata['content_item_kinds'];attribution=metadata['content_item_metadata']
+    require(type(kinds) is list and type(attribution) is list and
+            len(kinds)==len(attribution)==len(item['content']), 'misaligned durable attribution')
+    for kind,value in zip(kinds,attribution):
+        require(type(kind) is str and kind in ('user.text','environments.environment_context'),
+                'unknown durable user classification')
+        expected={'provenance':{'type':'user'}} if kind=='user.text' else {'provenance':{'type':'harness','hook':False}}
+        require(type(value) is dict and canonical(value)==canonical(expected), 'unknown durable user attribution')
+    projected=copy.deepcopy(item)
+    del projected[METADATA]['content_item_metadata']
+    if not projected[METADATA]:del projected[METADATA]
+    return projected
+
+
 class Journey:
     """Evidence is retained from first turns, never supplied by a resume caller."""
     def __init__(self, root, end, meter, nonce):
@@ -170,6 +199,7 @@ class Journey:
         self.cli_ready = threading.Event()
         self.last_request = None
         self.metadata_rejection = None
+        self.rollout_rejection = None; self.continuations = {}
         self.harness_sha256 = sha(Path(__file__).read_bytes())
 
     def begin(self, label, phase, expected_uuid=None):
@@ -325,6 +355,9 @@ class Journey:
             self.entries[label] = {'uuid':turn['uuid'], 'expected_prompt':prompt(label,'first',self.nonce),
                                   'user_context':copy.deepcopy(turn['user_context']),
                                   'issued':copy.deepcopy(turn['issued']), **copy.deepcopy(turn['returned'])}
+        else:
+            self.continuations[label]={'user_context':copy.deepcopy(turn['user_context']),
+                'issued':copy.deepcopy(turn['issued']),**copy.deepcopy(turn['returned'])}
         self.records.append({'label':label,'phase':phase,'uuid':turn['uuid'], 'context_sha256':sha(canonical(turn['user_context'])),
                              'user_context_count':len(turn['user_context']),
                              'call_sha256':sha(canonical(turn['returned']['call'])), 'output_sha256':sha(canonical(turn['returned']['output'])),
@@ -362,7 +395,38 @@ def database(root, expected=None, integrity=False):
     return result
 
 
-def rollout_proof(root, row, entry):
+def rollout_mismatch(journey, stage, contexts, projected, expected, checkpoint_sha256):
+    if journey is None or journey.rollout_rejection is not None:return
+    index=next((i for i in range(max(len(projected),len(expected)))
+                if i>=len(projected) or i>=len(expected) or canonical(projected[i])!=canonical(expected[i])),None)
+    observed=contexts[index] if index is not None and index<len(contexts) else {}
+    actual=projected[index] if index is not None and index<len(projected) else observed
+    wanted=expected[index] if index is not None and index<len(expected) else {}
+    known=('type','role','id','content','status','phase','encrypted_content')
+    metadata=observed.get(METADATA) if type(observed) is dict else None
+    left=actual.get(METADATA,{}) if type(actual) is dict else {};right=wanted.get(METADATA,{})
+    witness={'stage':stage,'kind':'durable-rollout','expected_user_count':len(expected),
+        'observed_user_count':len(contexts),'first_differing_index':index,
+        'raw_context_sha256':sha(canonical(contexts)),'projected_context_sha256':sha(canonical(projected)),
+        'wire_context_sha256':sha(canonical(expected)),'projection_applied':bool(projected),
+        'field_difference':{key:actual.get(key)!=wanted.get(key) or (key in actual)!=(key in wanted) for key in known},
+        'metadata_difference':{key:(left.get(key)!=right.get(key) or (key in left)!=(key in right))
+            if type(left) is dict and type(right) is dict else True for key in ('turn_id','create_time','content_item_kinds','content_item_metadata')},
+        'recognized_metadata':{key:{'present':type(metadata) is dict and key in metadata,
+            'type':json_type(metadata[key]) if type(metadata) is dict and key in metadata else None}
+            for key in ('turn_id','create_time','content_item_kinds','content_item_metadata')},
+        'unknown_key_count':sum(key not in set(known)|{METADATA} for key in observed)+
+            (sum(key not in ('turn_id','create_time','content_item_kinds','content_item_metadata') for key in metadata) if type(metadata) is dict else 0),
+        'request':journey.last_request,'checkpoint_sha256':checkpoint_sha256,
+        'harness_sha256':journey.harness_sha256,'codex_source_sha':STOCK_SOURCE}
+    if len(canonical(witness))>2048:
+        witness={'stage':stage,'kind':'durable-rollout','availability':'witness-unavailable',
+            'raw_context_sha256':sha(canonical(contexts)),'wire_context_sha256':sha(canonical(expected)),
+            'harness_sha256':journey.harness_sha256,'checkpoint_sha256':checkpoint_sha256}
+    journey.rollout_rejection=witness
+
+
+def rollout_proof(root, row, entry, continuation=None, journey=None, checkpoint_sha256=None):
     ident,cwd,raw,provider = row
     require(ident == entry['uuid'] and cwd == '/job' and provider == 'openai' and type(raw) is str,
             'actual thread database identity/cwd/provider mismatch')
@@ -378,14 +442,47 @@ def rollout_proof(root, row, entry):
     meta=rows[0];require(meta.get('type')=='session_meta' and meta.get('payload',{}).get('id')==ident and
                         meta['payload'].get('cwd')=='/job', 'rollout metadata is not actual bound session')
     items=[r.get('payload') for r in rows if r.get('type')=='response_item']
-    contexts=[item for _,item in user_context(items)]
-    require(canonical(contexts[:len(entry['user_context'])]) == canonical(entry['user_context']),
-            'rollout observed prior user context changed')
-    calls=[i for i in items if type(i)is dict and i.get('type')=='function_call' and i.get('call_id')==entry['issued']['call_id']]
-    outputs=[i for i in items if type(i)is dict and i.get('type')=='function_call_output' and i.get('call_id')==entry['issued']['call_id']]
-    require(len(calls)==len(outputs)==1 and all(calls[0].get(k)==v for k,v in entry['issued'].items()) and
-            outputs[0].get('output')==entry['output']['output'], 'rollout call/result binding missing')
-    return {'path_sha256':sha(raw.encode()),'bytes':len(data),'sha256':sha(data),'uuid':ident,'cwd':cwd}
+    contexts=[item for item in items if type(item) is dict and item.get('role')=='user']
+    expected=entry['user_context'] if continuation is None else continuation['user_context']
+    projected=[];stage='durable-context'
+    try:
+        for item in contexts:projected.append(durable_user_to_wire(item))
+        stage='context-binding'
+        require(canonical(projected)==canonical(expected), 'rollout complete observed user context changed')
+        original_count=len(entry['user_context'])
+        require(canonical(expected[:original_count])==canonical(entry['user_context']) and
+                len(expected)==original_count+(1 if continuation is not None else 0), 'unbound continuation context')
+        allowed={entry['issued']['call_id']:entry}
+        if continuation is not None:allowed[continuation['issued']['call_id']]=continuation
+        stage='orphan-history'
+        for item in items:
+            require(type(item) is dict, 'nonobject durable history')
+            if 'call_id' in item or str(item.get('type','')).endswith(('_call','_output')):
+                require(item.get('type') in ('function_call','function_call_output') and
+                        type(item.get('call_id')) is str and item['call_id'] in allowed, 'unissued durable call/result')
+        pairs={};stage='pair-binding'
+        for call_id,bound in allowed.items():
+            positions=[]
+            for kind,key in (('function_call','call'),('function_call_output','output')):
+                found=[(i,v) for i,v in enumerate(items) if v.get('type')==kind and v.get('call_id')==call_id]
+                require(len(found)==1, 'missing/duplicate durable call/result')
+                i,value=found[0];history_item(value,bound['issued'],kind)
+                require(canonical(value)==canonical(bound[key]), 'durable call/result differs from retained wire')
+                positions.append(i)
+            require(positions[0]<positions[1], 'reordered durable call/result');pairs[call_id]=positions
+        stage='causal-order'
+        original_call,original_output=pairs[entry['issued']['call_id']]
+        user_positions=[i for i,item in enumerate(items) if item.get('role')=='user']
+        require(all(i<original_call for i in user_positions[:original_count]), 'prior context follows original call')
+        if continuation is not None:
+            new_call,new_output=pairs[continuation['issued']['call_id']]
+            require(original_output<user_positions[-1]<new_call<new_output, 'continuation crossed original causal pair')
+    except ValueError:
+        rollout_mismatch(journey,stage,contexts,projected,expected,checkpoint_sha256)
+        raise
+    return {'path_sha256':sha(raw.encode()),'bytes':len(data),'sha256':sha(data),'uuid':ident,'cwd':cwd,
+            'raw_user_context_sha256':sha(canonical(contexts)),'projected_user_context_sha256':sha(canonical(projected)),
+            'wire_user_context_sha256':sha(canonical(expected)),'projection_applied':True}
 
 
 def cli_args(port, context, resume=None):
@@ -451,7 +548,8 @@ def worker(args):
         report['checkpoint_sha256']=journey.checkpoint('/result/checkpoint.json')
         ids=journey.read_checkpoint('/result/checkpoint.json')
         rows=database('/',set(initial)|set(ids.values()),integrity=True)
-        report['first_rollouts']={label:rollout_proof('/',rows[ids[label]],journey.entries[label]) for label in LABELS}
+        report['first_rollouts']={label:rollout_proof('/',rows[ids[label]],journey.entries[label],journey=journey,
+            checkpoint_sha256=report['checkpoint_sha256']) for label in LABELS}
         for label in LABELS:
             require(journey.read_checkpoint('/result/checkpoint.json')==ids,'checkpoint identities changed')
             journey.begin(label,'resume',ids[label])
@@ -469,7 +567,8 @@ def worker(args):
         report['unknown_uuid_rejected']=True;report['unknown_uuid_evidence']=negative
         final=database('/',set(initial)|set(ids.values()),integrity=True)
         report['sessions']={label:{'uuid':ids[label],'progress':marker('/',label,('first','resume'),journey.nonce),
-            'rollout':rollout_proof('/',final[ids[label]],journey.entries[label])} for label in LABELS}
+            'rollout':rollout_proof('/',final[ids[label]],journey.entries[label],continuation=journey.continuations[label],
+                journey=journey,checkpoint_sha256=report['checkpoint_sha256'])} for label in LABELS}
         require(source.read_bytes()==UNCOMMITTED,'uncommitted source changed')
         report['uncommitted_source_sha256']=sha(UNCOMMITTED);report['database_integrity']='ok';report['uuid_set_unchanged']=True
         report['status']='pass'
@@ -484,7 +583,7 @@ def worker(args):
             report.update(turns=journey.records,http_requests=journey.requests,http_connections=server.connections if server else 0,
                           transport_error=journey.error,last_request=journey.last_request,captured_bytes=journey.meter.used,
                           observed_session_uuids={k:v['uuid'] for k,v in journey.entries.items()},
-                          history_metadata_rejection=journey.metadata_rejection)
+                          history_metadata_rejection=journey.metadata_rejection,rollout_rejection=journey.rollout_rejection)
         data=canonical(report)+b'\n';require(len(data)<=t.REPORT_BYTES,'session report exceeded')
         fd=os.open('/result/report.json',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(data)

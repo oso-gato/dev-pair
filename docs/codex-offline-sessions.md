@@ -7,7 +7,7 @@ setup, output metering and owned cleanup. The existing 32-action inventory and
 its verdict are unchanged. No real model, credentials or endpoint is used.
 
 Source tests and review are distinct from actual stock validation. This source
-unit has not run the stock journey; a fresh exact-candidate review must precede
+candidate has not run the stock journey; a fresh exact-candidate review must precede
 one separately authorized bounded experiment. Tiny fake binaries and synthetic
 history/SQLite fixtures in tests are not stock restoration evidence.
 
@@ -41,7 +41,7 @@ in the first request, plus one exact new continuation prompt, and the exact
 previously observed call/result pair in order. First-result requests must retain
 the same observed context too. The expected prompt is a separate exact full-message
 binding, never a substring or a substitute for observed history. No metadata
-normalization is performed; any needed normalization requires pinned-source proof.
+normalization is performed on independently observed wire messages.
 Reported context hashes derive from the observed message sequence. The other
 session is excluded. Unknown/orphan/duplicate/reordered
 call outputs or changed history reject without committing acceptance bookkeeping.
@@ -76,6 +76,40 @@ validity booleans and request/harness/source hashes. It never records arbitrary
 unknown key names, values, transcripts, arguments or output snippets. Rejection
 changes no acceptance/checkpoint state and never undoes real file effects. The
 witness uses the existing request/report/capture budgets and creates no retry.
+
+A later reviewed metadata candidate accepted both first turns with distinct actual
+UUIDs, exact complete observed contexts and one verified progress marker each,
+then blocked at the first durable rollout comparison. Six requests and nine
+baseline checks completed; cleanup completed. No explicit UUID resume was
+reached. Field-level differences were not retained, so attribution is a
+source-supported likely mismatch, not a proven sole cause of that failure.
+
+Pinned source persists per-content attribution in durable user messages, then
+removes only `content_item_metadata` from the request copy for this unchanged
+non-RLite catalog model. Durable validation now separately checks the exact
+text-only message envelope, canonical IDs when present, UUID/time metadata and
+aligned classification/attribution arrays. `user.text` must have exactly user
+provenance; `environments.environment_context` must have exactly harness
+provenance with `hook=false`. Unknown, missing, extra or tool-derived attribution
+blocks. Only that validated attribution field is removed from a deep copy;
+classification, IDs, timestamps, full content and order remain exact. Raw rollout
+bytes and raw/projected/wire context hashes remain separate evidence. Base
+instructions have developer role and do not justify omitting a user message.
+
+The first rollout audit requires the entire observed first context, with no
+extra user messages, before exactly one original call/result pair. Both pair
+members must match the independently observed wire dictionaries completely.
+The final audit additionally binds the separately retained observed continuation
+context and its issued call/result after the original output. Orphan, duplicate,
+reordered or altered pairs block. The original SR1 resumed-wire guard remains
+unchanged; durable projection is never applied to its retained wire baseline.
+
+The first durable mismatch records at most 2 KiB of fixed stages, counts,
+recognized field/type differences and raw/projected/wire hashes linked to
+harness, request and checkpoint identities. It contains no transcript, arbitrary
+unknown key names/values, arguments, output or rollout path. Diagnostic recording
+cannot change accepted evidence or undo actual file effects. Existing caps and
+cleanup rules remain unchanged.
 
 Actual repaired resume wire/metadata serialization remains unproven until a
 fresh review and separately authorized changed-candidate stock validation. An unexpected shape blocks with bounded hashes/partial positive
