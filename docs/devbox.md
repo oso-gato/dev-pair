@@ -29,7 +29,7 @@ The development release producer must assemble and seal its own gptbox through t
 
 - The source SHA, context hash and full immutable image config ID for a development release, with the associated immutable `dev-pair.role=development`, `dev-pair.context`, `dev-pair.inputs`, `dev-pair.standards`, `dev-pair.distrobox`, `dev-pair.codex.version` and `org.opencontainers.image.revision` labels.
 - The original `/usr/lib/dev-pair/gptbox/inputs.json` with `role=development` and the development source SHA, and the finalizer-generated `sealed.json` binding those input bytes, source and UID/GID 1000. Record both raw file hashes.
-- The ordered OCI rootfs layer DiffIDs and one uncompressed `podman save --format oci-archive` tar of that exact image, with plain or gzip-compressed OCI layers. Record the archive SHA-256 and byte count. Before Podman loads it, the controller verifies the exact config and ordered layer contents independently of the local image cache. It checks the imported image identity and verifies the sealed data through the exact running child.
+- The ordered OCI rootfs layer DiffIDs and one uncompressed `podman save --format oci-archive` tar of that exact image, with plain or gzip-compressed OCI layers. Record the archive SHA-256 and byte count. Before Podman loads it, the controller requires canonical OCI structural keys and verifies the exact config and ordered layer contents independently of the local image cache. It checks the imported image identity and verifies the sealed data through the exact running child.
 
 Separate development image construction and export are an outstanding implementation dependency. A maintenance artifact has a separate role and evidence record.
 
@@ -85,6 +85,8 @@ python3 tools/devbox.py run \
 ```
 
 A successful receipt includes the exact image and manifest identities, observed namespaces and mapping data, enforcing labels, confirmed outer cgroup ceilings, both distinct start identities, Distrobox probe results, and exact-owned container removal. The parent has a 600-second native lifetime and the child has a 180-second native lifetime per cycle. Host-side aggregate limits are two GiB of memory with no swap, 512 tasks and one CPU. The inner uses the private outer cgroup namespace and its aggregate limits.
+
+SELinux checks compare the exact user, role, type and category membership. The reader accepts the kernel's single terminating NUL and either category range or list syntax.
 
 A compatible native profile still has to demonstrate transported mapping-helper xattrs, ancestor seccomp compatibility, the composed UID/GID mappings and a real confined SELinux transition. Collect the first failed stage and applicable native AVCs before making a versioned profile correction. Full negative policy and mount-escape tests, interrupted native cleanup, quota-pressure tests and independent exact-candidate review remain open. The probe retains the verified local image store and synthetic job leaves. Retry the exact input under the same lease to reconcile an owned container; use a fresh job leaf for a different admission.
 

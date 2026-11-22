@@ -45,7 +45,7 @@ def admission(content):
 
 
 def oci_archive(path, *, variant=False, order=(0, 1), extra_member=None, gzip_layers=True,
-                mutated_blob=False, relative_paths=False):
+                mutated_blob=False, relative_paths=False, transform=None):
     blobs = {}
     media = db.OCI_MIME
 
@@ -53,6 +53,11 @@ def oci_archive(path, *, variant=False, order=(0, 1), extra_member=None, gzip_la
         key = admission(content)
         blobs['blobs/sha256/' + key] = content
         return {'digest': 'sha256:' + key, 'size': len(content), 'mediaType': media + kind}
+
+    def checked_fixture(kind, value):
+        if transform is not None:
+            transform(kind, value)
+        return value
 
     layers, diff_ids = [], []
     for value in (b'first layer', b'second layer'):
@@ -65,14 +70,22 @@ def oci_archive(path, *, variant=False, order=(0, 1), extra_member=None, gzip_la
         diff_ids.append('sha256:' + admission(plain))
         content = gzip.compress(plain, mtime=0) if gzip_layers else plain
         layers.append(add(content, 'layer.v1.tar+gzip' if gzip_layers else 'layer.v1.tar'))
-    config = add(json.dumps({'os': 'linux', 'architecture': 'amd64', 'config': {'Variant': variant},
-                             'rootfs': {'type': 'layers', 'diff_ids': diff_ids}}).encode(), 'config.v1+json')
-    image = add(json.dumps({'schemaVersion': 2, 'mediaType': media + 'manifest.v1+json',
-                            'config': config, 'layers': [layers[index] for index in order]}).encode(),
-                'manifest.v1+json')
+    config_data = checked_fixture('image config', {
+        'os': 'linux', 'architecture': 'amd64',
+        'config': checked_fixture('runtime config', {'Labels': {'fixture.Variant': 'literal', 'fixture.variant': str(variant)}}),
+        'rootfs': checked_fixture('rootfs', {'type': 'layers', 'diff_ids': diff_ids}),
+        'history': [checked_fixture('history entry', {'created_by': 'fixture'})],
+    })
+    config = add(json.dumps(config_data).encode(), 'config.v1+json')
+    image_data = checked_fixture('manifest', {'schemaVersion': 2, 'mediaType': media + 'manifest.v1+json',
+                                             'config': config, 'layers': [layers[index] for index in order]})
+    image = add(json.dumps(image_data).encode(), 'manifest.v1+json')
+    image['platform'] = checked_fixture('descriptor platform', {'architecture': 'amd64', 'os': 'linux'})
+    index = checked_fixture('index', {'schemaVersion': 2, 'manifests': [checked_fixture('descriptor', image)],
+                                      'annotations': {'fixture.Name': 'first', 'fixture.name': 'second'}})
     members = {
         'oci-layout': b'{"imageLayoutVersion":"1.0.0"}',
-        'index.json': json.dumps({'schemaVersion': 2, 'manifests': [image]}).encode(),
+        'index.json': json.dumps(index).encode(),
         **blobs,
     }
     if extra_member is not None:
@@ -169,7 +182,8 @@ class TestConfinementContract(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             proc = Path(temporary)
             (proc / 'attr').mkdir()
-            (proc / 'attr/current').write_text('system_u:system_r:container_engine_t:s0:c10.c12\n')
+            label = 'system_u:system_r:container_engine_t:s0:c10.c12'
+            (proc / 'attr/current').write_text(label + '\x00')
             (proc / 'ns').mkdir()
             for namespace in db.NS_NAMES:
                 (proc / 'ns' / namespace).symlink_to(namespace + ':[123]')
@@ -177,8 +191,11 @@ class TestConfinementContract(unittest.TestCase):
             status = proc / 'status'
             base = 'Uid:\t1000 1000 1000 1000\nGid:\t1000 1000 1000 1000\nGroups:\t1000\nNoNewPrivs:\t0\nSeccomp:\t2\n'
             status.write_text(base + ''.join(f'{key}:\t{value:x}\n' for key, value in zip(db.CAP_KEYS, db.OUTER_CAPS)))
-            self.assertEqual(db.proc_snapshot(proc, db.OUTER_CAPS, 0, expected, 1000, 1000)['label'],
-                             'system_u:system_r:container_engine_t:s0:c10.c12')
+            self.assertEqual(db.proc_snapshot(proc, db.OUTER_CAPS, 0, expected, 1000, 1000)['label'], label + '\x00')
+            (proc / 'attr/current').write_text(label + '\x00\x00')
+            with self.assertRaisesRegex(db.Blocked, 'effective SELinux process label'):
+                db.proc_snapshot(proc, db.OUTER_CAPS, 0, expected, 1000, 1000)
+            (proc / 'attr/current').write_text(label + '\n')
             status.write_text(base + ''.join(f'{key}:\tc0\n' for key in db.CAP_KEYS))
             with self.assertRaisesRegex(db.Blocked, 'effective capability'):
                 db.proc_snapshot(proc, db.OUTER_CAPS, 0, expected, 1000, 1000)
@@ -202,6 +219,26 @@ class TestConfinementContract(unittest.TestCase):
                 self.assertFalse(db.same_label(label, outer))
         with patch.object(devbox.os, 'getxattr', return_value=b'system_u:object_r:container_file_t:s0:c10.c12\0'):
             devbox.check_label(Path('/fixture'), db.file_label(value, 'outer'))
+        with patch.object(devbox.os, 'getxattr', return_value=b'system_u:object_r:container_file_t:s0:c10.c12\0\0'):
+            with self.assertRaisesRegex(db.Blocked, 'SELinux volume label'):
+                devbox.check_label(Path('/fixture'), db.file_label(value, 'outer'))
+
+    def test_probe_receipt_accepts_one_terminal_nul_from_proc_attr(self):
+        value = manifest()
+        label = 'system_u:system_r:container_t:s0:c10.c11'
+        cycle = {'version': f'codex-cli {db.CODEX_VERSION}', 'started_at': START,
+                 'proc': {'label': label}, 'probe': {'boundary_probe': 'passed', 'selinux_label': label + '\x00'}}
+        receipt = {'kind': 'dev-pair-devbox-probe-v1', 'manifest_sha256': OUTER, 'owner': OWNER,
+                   'inner_container_id': CHILD, 'inner_image_id': INNER, 'job_admission': False,
+                   'inner_removed': True, 'cycles': [cycle | {'started_at': 'later'}, cycle]}
+        decoded = db.json_data(json.dumps(receipt).encode())
+        devbox.validate_result(decoded, OUTER, OWNER, value)
+        for invalid in (label + '\x00\x00', label.replace('container_t', 'container\x00_t'),
+                        label.replace('c10.c11', 'c10.c12') + '\x00'):
+            with self.subTest(invalid=invalid):
+                decoded['cycles'][0]['probe']['selinux_label'] = invalid
+                with self.assertRaisesRegex(db.Blocked, 'nested probe evidence mismatch'):
+                    devbox.validate_result(decoded, OUTER, OWNER, value)
 
     def test_nested_engine_checks_effective_image_copy_directory(self):
         config = tomllib.loads((devbox.RUNTIME / 'containers.conf').read_text())
@@ -468,6 +505,35 @@ class TestDevelopmentArchive(unittest.TestCase):
             with self.assertRaisesRegex(db.Blocked, 'expanded layer budget'):
                 db.load_development_archive(engine, value, path)
             self.assertEqual(engine.loads, [])
+
+    def test_noncanonical_structural_aliases_block_before_podman_can_reinterpret_archive(self):
+        aliases = (
+            ('index', 'Manifests', lambda _value: []),
+            ('manifest', 'Layers', lambda value: list(reversed(value['layers']))),
+            ('manifest', 'Config', lambda value: value['layers'][0]),
+            ('descriptor', 'Digest', lambda _value: 'sha256:' + '0' * 64),
+            ('descriptor platform', 'Architecture', lambda _value: 'arm64'),
+            ('image config', 'RootFS', lambda value: value['rootfs'] | {'diff_ids': []}),
+            ('image config', 'OS', lambda _value: 'windows'),
+            ('rootfs', 'Diff_Ids', lambda value: list(reversed(value['diff_ids']))),
+            ('runtime config', 'labels', lambda _value: {'dev-pair.role': 'maintenance'}),
+            ('history entry', 'Created_By', lambda _value: 'substitute'),
+        )
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'candidate.tar'
+            for level, alias, override in aliases:
+                with self.subTest(level=level, alias=alias):
+                    def transform(kind, value):
+                        if level == kind:
+                            value[alias] = override(value)
+
+                    value = manifest()
+                    value['inner'].update(oci_archive(path, transform=transform))
+                    engine = self.cached_engine(value)
+                    with self.assertRaisesRegex(db.Blocked, f'OCI {level} structural keys'):
+                        db.load_development_archive(engine, value, path)
+                    self.assertEqual(engine.loads, [])
+                    self.assertEqual(engine.inspections, [])
 
 
 if __name__ == '__main__':
