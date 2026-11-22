@@ -936,8 +936,9 @@ def storage_public_projection(state_root,expected,source):
     try:
         observer=storage_observer(source)
         prepared=read_json(state_root/'gptbox-image.json',16384)
-        require(prepared['source_sha']==expected['source_sha'] and prepared['context_sha256']==expected['context_sha256'],
+        require(type(prepared) is dict and prepared['source_sha']==expected['source_sha'] and prepared['context_sha256']==expected['context_sha256'],
                 'Storage prepared identity mismatch')
+        require(type(prepared['image_id']) is str, 'Storage image identity missing')
         image=prepared['image_id'].removeprefix('sha256:')
         require(re.fullmatch('[0-9a-f]{64}',image), 'Storage image identity missing')
     except (OSError,ValueError,KeyError,TypeError):return result

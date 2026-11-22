@@ -1649,7 +1649,7 @@ class Bootstrap:
         # lifecycle failures propagate unchanged; this is not a fallback executor.
         output=self.run._call('/usr/bin/python3','-I',str(Path(__file__).with_name('storage.py')),
             str(self.path(observer.ROOT)),'--seconds',str(min(9,remaining/2)),
-            timeout=remaining,maximum=16384,ok=(0,2))
+            timeout=remaining,maximum=262144,ok=(0,2))
         try:
             inventory=observer.decode(output)
             if inventory is None:value['reason']='collector-unavailable'

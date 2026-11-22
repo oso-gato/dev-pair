@@ -64,7 +64,7 @@ class StorageObservation(unittest.TestCase):
 
     def test_real_children_deadline_capture_and_lifecycle_evidence(self):
         original=subprocess.Popen
-        for code in ('import time;time.sleep(20)', 'print("SECRET"*4000)'):
+        for code in ('import time;time.sleep(20)', 'print("SECRET"*50000)'):
             children=[];calls=[]
             def launch(argv,**kwargs):
                 calls.append(argv);child=original([sys.executable,'-c',code],**kwargs);children.append(child);return child
@@ -80,12 +80,12 @@ class StorageObservation(unittest.TestCase):
             self.assertNotIn('SECRET',json.dumps(metadata));self.assertNotIn('stdout_tail',json.dumps(metadata))
 
     def test_complete_malformed_partial_duplicate_or_blocked_output_unavailable(self):
-        for text,reason in [('SECRET','invalid-collector-output'),('{','invalid-collector-output'),
+        for text,reason in [('SECRET','invalid-collector-output'),('{','invalid-collector-output'), (' '*16385,'invalid-collector-output'),
                             ('{"sample":1,"sample":2}','invalid-collector-output'),
                             (json.dumps({'sample':'blocked','reason':'inventory-deadline','enforces_capacity':False}),'collector-unavailable')]:
             class Fixed(b.Commands):
                 def _call(inner,*args,**kwargs):
-                    self.assertLessEqual(kwargs['timeout'],10);self.assertEqual(kwargs['maximum'],16384)
+                    self.assertLessEqual(kwargs['timeout'],10);self.assertEqual(kwargs['maximum'],262144)
                     self.assertEqual(kwargs['ok'],(0,2));return text
             self.app.run=Fixed();result=self.collect();self.assertEqual(result['reason'],reason)
             self.assertIsNone(result['inventory']);self.assertNotIn('SECRET',json.dumps(result))
@@ -136,6 +136,57 @@ class StorageObservation(unittest.TestCase):
         self.assertNotIn('SECRET',json.dumps(projected));saved.write_text(raw)
         expected['source_sha']='f'*40
         self.assertEqual(guest.storage_public_projection(self.state,expected,source)['prepared-image']['reason'],'not-recorded')
+
+    def test_native_prefix_uses_actual_decoder_and_cli_supported_cap(self):
+        import test_native_relay as local_relay
+        from unittest.mock import MagicMock
+        class StopAtDecoder(BaseException):pass
+        self.run.native_prefix='dev-pair-initialize-prepare-12345678'
+        self.run.deadline=time.monotonic()+9
+        original=b.Commands._call;constructor=b.relay.Decoder;seen=[]
+        def dispatch(run,*args,**kwargs):
+            if run is self.run:return original(run,*args,**kwargs)
+            return 'LoadState=not-found\nActiveState=inactive\n'
+        def decode(maximum):
+            decoder=constructor(maximum);seen.append(maximum)
+            # Actual relay argparse/pump/framing in a real local child. UID,
+            # labels/profile are explicit fixtures; no native service is started.
+            process=local_relay.launch('print("local-cap-contract")',maximum=maximum)
+            try:stdout,wire=process.communicate(timeout=4)
+            finally:
+                if process.poll() is None:os.killpg(process.pid,9);process.wait(timeout=2)
+            self.assertEqual(process.returncode,0);self.assertEqual(stdout,b'local-cap-contract\n')
+            self.assertEqual(b''.join(decoder.feed(wire)),b'')
+            decoder.finish(process.returncode,os.getuid(),local_relay.SHA)
+            raise StopAtDecoder()
+        transport=MagicMock();transport.created_intent=False
+        with patch.object(b.Commands,'_call',new=dispatch),patch.object(b,'NativeTransport',return_value=transport), \
+                patch.object(b,'lookup_paths',return_value=()),patch.object(b,'configuration_snapshot',return_value=()), \
+                patch.object(b,'stage_relay',return_value=(Path(local_relay.r.__file__),local_relay.SHA)), \
+                patch.object(b,'expected_uid',return_value=os.getuid()),patch.object(b.relay,'Decoder',side_effect=decode):
+            with self.assertRaises(StopAtDecoder):self.collect()
+        self.assertEqual(seen,[262144]);transport.setup.assert_called_once()
+        self.assertEqual(json.loads((self.state/'storage-prepared.json').read_text())['reason'],'collector-lifecycle-failure')
+        with self.assertRaises(ValueError):constructor(16384)  # Old candidate reproducibly failed this contract.
+
+    def test_malformed_prepared_image_identity_preserves_public_report(self):
+        expected={'source_sha':SOURCE,'context_sha256':CONTEXT}
+        source=Path(__file__).resolve().parents[1]
+        self.state.mkdir(parents=True,exist_ok=True)
+        for value in (None,True,7,[],{'SECRET_KEY':'SECRET_VALUE'}):
+            record={'source_sha':SOURCE,'context_sha256':CONTEXT,'image_id':value}
+            (self.state/'gptbox-image.json').write_text(json.dumps(record))
+            direct=guest.storage_public_projection(self.state,expected,source)
+            public=guest.public_diagnostics(self.state,expected,source)
+            self.assertEqual(public['storage_observations'],direct)
+            self.assertTrue(all(v=={'status':'unavailable','reason':'not-recorded'} for v in direct.values()))
+            report={'source_sha':SOURCE,'initialization':{'primary_failure':'preserved'},'diagnostics':public}
+            frame=guest.encode_report(report)
+            self.assertIn(b'preserved',frame);self.assertNotIn(b'SECRET',frame)
+            self.assertEqual(report['source_sha'],SOURCE)
+        for value in (None,True,7,[]):
+            (self.state/'gptbox-image.json').write_text(json.dumps(value))
+            self.assertEqual(guest.storage_public_projection(self.state,expected,source),direct)
 
     def test_logical_descriptors_are_optional_bounded_and_not_physical(self):
         for row in ({},{'Size':None},{'Size':True},{'Size':-1},{'Size':2**63},{'Size':float('nan')}):

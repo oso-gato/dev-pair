@@ -96,8 +96,9 @@ staging, image-copy/export workspaces and outer snapshots remain outside this
 sample. No caller can select another production root. The existing scanner is
 executed through the existing bounded command/native machinery, with at most
 10 seconds clipped to the original remaining phase, a smaller internal scan
-budget, and a 16 KiB combined capture ceiling. Existing entry/depth/name limits
-remain unchanged. There is no retry or additional image build/export for a sample.
+budget, the existing supported 256 KiB native transport capture ceiling,
+and a separate strict 16 KiB collector JSON/semantic projection ceiling. Existing
+entry/depth/name limits remain unchanged. There is no retry or additional image build/export for a sample.
 
 No remaining launch budget produces typed unavailable evidence without launching.
 A complete scanner-blocked or invalid response also remains independently
