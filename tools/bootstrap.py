@@ -2002,10 +2002,12 @@ class Bootstrap:
         spec.loader.exec_module(module)
         return module
 
-    def check_gptbox_inputs(self, context, expected):
+    def check_gptbox_inputs(self, context, expected, *, expected_role='maintenance'):
         """Python-only input checks before any mutation; does not admit source or runtime."""
+        if expected_role not in ('maintenance', 'development'):
+            raise Blocked('unsupported expected gptbox context role')
         if platform.machine() != 'x86_64':
-            raise Blocked('current pinned Codex context supports x86_64 maintenance builds only')
+            raise Blocked('current pinned Codex context supports x86_64 builds only')
         if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected):
             raise Blocked('a separately trusted context SHA256 is required')
         tool = self.candidate_tool()
@@ -2020,8 +2022,8 @@ class Bootstrap:
                     raise Blocked('gptbox context must be root-owned, protected and nonsymlink')
         try:
             _, manifest = tool._verify_content(source, expected)
-            if manifest['role'] != 'maintenance':
-                raise Blocked('first bootstrap accepts only maintenance-role gptbox contexts')
+            if manifest['role'] != expected_role:
+                raise Blocked(f'this operation accepts only {expected_role}-role gptbox contexts')
         except (OSError, ValueError, subprocess.SubprocessError):
             raise Blocked('gptbox context/source verification failed; no host changes permitted') from None
         return tool, source, manifest

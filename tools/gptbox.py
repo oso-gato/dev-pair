@@ -1,7 +1,8 @@
 #!/usr/bin/python3
-"""Actual confined maintenance Distrobox assembly and probe-only controlled entry."""
+"""Confined gptbox assembly, maintenance probes and development image export."""
 import argparse
 import contextlib
+import gzip
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 
 from bootstrap import Bootstrap, Blocked, STATE, Commands, PrepareCost, github_keys, operator_password, validate_sources
@@ -27,6 +29,15 @@ BASE = '/usr/lib/dev-pair/gptbox'
 RUNTIME = BASE + '/runtime.py'
 CONTROL = '/usr/local/libexec/dev-pair-gptbox'
 ROOT = STATE + '/gptbox-adapter'
+ARTIFACTS = '/var/lib/dev-pair/artifacts/gptbox-adapter'
+DEVELOPMENT_ROOT = STATE + '/gptbox-development'
+DEVELOPMENT_ARTIFACTS = '/var/lib/dev-pair/artifacts/gptbox-development'
+DEVELOPMENT_ARCHIVE_LIMIT = 2 * 1024 ** 3
+DEVELOPMENT_EXPANSION_LIMIT = 8 * 1024 ** 3
+DEVELOPMENT_METADATA_LIMIT = 256 * 1024
+DEVELOPMENT_EXECUTION = 2040
+RELEASE_ARCHIVE = 'development.oci.tar'
+RELEASE_INNER = 'inner.json'
 INIT = ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt', '--init', '0']
 FINAL_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' finalize'
 FROZEN_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' frozen'
@@ -44,11 +55,152 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def image_inputs_bytes(inputs):
+    return json.dumps(inputs, sort_keys=True).encode() + b'\n'
+
+
 def image_id(value):
+    if type(value) is not str:
+        raise Blocked('engine returned no immutable image/container identity')
     value = value.strip().removeprefix('sha256:')
     if not re.fullmatch(r'[0-9a-f]{64}', value):
         raise Blocked('engine returned no immutable image/container identity')
     return value
+
+
+def image_diff_ids(value):
+    if (type(value) is not list or not 1 <= len(value) <= 128
+            or any(type(diff) is not str or not re.fullmatch(r'sha256:[0-9a-f]{64}', diff) for diff in value)):
+        raise Blocked('missing or invalid ordered image DiffIDs')
+    return value
+
+
+def capture_release_file(path, maximum, owner, *, output=None, contents=False):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        node = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(node.st_mode) or node.st_nlink != 1 or node.st_uid != owner
+                or not 0 < node.st_size <= maximum):
+            raise Blocked('unsafe development release file or byte limit exceeded')
+        digest = hashlib.sha256()
+        data = bytearray()
+        size = 0
+        while block := stream.read(min(1024 * 1024, node.st_size - size + 1)):
+            size += len(block)
+            if size > node.st_size:
+                raise Blocked('development release file grew during capture')
+            digest.update(block)
+            if output is not None:
+                output.write(block)
+            elif contents:
+                data.extend(block)
+        current = os.fstat(stream.fileno())
+        if (size, current.st_size, current.st_mtime_ns, current.st_ctime_ns) != (
+                node.st_size, node.st_size, node.st_mtime_ns, node.st_ctime_ns):
+            raise Blocked('development release file changed during capture')
+        return digest.hexdigest(), size, bytes(data)
+
+
+class ReleaseTarMember(tarfile.TarInfo):
+    @classmethod
+    def frombuf(cls, buf, encoding, errors):
+        member = super().frombuf(buf, encoding, errors)
+        # Reject extended headers before tarfile can allocate their payloads.
+        if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE) or member.size < 0:
+            raise Blocked('unsupported development OCI archive tar member')
+        return member
+
+
+def verify_development_archive(path, release, labels):
+    """Prove that the exported OCI graph contains the exact committed image."""
+    mime = 'application/vnd.oci.image.'
+    with tarfile.open(path, 'r:', tarinfo=ReleaseTarMember, errors='strict') as archive:
+        members = {}
+        for member in archive:
+            name = member.name.removeprefix('./') or '.'
+            if name in members or len(members) >= 135:
+                raise Blocked('duplicate or excessive development OCI archive members')
+            if name in ('.', 'blobs', 'blobs/sha256'):
+                if not member.isdir() or member.size != 0:
+                    raise Blocked('invalid development OCI archive directory')
+            elif (not member.isreg() or member.size <= 0 or (name not in ('index.json', 'oci-layout')
+                    and not re.fullmatch(r'blobs/sha256/[0-9a-f]{64}', name))):
+                raise Blocked('unexpected development OCI archive member')
+            members[name] = member
+        with path.open('rb') as tail:
+            tail.seek(archive.offset)
+            if tail.read(1024) != bytes(1024) or any(any(block) for block in iter(lambda: tail.read(1024 * 1024), b'')):
+                raise Blocked('development OCI archive has invalid tar termination')
+        used = {'index.json', 'oci-layout'}
+
+        def blob(descriptor, media_types):
+            digest = descriptor['digest']
+            if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest) or descriptor['mediaType'] not in media_types:
+                raise Blocked('invalid development OCI archive descriptor')
+            name = 'blobs/sha256/' + digest[7:]
+            member = members[name]
+            if type(descriptor['size']) is not int or descriptor['size'] != member.size:
+                raise Blocked('development OCI archive descriptor size mismatch')
+            used.add(name)
+            return name, digest
+
+        def metadata(name, digest=None):
+            member = members[name]
+            if member.size > DEVELOPMENT_METADATA_LIMIT:
+                raise Blocked('development OCI metadata exceeds its byte limit')
+            with archive.extractfile(member) as stream:
+                value = stream.read(DEVELOPMENT_METADATA_LIMIT + 1)
+            if len(value) != member.size or (digest is not None and 'sha256:' + sha(value) != digest):
+                raise Blocked('development OCI metadata hash mismatch')
+            result = json.loads(value, object_pairs_hook=fedora_oci.unique)
+            if type(result) is not dict:
+                raise Blocked('invalid development OCI metadata object')
+            return result
+
+        if metadata('oci-layout') != {'imageLayoutVersion': '1.0.0'}:
+            raise Blocked('development archive requires OCI layout version 1.0.0')
+        index = metadata('index.json')
+        if index['schemaVersion'] != 2 or type(index['manifests']) is not list or len(index['manifests']) != 1:
+            raise Blocked('development OCI archive must select exactly one manifest')
+        manifest = metadata(*blob(index['manifests'][0], (mime + 'manifest.v1+json',)))
+        config_name, config_digest = blob(manifest['config'], (mime + 'config.v1+json',))
+        config = metadata(config_name, config_digest)
+        diffs = release['diff_ids']
+        config_labels = config['config']['Labels']
+        if (config_digest != 'sha256:' + release['image_id'] or config.get('os') != 'linux'
+                or config.get('architecture') != 'amd64' or config.get('rootfs') != {'type': 'layers', 'diff_ids': diffs}
+                or type(config_labels) is not dict or any(config_labels.get(key) != value for key, value in labels.items())):
+            raise Blocked('development archive config differs from immutable image inspection')
+        layers = manifest['layers']
+        if manifest['schemaVersion'] != 2 or type(layers) is not list or len(layers) != len(diffs):
+            raise Blocked('development archive layer count mismatch')
+        plain = mime + 'layer.v1.tar'
+        remaining = DEVELOPMENT_EXPANSION_LIMIT
+        for descriptor, expected_diff in zip(layers, diffs):
+            name, compressed_hash = blob(descriptor, (plain, plain + '+gzip'))
+            member = members[name]
+            with archive.extractfile(member) as stream:
+                actual, size = release_stream_hash(stream, member.size)
+            if size != member.size or actual != compressed_hash:
+                raise Blocked('development archive layer blob mismatch')
+            if descriptor['mediaType'] != plain:
+                with archive.extractfile(member) as stream, gzip.GzipFile(fileobj=stream) as layer:
+                    actual, size = release_stream_hash(layer, remaining)
+            if actual != expected_diff or size > remaining:
+                raise Blocked('development archive layer DiffID/order mismatch')
+            remaining -= size
+        if {name for name, member in members.items() if member.isreg()} != used:
+            raise Blocked('development archive contains unselected blobs')
+
+
+def release_stream_hash(stream, maximum):
+    digest, size = hashlib.sha256(), 0
+    while block := stream.read(min(1024 * 1024, maximum - size + 1)):
+        size += len(block)
+        if size > maximum:
+            raise Blocked('development OCI stream exceeds its byte limit')
+        digest.update(block)
+    return 'sha256:' + digest.hexdigest(), size
 
 
 class ProbeCommands(Commands):
@@ -70,6 +222,10 @@ class ProbeCommands(Commands):
 
 
 class Gptbox(Bootstrap):
+    role = 'maintenance'
+    artifact_root = ARTIFACTS
+    control = CONTROL
+
     def __init__(self, root=Path('/'), run=None):
         super().__init__(root, run or ProbeCommands())
 
@@ -101,12 +257,12 @@ class Gptbox(Bootstrap):
         self.protected(context)
         for file in Path(context).iterdir():
             self.protected(file)
-        _, _, manifest = self.check_gptbox_inputs(context, expected)
+        _, _, manifest = self.check_gptbox_inputs(context, expected, expected_role=self.role)
         self.source_stage = 'context-source'
         candidate.verify(context, expected)
-        if (manifest['role'] != 'maintenance' or manifest['fedora']['image'] != FEDORA
+        if (manifest['role'] != self.role or manifest['fedora']['image'] != FEDORA
                 or manifest['codex']['version'] != '0.169.0' or manifest['codex']['sha256'] != CODEX_SHA):
-            raise Blocked('first adapter accepts only the independently verified pinned maintenance inputs')
+            raise Blocked('adapter requires independently verified pinned inputs for its role')
         if manifest['source_sha'] != revision:
             raise Blocked('context source differs from requested adapter target')
         self.source_stage = 'executing-source'
@@ -190,24 +346,41 @@ class Gptbox(Bootstrap):
         self.gid = self.run('/usr/bin/id', '-g', 'dp-maint').strip()
         if not self.gid.isdigit() or int(self.gid) < 1000:
             raise Blocked('invalid maintenance primary GID')
+        control = self.control
         self.directory('/usr/local/libexec', mode=0o755)
-        self.directory(CONTROL, mode=0o755)
-        self.directory(CONTROL + '/home', mode=0o755)
-        self.directory(CONTROL + '/xdg-config', mode=0o755)
-        self.directory(CONTROL + '/bin', mode=0o755)
-        self.directory(CONTROL + '/empty-hooks', mode=0o755)
-        if any(self.path(CONTROL + '/empty-hooks').iterdir()) or any(self.path(CONTROL + '/home').iterdir()) or any(self.path(CONTROL + '/xdg-config').iterdir()):
+        self.directory(control, mode=0o755)
+        self.directory(control + '/home', mode=0o755)
+        self.directory(control + '/xdg-config', mode=0o755)
+        self.directory(control + '/bin', mode=0o755)
+        self.directory(control + '/empty-hooks', mode=0o755)
+        if any(self.path(control + '/empty-hooks').iterdir()) or any(self.path(control + '/home').iterdir()) or any(self.path(control + '/xdg-config').iterdir()):
             raise Blocked('controller home/hooks contain undeclared parent integration')
-        self.atomic(CONTROL + '/containers.conf', '[containers]\nnetns="private"\n[engine]\nevents_logger="file"\n', mode=0o444)
-        storage = '/var/lib/dev-pair/maintenance/images'
+        config = '[containers]\nnetns="private"\n[engine]\nevents_logger="file"\n'
+        self.atomic(control + '/containers.conf', config, mode=0o444)
+        context = self.target.rsplit('/', 1)[-1]
+        storage = '/var/lib/dev-pair/maintenance/images' if self.role == 'maintenance' else self.artifact_root + '/' + context + '/image-store'
         self.directory(storage, owner='dp-maint')
-        self.wrapper = str(self.path(CONTROL + '/bin/podman'))
-        script = (f'#!/bin/sh\nif [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={fedora_oci.SAVE_FILE_LIMIT}:{fedora_oci.SAVE_FILE_LIMIT} /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox --storage-driver=vfs --events-backend=file "$@"; fi\n'
-                  f'exec /usr/bin/podman --root {self.path(storage)} --runroot /run/user/{uid}/dev-pair-gptbox '
-                  '--storage-driver=vfs --events-backend=file "$@"\n')
-        self.atomic(CONTROL + '/bin/podman', script, mode=0o555)
-        self.atomic(CONTROL + '/distrobox-enter', self.scripts['distrobox-enter'].decode(), mode=0o555)
-        self.run('/usr/sbin/restorecon', '-RF', str(self.path(CONTROL)))
+        runroot = f'/run/user/{uid}/dev-pair-gptbox'
+        script = '#!/bin/sh\n'
+        if self.role == 'development':
+            runroot += '-development-' + context
+            destination = self.path(self.artifact_root + '/' + context + '/export-work/image-copy') / RELEASE_ARCHIVE
+            self.atomic(control + '/export-containers.conf', config + 'image_copy_tmp_dir = ' +
+                        json.dumps(str(destination.parent)) + '\n', mode=0o444)
+            engine = f'/usr/bin/podman --root {shlex.quote(str(self.path(storage)))} --runroot {runroot} --storage-driver=vfs --events-backend=file'
+            limit = DEVELOPMENT_ARCHIVE_LIMIT
+            script += (f'if [ "$#" = 5 ] && [ "$1" = save ] && [ "$2" = --format=oci-archive ] && '
+                       f'[ "$3" = --output ] && [ "$4" = {shlex.quote(str(destination))} ]; then '
+                       f'exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n')
+        else:
+            engine = f'/usr/bin/podman --root {self.path(storage)} --runroot {runroot} --storage-driver=vfs --events-backend=file'
+        limit = fedora_oci.SAVE_FILE_LIMIT
+        script += (f'if [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n'
+                   f'exec {engine} "$@"\n')
+        self.wrapper = str(self.path(control + '/bin/podman'))
+        self.atomic(control + '/bin/podman', script, mode=0o555)
+        self.atomic(control + '/distrobox-enter', self.scripts['distrobox-enter'].decode(), mode=0o555)
+        self.run('/usr/sbin/restorecon', '-RF', str(self.path(control)))
         self.run('/usr/bin/systemctl', 'start', f'user@{uid}.service')
         self.unit = 'dev-pair-gptbox-' + self.target.rsplit('/', 1)[-1] + '.service'
         status = self.run('/usr/bin/systemctl', 'show', '--property=User', '--property=Description', '--property=ActiveState', self.unit, ok=(0, 1, 4))
@@ -224,10 +397,10 @@ class Gptbox(Bootstrap):
         self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--quiet', '--wait', '--collect', '--service-type=exec',
                          '--uid=dp-maint', '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=10',
                          '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
-                         '--property=CPUQuota=100%', '/usr/bin/env', '-i', 'PATH=' + str(self.path(CONTROL + '/bin')) + ':/usr/bin:/usr/sbin:/bin',
-                         'HOME=' + str(self.path(CONTROL + '/home')), 'USER=gpt', 'LOGNAME=gpt',
-                         'XDG_RUNTIME_DIR=/run/user/' + uid, 'XDG_CONFIG_HOME=' + str(self.path(CONTROL + '/xdg-config')),
-                         'CONTAINERS_CONF=' + str(self.path(CONTROL + '/containers.conf')),
+                         '--property=CPUQuota=100%', '/usr/bin/env', '-i', 'PATH=' + str(self.path(control + '/bin')) + ':/usr/bin:/usr/sbin:/bin',
+                         'HOME=' + str(self.path(control + '/home')), 'USER=gpt', 'LOGNAME=gpt',
+                         'XDG_RUNTIME_DIR=/run/user/' + uid, 'XDG_CONFIG_HOME=' + str(self.path(control + '/xdg-config')),
+                         'CONTAINERS_CONF=' + str(self.path(control + '/containers.conf')),
                          'DBX_CONTAINER_MANAGER=podman']
 
     def record(self, name, value):
@@ -359,7 +532,7 @@ class Gptbox(Bootstrap):
             self.engine('rm', '--force', image_id(rows[0]['Id']))
 
     def recover_image_work(self, expected):
-        work = self.path('/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/image-work')
+        work = self.path(self.artifact_root + '/' + expected + '/image-work')
         if not work.exists() and not work.is_symlink(): return
         self.protected(work)
         def reconcile():
@@ -483,24 +656,8 @@ class Gptbox(Bootstrap):
         stage_name, runtime_name = 'dp-gptbox-a-' + expected[:16] + '-' + str(count), 'dp-gptbox-r-' + expected[:16] + '-' + str(count)
         self.record('resources', {stage_name: base})
         try:
-            stage = image_id(self.engine('create', '--name=' + stage_name, '--label=dev-pair.context=' + expected, '--timeout=' + str(ASSEMBLY_LIFETIME), '--restart=no',
-                '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private', '--userns=private', '--cap-add=SYS_ADMIN',
-                '--security-opt=no-new-privileges', '--security-opt=label=type:container_engine_t',
-                '--memory=2g', '--pids-limit=512', '--cpus=1', '--tmpfs=/run:rw,nosuid,nodev,mode=0755,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,notmpcopyup',
-                '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--entrypoint=/usr/bin/distrobox-init', base,
-                *INIT[1:], '--', FINAL_HOOK))
-            self.inspect_container(stage, base, runtime=False)
-            output = self.engine('start', '--attach', stage, timeout=900)
-            attestation = json.loads(output.strip().splitlines()[-1])
-            if (attestation.get('kind') != 'genuine-distrobox-assembled'
-                    or attestation.get('inputs_sha256') != sha(json.dumps(inputs, sort_keys=True).encode() + b'\n')
-                    or attestation.get('source_sha') != revision or attestation.get('uid') != 1000 or attestation.get('gid') != 1000):
-                raise Blocked('actual upstream finalizer attestation is missing or mismatched')
-            self.record('assembly-attestation', attestation)
-            stopped = json.loads(self.engine('inspect', '--type=container', stage))[0]
-            if stopped['State'].get('ExitCode') != 0 or stopped['State'].get('Running'):
-                raise Blocked('actual upstream assembly did not exit successfully')
-            sealed = image_id(self.engine('commit', '--pause=false', stage))
+            stage = self.create_assembly_stage(stage_name, expected, base)
+            sealed, _ = self.seal_assembly_stage(stage, base, revision, inputs)
             self.record('resources', {stage_name: base, runtime_name: sealed})
             # A separate immutable runtime, never the writable assembly container.
             self.mounts = {}
@@ -546,9 +703,41 @@ class Gptbox(Bootstrap):
         self.image_stage('complete',revision,expected)
         return result
 
+    def create_assembly_stage(self, name, expected, base):
+        return image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + expected,
+            '--timeout=' + str(ASSEMBLY_LIFETIME), '--restart=no',
+            '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private',
+            '--userns=private', '--cap-add=SYS_ADMIN', '--security-opt=no-new-privileges',
+            '--security-opt=label=type:container_engine_t', '--memory=2g', '--pids-limit=512', '--cpus=1',
+            '--tmpfs=/run:rw,nosuid,nodev,mode=0755,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,notmpcopyup',
+            '--hooks-dir=' + str(self.path(self.control + '/empty-hooks')), '--entrypoint=/usr/bin/distrobox-init',
+            base, *INIT[1:], '--', FINAL_HOOK))
+
+    def seal_assembly_stage(self, stage, base, revision, inputs):
+        self.inspect_container(stage, base, runtime=False)
+        output = self.engine('start', '--attach', stage, timeout=ASSEMBLY_LIFETIME)
+        lines = output.strip().splitlines()
+        attestation = json.loads(lines[-1], object_pairs_hook=fedora_oci.unique) if lines else None
+        if (type(attestation) is not dict or attestation.get('kind') != 'genuine-distrobox-assembled'
+                or attestation.get('inputs_sha256') != sha(image_inputs_bytes(inputs))
+                or attestation.get('source_sha') != revision or attestation.get('uid') != 1000 or attestation.get('gid') != 1000):
+            raise Blocked('actual upstream finalizer attestation is missing or mismatched')
+        self.record('assembly-attestation', attestation)
+        if self.role == 'development':
+            stopped = self.inspect_container(stage, base, runtime=False)['State']
+            if stopped.get('Status') not in ('exited', 'stopped') or stopped.get('Running') is not False:
+                raise Blocked('development commit requires the exact stopped Distrobox stage')
+            format_args = ('--format=oci',)
+        else:
+            stopped = json.loads(self.engine('inspect', '--type=container', stage))[0]['State']
+            format_args = ()
+        if stopped.get('ExitCode') != 0 or stopped.get('Running'):
+            raise Blocked('actual upstream assembly did not exit successfully')
+        return image_id(self.engine('commit', '--pause=false', *format_args, stage)), attestation
+
 
     def image_stage(self,stage,revision,expected):
-        allowed=('executor-setup','input-staging','signed-import','build','immutable-inspect','completion-record','storage','prepared-marker','assembly','runtime','complete')
+        allowed=('executor-setup','input-staging','signed-import','build','immutable-inspect','completion-record','storage','prepared-marker','assembly','runtime','export','complete')
         if stage not in allowed:raise Blocked('unknown image stage')
         self.record('image-progress',{'schema':1,'source_sha':revision,'context_sha256':expected,'phase':'candidate-image','stage':stage})
 
@@ -576,16 +765,18 @@ class Gptbox(Bootstrap):
     def _candidate_image(self,context,expected,revision,manifest,*,fresh=False,on_prepared=None):
         self.image_stage('input-staging',revision,expected)
         self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
-        self.directory('/var/lib/dev-pair/artifacts/gptbox-adapter', mode=0o755)
-        self.directory('/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected, mode=0o755)
-        build = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/build'
+        self.directory(self.artifact_root, mode=0o755)
+        self.directory(self.artifact_root + '/' + expected, mode=0o755)
+        build = self.artifact_root + '/' + expected + '/build'
         self.directory(build, mode=0o755)
         runtime = Path(__file__).with_name('gptbox_runtime.py').read_bytes()
         files = {'codex': Path(context, 'codex').read_bytes(), 'distrobox-init': self.scripts['distrobox-init'],
                  'runtime.py': runtime}
         inputs = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
+                  'role': self.role,
                   'files': {'/opt/dev-pair/bin/codex': sha(files['codex']), '/usr/bin/distrobox-init': sha(files['distrobox-init']), RUNTIME: sha(runtime)}}
-        input_digest=sha(json.dumps(inputs,sort_keys=True).encode()+b'\n')
+        input_bytes = image_inputs_bytes(inputs)
+        input_digest = sha(input_bytes)
         # Match the pinned upstream setup_dnf availability resolution; aliases
         # absent from Fedora's architecture-specific metadata are not forced.
         dependencies = ('bash bash-completion bc bzip2 cracklib-dicts curl diffutils dnf-plugins-core findutils '
@@ -608,14 +799,14 @@ class Gptbox(Bootstrap):
                   'rpm -qa --qf "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n" | sort > /usr/lib/dev-pair/gptbox/rpms.txt; '
                   'rm /tmp/upstream-packages /tmp/resolved-packages; dnf clean all\n'
                   f'COPY --chmod=0555 codex /opt/dev-pair/bin/codex\nCOPY --chmod=0555 distrobox-init /usr/bin/distrobox-init\nCOPY --chmod=0555 runtime.py {RUNTIME}\nCOPY --chmod=0444 inputs.json {BASE}/inputs.json\n'
-                  f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA} org.opencontainers.image.revision={revision} dev-pair.role=maintenance dev-pair.standards={candidate.STANDARDS} dev-pair.codex.version=0.169.0 dev-pair.inputs={input_digest} dev-pair.runtime={sha(runtime)} dev-pair.init={sha(files['distrobox-init'])} dev-pair.codex.sha256={sha(files['codex'])}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n')
+                  f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA} org.opencontainers.image.revision={revision} dev-pair.role={self.role} dev-pair.standards={candidate.STANDARDS} dev-pair.codex.version=0.169.0 dev-pair.inputs={input_digest} dev-pair.runtime={sha(runtime)} dev-pair.init={sha(files['distrobox-init'])} dev-pair.codex.sha256={sha(files['codex'])}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n')
         lines = recipe.splitlines()
         # Fixed source-controlled package/locale operation, never submitted
         # script input. This native inner bound also covers detached RUN
         # helpers; remaining build/VM budgets can still end sooner.
         lines[1] = 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec ' + shlex.quote(lines[1][4:])
         recipe = '\n'.join(lines) + '\n'
-        for name, data in {**files, 'inputs.json': json.dumps(inputs, sort_keys=True).encode() + b'\n', 'Containerfile': recipe.encode()}.items():
+        for name, data in {**files, 'inputs.json': input_bytes, 'Containerfile': recipe.encode()}.items():
             # Binary-safe atomic creation in a protected new build directory.
             destination = self.path(build) / name
             if destination.exists():
@@ -633,7 +824,7 @@ class Gptbox(Bootstrap):
         binding={'schema':1,'kind':'full-adapter-candidate','source_sha':revision,'context_sha256':expected,
             'standards_sha':candidate.STANDARDS,'base_image':FEDORA,'codex_sha256':sha(files['codex']),
             'distrobox_sha':DBX_SHA,'init_sha256':sha(files['distrobox-init']),'runtime_sha256':sha(runtime),
-            'inputs_sha256':sha(json.dumps(inputs,sort_keys=True).encode()+b'\n'),'recipe_sha256':sha(recipe.encode()),
+            'inputs_sha256':input_digest,'recipe_sha256':sha(recipe.encode()),
             'platform':{'os':'linux','architecture':'amd64'},'distrobox_assembled':False,'runtime_validated':False}
         location=self.target+'/candidate-image.json'
         path=self.path(location);exists=path.exists() or path.is_symlink();prior=None
@@ -661,7 +852,7 @@ class Gptbox(Bootstrap):
             def reconcile_copy():
                 if isinstance(self.run, Commands):
                     self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
-            work = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + expected + '/image-work'
+            work = self.artifact_root + '/' + expected + '/image-work'
             self.directory(work, mode=0o755)
             try:
                 with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=reconcile_copy, reserve=8*1024**3) as (copy_tmp, verification_root):
@@ -690,7 +881,7 @@ class Gptbox(Bootstrap):
         labels=rows[0].get('Labels') or config.get('Labels',{})
         if type(labels) is not dict:raise Blocked('malformed full candidate labels')
         wanted={'dev-pair.context':expected,'dev-pair.distrobox':DBX_SHA,'org.opencontainers.image.revision':revision,
-            'dev-pair.role':'maintenance','dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':'0.169.0',
+            'dev-pair.role':self.role,'dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':'0.169.0',
             'dev-pair.inputs':binding['inputs_sha256'],'dev-pair.runtime':binding['runtime_sha256'],'dev-pair.init':binding['init_sha256'],'dev-pair.codex.sha256':binding['codex_sha256']}
         if (type(rows) is not list or len(rows)!=1 or image_id(rows[0]['Id'])!=base or rows[0].get('Architecture')!='amd64' or
             rows[0].get('Os')!='linux' or any(labels.get(k)!=v for k,v in wanted.items())):
@@ -698,9 +889,10 @@ class Gptbox(Bootstrap):
         complete={**binding,'image_id':base,'fedora_base':imported}
         self.image_stage('completion-record',revision,expected)
         if prior is None:self.record('candidate-image',complete)
-        existing=json.loads(self.text(STATE+'/gptbox-image.json','null'),object_pairs_hook=fedora_oci.unique)
-        if type(existing) is dict and existing.get('kind')=='full-adapter-candidate' and existing!=complete:raise Blocked('prepared full candidate record conflict')
-        if fresh:self._publish_prepared(complete,revision,expected)
+        if self.role == 'maintenance':
+            existing=json.loads(self.text(STATE+'/gptbox-image.json','null'),object_pairs_hook=fedora_oci.unique)
+            if type(existing) is dict and existing.get('kind')=='full-adapter-candidate' and existing!=complete:raise Blocked('prepared full candidate record conflict')
+            if fresh:self._publish_prepared(complete,revision,expected)
         return base,imported,inputs
 
 
@@ -917,9 +1109,220 @@ class Gptbox(Bootstrap):
                 preparation.run.native_register = None
 
 
+class DevelopmentGptbox(Gptbox):
+    role = 'development'
+    artifact_root = DEVELOPMENT_ARTIFACTS
+
+    def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
+        def phase(seconds):
+            if isinstance(self.run, Commands):
+                return self.run.phase(seconds, 'dev-pair-development-image', native=False)
+            return contextlib.nullcontext()
+
+        with phase(120):
+            self.preflight()
+            manifest, self.scripts = self.inputs(context, expected, upstream, revision)
+        if not apply:
+            return {'preview': 'build-development', 'changes': False, 'source_sha': revision,
+                    'context_sha256': expected, 'job_admission': False}
+        self.target = DEVELOPMENT_ROOT + '/' + expected
+        self.control = '/usr/local/libexec/dev-pair-gptbox-development/' + expected
+        self.failure_diagnostic_identity = {'source_sha': revision, 'context_sha256': expected,
+                                            'phase': 'development-gptbox'}
+        artifact_target = self.artifact_root + '/' + expected
+        release = self.path(artifact_target + '/release')
+        pending = self.path(artifact_target + '/release.pending')
+        with self.lock():
+            with phase(DEVELOPMENT_EXECUTION):
+                if release.exists() or release.is_symlink():
+                    inner = self.read_release(release, expected, revision)
+                    reused = True
+                else:
+                    inner = self.stage_release(context, expected, revision, manifest, pending, retry)
+                    reused = False
+            # Publish the directory only after the phase and its exact cleanup complete.
+            if not reused:
+                os.rename(pending, release)
+                fd = os.open(release.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        return {'kind': 'development-gptbox-release-candidate', 'archive': str(release / RELEASE_ARCHIVE),
+                'inner_record': str(release / RELEASE_INNER), 'inner': inner, 'reused': reused,
+                'job_admission': False}
+
+    def read_release(self, release, expected, revision):
+        self.protected(release)
+        if not release.is_dir() or set(node.name for node in release.iterdir()) != {RELEASE_ARCHIVE, RELEASE_INNER}:
+            raise Blocked('development release directory conflicts')
+        for name in (RELEASE_ARCHIVE, RELEASE_INNER):
+            info = self.protected(release / name).lstat()
+            if stat.S_IMODE(info.st_mode) != 0o444:
+                raise Blocked('development release file permissions changed')
+        _, _, raw = capture_release_file(release / RELEASE_INNER, 16384, os.getuid(), contents=True)
+        inner = json.loads(raw, object_pairs_hook=fedora_oci.unique)
+        keys = {'source_sha', 'image_id', 'context_sha256', 'inputs_sha256', 'sealed_sha256',
+                'archive_sha256', 'archive_bytes', 'diff_ids'}
+        if (type(inner) is not dict or set(inner) != keys or inner['source_sha'] != revision
+                or inner['context_sha256'] != expected or type(inner['archive_bytes']) is not int
+                or not 0 < inner['archive_bytes'] <= DEVELOPMENT_ARCHIVE_LIMIT
+                or any(type(inner[key]) is not str or not re.fullmatch(r'[0-9a-f]{64}', inner[key])
+                       for key in ('image_id', 'inputs_sha256', 'sealed_sha256', 'archive_sha256'))):
+            raise Blocked('development release inner record identity mismatch')
+        image_diff_ids(inner['diff_ids'])
+        digest, size, _ = capture_release_file(release / RELEASE_ARCHIVE, inner['archive_bytes'], os.getuid())
+        if (digest, size) != (inner['archive_sha256'], inner['archive_bytes']):
+            raise Blocked('published development archive no longer matches its inner record')
+        return inner
+
+    def reconcile_executor(self):
+        if isinstance(self.run, Commands):
+            self.run.reconcile_native(('--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit,
+                                       '--uid=dp-maint'), {})
+
+    def stage_release(self, context, expected, revision, manifest, pending, retry):
+        self.directory(self.target, mode=0o755)
+        self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
+        self.directory(self.artifact_root, mode=0o755)
+        self.directory(self.artifact_root + '/' + expected, mode=0o755)
+        target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA}
+        intent = self.path(self.target + '/attempt.json')
+        export_work = self.artifact_root + '/' + expected + '/export-work'
+        count = 0
+        if intent.exists() or intent.is_symlink():
+            _, _, raw = capture_release_file(self.protected(intent), 4096, os.getuid(), contents=True)
+            prior = json.loads(raw, object_pairs_hook=fedora_oci.unique)
+            count = prior.get('count') if type(prior) is dict else None
+            if type(count) is not int or not 1 <= count <= 2 or prior != {**target, 'count': count}:
+                raise Blocked('invalid protected development attempt record')
+            if not retry:
+                raise Blocked('development assembly retry requires explicit --retry')
+        elif pending.exists() or pending.is_symlink():
+            raise Blocked('unowned pending development release preserved')
+        self.image_stage('executor-setup', revision, expected)
+        self.setup_executor(retry=bool(count))
+        if count:
+            self.recover_resources(expected)
+            self.recover_image_work(expected)
+            work = self.path(export_work)
+            if work.exists() or work.is_symlink():
+                fedora_oci.recover_workspaces(self.protected(work), uid=int(self.uid), reconcile=self.reconcile_executor)
+            if pending.exists() or pending.is_symlink():
+                self.protected(pending)
+                if not pending.is_dir() or stat.S_IMODE(pending.stat().st_mode) != 0o700:
+                    raise Blocked('unowned pending development release preserved')
+                for node in pending.iterdir():
+                    self.protected(node)
+                    if node.name not in {RELEASE_ARCHIVE, RELEASE_INNER} or not node.is_file() or node.stat().st_nlink != 1:
+                        raise Blocked('unowned pending development release member preserved')
+                for node in pending.iterdir():
+                    node.unlink()
+                pending.rmdir()
+        if count == 2:
+            raise Blocked('development assembly build retry budget exhausted')
+        reserve = 8 * 1024 ** 3 + 2 * DEVELOPMENT_ARCHIVE_LIMIT
+        if shutil.disk_usage(pending.parent).free < reserve:
+            raise Blocked('insufficient capacity for the bounded development export and eight GiB reserve')
+        self.record('attempt', {**target, 'count': count + 1})
+        base, _, inputs = self._full_candidate(context, expected, revision, manifest)
+        self.image_stage('assembly', revision, expected)
+        stage_name = f'dp-gptbox-a-{expected[:16]}-{count + 1}'
+        snapshot_name = f'dp-gptbox-r-{expected[:16]}-{count + 1}'
+        self.record('resources', {stage_name: base})
+        stage = snapshot = None
+        primary = None
+        try:
+            stage = self.create_assembly_stage(stage_name, expected, base)
+            sealed, seal = self.seal_assembly_stage(stage, base, revision, inputs)
+            if sealed == base:
+                raise Blocked('development commit did not produce a new immutable image')
+            self.image_stage('export', revision, expected)
+            self.record('resources', {stage_name: base, snapshot_name: sealed})
+            snapshot = image_id(self.engine('create', '--name=' + snapshot_name, '--label=dev-pair.context=' + expected,
+                '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                '--hooks-dir=' + str(self.path(self.control + '/empty-hooks')), '--entrypoint=/usr/bin/false', 'sha256:' + sealed))
+            inner = self.export_release(expected, revision, sealed, inputs, seal, snapshot, pending, export_work, reserve)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            cleanup_error = None
+            for identity in (snapshot, stage):
+                if identity:
+                    try:
+                        self.engine('rm', '--force', identity)
+                    except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
+            if cleanup_error is not None and primary is None:
+                raise cleanup_error
+        self.image_stage('complete', revision, expected)
+        return inner
+
+    def export_release(self, expected, revision, sealed, inputs, seal, snapshot, pending, export_work, reserve):
+        rows = json.loads(self.engine('inspect', '--type=container', snapshot), object_pairs_hook=fedora_oci.unique)
+        if (type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != snapshot
+                or image_id(rows[0]['Image']) != sealed or rows[0]['State']['Status'] not in ('configured', 'created')
+                or rows[0]['State'].get('Running') is not False):
+            raise Blocked('development raw file read requires the exact never-started image snapshot')
+        labels = {'dev-pair.role': 'development', 'dev-pair.context': expected,
+                  'dev-pair.inputs': sha(image_inputs_bytes(inputs)), 'dev-pair.standards': candidate.STANDARDS,
+                  'dev-pair.distrobox': DBX_SHA, 'dev-pair.codex.version': '0.169.0',
+                  'org.opencontainers.image.revision': revision}
+        rows = json.loads(self.engine('image', 'inspect', 'sha256:' + sealed), object_pairs_hook=fedora_oci.unique)
+        if (type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != sealed
+                or rows[0]['Os'] != 'linux' or rows[0]['Architecture'] != 'amd64'):
+            raise Blocked('sealed development image inspection mismatch')
+        image = rows[0]
+        actual_labels = image.get('Labels') or image['Config'].get('Labels', {})
+        if type(actual_labels) is not dict or any(actual_labels.get(key) != value for key, value in labels.items()):
+            raise Blocked('sealed development image labels mismatch')
+        diff_ids = image_diff_ids(image['RootFS']['Layers'])
+        self.directory(export_work, mode=0o755)
+        with fedora_oci.copy_workspace(self.path(export_work), uid=int(self.uid),
+                                       reconcile=self.reconcile_executor, reserve=reserve) as work:
+            for name, wanted in (('inputs.json', inputs), ('sealed.json', seal)):
+                self.execute('/usr/bin/prlimit', '--fsize=16384:16384', self.wrapper, 'cp', '--archive=false',
+                             snapshot + ':' + BASE + '/' + name, str(work / name), timeout=30)
+                _, _, raw = capture_release_file(work / name, 16384, int(self.uid), contents=True)
+                if raw != image_inputs_bytes(wanted):
+                    raise Blocked('immutable development input or seal bytes differ from the Distrobox assembly')
+                if name == 'sealed.json':
+                    sealed_digest = sha(raw)
+            source = work / RELEASE_ARCHIVE
+            self.execute('/usr/bin/env', 'TMPDIR=' + str(work),
+                         'CONTAINERS_CONF=' + str(self.path(self.control + '/export-containers.conf')),
+                         self.wrapper, 'save', '--format=oci-archive', '--output', str(source), 'sha256:' + sealed, timeout=240)
+            pending.mkdir(mode=0o700)
+            pending.chmod(0o700)
+            archive = pending / RELEASE_ARCHIVE
+            with archive.open('xb') as out:
+                archive_sha, archive_bytes, _ = capture_release_file(source, DEVELOPMENT_ARCHIVE_LIMIT,
+                                                                      int(self.uid), output=out)
+                os.fchmod(out.fileno(), 0o444)
+                out.flush()
+                os.fsync(out.fileno())
+            inner = {'source_sha': revision, 'image_id': sealed, 'context_sha256': expected,
+                     'inputs_sha256': labels['dev-pair.inputs'], 'sealed_sha256': sealed_digest,
+                     'archive_sha256': archive_sha, 'archive_bytes': archive_bytes, 'diff_ids': diff_ids}
+            verify_development_archive(archive, inner, labels)
+            with (pending / RELEASE_INNER).open('xb') as out:
+                out.write(image_inputs_bytes(inner))
+                os.fchmod(out.fileno(), 0o444)
+                out.flush()
+                os.fsync(out.fileno())
+            fd = os.open(pending, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        return inner
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('assemble', 'initialize'))
+    parser.add_argument('stage', choices=('assemble', 'initialize', 'build-development'))
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--retry', action='store_true', help='reconcile and retry one incomplete exact target; at most two attempts')
     parser.add_argument('--context', required=True)
@@ -930,7 +1333,7 @@ def main():
     parser.add_argument('--password-file')
     args = parser.parse_args()
     try:
-        app = Gptbox()
+        app = DevelopmentGptbox() if args.stage == 'build-development' else Gptbox()
         if args.stage == 'initialize':
             result = app.initialize(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
                                     args.bootstrap_source, args.password_file, args.apply, args.retry)
@@ -938,7 +1341,7 @@ def main():
             result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
         print(json.dumps(result, indent=2))
         return 0
-    except (Blocked, OSError, ValueError, KeyError, subprocess.SubprocessError):
+    except (Blocked, OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError):
         print('gptbox operation blocked; no job/runtime admission; inspect protected evidence locally', file=sys.stderr)
         return 2
 

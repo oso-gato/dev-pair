@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verified public maintenance inputs; no agent, VM, account or host admission."""
+"""Verified public gptbox inputs; no agent, VM, account or host admission."""
 import argparse
 import contextlib
 import gzip
@@ -54,6 +54,8 @@ FILE_LIMIT = 2048
 MANIFEST_LIMIT = 256 * 1024
 EXTRACTION_SECONDS = 120
 VERIFICATION = 'strict-cosign-keyless; Fedora signed-CHECKSUM/OCI verification is separately required; Cosign bootstrap is official HTTPS plus pinned digest; no runtime/model admission'
+ROLES = ('maintenance', 'development')
+PUBLIC_INPUT_KINDS = tuple(f'verified-public-{role}-inputs' for role in ROLES)
 PROXY_ENV = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy',
              'all_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'REQUESTS_CA_BUNDLE', 'CURL_CA_BUNDLE')
 
@@ -355,12 +357,13 @@ def write_payload(root, files, destination):
     require(destination.stat().st_size <= PAYLOAD_LIMIT, 'compressed payload byte limit exceeded')
 
 
-def build(cache, distrobox, output):
+def build(cache, distrobox, output, *, role='maintenance'):
     with wall_limit(600):
-        return build_within_limit(cache, distrobox, output)
+        return build_within_limit(cache, distrobox, output, role=role)
 
 
-def build_within_limit(cache, distrobox, output):
+def build_within_limit(cache, distrobox, output, *, role='maintenance'):
+    require(role in ROLES, 'unsupported public-input role')
     repo = pathlib.Path(__file__).resolve().parents[1]
     output = private_directory(output)
     try:
@@ -396,15 +399,19 @@ def build_within_limit(cache, distrobox, output):
             tree.mkdir()
             clean_checkout(repo, revision, tree / 'dev-pair', work)
             clean_checkout(pathlib.Path(distrobox), DBX_SOURCE, tree / 'distrobox', work)
+            # The context schema models placement only. These fixed descriptors
+            # are never used to allocate a target job or mount credentials.
+            leaf = 'bootstrap-probe' if role == 'maintenance' else 'development-image-probe'
+            role_root = f'/var/lib/dev-pair/{role}'
             manifest = {'kind': 'operator-verified-inputs', 'source_sha': revision, 'standards_sha': STANDARDS,
                         'fedora': dict(fedora_oci.PROVENANCE),
                         'codex': {'version': '0.169.0', 'source': ARTIFACTS['codex.tar.gz'][0], 'sha256': CODEX_SHA,
                                   'verification': 'Strict Cosign3.1.4 identity/issuer/workflow/repository/ref/source verification passed; evidence in payload'},
-                        'role': 'maintenance', 'provider': 'gptbox', 'model': 'gpt-6.1-sol', 'effort': 'high',
-                        'mounts': {'workspace': '/var/lib/dev-pair/maintenance/workspaces/bootstrap-probe',
-                                   'state': '/var/lib/dev-pair/maintenance/state/bootstrap-probe',
-                                   'cache': '/var/lib/dev-pair/maintenance/cache/bootstrap-probe',
-                                   'credentials': '/var/lib/dev-pair/credentials/maintenance/bootstrap-probe'}}
+                        'role': role, 'provider': 'gptbox', 'model': 'gpt-6.2-sol', 'effort': 'high',
+                        'mounts': {'workspace': f'{role_root}/workspaces/{leaf}',
+                                   'state': f'{role_root}/state/{leaf}',
+                                   'cache': f'{role_root}/cache/{leaf}',
+                                   'credentials': f'/var/lib/dev-pair/credentials/{role}/{leaf}'}}
             inputs = work / 'inputs.json'
             inputs.write_text(json.dumps(manifest))
             preparation = command([sys.executable, '-I', str(tree / 'dev-pair/tools/candidate.py'), 'prepare',
@@ -418,9 +425,9 @@ def build_within_limit(cache, distrobox, output):
             shutil.copyfile(retained / 'receipt.json', evidence / 'verification-receipt.json')
             shutil.copyfile(retained / 'fedora-verification.json', evidence / 'fedora-verification.json')
             files = inventory(tree)
-            payload = output / 'maintenance-inputs.tar.gz'
+            payload = output / f'{role}-inputs.tar.gz'
             write_payload(tree, files, payload)
-            record = {'version': 2, 'kind': 'verified-public-maintenance-inputs', 'fedora': dict(fedora_oci.PROVENANCE), 'source_sha': revision,
+            record = {'version': 2, 'kind': f'verified-public-{role}-inputs', 'fedora': dict(fedora_oci.PROVENANCE), 'source_sha': revision,
                       'standards_sha': STANDARDS, 'distrobox_sha': DBX_SOURCE, 'context_sha256': context['context_sha256'],
                       'artifacts': {name: {'url': url, 'bytes': size, 'sha256': sha} for name, (url, size, sha) in ARTIFACTS.items()},
                       'payload': {'sha256': digest(payload), 'bytes': payload.stat().st_size}, 'files': files,
@@ -451,7 +458,7 @@ def validate_manifest(obj):
     def keys(value, names):
         require(type(value) is dict and set(value) == set(names.split()), 'missing or unknown manifest fields')
     keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification fedora')
-    require(type(obj['version']) is int and obj['version'] == 2 and obj['kind'] == 'verified-public-maintenance-inputs',
+    require(type(obj['version']) is int and obj['version'] == 2 and obj['kind'] in PUBLIC_INPUT_KINDS,
             'unsupported public-input manifest version/kind')
     require(obj['fedora'] == fedora_oci.PROVENANCE, 'signed Fedora provenance mismatch')
     require(re.fullmatch('[0-9a-f]{40}', obj['source_sha']) and obj['standards_sha'] == STANDARDS and
@@ -481,7 +488,7 @@ def validate_manifest(obj):
     required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json', 'evidence/fedora-verification.json'}
     for repo in ('dev-pair', 'distrobox'):
         required |= {repo + '/.git/' + name for name in ('HEAD', 'config', 'shallow', 'refs/heads/public-input')}
-    require(required <= set(names), 'incomplete maintenance payload')
+    require(required <= set(names), 'incomplete public-input payload')
     return obj
 
 
@@ -503,12 +510,14 @@ def read_manifest(path, expected_sha):
         return parse_manifest(data, actual_sha, expected_sha)
 
 
-def extract(payload, manifest_path, expected_manifest_sha, destination):
+def extract(payload, manifest_path, expected_manifest_sha, destination, *, role='maintenance'):
     # Admission (including open/fstat/hash/JSON) is inside the same deadline as
     # expansion. Neither untrusted path is ever reopened for consumption.
     with wall_limit(EXTRACTION_SECONDS):
         data, actual_sha = capture_regular(manifest_path, MANIFEST_LIMIT)
         record = parse_manifest(data, actual_sha, expected_manifest_sha)
+        require(role in ROLES and record['kind'] == f'verified-public-{role}-inputs',
+                'public input payload role mismatch')
         return _extract_captured(payload, record, destination)
 
 
@@ -574,18 +583,20 @@ def main():
     build_parser.add_argument('--cache', required=True, type=pathlib.Path)
     build_parser.add_argument('--distrobox-source', required=True, type=pathlib.Path)
     build_parser.add_argument('--output', required=True, type=pathlib.Path)
+    build_parser.add_argument('--role', choices=ROLES, default='maintenance')
     consumer = sub.add_parser('extract')
     consumer.add_argument('--payload', required=True, type=pathlib.Path)
     consumer.add_argument('--manifest', required=True, type=pathlib.Path)
     consumer.add_argument('--expected-manifest-sha256', required=True)
     consumer.add_argument('--output', required=True, type=pathlib.Path)
+    consumer.add_argument('--role', choices=ROLES, default='maintenance')
     args = parser.parse_args()
     if args.command == 'fetch':
         result = fetch(args.output, args.fedora_cache)
     elif args.command == 'build':
-        result = build(args.cache, args.distrobox_source, args.output)
+        result = build(args.cache, args.distrobox_source, args.output, role=args.role)
     else:
-        result = extract(args.payload, args.manifest, args.expected_manifest_sha256, args.output)
+        result = extract(args.payload, args.manifest, args.expected_manifest_sha256, args.output, role=args.role)
     print(json.dumps(result, sort_keys=True))
 
 
