@@ -2,6 +2,7 @@
 """Image-owned gptbox assembly and fixed headless role entry."""
 from contextlib import suppress
 import ctypes
+import fcntl
 import grp
 import hashlib
 import json
@@ -355,16 +356,22 @@ def run_turn(argv, prompt, output, error, env):
         finally:
             os.close(descriptor)
         deadline = time.monotonic() + TURN_SECONDS
-        if not cancelled:
-            launch_attempted = True
-            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output, stderr=error,
-                                       cwd=WORK, env=env, start_new_session=True)
+        # Give the CLI the validated snapshot and EOF independent of pipe capacity.
+        flags = os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING
+        with os.fdopen(os.memfd_create('gptbox-prompt', flags), 'wb') as source:
+            source.write(prompt)
+            source.seek(0)
+            seals = fcntl.F_SEAL_WRITE | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
+            fcntl.fcntl(source, fcntl.F_ADD_SEALS, seals)
+            if not cancelled:
+                launch_attempted = True
+                process = subprocess.Popen(argv, stdin=source, stdout=output, stderr=error,
+                                           cwd=WORK, env=env, start_new_session=True)
+        if process is not None:
             while not cancelled and (remaining := deadline - time.monotonic()) > 0:
                 try:
-                    process.communicate(input=prompt, timeout=min(.1, remaining))
+                    process.wait(timeout=min(.1, remaining))
                 except subprocess.TimeoutExpired:
-                    # communicate retains the pending input after its first wait.
-                    prompt = None
                     continue
                 if process.returncode != 0:
                     failure = 'codex-failed'
@@ -380,9 +387,6 @@ def run_turn(argv, prompt, output, error, env):
                 with suppress(OSError):
                     if reap_turn(process):
                         cleanup = 'reaped'
-            if process is not None:
-                with suppress(OSError):
-                    process.stdin.close()
         finally:
             for signum, handler in previous.items():
                 signal.signal(signum, handler)

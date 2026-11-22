@@ -138,7 +138,7 @@ class ControllerEntryTests(unittest.TestCase):
 
 
 class RoleProcessTests(unittest.TestCase):
-    WORKER = """
+    TURN_SETUP = """
 import os, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
@@ -155,6 +155,8 @@ t.verify_turn_environment = lambda: None
 t.turn_request = lambda role: (dict(operation='turn', role=role, model='gpt-6.2-sol', effort='high',
                                      endpoint='http://127.0.0.1:39162/v1'), b'fixture', 'synthetic')
 t.STATE.mkdir(mode=0o700)
+"""
+    WORKER = TURN_SETUP + """
 try:
     t.turn()
 except RuntimeError as error:
@@ -174,6 +176,45 @@ except RuntimeError as error:
 else:
     raise AssertionError('the interrupted claim was reused')
 """
+
+    def test_full_prompt_reaches_delayed_reader_with_eof(self):
+        worker = self.TURN_SETUP + """
+from functools import partial
+t.subprocess.Popen = partial(t.subprocess.Popen, pipesize=8192)
+selection, _, key = t.turn_request('maintenance')
+t.turn_request = lambda role: (selection, (t.WORK / 'prompt').read_bytes(), key)
+t.turn()
+"""
+        child = """
+import fcntl, json, os, stat, sys, time
+from pathlib import Path
+if stat.S_ISFIFO(os.fstat(0).st_mode):
+    assert fcntl.fcntl(0, fcntl.F_GETPIPE_SZ) == 8192
+time.sleep(.25)
+data = sys.stdin.buffer.read(16385)
+assert sys.stdin.buffer.read(1) == b''
+Path('received').write_bytes(data)
+for event in (
+    {'type': 'thread.started', 'thread_id': '01234567-1234-7678-9012-3456789abcde'},
+    {'type': 'turn.started'},
+    {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'read to EOF'}},
+    {'type': 'turn.completed'},
+):
+    print(json.dumps(event))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = b'0123456789abcdef' * 1024
+            (root / 'prompt').write_bytes(prompt)
+            executable = root / 'child'
+            executable.write_text(f'#!{sys.executable}\n' + child)
+            executable.chmod(0o700)
+            finished = subprocess.run([sys.executable, '-I', '-c', worker, str(Path(runtime.__file__).parent),
+                                       directory, '1'], capture_output=True, timeout=4)
+            self.assertEqual(finished.returncode, 0, finished.stderr.decode())
+            self.assertEqual((root / 'received').read_bytes(), prompt)
+            receipt = json.loads((root / 'state/turns/turn/result.json').read_bytes())
+            self.assertEqual((receipt['status'], receipt['owned_cleanup']), ('completed-turn', 'reaped'))
 
     def test_timeout_and_cancel_reap_the_detached_child_before_returning(self):
         child = """

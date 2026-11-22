@@ -10,8 +10,9 @@ uses its three probe mounts and cannot dispatch a turn.
 The mounted request in `/run/dev-pair-turn/request.json` supplies one operation
 ID, the role, provider, recorded model and effort, the standards pin, the local
 endpoint, and the SHA256 of the prompt and both configuration inputs. The role
-must match the sealed image. `/run/dev-pair-turn/prompt.txt` supplies the prompt
-on stdin. Codex receives the managed startup instruction from
+must match the sealed image. The runtime delivers the validated prompt from
+`/run/dev-pair-turn/prompt.txt` on stdin through a sealed in-memory file. Codex
+receives the managed startup instruction from
 `/etc/codex/requirements.toml` and its validated configuration and frozen
 loaders through the read-only binds listed in `TURN_READONLY_MOUNTS`. The fixture
 seeds the pinned CLI's bundled skills before mounting them read-only.
