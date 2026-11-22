@@ -52,31 +52,71 @@ def reconcile_pending():
 def _publish_child(owner,args,kwargs):
     # Main-thread handlers are deferred, not blocked/inherited across exec.
     if threading.current_thread() is not threading.main_thread():raise ValueError('main thread required')
-    pending={};saved={}
-    def deferred(number,frame):pending.setdefault(number,frame)
+    numbers=tuple(number for number in (signal.SIGALRM,signal.SIGINT,signal.SIGTERM,signal.SIGHUP)
+        if number in (signal.SIGALRM,signal.SIGINT) or callable(signal.getsignal(number)))
+    saved={number:signal.getsignal(number) for number in numbers}
+    # This query changes nothing: an interrupt before assignment loses no mask.
+    prior_mask=signal.pthread_sigmask(signal.SIG_BLOCK,())
+    pending={};deferring=True
+    def deliver(number,frame):
+        handler=saved[number]
+        if handler==signal.SIG_IGN:return
+        if handler==signal.SIG_DFL:signal.raise_signal(number)
+        else:handler(number,frame)
+    def deferred(number,frame):
+        if deferring:pending.setdefault(number,frame)
+        else:deliver(number,frame) # Failed restoration cannot orphan deadlines.
+    def drain():
+        while pending:
+            number=next(iter(pending));frame=pending.pop(number)
+            deliver(number,frame)
+    def restore_mask():
+        try:signal.pthread_sigmask(signal.SIG_SETMASK,prior_mask)
+        except BaseException:
+            # Retain the saved mask if a setter is interrupted before its effect.
+            if signal.pthread_sigmask(signal.SIG_BLOCK,())!=prior_mask:
+                signal.pthread_sigmask(signal.SIG_SETMASK,prior_mask)
+            raise
+    def restore_handlers():
+        nonlocal deferring
+        failure=None
+        try:
+            try:signal.pthread_sigmask(signal.SIG_BLOCK,numbers)
+            except BaseException as error:failure=error
+            for number in reversed(numbers):
+                # Restoration knowledge remains live until the setter succeeds.
+                for attempt in range(2):
+                    try:signal.signal(number,saved[number]);break
+                    except BaseException as error:
+                        if failure is None:failure=error
+                        if signal.getsignal(number) is saved[number]:break
+        finally:
+            deferring=False
+            restore_mask()
+        if any(signal.getsignal(n) is not saved[n] for n in numbers):raise RuntimeError('signal restoration unavailable')
+        if failure is not None:raise failure
     original_error=None
     try:
-        with contextlib.ExitStack() as restore:
-            for number in (signal.SIGALRM,signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
-                handler=signal.getsignal(number)
-                if number not in (signal.SIGALRM,signal.SIGINT) and not callable(handler):continue
-                saved[number]=handler
-                signal.signal(number,deferred);restore.callback(signal.signal,number,handler)
-            process=subprocess.Popen(args,**kwargs)
-            owner['process']=process
+        # Only handler mutation is masked, never Popen or its exec handshake.
+        try:
+            signal.pthread_sigmask(signal.SIG_BLOCK,numbers)
+            for number in numbers:signal.signal(number,deferred)
+        finally:restore_mask()
+        drain() # Known setup cancellation must prevent a new child launch.
+        process=subprocess.Popen(args,**kwargs)
+        owner['process']=process
     except BaseException as error:
         original_error=error
         raise
     finally:
-        # All previous handlers are restored before original delivery semantics.
-        for number,frame in pending.items():
-            handler=saved[number]
-            if handler==signal.SIG_IGN:continue
-            try:
-                if handler==signal.SIG_DFL:signal.raise_signal(number)
-                else:handler(number,frame)
-            except BaseException:
-                if original_error is None or isinstance(original_error,DIAGNOSTIC_ERRORS):raise
+        restoration_error=None
+        try:restore_handlers()
+        except BaseException as error:restoration_error=error
+        try:drain()
+        except BaseException:
+            if (original_error is None or isinstance(original_error,DIAGNOSTIC_ERRORS)) and (restoration_error is None or isinstance(restoration_error,DIAGNOSTIC_ERRORS)):raise
+        if restoration_error is not None and (original_error is None or isinstance(original_error,DIAGNOSTIC_ERRORS)):
+            raise restoration_error
     return process
 
 def _encrypt(plain,end):

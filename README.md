@@ -88,8 +88,11 @@ report summarizes delivery without separate per-startup call/output hashes.
 The prior `65bd26b` cleanup repair passed 669 local tests but fresh review found
 four lifecycle defects, so that full pass is not acceptance. The replacement
 source uses a fixed immutable empty ISO home and the direct pinned recipient,
-removing writable-home creation/deletion. Narrow launch-publication signal
-deferral and explicit cancellation/primary arbitration are tested locally.
+removing writable-home creation/deletion. The first simplification still failed fresh review at handler install/restore
+boundaries. The focused repair now captures the prior mask without changing it,
+masks only fixed handler transitions, restores that mask before Popen/exec, and
+retains explicit cancellation/primary arbitration. Both real-signal boundary
+reproductions and later phase-ALRM delivery are checked locally.
 Fresh review, a later combined full and separately authorized native validation
 remain required. This is diagnostic capability, not a runtime fix or a diagnosed
 native34 cause; local read-only DAC tests do not prove native ISO behavior.

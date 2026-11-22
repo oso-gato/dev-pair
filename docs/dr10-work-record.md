@@ -3,6 +3,49 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 05:24 HKT — coherent handler transitions
+
+- Fresh e7689ba review found one coherent R1 at both ends of handler deferral.
+  Real SIGINT after ALRM installation but before callback registration orphaned
+  the deferred ALRM handler. The reverse transition also failed when INT was
+  restored but an already-popped ALRM callback was interrupted before its setter.
+  A later actual ALRM did not call the original phase handler. Those original
+  failing receipts/logs/reproductions remain immutable; prior simplification gains
+  and actual64 finite session evidence remain, without declaring e768 accepted.
+- The fixed main-thread handler set is snapshotted before mutation. A non-mutating
+  empty-set query captures the prior POSIX mask before any block operation. Only
+  installation/restoration transitions are masked, with cleanup entered before
+  mutation; the original mask is restored before Popen and its exec handshake.
+  Restoration knowledge stays live until setter success, including bounded retry
+  of an interrupted restore, without a workload retry or fresh time allowance.
+- Known setup cancellation is delivered before starting a child. Original phase,
+  KeyboardInterrupt/SystemExit and native primary precedence remain. The pending
+  handler fallback cannot silently orphan later deadlines after restore failure.
+  Source still uses immutable ISO GPG inputs; no mutable directory/deletion,
+  inherited added mask, Python preexec, timer reset or new generic manager appears.
+- Copied/redirected setup and restoration probes use actual SIGINT, handler changes,
+  actual owned child and subsequent real phase ALRM. Both now preserve handlers,
+  prior masks and cancellation; setup starts no child and restoration reaps its
+  exact child. Additional cases interrupt the non-mutating mask query, mask/setter
+  before or after its effect, preserve pre-existing masks and retain real prlimit,
+  publication, cleanup, crypto/report and original-primary evidence.
+- The final affected suite passed 142 tests in 18.858 seconds; an additional
+  faithful restoration trace using unmodified signal.signal passed in 0.010
+  seconds. No full suite is claimed.
+- The initial affected run exposed suppressed pending phase cancellation when
+  Popen also failed; its failing log is retained, and the corrected boundary set
+  passes. Exact final affected outcome is under
+  `/workspace/artifacts/native-gpg-handlers-20261122/`. No full suite, stock,
+  native, network/auth/model, CI/SSH/push/merge or deployment runs in this unit.
+- All session/dependency/registry/ledger/default policy/helper and immutable GPG
+  inputs/projections remain unchanged. Native34 remains failed125 with unknown
+  cause; local signal/crypto/DAC checks do not prove native mount acceptance.
+  Fresh review, a root-scoped combined full and changed native35 remain required.
+- Allocation: 21:17:22–21:32:22 UTC, no extension. API-selected GPT-6.1 Sol/high
+  remains the builder; backend attestation is unavailable. No root private key
+  read/use/copy occurs; all test outputs are in the new owned artifact directory.
+
+
 ### November 23, 2026, 05:09 HKT — immutable GPG inputs and cancellation repair
 
 - Fresh review of 65bd26b found four defects despite its 669-test local full pass:

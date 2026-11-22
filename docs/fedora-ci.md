@@ -325,7 +325,7 @@ base64 bytes. Its maximum is 8 KiB; stock GPG encrypts through private pipes wit
 the fixed empty read-only payload ISO home and sole pinned public recipient directly.
 It creates no runtime home, key copy, keyring, trustdb or random-seed file. No
 plaintext file, argv, environment, public tail or fallback is written. The existing `/usr/bin/prlimit --core=0:0 -- /usr/bin/gpg` chain replaces a Python
-preexec callback. No signal mask is blocked or inherited across exec. GPG's
+preexec callback. No added blocked mask remains during Popen/exec or reaches the child. GPG's
 maximum five seconds is clipped to the original command/phase deadline and
 includes a reserved reap interval; ciphertext is capped at 16 KiB. A cleanup
 uncertainty has its own closed unavailable reason and cannot replace the engine's
@@ -368,10 +368,19 @@ use an unchanged empty 0500 home with actual UID1000 DAC write denial, not an
 immutable-mount or hostile-owner proof. The earlier research's failed bwrap setup
 is preserved separately; no confinement workaround is used in the product.
 
-Only the main-thread signal handlers are deferred across Popen return and exact
-owner publication. Prior handlers are restored and pending delivery invokes their
-original semantics immediately, including when process creation fails. No timer
-is reset; no Python preexec callback or inherited blocked mask is used. This is
+Only the fixed main-thread handlers are deferred across Popen return and exact
+owner publication. The e7689ba review found partial handler installation and
+interrupted restoration could orphan the phase handler. The repair snapshots all
+original handlers and obtains the prior mask with a non-mutating query first.
+Mask changes occur only inside protected handler-transition cleanup; restoration
+knowledge remains live until each setter takes effect, with one bounded
+restoration retry for an interrupted setter/mask operation. This is not a child,
+engine or workload retry and grants no additional time. All handlers and the prior
+mask are restored on exit; a failed restore cannot silently swallow later phase
+signals. Known pending setup cancellation invokes its original handler before any
+child launch. Pending publication/cancellation and failed-launch semantics remain.
+No handled signal stays newly blocked over Popen/exec, no Python preexec callback
+is used, and no timer or original deadline is reset. This is
 operational ownership protection, not a hostile-kernel hard-wall guarantee.
 One actual Popen owner remains only while reap/pipe cleanup is unconfirmed;
 subsequent collection is blocked, and reconciliation uses the original end time.
