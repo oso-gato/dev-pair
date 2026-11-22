@@ -24,15 +24,28 @@ through, including older selections, and never selects a replacement model.
 
 The runtime creates the operation directory before starting Codex. An existing
 directory suppresses another launch for that operation. The CLI writes its
-usual rollout under `/state/codex`. Private output and a successful completion
-receipt are written under `/state/turns/<operation>`, with a bounded summary on
-stdout. A failed or interrupted operation retains its directory for inspection.
+usual rollout under `/state/codex`. Private output and the turn receipt are
+written under `/state/turns/<operation>`. A completed turn emits a bounded
+summary on stdout.
+
+The entry allows 20 seconds for the CLI and up to two seconds to reconcile
+owned descendants. The launcher handles SIGTERM and SIGINT while the turn is
+running. Linux reparents detached descendants to the entry process, which
+signals children through pidfds after verifying kernel parentage. The entry
+confirms cleanup when the kernel reports it has no children left. The failure
+receipt records the stop reason and whether owned processes were reaped,
+cleanup was unresolved, or launch did not start.
+An interrupted operation retains its claim for inspection. A launcher stopped
+by SIGKILL can leave a claim without a receipt, which requires observation of
+the enclosing runtime before further action.
 
 The focused local fixture runs the exact pinned Codex 0.169.0 executable through
 the image entry, checks the model, effort, startup directive, prompt and synthetic
 bearer header on the wire, sees a completed assistant turn and verifies the
-persisted session rollout. It also checks that a duplicate dispatch produces no
-request. Run with a locally verified copy of the binary.
+persisted session rollout. It measures accepted TCP connections, HTTP requests,
+WebSocket upgrade attempts and Responses POST bodies before and after duplicate
+dispatch. All four deltas must be zero. Run with a locally verified copy of the
+binary.
 
 ```sh
 python3 tests/role_entry_stock.py --binary /path/to/pinned/codex --report /path/to/new-receipt.json

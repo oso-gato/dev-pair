@@ -1,5 +1,7 @@
 #!/usr/bin/python3
 """Image-owned gptbox assembly and fixed headless role entry."""
+from contextlib import suppress
+import ctypes
 import grp
 import hashlib
 import json
@@ -8,9 +10,11 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 import tomllib
 import uuid
 
@@ -30,6 +34,8 @@ STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 OFFLINE_KEY = b'dev-pair-offline-synthetic-not-a-credential'
 TURN_BYTES = 1024 * 1024
 TURN_SECONDS = 20
+TURN_CLEANUP_SECONDS = 2
+PR_SET_CHILD_SUBREAPER = 36
 ENV = {'HOME': '/home/gpt', 'CODEX_HOME': str(CODEX_HOME),
        'PATH': '/opt/dev-pair/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': '/tmp',
        'XDG_RUNTIME_DIR': '/run/user/1000', 'XDG_CACHE_HOME': '/cache/job',
@@ -290,14 +296,126 @@ def completed_turn(output):
     return ident
 
 
-def turn():
-    image = verify_files()
+def reap_turn(process):
+    # This standalone entry starts only the turn. Linux reparents its orphaned
+    # descendants here even when they have left the original process group.
+    deadline = time.monotonic() + TURN_CLEANUP_SECONDS
+    parent = str(os.getpid()).encode()
+    for _ in range(4096):
+        if time.monotonic() >= deadline:
+            return False
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if pid:
+            if process is not None and pid == process.pid:
+                process.returncode = os.waitstatus_to_exitcode(status)
+            continue
+        with os.scandir('/proc') as processes:
+            for count, entry in enumerate(processes):
+                if count >= 8192 or time.monotonic() >= deadline:
+                    return False
+                if not entry.name.isdigit():
+                    continue
+                # Pin the process before verifying direct kernel parentage.
+                with suppress(ProcessLookupError, FileNotFoundError, PermissionError):
+                    descriptor = os.pidfd_open(int(entry.name))
+                    try:
+                        with open(f'/proc/{entry.name}/status', 'rb') as source:
+                            status = source.read(4096)
+                        parents = [line.split()[1] for line in status.splitlines() if line.startswith(b'PPid:')]
+                        if parents == [parent]:
+                            signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    finally:
+                        os.close(descriptor)
+        time.sleep(.01)
+    return False
+
+
+def run_turn(argv, prompt, output, error, env):
+    cancelled = False
+
+    def request_stop(_signum, _frame):
+        nonlocal cancelled
+        cancelled = True
+
+    handled = (signal.SIGTERM, signal.SIGINT)
+    previous = {signum: signal.signal(signum, request_stop) for signum in handled}
+    process = None
+    launch_attempted = False
+    failure = None
+    cleanup = 'not-started'
+    try:
+        require(ctypes.CDLL(None).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0,
+                'owned process reaper unavailable')
+        descriptor = os.pidfd_open(os.getpid())
+        try:
+            signal.pidfd_send_signal(descriptor, 0)
+        finally:
+            os.close(descriptor)
+        deadline = time.monotonic() + TURN_SECONDS
+        if not cancelled:
+            launch_attempted = True
+            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=output, stderr=error,
+                                       cwd=WORK, env=env, start_new_session=True)
+            while not cancelled and (remaining := deadline - time.monotonic()) > 0:
+                try:
+                    process.communicate(input=prompt, timeout=min(.1, remaining))
+                except subprocess.TimeoutExpired:
+                    # communicate retains the pending input after its first wait.
+                    prompt = None
+                    continue
+                if process.returncode != 0:
+                    failure = 'codex-failed'
+                break
+            else:
+                failure = 'deadline'
+    except (OSError, RuntimeError):
+        failure = 'execution-failed'
+    finally:
+        try:
+            if launch_attempted:
+                cleanup = 'unresolved'
+                with suppress(OSError):
+                    if reap_turn(process):
+                        cleanup = 'reaped'
+            if process is not None:
+                with suppress(OSError):
+                    process.stdin.close()
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
+    if cancelled:
+        failure = 'cancelled'
+    if cleanup == 'unresolved' and failure is None:
+        failure = 'cleanup-failed'
+    return failure, cleanup
+
+
+def publish_turn(destination, result):
+    temporary_result = destination / 'result.pending'
+    with temporary_result.open('x') as record:
+        json.dump(result, record, sort_keys=True)
+        record.write('\n')
+        record.flush()
+        os.fsync(record.fileno())
+    temporary_result.rename(destination / 'result.json')
+    sync_directory(destination)
+
+
+def verify_turn_environment():
     status = dict(line.split(':', 1) for line in Path('/proc/self/status').read_text().splitlines() if ':' in line)
     interfaces = [line.split(':', 1)[0].strip() for line in Path('/proc/net/dev').read_text().splitlines()[2:]]
     require((os.getuid(), os.getgid()) == (1000, 1000) and os.getgroups() in ([], [1000]) and
             status['NoNewPrivs'].strip() == '1' and
             all(int(status[name].strip(), 16) == 0 for name in ('CapEff', 'CapPrm', 'CapInh', 'CapBnd', 'CapAmb'))
             and interfaces == ['lo'], 'isolated headless runtime required')
+
+
+def turn():
+    image = verify_files()
+    verify_turn_environment()
     selection, prompt, key = turn_request(image.get('role'))
     os.umask(0o077)
     for path in (CODEX_HOME, STATE / 'sqlite', STATE / 'logs', STATE / 'turns'):
@@ -311,24 +429,21 @@ def turn():
             '-c', 'model_reasoning_effort=' + json.dumps(selection['effort']),
             'exec', '--skip-git-repo-check', '--json', '--model', selection['model'], '-C', str(WORK), '-']
     with (destination / 'events.jsonl').open('xb') as output, (destination / 'stderr.txt').open('xb') as error:
-        process = subprocess.run(argv, input=prompt, stdout=output, stderr=error,
-                                 cwd=WORK, env={**ENV, 'CODEX_API_KEY': key}, timeout=TURN_SECONDS)
+        failure, cleanup = run_turn(argv, prompt, output, error, {**ENV, 'CODEX_API_KEY': key})
+        if failure:
+            print(f'gptbox turn stopped ({failure}), owned cleanup {cleanup}', file=sys.stderr)
         os.fsync(output.fileno())
         os.fsync(error.fileno())
-    require(process.returncode == 0, 'stock Codex returned a failure')
-    events = fixed_read(destination / 'events.jsonl', TURN_BYTES)
-    result = {'schema': 1, 'status': 'completed-turn', 'operation': selection['operation'],
+    result = {'schema': 1, 'operation': selection['operation'],
               'role': selection['role'], 'model': selection['model'], 'effort': selection['effort'],
-              'session_uuid': completed_turn(events), 'events_sha256': hashlib.sha256(events).hexdigest(),
-              'events_bytes': len(events), 'transport': 'local-synthetic', 'runtime_admitted': False}
-    temporary_result = destination / 'result.pending'
-    with temporary_result.open('x') as record:
-        json.dump(result, record, sort_keys=True)
-        record.write('\n')
-        record.flush()
-        os.fsync(record.fileno())
-    temporary_result.rename(destination / 'result.json')
-    sync_directory(destination)
+              'transport': 'local-synthetic', 'runtime_admitted': False, 'owned_cleanup': cleanup}
+    if failure:
+        publish_turn(destination, {**result, 'status': 'failed-turn', 'reason': failure})
+        raise RuntimeError('fixed role turn failed')
+    events = fixed_read(destination / 'events.jsonl', TURN_BYTES)
+    result.update(status='completed-turn', session_uuid=completed_turn(events),
+                  events_sha256=hashlib.sha256(events).hexdigest(), events_bytes=len(events))
+    publish_turn(destination, result)
     print(json.dumps(result, sort_keys=True))
 
 
