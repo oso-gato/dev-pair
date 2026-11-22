@@ -2,6 +2,26 @@
 
 ## Latest continuation checkpoint
 
+### November 23, 2026, 06:44 HKT — local checklist and restart handoff
+
+- The owner’s standing model policy applies to new and resumed work.
+  API-select GPT-6.2 Astra High for coordination and independent review, Sol
+  High for implementation and host validation, and Sol Medium for mechanical
+  work. Extra High requires a specific, bounded justification. Backend model
+  attestation remains unavailable.
+- Independent local review accepted the checklist at `443480afb97efd1436ce1d3f9fc6d773fa91962d`
+  and the repaired handoff at `d06589bf2d26f318571634c8e3f7f94b9bf24f41`.
+  Integration `1ad911f948d8051245a71a1ab5dbec4f914ed0a5` preserves both sets
+  of file bytes. The handoff’s 4 restart and 23 ledger checks are recorded
+  in the builder’s collation of the independent review.
+- Draft PR 13 remains at `4923db399aa301558b65d2a77f9026262955ab2a`.
+  Native 36 passed 708 hosted checks and then stopped at a mount boundary
+  during tooling image load, before Fedora boot. The image-copy worker
+  remained unresolved and scratch was preserved. [Run 36](https://github.com/oso-gato/dev-pair/actions/runs/45077288701)
+- Role-entry and nested-runtime source repairs are in progress. The next
+  integration needs a producer that builds, seals and exports the development
+  gptbox with genuine Distrobox initialization for the nested DevBox launcher.
+
 ### November 23, 2026, 06:10 HKT — model migration and storage checkpoint
 
 - The owner explicitly migrated active and resumed development work to
