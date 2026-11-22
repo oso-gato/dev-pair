@@ -165,3 +165,28 @@ fixed typed evidence, not a payload-execution or cleanup claim. Raw image
 launcher/payload diagnostic tails are withheld. No full native image, storage
 quota, timing fit, authenticated runtime or renewal acceptance follows from local
 source tests.
+
+
+The adapter's rootless engine now receives a fixed `XDG_CONFIG_HOME` pointing to
+an empty, protected root-owned `CONTROL/xdg-config` directory. HOME remains the
+empty protected controller home, and `CONTAINERS_CONF` stays immutable. Existing
+symlink/ownership/mode/content conflicts reject; no agent-writable mount includes
+this directory. This bypasses a source-proven Podman 5.8.1 default that attempts
+`HOME/.config` initialization. It does not prove the historical signed-load cause
+or successful behavior of the Fedora downstream engine.
+
+Only the exact source/context/UID-bound signed-load diagnostic scope retains
+per-stream captured byte counts, SHA256 and completion/control flags before
+image tails are suppressed. Missing/unverified capture is not published as a
+complete empty stream. Complete verified exit-1 payloads can match only the exact
+bare single-line reported stat ENOENT/EACCES or ownership forms at the fixed old
+HOME config path. These are reported-message classifications, not causal facts.
+Other paths, errno text, ANSI/multiline/truncated text and later Error-prefixed
+wrappers remain unknown and hash-only. No raw text/environment/config is added.
+
+The typed payload field is separately bounded to 1 KiB and validated again by
+the guest public projection and controller report consumer. Existing native
+failure/launcher, command capture, report, timeout/resource/security and cleanup
+bounds stay unchanged. Matching native Podman/Fedora and distinct-owner DAC
+acceptance remain required; local synthetic-engine and real-pipe tests do not
+establish them. Standalone minimal preparation is unchanged.

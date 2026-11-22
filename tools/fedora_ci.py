@@ -24,7 +24,7 @@ import time
 import urllib.request
 
 from fedora_ci_guest import (REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS,
-                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor, STARTUP_MARKER, validate_startup_witness)
+                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor, STARTUP_MARKER, validate_startup_witness, signed_load_projection)
 import public_inputs as public
 import fedora_oci
 
@@ -531,6 +531,21 @@ def parse_serial(data, expected_source, expected_guest, expected_inputs):
     validate_inputs(expected_inputs)
     require(result['inputs'] == expected_inputs and result['inputs']['source_sha'] == expected_source, 'guest public input identity mismatch')
     require(type(result['identity']) is dict and type(result['diagnostics']) is dict and type(result['initialization']) is dict, 'invalid guest evidence objects')
+    operations=result['diagnostics'].get('public_operations',{})
+    if type(operations) is dict:
+        for name in ('prepare','adapter'):
+            group=operations.get(name)
+            if type(group) is not dict:continue
+            for key in ('records','recent_metadata'):
+                rows=group.get(key,[])
+                if type(rows) is not list:continue
+                for entry in rows:
+                    if type(entry) is not dict or 'signed_load_payload' not in entry:continue
+                    value=entry['signed_load_payload']
+                    if value=={'availability':'unavailable'}:continue
+                    bound={**entry,'diagnostic_identity':value.get('identity') if type(value) is dict else None}
+                    require(signed_load_projection(bound,expected_inputs,'prepare' if name=='prepare' else 'maintenance-gptbox')==value,
+                            'invalid signed load public payload evidence')
     required = set(GUEST_PHASES)
     require(type(result['phases']) is dict and set(result['phases']) == required, 'missing guest phases')
     for phase in result['phases'].values():

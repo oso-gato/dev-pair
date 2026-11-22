@@ -1210,6 +1210,53 @@ def launcher_projection(value,context=None):
     except (ValueError,KeyError,TypeError):return unavailable
 
 
+def signed_load_projection(entry,expected,phase='maintenance-gptbox'):
+    unavailable={'availability':'unavailable'}
+    try:
+        identity=entry.get('diagnostic_identity');value=entry.get('signed_load_payload')
+        require(type(identity) is dict and set(identity)=={'source_sha','context_sha256','phase'} and
+                identity['source_sha']==expected['source_sha'] and identity['context_sha256']==expected['context_sha256'] and
+                identity['phase']==phase=='maintenance-gptbox' and entry.get('step')=='candidate-image' and
+                entry.get('operation_id')=='candidate-native-executor','Signed load scope')
+        keys={'schema','availability','context_sha256','uid','suboperation','launch_handle_observed','control_verified','status','streams','classification'}
+        require(type(value) is dict and set(value) in (keys,keys|{'identity'}) and type(value['schema']) is int and value['schema']==1 and
+                value['availability'] in ('observed','partial','unavailable') and value['context_sha256']==identity['context_sha256'] and
+                type(value['uid']) is int and 1000<=value['uid']<2**32 and value['suboperation']=='load','Signed load schema')
+        if 'identity' in value:require(value['identity']==identity,'Signed load identity')
+        require(type(value['launch_handle_observed']) is bool and type(value['control_verified']) is bool,'Signed load flags')
+        status=value['status'];verified=value['control_verified']
+        require((verified and value['launch_handle_observed'] and type(status) is int and 0<=status<=255 and
+                 entry.get('relay_verified') is True and type(entry.get('native_exit_status')) is int and entry['native_exit_status']==status) or
+                (not verified and status is None),'Signed load control evidence')
+        streams=value['streams'];require(type(streams) is dict and set(streams)=={'stdout','stderr'},'Signed load streams')
+        for stream in streams.values():
+            require(type(stream) is dict and set(stream)=={'bytes','sha256','complete'} and type(stream['complete']) is bool,'Signed load stream schema')
+            count=stream['bytes'];digest=stream['sha256']
+            require((count is None and digest is None and not stream['complete']) or
+                (type(count) is int and 0<=count<=4194304 and type(digest) is str and re.fullmatch('[0-9a-f]{64}',digest) and
+                 (count>0 or stream['complete'] and digest==EMPTY_SHA256)),'Signed load stream bounds')
+        complete=all(v['complete'] for v in streams.values())
+        require(sum(v['bytes'] for v in streams.values() if v['bytes'] is not None)<=4194304 and
+            (not complete or verified) and (value['availability']=='observed')==complete and
+            (value['availability']!='partial' or any(v['bytes'] is not None for v in streams.values())) and
+            (value['availability']!='unavailable' or all(v['bytes'] is None for v in streams.values())),'Signed load completion')
+        classification=value['classification']
+        require(type(classification) is dict and set(classification)=={'family','path_role'} and classification['family'] in ('unknown','reported-owner','reported-stat-enoent','reported-stat-eacces'),'Signed load family')
+        if classification['family']=='unknown':require(classification['path_role']=='none','Unknown signed load path')
+        else:
+            forms={'reported-owner':b'path "/usr/local/libexec/dev-pair-gptbox/home/.config" exists and it is not owned by the current user\n',
+                'reported-stat-enoent':b'stat /usr/local/libexec/dev-pair-gptbox/home/.config: no such file or directory\n',
+                'reported-stat-eacces':b'stat /usr/local/libexec/dev-pair-gptbox/home/.config: permission denied\n'}
+            message=forms[classification['family']]
+            require(complete and status==1 and streams['stdout']['bytes']==0 and
+                (streams['stderr']['bytes'],streams['stderr']['sha256'])==(len(message),hashlib.sha256(message).hexdigest()) and
+                classification['path_role']=='old-home-config','Signed load family evidence')
+        result={'identity':dict(identity),**value}
+        require(len(json.dumps(result,separators=(',',':')).encode())<=1024,'Signed load projection bound')
+        return result
+    except (ValueError,KeyError,TypeError,AttributeError):return unavailable
+
+
 def native_failure_projection(entry,expected,phase=None):
     unavailable={'availability':'unavailable'}
     try:
@@ -1293,6 +1340,7 @@ def public_diagnostics(state_root, expected, source=None):
                     for item in record.get('recent', [])[-4:]]
             for recent, item in zip(selected[name]['recent_metadata'], record.get('recent', [])[-4:]):
                 recent['native_failure']=native_failure_projection(item,expected,'prepare' if name=='prepare' else 'maintenance-gptbox')
+                if 'signed_load_payload' in item:recent['signed_load_payload']=signed_load_projection(item,expected,'prepare' if name=='prepare' else 'maintenance-gptbox')
                 if item.get('operation') in ('selinux-enforcement', 'resolved-service-identity'):
                     recent['public_stdout_tail'] = safe_text(item.get('stdout_tail', ''), 300)
                     recent['public_stderr_tail'] = safe_text(item.get('stderr_tail', ''), 300)
@@ -1311,6 +1359,7 @@ def public_diagnostics(state_root, expected, source=None):
                         'sudo_denials': {item['operation_id']: item.get('sudo_denial')}})
                     entry['sudo_evidence'] = projected
                 entry['native_failure']=native_failure_projection(item,expected,'prepare' if name=='prepare' else 'maintenance-gptbox')
+                if 'signed_load_payload' in item:entry['signed_load_payload']=signed_load_projection(item,expected,'prepare' if name=='prepare' else 'maintenance-gptbox')
                 for stream in ('stdout', 'stderr'):
                     text = item.get(stream + '_tail', '')
                     entry[stream + '_tail'] = safe_text(text, 1500)

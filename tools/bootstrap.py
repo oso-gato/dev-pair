@@ -305,6 +305,30 @@ def launcher_summary(raw, complete, expected_unit=None):
     except (ValueError,UnicodeError):return unavailable
 
 
+SIGNED_LOAD_OWNER_ERROR = b'path "/usr/local/libexec/dev-pair-gptbox/home/.config" exists and it is not owned by the current user'
+SIGNED_LOAD_ERRORS={'reported-owner':SIGNED_LOAD_OWNER_ERROR+b'\n',
+    'reported-stat-enoent':b'stat /usr/local/libexec/dev-pair-gptbox/home/.config: no such file or directory\n',
+    'reported-stat-eacces':b'stat /usr/local/libexec/dev-pair-gptbox/home/.config: permission denied\n'}
+
+
+def signed_load_payload(buffers, selection, uid, *, launched, verified, status, complete):
+    """Hash-only captured streams; matched forms are diagnostics, never causes."""
+    if selection is None or selection.get('suboperation')!='load':return None
+    streams={}
+    for name in ('stdout','stderr'):
+        data=bytes(buffers[name]);known=bool(data) or complete
+        streams[name]={'bytes':len(data) if known else None,
+                       'sha256':hashlib.sha256(data).hexdigest() if known else None,'complete':complete}
+    family='unknown';role='none'
+    if complete and status==1 and not buffers['stdout']:
+        for name,form in SIGNED_LOAD_ERRORS.items():
+            if bytes(buffers['stderr'])==form:family=name;role='old-home-config';break
+    return {'schema':1,'availability':'observed' if complete else 'partial' if any(buffers.values()) else 'unavailable',
+            'context_sha256':selection['context_sha256'],'uid':int(uid),'suboperation':'load',
+            'launch_handle_observed':launched,'control_verified':verified,'status':status if verified else None,
+            'streams':streams,'classification':{'family':family,'path_role':role}}
+
+
 class Commands:
     """Bounded execution with secret-safe, explicitly public diagnostics."""
     deadline = None
@@ -338,16 +362,16 @@ class Commands:
         if type(context) is not str or not re.fullmatch('[0-9a-f]{64}',context) or type(uid) is not str or not re.fullmatch('[1-9][0-9]{0,9}',uid):return None
         unit='dev-pair-gptbox-'+context+'.service';control='/usr/local/libexec/dev-pair-gptbox'
         fixed=('/usr/bin/systemd-run','--unit='+unit,'--description=dev-pair-owned-'+unit,'--quiet','--wait','--collect','--service-type=exec','--uid=dp-maint')
-        if args[:8]!=fixed or len(args)<23 or not args[8].startswith('--property=RuntimeMaxSec='):return None
+        if args[:8]!=fixed or len(args)<24 or not args[8].startswith('--property=RuntimeMaxSec='):return None
         try:
             duration=float(args[8].split('=',2)[2])
             if not math.isfinite(duration) or not 0<duration<=600:return None
         except ValueError:return None
         tail=('--property=TimeoutStopSec=10','--property=KillMode=control-group','--property=MemoryMax=2G','--property=TasksMax=512','--property=CPUQuota=100%',
             '/usr/bin/env','-i','PATH='+control+'/bin:/usr/bin:/usr/sbin:/bin','HOME='+control+'/home','USER=gpt','LOGNAME=gpt',
-            'XDG_RUNTIME_DIR=/run/user/'+uid,'CONTAINERS_CONF='+control+'/containers.conf','DBX_CONTAINER_MANAGER=podman')
-        if args[9:23]!=tail:return None
-        rest=args[23:];work='/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/image-work';wrapper=control+'/bin/podman'
+            'XDG_RUNTIME_DIR=/run/user/'+uid,'XDG_CONFIG_HOME='+control+'/xdg-config','CONTAINERS_CONF='+control+'/containers.conf','DBX_CONTAINER_MANAGER=podman')
+        if args[9:24]!=tail:return None
+        rest=args[24:];work='/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/image-work';wrapper=control+'/bin/podman'
         temporary=('/usr/bin/env','TMPDIR='+work+'/image-copy',wrapper)
         copied=rest[:3]==temporary
         if copied:operation=rest[3:]
@@ -635,6 +659,8 @@ class Commands:
             input_text is None and not probe and bool(self.native_prefix) and
             re.fullmatch(r'dev-pair-initialize-prepare-[0-9a-f]{8}', self.native_prefix) is not None)
         maintenance_launcher=self.maintenance_launcher_selection(original,input_text,probe)
+        signed_load_selected=(maintenance_launcher is not None and self._adapter_image_binding is not None and
+                              maintenance_launcher['suboperation']=='load')
         launcher_selected=tailscale_launcher or maintenance_launcher is not None
         # Existing user transient units are already native executors. Tighten
         # their ceilings rather than putting them outside the phase budget.
@@ -666,6 +692,7 @@ class Commands:
         process = None
         completed = False
         capture_complete = False
+        payload_eof=set()
         primary_pending = False
         special_result = None
         transport = None
@@ -895,6 +922,7 @@ class Commands:
                     failure_point='pipe-read'
                     block = os.read(descriptor, 8192 if decoder is not None and key.data == 'stderr' else min(8192, maximum - total + 1))
                     if not block:
+                        if key.data in ('stdout','stderr'):payload_eof.add(key.data)
                         if launcher_selected and key.data.startswith('launcher_'):launcher_eof.add(key.data)
                         selector.unregister(key.fileobj)
                         continue
@@ -1012,6 +1040,17 @@ class Commands:
                     process.stdin.close()
                 process.stdout.close()
                 process.stderr.close()
+            payload=None
+            if signed_load_selected:
+                try:
+                    verified=(relay_verified and decoder is not None and decoder.control is not None and
+                              decoder.control['uid']==int(self._adapter_image_binding[1]))
+                    payload=signed_load_payload(buffers,maintenance_launcher,self._adapter_image_binding[1],
+                        launched=process is not None,verified=verified,
+                        status=decoder.control['status'] if verified else None,
+                        complete=bool(verified and capture_complete and cleanup_error is None and payload_eof=={'stdout','stderr'}))
+                except Exception:
+                    payload={'availability':'unavailable'};callback_failed=True
             if probe and self.diagnostic:
                 actual = process.returncode if process is not None else None
                 notify(self.diagnostic,buffers,actual if actual is not None and actual not in ok else status)
@@ -1022,6 +1061,7 @@ class Commands:
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None,
                           'launcher_handle_observed':process is not None}
                 if failure_witness is not None:record['native_failure']=failure_witness
+                if payload is not None:record['signed_load_payload']=payload
                 if sudo_probe is not None:
                     record['sudo_denial'] = sudo_denial_projection(sudo_probe['role'], bytes(buffers['stdout']), bytes(buffers['stderr']),
                         complete=capture_complete and cleanup_error is None,

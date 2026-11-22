@@ -152,7 +152,7 @@ class Gptbox(Bootstrap):
                 if not current_diagnostic_recorded:raise Blocked('current command diagnostic record unavailable')
                 path = self.target + '/diagnostics.json'
                 history = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
-                selected = {key: record[key] for key in ('operation_id','step','admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status', 'accepted_exit', 'elapsed_seconds','native_failure') if key in record}
+                selected = {key: record[key] for key in ('operation_id','step','admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status', 'accepted_exit', 'elapsed_seconds','native_failure','signed_load_payload') if key in record}
                 latest = history['recent'][-1] if history['recent'] else None
                 failed = bool(latest is not None and history['failures'] and history['failures'][-1] == latest)
                 if latest is not None:
@@ -189,9 +189,10 @@ class Gptbox(Bootstrap):
         self.directory('/usr/local/libexec', mode=0o755)
         self.directory(CONTROL, mode=0o755)
         self.directory(CONTROL + '/home', mode=0o755)
+        self.directory(CONTROL + '/xdg-config', mode=0o755)
         self.directory(CONTROL + '/bin', mode=0o755)
         self.directory(CONTROL + '/empty-hooks', mode=0o755)
-        if any(self.path(CONTROL + '/empty-hooks').iterdir()) or any(self.path(CONTROL + '/home').iterdir()):
+        if any(self.path(CONTROL + '/empty-hooks').iterdir()) or any(self.path(CONTROL + '/home').iterdir()) or any(self.path(CONTROL + '/xdg-config').iterdir()):
             raise Blocked('controller home/hooks contain undeclared parent integration')
         self.atomic(CONTROL + '/containers.conf', '[containers]\nnetns="private"\n[engine]\nevents_logger="file"\n', mode=0o444)
         storage = '/var/lib/dev-pair/maintenance/images'
@@ -221,7 +222,8 @@ class Gptbox(Bootstrap):
                          '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
                          '--property=CPUQuota=100%', '/usr/bin/env', '-i', 'PATH=' + str(self.path(CONTROL + '/bin')) + ':/usr/bin:/usr/sbin:/bin',
                          'HOME=' + str(self.path(CONTROL + '/home')), 'USER=gpt', 'LOGNAME=gpt',
-                         'XDG_RUNTIME_DIR=/run/user/' + uid, 'CONTAINERS_CONF=' + str(self.path(CONTROL + '/containers.conf')),
+                         'XDG_RUNTIME_DIR=/run/user/' + uid, 'XDG_CONFIG_HOME=' + str(self.path(CONTROL + '/xdg-config')),
+                         'CONTAINERS_CONF=' + str(self.path(CONTROL + '/containers.conf')),
                          'DBX_CONTAINER_MANAGER=podman']
 
     def record(self, name, value):

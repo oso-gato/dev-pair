@@ -3,6 +3,44 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 03:33 HKT — protected XDG config and signed-load payload evidence
+
+- Native33 on 505f591 passed 589 hosted tests and completed host prerequisites in
+  520.262 seconds under its existing 600-second cap. The first signed load returned
+  1 after 4.236 seconds with complete verified relay and ample command/image time
+  remaining. Images, real assembly and storage samples were not reached. Exact
+  owned reconciliation and outer cleanup passed; suppressed payload text means the
+  historical cause remains unknown.
+- Exact official Podman 5.8.1 source proves absent XDG_CONFIG_HOME resolves HOME,
+  attempts HOME/.config creation and checks effective ownership. The root-owned
+  empty immutable HOME conflicts with that default. The adapter now creates only
+  a fixed protected empty root-owned CONTROL/xdg-config and passes explicit
+  XDG_CONFIG_HOME. HOME, immutable containers.conf, storage flags, slirp, resources,
+  privilege/security profiles and all deadlines/cleanup remain unchanged. Symlink,
+  foreign-owner, mode and content conflicts block. The standalone minimal builder
+  function is unchanged and receives no new behavior.
+- Only the already selected source/context/UID-bound signed load gains typed
+  per-stream captured byte counts/hashes and completeness/control evidence before
+  image-tail suppression. Complete verified exit-1 payloads match only whole bare
+  stat ENOENT/EACCES or ownership lines at the independently fixed old HOME config
+  path. These classify reported text only; prefixed/multiline/ANSI/unknown or partial
+  messages stay unknown/hash-only. Projection/collector errors retain the original
+  primary; callback-only diagnostic failure remains closed, and cleanup uncertainty
+  remains separate. Guest and controller both validate the new bounded field.
+- Real framed-payload/launcher channel tests, exact producer-to-selector coverage,
+  protected directory conflicts and report-consumer/privacy/failure checks are in
+  `/workspace/artifacts/adapter-xdg-load-20261122/`. Local UID/SELinux/manager
+  boundaries are injected. No matching Podman/Fedora engine or distinct-root/DAC
+  proof is claimed. Actual changed native validation is required after fresh review;
+  no engine/native/stock/auth/model/SSH/deployment action occurred in this unit.
+- The reviewed e6 registry/session/ledger bytes remain untouched. Its independent
+  source review passed; actual changed stock acceptance remains open. Startup
+  standards stay hash-only, fixture metadata is not real API selection, and all
+  runtime/job/nested/renewal/storage/auth/release/Hostinger gates remain open.
+  Builder API selection remains GPT-6.1 Sol/high, backend unattested. This source
+  allocation is 19:17:13–19:42:13 UTC without extension.
+
+
 ### November 23, 2026, 03:14 HKT — supervisor SC-R1/2/3 source repair
 
 - The frozen 5d2b73d review found three private-registry integrity defects:
