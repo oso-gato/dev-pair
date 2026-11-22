@@ -2,6 +2,77 @@
 
 ## Latest continuation checkpoint
 
+### November 22, 2026, 18:08 HKT — reviewed diagnostics and offline inventory integration
+
+- Native [run21](https://github.com/oso-gato/dev-pair/actions/runs/45007529031),
+  exact `eceee68f9046080fd5e517af0be7c0a5cc595c04`, passed377 hosted tests
+  in56.083s, required slirp capability checks and actual signed OCI import/save-back
+  verification on Podman4.9.3. Tooling STEP2 then failed with `while running runtime:
+  exit status125`; the primary build error was retained. Cleanup failed because
+  launched-worker termination remained unresolved, preserving scratch. Fedora did
+  not boot; this scope is closed. Runner image/kernel changed, but no specific
+  runtime, kernel, network or timeout cause is proved. Evidence:
+  `/workspace/artifacts/fedora-ci-run-45007529031-controller.json` and `.log`;
+  source diagnosis `/workspace/artifacts/resume-20261122/run21-runtime-diagnosis.json`.
+- Diagnostic `48b0d89` added fixed stage markers within the existing single timed
+  tooling operation and selected OCI runtime metadata. Local shell checks preserve
+  exact success/nonzero/timeout status even when marker writes fail. Fresh review
+  required correction because failed runtime-info queries emitted the raw selected
+  JSON before projection. That failure and CHANGES_REQUIRED receipt remain at
+  `/workspace/artifacts/tooling-diagnostics-review-48b0d89/review.json`, SHA256
+  `1152dd8e84d776dd725356b328fa363e0b45b8cf5f57de7f868afb83b704b391`.
+  Repair `73e7717d7f7d4609044e1384ced721eee8cd3dd4` suppresses raw failure
+  output only for that fixed query; bounded capture, first-primary failure,
+  unresolved cleanup and storage/deadline rules remain unchanged. Fifteen focused
+  and386 full tests passed. Evidence:
+  `/workspace/artifacts/runtime-output-r1-73e7717/evidence.json`, SHA256
+  `187746ee2634cea65529bbff53f75d071da66f448be2437869e9ceddfb7539e9`.
+  Fresh Astra High review PASS_SOURCE_LOCAL:
+  `/workspace/artifacts/runtime-output-review-73e7717/review.json`, SHA256
+  `bf289b2f264a7371277b4080f6c914932c54eb66cc410572bbdbc433527e6b70`.
+- Inventory review of `718dd07` found a conditional PTY proof-retention defect.
+  Separate repair `82efae1aefa9db38b6075796120747fced2694ff` retains bounded
+  owned payload across input and the sole permitted completion poll, including
+  fragmented JSON and transactional acceptance rollback. Thirty-one focused and383
+  full tests passed. Fresh Astra High review PASS_SOURCE_LOCAL:
+  `/workspace/artifacts/inventory-pty-review-82efae1/review.json`, SHA256
+  `f31847e5a456d70e582bfd4147921a714154130dcfca70be066afbe86178b6fb`.
+- One separately authorized immutable stock validation of exact `82efae1` passed
+  all32 mandatory actions plus9 baseline checks in8.359s, with34 requests and
+  57,111 captured bytes. CLI exit0; harness exit2 truthfully retains overall
+  BLOCKED. Owned cleanup completed. PTY retired at input; optional completion
+  poll was unused. Actual-thread readonly SQLite goal state completed with
+  integrity `ok`. Positive search returned actual source-bound deferred metadata;
+  empty whitespace/zero search results do not prove handler validator execution.
+  No discovered-agent effect ran. Prior four changed-source experiments retain
+  their failures. Receipt:
+  `/workspace/artifacts/inventory-final-stock-82efae1/evidence.json`, SHA256
+  `5dc8d91a64f1e1372568201aeed6175d05867c801a324759f2306acc466b4427`;
+  raw report SHA256
+  `443b0b0b1a3124db1821d47aebf85cb2ffb0751560e42e0bd7791824a3426e9f`.
+- Disjoint reviewed components merge exactly at `d625df9`; computed merge tree
+  `0dd85ff21738cab1dbad6960db7191c1df813c1c` matches all integrated bytes.
+  Only README DR2.5/DR2.7 and this checkpoint change before one bounded combined
+  full suite on the final documentation commit. Exact component/tree/test receipt:
+  `/workspace/artifacts/integration-native-inventory-20261122/`.
+- After a passing combined result, one changed-candidate Fedora22 attempt is
+  recorded under the same scope: configuration/modes/labels/listeners, root and
+  dp-maint boundaries, signed preparation, maintenance assembly and owned cleanup
+  as far as execution reaches. CI must build/verify fresh exact published-HEAD
+  inputs. No unchanged retry or production promotion. Limits remain hosted60min;
+  controller3300s (setup540/VM2640/cleanup120), timed tooling540s/kill10s;
+  guest6GiB/2CPU/32GiB virtual; outer8GiB/3CPU/1024PIDs; overlay16GiB,
+  overhead4GiB, host reserve3GiB, guest reserve8GiB; logs8MiB/report64KiB.
+  Failed-worker uncertainty remains cleanupFAIL. No security/network/storage
+  exception, extra native retry, real auth/model call or VPS operation is included.
+- A12 session selections remain API-recorded `gpt-6.1-sol/high` sole builder and
+  fresh `gpt-6-astra/high` reviewer/coordinator local subagents. Backend attestation
+  and root model/effort are unavailable. The stock catalog's synthetic `gpt-5.5`
+  fixture is separate from worker selection. Complete tool/provider coverage,
+  cross-job ownership, renewal, hard storage, nested placement and all outstanding
+  deployment/recovery gates remain required. The next ledger recovery source
+  slice is queued separately and has not begun.
+
 ### November 22, 2026, 17:25 HKT — reviewed tooling repair
 
 - [Run20](https://github.com/oso-gato/dev-pair/actions/runs/45005980108), exact
