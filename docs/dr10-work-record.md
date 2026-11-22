@@ -3,7 +3,7 @@
 ## Latest continuation checkpoint
 
 
-### November 23, 2026, 00:54 HKT — combined native source freeze and local checks
+### November 23, 2026, 00:53 HKT — combined native source freeze and local checks
 
 - Session `1c2ede3` merged exactly into this isolated native worktree; session
   implementation, helper, fixture and audit files remain byte-identical. The
@@ -12,20 +12,20 @@
 - Initial launcher checks passed five tests. A broader 94-test run had one new
   test error: its intended discovery-owner mutation selected the first DNS53
   row instead, which correctly retained the existing loopback allowance. The
-  corrected test changes the intended5355 row; no product predicate changed.
+  corrected test changes the intended 5355 row; no product predicate changed.
   The preserved corrected affected run passed 100 tests, including real owned
   pipes/children, pre-interrupt status, absent relay despite parsed success,
   deadline/output rejection, exact property timing, listener identities and
   resolved configuration/source-ordering regressions.
 - The final frozen candidate now receives the one combined full suite, bounded
-  to 300 seconds/8MiB and the remaining source allocation ending17:07:34 UTC.
+  to 300 seconds / 8 MiB and the remaining source allocation ending 17:07:34 UTC.
   All existing execution/phase/cleanup limits remain unchanged. Fresh review
   remains required before publication or any separately authorized native run.
   API-selected Sol/high remains backend-unattested; this unit makes no engine,
   stock, native, network, authentication/model, VPS, CI or deployment call.
 
 
-### November 23, 2026, 00:53 HKT — ephemeral resolved listener identity batch
+### November 23, 2026, 00:50 HKT — ephemeral resolved listener identity batch
 
 - The independent preparation read reduction follows the launcher diagnostic;
   it does not attribute native30's failure or predict runtime savings. In one
@@ -45,7 +45,7 @@
   authorized stock/native proof remain required; no runtime admission follows.
 
 
-### November 23, 2026, 00:49 HKT — native30 launcher diagnostic source slice
+### November 23, 2026, 00:48 HKT — native30 launcher diagnostic source slice
 
 - Actual native30 passed 526 hosted tests and reached the Tailscale signed-package
   step. The owned launcher exited 1 before interruption with no relay frame;
