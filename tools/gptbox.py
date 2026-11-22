@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Actual confined maintenance Distrobox assembly and probe-only controlled entry."""
+"""Confined maintenance Distrobox assembly and controlled role entry."""
 import argparse
 import contextlib
 import hashlib
@@ -18,6 +18,7 @@ import time
 
 from bootstrap import Bootstrap, Blocked, STATE, Commands, PrepareCost, github_keys, operator_password, validate_sources
 import candidate
+from gptbox_runtime import TURN_READONLY_MOUNTS
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
@@ -313,15 +314,26 @@ class Gptbox(Bootstrap):
         return item
 
     def enter(self, identity, sealed, operation):
-        if operation not in ('probe', 'version'):
-            raise Blocked('job/auth/model execution is not admitted')
+        if operation not in ('probe', 'version', 'turn'):
+            raise Blocked('unsupported fixed role entry')
         before = self.inspect_container(identity, sealed)
         if before['State']['Status'] != 'running':
             raise Blocked('entry requires an already running exact target; no auto-create/start fallback')
+        if operation == 'turn':
+            expected = {'/work/job': True, '/state': True, '/cache/job': True,
+                        **dict.fromkeys(map(str, TURN_READONLY_MOUNTS), False)}
+            actual = [mount for mount in before['Mounts'] if mount.get('Type') == 'bind']
+            if (len(actual) != len(expected)
+                    or {mount['Destination']: mount.get('RW') for mount in actual} != expected
+                    or not before['State'].get('StartedAt')):
+                raise Blocked('headless role entry requires the exact running job mounts')
         output = self.execute(str(self.path(CONTROL + '/distrobox-enter')),
                           '--name', identity, '--no-tty', '--no-workdir', '--clean-path', '--',
-                          '/usr/bin/python3', RUNTIME, 'entry', operation, timeout=30)
-        self.inspect_container(identity, sealed)
+                          '/usr/bin/python3', '-I', RUNTIME, 'entry', operation, timeout=30)
+        after = self.inspect_container(identity, sealed)
+        if operation == 'turn' and (after['State']['Status'] != 'running' or
+                                   before['State']['StartedAt'] != after['State'].get('StartedAt')):
+            raise Blocked('runtime changed during headless entry; inspect durable turn state')
         return output
 
     def ready(self, identity, sealed, previous_start=None):
@@ -584,6 +596,7 @@ class Gptbox(Bootstrap):
         files = {'codex': Path(context, 'codex').read_bytes(), 'distrobox-init': self.scripts['distrobox-init'],
                  'runtime.py': runtime}
         inputs = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
+                  'role': 'maintenance',
                   'files': {'/opt/dev-pair/bin/codex': sha(files['codex']), '/usr/bin/distrobox-init': sha(files['distrobox-init']), RUNTIME: sha(runtime)}}
         input_digest=sha(json.dumps(inputs,sort_keys=True).encode()+b'\n')
         # Match the pinned upstream setup_dnf availability resolution; aliases
