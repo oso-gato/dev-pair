@@ -164,3 +164,38 @@ Positions are diagnostic only and are unresolved unless the original pair is
 unique, ordered and canonically exact, with no unknown call identity. The
 witness never issues work or advances accepted context, progress or checkpoint
 state. No normalization or optional fresh-context acceptance is added.
+
+The next actual diagnostic attempt proved the old complete prefix and original
+pair were exact, with one additional environment-classified message after the old
+output and before the exact new prompt. It did not compare that new body to the
+old environment. No continuation action was issued; body equality and fresh
+identity/turn binding remain unknown actual facts.
+
+The conditional repair preserves the original no-extra path. Its only additional
+path requires exactly one extra closed environment message whose entire content
+array is canonically equal to exactly one independently retained original
+environment. That original must have a closed single-part shape and a completed
+strict first-rollout audit bound to the retained entry. Missing, ambiguous or
+unsupported baselines block. No XML/tag, path, date, shell, network, whitespace or
+metadata normalization is used to manufacture equality.
+
+The new environment requires the observed exact envelope and three-key metadata,
+`environments.environment_context`, a unique canonical `msg_` UUIDv7 ID, valid turn
+UUID and finite positive timestamp. The current physical prompt also needs its
+closed `user.text` metadata and canonical `msg_input_` identity; its new turn must
+match the environment and differ from the original environment turn. Timestamps
+need not equal or order across these separately stamped items. They convey no
+authority. Original prefix and call/result remain exact, with strict original
+output < new environment < current prompt < new call < new result ordering.
+
+Acceptance retains the entire observed continuation context, explicit zero/one
+environment mode and exact environment item. The result request cannot change or
+remove any of it. Final durable audit uses that retained mode, complete context
+and both exact causal pairs; its existing attribution-only projection is unchanged.
+Public turn records contain the fixed mode and environment hash, never its body.
+Rejected extra environments extend the first 2 KiB witness with fixed baseline,
+schema, body-equality, ID, turn and ordering flags plus canonical content lengths
+and hashes. Unsupported baseline/content is null, not zero/equal; summaries yield
+to essential evidence at the same bound. Unequal or unexplained content remains
+blocked for a separately scoped diagnosis. This source candidate has not run the
+stock journey; fresh review and separate experiment authorization remain required.

@@ -188,6 +188,63 @@ def durable_user_to_wire(item):
     return projected
 
 
+ENVIRONMENT_KIND='environments.environment_context'
+
+
+def wire_fragment(item,kind,prefix):
+    if (type(item) is not dict or set(item)!={'type','role','id','content',METADATA} or item.get('type')!='message' or
+            item.get('role')!='user' or type(item.get('id')) is not str or not item['id'].startswith(prefix)):
+        return False
+    suffix=item['id'][len(prefix):]
+    if not valid_uuid(suffix):return False
+    if prefix=='msg_' and (uuid.UUID(suffix).version!=7 or uuid.UUID(suffix).variant!=uuid.RFC_4122):return False
+    metadata=item[METADATA];content=item['content']
+    return (type(content) is list and len(content)==1 and type(content[0]) is dict and set(content[0])=={'type','text'} and
+        content[0]['type']=='input_text' and type(content[0]['text']) is str and type(metadata) is dict and
+        set(metadata)=={'turn_id','create_time','content_item_kinds'} and metadata['content_item_kinds']==[kind] and
+        valid_uuid(metadata['turn_id']) and valid_timestamp(metadata['create_time']))
+
+
+def environment_comparison(journey,contexts,observed,inputs):
+    entry=journey.entries[journey.turn['label']];retained=entry['user_context']
+    originals=[item for item in retained if type(item.get(METADATA)) is dict and
+               item[METADATA].get('content_item_kinds')==[ENVIRONMENT_KIND]]
+    baseline=originals[0] if len(originals)==1 else None
+    new=contexts[-2] if len(contexts)==len(retained)+2 else None;current=contexts[-1]
+    baseline_valid=wire_fragment(baseline,ENVIRONMENT_KIND,'msg_')
+    new_valid=wire_fragment(new,ENVIRONMENT_KIND,'msg_');prompt_valid=wire_fragment(current,'user.text','msg_input_')
+    original_ids={item['id'] for item in [*retained,entry['call'],entry['output']] if type(item.get('id')) is str}
+    new_id_valid=type(new) is dict and type(new.get('id')) is str and new['id'].startswith('msg_') and valid_uuid(new['id'][4:])
+    new_id_valid=bool(new_id_valid and uuid.UUID(new['id'][4:]).version==7 and uuid.UUID(new['id'][4:]).variant==uuid.RFC_4122)
+    raw_metadata=new.get(METADATA) if type(new) is dict else None
+    new_turn=raw_metadata.get('turn_id') if type(raw_metadata) is dict else None
+    old_turn=baseline[METADATA]['turn_id'] if baseline_valid else None
+    current_turn=current[METADATA]['turn_id'] if prompt_valid else None
+    audited=journey.first_rollout_audits.get(journey.turn['label'])==sha(canonical(entry))
+    def content(item):return item.get('content') if type(item) is dict else None
+    calls=[i for i,item in enumerate(inputs) if type(item) is dict and item.get('type')=='function_call' and item.get('call_id')==entry['issued']['call_id']]
+    outputs=[i for i,item in enumerate(inputs) if type(item) is dict and item.get('type')=='function_call_output' and item.get('call_id')==entry['issued']['call_id']]
+    pair_exact=(len(calls)==len(outputs)==1 and calls[0]<outputs[0] and
+        canonical(inputs[calls[0]])==canonical(entry['call']) and canonical(inputs[outputs[0]])==canonical(entry['output']))
+    positions=bool(pair_exact and all(i<calls[0] for i,_ in observed[:len(retained)]) and
+        outputs[0]<observed[-2][0]<observed[-1][0])
+    comparison={'stage':'environment-binding' if positions else 'environment-position','original_pair_exact':pair_exact,'causal_positions_valid':positions,'baseline_environment_count':len(originals),'baseline_audited':audited,
+        'baseline_schema':baseline_valid,'closed_environment_schema':new_valid,'current_prompt_schema':prompt_valid,
+        'new_message_id_valid':new_id_valid,'new_message_id_unique':bool(new_id_valid and new['id'] not in original_ids and new['id']!=current.get('id')),
+        'current_prompt_id_unique':bool(prompt_valid and current['id'] not in original_ids),
+        'new_turn_valid':valid_uuid(new_turn),'new_turn_differs_from_old':bool(new_valid and baseline_valid and new_turn!=old_turn),
+        'new_turn_matches_current_prompt':bool(new_valid and prompt_valid and new_turn==current_turn),
+        'exact_environment_content_equal':canonical(content(new))==canonical(content(baseline)) if baseline_valid and new_valid else None,
+        'original_content_bytes':len(canonical(content(baseline))) if baseline_valid else None,
+        'new_content_bytes':len(canonical(content(new))) if new_valid else None,
+        'original_content_sha256':sha(canonical(content(baseline))) if baseline_valid else None,
+        'new_content_sha256':sha(canonical(content(new))) if new_valid else None}
+    valid=(baseline_valid and new_valid and prompt_valid and audited and positions and comparison['new_message_id_unique'] and
+           comparison['current_prompt_id_unique'] and comparison['new_turn_differs_from_old'] and
+           comparison['new_turn_matches_current_prompt'] and comparison['exact_environment_content_equal'])
+    return bool(valid),comparison
+
+
 RESUME_FIELDS=('type','role','id','content','turn_id','create_time','content_item_kinds','metadata')
 RESUME_ENVELOPE=('type','role','id','content',METADATA,'status','phase','encrypted_content')
 RESUME_METADATA=('turn_id','create_time','content_item_kinds','content_item_metadata')
@@ -269,7 +326,7 @@ class Journey:
         self.cli_ready = threading.Event()
         self.last_request = None
         self.metadata_rejection = None
-        self.rollout_rejection = None; self.continuations = {}; self.resume_context_rejection = None
+        self.rollout_rejection = None; self.continuations = {}; self.resume_context_rejection = None; self.first_rollout_audits = {}
         self.harness_sha256 = sha(Path(__file__).read_bytes())
 
     def begin(self, label, phase, expected_uuid=None):
@@ -279,7 +336,7 @@ class Journey:
             require(label in self.entries and expected_uuid == self.entries[label]['uuid'], 'resume UUID not bound to retained checkpoint')
         self.turn = {'label': label, 'phase': phase, 'expected_uuid': expected_uuid, 'uuid': None,
                      'issued': None, 'returned': None, 'finished': False, 'started': 0, 'completed': 0,
-                     'user_context':None}
+                     'user_context':None,'resume_mode':None,'resume_environment':None}
         self.cli_ready.clear(); self.action_end = min(self.end, time.monotonic() + t.ACTION_SECONDS)
 
     def observe_cli(self, raw):
@@ -358,11 +415,26 @@ class Journey:
         contexts = [item for _,item in observed]
         own = prompt(label,'first',self.nonce); current = prompt(label,phase,self.nonce)
         own_positions = [i for i,item in observed if exact_prompt_message(item,own)]
-        if phase=='resume' and self.resume_context_rejection is None:
-            retained=self.entries[label]['user_context']
-            if not (len(contexts)==len(retained)+1 and canonical(contexts[:-1])==canonical(retained) and
-                    exact_prompt_message(contexts[-1],current)):
-                self.resume_context_rejection=resume_rejection_witness(self,observed,inputs,current)
+        resume_mode=None;resume_environment=None
+        if phase=='resume':
+            retained=self.entries[label]['user_context'];count=len(retained)
+            prefix_equal=canonical(contexts[:count])==canonical(retained)
+            no_extra=len(contexts)==count+1 and prefix_equal
+            one_extra=len(contexts)==count+2 and prefix_equal
+            environment_valid=False;comparison=None
+            if one_extra:environment_valid,comparison=environment_comparison(self,contexts,observed,inputs)
+            if not (no_extra or environment_valid) or not exact_prompt_message(contexts[-1],current):
+                if self.resume_context_rejection is None:
+                    witness=resume_rejection_witness(self,observed,inputs,current)
+                    if comparison is not None:
+                        witness['environment_comparison']=comparison
+                        while len(canonical(witness))>2048 and witness['summaries']:
+                            witness['summaries'].pop();witness['truncated_summary']=True
+                        require(len(canonical(witness))<=2048,'environment witness exceeded fixed bound')
+                    self.resume_context_rejection=witness
+            require(no_extra or environment_valid,'prior ordered user context changed/injected/removed')
+            resume_mode='one-environment' if environment_valid else 'no-environment'
+            resume_environment=contexts[-2] if environment_valid else None
         require(len(own_positions) == 1, 'exact prior prompt absent or duplicated')
         if phase == 'first':
             require(exact_prompt_message(contexts[-1],own), 'first prompt must be the exact final user message')
@@ -370,7 +442,7 @@ class Journey:
                 require(canonical(contexts) == canonical(turn['user_context']), 'first-result user context changed')
         else:
             retained = self.entries[label]['user_context']
-            require(len(contexts) == len(retained)+1 and canonical(contexts[:-1]) == canonical(retained),
+            require(canonical(contexts[:len(retained)]) == canonical(retained),
                     'prior ordered user context changed/injected/removed')
             require(exact_prompt_message(contexts[-1],current), 'continuation prompt must be an exact new user message')
             if turn['user_context'] is not None:
@@ -382,10 +454,12 @@ class Journey:
             entry = self.entries[label]
             current_positions = [observed[-1][0]]
             first_call, first_output = self.pair(inputs, entry['issued'])
-            require(all(i < first_call[0] for i,_ in observed[:-1]) and
+            require(all(i < first_call[0] for i,_ in observed[:len(entry['user_context'])]) and
                     own_positions[0] < first_call[0] < first_output[0] < current_positions[0] and
                     canonical(first_call[1]) == canonical(entry['call']) and canonical(first_output[1]) == canonical(entry['output']),
                     'restored history not identical to independently observed first turn')
+            if resume_mode=='one-environment':
+                require(first_output[0]<observed[-2][0]<current_positions[0], 'new environment outside exact continuation position')
             allowed[entry['issued']['call_id']] = entry['issued']
         if turn['issued'] is not None: allowed[turn['issued']['call_id']] = turn['issued']
         for item in inputs:
@@ -409,7 +483,10 @@ class Journey:
         # All incoming evidence is checked before acceptance bookkeeping changes.
         rid = 'session-fixture-' + label + '-' + phase + ('-final' if pending else '-action')
         events = [{'type':'response.created','response':{'id':rid}}]
-        if turn['user_context'] is None:turn['user_context'] = copy.deepcopy(contexts)
+        if turn['user_context'] is None:
+            turn['user_context'] = copy.deepcopy(contexts)
+            if phase=='resume':
+                turn['resume_mode']=resume_mode;turn['resume_environment']=copy.deepcopy(resume_environment)
         if pending is None:
             issued = action(label,phase,self.nonce); turn['issued'] = issued
             events.append({'type':'response.output_item.done','item':issued})
@@ -432,11 +509,20 @@ class Journey:
                                   'issued':copy.deepcopy(turn['issued']), **copy.deepcopy(turn['returned'])}
         else:
             self.continuations[label]={'user_context':copy.deepcopy(turn['user_context']),
+                'resume_mode':turn['resume_mode'],'resume_environment':copy.deepcopy(turn['resume_environment']),
                 'issued':copy.deepcopy(turn['issued']),**copy.deepcopy(turn['returned'])}
         self.records.append({'label':label,'phase':phase,'uuid':turn['uuid'], 'context_sha256':sha(canonical(turn['user_context'])),
                              'user_context_count':len(turn['user_context']),
+                             'resume_mode':turn['resume_mode'] if phase=='resume' else 'first-turn',
+                             'resume_environment_sha256':sha(canonical(turn['resume_environment'])) if turn['resume_environment'] is not None else None,
                              'call_sha256':sha(canonical(turn['returned']['call'])), 'output_sha256':sha(canonical(turn['returned']['output'])),
                              'progress':turn['returned']['effect'], 'pass':True})
+
+    def audit_first_rollout(self,row,label,checkpoint_sha256=None):
+        entry=self.entries[label]
+        proof=rollout_proof(self.root,row,entry,journey=self,checkpoint_sha256=checkpoint_sha256)
+        self.first_rollout_audits[label]=sha(canonical(entry))
+        return proof
 
     def checkpoint(self, path):
         require(set(self.entries) == set(LABELS), 'both first checkpoints are required')
@@ -526,7 +612,7 @@ def rollout_proof(root, row, entry, continuation=None, journey=None, checkpoint_
         require(canonical(projected)==canonical(expected), 'rollout complete observed user context changed')
         original_count=len(entry['user_context'])
         require(canonical(expected[:original_count])==canonical(entry['user_context']) and
-                len(expected)==original_count+(1 if continuation is not None else 0), 'unbound continuation context')
+                len(expected)==original_count+(2 if continuation is not None and continuation.get('resume_mode')=='one-environment' else 1 if continuation is not None else 0), 'unbound continuation context')
         allowed={entry['issued']['call_id']:entry}
         if continuation is not None:allowed[continuation['issued']['call_id']]=continuation
         stage='orphan-history'
@@ -550,6 +636,12 @@ def rollout_proof(root, row, entry, continuation=None, journey=None, checkpoint_
         user_positions=[i for i,item in enumerate(items) if item.get('role')=='user']
         require(all(i<original_call for i in user_positions[:original_count]), 'prior context follows original call')
         if continuation is not None:
+            mode=continuation.get('resume_mode')
+            require(mode in ('no-environment','one-environment'),'unbound continuation mode')
+            if mode=='one-environment':
+                require(canonical(expected[-2])==canonical(continuation.get('resume_environment')) and
+                    original_output<user_positions[-2]<user_positions[-1], 'durable environment moved/changed')
+            else:require(continuation.get('resume_environment') is None,'unexpected durable environment mode')
             new_call,new_output=pairs[continuation['issued']['call_id']]
             require(original_output<user_positions[-1]<new_call<new_output, 'continuation crossed original causal pair')
     except ValueError:
@@ -623,8 +715,7 @@ def worker(args):
         report['checkpoint_sha256']=journey.checkpoint('/result/checkpoint.json')
         ids=journey.read_checkpoint('/result/checkpoint.json')
         rows=database('/',set(initial)|set(ids.values()),integrity=True)
-        report['first_rollouts']={label:rollout_proof('/',rows[ids[label]],journey.entries[label],journey=journey,
-            checkpoint_sha256=report['checkpoint_sha256']) for label in LABELS}
+        report['first_rollouts']={label:journey.audit_first_rollout(rows[ids[label]],label,report['checkpoint_sha256']) for label in LABELS}
         for label in LABELS:
             require(journey.read_checkpoint('/result/checkpoint.json')==ids,'checkpoint identities changed')
             journey.begin(label,'resume',ids[label])

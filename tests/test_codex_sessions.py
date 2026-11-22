@@ -560,6 +560,130 @@ class SessionsTests(unittest.TestCase):
                 except ValueError as error:outcomes.append(('rejected',str(error)))
             self.assertEqual(outcomes[0],outcomes[1])
 
+    def environment_resume(self,audit=True):
+        path,rows,row,entry=self.source_first_rollout()
+        if audit:self.j.audit_first_rollout(row,'alpha')
+        current_turn='44444444-4444-7444-8444-444444444444'
+        env=durable_message(entry['user_context'][0]['content'][0]['text'],s.ENVIRONMENT_KIND,
+            ident='33333333-3333-7333-8333-333333333333',turn=current_turn,created=1.)
+        current=durable_message(s.prompt('alpha','resume',NONCE),ident='55555555-5555-7555-8555-555555555555',
+            turn=current_turn,created=1700000004.)
+        items=copy.deepcopy(entry['user_context'])+[copy.deepcopy(entry['call']),copy.deepcopy(entry['output']),source_wire(env),source_wire(current)]
+        return path,rows,row,entry,env,current,items
+
+    def test_same_whole_environment_body_bound_to_audited_original_and_new_turn(self):
+        path,rows,row,entry,env,current,items=self.environment_resume();self.observed('alpha','resume')
+        self.j.request(body(items));self.assertIsNone(self.j.resume_context_rejection)
+        self.assertEqual(self.j.turn['resume_mode'],'one-environment')
+        self.assertEqual(self.j.turn['resume_environment'],source_wire(env))
+        self.assertEqual(self.j.turn['user_context'],entry['user_context']+[source_wire(env),source_wire(current)])
+        issued=copy.deepcopy(self.j.turn['issued']);actual=self.run_action(issued)
+        call=dict(issued,**{s.METADATA:{'turn_id':current[s.METADATA]['turn_id']}})
+        output={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual),
+                s.METADATA:{'turn_id':current[s.METADATA]['turn_id'],'create_time':2.}}
+        self.j.request(body(items+[call,output]));self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}));self.j.finish(0)
+        bound=self.j.continuations['alpha'];self.assertEqual(bound['resume_mode'],'one-environment')
+        self.assertEqual(self.j.records[-1]['resume_mode'],'one-environment')
+        self.assertEqual(self.j.records[-1]['resume_environment_sha256'],t.sha(t.canonical(source_wire(env))))
+        self.assertEqual(s.marker(self.root,'alpha',('first','resume'),NONCE)['lines'],2)
+        rows += [{'type':'response_item','payload':item} for item in (env,current,call,output)]
+        self.write_rollout(path,rows)
+        self.assertEqual(s.rollout_proof(self.root,row,entry,continuation=bound)['uuid'],IDS['alpha'])
+        for key,value in [('resume_mode','no-environment'),('resume_mode','unknown'),('resume_environment',None)]:
+            bad=copy.deepcopy(bound);bad[key]=value
+            with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry,continuation=bad)
+        variants=[rows[:-4]+rows[-3:],rows+[rows[-4]],rows[:-4]+[rows[-3],rows[-4]]+rows[-2:]]
+        bad=copy.deepcopy(rows);bad[-4]['payload'][s.METADATA]['content_item_metadata'][0]['provenance']['hook']=True;variants.append(bad)
+        for bad in variants:
+            self.write_rollout(path,bad)
+            with self.assertRaises(ValueError):s.rollout_proof(self.root,row,entry,continuation=bound)
+
+    def test_environment_whole_body_changes_and_arbitrary_instructions_reject_privately(self):
+        _,_,_,entry,_,_,items=self.environment_resume()
+        for text in (entry['user_context'][0]['content'][0]['text']+' ', 'changed date /path network', 'SECRET_INSTRUCTION'):
+            changed=copy.deepcopy(items);changed[-2]['content'][0]['text']=text
+            self.j.resume_context_rejection=None;self.observed('alpha','resume')
+            with self.assertRaises(ValueError):self.j.request(body(changed))
+            self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+            witness=self.j.resume_context_rejection;comparison=witness['environment_comparison']
+            self.assertTrue(comparison['baseline_audited']);self.assertTrue(comparison['closed_environment_schema'])
+            self.assertFalse(comparison['exact_environment_content_equal'])
+            encoded=t.canonical(witness);self.assertLessEqual(len(encoded),2048);self.assertNotIn(b'SECRET',encoded)
+            self.assertEqual(len(comparison['original_content_sha256']),64)
+            self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
+
+    def test_environment_closed_shape_id_turn_and_timestamp_negative_matrix(self):
+        _,_,_,_,_,_,valid=self.environment_resume();variants=[]
+        for key,value in [('id','msg_input_'+IDS['alpha']),('id','msg_'+IDS['alpha']),
+                          ('id','msg_11111111-1111-4111-8111-111111111111'),('id',None),('SECRET_KEY','SECRET_VALUE'),
+                          ('content',[{'type':'input_text','text':'x'},{'type':'input_text','text':'y'}])]:
+            changed=copy.deepcopy(valid);changed[-2][key]=value;variants.append(changed)
+        for key,value in [('turn_id',IDS['beta']),('turn_id',IDS['alpha']),('turn_id',None),('create_time',True),
+                          ('create_time',float('nan')),('create_time',float('inf')),('content_item_kinds',['user.text']),
+                          ('SECRET_KEY','SECRET_VALUE')]:
+            changed=copy.deepcopy(valid);changed[-2][s.METADATA][key]=value;variants.append(changed)
+        changed=copy.deepcopy(valid);changed[-2]['id']=changed[-1]['id'];variants.append(changed)
+        changed=copy.deepcopy(valid)
+        for index in (-2,-1):changed[index][s.METADATA]['turn_id']=IDS['beta']
+        variants.append(changed)  # Matching current pair still cannot reuse the original turn.
+        for value in (None,True,[],{'turn_id':IDS['alpha']}):
+            changed=copy.deepcopy(valid);changed[-2][s.METADATA]=value;variants.append(changed)
+        for key,value in [('turn_id',IDS['alpha']),('content_item_kinds',[s.ENVIRONMENT_KIND]),('create_time',False),('SECRET_KEY','SECRET')]:
+            changed=copy.deepcopy(valid);changed[-1][s.METADATA][key]=value;variants.append(changed)
+        changed=copy.deepcopy(valid);changed[-1]['id']=valid[1]['id'];variants.append(changed)
+        changed=copy.deepcopy(valid);changed[-1]['status']=None;variants.append(changed)
+        for changed in variants:
+            self.j.resume_context_rejection=None;self.observed('alpha','resume')
+            with self.assertRaises(ValueError):self.j.request(body(changed))
+            self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+            self.assertNotIn('SECRET',json.dumps(self.j.resume_context_rejection))
+
+    def test_environment_requires_exact_old_prefix_pair_and_causal_positions(self):
+        _,_,_,_,_,_,valid=self.environment_resume();variants=[]
+        # Two old user messages, then original call/output, then env/current prompt.
+        variants += [[*valid[:2],valid[-2],*valid[2:-2],valid[-1]],
+                     [*valid[:3],valid[-2],valid[3],valid[-1]],
+                     [*valid[:-2],valid[-1],valid[-2]],valid[:-1]+[copy.deepcopy(valid[-2]),valid[-1]]]
+        for index,key,value in ((0,'id','msg_'+IDS['beta']),(2,'arguments','{}'),(3,'output','forged')):
+            changed=copy.deepcopy(valid);changed[index][key]=value;variants.append(changed)
+        changed=copy.deepcopy(valid);changed[0][s.METADATA]['turn_id']=IDS['alpha'];variants.append(changed)
+        variants += [valid+[copy.deepcopy(valid[2])],valid+[{'type':'custom_tool_call','call_id':'orphan','input':'x'}]]
+        for changed in variants:
+            self.j.resume_context_rejection=None;self.observed('alpha','resume')
+            with self.assertRaises(ValueError):self.j.request(body(changed))
+            self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+
+    def test_environment_needs_unique_original_baseline_and_completed_first_rollout_audit(self):
+        path,rows,row,entry,_,_,valid=self.environment_resume(audit=False);self.observed('alpha','resume')
+        with self.assertRaises(ValueError):self.j.request(body(valid))
+        self.assertFalse(self.j.resume_context_rejection['environment_comparison']['baseline_audited'])
+        self.j.audit_first_rollout(row,'alpha');original=copy.deepcopy(entry)
+        for contexts in ([entry['user_context'][-1]], [entry['user_context'][0],*entry['user_context']]):
+            entry['user_context']=copy.deepcopy(contexts)
+            self.j.first_rollout_audits['alpha']=t.sha(t.canonical(entry))
+            items=copy.deepcopy(contexts)+[entry['call'],entry['output'],valid[-2],valid[-1]]
+            self.j.resume_context_rejection=None;self.observed('alpha','resume')
+            with self.assertRaises(ValueError):self.j.request(body(items))
+            self.assertIsNone(self.j.turn['issued'])
+        self.j.entries['alpha']=original
+
+    def test_environment_result_requires_the_exact_accepted_new_context_and_keeps_effect(self):
+        _,_,_,_,_,_,items=self.environment_resume();self.observed('alpha','resume');self.j.request(body(items))
+        retained=copy.deepcopy(self.j.turn['user_context']);issued=copy.deepcopy(self.j.turn['issued']);actual=self.run_action(issued)
+        output={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual)}
+        variants=[]
+        for key,value in [('create_time',3.),('turn_id',IDS['alpha'])]:
+            changed=copy.deepcopy(items);changed[-2][s.METADATA][key]=value;variants.append(changed)
+        changed=copy.deepcopy(items);changed[-2]['content'][0]['text']+=' ';variants.append(changed)
+        variants.append(items[:-2]+[items[-1]])
+        variants.append(items[:-2]+[items[-1],items[-2]])
+        for changed in variants:
+            with self.assertRaises(ValueError):self.j.request(body(changed+[issued,output]))
+            self.assertEqual(self.j.turn['issued'],issued);self.assertEqual(self.j.turn['user_context'],retained)
+            self.assertIsNone(self.j.turn['returned']);self.assertFalse(self.j.turn['finished'])
+            self.assertEqual(s.marker(self.root,'alpha',('first','resume'),NONCE)['lines'],2)
+        self.j.request(body(items+[issued,output]));self.assertTrue(self.j.turn['finished'])
+
     def test_resume_argv_is_explicit_uuid_not_last_or_cwd_inference(self):
         argv=s.cli_args(12345,'synthetic-context',IDS['alpha'])
         index=argv.index('resume');self.assertEqual(argv[index+1],IDS['alpha'])
