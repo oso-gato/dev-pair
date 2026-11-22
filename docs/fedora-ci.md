@@ -194,7 +194,10 @@ Measured insufficiency, ENOSPC, timeout and capability failures remain blockers.
 
 The source-bound storage worker measures allocated blocks with descriptor-relative
 traversal, hardlink deduplication and the existing `guest.qcow2` basename
-exclusion. Mount crossings block. A descendant disappearance can yield a
+exclusion. It skips other devices without enumerating them. Same-device bind
+mounts are traversed only after the worker verifies their source inside owned
+scratch, with GNU `du --one-file-system` accounting for aliases and cycles.
+Unverified same-device mounts block. A descendant disappearance can yield a
 provisional sample or trigger another attempt without contributing a total.
 Across at most three attempts, the largest usable sample counts against the
 same overhead and active-copy reserve. Final measurements require a complete
