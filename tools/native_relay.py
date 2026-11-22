@@ -45,6 +45,19 @@ def unique(pairs):
     return value
 
 
+DECODER_REASONS=('unavailable','raw-byte-bound','after-terminal-frame','header-invalid','data-after-partial','frame-count',
+    'failure-json','failure-shape','control-json','control-shape','control-version','control-complete','control-status',
+    'control-uid','control-domain','control-helper','control-protocol','incomplete-frame','uid-mismatch','helper-mismatch',
+    'relay-error-status','payload-signal','native-status-mismatch')
+
+
+class DecoderRejected(ValueError):
+    def __init__(self,reason):
+        require(reason in DECODER_REASONS)
+        self.reason=reason
+        super().__init__('native relay protocol rejected')
+
+
 class Decoder:
     def __init__(self, maximum):
         require(maximum in MAXIMA)
@@ -54,22 +67,42 @@ class Decoder:
         self.failure = None
         self.partial = False
         self.frames = 0
+        self.reason='unavailable';self.last_kind='unavailable'
+
+    def check(self,value,reason):
+        if not value:
+            self.reason=reason
+            raise DecoderRejected(reason)
+
+    def json(self,reason):
+        try:return json.loads(self.body,object_pairs_hook=unique)
+        except (ValueError,UnicodeError):self.check(False,reason)
+
+    def witness(self):
+        bound=self.maximum+overhead(self.maximum)+8192
+        return {'reason':self.reason,'maximum':self.maximum,'raw_bytes':min(self.raw,bound),
+            'raw_bytes_clamped':self.raw>bound,'data_frames':min(self.frames,math.ceil(self.maximum/CAPACITY)+1),
+            'frame_kind':self.last_kind,'header_present':bool(self.header),'body_present':bool(self.body),
+            'control_present':self.control is not None,'failure_present':self.failure is not None,
+            'partial_frame':bool(self.header or self.body or self.length is not None),
+            'complete':self.control is not None and not self.header and not self.body and self.length is None}
 
     def feed(self, data):
         self.raw += len(data)
-        require(self.raw <= self.maximum + overhead(self.maximum))
+        self.check(self.raw <= self.maximum + overhead(self.maximum),'raw-byte-bound')
         output = []
         view = memoryview(data)
         while view:
-            require(self.control is None and self.failure is None)
+            self.check(self.control is None and self.failure is None,'after-terminal-frame')
             if self.length is None:
                 count = min(8 - len(self.header), len(view))
                 self.header.extend(view[:count]); view = view[count:]
                 if len(self.header) < 8:
                     continue
                 kind, magic, size = HEADER.unpack(self.header)
-                require(magic == MAGIC and kind in (b'D', b'C', b'F') and 0 < size <= (4096 if kind == b'D' else 248))
-                require(not (kind == b'D' and self.partial))
+                self.last_kind=kind.decode('ascii') if kind in (b'D',b'C',b'F') else 'unknown'
+                self.check(magic == MAGIC and kind in (b'D', b'C', b'F') and 0 < size <= (4096 if kind == b'D' else 248),'header-invalid')
+                self.check(not (kind == b'D' and self.partial),'data-after-partial')
                 self.kind, self.length = kind, size
                 self.header.clear()
             count = min(self.length - len(self.body), len(view))
@@ -77,35 +110,39 @@ class Decoder:
             if len(self.body) == self.length:
                 if self.kind == b'D':
                     self.frames += 1
-                    require(self.frames <= math.ceil(self.maximum / CAPACITY))
+                    self.check(self.frames <= math.ceil(self.maximum / CAPACITY),'frame-count')
                     self.partial = self.length < CAPACITY
                     output.append(bytes(self.body))
                 elif self.kind == b'F':
-                    value = json.loads(self.body, object_pairs_hook=unique)
-                    require(type(value) is dict and set(value) == {'v', 'done', 'stage', 'reason', 'property', 'observed'} and
+                    value = self.json('failure-json')
+                    self.check(type(value) is dict and set(value) == {'v', 'done', 'stage', 'reason', 'property', 'observed'} and
                             type(value['v']) is int and value['v'] == 1 and value['done'] is False and value['stage'] == 'effective-profile' and
                             value['reason'] == 'rejected' and type(value['property']) is str and value['property'] in PROFILE_KEYS and
-                            ProfileError(value['property'], value['observed']).value == value['observed'])
+                            ProfileError(value['property'], value['observed']).value == value['observed'],'failure-shape')
                     self.failure = value
                 else:
-                    value = json.loads(self.body, object_pairs_hook=unique)
-                    require(type(value) is dict and set(value) == {'v', 'done', 'status', 'uid', 'domain', 'helper', 'p'} and
-                            type(value['v']) is int and value['v'] == 1 and type(value['p']) is int and value['p'] == 1 and value['done'] is True and
-                            type(value['status']) is int and -64 <= value['status'] <= 255 and
-                            type(value['uid']) is int and value['uid'] >= 0 and value['domain'] == 'unconfined_service_t' and
-                            type(value['helper']) is str and len(value['helper']) == 64 and all(c in '0123456789abcdef' for c in value['helper']))
+                    value = self.json('control-json')
+                    self.check(type(value) is dict and set(value) == {'v', 'done', 'status', 'uid', 'domain', 'helper', 'p'},'control-shape')
+                    self.check(type(value['v']) is int and value['v'] == 1,'control-version')
+                    self.check(type(value['p']) is int and value['p'] == 1,'control-protocol')
+                    self.check(value['done'] is True,'control-complete')
+                    self.check(type(value['status']) is int and -64 <= value['status'] <= 255,'control-status')
+                    self.check(type(value['uid']) is int and value['uid'] >= 0,'control-uid')
+                    self.check(value['domain'] == 'unconfined_service_t','control-domain')
+                    self.check(type(value['helper']) is str and len(value['helper']) == 64 and all(c in '0123456789abcdef' for c in value['helper']),'control-helper')
                     self.control = value
                 self.body.clear(); self.kind, self.length = None, None
         return output
 
     def finish(self, native_status, expected_uid, helper_sha):
-        require(self.control is not None and not self.header and not self.body and self.length is None)
+        self.check(self.control is not None and not self.header and not self.body and self.length is None,'incomplete-frame')
         value = self.control
-        require(value['uid'] == expected_uid and value['helper'] == helper_sha and value['status'] != ERROR_STATUS)
-        # systemd-run maps clean service signals to0 and other signals to255;
-        # neither is an ordinary successful payload exit. Signals are outside
-        # this provisioning contract, independently of any caller's allowed set.
-        require(value['status'] >= 0 and native_status == value['status'])
+        self.check(value['uid'] == expected_uid,'uid-mismatch')
+        self.check(value['helper'] == helper_sha,'helper-mismatch')
+        self.check(value['status'] != ERROR_STATUS,'relay-error-status')
+        # Diagnostic reasons preserve every original acceptance predicate.
+        self.check(value['status'] >= 0,'payload-signal')
+        self.check(native_status == value['status'],'native-status-mismatch')
         return value
 
 

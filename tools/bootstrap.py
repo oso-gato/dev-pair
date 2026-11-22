@@ -535,6 +535,21 @@ class Commands:
         relay_verified = False
         admission_stage = 'not-native'
         admission_reason = 'none'
+        failure_point='not-reached';failure_category=None;failure_witness=None
+        def capture_failure(error):
+            nonlocal failure_witness
+            if failure_witness is not None or not native_execution:return
+            category=failure_category or ('decoder-rejected' if isinstance(error,relay.DecoderRejected) else
+                'wait-timeout' if isinstance(error,subprocess.TimeoutExpired) else 'io-error' if isinstance(error,OSError) else
+                'text-decode' if isinstance(error,UnicodeError) else 'value-rejected' if isinstance(error,ValueError) else
+                'subprocess-error' if isinstance(error,subprocess.SubprocessError) else 'blocked-or-interrupted')
+            observed=None;sampled=False
+            if process is not None:
+                try:observed=process.poll();sampled=True
+                except OSError:pass
+            failure_witness={'point':failure_point,'category':category,'launcher_handle_observed':process is not None,
+                'status_sampled_before_interrupt':sampled,'launcher_status_before_interrupt':observed,
+                'decoder':decoder.witness() if decoder is not None else {'availability':'unavailable'}}
         launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
@@ -664,6 +679,7 @@ class Commands:
                 runtime_us = round(float(runtime) * 1000000)
                 helper_end = command_end - min(.1, remaining / 2)
                 admission_stage = 'effective-profile'
+                failure_point='transport-verification'
                 transport.verify()
                 nodes = transport.state['nodes']
                 node_args = tuple(value for name in ('stdout', 'stderr', 'stdin') if name in nodes
@@ -678,6 +694,7 @@ class Commands:
                         *node_args, '--maximum', str(maximum), '--deadline', str(helper_end), '--helper', relay_sha, '--', *args[payload:])
                 for _ in range(2):
                     launcher_pairs.append(pipe_pair())
+                failure_point='launcher-start'
                 process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=launcher_pairs[0][1],
                                            stderr=launcher_pairs[1][1], start_new_session=True, close_fds=True)
                 process.stdout = os.fdopen(launcher_pairs[0][0], 'rb', buffering=0)
@@ -704,6 +721,7 @@ class Commands:
             status = 'running'
             while selector.get_map() or process.poll() is None:
                 if time.monotonic() >= command_end:
+                    failure_category='deadline'
                     raise Blocked('command deadline exceeded; output withheld')
                 if transport is not None and process.poll() is not None:
                     transport.release()
@@ -718,23 +736,29 @@ class Commands:
                             process.stdin.close()
                         continue
                     descriptor = key.fileobj if isinstance(key.fileobj, int) else key.fileobj.fileno()
+                    failure_point='pipe-read'
                     block = os.read(descriptor, 8192 if decoder is not None and key.data == 'stderr' else min(8192, maximum - total + 1))
                     if not block:
                         selector.unregister(key.fileobj)
                         continue
+                    if decoder is not None and key.data=='stderr':failure_point='relay-feed'
                     chunks = decoder.feed(block) if decoder is not None and key.data == 'stderr' else (block,)
                     for chunk in chunks:
                         total += len(chunk)
                         if total > maximum:
+                            failure_category='output-limit'
                             raise Blocked('command output byte budget exceeded; output withheld')
                         if input_text is None:
                             name = 'stderr' if key.data.startswith('launcher_') else key.data
                             buffers[name].extend(chunk)
+            failure_point='launcher-wait'
             status = process.wait(timeout=1)
             if time.monotonic() >= command_end:
+                failure_category='deadline'
                 raise Blocked('command deadline exceeded; output withheld')
             self.limit_timeout(timeout)
             if decoder is not None:
+                failure_point='relay-finish'
                 decoder.finish(status, relay_uid, relay_sha)
                 relay_verified = True
             capture_complete = True
@@ -751,12 +775,15 @@ class Commands:
                                                           capture_complete and (relay_verified or not native_execution), status)
                 if not special_result['supported']:
                     raise Blocked('unsupported or unavailable guest sudo package provenance')
+            failure_point='payload-status'
             if (decoder is not None and status == relay.ERROR_STATUS) or status not in ok:
+                failure_category='status-rejected'
                 raise Blocked('%s failed (exit %s; output withheld)' % (Path(original[0]).name, status))
             result = special_result if sudo_probe is not None or sudo_package else bytes(buffers['stdout']).decode() if input_text is None else ''
             completed = True
             return result
         except (OSError, ValueError, subprocess.SubprocessError) as error:
+            capture_failure(error)
             known = {'Lookup directory timestamp did not advance': 'lookup-mtime-not-advanced', 'Unknown manager UnitPath': 'manager-paths-rejected',
                      'Unknown applicable drop-in': 'unknown-drop-in', 'Applicable dependency effects are forbidden': 'dependency-effects',
                      'Existing native fragment or alias': 'fragment-or-alias', 'Native manager stream context mismatch': 'label-mismatch',
@@ -777,7 +804,8 @@ class Commands:
                 admission_reason = known.get(text, 'admission-rejected') if not isinstance(error, OSError) else category
             status = 'failed-or-timed-out'
             raise Blocked('command failed or timed out; output withheld') from None
-        except BaseException:
+        except BaseException as error:
+            capture_failure(error)
             if admission_stage != 'cache-recheck' or not admission_reason.startswith('cache-'):
                 admission_reason = 'blocked-or-interrupted'
             if status == 'running' or (not completed and status in ok):
@@ -824,6 +852,7 @@ class Commands:
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None,
                           'launcher_handle_observed':process is not None}
+                if failure_witness is not None:record['native_failure']=failure_witness
                 if sudo_probe is not None:
                     record['sudo_denial'] = sudo_denial_projection(sudo_probe['role'], bytes(buffers['stdout']), bytes(buffers['stderr']),
                         complete=capture_complete and cleanup_error is None,

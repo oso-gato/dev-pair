@@ -1141,6 +1141,53 @@ def prepare_observations(state, expected):
     return result
 
 
+DECODER_REASONS=('unavailable','raw-byte-bound','after-terminal-frame','header-invalid','data-after-partial','frame-count',
+    'failure-json','failure-shape','control-json','control-shape','control-version','control-complete','control-status',
+    'control-uid','control-domain','control-helper','control-protocol','incomplete-frame','uid-mismatch','helper-mismatch',
+    'relay-error-status','payload-signal','native-status-mismatch')
+
+NATIVE_FAILURE_POINTS=('not-reached','transport-verification','launcher-start','pipe-read','relay-feed','launcher-wait','relay-finish','payload-status')
+NATIVE_FAILURE_CATEGORIES=('decoder-rejected','wait-timeout','io-error','text-decode','value-rejected','subprocess-error',
+                           'blocked-or-interrupted','deadline','output-limit','status-rejected')
+
+
+def native_failure_projection(entry,expected,phase=None):
+    unavailable={'availability':'unavailable'}
+    try:
+        identity=entry.get('diagnostic_identity')
+        require(type(identity) is dict and set(identity)=={'source_sha','context_sha256','phase'} and
+                identity['source_sha']==expected['source_sha'] and identity['context_sha256']==expected['context_sha256'] and
+                identity['phase'] in ('prepare','maintenance-gptbox') and (phase is None or identity['phase']==phase), 'Native failure identity mismatch')
+        value=entry.get('native_failure');keys={'point','category','launcher_handle_observed','status_sampled_before_interrupt','launcher_status_before_interrupt','decoder'}
+        require(type(value) is dict and set(value)==keys and value['point'] in NATIVE_FAILURE_POINTS and
+                value['category'] in NATIVE_FAILURE_CATEGORIES, 'Native failure schema mismatch')
+        require(type(value['launcher_handle_observed']) is bool and type(value['status_sampled_before_interrupt']) is bool,
+                'Native failure flags mismatch')
+        status=value['launcher_status_before_interrupt']
+        require(status is None or type(status) is int and -255<=status<=255, 'Invalid pre-interrupt status')
+        require((value['launcher_handle_observed'] or not value['status_sampled_before_interrupt']) and
+                (value['status_sampled_before_interrupt'] or status is None), 'Native failure status mismatch')
+        decoder=value['decoder']
+        if decoder!={'availability':'unavailable'}:
+            require(type(decoder) is dict and set(decoder)=={'reason','maximum','raw_bytes','raw_bytes_clamped','data_frames','frame_kind',
+                'header_present','body_present','control_present','failure_present','partial_frame','complete'}, 'Decoder witness schema mismatch')
+            require(decoder['reason'] in DECODER_REASONS and type(decoder['maximum']) is int and
+                    decoder['maximum'] in (262144,1048576,4194304) and decoder['frame_kind'] in ('D','C','F','unknown','unavailable'),
+                    'Decoder witness enum mismatch')
+            limit=decoder['maximum'];frames=(limit+4095)//4096;bound=limit+8*frames+256+8192
+            require(type(decoder['raw_bytes']) is int and 0<=decoder['raw_bytes']<=bound and
+                    type(decoder['data_frames']) is int and 0<=decoder['data_frames']<=frames+1, 'Decoder witness counters invalid')
+            require(all(type(decoder[k]) is bool for k in ('raw_bytes_clamped','header_present','body_present','control_present','failure_present','partial_frame','complete')),
+                    'Decoder witness flags invalid')
+            require(not decoder['raw_bytes_clamped'] or decoder['raw_bytes']==bound, 'Decoder witness bound mismatch')
+            require(decoder['complete']==(decoder['control_present'] and not decoder['partial_frame']) and
+                    (not decoder['complete'] or not decoder['header_present'] and not decoder['body_present']), 'Decoder completion mismatch')
+        result={'availability':'observed','identity':dict(identity),**value}
+        require(len(json.dumps(result,separators=(',',':')).encode())<=1536, 'Native failure projection bound')
+        return result
+    except (ValueError,KeyError,TypeError,AttributeError):return unavailable
+
+
 def public_diagnostics(state_root, expected, source=None):
     selected = {'storage_observations':storage_public_projection(state_root,expected,source)}
     for name, path in (('prepare', state_root / 'prepare-diagnostics.json'),
@@ -1154,6 +1201,7 @@ def public_diagnostics(state_root, expected, source=None):
                     ('operation_id', 'step', 'status', 'outcome', 'accepted_exit', 'allowed_exit_statuses', 'native', 'elapsed_seconds', 'admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status')}
                     for item in record.get('recent', [])[-4:]]
             for recent, item in zip(selected[name]['recent_metadata'], record.get('recent', [])[-4:]):
+                recent['native_failure']=native_failure_projection(item,expected,'prepare' if name=='prepare' else 'maintenance-gptbox')
                 if item.get('operation') in ('selinux-enforcement', 'resolved-service-identity'):
                     recent['public_stdout_tail'] = safe_text(item.get('stdout_tail', ''), 300)
                     recent['public_stderr_tail'] = safe_text(item.get('stderr_tail', ''), 300)
@@ -1171,6 +1219,7 @@ def public_diagnostics(state_root, expected, source=None):
                     projected = sudo_public_projection({'sudo_package': item.get('sudo_package', record.get('sudo_package')),
                         'sudo_denials': {item['operation_id']: item.get('sudo_denial')}})
                     entry['sudo_evidence'] = projected
+                entry['native_failure']=native_failure_projection(item,expected,'prepare' if name=='prepare' else 'maintenance-gptbox')
                 for stream in ('stdout', 'stderr'):
                     text = item.get(stream + '_tail', '')
                     entry[stream + '_tail'] = safe_text(text, 1500)

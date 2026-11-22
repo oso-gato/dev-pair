@@ -136,6 +136,7 @@ class Gptbox(Bootstrap):
                 path = self.target + '/diagnostics.json'
                 prior = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
                 entry = {'status': status, 'scope': 'credential-free assembly/probe',
+                         'diagnostic_identity':getattr(self,'failure_diagnostic_identity',None),
                          **{name + '_tail': bytes(data[-16384:]).decode('utf-8', errors='replace') for name, data in buffers.items()},
                          **{name + '_truncated': len(data) > 16384 for name, data in buffers.items()},
                          **{name + '_bytes': len(data) for name, data in buffers.items()}}
@@ -146,7 +147,7 @@ class Gptbox(Bootstrap):
             def metadata(record):
                 path = self.target + '/diagnostics.json'
                 history = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
-                selected = {key: record[key] for key in ('admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status', 'accepted_exit', 'elapsed_seconds') if key in record}
+                selected = {key: record[key] for key in ('admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status', 'accepted_exit', 'elapsed_seconds','native_failure') if key in record}
                 latest = history['recent'][-1] if history['recent'] else None
                 failed = bool(latest is not None and history['failures'] and history['failures'][-1] == latest)
                 if latest is not None:
@@ -358,6 +359,7 @@ class Gptbox(Bootstrap):
     def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
         self.preflight()
         manifest, self.scripts = self.inputs(context, expected, upstream, revision)
+        self.failure_diagnostic_identity={'source_sha':revision,'context_sha256':expected,'phase':'maintenance-gptbox'}
         if not apply:
             return {'preview': True, 'changes': False, 'job_admission': False,
                     'operation': 'genuine Distrobox assembly, seal, boundary/version entry and restart probes'}
@@ -598,6 +600,7 @@ class Gptbox(Bootstrap):
                 self.atomic(path, json.dumps(record, sort_keys=True) + '\n', expected=self.text(path) or None)
             cost=None
             def diagnostic(entry):
+                entry={**entry,'diagnostic_identity':{'source_sha':revision,'context_sha256':expected,'phase':'prepare'}}
                 if cost is not None:cost.command(entry)
                 location = STATE + '/prepare-diagnostics.json'
                 history = json.loads(self.text(location, '{"recent":[],"failures":[]}'))
@@ -627,7 +630,7 @@ class Gptbox(Bootstrap):
                     diagnostic({'operation': 'withheld', 'operation_id': 'source-git-read',
                                 'step': 'adapter-source-and-upstream', 'status': status,
                                 'accepted_exit': metadata['accepted_exit'], 'outcome': metadata['outcome'],
-                                **{key:metadata[key] for key in ('elapsed_seconds','launcher_handle_observed') if key in metadata}})
+                                **{key:metadata[key] for key in ('elapsed_seconds','launcher_handle_observed','native_failure') if key in metadata}})
                 try:
                     self.run.metadata_diagnostic = source_diagnostic
                     self.source_stage = 'input-content'

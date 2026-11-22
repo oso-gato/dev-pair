@@ -262,3 +262,18 @@ configuration mutations blocking without rejecting a read alone. Cache-recheck
 failures retain fixed subcondition/category codes; no exception text, paths or
 configuration content enter those diagnostics. A local atime regression does
 not establish the cause of any prior native failure.
+
+
+The native controller retains a closed failure point/category and the owned
+launcher's status sampled before its existing interruption/cleanup path. A null
+sample means the launcher was still running at that observation; an unavailable
+sample means no status was established. The later `native_exit_status` remains
+separate and may reflect cleanup. Neither status proves descendant termination.
+Decoder witnesses contain only fixed reasons and bounded structural counts and
+flags from the existing failing predicates. A complete control shape is not
+independent acceptance: identity, helper and native status checks still apply.
+The public witness is limited to 1,536 bytes and validates exact source, context
+and prepare/maintenance phase binding. Invalid or missing evidence is unavailable.
+There is no new prelude frame or probe: failure before the existing safe framed
+channel is established can remain unavailable. These diagnostics do not change
+accepted frames, native profile checks, subprocesses, deadlines or cleanup.

@@ -2,6 +2,47 @@
 
 ## Latest continuation checkpoint
 
+
+### November 22, 2026, 22:38 HKT — native27 closed; diagnostic source candidate
+
+- Published PR13 source is `de85467e6238504203cdfe7ad10222b93f9a2b29`.
+  Native [run27](https://github.com/oso-gato/dev-pair/actions/runs/45025114650)
+  passed 459 hosted tests, signed inputs, all nine tooling markers and actual
+  enforcing Fedora boot. Both roles completed eight directories with two owner
+  lookups each and passed restricted-role sudo checks. Preparation took 412.364
+  seconds; its unchanged 600-second alarm did not fire. Tailscale package and
+  daemon setup progressed; enrollment was not requested and no missing
+  credential cause is established.
+- The first dp-maint signed-base load was rejected after 1.557 seconds. The
+  retained `effective-profile` label spans later pipe/decoder checks and does
+  not prove a property mismatch. Launcher status -9 was sampled after cleanup
+  interruption and does not establish the primary cause. Outer cleanup passed;
+  guest cleanup, prepared/assembled images and storage samples remain unverified.
+  Diagnosis `/workspace/artifacts/resume-20261122/run27-maintenance-native-diagnosis.json`,
+  SHA256 `e7cee7e3911311b41f686362a37007918ffa9bbfbfba374694d27cfed2dda131`,
+  binds the controller, report and log hashes. No unchanged native retry follows.
+- This isolated source slice adds fixed controller failure points/categories,
+  launcher status sampled before interruption, and closed decoder rejection
+  reasons/counters at existing predicates. Public projection requires exact
+  source/context/phase binding and at most 1,536 bytes per witness. No frame
+  contents, exception text, argv or environment enters this witness. Missing
+  safe prelude evidence remains unavailable. Acceptance, cleanup, commands,
+  security and time/output limits are unchanged; source/local tests do not
+  establish actual native success or deployment.
+- Access evidence at `/workspace/artifacts/resume-20261122/ssh-transport-20261122T1430.json`
+  reports the managed environment running with unrestricted policy enforced and
+  the credential reference ready. A no-auth SSH connection to the configured
+  Hostinger endpoint returned 255, Connection refused, before authentication.
+  No password was sent and no host was inspected or changed; cause is unknown.
+  `/workspace/artifacts/resume-20261122/release-enforcement-current.json` reports
+  main unprotected, required checks off and only two historical tag rules.
+  Connector administration is unsupported; release enforcement remains open.
+- Builder API selection is GPT-6.1 Sol/high; backend attestation is unavailable.
+  Full native assembly/nested runtime, hard quotas, provider/auth/tool coverage,
+  renewal and recovery, tailnet cutover, independent release enforcement and
+  Hostinger acceptance remain gates. No production admission or release claim.
+
+
 ### November 22, 2026, 20:48 HKT — reviewed native components and closed native26
 
 - Published PR13 remains draft/open/unmerged at exact
