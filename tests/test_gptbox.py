@@ -147,6 +147,7 @@ class GptboxTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.parent.chmod(0o700)
         path.write_text('fixture prepared state, not host evidence')
+        self.app.atomic(g.STATE+'/gptbox-image.json',json.dumps({'source_sha':SOURCE,'context_sha256':EXPECTED,'image_id':'f'*64})+'\n')
         self.context = self.root / 'input'
         self.context.mkdir()
         import fedora_input_fixture
@@ -236,6 +237,29 @@ class GptboxTests(unittest.TestCase):
         self.engine.bad_attestation = False
         self.assertFalse(self.assemble(retry=True)['job_admission'])
         self.assertEqual(json.loads(self.app.text(self.app.target + '/attempt.json'))['count'], 2)
+
+    def test_storage_stage_is_after_exact_removal_and_never_after_failure(self):
+        observed=[]
+        original=self.app.observe_storage
+        def observe(*args):
+            self.assertFalse(self.engine.containers)
+            observed.append(args)
+            return original(*args)
+        with patch.object(self.app,'observe_storage',side_effect=observe):
+            self.assemble()
+        self.assertEqual(observed,[('assembled-postcleanup',SOURCE,EXPECTED,'f'*64,SEALED)])
+        value=json.loads(self.app.text(self.app.target+'/storage-assembled-postcleanup.json'))
+        self.assertTrue(value['cleanup_verified']);self.assertEqual(value['reason'],'bounded-runner-unavailable')
+        self.app.path(self.app.target+'/result.json').unlink()
+        self.engine.bad_attestation=True
+        with patch.object(self.app,'observe_storage',side_effect=AssertionError('observation after failed assembly')):
+            with self.assertRaisesRegex(g.Blocked,'attestation'):self.assemble(retry=True)
+
+    def test_storage_stage_does_not_run_after_failed_owned_cleanup(self):
+        self.engine.fail=lambda args:'rm' in args
+        with patch.object(self.app,'observe_storage',side_effect=AssertionError('postcleanup stage invented')):
+            with self.assertRaisesRegex(g.Blocked,'injected engine boundary failure'):self.assemble()
+        self.assertFalse(self.app.path(self.app.target+'/storage-assembled-postcleanup.json').exists())
 
     def test_runtime_security_mutations_fail_before_any_entry(self):
         self.assemble()
@@ -395,7 +419,7 @@ class ProductionInputContractTests(unittest.TestCase):
             repo = root / 'reviewed-adapter-source'
             tools = repo / 'tools'
             tools.mkdir(parents=True)
-            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py'):
+            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py'):
                 (tools / name).write_bytes((ROOT / 'tools' / name).read_bytes())
             upstream = root / 'synthetic-upstream-NOT-DISTROBOX'
             upstream.mkdir()

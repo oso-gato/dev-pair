@@ -81,3 +81,39 @@ mutation races and work bounds. Same-device mount-ID changes and unavailable
 capacity are explicitly injected, without making mounts or claiming backend
 acceptance. Counterexamples test reserve edges, unknown metrics, outstanding
 commitments, preallocation non-double-counting and independent CI limits.
+
+The maintenance integration now has two fixed point-sample slots. Bootstrap
+samples after exact prepared-image inspection and completed image-copy workspace
+unwinding. The adapter samples after successful exact owned stage/runtime
+container removal, including reconciliation of an already completed candidate.
+A failed build, assembly or cleanup does not manufacture a postcleanup stage.
+Both records bind source, context and immutable prepared/sealed image identities.
+They do not establish a phase high-water mark or prove all writers stopped.
+
+The root is fixed to `/var/lib/dev-pair/maintenance`. Its image graphroot is an
+explicitly overlapping included subset, with no second counter to add. Artifact
+staging, image-copy/export workspaces and outer snapshots remain outside this
+sample. No caller can select another production root. The existing scanner is
+executed through the existing bounded command/native machinery, with at most
+10 seconds clipped to the original remaining phase, a smaller internal scan
+budget, and a 16 KiB combined capture ceiling. Existing entry/depth/name limits
+remain unchanged. There is no retry or additional image build/export for a sample.
+
+No remaining launch budget produces typed unavailable evidence without launching.
+A complete scanner-blocked or invalid response also remains independently
+unavailable. A launched execution/control/cleanup failure propagates unchanged;
+a protected typed unavailable record is retained as secondary evidence. Raw
+collector stdout/stderr never enters probe-tail diagnostics. Aggregate-only
+public projection rejects unknown fields, invalid numbers, contradictory capacity
+flags and mismatched source/context/image/stage records. Unknown inode capacity
+stays null with its fixed blocker while independently observed counts remain.
+No absent count becomes zero, and observation failure creates no capacity verdict.
+
+Already required image inspection can additionally expose validated optional
+logical Size and bounded layer digests/counts. Missing or invalid descriptors
+remain null. They are source/context/image bound and are never summed as unique
+physical storage. The prepared record retains the same selected descriptors;
+no extra engine query is launched solely for them. The two observations retain
+`quiescence_proven=false`, `enforces_capacity=false` and `runtime_admitted=false`.
+No fabricated growth maximum, `storage.admit` call, allocation or job admission
+is added. Current usage cannot replace future capacity/enforcement proof.

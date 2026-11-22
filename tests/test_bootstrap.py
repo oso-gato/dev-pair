@@ -574,6 +574,12 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(result['image_id'], 'sha256:' + 'a' * 64)
         self.assertFalse(result['distrobox_assembled'])
         self.assertFalse(result['runtime_validated'])
+        observation=json.loads(self.app.text(b.STATE+'/storage-prepared.json'))
+        self.assertEqual(observation['stage'],'prepared-image')
+        self.assertEqual(observation['context_sha256'],digest)
+        self.assertEqual(observation['prepared_image_id'],'a'*64)
+        self.assertEqual(observation['reason'],'bounded-runner-unavailable')
+        self.assertIsNone(result['logical_storage']['logical_size_bytes'])
         stage = self.app.path('/var/lib/dev-pair/artifacts/gptbox/' + digest)
         self.assertTrue(all(p.stat().st_mode & 0o777 == 0o444 for p in stage.iterdir()))
 
@@ -604,6 +610,7 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(b.Blocked):
                 self.app.build_gptbox(context, digest)
         self.assertFalse(self.app.path(b.STATE + '/gptbox-image.json').exists())
+        self.assertFalse(self.app.path(b.STATE + '/storage-prepared.json').exists())
         self.assertTrue(self.app.path(b.STATE + '/gptbox-build-intent.json').exists())
         self.fake.fail = None
         manifest = json.loads((context / 'inputs.json').read_text())

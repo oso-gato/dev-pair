@@ -81,6 +81,7 @@ class FedoraPrepareTests(unittest.TestCase):
         source = self.root / 'source'
         (source / 'tools').mkdir(parents=True)
         (source / 'tools/bootstrap.py').write_text('synthetic code identity only\n')
+        (source / 'tools/storage_observation.py').write_bytes((Path(__file__).resolve().parents[1]/'tools/storage_observation.py').read_bytes())
         (self.root / 'prepared').write_text(json.dumps({'gptbox_context_sha256': expected['context_sha256'],
                  'standards_sha': expected['standards_sha'], 'bootstrap_sha256': guest.digest(source / 'tools/bootstrap.py')}))
         (self.root / 'gptbox-image.json').write_text(json.dumps({'image_id': 'sha256:' + 'd' * 64,
@@ -92,10 +93,16 @@ class FedoraPrepareTests(unittest.TestCase):
                 {'Id': 'sha256:' + 'e' * 64, 'Architecture': 'amd64', 'Os': 'linux',
                  'Labels': {'dev-pair.context': expected['context_sha256'], 'org.opencontainers.image.revision': expected['source_sha'],
                             'dev-pair.distrobox': expected['distrobox_sha']}}]
+        rows[0].update(Size=12345,RootFS={'Layers':['sha256:'+'a'*64]})
         with mock.patch.object(guest.pwd, 'getpwnam', return_value=type('UID', (), {'pw_uid': 1001})()), \
                 mock.patch.object(guest, 'native_image_capture', side_effect=lambda source, argv, timeout: json.dumps(rows).encode()) as command:
             projected = guest.initialize_projection(state(maintenance='complete'), expected, 0)
-            guest.image_evidence(expected, projected, self.root, source, time.monotonic() + 20)
+            logical={}
+            guest.image_evidence(expected, projected, self.root, source, time.monotonic() + 20,logical_observations=logical)
+            self.assertEqual(logical['prepared']['logical_size_bytes'],12345)
+            self.assertEqual(logical['prepared']['image_id'],'d'*64)
+            self.assertEqual(logical['prepared']['source_sha'],expected['source_sha'])
+            self.assertIsNone(logical['assembled']['logical_size_bytes'])
             self.assertTrue(projected['prepared_image_verified'])
             self.assertTrue(projected['assembled_image_verified'])
             self.assertEqual(projected['package_count'], 3)

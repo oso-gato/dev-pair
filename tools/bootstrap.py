@@ -1628,6 +1628,35 @@ class Bootstrap:
             raise Blocked('gptbox context/source verification failed; no admission') from None
         return tool, source, manifest
 
+    @staticmethod
+    def storage_observer():
+        spec=importlib.util.spec_from_file_location('dev_pair_storage_observation',Path(__file__).with_name('storage_observation.py'))
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+    def observe_storage(self,stage,source,context,prepared,sealed=None):
+        observer=self.storage_observer()
+        value=observer.record(stage,source,context,prepared.removeprefix('sha256:'),
+            sealed.removeprefix('sha256:') if sealed else None,cleanup=stage=='assembled-postcleanup')
+        location=(STATE+'/storage-prepared.json' if stage=='prepared-image' else
+                  STATE+'/gptbox-adapter/'+context+'/storage-assembled-postcleanup.json')
+        def save():self.atomic(location,json.dumps(value,sort_keys=True)+'\n',expected=self.text(location) or None)
+        if not isinstance(self.run,Commands):value['reason']='bounded-runner-unavailable';save();return value
+        end=self.run.execution_deadline()
+        remaining=min(10,end-time.monotonic()) if end is not None else 10
+        if remaining<2:value['reason']='no-budget';save();return value
+        value['reason']='collector-lifecycle-failure';save()
+        # _call deliberately bypasses ProbeCommands raw-buffer diagnostics. Native
+        # lifecycle failures propagate unchanged; this is not a fallback executor.
+        output=self.run._call('/usr/bin/python3','-I',str(Path(__file__).with_name('storage.py')),
+            str(self.path(observer.ROOT)),'--seconds',str(min(9,remaining/2)),
+            timeout=remaining,maximum=16384,ok=(0,2))
+        try:
+            inventory=observer.decode(output)
+            if inventory is None:value['reason']='collector-unavailable'
+            else:value.update(status='observed',reason='none',inventory=inventory)
+        except (ValueError,TypeError):value['reason']='invalid-collector-output'
+        save();return value
+
     def build_gptbox(self, context, expected):
         tool, source, manifest = self.validate_gptbox_context(context, expected)
         try:
@@ -1751,8 +1780,10 @@ class Bootstrap:
                   'local_tag': tag, 'runtime_user': 'dp-maint', 'storage_driver': 'vfs',
                   'launch': 'blocked: stock Distrobox 1.8.2.5 adds privileged, label=disable and host mounts',
                   'distrobox_assembled': False, 'runtime_validated': False,
-                  'fedora_base': import_proof if not prior else prior.get('fedora_base')}
+                  'fedora_base': import_proof if not prior else prior.get('fedora_base'),
+                  'logical_storage':self.storage_observer().logical(image)}
         self.atomic(record_path, json.dumps(record, sort_keys=True, indent=2) + '\n')
+        self.observe_storage('prepared-image',manifest['source_sha'],expected,image_id)
         return record
 
     def guard(self, sources):

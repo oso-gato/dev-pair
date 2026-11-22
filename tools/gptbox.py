@@ -91,7 +91,7 @@ class Gptbox(Bootstrap):
         repo = Path(__file__).resolve().parents[1]
         if self.run('/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD').strip() != revision:
             raise Blocked('adapter source HEAD differs from requested exact target')
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py'):
             data = self.protected(Path(__file__).with_name(name)).read_bytes()
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
@@ -349,6 +349,12 @@ class Gptbox(Bootstrap):
                 self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
         fedora_oci.recover_workspaces(work,uid=int(self.uid),reconcile=reconcile)
 
+    def observe_assembled_storage(self,expected,revision,sealed):
+        prepared=json.loads(self.text(STATE+'/gptbox-image.json'))
+        if prepared.get('source_sha')!=revision or prepared.get('context_sha256')!=expected:
+            raise Blocked('storage prepared identity mismatch')
+        return self.observe_storage('assembled-postcleanup',revision,expected,prepared['image_id'],sealed)
+
     def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
         self.preflight()
         manifest, self.scripts = self.inputs(context, expected, upstream, revision)
@@ -377,6 +383,7 @@ class Gptbox(Bootstrap):
                         or labels.get('dev-pair.context') != expected or labels.get('dev-pair.distrobox') != DBX_SHA
                         or labels.get('org.opencontainers.image.revision') != revision):
                     raise Blocked('recorded assembled image is unavailable')
+                self.observe_assembled_storage(expected,revision,result['assembled_image_id'])
                 return {**result, 'reused_completed_evidence': True}
             if previous and not retry:
                 raise Blocked('incomplete attempt requires explicit --retry; evidence remains intact')
@@ -525,6 +532,7 @@ class Gptbox(Bootstrap):
                 for identity in (runtime_id, stage):
                     if identity:
                         self.engine('rm', '--force', identity)
+            self.observe_assembled_storage(expected,revision,sealed)
             self.record('result', result)
             return result
 
@@ -550,7 +558,7 @@ class Gptbox(Bootstrap):
         self.protected(upstream)
         for name in ('distrobox-init', 'distrobox-enter'):
             self.protected(Path(upstream) / name)
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py'):
+        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py'):
             self.protected(Path(__file__).with_name(name))
         self.protected(Path(fedora_oci._public_inputs().__file__))
         if self.path('/usr/bin/git').exists():

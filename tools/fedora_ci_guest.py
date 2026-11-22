@@ -925,7 +925,39 @@ def native_image_capture(source, argv, timeout):
         raise ValueError('Native image observation blocked; ' + detail) from None
 
 
-def image_evidence(expected, projection, state_root, source, end):
+def storage_observer(source):
+    spec=importlib.util.spec_from_file_location('dev_pair_public_storage_observation',source/'tools/storage_observation.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+
+def storage_public_projection(state_root,expected,source):
+    result={stage:{'status':'unavailable','reason':'not-recorded'} for stage in ('prepared-image','assembled-postcleanup')}
+    if source is None:return result
+    try:
+        observer=storage_observer(source)
+        prepared=read_json(state_root/'gptbox-image.json',16384)
+        require(prepared['source_sha']==expected['source_sha'] and prepared['context_sha256']==expected['context_sha256'],
+                'Storage prepared identity mismatch')
+        image=prepared['image_id'].removeprefix('sha256:')
+        require(re.fullmatch('[0-9a-f]{64}',image), 'Storage image identity missing')
+    except (OSError,ValueError,KeyError,TypeError):return result
+    for stage in result:
+        try:
+            sealed=None
+            if stage=='prepared-image':path=state_root/'storage-prepared.json'
+            else:
+                target=state_root/'gptbox-adapter'/expected['context_sha256']
+                completed=read_json(target/'result.json',16384)
+                require(completed['source_sha']==expected['source_sha'] and completed['context_sha256']==expected['context_sha256'] and
+                        completed['runtime_container_removed'] is True and completed['job_admission'] is False,
+                        'Storage cleanup not verified')
+                sealed=completed['assembled_image_id'];path=target/'storage-assembled-postcleanup.json'
+            result[stage]=observer.validate(read_json(path,16384),stage,expected['source_sha'],expected['context_sha256'],image,sealed)
+        except (OSError,ValueError,KeyError,TypeError):pass
+    return result
+
+
+def image_evidence(expected, projection, state_root, source, end, logical_observations=None):
     images = []
     if projection['prepare'] == 'complete':
         desired = read_json(state_root / 'prepared')
@@ -970,6 +1002,10 @@ def image_evidence(expected, projection, state_root, source, end):
         else:
             require(labels.get('dev-pair.distrobox') == expected['distrobox_sha'], 'Actual sealed image upstream mismatch')
             projection['assembled_image_verified'] = True
+        if logical_observations is not None:
+            logical_observations['prepared' if index==0 else 'assembled']={
+                'source_sha':expected['source_sha'],'context_sha256':expected['context_sha256'],
+                'image_id':identity,**storage_observer(source).logical(row)}
     return projection
 
 
@@ -1053,8 +1089,8 @@ def prepare_observations(state, expected):
     return result
 
 
-def public_diagnostics(state_root, expected):
-    selected = {}
+def public_diagnostics(state_root, expected, source=None):
+    selected = {'storage_observations':storage_public_projection(state_root,expected,source)}
     for name, path in (('prepare', state_root / 'prepare-diagnostics.json'),
                        ('adapter', state_root / 'gptbox-adapter' / expected['context_sha256'] / 'diagnostics.json')):
         try:
@@ -1206,7 +1242,8 @@ def main():
                     report['initialization'] = initialize_projection(read_json(state_root / 'initialize.json'), expected, None)
                 projection = report['initialization']
                 if projection:
-                    report['initialization'] = image_evidence(expected, projection, state_root, source, evidence_end)
+                    report['initialization'] = image_evidence(expected, projection, state_root, source, evidence_end,
+                        logical_observations=report['diagnostics'].setdefault('image_logical_storage',{}))
                     if projection['prepare'] == 'complete' and projection['prepared_image_verified']:
                         phases['bootstrap-prepare'] = {'status': 'pass', 'detail': 'Shared initialize completed preparation; protected exact-target evidence and actual prerequisite image verified'}
                     if (projection['exit_status'] == 0 and projection['phase'] == 'complete' and projection['maintenance_gptbox'] == 'complete' and projection['assembled_image_verified']):
@@ -1225,7 +1262,7 @@ def main():
                     phases[phase] = {'status': 'pass', 'detail': 'Actual post-initialize bootstrap ' + stage + ' completed'}
                 except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                     phases[phase] = {'status': 'blocked', 'detail': safe_text(exc, 1000)}
-            report['diagnostics']['public_operations'] = public_diagnostics(state_root, expected)
+            report['diagnostics']['public_operations'] = public_diagnostics(state_root, expected, source)
             try:
                 packages = read_bytes(state_root / 'packages.txt', 32768)
                 report['diagnostics']['host_packages'] = {'sha256': hashlib.sha256(packages).hexdigest(),
