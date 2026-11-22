@@ -449,25 +449,6 @@ def tooling_stage_evidence(data, truncated=False):
             'all_stages_observed':observed==list(TOOL_STAGES) and not (truncated or invalid or order_invalid or partial)}
 
 
-def runtime_projection(data):
-    unavailable=lambda reason:{'status':'unavailable','reason':reason}
-    if type(data)is not bytes or len(data)>4096:return unavailable('projection-byte-bound')
-    try:value=json.loads(data,object_pairs_hook=unique_object)
-    except (ValueError,TypeError):return unavailable('invalid-json')
-    if value is None:return unavailable('runtime-not-reported')
-    if type(value)is not dict or set(value)!={'name','package','path','version'}:return unavailable('invalid-object-shape')
-    if type(value['package'])is not str:return unavailable('invalid-package-type')
-    try:
-        value['package'].encode()
-        for key,limit in (('name',128),('path',1024),('version',2048)):
-            if type(value[key])is not str or not 0<len(value[key].encode())<=limit:return unavailable('invalid-runtime-field')
-    except UnicodeError:return unavailable('invalid-runtime-encoding')
-    if not value['path'].startswith('/') or '\0' in value['path']:return unavailable('invalid-runtime-path')
-    result={'status':'observed',**{key:value[key] for key in ('name','path','version')}}
-    if len(json.dumps(result).encode())>4096:return unavailable('retained-object-byte-bound')
-    return result
-
-
 def verification_evidence(directory, source):
     # Preserve bounded original public crypto evidence before downstream
     # packaging failures or isolated scratch cleanup can remove it.
@@ -708,7 +689,7 @@ class Probe:
             self.report['storage_measurement_failure'] = exc.diagnostics
             raise
 
-    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False, tooling_stages=False, suppress_failure_output=False):
+    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False, tooling_stages=False):
         """Bound logs/time and watch storage while a native child runs."""
         if self.phase_end is not None:
             timeout = min(timeout, self.phase_end - time.monotonic())
@@ -789,8 +770,7 @@ class Probe:
             except (ProcessLookupError, PermissionError):
                 pass
             process.wait(timeout=5)
-            if not suppress_failure_output:
-                emit_text('', bytes(log), 12000)
+            emit_text('', bytes(log), 12000)
             raise
         finally:
             if tooling_stages:
@@ -883,7 +863,7 @@ class Probe:
         with fedora_oci.image_workspaces(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as (copy_tmp, verification_root):
             with fedora_oci.verified(signed, temporary_parent=verification_root, leased=True) as (plain, proof):
                 def local_image(*args, **kwargs):
-                    operation = 'runtime-info' if args==('info','--format={{json .Host.OCIRuntime}}') else 'inspect' if args[:2]==('image','inspect') else args[0] if args and args[0] in ('load','save','build') else None
+                    operation = 'inspect' if args[:2]==('image','inspect') else args[0] if args and args[0] in ('load','save','build') else None
                     require(operation is not None, 'unsupported local image operation')
                     try:
                         prefix = list(self.podman)
@@ -903,8 +883,7 @@ class Probe:
                             self.image_copy_active=False  # The worker has not been launched.
                             raise
                         self.engine_activity=True  # Even a failed launch may leave owned engine resources.
-                        value=self.bounded(prefix+list(args),seconds,'owned image copy',tooling_stages=operation=='build',
-                                           suppress_failure_output=operation=='runtime-info')
+                        value=self.bounded(prefix+list(args),seconds,'owned image copy',tooling_stages=operation=='build')
                         self.image_copy_active=False
                         return value
                     except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
@@ -917,7 +896,6 @@ class Probe:
                 base_proof = fedora_oci.import_image(local_image, plain)
             self.report['signed_container_base'] = base_proof
             self.report['oci_runtime']={'status':'unavailable','reason':'not-collected'}
-            self.report['oci_runtime']=runtime_projection(local_image('info','--format={{json .Host.OCIRuntime}}',timeout=5))
             self.report['tooling_stages']={'availability':'unavailable','reason':'build-not-started'}
             build = self.root / 'tool-build'
             build.mkdir()

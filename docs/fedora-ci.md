@@ -263,17 +263,17 @@ RUN text, missing stages, partial lines and truncated capture do not establish
 execution success or identify a cause. The540-second/10-second timeout settings,
 package signature checks, environment, network and resource profile are unchanged.
 
-A fixed owned-engine `info --format={{json .Host.OCIRuntime}}` query records only
-validated bounded runtime name/path/version metadata. It has at most five seconds
-inside the original phase deadline, uses the existing cleared environment/TMPDIR
-and never executes the reported path. Valid package metadata is discarded;
-null, malformed or oversized completed output is explicitly unavailable. A failed
-launched query retains the existing primary failure and unresolved-worker cleanup
-behavior; its raw failure capture is suppressed so package/malformed fields cannot
-bypass projection through the ordinary error log. Bytes still count against the
-same aggregate capture ceiling. Other command failure logs remain unchanged.
-These diagnostics do not prove native runtime support, explain the
-prior exit125, or establish failed-helper termination/cleanup.
+The optional pre-build owned-engine runtime-info query is omitted. OCI runtime
+metadata remains explicitly `unavailable` with reason `not-collected`; no previous
+sample or Podman version substitutes for current runtime identity. There is no
+replacement probe, retry, or transfer of its former five-second budget. Required
+signed load/inspect/save-back, build and tooling run keep their original flags,
+time/resource/capture limits and failure-output accounting. A failed necessary
+engine operation still preserves its primary failure, sticky active latch and
+owned scratch when complete worker termination is unresolved. Omitting future
+diagnostic work neither reclaims run26 resources nor proves a particular helper
+caused exit124, native runtime support, or failed-helper cleanup.
+
 
 
 The runtime-account sudo probe exports only closed typed negative evidence and

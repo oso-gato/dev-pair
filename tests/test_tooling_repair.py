@@ -53,9 +53,11 @@ class ToolingRepair(unittest.TestCase):
             self.assertGreater(seconds,0)
             observed.append((operation,argv,name));return b'fixture-rpm-manifest'
         with self.fixture(bounded,import_calls=True),contextlib.redirect_stdout(io.StringIO()):self.probe.tooling()
-        self.assertEqual([row[0] for row in observed],['load','image','save','info','build','run'])
-        self.assertEqual(observed[3][1][-2:],['info','--format={{json .Host.OCIRuntime}}'])
-        build=observed[4][1]
+        baseline_sequence=['load','image','save','info','build','run']
+        self.assertEqual([row[0] for row in observed],[value for value in baseline_sequence if value!='info'])
+        self.assertFalse(any('info' in argv for _,argv,_ in observed))
+        self.assertEqual(self.probe.report['oci_runtime'],{'status':'unavailable','reason':'not-collected'})
+        build=observed[3][1]
         self.assertEqual([a for a in build if a.startswith('--network=')],['--network=slirp4netns:allow_host_loopback=false'])
         for arg in ('--pull=never','--http-proxy=false','--memory=2g','--cpu-quota=200000','--force-rm','--ulimit=fsize=2147483648:2147483648'):
             self.assertIn(arg,build)
@@ -77,7 +79,6 @@ class ToolingRepair(unittest.TestCase):
         marker=self.root/'preserved';marker.write_text('retain')
         def actual_child(argv,seconds,name,**kwargs):
             self.assertTrue(self.probe.engine_activity);self.assertTrue(self.probe.image_copy_active)
-            if 'info' in argv:return b'null'
             # Real bounded nonzero process; this is not an engine/helper lifetime proof.
             code='import os,json,sys;print(json.dumps({"keys":sorted(os.environ)}));sys.exit(125)'
             return ci.Probe.bounded(self.probe,[sys.executable,'-c',code],seconds,name,disk_check=False)
@@ -123,7 +124,7 @@ class ToolingRepair(unittest.TestCase):
              patch.object(self.probe,'storage_measurement',side_effect=ci.Blocked('capacity blocked fixture')):
             with self.assertRaisesRegex(ci.Blocked,'capacity blocked fixture'):self.probe.tooling()
         self.assertFalse(self.probe.engine_activity);self.assertFalse(self.probe.image_copy_active)
-        self.assertEqual(self.probe.primary_image_failure,('runtime-info','capacity blocked fixture'))
+        self.assertEqual(self.probe.primary_image_failure,('build','capacity blocked fixture'))
         self.assertFalse((self.root/'image-copy').exists());self.assertFalse((self.root/'verification-work').exists())
 
     @contextlib.contextmanager
