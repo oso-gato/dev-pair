@@ -177,6 +177,96 @@ class FedoraOCI(unittest.TestCase):
             wrong,_=self.graph(raw=b'changed rootfs',declared_diff=pins['DIFF'])
             with self.assertRaises(ValueError):f.parse_oci(wrong,time.monotonic()+2,derived=True)
 
+    def alter_index(self, change):
+        def alter(entries):
+            return [(name, json.dumps(change(json.loads(data))).encode() if name=='index.json' else data)
+                    for name,data in entries]
+        return alter
+
+    def test_derived_index_can_omit_type_but_signed_source_still_requires_it(self):
+        def without_type(index):index.pop('mediaType');return index
+        source,pins=self.graph()
+        path,changed=self.graph(alter=self.alter_index(without_type),gzip_time=1)
+        self.assertEqual(pins['CONFIG'],changed['CONFIG'])
+        self.assertEqual(pins['DIFF'],changed['DIFF'])
+        self.assertNotEqual(pins['LAYER'],changed['LAYER'])
+        with contextlib.ExitStack() as stack:
+            for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+            f.parse_oci(source,time.monotonic()+2)
+            with self.assertRaisesRegex(ValueError,'unsupported OCI index'):
+                f.parse_oci(path,time.monotonic()+2)
+            proof=f.parse_oci(path,time.monotonic()+2,derived=True)
+            self.assertEqual(proof['manifest_sha256'],changed['MANIFEST'])
+            self.assertEqual(proof['config_sha256'],pins['CONFIG'])
+            self.assertEqual(proof['compressed_layer_sha256'],changed['LAYER'])
+            self.assertEqual(proof['diff_id_sha256'],pins['DIFF'])
+            with self.assertRaisesRegex(ValueError,'unsupported OCI index'):
+                f.import_image(lambda *a,**k:self.fail('engine reached unsigned transport'),path)
+            for declared in (None,pins['DIFF']):
+                altered,_=self.graph(alter=self.alter_index(without_type),raw=b'changed rootfs',declared_diff=declared)
+                with self.subTest(declared=declared),self.assertRaises(ValueError):
+                    f.parse_oci(altered,time.monotonic()+2,derived=True)
+
+    def test_index_optional_type_never_accepts_wrong_type_shape_or_graph(self):
+        changes=[lambda index,value=value:dict(index,mediaType=value)
+                 for value in (None,'',0,False,[],{},'application/vnd.docker.distribution.manifest.list.v2+json')]
+        changes += [lambda index:dict(index,unknown=True),lambda index:dict(index,manifests=[]),
+                    lambda index:dict(index,manifests=index['manifests']*2),
+                    lambda index:dict(index,manifests={}),lambda index:dict(index,schemaVersion=1),
+                    lambda index:[],lambda index:None]
+        for change in changes:
+            path,pins=self.graph(alter=self.alter_index(change))
+            with contextlib.ExitStack() as stack:
+                for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+                for derived in (False,True):
+                    with self.subTest(change=change,derived=derived),self.assertRaisesRegex(ValueError,'unsupported OCI index'):
+                        f.parse_oci(path,time.monotonic()+2,derived=derived)
+        def bad_descriptor(index):
+            index.pop('mediaType');index['manifests'][0]['digest']='sha256:'+'0'*64;return index
+        path,pins=self.graph(alter=self.alter_index(bad_descriptor))
+        with contextlib.ExitStack() as stack:
+            for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+            with self.assertRaisesRegex(ValueError,'OCI descriptor mismatch'):
+                f.parse_oci(path,time.monotonic()+2,derived=True)
+
+    def test_missing_derived_index_type_retains_full_graph_integrity(self):
+        def without_type(index):index.pop('mediaType');return index
+        strip=self.alter_index(without_type)
+        def wrong_size(index):
+            index.pop('mediaType');index['manifests'][0]['size']+=1;return index
+        mutations=[self.alter_index(wrong_size),
+                   lambda entries:[(name,data+b'changed' if name.startswith('blobs/sha256/') and data is not None else data)
+                                   for name,data in strip(entries)],
+                   lambda entries:strip(entries)[:-1],
+                   lambda entries:strip(entries)+[('blobs/sha256/'+hashlib.sha256(b'unreferenced').hexdigest(),b'unreferenced')]]
+        for mutate in mutations:
+            path,pins=self.graph(alter=mutate)
+            with contextlib.ExitStack() as stack:
+                for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+                with self.subTest(mutate=mutate),self.assertRaises(ValueError):
+                    f.parse_oci(path,time.monotonic()+2,derived=True)
+
+    def test_import_saveback_uses_derived_omitted_type_without_changing_source(self):
+        def without_type(index):index.pop('mediaType');return index
+        source,pins=self.graph();derived,changed=self.graph(alter=self.alter_index(without_type),gzip_time=1)
+        source_hash=hashlib.sha256(source.read_bytes()).hexdigest();calls=[]
+        with contextlib.ExitStack() as stack:
+            for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
+            stack.enter_context(patch.object(f,'IMAGE','sha256:'+pins['CONFIG']))
+            row={'Id':f.IMAGE,'Digest':'sha256:'+pins['MANIFEST'],'ManifestType':'application/vnd.oci.image.manifest.v1+json',
+                 'Os':'linux','Architecture':'amd64','RootFS':{'Layers':['sha256:'+pins['DIFF']]}}
+            def fixture_engine(*args,**kwargs):
+                calls.append(args)
+                if args[:2]==('image','inspect'):return json.dumps([row])
+                if args[0]=='save':Path(args[args.index('--output')+1]).write_bytes(derived.read_bytes())
+                return ''
+            proof=f.import_image(fixture_engine,source)
+        self.assertEqual([row[0] for row in calls],['load','image','save'])
+        self.assertEqual(proof['saveback']['manifest_sha256'],changed['MANIFEST'])
+        self.assertEqual(proof['saveback']['config_sha256'],pins['CONFIG'])
+        self.assertEqual(proof['saveback']['diff_id_sha256'],pins['DIFF'])
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(),source_hash)
+
     def test_isolated_python_keeps_source_siblings_without_ambient_import_path(self):
         import subprocess
         tools=Path(f.__file__).parent

@@ -175,8 +175,13 @@ def parse_oci(plain, end, *, derived=False):
         require({'index.json','oci-layout'} <= seen and len(blobs) == 3, 'missing OCI descriptor/blob')
         require(_json(metadata['oci-layout']) == {'imageLayoutVersion':'1.0.0'}, 'unsupported OCI layout')
         index = _json(metadata['index.json'])
-        require(set(index) == {'schemaVersion','mediaType','manifests'} and index['schemaVersion'] == 2
-                and index['mediaType'] == 'application/vnd.oci.image.index.v1+json'
+        # containers/image v5.29.2 (Podman 4.9) leaves index MediaType unset
+        # when saving an OCI archive. Only derived transport may omit it;
+        # supplied types and the authenticated source remain exact.
+        required_index = {'schemaVersion','manifests'} | (set() if derived else {'mediaType'})
+        require(type(index) is dict and required_index <= set(index) <= {'schemaVersion','mediaType','manifests'}
+                and index['schemaVersion'] == 2
+                and index.get('mediaType', 'application/vnd.oci.image.index.v1+json') == 'application/vnd.oci.image.index.v1+json'
                 and type(index['manifests']) is list and len(index['manifests']) == 1, 'unsupported OCI index')
         def descriptor(item, media, wanted=None):
             require(type(item) is dict and set(item) <= {'mediaType','digest','size','annotations'}
