@@ -274,3 +274,19 @@ bypass projection through the ordinary error log. Bytes still count against the
 same aggregate capture ceiling. Other command failure logs remain unchanged.
 These diagnostics do not prove native runtime support, explain the
 prior exit125, or establish failed-helper termination/cleanup.
+
+
+The runtime-account sudo probe exports only closed typed negative evidence and
+bounded guest package metadata. Successful listing status zero is distinct from
+permission: both fixed roles must return the exact hostname-bound C-locale denial
+with empty stderr and verified complete relay transport on native execution.
+Standalone trusted-root preparation retains its existing fixed direct subprocess
+with actual waited status and complete bounded pipes, explicitly typed as direct
+without a relay or native-exit claim. A failed native operation cannot select it
+as a fallback. Public reports retain
+the two stable role receipts even after ordinary recent records rotate; raw sudo
+policy output remains withheld on success and rejection. Guest package provenance
+is explicitly package-only, with loaded-policy-plugin verification false. Unknown
+versions/backends/grammar block. No extra privileges, package workaround, changed
+native executor semantics or larger resource/deadline/capture/report limits are
+introduced; local parser/process tests are not Fedora policy acceptance.

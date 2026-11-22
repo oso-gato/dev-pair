@@ -972,6 +972,54 @@ def image_evidence(expected, projection, state_root, source, end):
     return projection
 
 
+def sudo_public_projection(record):
+    """Closed typed fields only; a policy listing is never public evidence."""
+    result = {'package': {'availability': 'unavailable'}, 'denials': {}}
+    package = record.get('sudo_package')
+    base = {'availability', 'supported', 'provenance', 'policy_plugin_verified'}
+    if type(package) is dict and package.get('provenance') == 'package-only' and package.get('policy_plugin_verified') is False:
+        if set(package) == base and package.get('availability') == 'unavailable' and package.get('supported') is False:
+            result['package'] = dict(package)
+        elif (set(package) == base | {'name','version','release','arch'} and package.get('availability') == 'observed' and
+              type(package.get('supported')) is bool and all(type(package.get(k)) is str and
+              re.fullmatch(r'[A-Za-z0-9_.+-]{1,64}', package[k]) for k in ('name','version','release','arch'))):
+            supported = (package['name'] == 'sudo' and package['version'] == '1.9.17' and
+                         re.fullmatch(r'[0-9]+\.p2\.fc44',package['release']) is not None and
+                         package['arch'] in ('x86_64','aarch64'))
+            if supported == package['supported']:
+                result['package'] = dict(package)
+    denials = record.get('sudo_denials', {})
+    if type(denials) is not dict:
+        return result
+    fields = set(('operation_id role execution_kind relay_applicability payload_exit native_exit relay_verified exact_denial hostname_bound stderr_empty '
+                  'complete_input stdout_bytes stderr_bytes package_supported outcome').split())
+    for role, operation in (('dp-maint','maintenance-sudo-denial'),('dp-dev','development-sudo-denial')):
+        value = denials.get(operation)
+        if type(value) is not dict or set(value) != fields or value.get('role') != role or value.get('operation_id') != operation:
+            continue
+        booleans = ('relay_verified','exact_denial','hostname_bound','stderr_empty','complete_input','package_supported')
+        if not all(type(value[k]) is bool for k in booleans):
+            continue
+        if value['package_supported'] and result['package'].get('supported') is not True:
+            continue
+        if not all(value[k] is None or type(value[k]) is int and -255 <= value[k] <= 255 for k in ('payload_exit','native_exit')):
+            continue
+        if not all(type(value[k]) is int and 0 <= value[k] <= 1048576 for k in ('stdout_bytes','stderr_bytes')):
+            continue
+        if value['execution_kind'] not in ('native','direct'):
+            continue
+        if value['relay_applicability'] != ('required' if value['execution_kind'] == 'native' else 'not-applicable'):
+            continue
+        transport = ((value['execution_kind'] == 'native' and value['relay_verified'] and value['native_exit'] == 0) or
+                     (value['execution_kind'] == 'direct' and not value['relay_verified'] and value['native_exit'] is None))
+        denied = (all(value[k] for k in booleans if k != 'relay_verified') and transport and value['payload_exit'] == 0 and
+                  value['stderr_bytes'] == 0 and value['stdout_bytes'] == len('User '+role+' is not allowed to run sudo on erebus.\n'))
+        if value['outcome'] != ('denied' if denied else 'blocked'):
+            continue
+        result['denials'][operation] = dict(value)
+    return result
+
+
 def public_diagnostics(state_root, expected):
     selected = {}
     for name, path in (('prepare', state_root / 'prepare-diagnostics.json'),
@@ -980,6 +1028,7 @@ def public_diagnostics(state_root, expected):
             record = read_json(path, 524288)
             failures = record.get('failures', [])
             selected[name] = {'available_failures': len(failures), 'retained_failures': min(2, len(failures)), 'records': []}
+            selected[name]['sudo_evidence'] = sudo_public_projection(record)
             selected[name]['recent_metadata'] = [{key: item.get(key) for key in
                     ('operation_id', 'step', 'status', 'outcome', 'accepted_exit', 'allowed_exit_statuses', 'native', 'elapsed_seconds', 'admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status')}
                     for item in record.get('recent', [])[-4:]]
@@ -997,6 +1046,10 @@ def public_diagnostics(state_root, expected):
                          'accepted_exit': item.get('accepted_exit'), 'allowed_exit_statuses': item.get('allowed_exit_statuses'),
                          'native': item.get('native', {'availability': 'not-recorded'}),
                          **{key: item[key] for key in ('elapsed_seconds', 'admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status') if key in item}}
+                if item.get('operation_id') in ('maintenance-sudo-denial', 'development-sudo-denial', 'sudo-package-provenance'):
+                    projected = sudo_public_projection({'sudo_package': item.get('sudo_package', record.get('sudo_package')),
+                        'sudo_denials': {item['operation_id']: item.get('sudo_denial')}})
+                    entry['sudo_evidence'] = projected
                 for stream in ('stdout', 'stderr'):
                     text = item.get(stream + '_tail', '')
                     entry[stream + '_tail'] = safe_text(text, 1500)
