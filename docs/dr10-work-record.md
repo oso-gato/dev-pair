@@ -3,6 +3,33 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 00:07 HKT — strict owned-helper source branch and all-entry fallback
+
+- Isolated source starts from reviewed `8aa45c2`. Finalized diagnosis
+  `/workspace/artifacts/resume-20261122/session-048-filesystem-diagnosis.json`,
+  SHA256 `0fbf2976cae21626854a319721c413d08331d3ae006d3df841fd6ba593e1067c`,
+  authorizes one strict independently attested helper-rotation branch. Actual048
+  attribution remains unresolved; its unequal filesystem and cwd/shell omissions
+  alone never prove helper rotation or resumed progress.
+- Live owned Popen/start/PPID, binary/aliases, anchored directory/lock identities,
+  closed exclusive FLOCK ownership and actual lock contention now gate the branch.
+  First helper observations are separate from immutable request/history. Handles
+  publish before responses and clear on exit; unknown/dead/foreign evidence blocks.
+  Only the exact independently observed READ target and exact source-shaped
+  cwd/shell omissions can derive a new full body. Original prefix/pair, prompt,
+  metadata/turn uniqueness, result replay and final durable audit remain exact.
+- Bounded all-entry fallback records only counts/enums/hashes, ordered and multiset
+  comparisons and prioritized changed targets within2KiB. No path/secret/PID/raw
+  process values are public, no normalization grants acceptance, and all original
+  action/global/capture/resource limits remain. Source tests use real local
+  process locks and copied immutable Python, not actual stock or production proof.
+- No stock/native/CI/auth/provider/VPS/network/main/push action occurs in this unit.
+  Fresh exact-candidate review and a separately authorized stock experiment remain
+  required. Builder API selection is GPT-6.1 Sol/high; backend attestation is
+  unavailable. Runtime/job admission, actual renewal, native assembly/nesting,
+  quotas, release enforcement, tailnet and destination acceptance remain open.
+
+
 ### November 22, 2026, 23:37 HKT — hosted native29 fixture portability correction
 
 - Published `048e96532e00dc28b1db65facf9a5558f9eca8df` passed fresh combined

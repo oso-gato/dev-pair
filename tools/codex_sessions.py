@@ -20,6 +20,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import codex_tools as t
+import session_helper as helper
 
 CATALOG_SHA = '1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10'
 LABELS = ('alpha', 'beta')
@@ -258,10 +259,10 @@ ENV_REQUIRED_CHILDREN={'environments':frozenset(('environment',)),'workspace_roo
     'filesystem':frozenset(('permission_profile',)),'permission_profile':frozenset(('file_system',))}
 
 
-def environment_components(content):
+def environment_components(content,visitor=None):
     """Diagnostic-only bounded streaming parse; exact component bytes, never an acceptance oracle."""
     from xml.parsers import expat
-    result={'status':'shape','presence':0,'order':1,'duplicates':0,'unknown':0,'parts':{},'prefix':None,'suffix':None}
+    result={'status':'shape','presence':0,'order':1,'duplicates':0,'unknown':0,'parts':{},'spans':{},'prefix':None,'suffix':None}
     if not (type(content) is list and len(content)==1 and type(content[0]) is dict and
             set(content[0])=={'type','text'} and content[0].get('type')=='input_text' and type(content[0].get('text')) is str):return result
     if len(content[0]['text'])>16384:result['status']='bytes';return result
@@ -275,7 +276,7 @@ def environment_components(content):
     def finish(end):
         nonlocal pending,start
         if pending is not None:
-            block=raw[start:end];result['parts'].setdefault(pending,[]).append((len(block),sha(block)))
+            block=raw[start:end];result['parts'].setdefault(pending,[]).append((len(block),sha(block)));result['spans'][pending]=(start,end)
             pending=None;start=None
     def opened(name,attributes):
         nonlocal nodes,pending,start,first
@@ -304,6 +305,7 @@ def environment_components(content):
             index=ENV_COMPONENTS.index(name);bit=1<<index
             result['presence']|=bit;result['order']=(result['order']<<4)|(index+1)
             pending=name;start=parser.CurrentByteIndex
+        if visitor is not None:visitor('start',name,attributes,parser.CurrentByteIndex)
         stack.append(name);children.append(set());forms.append(attribute_names)
     def closed(name):
         if not ENV_REQUIRED_CHILDREN.get(name,frozenset())<=children[-1]:fail('shape')
@@ -313,10 +315,12 @@ def environment_components(content):
             finish(parser.CurrentByteIndex)
             if first is None:result['prefix']=sha(raw[:parser.CurrentByteIndex])
             result['suffix']=sha(raw[parser.CurrentByteIndex:])
+        if visitor is not None:visitor('end',name,None,parser.CurrentByteIndex)
         stack.pop();children.pop();forms.pop()
     def text(value):
         if stack and stack[-1] in ENV_CHILDREN and any(char not in ' \t\r\n' for char in value):fail('shape')
         if stack and stack[-1] in ('shell_version','current_date') and 'status' in forms[-1] and value:fail('shape')
+        if visitor is not None and stack:visitor('text',stack[-1],value,parser.CurrentByteIndex)
     parser.StartElementHandler=opened;parser.EndElementHandler=closed;parser.CharacterDataHandler=text
     parser.ExternalEntityRefHandler=lambda *args:0
     parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
@@ -338,6 +342,7 @@ def component_comparison(old,new):
             before=original['parts'].get(key,[]);after=current['parts'].get(key,[])
             if before==after:equal|=1<<index
             else:changed.append([index,*(before[0] if before else (None,None)),*(after[0] if after else (None,None))])
+    changed.sort(key=lambda item:item[1] is None or item[3] is None)
     return {'status':[original['status'],current['status']],'presence':[original['presence'],current['presence']],
         'order':[original['order'],current['order']],'duplicates':[original['duplicates'],current['duplicates']],
         'unknown':[original['unknown'],current['unknown']],'equal':equal if supported else None,
@@ -355,7 +360,7 @@ def compact_comparison(value):
                       sum((value[k] is True)<<bit for bit,k in enumerate(ENV_CHECKS))],
         'baseline_count':value['baseline_environment_count'],
         'body':[value['original_content_bytes'],value['new_content_bytes'],value['original_content_sha256'],value['new_content_sha256']],
-        'prompt':value['prompt'],'components':value['components']}
+        'prompt':value['prompt'],'components':value['components'],'filesystem':value['filesystem']}
 
 
 def comparison_flag(value,key):
@@ -405,6 +410,11 @@ def environment_comparison(journey,contexts,observed,inputs):
     valid=(baseline_valid and new_valid and prompt_valid and audited and positions and comparison['new_message_id_unique'] and
            comparison['current_prompt_id_unique'] and comparison['new_turn_differs_from_old'] and
            comparison['new_turn_matches_current_prompt'] and comparison['exact_environment_content_equal'])
+    if (not valid and journey.helper_binary is not None and journey.owned_child is not None and journey.child_turn is journey.turn and
+            isinstance(journey.turn_helper,helper.Evidence) and journey.turn_helper.owner is journey.owned_child and baseline_valid and new_valid and prompt_valid and audited and positions and
+            all(comparison[k] is True for k in ('new_message_id_unique','current_prompt_id_unique','new_turn_differs_from_old','new_turn_matches_current_prompt'))):
+        valid=helper.transformed(content(baseline),content(new),journey.helper_origins.get(journey.turn['label']),journey.turn_helper,environment_components)
+    comparison['filesystem']=helper.filesystem_witness(content(baseline),content(new),environment_components)
     comparison['prompt']=prompt_diagnostic(current,prompt(journey.turn['label'],'resume',journey.nonce))
     comparison['components']=component_comparison(content(baseline),content(new))
     return bool(valid),comparison
@@ -483,17 +493,19 @@ def resume_rejection_witness(journey,observed,inputs,current):
 
 class Journey:
     """Evidence is retained from first turns, never supplied by a resume caller."""
-    def __init__(self, root, end, meter, nonce):
+    def __init__(self, root, end, meter, nonce, helper_binary=None):
         require(type(nonce) is str and re.fullmatch('[0-9a-f]{32}',nonce), 'invalid synthetic nonce')
         self.root = Path(root); self.end = end; self.meter = meter; self.nonce = nonce
         self.requests = 0; self.error = None; self.action_end = end
+        self.helper_binary=helper_binary;self.owned_child=None;self.child_turn=None;self.child_ready=threading.Event();self.child_lock=threading.Lock()
+        self.turn_helper=None;self.helper_origins={};self.helper_rejection=None
         self.entries = {}; self.turn = None; self.records = []; self.wall_started = time.time(); self.negative = False
         self.negative_reason_witnessed = False
         self.cli_ready = threading.Event()
         self.last_request = None
         self.metadata_rejection = None
         self.rollout_rejection = None; self.continuations = {}; self.resume_context_rejection = None; self.first_rollout_audits = {}
-        self.harness_sha256 = sha(Path(__file__).read_bytes())
+        self.harness_sha256 = sha(Path(__file__).read_bytes());self.helper_sha256=sha(Path(helper.__file__).read_bytes())
 
     def begin(self, label, phase, expected_uuid=None):
         require(label in LABELS and phase in ('first','resume'), 'unplanned turn')
@@ -503,7 +515,37 @@ class Journey:
         self.turn = {'label': label, 'phase': phase, 'expected_uuid': expected_uuid, 'uuid': None,
                      'issued': None, 'returned': None, 'finished': False, 'started': 0, 'completed': 0,
                      'user_context':None,'resume_mode':None,'resume_environment':None}
+        self.turn_helper=None;self.child_ready.clear()
         self.cli_ready.clear(); self.action_end = min(self.end, time.monotonic() + t.ACTION_SECONDS)
+
+    def publish_child(self,process):
+        if self.helper_binary is None or self.negative:return
+        with self.child_lock:
+            require(self.owned_child is None and self.turn is not None,'owned helper publication collision')
+            try:self.owned_child=helper.OwnedChild(process,min(self.end,self.action_end),self.helper_binary)
+            except (OSError,ValueError):
+                self.child_ready.set();raise ValueError('owned CLI helper publication unavailable') from None
+            self.child_turn=self.turn;self.child_ready.set()
+
+    def clear_child(self):
+        with self.child_lock:
+            if self.owned_child is not None:self.owned_child.close()
+            self.owned_child=None;self.child_turn=None;self.child_ready.set()
+
+    def observe_helper(self):
+        if self.helper_binary is None:return None
+        try:
+            require(self.child_ready.wait(max(0,min(self.end,self.action_end)-time.monotonic())),'owned helper not published')
+            with self.child_lock:
+                require(self.owned_child is not None and self.child_turn is self.turn,'owned helper turn unavailable')
+                observed=self.owned_child.capture()
+                require(self.turn_helper is None or observed==self.turn_helper,'owned helper changed within turn')
+                return observed
+        except (ValueError,OSError):
+            if self.helper_rejection is None:self.helper_rejection={'availability':'unavailable','stage':getattr(self.owned_child,'stage','owned-child-helper'),
+                'label':self.turn['label'],'phase':self.turn['phase'],'request':self.last_request,
+                'harness_sha256':self.harness_sha256,'codex_source_sha':STOCK_SOURCE}
+            raise ValueError('owned CLI helper binding unavailable') from None
 
     def observe_cli(self, raw):
         row = json.loads(raw, object_pairs_hook=t.unique)
@@ -579,6 +621,8 @@ class Journey:
         require(self.cli_ready.wait(max(0, min(t.ACTION_SECONDS, self.action_end-time.monotonic()))), 'request before actual CLI session identity')
         label, phase = turn['label'], turn['phase']; inputs = body['input']; observed = user_context(inputs)
         contexts = [item for _,item in observed]
+        observed_helper=self.observe_helper()
+        if observed_helper is not None:self.turn_helper=observed_helper
         own = prompt(label,'first',self.nonce); current = prompt(label,phase,self.nonce)
         own_positions = [i for i,item in observed if exact_prompt_message(item,own)]
         resume_mode=None;resume_environment=None
@@ -598,6 +642,16 @@ class Journey:
                         # Prefer source/body/prompt bindings over redundant entry summaries.
                         while len(canonical(witness))>2048 and witness['summaries']:
                             witness['summaries'].pop();witness['truncated_summary']=True
+                        fs=witness['environment_comparison']['filesystem']
+                        if fs['status']=='observed':
+                            # Equivalent prefix digests/true presence carry no additional evidence.
+                            witness.pop('observed_prefix_sha256',None);witness.pop('old_prefix_present',None);witness.pop('first_mismatching_original_index',None)
+                            witness['environment_comparison']['components']['changed']=[]
+                            witness['environment_comparison']['components']['truncated']=True
+                            while len(canonical(witness))>2048 and fs['details']:
+                                fs['details'].pop();fs['truncated']=True
+                            if len(canonical(witness))>2048:
+                                witness['environment_comparison']['filesystem']={'status':'overflow','counts':fs['counts'],'checks':fs['checks'],'truncated':True}
                         changed=witness['environment_comparison']['components']['changed']
                         while len(canonical(witness))>2048 and changed:
                             changed.pop();witness['environment_comparison']['components']['truncated']=True
@@ -656,10 +710,19 @@ class Journey:
         else:
             require(any(type(v) is dict and v.get('type') == 'function' and v.get('name') == 'exec_command'
                         for v in body.get('tools',[])), 'fixed child tool unavailable')
+        if phase=='first' and observed_helper is not None:
+            environments=[v for v in contexts if type(v.get(METADATA)) is dict and v[METADATA].get('content_item_kinds')==[ENVIRONMENT_KIND]]
+            require(len(environments)==1,'original environment helper binding unavailable')
+            model=helper.filesystem(environments[0]['content'],environment_components)
+            require(model is not None and model['profile']=='managed' and model['mode']=='restricted' and
+                    sum(v==('read',None,'path',observed_helper['path']) for v in model['entries'])==1 and
+                    sum(v[3]==observed_helper['path'] for v in model['entries'])==1,
+                    'original environment does not bind owned helper')
         # All incoming evidence is checked before acceptance bookkeeping changes.
         rid = 'session-fixture-' + label + '-' + phase + ('-final' if pending else '-action')
         events = [{'type':'response.created','response':{'id':rid}}]
         if turn['user_context'] is None:
+            if phase=='first' and observed_helper is not None:self.helper_origins[label]=observed_helper
             turn['user_context'] = copy.deepcopy(contexts)
             if phase=='resume':
                 turn['resume_mode']=resume_mode;turn['resume_environment']=copy.deepcopy(resume_environment)
@@ -841,6 +904,7 @@ def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Po
                   stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
     selector=None;line=bytearray();used=0;errors=bytearray();error_bytes=0
     try:
+        if hasattr(journey,'publish_child'):journey.publish_child(process)
         selector=selectors.DefaultSelector()
         for name,stream in (('stdout',process.stdout),('stderr',process.stderr)):
             os.set_blocking(stream.fileno(),False);selector.register(stream,selectors.EVENT_READ,name)
@@ -864,7 +928,9 @@ def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Po
             'stderr_sha256':sha(errors) if error_bytes<=4096 else None,'unknown_uuid_reason_witnessed':negative_witness}
     finally:
         if selector is not None:selector.close()
-        t.stop(process)
+        try:t.stop(process)
+        finally:
+            if hasattr(journey,'clear_child'):journey.clear_child()
 
 
 def worker(args):
@@ -877,7 +943,7 @@ def worker(args):
         require(identity['uid']==identity['gid']==1000 and identity['uid_map'].split()==['1000','0','1'] and
                 identity['gid_map'].split()==['1000','0','1'],'fixed single-identity namespace mismatch')
         meter=t.Meter(args.captured_seed,args.captured_seed+args.output_limit)
-        journey=Journey('/',args.end,meter,uuid.uuid4().hex)
+        journey=Journey('/',args.end,meter,uuid.uuid4().hex,helper_binary='/opt/codex')
         source=Path('/job/src/uncommitted-session-source');source.write_bytes(UNCOMMITTED)
         initial=database('/',integrity=True)
         server=t.FixtureServer(('127.0.0.1',0),t.Handler);server.connections=0;server.sequence=journey
@@ -925,7 +991,7 @@ def worker(args):
             report.update(turns=journey.records,http_requests=journey.requests,http_connections=server.connections if server else 0,
                           transport_error=journey.error,last_request=journey.last_request,captured_bytes=journey.meter.used,
                           observed_session_uuids={k:v['uuid'] for k,v in journey.entries.items()},
-                          history_metadata_rejection=journey.metadata_rejection,rollout_rejection=journey.rollout_rejection,resume_context_rejection=journey.resume_context_rejection)
+                          helper_source_sha256=journey.helper_sha256,helper_rejection=journey.helper_rejection,history_metadata_rejection=journey.metadata_rejection,rollout_rejection=journey.rollout_rejection,resume_context_rejection=journey.resume_context_rejection)
         data=canonical(report)+b'\n';require(len(data)<=t.REPORT_BYTES,'session report exceeded')
         fd=os.open('/result/report.json',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(data)
@@ -954,7 +1020,7 @@ def main():
         selected=[m for m in json.loads(catalog,object_pairs_hook=t.unique)['models'] if m.get('slug')==t.MODEL]
         require(len(selected)==1,'fixture catalog model absent/ambiguous')
         files={}
-        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__))):
+        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__)),('session_helper.py',Path(helper.__file__))):
             path=Path(root)/name;path.write_bytes(t.snapshot(source,131072,runner.end));path.chmod(0o444);files[name]=path
         models=Path(root)/'models.json';models.write_bytes(catalog);models.chmod(0o444)
         result=Path(root)/'result';result.mkdir(mode=0o700)
@@ -964,7 +1030,7 @@ def main():
         index=argv.index('--unshare-all')+1
         argv[index:index]=['--uid','0','--gid','0','--cap-drop','ALL','--cap-add','CAP_NET_ADMIN','--cap-add','CAP_SETPCAP','--cap-add','CAP_SETFCAP']
         index=argv.index('--remount-ro');argv[index:index]=['--ro-bind',str(files['worker.py']),'/opt/tool_boundary.py',
-            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
+            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(files['session_helper.py']),'/opt/session_helper.py','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
         process=subprocess.Popen(argv,env=state.ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                  start_new_session=True,preexec_fn=state.child_limits)
         try:

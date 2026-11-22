@@ -291,3 +291,28 @@ container text is XML whitespace only; leaf values remain opaque. Status forms
 of shell_version/current_date are empty markers. These are bounded shape checks,
 not ID/domain/permission/path/date/attribute-value validation or an acceptance
 oracle. Exact-body/history/result/final-audit admission remains unchanged.
+
+
+A further review-gated source branch binds the actual live owned CLI child before
+any response. A published Popen/start/parent identity, anchored private helper
+and lock inodes, exact executable/three aliases, closed Linux exclusive FLOCK
+record and independent nonblocking lock contention are all required and rechecked.
+Missing/foreign/dead/swapped/unrecognized bindings block. No environ/cmdline or
+arbitrary file contents are read. First-turn evidence is retained separately from
+immutable history; later requests recheck the current child, and the handle is
+cleared on exit. Unsupported lock modes/formats remain unavailable.
+
+Only this independent evidence can enable the narrow byte-derived suffix:
+original managed/restricted body and exact /job/bash spans, exact globals,
+source-shaped cwd/shell omission, and one original READ path target replaced by
+the independently attested resumed helper path. Every other byte, historical
+message, causal pair, current prompt, result replay and final durable audit stays
+exact. Self-described paths/prefixes are insufficient. No static-policy change,
+XML normalization, privilege or runtime admission is introduced.
+
+The fallback inspects all bounded filesystem entries, with ordered/multiset/root
+digests, fixed header/check/count fields and hashed target details. Present
+filesystem changes take priority over omission details; explicit truncation and
+overflow retain aggregate rejection evidence within2KiB. Prefix-based helper
+roles in diagnostics do not establish ownership. This candidate has not run
+stock Codex; copied-executable/process/lock tests are local source evidence only.
