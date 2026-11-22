@@ -260,7 +260,7 @@ def terminal_header(text):
     return (int(running[0]) if running else None,int(exited[0]) if exited else None,output)
 
 
-def goal_rows(path,integrity=False):
+def goal_rows(path,integrity=False,thread_id=None):
     if not path.exists():
         require(not integrity,'goal database missing after lifecycle');return []
     require(path.is_file() and not path.is_symlink() and path.stat().st_size<=16*1024**2,'invalid goal database')
@@ -269,7 +269,9 @@ def goal_rows(path,integrity=False):
         if integrity:require(db.execute('PRAGMA integrity_check').fetchall()==[('ok',)],'goal database integrity failed')
         exists=db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?",('thread_goals',)).fetchall()
         if not exists:return []
-        result=[dict(zip(GOAL_COLUMNS,row)) for row in db.execute('SELECT '+','.join(GOAL_COLUMNS)+' FROM thread_goals ORDER BY thread_id LIMIT 129')]
+        query='SELECT '+','.join(GOAL_COLUMNS)+' FROM thread_goals'
+        result=[dict(zip(GOAL_COLUMNS,row)) for row in db.execute(query+(' WHERE thread_id=?' if thread_id is not None else '')+' ORDER BY thread_id LIMIT 129',
+                                                                 (thread_id,) if thread_id is not None else ())]
         require(len(result)<=128 and len(canonical(result))<=BODY_BYTES,'goal oracle inventory exceeded')
         return result
 
@@ -291,7 +293,13 @@ def search_definitions(tools):
                                                                                {'message','items','agent_type','fork_context','model','reasoning_effort'}),'unknown spawn properties')
     for name,value in props.items():
         require(type(value)is dict and value.get('type')==('array' if name=='items' else 'boolean' if name=='fork_context' else 'string'),'unknown spawn property type')
-    require(type(props['items'].get('items'))is dict,'unknown spawn input-item schema')
+    def structure(value):
+        if type(value)is dict:return {k:structure(v) for k,v in value.items() if k!='description'}
+        if type(value)is list:return [structure(v) for v in value]
+        return value
+    expected={name:{'type':'boolean' if name=='fork_context' else 'string'} for name in props if name!='items'}
+    expected['items']={'type':'array','items':{'type':'object','properties':{name:{'type':'string'} for name in ('type','text','image_url','audio_url','path','name')},'additionalProperties':False}}
+    require(structure(schema)=={'type':'object','properties':expected,'additionalProperties':False},'unknown complete spawn schema')
     return tool_inventory(tools)
 
 
@@ -330,6 +338,7 @@ def tool_inventory(value):
 OUTPUT_KINDS = {
     'function_call': 'function_call_output',
     'custom_tool_call': 'custom_tool_call_output',
+    'tool_search_call': 'tool_search_output',
 }
 
 
@@ -337,10 +346,119 @@ class Sequence:
     def __init__(self,planned,root,end,meter=None):
         self.planned=planned;self.root=Path(root);self.end=end;self.meter=meter or Meter();self.action_end=min(end,time.monotonic()+ACTION_SECONDS)
         self.index=0;self.requests=0;self.records=[];self.inventories=[];self.error=None;self.finished=False
+        self.emitted={};self.returned={};self.definitions={};self.discovered=set()
+        self.thread_id=None;self.pty_id=None;self.pty_retired=False;self.pty_completion_added=False
+        self.goal_initial=goal_rows(self.path('/state/sqlite/goals_1.sqlite'));self.goal_identity=None;self.metadata_products=None
         self.protected={p:sha(self.path(p).read_bytes()) for p in ('/credentials/marker','/credentials/valid.png','/state/codex/marker','/state/sqlite/marker','/etc/codex/requirements.toml','/state/codex/config.toml')}
 
     def path(self,value):
         return self.root/value.lstrip('/')
+
+    def observe_cli(self,line):
+        try:row=json.loads(line,object_pairs_hook=unique)
+        except (ValueError,UnicodeError):return
+        if type(row)is dict and row.get('type')=='thread.started':
+            thread=row.get('thread_id')
+            require(type(thread)is str and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',thread),'invalid actual CLI thread identity')
+            require(self.thread_id in (None,thread),'CLI changed thread identity');self.thread_id=thread
+
+    def products(self):
+        result={}
+        for parent,dirs,files in os.walk(self.path('/job/src'),followlinks=False):
+            for name in sorted(dirs+files):
+                require(len(result)<128 and time.monotonic()<self.action_end,'product oracle bound exceeded')
+                path=Path(parent)/name;info=path.lstat();key=str(path.relative_to(self.path('/job/src')))
+                if stat.S_ISLNK(info.st_mode):result[key]={'symlink':os.readlink(path)}
+                elif stat.S_ISREG(info.st_mode):result[key]={'sha256':sha(snapshot(path,16*1024**2,self.action_end))}
+                else:require(stat.S_ISDIR(info.st_mode),'unknown product object')
+        return result
+
+    def goal_state(self,integrity=False):
+        require(self.thread_id is not None,'actual CLI thread identity missing')
+        rows=goal_rows(self.path('/state/sqlite/goals_1.sqlite'),integrity)
+        unrelated=[row for row in rows if row['thread_id']!=self.thread_id]
+        require(unrelated==self.goal_initial,'unrelated goal rows changed')
+        own=goal_rows(self.path('/state/sqlite/goals_1.sqlite'),thread_id=self.thread_id)
+        require(len(own)<=1,'multiple thread goals')
+        return own[0] if own else None
+
+    def inventory_oracle(self,action,item,text,rows):
+        ident=action['id'];result={}
+        marker=self.path('/job/src/pty-consumed')
+        if ident in ('pty-start','pty-poll'):
+            running,exited,output=terminal_header(text)
+            require(running is not None and exited is None and not marker.exists(),'PTY must remain pending without product effect')
+            if ident=='pty-start':
+                require(self.pty_id is None and PTY_READY in output,'PTY readiness/binding missing');self.pty_id=running
+            else:require(running==self.pty_id and not self.pty_retired,'PTY poll changed owned session')
+            result={'session_id':running,'phase':'pending'}
+        elif ident in ('pty-input','pty-complete'):
+            require(self.pty_id is not None and not self.pty_retired,'PTY ownership not established')
+            running,exited,output=terminal_header(text)
+            if running is not None:
+                require(ident=='pty-input' and running==self.pty_id and not self.pty_completion_added,'PTY did not complete within finite poll plan')
+                self.pty_completion_added=True
+                self.planned.insert(self.index,{'id':'pty-complete','kind':'function_call','name':'write_stdin',
+                    'arguments':{'session_id':self.pty_id,'chars':'','yield_time_ms':5000,'max_output_tokens':1500}})
+            else:
+                require(exited==0,'PTY child did not exit successfully')
+                require(any(row.get('consumed') is True and row.get('uid')==1000 and row.get('nnp')=='1'
+                            and type(row.get('cap_eff'))is str and int(row['cap_eff'],16)==0
+                            and row.get('netns')!=os.readlink('/proc/self/ns/net')
+                            and row.get('denied',{}).get('/credentials/marker') in (2,13)
+                            and row.get('denied',{}).get('/etc/codex/requirements.toml') in (13,30) for row in rows),'PTY child consumption/confinement not proved')
+                self.pty_retired=True
+            require(marker.read_bytes()==PTY_TOKEN.encode(),'PTY exact-once product effect missing')
+            result={'session_id':self.pty_id,'phase':'retired' if self.pty_retired else 'completion-pending','product_sha256':sha(marker.read_bytes())}
+        elif ident in ('pty-stale','pty-invalid'):
+            wanted=self.pty_id if ident=='pty-stale' else -1
+            require(self.pty_retired and self.pty_id is not None and wanted is not None
+                    and (ident!='pty-invalid' or wanted!=self.pty_id)
+                    and text.strip()=='write_stdin failed: Unknown process id '+str(wanted)
+                    and marker.read_bytes()==PTY_TOKEN.encode(),'retired/invalid PTY lookup did not reject without effects')
+            result={'session_id':wanted,'phase':'unknown-process-rejected'}
+        elif ident=='input-reject':
+            if 'request_user_input is unavailable in Default mode' in text:layer='current-mode-rejected'
+            else:
+                require('request_user_input was cancelled before receiving a response' in text,'current exec input was not rejected')
+                layer='cancelled-before-answer; exec-client layer not independently witnessed'
+            require('answers' not in text,'input rejection contained an answer');result={'coverage':layer,'interactive_client_covered':False}
+        elif ident.startswith('goal-'):
+            own=self.goal_state();result={'goal_row':own,'goal_row_sha256':sha(canonical(own)),'actual_thread_id':self.thread_id}
+            errors={'goal-missing':'cannot update goal because this thread has no goal','goal-whitespace':'goal objective must not be empty',
+                    'goal-budget':'goal budgets must be positive when provided','goal-duplicate':'cannot create a new goal because this thread has an unfinished goal; complete the existing goal first',
+                    'goal-active':"update_goal can only mark the existing goal complete, blocked, or paused at the user's explicit request; resume, budget-limited, and usage-limited status changes are controlled by the user or system"}
+            if ident in errors:require(text.strip()==errors[ident],'goal handler rejection not established')
+            if ident in ('goal-empty','goal-missing','goal-whitespace','goal-budget'):
+                require(own is None,'rejected/empty goal changed database')
+                if ident=='goal-empty':require(json.loads(text)['goal'] is None,'initial goal was not null')
+            else:
+                require(own is not None and own['objective']==GOAL_OBJECTIVE and own['status']==('complete' if ident in ('goal-complete','goal-get') else 'active'),'goal database state mismatch')
+                identity={k:own[k] for k in ('thread_id','goal_id','objective','token_budget','created_at_ms')}
+                if ident=='goal-create':require(self.goal_identity is None,'goal already established');self.goal_identity=identity
+                require(identity==self.goal_identity,'existing goal identity replaced')
+                require(all(type(own[k])is int and own[k]>=0 for k in ('tokens_used','time_used_seconds','created_at_ms','updated_at_ms')),'invalid goal database accounting')
+                if ident in ('goal-create','goal-complete','goal-get'):
+                    payload=json.loads(text);goal=payload.get('goal')
+                    require(type(goal)is dict and goal.get('threadId')==self.thread_id and goal.get('objective')==GOAL_OBJECTIVE
+                            and goal.get('status')==own['status'] and goal.get('tokenBudget')==own['token_budget'],'goal wire/database identity mismatch')
+                    require(all(type(goal.get(k))is int and 0<=goal[k]<=own[db] for k,db in (('tokensUsed','tokens_used'),('timeUsedSeconds','time_used_seconds'))),'goal wire/database usage mismatch')
+                    result['goal_payload']=payload
+        elif ident.startswith('search-'):
+            require(set(item)=={'type','call_id','status','execution','tools'} and item.get('status')=='completed'
+                    and item.get('execution')=='client' and type(item.get('tools'))is list,'invalid special search output')
+            own=self.goal_state();require(own is not None and own['status']=='complete' and {k:own[k] for k in self.goal_identity}==self.goal_identity,'search changed goal identity/state')
+            if ident=='search-positive':
+                found=search_definitions(item['tools']);self.discovered.update(found)
+                result={'coverage':'actual-local-registry-metadata','discovered_names':found,'definitions':item['tools'],'definition_sha256':sha(canonical(item['tools']))}
+            else:
+                require(item['tools']==[],'invalid-input search exposed definitions')
+                result={'coverage':'bounded-invalid-input/no-definition','handler_validation_witnessed':False,
+                        'limitation':'completed/client/empty also encodes dispatch failure or cancellation; source validator intent is not an observed error'}
+        else:raise ValueError('unknown inventory action oracle')
+        if ident.startswith(('goal-','search-')):
+            require(self.metadata_products==self.products(),'supervisor metadata action changed product files')
+        return result
 
     def oracle(self,action,item):
         text=output_text(item.get('output'));ident=action['id']
@@ -363,14 +481,19 @@ class Sequence:
             require(len(encoded)==2 and encoded[0].startswith('data:image/') and sha(base64.b64decode(encoded[1],validate=True))==sha(self.path('/job/src/valid.png').read_bytes()),'allowed image content mismatch')
         elif ident.startswith('image-'):require(not has_image(item) and 'Permission denied (os error 13)' in text,'valid forbidden image did not fail access')
         elif ident=='login-deny':require(not self.path('/job/src/login-ran').exists() and 'login shell is disabled by config' in text,'requested login was not rejected')
-        return {'id':ident,'pass':True,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':item.get('type'),'output':item.get('output'),'output_sha256':sha(canonical(item.get('output'))),
-                'partial_product_exists':self.path('/job/src/partial-patch').exists(),'protected_unchanged':True}
+        else:extra=self.inventory_oracle(action,item,text,rows)
+        payload=item.get('tools') if action['kind']=='tool_search_call' else item.get('output')
+        return {'id':ident,'pass':True,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':item.get('type'),'output':payload,'output_sha256':sha(canonical(payload)),
+                'emitted_item':self.emitted.get(ident),'returned_item':item,'partial_product_exists':self.path('/job/src/partial-patch').exists(),'protected_unchanged':True,**(extra if 'extra' in locals() else {})}
 
     def request(self,body):
+        require(not self.finished,'request after finite sequence finished')
         require(time.monotonic()<self.action_end,'tool action deadline exceeded')
         require(type(body)is dict and body.get('model')==MODEL and isinstance(body.get('input'),list),'unexpected model/request input')
-        names=tool_inventory(body.get('tools'));self.inventories.append({'sha256':sha(canonical(body['tools'])),'names':names})
-        outputs=[v for v in body['input'] if isinstance(v,dict) and v.get('type') in ('function_call_output','custom_tool_call_output')]
+        names=tool_inventory(body.get('tools'));definition_hash=sha(canonical(body['tools']))
+        self.inventories.append({'sha256':definition_hash,'names':names});self.definitions[definition_hash]=body['tools']
+        require(self.discovered<=set(names),'discovered definition missing from later request')
+        outputs=[v for v in body['input'] if isinstance(v,dict) and v.get('type') in OUTPUT_KINDS.values()]
         issued={v['id']:v for v in self.planned[:self.index]}
         for item in body['input']:
             if isinstance(item,dict) and 'call_id' in item:
@@ -380,22 +503,37 @@ class Sequence:
         require(all(type(v.get('call_id')) is str and v['call_id'] in issued for v in outputs),'orphan tool output')
         require(len(outputs)==len({v['call_id'] for v in outputs}),'duplicate tool output')
         require(all(v['type']==OUTPUT_KINDS[issued[v['call_id']]['kind']] for v in outputs),'cross-kind tool output')
+        require(all(v['call_id'] not in self.returned or sha(canonical(v))==self.returned[v['call_id']] for v in outputs),'changed replayed tool output')
         if self.index:
             action=self.planned[self.index-1];matches=[v for v in outputs if v.get('call_id')==action['id']]
             require(len(matches)==1,'missing/duplicate matching tool output')
-            self.meter.add(len(canonical(matches[0].get('output'))))
+            payload=matches[0].get('tools') if action['kind']=='tool_search_call' else matches[0].get('output')
+            self.meter.add(len(canonical(payload)))
             try:
                 self.records.append(self.oracle(action,matches[0]))
-            except ValueError as error:
-                self.records.append({'id':action['id'],'pass':False,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':matches[0]['type'],'output':matches[0].get('output'),'check_error':str(error),'partial_product_exists':self.path('/job/src/partial-patch').exists()})
+                self.returned[action['id']]=sha(canonical(matches[0]))
+            except Exception as error:
+                self.records.append({'id':action['id'],'pass':False,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':matches[0]['type'],'emitted_item':self.emitted.get(action['id']),
+                                     'returned_item':matches[0],'output':payload,'check_error':str(error),'partial_product_exists':self.path('/job/src/partial-patch').exists()})
                 raise
         rid='offline-response-'+str(self.index)
         events=[{'type':'response.created','response':{'id':rid}}]
         if self.index<len(self.planned):
             action=self.planned[self.index]
             require(action.get('kind') in OUTPUT_KINDS,'unknown planned tool call kind')
-            item={'type':action['kind'],'name':action['name'],'call_id':action['id']}
-            item.update({'arguments':json.dumps(action['arguments'])} if action['kind']=='function_call' else {'input':action['input']})
+            if action['id']=='goal-empty':self.metadata_products=self.products()
+            if action['name']=='write_stdin' and action['arguments'].get('session_id') is None:
+                require(self.pty_id is not None,'PTY session not bound before continuation');action['arguments']['session_id']=self.pty_id
+            item={'type':action['kind'],'call_id':action['id']}
+            if action['kind']=='tool_search_call':
+                require(any(value.get('type')=='tool_search' and value.get('execution')=='client'
+                            and 'Multi-agent tools' in value.get('description','') for value in body['tools']),
+                        'search-positive blocked: no evidenced searchable source')
+                item.update(execution='client',arguments=action['arguments'])
+            else:
+                item['name']=action['name']
+                item.update({'arguments':json.dumps(action['arguments'])} if action['kind']=='function_call' else {'input':action['input']})
+            self.emitted[action['id']]=item
             events.append({'type':'response.output_item.done','item':item});self.index+=1
         else:
             events.append({'type':'response.output_item.done','item':{'type':'message','id':'offline-done','role':'assistant','content':[{'type':'output_text','text':'Synthetic fixture complete.'}]}});self.finished=True
@@ -468,7 +606,7 @@ def worker(args):
         server=FixtureServer(('127.0.0.1',0),Handler);server.timeout=.1;server.connections=0
         port=server.server_address[1]
         meter=Meter(args.captured_seed,args.captured_seed+args.output_limit)
-        sequence=Sequence(actions(port),'/',args.end,meter);server.sequence=sequence
+        sequence=Sequence(actions(port)+inventory_actions(),'/',args.end,meter);server.sequence=sequence
         thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.05},daemon=True);thread.start()
         delta=['-c','openai_base_url='+json.dumps('http://127.0.0.1:'+str(port)+'/v1'),'-c','model_catalog_json="/opt/models.json"','exec','--skip-git-repo-check','--json','--model',MODEL,'-C','/job','Execute only the finite synthetic fixture; no real model is serving.']
         report['fixture_delta']={'argv':delta,'environment_keys':['CODEX_API_KEY','OFFLINE_TOOL_CANARY'],'key_mode':'synthetic','provider_id':'openai','catalog_sha256':sha(Path('/opt/models.json').read_bytes()),'websocket_426_fallback':True,'identity_setup':'outer UID0 then inner UID1000; one existing host identity only','setup_namespace_caps':['NET_ADMIN','SETPCAP','SETFCAP'],'execution_caps':'all zero; NNP before listener/Codex'}
@@ -489,7 +627,9 @@ def worker(args):
                     budget[0]+=len(data);meter.add(len(data))
                     buffers[key.data].extend(data)
                     if key.data=='stdout':
-                        line.extend(data);require(all(len(v)<=BODY_BYTES for v in line.split(b'\n')),'stock output line exceeded');line[:]=line.rsplit(b'\n',1)[-1]
+                        line.extend(data);require(all(len(v)<=BODY_BYTES for v in line.split(b'\n')),'stock output line exceeded')
+                        for raw_line in line.split(b'\n')[:-1]:sequence.observe_cli(raw_line)
+                        line[:]=line.rsplit(b'\n',1)[-1]
             require(process.wait(timeout=.1)==0 and sequence.finished and len(sequence.records)==len(sequence.planned),'stock did not finish the finite sequence')
             report['status']='pass'
         finally:selector.close()
@@ -501,19 +641,34 @@ def worker(args):
         if process is not None:
             try:stop(process)
             except Exception:report.update(status='blocked',cleanup='process cleanup failed')
+        if 'sequence' in locals() and sequence.goal_identity is not None:
+            try:
+                final_goal=sequence.goal_state(integrity=True)
+                require(final_goal is not None and final_goal['status']=='complete','final goal incomplete')
+                report['goal_database_final']={'integrity':'ok','thread_id':sequence.thread_id,'goal_row':final_goal}
+            except Exception as error:report.update(status='blocked',goal_database_final={'blocked':str(error)[:300]})
         if server is not None:
             closing=threading.Thread(target=server.shutdown,daemon=True);closing.start();closing.join(timeout=1)
             server.server_close()
             if thread is not None:thread.join(timeout=1)
             if closing.is_alive() or thread is not None and thread.is_alive():report.update(status='blocked',cleanup='listener unresolved; outer owner must terminate')
         if 'sequence' in locals():
-            report.update(actions=sequence.records,inventory_observations=sequence.inventories,http_requests=sequence.requests,http_connections=server.connections,planned_actions=len(sequence.planned),transport_error=sequence.error)
-            names=sorted({v for row in sequence.inventories for v in row['names']})
+            report.update(actions=sequence.records,inventory_observations=sequence.inventories,inventory_definitions=sequence.definitions,
+                          http_requests=sequence.requests,http_connections=server.connections,planned_actions=len(sequence.planned),transport_error=sequence.error,
+                          actual_thread_id=sequence.thread_id,pty_session_id=sequence.pty_id,pty_retired=sequence.pty_retired,
+                          conditional_completion_poll_used=sequence.pty_completion_added)
+            names=sorted({v for row in sequence.inventories for v in row['names']}|sequence.discovered)
             required={'exec_command':{'shell-allow','shell-deny','cwd-allow','cwd-deny','escalation-deny','network-deny','login-deny'},
-                      'apply_patch':{'patch-allow','patch-deny','patch-partial','patch-intercept'},'view_image':{'image-allow','image-deny','image-alias-deny'}}
+                      'apply_patch':{'patch-allow','patch-deny','patch-partial','patch-intercept'},'view_image':{'image-allow','image-deny','image-alias-deny'},
+                      'write_stdin':{'pty-start','pty-poll','pty-input','pty-stale','pty-invalid'},
+                      'get_goal':{'goal-empty','goal-get'},'create_goal':{'goal-whitespace','goal-budget','goal-create','goal-duplicate'},
+                      'update_goal':{'goal-missing','goal-active','goal-complete'},'tool_search':{'search-positive','search-whitespace','search-zero'}}
             passed={row['id'] for row in sequence.records if row['pass']}
             covered={name for name,cases in required.items() if cases<=passed}
-            report['inventory_disposition']={name:('representative-exercised' if name in covered else ('partially-exercised' if any(row['tool']==name for row in sequence.records) else 'unclosed-effect-surface')) for name in names}
+            report['inventory_disposition']={name:('discovered-effect-surface-unexercised' if name in sequence.discovered else
+                'provider-hosted-backend-unverified' if name=='web_search' else 'current-entrypoint-rejected; interactive-client-unverified' if name=='request_user_input' and 'input-reject' in passed else
+                'local-registry-metadata; invalid-handler-errors-unwitnessed' if name=='tool_search' and name in covered else
+                'representative-exercised' if name in covered else ('partially-exercised' if any(row['tool']==name for row in sequence.records) else 'unclosed-effect-surface')) for name in names}
             report['inventory_closed']=bool(names and sequence.finished and len(sequence.records)==len(sequence.planned) and all(row['pass'] for row in sequence.records) and all(name in covered for name in names))
             if not report['inventory_closed']:report.update(status='blocked',inventory_gate='unexercised/unknown tool surfaces require later acceptance')
         report.setdefault('cleanup','owned listener/supervisor groups stopped; outer namespace teardown remains owner')

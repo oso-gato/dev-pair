@@ -203,3 +203,119 @@ else:
         report={'status':'pass','actions':[{'pass':True}]}
         with patch.object(t.shutil,'rmtree',side_effect=failed):t.finish_fixture(str(root),report,time.monotonic()+1)
         self.assertEqual(report['status'],'blocked');self.assertTrue(report['actions'][0]['pass']);self.assertFalse(root.exists())
+
+
+class InventoryExtension(OfflineTools):
+    def test_fixed_plan_preserves_original_and_32_mandatory_actions(self):
+        planned=t.actions(12345)+t.inventory_actions()
+        self.assertEqual(len(planned),32);self.assertEqual(len({a['id'] for a in planned}),32)
+        self.assertEqual(sum(a['name']=='write_stdin' for a in planned),4)
+        self.assertEqual(sum(a['kind']=='tool_search_call' for a in planned),3)
+        self.assertFalse(any(a['name']=='spawn_agent' for a in planned))
+        self.assertEqual((t.SECONDS,t.ACTION_SECONDS,t.REQUESTS,t.BODY_BYTES,t.OUTPUT_BYTES,t.REPORT_BYTES),(180,20,64,262144,2097152,4194304))
+
+    def test_terminal_ids_are_only_bound_from_one_header_before_output(self):
+        text='Chunk ID: x\nWall time: 0.2500 seconds\nProcess running with session ID 41\nOutput:\n'+t.PTY_READY
+        self.assertEqual(t.terminal_header(text)[:2],(41,None))
+        for value in ('Output:\nProcess running with session ID 41',
+                      'Chunk ID: x\nOutput:\nProcess running with session ID 41',
+                      text.replace('Output:','Process running with session ID 42\nOutput:'),
+                      text.replace('Output:','Process exited with code 0\nOutput:')):
+            with self.subTest(value=value),self.assertRaises(ValueError):t.terminal_header(value)
+
+    def wire_item(self,wire):
+        events=[json.loads(line[6:]) for line in wire.decode().splitlines() if line.startswith('data: ')]
+        return next(event['item'] for event in events if event['type']=='response.output_item.done')
+
+    def result(self,ident,text,kind='function_call_output'):
+        return {'type':kind,'call_id':ident,'output':text}
+
+    def test_dynamic_pty_poll_exact_input_retirement_and_replay(self):
+        seq=t.Sequence(t.inventory_actions()[:5],self.root,time.monotonic()+5)
+        self.wire_item(seq.request(self.body()))
+        running='Chunk ID: x\nProcess running with session ID 41\nOutput:\n'+t.PTY_READY
+        poll=self.wire_item(seq.request(self.body([self.result('pty-start',running)])))
+        self.assertEqual(json.loads(poll['arguments'])['session_id'],41)
+        self.assertEqual(self.wire_item(seq.request(self.body([self.result('pty-poll',running)])))['call_id'],'pty-input')
+        marker=self.root/'job/src/pty-consumed';marker.write_text(t.PTY_TOKEN)
+        proof={'consumed':True,'uid':1000,'cap_eff':'0','nnp':'1','netns':'different','denied':{'/credentials/marker':13,'/etc/codex/requirements.toml':30}}
+        done='Process exited with code 0\nOutput:\n'+json.dumps(proof)
+        stale=self.wire_item(seq.request(self.body([self.result('pty-input',done)])))
+        self.assertEqual(json.loads(stale['arguments'])['session_id'],41)
+        seq.request(self.body([self.result('pty-stale','write_stdin failed: Unknown process id 41')]))
+        seq.request(self.body([self.result('pty-invalid','write_stdin failed: Unknown process id -1')]))
+        self.assertTrue(seq.finished);self.assertTrue(seq.pty_retired);self.assertEqual(marker.read_text(),t.PTY_TOKEN)
+        with self.assertRaisesRegex(ValueError,'finished'):seq.request(self.body())
+
+    def test_pty_completion_poll_is_predeclared_once_and_failed_pending_record_is_retained(self):
+        seq=t.Sequence(t.inventory_actions()[:5],self.root,time.monotonic()+5)
+        seq.pty_id=19;seq.index=3
+        marker=self.root/'job/src/pty-consumed';marker.write_text(t.PTY_TOKEN)
+        running='Process running with session ID 19\nOutput:\n'
+        seq.oracle(seq.planned[2],self.result('pty-input',running))
+        self.assertEqual(seq.planned[3]['id'],'pty-complete');self.assertEqual(seq.planned[3]['arguments']['yield_time_ms'],5000)
+        with self.assertRaises(ValueError):seq.oracle(seq.planned[3],self.result('pty-complete',running))
+        other=t.Sequence(t.inventory_actions()[:5],self.root,time.monotonic()+5);marker.unlink()
+        other.request(self.body());(self.root/'credentials/marker').write_text('changed')
+        with self.assertRaises(ValueError):other.request(self.body([self.result('pty-start',running)]))
+        self.assertFalse(other.records[-1]['pass']);self.assertFalse(other.finished)
+
+    def database(self):
+        import sqlite3
+        path=self.root/'state/sqlite/goals_1.sqlite'
+        with sqlite3.connect(path) as db:
+            db.execute('CREATE TABLE thread_goals (thread_id TEXT PRIMARY KEY,goal_id TEXT,objective TEXT,status TEXT,token_budget INTEGER,tokens_used INTEGER,time_used_seconds INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER)')
+            db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',('foreign','kept','foreign objective','active',None,0,0,1,1))
+        return path
+
+    def test_real_readonly_goal_database_scope_identity_and_wire_invariants(self):
+        import sqlite3
+        path=self.database();thread='00000000-0000-0000-0000-000000000001'
+        seq=t.Sequence(t.inventory_actions()[6:15],self.root,time.monotonic()+5)
+        seq.observe_cli(t.canonical({'type':'thread.started','thread_id':thread}));seq.metadata_products=seq.products()
+        self.assertIsNone(seq.goal_state())
+        seq.oracle(seq.planned[0],self.result('goal-empty',json.dumps({'goal':None})))
+        seq.oracle(seq.planned[1],self.result('goal-missing','cannot update goal because this thread has no goal'))
+        with sqlite3.connect(path) as db:db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',(thread,'owned',t.GOAL_OBJECTIVE,'active',None,0,0,2,2))
+        payload={'goal':{'threadId':thread,'objective':t.GOAL_OBJECTIVE,'status':'active','tokensUsed':0,'timeUsedSeconds':0}}
+        self.assertTrue(seq.oracle(seq.planned[4],self.result('goal-create',json.dumps(payload)))['pass'])
+        before=path.read_bytes();self.assertEqual(t.goal_rows(path,thread_id=thread)[0]['goal_id'],'owned');self.assertEqual(path.read_bytes(),before)
+        for field,value in (('threadId','wrong'),('objective','wrong'),('tokenBudget',10)):
+            bad=json.loads(json.dumps(payload));bad['goal'][field]=value
+            with self.subTest(field=field),self.assertRaises(ValueError):seq.oracle(seq.planned[8],self.result('goal-get',json.dumps(bad)))
+        with sqlite3.connect(path) as db:db.execute('UPDATE thread_goals SET goal_id=? WHERE thread_id=?',('replaced',thread))
+        with self.assertRaisesRegex(ValueError,'identity replaced'):seq.oracle(seq.planned[5],self.result('goal-duplicate','cannot create a new goal because this thread has an unfinished goal; complete the existing goal first'))
+        with sqlite3.connect(path) as db:db.execute('UPDATE thread_goals SET objective=? WHERE thread_id=?',('changed','foreign'))
+        with self.assertRaisesRegex(ValueError,'unrelated'):seq.goal_state()
+        with self.assertRaises(ValueError):seq.observe_cli(t.canonical({'type':'thread.started','thread_id':'not uuid'}))
+        self.assertEqual(t.goal_rows(path,thread_id="' OR 1=1 --"),[])
+
+    def search_namespace(self):
+        props={name:{'type':kind} for name,kind in (('message','string'),('fork_context','boolean'),('model','string'),('reasoning_effort','string'))}
+        props['items']={'type':'array','items':{'type':'object','properties':{name:{'type':'string'} for name in ('type','text','image_url','audio_url','path','name')},'additionalProperties':False}}
+        return {'type':'namespace','name':'multi_agent_v1','description':'Tools for spawning and managing sub-agents.','tools':[{'type':'function','name':'spawn_agent','description':'metadata only','strict':False,'defer_loading':True,'parameters':{'type':'object','properties':props,'additionalProperties':False}}]}
+
+    def test_special_search_wire_object_arguments_no_name_and_tools_meter(self):
+        action=t.inventory_actions()[-3];seq=t.Sequence([action],self.root,time.monotonic()+5)
+        body=self.body();body['tools']=[{'type':'tool_search','execution':'client','description':'Multi-agent tools'}]
+        wire=self.wire_item(seq.request(body));self.assertEqual(wire['type'],'tool_search_call');self.assertNotIn('name',wire)
+        self.assertIsInstance(wire['arguments'],dict);self.assertEqual(wire['execution'],'client')
+        tools=[self.search_namespace()];self.assertEqual(t.search_definitions(tools),['multi_agent_v1.spawn_agent'])
+        result={'type':'tool_search_output','call_id':'search-positive','status':'completed','execution':'client','tools':tools}
+        before=seq.meter.used
+        # Protocol dispatch and byte meter are checked independently of the
+        # separate SQLite/registry effect oracle; synthetic outputs are not stock proof.
+        with patch.object(seq,'oracle',return_value={'pass':True}):seq.request(dict(body,input=[result]))
+        self.assertEqual(seq.meter.used-before,len(t.canonical(tools)))
+        for kind in ('function_call_output','custom_tool_call_output'):
+            other=t.Sequence([action],self.root,time.monotonic()+5);other.request(body)
+            with self.assertRaisesRegex(ValueError,'cross-kind'):other.request(dict(body,input=[dict(result,type=kind)]))
+        altered=json.loads(json.dumps(tools));altered[0]['tools'][0]['parameters']['properties']['unexpected']={'type':'string'}
+        with self.assertRaises(ValueError):t.search_definitions(altered)
+
+    def test_missing_search_source_and_changed_history_cannot_advance(self):
+        seq=t.Sequence([t.inventory_actions()[-3]],self.root,time.monotonic()+5)
+        with self.assertRaisesRegex(ValueError,'no evidenced'):seq.request(self.body())
+        seq=t.Sequence([a for a in t.actions(123) if a['id'] in ('patch-deny','image-deny')],self.root,time.monotonic()+5)
+        seq.request(self.body());first=self.result('patch-deny','Permission denied (os error 13)','custom_tool_call_output');seq.request(self.body([first]))
+        with self.assertRaisesRegex(ValueError,'changed replayed'):seq.request(self.body([dict(first,output='changed'),self.result('image-deny','Permission denied (os error 13)')]))
