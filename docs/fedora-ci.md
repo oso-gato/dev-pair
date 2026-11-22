@@ -346,3 +346,15 @@ checks these fixed operands in memory and returns only a boolean; it neither
 decrypts nor authorizes a cause claim. Native35 requires fresh source review and
 separate authorization. Production runtime/jobs, authentication, nested placement,
 hard quota, renewal, tailnet and release/deployment gates remain unclosed.
+
+
+The independent f451b33 review found that a phase signal during final GPG wait
+could lose unconfirmed cleanup and remove the public temporary home. The repair
+retains at most one exact live Popen handle and held directory descriptor; no
+PID-based adoption or persistent cleanup authority is introduced. Any interrupted
+reap or pipe cleanup returns `encryption-cleanup-unresolved` and keeps the owned
+public home while blocking further collection. Bounded reconciliation uses only
+the original end time, never a fresh allowance, and removes the home only after
+confirmed reap plus directory identity checks. A replaced/foreign path is retained.
+The original engine primary and native cleanup failure keep their existing
+precedence. Exact repaired-source review is required before any native35 run.

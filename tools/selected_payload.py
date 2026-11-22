@@ -10,6 +10,7 @@ import resource
 import selectors
 import secrets
 import signal
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -26,47 +27,79 @@ def canonical(value):return json.dumps(value,sort_keys=True,separators=(',',':')
 def unavailable(reason):return {'schema':1,'availability':'unavailable','reason':reason}
 def digest(value):return hashlib.sha256(value).hexdigest()
 
+# One live diagnostic owner at most. Never a PID-based adoption registry.
+_PENDING=None
+
+class CleanupUnresolved(Exception):
+    def __init__(self,owner):
+        self.owner=owner
+        super().__init__('encryption cleanup unresolved')
+
+def _cleanup_owned(owner):
+    process=owner['process']
+    if process is not None:
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
+            process.wait(timeout=max(0,owner['end']-time.monotonic()))
+        if process.returncode is None:raise ValueError('exit unconfirmed')
+        for stream in (process.stdin,process.stdout,process.stderr):
+            if not stream.closed:stream.close()
+    # Only the held directory inode can authorize removal after confirmed reap.
+    info=os.fstat(owner['fd']);path=owner['home'].lstat()
+    if (info.st_dev,info.st_ino)!=(path.st_dev,path.st_ino) or not stat.S_ISDIR(path.st_mode) or stat.S_ISLNK(path.st_mode) or path.st_uid!=os.getuid():raise ValueError('owned directory changed')
+    shutil.rmtree(owner['home']);os.close(owner['fd']);owner['fd']=None
+
+def reconcile_pending():
+    """Live exact ownership only; wait budget is the original end, never reset."""
+    global _PENDING
+    if _PENDING is None:return True
+    try:_cleanup_owned(_PENDING)
+    except BaseException:return False
+    _PENDING=None;return True
+
 def _encrypt(plain,key,end):
     """Owned stock GPG, no plaintext files/arguments/environment or ambient keys."""
+    global _PENDING
     if len(plain)>PLAIN_LIMIT:raise ValueError('capsule size')
-    with tempfile.TemporaryDirectory(prefix='dev-pair-seal-') as directory:
-        home=Path(directory);home.chmod(0o700);public=home/'recipient.asc';public.write_bytes(key);public.chmod(0o400)
-        operation_end=end-.25
-        process=None;selector=selectors.DefaultSelector();buffers={'stdout':bytearray(),'stderr':bytearray()};position=0
-        try:
-            if time.monotonic()>=operation_end:raise ValueError('capsule deadline')
-            process=subprocess.Popen(['/usr/bin/gpg','--no-options','--batch','--no-tty','--homedir',str(home),
-                '--no-autostart','--no-auto-key-retrieve','--trust-model','always','--recipient-file',str(public),
-                '--compress-algo','none','--output','-','--encrypt'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-                preexec_fn=lambda:resource.setrlimit(resource.RLIMIT_CORE,(0,0)),
-                env={'PATH':'/usr/bin:/bin','HOME':str(home),'LANG':'C','LC_ALL':'C'},start_new_session=True)
-            for stream in (process.stdin,process.stdout,process.stderr):os.set_blocking(stream.fileno(),False)
-            selector.register(process.stdin,selectors.EVENT_WRITE,'stdin');selector.register(process.stdout,selectors.EVENT_READ,'stdout');selector.register(process.stderr,selectors.EVENT_READ,'stderr')
-            while selector.get_map():
-                remaining=operation_end-time.monotonic()
-                if remaining<=0:raise ValueError('capsule deadline')
-                for event,_ in selector.select(min(.05,remaining)):
-                    if event.data=='stdin':
-                        try:position+=os.write(event.fd,plain[position:])
-                        except BrokenPipeError:position=len(plain)
-                        if position==len(plain):selector.unregister(event.fileobj);event.fileobj.close()
+    home=Path(tempfile.mkdtemp(prefix='dev-pair-seal-'));home.chmod(0o700)
+    owner={'home':home,'fd':os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW),'process':None,'end':end}
+    operation_end=end-.25
+    process=None;selector=selectors.DefaultSelector();buffers={'stdout':bytearray(),'stderr':bytearray()};position=0
+    try:
+        public=home/'recipient.asc';public.write_bytes(key);public.chmod(0o400)
+        if time.monotonic()>=operation_end:raise ValueError('capsule deadline')
+        process=subprocess.Popen(['/usr/bin/gpg','--no-options','--batch','--no-tty','--homedir',str(home),
+            '--no-autostart','--no-auto-key-retrieve','--trust-model','always','--recipient-file',str(public),
+            '--compress-algo','none','--output','-','--encrypt'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+            preexec_fn=lambda:resource.setrlimit(resource.RLIMIT_CORE,(0,0)),
+            env={'PATH':'/usr/bin:/bin','HOME':str(home),'LANG':'C','LC_ALL':'C'},start_new_session=True)
+        owner['process']=process
+        for stream in (process.stdin,process.stdout,process.stderr):os.set_blocking(stream.fileno(),False)
+        selector.register(process.stdin,selectors.EVENT_WRITE,'stdin');selector.register(process.stdout,selectors.EVENT_READ,'stdout');selector.register(process.stderr,selectors.EVENT_READ,'stderr')
+        while selector.get_map():
+            remaining=operation_end-time.monotonic()
+            if remaining<=0:raise ValueError('capsule deadline')
+            for event,_ in selector.select(min(.05,remaining)):
+                if event.data=='stdin':
+                    try:position+=os.write(event.fd,plain[position:])
+                    except BrokenPipeError:position=len(plain)
+                    if position==len(plain):selector.unregister(event.fileobj);event.fileobj.close()
+                else:
+                    data=os.read(event.fd,4096)
+                    if not data:selector.unregister(event.fileobj)
                     else:
-                        data=os.read(event.fd,4096)
-                        if not data:selector.unregister(event.fileobj)
-                        else:
-                            buffers[event.data].extend(data)
-                            if len(buffers[event.data])>(CIPHER_LIMIT if event.data=='stdout' else 4096):raise ValueError('capsule capture')
-            if process.wait(timeout=max(0,operation_end-time.monotonic()))!=0 or not buffers['stdout']:raise ValueError('capsule encryption')
-            return bytes(buffers['stdout'])
-        finally:
+                        buffers[event.data].extend(data)
+                        if len(buffers[event.data])>(CIPHER_LIMIT if event.data=='stdout' else 4096):raise ValueError('capsule capture')
+        if process.wait(timeout=max(0,operation_end-time.monotonic()))!=0 or not buffers['stdout']:raise ValueError('capsule encryption')
+        return bytes(buffers['stdout'])
+    finally:
+        try:
             selector.close()
-            if process is not None:
-                if process.poll() is None:
-                    with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
-                try:process.wait(timeout=max(0,end-time.monotonic()))
-                finally:
-                    for stream in (process.stdin,process.stdout,process.stderr):
-                        if not stream.closed:stream.close()
+            _cleanup_owned(owner)
+        except BaseException:
+            # Store before raising; no later close can replace this uncertainty.
+            _PENDING=owner
+            raise CleanupUnresolved(owner) from None
 
 def _recipient():
     fd=os.open(RECIPIENT,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
@@ -79,6 +112,8 @@ def _recipient():
 
 def seal(buffers,payload,identity,end):
     """Only internal checked selector/control evidence may supply these operands."""
+    global _PENDING
+    if _PENDING is not None:return unavailable('encryption-cleanup-unresolved')
     try:
         if type(identity) is not dict or set(identity)!={'source_sha','context_sha256','phase'} or not re.fullmatch('[0-9a-f]{40}',identity['source_sha']) or not re.fullmatch('[0-9a-f]{64}',identity['context_sha256']) or identity['phase']!='maintenance-gptbox':return unavailable('not-selected')
         if type(payload) is not dict or payload.get('context_sha256')!=identity['context_sha256'] or payload.get('suboperation')!='load' or payload.get('launch_handle_observed') is not True or payload.get('control_verified') is not True or type(payload.get('uid')) is not int or not 1000<=payload['uid']<2**32 or type(payload.get('status')) is not int or not 1<=payload['status']<=255:return unavailable('not-selected')
@@ -99,7 +134,10 @@ def seal(buffers,payload,identity,end):
         except FileNotFoundError:return unavailable('not-collected')
         except (OSError,ValueError):return unavailable('recipient-unavailable')
         try:cipher=_encrypt(plain,key,min(end,time.monotonic()+5))
-        except subprocess.TimeoutExpired:return unavailable('encryption-cleanup-unresolved')
+        except CleanupUnresolved as error:
+            _PENDING=error.owner
+            return unavailable('encryption-cleanup-unresolved')
+        except subprocess.TimeoutExpired:return unavailable('encryption-unavailable')
         except Exception:return unavailable('encryption-unavailable')
         return {'schema':1,'availability':'sealed','attempt_id':attempt,'identity':identity,'uid':payload['uid'],'status':payload['status'],
             'recipient_sha256':RECIPIENT_SHA,'fingerprint':FINGERPRINT,'ciphertext_bytes':len(cipher),'ciphertext_sha256':digest(cipher),'ciphertext_base64':base64.b64encode(cipher).decode()}

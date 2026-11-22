@@ -79,10 +79,15 @@ changed stock attempt stopped before the CLI/listener at a missing staged
 or final audit was reached. A narrow source repair now adds `fedora_oci.py` to the fixed immutable snapshot,
 read-only mounts and aggregate source identity. An isolated staged import regression
 checks that exact dependency closure; changed stock delivery remains unproved.
-The native encrypted diagnostic remains a separate source change with a confirmed
-cleanup-interruption review finding queued for repair, not a runtime fix or a
-diagnosed cause. This dependency repair passed 116 affected tests; a combined full
-suite waits for that native repair, and changed stock delivery is still unproved.
+The dependency repair passed 116 affected tests and fresh review. One changed
+finite stock attempt on `64b74b4` then passed the synthetic startup/session oracles:
+seven complete documents, two original UUID resumptions, four turns and final
+history/helper/marker/SQLite/unknown-UUID audits, with owned cleanup. That is finite
+delivery evidence, not model understanding or production authentication. The
+report summarizes delivery without separate per-startup call/output hashes.
+A separate source repair now keeps GPG cleanup uncertainty and exact live ownership
+sticky across interrupted reap; fresh review and native validation remain required.
+It is a diagnostic correction, not a runtime fix or a diagnosed native34 cause.
 
 No production deployment is established.
 

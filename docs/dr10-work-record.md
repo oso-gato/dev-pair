@@ -3,6 +3,45 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 04:48 HKT — sticky owned GPG cleanup repair
+
+- Fresh f451b33 review confirmed one R1: phase-style SIGALRM/Blocked during final
+  GPG wait left the real child unreaped, but ordinary encryption-unavailable was
+  returned and its temporary home removed. The reviewer preserved evidence then
+  killed/reaped its exact child. Original review/reproducer artifacts remain intact.
+- Cleanup uncertainty is now sticky across any exception/cancellation in reap or
+  pipe cleanup. At most one live Popen handle and held directory descriptor remain
+  in the controller; the public projection contains only the fixed unavailable
+  reason. Further collection is blocked while that ownership is unresolved.
+  No persisted PID is authority, no foreign/replaced directory is removed, and
+  reconciliation cannot reset the original end time or borrow a new wait budget.
+- The owned public-only temporary home is removed only after confirmed child
+  reap and matching held-directory identity. Failure to confirm retains state.
+  No plaintext recovery data is stored. Existing engine primary/native cleanup
+  precedence, selected load/recipient binding, GPG/key/stream/report caps and all
+  security/runtime/resource limits remain unchanged. This diagnoses no native34
+  cause and makes no runtime-fix, native35 or deployment claim.
+- Fifty affected checks passed in 8.582 seconds, including actual owned child and
+  SIGALRM, other interrupted waits, replaced home, expired original deadline,
+  interrupted pipe close, real framed native primary/cleanup precedence and the
+  copied/redirected original reproducer. One transient syntax-edit failure is
+  retained before correction. The one combined full suite follows on frozen source;
+  its exact outcome is recorded in `/workspace/artifacts/native-gpg-cleanup-20261122/`.
+- Reviewed 64b74b4's one finite stock attempt passed in 4.145 seconds (4.290 outer),
+  14 requests/connections and 510,629 captured bytes, with nine baseline checks and
+  complete owned cleanup. All seven complete synthetic documents/directives,
+  four turns/two original UUID resumptions and history/helper/marker/SQLite/final
+  audits passed; unknown UUID naturally exited 1 with request delta zero.
+  Registry evidence has four completed operations/two UUIDs. The source enforces
+  causal wire/durable startup order; the report summarizes delivery without separate
+  per-startup pair hashes. Understanding/compliance/real-model/auth/production flags
+  remain false. All session/dependency/registry/ledger/policy/helper bytes stay 64.
+- Allocation is 20:40:35–20:55:35 UTC, including test-slot waiting, no extension.
+  API-selected GPT-6.1 Sol/high remains the builder; backend attestation is unavailable.
+  The root private key was never read, used or copied. No stock/native/CI/network,
+  SSH/auth/real-model, push/merge or deployment occurred in this repair unit.
+
+
 ### November 23, 2026, 04:39 HKT — fixed staged startup dependency closure
 
 - The single stock attempt on reviewed 78c1355 stopped before Journey/listener:
