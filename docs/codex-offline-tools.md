@@ -32,7 +32,7 @@ before creating the listener or supervisor. It mounts no ambient HOME/auth/proxy
 or credentials. This is a fixture identity delta, not distinct root/job ownership
 acceptance. The supervisor alone gets a synthetic key; child environment is cleared.
 
-Fourteen finite actions independently inspect product effects and unchanged
+The original fourteen actions independently inspect product effects and unchanged
 protected objects: shell positive/negative, allowed and forbidden cwd requests,
 escalation/login rejection, denied connection to the live fixture, direct patch,
 forbidden/partial patch, intercepted shell patch and identical valid PNG
@@ -40,6 +40,50 @@ allow/denial through direct and symlink paths. Wrong-path, unsupported-tool and
 invalid-image errors cannot count as denial. Failed actions and actual partial
 product effects are retained. The denied cwd request may execute confined at the
 HOME fallback; its actual cwd and absolute-target denial remain visible.
+
+The fixed expansion has32 mandatory actions and at most one explicit completion
+poll (33 maximum). It adds five owned-PTY actions: start with a bound header ID,
+empty poll, exact-once input consumption, retired-ID rejection and invalid-ID
+rejection. The continued child independently writes the product marker, reports
+UID/capabilities/NNP and attempts the known denied read and protected-code write.
+Its18-second alarm and the existing action/experiment deadlines bound input wait.
+The optional completion poll is inserted once only if the input result is still
+running; remaining running state blocks instead of polling indefinitely.
+Input and completion responses drain different bytes. The fixture retains at
+most256KiB of payload associated with the bound PTY across those two responses,
+removing only each rendered header separator so fragmented JSON rejoins exactly.
+Final exit0, exact product bytes and complete consumption/confinement proof remain
+mandatory. This retained state participates in incoming-request rollback; it
+adds no poll or capture-budget allowance.
+
+Nine goal actions exercise initial absence, missing-goal update, empty objective,
+nonpositive budget, create, duplicate create, forbidden active update, complete
+and final get. The controller binds the actual CLI `thread.started` UUID to
+read-only SQLite row snapshots, parameterized lookup, stable goal identity,
+unchanged unrelated rows and final database integrity after supervisor stop.
+Usage may advance legitimately; token entitlement/spending and recovery are
+unverified. The objective contains a literal protected path as data, and product
+file snapshots must remain unchanged during these supervisor operations.
+
+One valid input request observes rejection under the unchanged current exec/
+Default configuration, followed by subsequent tool work. It does not establish
+interactive answer/client correlation. Three special client `tool_search_call`
+items use object arguments and require correlated `tool_search_output` kinds.
+The actual history-stamped result has seven fields, including a `tso_` UUIDv7
+and the same typed turn/time envelope checked against the completed goal turn.
+The recorded stock output is retained as a replay regression; replay checks do
+not substitute for a fresh stock execution of a changed candidate.
+Positive search requires the actual advertised Multi-agent source and its exact
+cached-source namespace/function schema; the fixture never invokes the discovered
+`spawn_agent`. Complete definitions and every request inventory are retained and
+hashed. Empty invalid-input results establish bounded no-definition behavior
+only: the same completed/client/empty shape can encode errors or cancellation,
+so it cannot prove a particular handler validator without a separate witness.
+When stock deferred-world-state mode omits the source list from the search
+description, only a unique initial developer `<tools>` namespace block with the
+exact pinned-source namespace/description can supply the evidence. The block is
+bounded to the stock4096-byte fragment cap and retained with its hash. User,
+goal and tool-output lookalikes cannot supply registry evidence.
 
 Each action record retains its emitted call kind and the actual returned output
 kind. The pinned stock source maps `function_call` to `function_call_output` and
@@ -50,13 +94,35 @@ replayed history, must match its issued ID and kind. Unknown, orphan, duplicate
 or cross-kind outputs cannot advance the sequence or pass an action. Older
 reports without these fields do not establish observed wire kinds.
 
+Stock successful goal creation can also inject a source-defined named untrusted
+context item (`context-fragments/src/additional_context.rs` and
+`ext/goal/src/tool.rs` at the same pinned source). The fixture recognizes only
+`function_call_output` with omitted call ID, namespace `agent`, name
+`goal_objective` and the exact planned objective, first alongside a correlated
+successful create result and its actual thread/database identity. The durable
+history boundary (`core/src/session/mod.rs`) adds its `fco_` UUIDv7 and the
+two-field turn-ID/creation-time metadata. The fixture checks exactly those six
+fields, distinct result IDs, the same valid turn as the correlated create output
+and finite timestamps within the experiment/action bounds. It records this
+supervisor context separately and permits only unchanged replay. Other
+uncorrelated items block. Acceptance bookkeeping is staged for the whole request;
+failed context validation keeps actual database/file effects and failure evidence
+while rolling back provisional passing records and identities. A protocol
+rejection retains bounded complete output items, request hash/size and issued IDs
+for diagnosis under the existing caps.
+Once the entire incoming request validates, its completed results commit before
+planning the next response; a later availability blocker preserves those results.
+
 Actual request tool inventories are hashed and classified from completed checks.
 Unknown/unexercised surfaces block inventory closure and overall status, even when
-all fourteen actions pass. In the observed direct-tool fixture, goals,
-write_stdin, tool_search, request_user_input and provider-hosted web_search remain
-unclosed. This is deliberately partial representative coverage; PTY/session
-continuation, helper-in-script patch routes, additional permission modes, complete
-loader discovery and auth/backend-dependent tools remain later gates.
+all planned actions pass. Provider-hosted web_search, discovered untested
+collaboration tools, interactive input/client behavior, cross-job ownership and
+renewal remain gates. Same-session PTY continuation, one thread's supervisor goal
+state, local registry metadata and current-mode input rejection are separate
+coverage classes. Search definitions in history need not be copied into the
+request's top-level tools array; the report inventories their union. Helper-in-
+script patch routes, additional permission modes, complete loader discovery and
+auth/backend-dependent paths remain later acceptance work.
 
 The total envelope is180s with20s per action clipped to remaining time,64 private
 connections/requests,256KiB bodies/lines,2MiB combined capture (64KiB reserved for
@@ -76,6 +142,10 @@ ownership remain separate runtime gates.
 Local tests cover matching IDs, orphan/duplicate output rejection, protected
 mutation, invalid denial oracles, exact image bytes, real capture time/output
 limits, detached-child cleanup, FIFO/oversize snapshots and cleanup failure.
+Expansion checks cover dynamic header-only PTY binding, one conditional poll,
+real pending-PTY termination, exact input effects, read-only goal identity/foreign
+row preservation, special search wire/kind/byte accounting, ambiguous empty search
+results, named context causal binding and bounded product metadata snapshots.
 They open no host listener and make no model request. Fedora/Podman/SELinux,
 production endpoint/catalog integrity, credential lifecycle, complete tools and
 loaders, identity ownership and hard storage enforcement remain unverified.
