@@ -2,6 +2,50 @@
 
 ## Latest continuation checkpoint
 
+### Resumed November 22, 2026, 16:55 HKT — combined candidate validated
+
+Arthur explicitly resumed the job, retaining the repository's model/effort
+selection. Collaboration API accepted `/root/resume_coordination` with
+`gpt-6-astra/high` and `/root/resume_build` with `gpt-6.1-sol/high`.
+These are local subagents, not standalone Cloud conversations. Backend
+attestation and the root conversation's model/effort remain unavailable.
+
+- Verified clean baseline `c318e1b37706578afa0148474a2e18a06f9c0bad` and the
+  unchanged standards pin; all four project documents and three pinned shared
+  documents were loaded. Final integrated product source is `d04a17a`.
+- The Sol validator matched all48 tracked tools/tests/workflow paths to the
+  reviewed native and signed components, including both cleanup patch IDs.
+  Combined367 tests passed in55.259s on the managed Debian13 worker. An initial
+  execution-only long TMPDIR caused22 fixture setup errors; that evidence is
+  retained separately. Correcting TMPDIR to `/tmp` required no source change.
+  Both attempts stayed inside the original300-second validation allocation.
+  Evidence: `/workspace/artifacts/resume-20261122/combined-unittest-result.json`
+  and `integration.json`; final log SHA256
+  `8afea3926a9f6e2be196987c758b9e009d5e0ed0cd37f00d3482e75e4f46cf8b`.
+- Astra coordination verified final signed review provenance and gave conditional
+  GO for one changed-candidate Fedora19 attempt after this combined pass.
+  Receipt: `/workspace/artifacts/resume-20261122/coordination-receipt.json`.
+  CI itself builds and verifies a fresh exact published-HEAD public context;
+  the historical component bundle cannot admit the merged source.
+- The next single publication tests resolved configuration/modes/labels/listeners,
+  root and dp-maint command boundaries, authenticated signed OCI import, signed
+  package preparation, maintenance assembly and owned cleanup as far as execution
+  reaches. Keep the PR draft/unmerged. Stop at the first bounded failure, retain
+  evidence and repair a changed candidate; no unchanged retry.
+- Limits remain hosted60min; controller3300s (setup540/VM2640/cleanup120);
+  guest6GiB/2CPU/32GiB virtual; outer8GiB/3CPU/1024PIDs; overlay16GiB,
+  overhead4GiB, host reserve3GiB, guest reserve8GiB; logs8MiB/report64KiB.
+  No real credentials/model calls, VPS operation, confinement exception,
+  production promotion or resource increase is included.
+- GitHub still reports PR13 draft/open/unmerged at `932c296` and run18 closed
+  before publication. The separate clean inventory worktree at `07c55c1` retains
+  at most28 minutes of its source allocation. All outstanding runtime/product
+  acceptance in the pause record remains required.
+- Current provider status confirms the same running environment/spec1 and ready
+  `hostinger_root` reference without exposing its value. An inbound SSH portal
+  does not establish outbound VPS connectivity. VPS remains untouched; no
+  supported outbound route has yet been verified.
+
 ### Owner-requested pause — November 16, 2026, 08:29 HKT
 
 Arthur requested a prompt, durable pause to conserve tokens. Do not resume
