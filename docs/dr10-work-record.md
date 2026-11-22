@@ -2,6 +2,41 @@
 
 ## Latest continuation checkpoint
 
+### November 22, 2026, 17:07 HKT — reviewed OCI compatibility repair
+
+- Native [run19](https://github.com/oso-gato/dev-pair/actions/runs/45005098009),
+  exact `934d621`, passed367 hosted tests in45.059s, runner preflight and signed
+  Cloud image verification. Tooling blocked with `unsupported OCI index` before
+  VM boot; outer cleanup passed. This scope is closed. Evidence:
+  `/workspace/artifacts/fedora-ci-run-45005098009-controller.json` and `.log`.
+- Astra diagnosis found that the tagged Podman4.9.3 OCI writer omits optional
+  index `mediaType`, whereas our derived parser required it. Actual run19 index
+  bytes and failing parse stage were not exported; the source-backed diagnosis
+  is not proof that native load/save completed. The unchanged signed-source
+  parser, hash graph, config bytes, full diffID and limits remain mandatory.
+- Sol repair `cf8b61d` passed cached actual signed-archive verification, including
+  old-parser rejection and fixed-parser acceptance of the complete altered-index
+  transport. Its first full suite caught one test expectation error: changed
+  signed blob paths reject before the index. Fresh review required correction;
+  that failure and review are preserved. Test-only `94d3bb0` isolates the cases.
+- Final clean `94d3bb08f4f5605f2232c3470d95a2ff81761e1f` passed371 tests in58.016s
+  and16 affected tests. The parser bytes exactly match the cached proof; no
+  redundant archive operation was needed. Fresh Astra review passed16 affected
+  tests and27 independently constructed checks, with no blocking findings.
+  Receipt `/workspace/artifacts/oci-index-independent-94d3bb0/review.json`, SHA256
+  `ccf472cc1922b85249bb2bb547dff510d527e17b1892ad30056ae33c29be8f82`.
+  Builder evidence `/workspace/artifacts/oci-index-94d3bb0/evidence.json`.
+- Main fast-forwarded to that exact tested/reviewed source. Only this work record
+  changes before publication. One changed-candidate Fedora20 attempt may now
+  exercise the same bounded scope as run19, with a fresh exact-HEAD context.
+  All limits and security boundaries recorded below remain unchanged. No native
+  compatibility, designated-host or deployment success is claimed in advance.
+- The separate inventory draft `dd372d7` is preserved and resumed by the sole
+  Sol High builder at17:05:13 HKT with1542 seconds remaining, deadline17:30:55 HKT.
+  No stock execution/coverage success is claimed for that draft. Fresh review
+  remains required before integration. Local handoff:
+  `/workspace/artifacts/dr10-active-handoff-20261122.json`.
+
 ### Resumed November 22, 2026, 16:55 HKT — combined candidate validated
 
 Arthur explicitly resumed the job, retaining the repository's model/effort
