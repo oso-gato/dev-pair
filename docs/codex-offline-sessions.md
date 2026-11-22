@@ -11,6 +11,49 @@ candidate has not run the stock journey; a fresh exact-candidate review must pre
 one separately authorized bounded experiment. Tiny fake binaries and synthetic
 history/SQLite fixtures in tests are not stock restoration evidence.
 
+The fixed positive turns now pass through a private local supervisor in
+`tools/session_controller.py`. It reserves an operation before launching the
+source-fixed CLI, binds real v1 ledger controller/job/checkpoint identities and
+immutable source/runtime/binary/policy/layout/standards/agreement references, and
+records only prompt hashes/lengths and a credential reference. The existing CLI
+arguments, synthetic environment, helper-child attestation and history/progress
+oracles remain in force. The unknown-UUID negative still reaches the original
+CLI directly and is explicitly outside positive-turn inventory.
+
+The separate mode-0700 registry uses fully synchronous SQLite transactions,
+mode-0600 files, an exclusive owner lease, at most 32 operation rows and a 1 MiB
+aggregate file bound. Identical operations return a typed observe-only outcome;
+changed bodies collide. A newly authorized operation reads the trusted ledger's
+current checkpoint; an old operation retains its original immutable checkpoint.
+A known session may have only one active/uncertain turn. Reserved unbound starts,
+failed operations and idle UUIDs remain in the generation-bound inventory.
+
+Read-only observers never own the child or issue signals. They can disconnect and
+reattach to the same operation/UUID/progress sequence:
+
+```sh
+python3 tools/session_controller.py --registry /private/controller/session-registry
+python3 tools/session_controller.py --registry /private/controller/session-registry \
+  --operation turn-alpha-first
+```
+
+A released owner lease makes active records uncertain in both read-only views.
+Owner loss permits neither automatic adoption nor replay; persisted PIDs are
+only diagnostics. The original deadline and capture meter continue across reads.
+Recorded cleanup distinguishes a reaped owned child from unresolved cleanup;
+process-group signaling does not prove detached descendants are gone.
+
+The outer controller reads the four repository documents and verifies the three
+shared-document cache hashes at the adopted standards pin before fixture startup.
+`--standards-cache` selects an authorized read-only cache; the default is
+`/workspace/standards`. Only a hash receipt enters the isolated fixture. Private
+standards text is never mounted into CLI-autoloaded instructions or captured
+request/history, and blank AGENTS files are unchanged. Managed instruction
+delivery and model consumption remain unverified. The ledger's medium effort is
+an unverified fixture record; actual fixture effort remains unconfigured. Neither
+that metadata nor the synthetic model label attests this development worker's
+API model selection. No production job/runtime admission is enabled.
+
 Use an already verified binary, the unchanged pinned catalog and a new report:
 
 ```sh

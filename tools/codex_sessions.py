@@ -21,6 +21,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import codex_tools as t
 import session_helper as helper
+import session_controller as controller
 
 CATALOG_SHA = '1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10'
 LABELS = ('alpha', 'beta')
@@ -1025,7 +1026,7 @@ def cli_args(port, context, resume=None):
     return args+[context]
 
 
-def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Popen):
+def _run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Popen):
     negative=getattr(journey,'negative_evidence',None) if getattr(journey,'negative',False) else None
     if negative is not None:negative['launch_handle_observed']=False
     process=popen(argv,env={'PATH':'/usr/bin:/bin','HOME':'/home/gpt','CODEX_HOME':'/state/codex','TMPDIR':'/tmp',
@@ -1034,6 +1035,7 @@ def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Po
     if negative is not None:negative.update(stage='launched',launch_handle_observed=True)
     selector=None;line=bytearray();used=0;errors=bytearray();error_bytes=0;stderr_eof=False;stdout_eof=False;natural_exit=None
     try:
+        if getattr(journey,'controller_turn',None) is not None:journey.controller_turn.child(process)
         if hasattr(journey,'publish_child'):journey.publish_child(process)
         selector=selectors.DefaultSelector()
         for name,stream in (('stdout',process.stdout),('stderr',process.stderr)):
@@ -1056,6 +1058,7 @@ def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Po
                     line.extend(data);require(all(len(v)<=t.BODY_BYTES for v in line.split(b'\n')),'CLI line budget exceeded')
                     while b'\n' in line:
                         raw,_,rest=line.partition(b'\n');line[:]=rest;journey.observe_cli(raw)
+                        if getattr(journey,'controller_turn',None) is not None:journey.controller_turn.event(raw)
         require(not line,'truncated CLI JSON line')
         family=stderr_reason_family(bytes(errors),stderr_eof and error_bytes<=4096)
         natural_exit=process.wait(timeout=max(.001,end-time.monotonic()))
@@ -1070,10 +1073,83 @@ def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Po
                 stderr_reason=None if family is None else family!='none',stderr_reason_family=family,
                 cli_stream_complete=stdout_eof and not line,natural_exit_observed=natural_exit is not None,natural_exit_code=natural_exit)
         if selector is not None:selector.close()
-        try:t.stop(process)
+        owned=getattr(journey,'controller_turn',None);pending=sys.exc_info()[1]
+        try:
+            try:t.stop(process)
+            except BaseException:
+                if owned is not None:
+                    try:owned.cleanup(False)
+                    except Exception:pass
+                if owned is None:raise
+                if pending is None:raise ValueError('owned child cleanup unresolved; details withheld') from None
+            else:
+                if owned is not None:
+                    try:owned.cleanup(True)
+                    except Exception:
+                        if pending is None:raise ValueError('controller cleanup observation unavailable') from None
         finally:
             if hasattr(journey,'clear_child'):journey.clear_child()
 
+
+
+def run_turn(argv, journey, meter, end, monitor=lambda:None, popen=subprocess.Popen):
+    registry=getattr(journey,'controller_registry',None)
+    # Negative UUID diagnostic remains the actual pinned CLI oracle, outside the
+    # positive-turn registry. It can never register an unknown UUID as a session.
+    if registry is None or getattr(journey,'negative',False):
+        return _run_turn(argv,journey,meter,end,monitor,popen)
+    turn=journey.turn;label=turn['label'];phase=turn['phase'];resume=turn['expected_uuid']
+    expected=cli_args(journey.controller_port,prompt(label,phase,journey.nonce),resume)
+    require(argv==expected,'submitted CLI differs from fixed session adapter')
+    operation='turn-'+label+'-'+phase
+    with registry.owner():
+        registry.uncertain()
+        row,created=registry.reserve(operation,label,expected[-1],min(end,journey.action_end),resume)
+        if not created:
+            # Observation is not replayed into Journey as fresh CLI evidence.
+            raise controller.ExistingOperation(row)
+        owned=controller.TurnOwner(registry,operation);journey.controller_turn=owned
+        try:
+            owned.launching()
+            code,details=_run_turn(expected,journey,meter,end,monitor,popen)
+            try:owned.finish(code,True)
+            except (OSError,sqlite3.Error):raise ValueError('controller terminal record unavailable') from None
+            return code,details
+        except BaseException:
+            try:
+                if registry.row(operation)['state'] in controller.ACTIVE:owned.fail(uncertain=True)
+            except Exception:pass  # Registry diagnostics cannot mask the primary.
+            raise
+        finally:journey.controller_turn=None
+
+
+def fixture_registry(root,receipt):
+    """Link the finite adapter to real v1 ledger identities, without altering v1."""
+    import job_protocol as protocol
+    require(type(receipt) is dict and set(receipt)=={'startup','identity'},'invalid fixture controller receipt')
+    controller.validate_startup(receipt['startup'])
+    identity=receipt['identity'];require(type(identity) is dict and set(identity)=={'source_revision','source_sha256','runtime_sha256','binary_sha256','policy_sha256','layout_sha256'},'invalid fixture controller identity')
+    ledger=protocol.Ledger(Path(root)/'job-ledger')
+    identity=receipt['identity'];runtime=identity['runtime_sha256']
+    agreement=sha(canonical({'scope':'finite-offline-session-fixture','real_model':False,'auth_verified':False}))
+    job=protocol.envelope('job',job_id='offline-session-fixture',standards_sha=controller.STANDARDS,agreement_sha256=agreement,
+        selection={'provider':'gptbox','model':t.MODEL,'effort':'medium','runtime_sha256':runtime,'verification':'unverified-record-only'},
+        budgets={'seconds':t.ACTION_SECONDS,'artifact_bytes':65536,'spend_usd':0},max_requests=64)
+    ledger.create_job(job)
+    checkpoint=protocol.envelope('checkpoint',job_id=job['job_id'],checkpoint_id='fixed-session-inputs',
+        candidate={'source_revision':identity['source_revision'],'artifact_sha256':identity['binary_sha256']},
+        test=protocol.recipe_identity(),summary='Finite synthetic selection record; effort/model consumption are unverified.',evidence=[])
+    ledger.checkpoint(checkpoint)
+    binding={'controller_id':ledger.controller_id,'job_id':job['job_id'],'checkpoint_id':checkpoint['checkpoint_id'],
+        'checkpoint_sha256':protocol.identity(checkpoint),'job_sha256':protocol.identity(job),'source_revision':identity['source_revision'],'source_sha256':identity['source_sha256'],'runtime_sha256':runtime,
+        'binary_sha256':identity['binary_sha256'],'policy_sha256':identity['policy_sha256'],'layout_sha256':identity['layout_sha256'],
+        'standards_sha':controller.STANDARDS,'agreement_sha256':agreement,'provider':'openai','model':t.MODEL,
+        'effort':'unconfigured-fixture','credential_ref':'offline-synthetic-key','startup_sha256':sha(canonical(receipt['startup']))}
+    try:registry=controller.Registry(Path(root)/'session-registry',binding)
+    except BaseException:
+        ledger.close();raise
+    registry.ledger=ledger
+    return registry
 
 def check_unknown_uuid(report,journey,argv,meter,end,runner=run_turn):
     before=journey.requests
@@ -1116,7 +1192,7 @@ def final_session_audits(report,journey,initial,ids,source,root='/'):
 def worker(args):
     report={'version':1,'status':'blocked','runtime_admitted':False,'real_model':False,'auth_verified':False,
             'replacement_verified':False,'interruption':'completed first-turn checkpoints; each stock process reaped before explicit UUID resume'}
-    server=None;thread=None;journey=None
+    server=None;thread=None;journey=None;registry=None
     try:
         identity=t.private_loopback(args.host_netns);report['namespace']=identity
         report['setup_namespace']=json.loads(t.snapshot('/result/setup.json',1024,args.end),object_pairs_hook=t.unique)
@@ -1129,6 +1205,9 @@ def worker(args):
         server=t.FixtureServer(('127.0.0.1',0),t.Handler);server.connections=0;server.sequence=journey
         thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.05},daemon=True);thread.start()
         port=server.server_address[1]
+        receipt=json.loads(Path('/opt/session-startup.json').read_bytes(),object_pairs_hook=t.unique)
+        registry=fixture_registry('/result',receipt);journey.controller_registry=registry;journey.controller_port=port
+        report['controller_startup']=receipt['startup']
         for label in LABELS:
             journey.begin(label,'first')
             code,_=run_turn(cli_args(port,prompt(label,'first',journey.nonce)),journey,meter,args.end)
@@ -1138,6 +1217,10 @@ def worker(args):
         ids=journey.read_checkpoint('/result/checkpoint.json')
         rows=database('/',set(initial)|set(ids.values()),integrity=True)
         report['first_rollouts']={label:journey.audit_first_rollout(rows[ids[label]],label,report['checkpoint_sha256']) for label in LABELS}
+        import job_protocol as protocol
+        current=registry.ledger.record('checkpoint','fixed-session-inputs')
+        current.update(checkpoint_id='verified-first-turns',summary='Both independent first-turn histories and progress retained; rollout audit remains required.',evidence=['sha256:'+report['checkpoint_sha256']])
+        registry.ledger.checkpoint(current)
         for label in LABELS:
             require(journey.read_checkpoint('/result/checkpoint.json')==ids,'checkpoint identities changed')
             journey.begin(label,'resume',ids[label])
@@ -1163,6 +1246,12 @@ def worker(args):
                           transport_error=journey.error,last_request=journey.last_request,captured_bytes=journey.meter.used,
                           observed_session_uuids={k:v['uuid'] for k,v in journey.entries.items()},
                           helper_source_sha256=journey.helper_sha256,helper_rejection=journey.helper_rejection,history_metadata_rejection=journey.metadata_rejection,rollout_rejection=journey.rollout_rejection,resume_context_rejection=journey.resume_context_rejection)
+        if registry is not None:
+            try:report['managed_inventory']=registry.inventory()
+            except Exception:
+                report.update(status='blocked',managed_inventory={'availability':'unavailable','reason':'registry-rejected'})
+            finally:registry.close()
+            report['managed_inventory_boundary']='positive fixed turns only; actual unknown-UUID diagnostic remains separately audited'
         data=canonical(report)+b'\n';require(len(data)<=t.REPORT_BYTES,'session report exceeded')
         fd=os.open('/result/report.json',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(data)
@@ -1175,6 +1264,7 @@ def main():
     parser.add_argument('--host-netns',type=int);parser.add_argument('--end',type=float)
     parser.add_argument('--output-limit',type=int,default=t.OUTPUT_BYTES-65536);parser.add_argument('--captured-seed',type=int,default=0)
     for name in ('binary','catalog','report'):parser.add_argument('--'+name,type=Path)
+    parser.add_argument('--standards-cache',type=Path,default=Path('/workspace/standards'))
     args=parser.parse_args()
     if args.setup:return t.setup_worker(args)
     if args.worker:return worker(args)
@@ -1185,15 +1275,18 @@ def main():
     require(ctypes.CDLL(None).prctl(36,1,0,0,0)==0,'owned subreaper unavailable')
     root=tempfile.mkdtemp(prefix='dev-pair-sessions-');runner=None;safe=False
     try:
+        startup=controller.startup_receipt(Path(__file__).resolve().parent.parent,args.standards_cache,started+t.SECONDS)
         runner=state.Harness(root,args.binary);runner.end=min(runner.end,started+t.SECONDS)
         report['state_component']=runner.exercise()
         catalog=t.snapshot(args.catalog,1048576,runner.end);require(sha(catalog)==CATALOG_SHA,'unreviewed fixture catalog')
         selected=[m for m in json.loads(catalog,object_pairs_hook=t.unique)['models'] if m.get('slug')==t.MODEL]
         require(len(selected)==1,'fixture catalog model absent/ambiguous')
         files={}
-        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__)),('session_helper.py',Path(helper.__file__))):
+        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__)),('session_helper.py',Path(helper.__file__)),('session_controller.py',Path(controller.__file__)),('job_protocol.py',Path(__file__).with_name('job_protocol.py')),('ledger_recovery.py',Path(__file__).with_name('ledger_recovery.py'))):
             path=Path(root)/name;path.write_bytes(t.snapshot(source,131072,runner.end));path.chmod(0o444);files[name]=path
         models=Path(root)/'models.json';models.write_bytes(catalog);models.chmod(0o444)
+        receipt={'startup':startup,'identity':{'source_revision':subprocess.check_output(['/usr/bin/git','-C',str(Path(__file__).resolve().parent.parent),'rev-parse','HEAD'],text=True).strip(),'source_sha256':sha(canonical({name:sha(path.read_bytes()) for name,path in files.items()})),'runtime_sha256':sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes()),'binary_sha256':state.CODEX_SHA,'policy_sha256':sha(canonical(state.generated_policy())),'layout_sha256':sha(canonical(state.layout()))}}
+        startup_path=Path(root)/'session-startup.json';startup_path.write_bytes(canonical(receipt));startup_path.chmod(0o444)
         result=Path(root)/'result';result.mkdir(mode=0o700)
         argv=runner.argv(['/usr/bin/python3','-I','/opt/tool_boundary.py','--setup','--host-netns',str(os.stat('/proc/self/ns/net').st_ino),
                           '--end',str(runner.end-5),'--output-limit',str(t.OUTPUT_BYTES-runner.used-65536),'--captured-seed',str(runner.used)])
@@ -1201,7 +1294,7 @@ def main():
         index=argv.index('--unshare-all')+1
         argv[index:index]=['--uid','0','--gid','0','--cap-drop','ALL','--cap-add','CAP_NET_ADMIN','--cap-add','CAP_SETPCAP','--cap-add','CAP_SETFCAP']
         index=argv.index('--remount-ro');argv[index:index]=['--ro-bind',str(files['worker.py']),'/opt/tool_boundary.py',
-            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(files['session_helper.py']),'/opt/session_helper.py','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
+            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(files['session_helper.py']),'/opt/session_helper.py',*sum((['--ro-bind',str(files[name]),'/opt/'+name] for name in ('session_controller.py','job_protocol.py','ledger_recovery.py')),[]),'--ro-bind',str(startup_path),'/opt/session-startup.json','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
         process=subprocess.Popen(argv,env=state.ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                  start_new_session=True,preexec_fn=state.child_limits)
         try:

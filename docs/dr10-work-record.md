@@ -3,7 +3,44 @@
 ## Latest continuation checkpoint
 
 
-### November 23, 2026, 03:36 HKT — hosted32 timeout fixture portability
+### November 23, 2026, 02:57 HKT — private fixed-turn supervisor component
+
+- A source-fixed nonprivileged positive-turn adapter now reserves durable private
+  operations before actual Popen dispatch. Fully synchronous SQLite transactions,
+  a held exclusive owner lease, closed identity/state schemas and finite rows/bytes
+  provide deduplication, collisions and session exclusion. Real v1 ledger
+  controller/job/current-checkpoint identities are linked without changing ledger
+  or strict recovery schemas. New trusted checkpoints can authorize new operations;
+  existing operation bindings remain immutable and observe-only.
+- Read-only observer inventory/reattach includes unbound reservations, uncertain
+  launches, failed turns and idle UUIDs. Disconnecting the observer does not own
+  or signal the child, and owner loss never authorizes PID adoption or replay.
+  Real local owner/child/observer and competing SQLite tests exercise these paths.
+  Completed-turn is only a complete CLI terminal state; independent work/history,
+  helper-child, progress, rollout, UUID-negative and final audits remain required.
+- Existing CLI arguments/environment, blank AGENTS, managed policy and all
+  action/fixture/capture/cleanup limits remain. Before fixture startup the controller
+  verifies the adopted private standards cache and public documents; only hashes
+  enter the fixture, never private plaintext. Actual managed instruction delivery,
+  model compliance and authentication remain unverified. The synthetic model and
+  ledger effort are record-only metadata, not an actual API-selection claim.
+- Native33 on 505f591 passed hosted checks and completed host prerequisites in
+  520.262 seconds. The signed-import load then returned status 1 after 4.236
+  seconds with complete verified relay and substantial command/phase budget left.
+  Its payload cause remains unknown; images, assembly and storage were not reached.
+  Exact owned reconciliation and outer cleanup passed. This unit makes no native
+  edits or acceptance claim. The changed session fixture has no stock result; f54's earlier finite pass
+  remains specific to its original bytes. Fresh exact source review and a separate
+  bounded stock validation are required. All job/runtime/renewal/nested/storage,
+  auth/access/release and designated-host deployment gates remain open.
+- Source allocation: 18:40:17–19:05:17 UTC, 25 minutes, without extension.
+  Local affected/full evidence is under
+  `/workspace/artifacts/session-supervisor-20261122/`. API-selected GPT-6.1 Sol/high
+  remains the builder selection; backend attestation is unavailable. The earlier
+  hosted32 checkpoint's HKT hour was corrected from 03:36 to 02:36.
+
+
+### November 23, 2026, 02:36 HKT — hosted32 timeout fixture portability
 
 - Native32 on reviewed 498e96f stopped in hosted tests: 588 tests in 79.813
   seconds, with one timeout-fixture assertion failure. Fedora was skipped; no VM,
