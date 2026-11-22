@@ -708,7 +708,7 @@ class Probe:
             self.report['storage_measurement_failure'] = exc.diagnostics
             raise
 
-    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False, tooling_stages=False):
+    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False, tooling_stages=False, suppress_failure_output=False):
         """Bound logs/time and watch storage while a native child runs."""
         if self.phase_end is not None:
             timeout = min(timeout, self.phase_end - time.monotonic())
@@ -789,7 +789,8 @@ class Probe:
             except (ProcessLookupError, PermissionError):
                 pass
             process.wait(timeout=5)
-            emit_text('', bytes(log), 12000)
+            if not suppress_failure_output:
+                emit_text('', bytes(log), 12000)
             raise
         finally:
             if tooling_stages:
@@ -902,7 +903,8 @@ class Probe:
                             self.image_copy_active=False  # The worker has not been launched.
                             raise
                         self.engine_activity=True  # Even a failed launch may leave owned engine resources.
-                        value=self.bounded(prefix+list(args),seconds,'owned image copy',tooling_stages=operation=='build')
+                        value=self.bounded(prefix+list(args),seconds,'owned image copy',tooling_stages=operation=='build',
+                                           suppress_failure_output=operation=='runtime-info')
                         self.image_copy_active=False
                         return value
                     except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:

@@ -124,3 +124,50 @@ class ToolingDiagnostics(unittest.TestCase):
         self.assertEqual(self.probe.report['phases']['cleanup']['status'],'fail')
         self.assertTrue(self.probe.image_copy_active)
         self.assertTrue((self.root/'image-copy').exists());self.assertTrue((self.root/'verification-work').exists())
+
+    def test_real_runtime_info_failures_suppress_package_body_and_preserve_primary_cleanup(self):
+        canary='PACKAGE_MUST_BE_DISCARDED'
+        for mode in ('exit125','exit17','timeout','capture-overflow'):
+            with tempfile.TemporaryDirectory() as directory:
+                self.root=Path(directory);self.probe=ci.Probe('a'*40,self.root)
+                payload=json.dumps({'name':'crun','package':canary,'path':'/usr/bin/crun','version':'fixture-version'})+'\n'
+                code='import os,sys,time;os.write(1,sys.argv[1].encode());'
+                if mode.startswith('exit'):code+='sys.exit('+mode[4:]+')'
+                elif mode=='timeout':code+='time.sleep(20)'
+                else:code+='time.sleep(.02);os.write(1,b"x"*4096)'
+                seen=[]
+                def child(argv,seconds,name,**kwargs):
+                    self.assertEqual(argv[-2:],['info','--format={{json .Host.OCIRuntime}}'])
+                    self.assertTrue(kwargs['suppress_failure_output']);self.assertFalse(kwargs['tooling_stages'])
+                    self.assertGreater(seconds,0);self.assertLessEqual(seconds,5)
+                    self.assertTrue(self.probe.engine_activity);self.assertTrue(self.probe.image_copy_active)
+                    seen.append((argv,seconds))
+                    return ci.Probe.bounded(self.probe,[sys.executable,'-c',code,payload],seconds,name,
+                                            disk_check=False,suppress_failure_output=kwargs['suppress_failure_output'])
+                capture=io.StringIO();phase=.15 if mode=='timeout' else ci.PUBLIC_SECONDS;cap=256 if mode=='capture-overflow' else ci.LOG_LIMIT
+                started=time.monotonic()
+                with self.fixture(child),patch.object(self.probe,'preflight'),patch.object(self.probe,'inputs'), \
+                     patch.object(ci,'PUBLIC_SECONDS',phase),patch.object(ci,'LOG_LIMIT',cap), \
+                     patch.dict(os.environ,{'GITHUB_STEP_SUMMARY':''}),contextlib.redirect_stdout(capture):
+                    self.assertEqual(self.probe.execute(),2)
+                self.assertEqual(len(seen),1);self.assertLess(time.monotonic()-started,2)
+                self.assertEqual(self.probe.primary_image_failure[0],'runtime-info')
+                self.assertEqual(self.probe.report['oci_runtime'],{'status':'unavailable','reason':'not-collected'})
+                self.assertIn('local image runtime-info:',self.probe.report['blocker'])
+                self.assertGreaterEqual(self.probe.log_used,len(payload.encode()))
+                if mode.startswith('exit'):self.assertIn('exit '+mode[4:],self.probe.report['blocker'])
+                if mode=='capture-overflow':
+                    self.assertIn('diagnostic byte limit',self.probe.report['blocker'])
+                    self.assertLessEqual(self.probe.log_used,cap+1)
+                self.assertEqual(self.probe.report['phases']['cleanup']['status'],'fail')
+                self.assertTrue(self.probe.image_copy_active);self.assertTrue(self.probe.engine_activity)
+                self.assertTrue((self.root/'image-copy').exists());self.assertTrue((self.root/'verification-work').exists())
+                self.assertNotIn(canary,capture.getvalue());self.assertNotIn('fixture-version',capture.getvalue())
+                self.assertNotIn(canary,json.dumps(self.probe.report))
+
+    def test_other_failed_command_keeps_original_bounded_public_log_path(self):
+        capture=io.StringIO()
+        code='import sys;print("OTHER_FIXED_PUBLIC_DIAGNOSTIC",flush=True);sys.exit(125)'
+        with contextlib.redirect_stdout(capture),self.assertRaises(ci.Blocked):
+            self.probe.bounded([sys.executable,'-c',code],2,'unchanged public operation',disk_check=False)
+        self.assertIn('OTHER_FIXED_PUBLIC_DIAGNOSTIC',capture.getvalue())

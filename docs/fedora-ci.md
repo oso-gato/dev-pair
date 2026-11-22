@@ -269,5 +269,8 @@ inside the original phase deadline, uses the existing cleared environment/TMPDIR
 and never executes the reported path. Valid package metadata is discarded;
 null, malformed or oversized completed output is explicitly unavailable. A failed
 launched query retains the existing primary failure and unresolved-worker cleanup
-behavior. These diagnostics do not prove native runtime support, explain the
+behavior; its raw failure capture is suppressed so package/malformed fields cannot
+bypass projection through the ordinary error log. Bytes still count against the
+same aggregate capture ceiling. Other command failure logs remain unchanged.
+These diagnostics do not prove native runtime support, explain the
 prior exit125, or establish failed-helper termination/cleanup.
