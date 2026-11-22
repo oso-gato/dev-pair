@@ -437,3 +437,26 @@ class InventoryExtension(unittest.TestCase):
         seq.request(self.body([context,result]));self.assertTrue(seq.finished);self.assertIsNotNone(seq.goal_context)
         changed=json.loads(json.dumps(context));changed['internal_chat_message_metadata_passthrough']['create_time']+=.01
         with self.assertRaisesRegex(ValueError,'replay changed'):seq.observe_goal_context(changed)
+
+    def test_later_search_availability_failure_preserves_validated_prior_action(self):
+        planned=[a for a in t.actions(123) if a['id']=='patch-deny']+[t.inventory_actions()[-3]]
+        seq=t.Sequence(planned,self.root,time.monotonic()+5);seq.request(self.body())
+        last=self.result('patch-deny','Permission denied (os error 13)','custom_tool_call_output')
+        with self.assertRaisesRegex(ValueError,'no evidenced'):seq.request(self.body([last]))
+        self.assertTrue(seq.records[0]['pass']);self.assertEqual(seq.records[0]['id'],'patch-deny')
+        self.assertFalse(seq.finished);self.assertEqual(seq.index,1)
+
+    def test_initial_developer_registry_witness_is_exact_bounded_and_not_tool_or_user_text(self):
+        block='<tools>\nDeferred tool namespaces:\n- multi_agent_v1: Tools for spawning and managing sub-agents.\n</tools>'
+        message={'type':'message','role':'developer','content':[{'type':'input_text','text':block}]}
+        proof=t.registry_source_witness([message]);self.assertEqual(proof['namespace'],'multi_agent_v1');self.assertEqual(proof['sha256'],t.sha(block.encode()))
+        self.assertIsNone(t.registry_source_witness([dict(message,role='user')]))
+        self.assertIsNone(t.registry_source_witness([{'type':'function_call_output','output':block}]))
+        self.assertIsNone(t.registry_source_witness([{'type':'message','role':'developer','content':[{'type':'input_text','text':t.GOAL_OBJECTIVE}]}]))
+        for text in (block+block,block.replace('multi_agent_v1','forged_namespace'),block.replace('sub-agents.','forged.'),block.replace('\n</tools>','\n'+('x'*4096)+'\n</tools>')):
+            wrong=dict(message,content=[{'type':'input_text','text':text}])
+            with self.assertRaises(ValueError):t.registry_source_witness([wrong])
+        action=t.inventory_actions()[-3];seq=t.Sequence([action],self.root,time.monotonic()+5)
+        body=self.body([message]);body['tools']=[{'type':'tool_search','execution':'client','description':'Source listing omitted by stock world-state mode'}]
+        wire=self.wire_item(seq.request(body));self.assertEqual(wire['call_id'],'search-positive')
+        self.assertEqual(seq.search_source['block'],block)

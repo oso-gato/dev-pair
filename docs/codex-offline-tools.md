@@ -69,6 +69,11 @@ cached-source namespace/function schema; the fixture never invokes the discovere
 hashed. Empty invalid-input results establish bounded no-definition behavior
 only: the same completed/client/empty shape can encode errors or cancellation,
 so it cannot prove a particular handler validator without a separate witness.
+When stock deferred-world-state mode omits the source list from the search
+description, only a unique initial developer `<tools>` namespace block with the
+exact pinned-source namespace/description can supply the evidence. The block is
+bounded to the stock4096-byte fragment cap and retained with its hash. User,
+goal and tool-output lookalikes cannot supply registry evidence.
 
 Each action record retains its emitted call kind and the actual returned output
 kind. The pinned stock source maps `function_call` to `function_call_output` and
@@ -95,6 +100,8 @@ failed context validation keeps actual database/file effects and failure evidenc
 while rolling back provisional passing records and identities. A protocol
 rejection retains bounded complete output items, request hash/size and issued IDs
 for diagnosis under the existing caps.
+Once the entire incoming request validates, its completed results commit before
+planning the next response; a later availability blocker preserves those results.
 
 Actual request tool inventories are hashed and classified from completed checks.
 Unknown/unexercised surfaces block inventory closure and overall status, even when

@@ -305,6 +305,23 @@ def search_definitions(tools):
     return tool_inventory(tools)
 
 
+def registry_source_witness(inputs):
+    blocks=[]
+    for item in inputs:
+        if type(item)is not dict or item.get('type')!='message' or item.get('role')!='developer':continue
+        for part in item.get('content',[]):
+            if type(part)is not dict or part.get('type')!='input_text' or type(part.get('text'))is not str:continue
+            blocks.extend(re.findall(r'<tools>\nDeferred tool namespaces:\n.*?\n</tools>',part['text'],re.S))
+    require(len(blocks)<=1,'ambiguous initial deferred registry source')
+    if not blocks:return None
+    block=blocks[0];require(len(block.encode())<=4096,'initial deferred registry source exceeds stock fragment bound')
+    expected='- multi_agent_v1: Tools for spawning and managing sub-agents.'
+    rows=block.splitlines()
+    require(sum(row.startswith('- multi_agent_v1') for row in rows)==1 and expected in rows,'initial deferred registry namespace mismatch')
+    return {'kind':'initial-stock-developer-world-state','namespace':'multi_agent_v1','description':'Tools for spawning and managing sub-agents.',
+            'block':block,'sha256':sha(block.encode())}
+
+
 def has_image(value):
     if isinstance(value,dict):return value.get('type')=='input_image' or any(has_image(v) for v in value.values())
     if isinstance(value,list):return any(has_image(v) for v in value)
@@ -351,6 +368,7 @@ class Sequence:
         self.wall_started=time.time()
         self.emitted={};self.returned={};self.definitions={};self.discovered=set()
         self.goal_context=None;self.last_outputs=[];self.last_request_identity=None
+        self.search_source=None
         self.thread_id=None;self.pty_id=None;self.pty_retired=False;self.pty_completion_added=False
         self.goal_initial=goal_rows(self.path('/state/sqlite/goals_1.sqlite'));self.goal_identity=None;self.metadata_products=None
         self.protected={p:sha(self.path(p).read_bytes()) for p in ('/credentials/marker','/credentials/valid.png','/state/codex/marker','/state/sqlite/marker','/etc/codex/requirements.toml','/state/codex/config.toml')}
@@ -538,11 +556,13 @@ class Sequence:
         # Oracles may establish provisional identity or insert the one finite
         # completion poll. Commit those admissions only after the whole request,
         # including source-bound supervisor context, validates.
-        fields=('index','finished','action_end','emitted','returned','planned','discovered','goal_identity','goal_context',
+        fields=('index','finished','action_end','emitted','returned','planned','discovered','goal_identity','goal_context','search_source',
                 'metadata_products','pty_id','pty_retired','pty_completion_added')
         before={name:copy.deepcopy(getattr(self,name)) for name in fields};count=len(self.records)
+        self.incoming_admitted=False
         try:return self._request(body)
         except BaseException as error:
+            if self.incoming_admitted:raise  # Later response planning cannot erase a fully validated tool result.
             staged=self.records[count:];del self.records[count:]
             for name,value in before.items():setattr(self,name,value)
             if staged:
@@ -556,6 +576,7 @@ class Sequence:
         require(type(body)is dict and body.get('model')==MODEL and isinstance(body.get('input'),list),'unexpected model/request input')
         serialized=canonical(body);require(len(serialized)<=BODY_BYTES,'request body byte limit exceeded')
         self.last_request_identity={'sha256':sha(serialized),'bytes':len(serialized)}
+        if self.index==0 and not self.inventories:self.search_source=registry_source_witness(body['input'])
         names=tool_inventory(body.get('tools'));definition_hash=sha(canonical(body['tools']))
         self.inventories.append({'sha256':definition_hash,'names':names});self.definitions[definition_hash]=body['tools']
         # Search definitions travel in tool_search_output history. The provider
@@ -590,6 +611,7 @@ class Sequence:
                 raise
         create_output=next((item for item in outputs if item.get('call_id')=='goal-create'),None)
         for item in context:self.observe_goal_context(item,create_output)
+        self.incoming_admitted=True
         rid='offline-response-'+str(self.index)
         events=[{'type':'response.created','response':{'id':rid}}]
         if self.index<len(self.planned):
@@ -601,7 +623,7 @@ class Sequence:
             item={'type':action['kind'],'call_id':action['id']}
             if action['kind']=='tool_search_call':
                 require(any(value.get('type')=='tool_search' and value.get('execution')=='client'
-                            and 'Multi-agent tools' in value.get('description','') for value in body['tools']),
+                            and ('Multi-agent tools' in value.get('description','') or self.search_source is not None) for value in body['tools']),
                         'search-positive blocked: no evidenced searchable source')
                 item.update(execution='client',arguments=action['arguments'])
             else:
@@ -732,6 +754,7 @@ def worker(args):
                           actual_thread_id=sequence.thread_id,pty_session_id=sequence.pty_id,pty_retired=sequence.pty_retired,
                           conditional_completion_poll_used=sequence.pty_completion_added)
             report['supervisor_goal_context']=sequence.goal_context
+            report['search_source_evidence']=sequence.search_source
             if sequence.error is not None:
                 report['protocol_rejection_witness']={'request_identity':sequence.last_request_identity,'outputs':sequence.last_outputs,
                     'outputs_sha256':sha(canonical(sequence.last_outputs)),'issued_call_ids':sorted(sequence.emitted)}
