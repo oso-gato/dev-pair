@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 import ctypes
+import errno
 import fcntl
 import http.client
 import os
@@ -16,6 +17,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 import job_protocol as p
@@ -147,6 +149,29 @@ def sealed_candidate(source, expected):
         os.close(fd)
 
 
+@contextlib.contextmanager
+def process_filter():
+    lib = ctypes.CDLL('libseccomp.so.2')
+    lib.seccomp_init.argtypes = [ctypes.c_uint32]
+    lib.seccomp_init.restype = ctypes.c_void_p
+    lib.seccomp_release.argtypes = [ctypes.c_void_p]
+    lib.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    lib.seccomp_rule_add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint]
+    lib.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    context = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+    p.require(context, 'cannot initialize the single-process sandbox filter')
+    try:
+        with tempfile.TemporaryFile() as rules:
+            for name in (b'clone', b'clone3', b'fork', b'vfork', b'io_uring_setup', b'memfd_create'):
+                syscall = lib.seccomp_syscall_resolve_name(name)
+                p.require(lib.seccomp_rule_add(context, 0x00050000 | errno.EPERM, syscall, 0) == 0,
+                          'cannot restrict process and anonymous file creation')
+            p.require(lib.seccomp_export_bpf(context, rules.fileno()) == 0, 'cannot publish sandbox filter')
+            yield rules
+    finally:
+        lib.seccomp_release(context)
+
+
 def child_limits(parent, seconds):
     # Linux PR_SET_PDEATHSIG: the fixture cannot outlive a killed controller.
     if LIBC.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
@@ -157,17 +182,20 @@ def child_limits(parent, seconds):
     resource.setrlimit(resource.RLIMIT_AS, (128 * 1024 * 1024, 128 * 1024 * 1024))
 
 
-def launch(artifact, workspace, listener, seconds):
+def launch(artifact, database, rules, listener, seconds):
     parent = os.getpid()
     listen_fd = listener.fileno()
+    rules.seek(0)
     command = [str(BWRAP), '--unshare-all', '--unshare-user', '--disable-userns', '--die-with-parent',
                '--new-session', '--cap-drop', 'ALL', '--clearenv', '--setenv', 'LC_ALL', 'C.UTF-8',
                '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64',
-               '--proc', '/proc', '--dev', '/dev', '--bind', str(workspace), '/data', '--remount-ro', '/',
+               '--proc', '/proc', '--dev', '/dev', '--remount-ro', '/dev',
+               '--size', str(MAX_FILE_BYTES), '--tmpfs', '/data', '--bind', str(database), '/data/checklist.sqlite3',
+               '--remount-ro', '/', '--seccomp', str(rules.fileno()),
                '--chdir', '/data', '--', str(APP_PYTHON), '-IB', '/proc/self/fd/' + str(artifact), 'serve',
                '--database', '/data/checklist.sqlite3', '--listen-fd', str(listen_fd)]
     return subprocess.Popen(command,
-                            pass_fds=(artifact, listen_fd), cwd=workspace, stdin=subprocess.DEVNULL,
+                            pass_fds=(artifact, listen_fd, rules.fileno()), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             env={'PATH': '/usr/bin', 'LC_ALL': 'C.UTF-8'},
                             preexec_fn=lambda: child_limits(parent, seconds))
@@ -201,13 +229,13 @@ def await_readiness(child, port, deadline):
 
 
 @contextlib.contextmanager
-def service(artifact, workspace, seconds, deadline, children):
+def service(artifact, database, rules, seconds, deadline, children):
     time_left(deadline)
     with socket.socket(socket.AF_INET) as listener:
         listener.bind(('127.0.0.1', 0))
         listener.listen(4)
         port = listener.getsockname()[1]
-        child = launch(artifact, workspace, listener, seconds)
+        child = launch(artifact, database, rules, listener, seconds)
         children.append(child)
         try:
             await_readiness(child, port, deadline)
@@ -247,10 +275,11 @@ def valid_item(item):
     p.require(type(item['done']) is bool, 'invalid application completion value')
 
 
-def run_attempt(ledger, request, attempt, scratch, artifact):
+def run_attempt(ledger, request, attempt, scratch, artifact, rules):
     deadline = time.monotonic() + request['budgets']['seconds']
     seconds = request['budgets']['seconds']
     workspace = scratch / attempt
+    database = workspace / 'checklist.sqlite3'
     title = RECIPE + '-' + attempt
     children, effects = [], []
     evidence = ['artifact-sha256:' + request['candidate']['artifact_sha256'],
@@ -261,8 +290,9 @@ def run_attempt(ledger, request, attempt, scratch, artifact):
     try:
         workspace.mkdir(mode=0o700)
         created = True
+        os.close(os.open(database, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
         stage = 'start the approved application'
-        with service(artifact, workspace, seconds, deadline, children) as (first, port):
+        with service(artifact, database, rules, seconds, deadline, children) as (first, port):
             evidence.append('first-supervisor-pid:' + str(first.pid))
             stage = 'create and complete the test item'
             item = app_http(port, deadline, 'POST', '/items', 201, {'title': title})
@@ -276,7 +306,7 @@ def run_attempt(ledger, request, attempt, scratch, artifact):
             effects.append('Completed the attempt item')
             evidence.append('completed-item-id:' + str(item['id']))
         stage = 'restart the owned application'
-        with service(artifact, workspace, seconds, deadline, children) as (second, port):
+        with service(artifact, database, rules, seconds, deadline, children) as (second, port):
             evidence.append('second-supervisor-pid:' + str(second.pid))
             effects.append('Replaced the owned process once using the same database')
             stage = 'read the item after restart'
@@ -321,7 +351,7 @@ def run_attempt(ledger, request, attempt, scratch, artifact):
                       checks=[check], diagnostics=diagnostic, evidence=evidence, effects=effects, cleanup=cleanup)
 
 
-def dispatch(ledger, scratch, artifact, size, job_id, candidate, principals, packet):
+def dispatch(ledger, scratch, artifact, size, rules, job_id, candidate, principals, packet):
     p.fields(packet, 'operation request')
     operation, request = packet['operation'], packet['request']
     p.require(operation in OPERATIONS, 'unknown handoff operation')
@@ -337,7 +367,7 @@ def dispatch(ledger, scratch, artifact, size, job_id, candidate, principals, pac
     attempt, previous = ledger.begin(request_id, authenticated_request=request)
     if previous is not None:
         return previous
-    return ledger.finish(run_attempt(ledger, request, attempt, scratch, artifact))
+    return ledger.finish(run_attempt(ledger, request, attempt, scratch, artifact, rules))
 
 
 def serve(args):
@@ -354,7 +384,7 @@ def serve(args):
         p.require(info.st_uid == 0 and not info.st_mode & 0o6022 and os.access(executable, os.X_OK),
                   'expected protected unprivileged sandbox tools')
     context, expected_peer, principals = tls_principal(args.tls, maintenance=True)
-    with sealed_candidate(args.candidate, args.artifact_sha256) as (artifact, size), \
+    with process_filter() as rules, sealed_candidate(args.candidate, args.artifact_sha256) as (artifact, size), \
             contextlib.closing(p.Ledger(args.state)) as ledger, socket.socket(socket.AF_INET) as listener:
         listener.bind(('127.0.0.1', 0))
         listener.listen(4)
@@ -373,7 +403,7 @@ def serve(args):
                         check_peer(stream, expected_peer)
                         packet = receive(stream, time.monotonic() + WIRE_SECONDS)
                         try:
-                            data = dispatch(ledger, scratch, artifact, size, args.job_id, candidate, principals, packet)
+                            data = dispatch(ledger, scratch, artifact, size, rules, args.job_id, candidate, principals, packet)
                             response = {'ok': True, 'data': data}
                         except ValueError as exc:
                             response = {'ok': False, 'data': str(exc)}
