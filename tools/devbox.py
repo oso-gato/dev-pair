@@ -78,7 +78,7 @@ def storage_mount(path, ceiling, mountinfo):
 
 def check_label(path, expected):
     actual = os.getxattr(path, 'security.selinux').decode('ascii').rstrip('\x00')
-    db.require(actual == expected, f'{path.name} SELinux volume label mismatch')
+    db.require(db.same_label(actual, expected), f'{path.name} SELinux volume label mismatch')
 
 
 def placement(account, manifest, actual_manifest):
@@ -89,7 +89,11 @@ def placement(account, manifest, actual_manifest):
     storage = storage_mount(build, manifest['storage_bytes'], mountinfo)
     inputs = build / 'inputs'
     graph = build / 'graph'
-    db.require(private_dir(graph, account).st_dev == build_stat.st_dev, 'nested graph must remain on bounded storage')
+    image_copy = build / 'image-copy'
+    for directory in (graph, image_copy):
+        db.require(private_dir(directory, account).st_dev == build_stat.st_dev,
+                   f'{directory.name} must remain on bounded development storage')
+        check_label(directory, db.file_label(manifest, 'outer'))
     db.require(inputs.resolve(strict=True) == inputs and inputs.stat().st_dev == build_stat.st_dev,
                'candidate inputs must remain on bounded storage')
     archive = inputs / 'development.oci.tar'
@@ -101,8 +105,8 @@ def placement(account, manifest, actual_manifest):
                    'candidate inputs must be unique, read-only regular files on the dedicated filesystem')
         check_label(source, db.file_label(manifest, 'outer'))
     db.require(archive.stat().st_size == manifest['inner']['archive_bytes'], 'development archive byte count mismatch')
-    check_label(graph, db.file_label(manifest, 'outer'))
-    mounts = {db.GRAPHROOT: (str(graph), True), db.ARCHIVE: (str(archive), False),
+    mounts = {db.GRAPHROOT: (str(graph), True), db.IMAGE_COPY_DIR: (str(image_copy), True),
+              db.ARCHIVE: (str(archive), False),
               db.MANIFEST: (str(actual_manifest), False)}
     for key in db.JOB_TARGETS:
         source = ROOT / key / job
@@ -217,8 +221,10 @@ def validate_result(receipt, admission, owner, manifest):
     db.require(type(cycles) is list and len(cycles) == 2 and cycles[0]['started_at'] != cycles[1]['started_at'],
                'two independent nested starts are required')
     for cycle in cycles:
+        label = db.process_label(manifest, 'inner')
         db.require(cycle['version'] == f'codex-cli {db.CODEX_VERSION}' and cycle['probe']['boundary_probe'] == 'passed'
-                   and cycle['proc']['label'] == db.process_label(manifest, 'inner'), 'nested probe evidence mismatch')
+                   and db.same_label(cycle['proc']['label'], label)
+                   and db.same_label(cycle['probe']['selinux_label'], label), 'nested probe evidence mismatch')
 
 
 def launch(engine, manifest, admission, account, owner, hooks, mounts):
