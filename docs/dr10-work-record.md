@@ -2,6 +2,42 @@
 
 ## Latest continuation checkpoint
 
+
+### November 22, 2026, 22:48 HKT — fixed CLI prompt family and bounded context diagnosis
+
+- This isolated session candidate starts from frozen `1df7952`. Its one actual
+  stock validation completed in 2.590 seconds with eight requests: nine baseline
+  checks, both first markers/distinct UUIDs/checkpoint and both first durable
+  audits passed. The first alpha resume was blocked before continuation; beta
+  resume, unknown-UUID negative and final audits were not reached. Cleanup
+  completed. Actual first-session effects were evidenced; no resumed progress
+  or production recovery is claimed.
+- The old prefix and original call/result were exact, with one fresh environment.
+  Its canonical content was unequal: 1,169 versus 1,127 bytes. The current prompt
+  schema was also false; prior schema-gated uniqueness/turn flags were not proof
+  of a collision or turn mismatch. The cached exact CLI source independently
+  proves ordinary prompt IDs use canonical `msg_` UUIDv7, not `msg_input_`.
+  This source correction requires that one family, preserving all input-ID,
+  original-context, causal pair/result and durable audit guards.
+- Environment-body equality stays strict. A first bounded rejection witness now
+  explains fixed component presence/order/byte hashes and independent prompt
+  schema/ID-family masks, with unavailable operands and explicit truncation.
+  Its bounded streaming parser rejects declarations/unknown structures and
+  publishes no raw content, keys, paths, values or timestamps. It is diagnostic
+  only and cannot admit any body delta. Full/diff environment derivation remains
+  unresolved; there is no actual stock result for this candidate.
+- Diagnosis `/workspace/artifacts/resume-20261122/session-1df-context-diagnosis.json`,
+  SHA256 `dca8a4aa139dab1f98ebe553b6c30c4a2bda69c382604a86b1f989f59290b028`,
+  binds the earlier stock receipt/witness/source findings. The existing 32-action
+  inventory, stock/catalog/features, 180-second fixture and all action/request/
+  capture/resource/cleanup limits are unchanged. Native witness `122688f` remains
+  separately frozen for review; this unit does not edit main or launch native CI.
+- Builder API selection remains GPT-6.1 Sol/high; backend attestation is
+  unavailable. Fresh review and one separately authorized stock validation must
+  precede any actual resume claim. Authenticated jobs, renewals, native assembly,
+  hard storage limits, nested runtime, tailnet, enforced release and Hostinger
+  acceptance remain open. No deployment or product-ready claim follows.
+
 ### November 22, 2026, 18:51 HKT — reviewed ledger recovery and sudo oracle integration
 
 - Native [run22](https://github.com/oso-gato/dev-pair/actions/runs/45011104016),

@@ -26,7 +26,7 @@ def terminal(output):return 'Chunk ID: fixture\nWall time: 0 seconds\nProcess ex
 
 def durable_message(text,kind='user.text',ident=IDS['alpha'],turn=IDS['beta'],created=1700000000.25):
     # Pinned producers persist attribution; non-RLite request preparation removes it.
-    return dict(message(text),id=('msg_input_' if kind=='user.text' else 'msg_')+ident,
+    return dict(message(text),id='msg_'+ident,
         **{s.METADATA:{'turn_id':turn,'create_time':created,'content_item_kinds':[kind],
             'content_item_metadata':[{'provenance':{'type':'user'}} if kind=='user.text' else
                                      {'provenance':{'type':'harness','hook':False}}]}})
@@ -606,10 +606,10 @@ class SessionsTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.j.request(body(changed))
             self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
             witness=self.j.resume_context_rejection;comparison=witness['environment_comparison']
-            self.assertTrue(comparison['baseline_audited']);self.assertTrue(comparison['closed_environment_schema'])
-            self.assertFalse(comparison['exact_environment_content_equal'])
+            self.assertTrue(s.comparison_flag(comparison,'baseline_audited'));self.assertTrue(s.comparison_flag(comparison,'closed_environment_schema'))
+            self.assertFalse(s.comparison_flag(comparison,'exact_environment_content_equal'))
             encoded=t.canonical(witness);self.assertLessEqual(len(encoded),2048);self.assertNotIn(b'SECRET',encoded)
-            self.assertEqual(len(comparison['original_content_sha256']),64)
+            self.assertEqual(len(comparison['body'][2]),64)
             self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
 
     def test_environment_closed_shape_id_turn_and_timestamp_negative_matrix(self):
@@ -656,7 +656,7 @@ class SessionsTests(unittest.TestCase):
     def test_environment_needs_unique_original_baseline_and_completed_first_rollout_audit(self):
         path,rows,row,entry,_,_,valid=self.environment_resume(audit=False);self.observed('alpha','resume')
         with self.assertRaises(ValueError):self.j.request(body(valid))
-        self.assertFalse(self.j.resume_context_rejection['environment_comparison']['baseline_audited'])
+        self.assertFalse(s.comparison_flag(self.j.resume_context_rejection['environment_comparison'],'baseline_audited'))
         self.j.audit_first_rollout(row,'alpha');original=copy.deepcopy(entry)
         for contexts in ([entry['user_context'][-1]], [entry['user_context'][0],*entry['user_context']]):
             entry['user_context']=copy.deepcopy(contexts)
@@ -699,8 +699,8 @@ class SessionsTests(unittest.TestCase):
                 self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
                 self.assertEqual(self.j.entries,before);self.assertFalse(self.j.continuations)
                 witness=self.j.resume_context_rejection;comparison=witness['environment_comparison']
-                self.assertTrue(comparison['baseline_audited']);self.assertTrue(comparison['history_id_inventory_supported'])
-                self.assertFalse(comparison[flag]);self.assertLessEqual(len(t.canonical(witness)),2048)
+                self.assertTrue(s.comparison_flag(comparison,'baseline_audited'));self.assertTrue(s.comparison_flag(comparison,'history_id_inventory_supported'))
+                self.assertFalse(s.comparison_flag(comparison,flag));self.assertLessEqual(len(t.canonical(witness)),2048)
                 self.assertNotIn('SECRET',json.dumps(witness));self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
 
     def test_distinct_nonuser_ids_work_but_result_collision_rejects_without_extra_effect(self):
@@ -713,7 +713,7 @@ class SessionsTests(unittest.TestCase):
         output={'type':'function_call_output','call_id':issued['call_id'],'output':terminal(actual)}
         changed=copy.deepcopy(items);changed[4]['id']=changed[-2]['id']
         with self.assertRaises(ValueError):self.j.request(body(changed+[issued,output]))
-        self.assertFalse(self.j.resume_context_rejection['environment_comparison']['new_message_id_unique'])
+        self.assertFalse(s.comparison_flag(self.j.resume_context_rejection['environment_comparison'],'new_message_id_unique'))
         self.assertEqual(self.j.turn['issued'],issued);self.assertEqual(self.j.turn['user_context'],retained)
         self.assertIsNone(self.j.turn['returned']);self.assertEqual(s.marker(self.root,'alpha',('first','resume'),NONCE)['lines'],2)
         self.j.request(body(items+[issued,output]));self.assertTrue(self.j.turn['finished'])
@@ -736,6 +736,121 @@ class SessionsTests(unittest.TestCase):
         report=self.root/'existing-report';report.write_text('canary')
         with patch.object(sys,'argv',['codex_sessions.py','--binary','/unused','--catalog','/unused','--report',str(report)]),self.assertRaises(ValueError):s.main()
         self.assertEqual(report.read_text(),'canary')
+
+    def test_fixed_ordinary_prompt_id_family_and_independent_schema_diagnostics(self):
+        _,_,_,_,_,_,valid=self.environment_resume()
+        self.assertTrue(s.wire_fragment(valid[-1],'user.text','msg_'))
+        variants=[('msg_input_55555555-5555-7555-8555-555555555555','msg-input-uuid'),
+            ('msg_55555555-5555-4555-8555-555555555555','invalid'),
+            ('msg_55555555-5555-7555-0555-555555555555','invalid'),(None,'invalid'),('SECRET_PRIVATE','other')]
+        for value,family in variants:
+            items=copy.deepcopy(valid);items[-1]['id']=value
+            # Null ID inventory is separately unsupported; the independent ID
+            # diagnostic still reports its own operands without raw values.
+            self.j.resume_context_rejection=None;self.observed('alpha','resume')
+            with self.assertRaises(ValueError):self.j.request(body(items))
+            witness=self.j.resume_context_rejection;comparison=witness['environment_comparison']
+            self.assertEqual(comparison['prompt']['id_family'],family)
+            self.assertTrue(comparison['prompt']['failed']&2)
+            self.assertIsNone(s.comparison_flag(comparison,'current_prompt_id_unique'))
+            self.assertTrue(s.comparison_flag(comparison,'new_turn_matches_current_prompt'))
+            self.assertIsNone(self.j.turn['issued']);self.assertNotIn('SECRET',json.dumps(witness))
+        items=copy.deepcopy(valid);items[-1][s.METADATA]['PRIVATE_UNKNOWN']='SECRET_VALUE'
+        self.j.resume_context_rejection=None;self.observed('alpha','resume')
+        with self.assertRaises(ValueError):self.j.request(body(items))
+        comparison=self.j.resume_context_rejection['environment_comparison']
+        self.assertEqual(comparison['prompt']['failed'],8)
+        self.assertTrue(s.comparison_flag(comparison,'current_prompt_id_unique'))
+        self.assertTrue(s.comparison_flag(comparison,'new_turn_matches_current_prompt'))
+        self.assertEqual(comparison['prompt']['unknown'],1)
+        item=copy.deepcopy(valid[-1]);del item['id']
+        self.assertEqual(s.prompt_diagnostic(item,s.prompt('alpha','resume',NONCE))['id_family'],'missing')
+        for key,bad,bit in [('turn_id',None,4),('create_time',False,5),('content_item_kinds',[s.ENVIRONMENT_KIND],6)]:
+            item=copy.deepcopy(valid[-1]);item[s.METADATA][key]=bad
+            diagnostic=s.prompt_diagnostic(item,s.prompt('alpha','resume',NONCE))
+            self.assertEqual(diagnostic['failed'],1<<bit);self.assertTrue(diagnostic['exact_text'])
+
+    def test_environment_component_byte_presence_order_changes_and_fixed_privacy(self):
+        def content(text):return [{'type':'input_text','text':text}]
+        old='<environment_context>\n<cwd>/PRIVATE_PATH</cwd>\n<shell>bash</shell>\n<current_date>2026-11-22</current_date>\n<network enabled="true"><allowed>PRIVATE_DOMAIN</allowed></network>\n<filesystem><workspace_roots><root>/PRIVATE_ROOT</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>\n</environment_context>'
+        self.assertEqual(s.component_comparison(content(old),content(old))['equal'],(1<<len(s.ENV_COMPONENTS))-1)
+        variants=[(old.replace('<cwd>/PRIVATE_PATH</cwd>\n','').replace('<shell>bash</shell>\n',''),('cwd','shell')),
+            (old.replace('PRIVATE_DOMAIN','PRIVATE_DOMAIn'),('network',)),
+            (old.replace('/PRIVATE_ROOT','/PRIVATE_ROOt'),('filesystem',)),
+            (old.replace('2026-11-22','2026-11-23'),('current_date',)),
+            (old.replace('<shell>bash</shell>\n','').replace('<cwd>/PRIVATE_PATH</cwd>\n','<shell>bash</shell>\n<cwd>/PRIVATE_PATH</cwd>\n'),())]
+        for changed,keys in variants:
+            result=s.component_comparison(content(old),content(changed))
+            self.assertEqual(result['status'],['parsed','parsed']);self.assertTrue(result['complete'])
+            for key in keys:self.assertFalse(result['equal']&(1<<s.ENV_COMPONENTS.index(key)))
+            if not keys:self.assertNotEqual(*result['order'])
+            self.assertLessEqual(len(result['changed']),2)
+            self.assertNotIn('PRIVATE',json.dumps(result));self.assertNotIn('2026-11',json.dumps(result))
+        changed=old.replace('PRIVATE_PATH','other').replace('bash','zsh').replace('2026-11-22','x')
+        self.assertTrue(s.component_comparison(content(old),content(changed))['truncated'])
+        # Escaped text is data, never an expanded external entity.
+        self.assertEqual(s.environment_components(content('<environment_context><cwd>&lt;x&gt;</cwd></environment_context>'))['status'],'parsed')
+
+    def test_component_parser_malformed_declarations_duplicates_depth_and_count_are_bounded(self):
+        samples=[('<environment_context><cwd>x</cwd><cwd>y</cwd></environment_context>','duplicate'),
+            ('<environment_context><SECRET_TAG>x</SECRET_TAG></environment_context>','shape'),
+            ('<environment_context xmlns="PRIVATE_NS"><cwd>x</cwd></environment_context>','shape'),
+            ('<environment_context><cwd>x</environment_context>','malformed'),
+            ('<!DOCTYPE environment_context [<!ENTITY a "PRIVATE">]><environment_context>&a;</environment_context>','declaration'),
+            ('<environment_context><!--PRIVATE--></environment_context>','declaration'),
+            ('<?PRIVATE x?><environment_context/>','declaration'),
+            ('<environment_context>'+'<environments>'*1000+'</environments>'*1000+'</environment_context>','bytes'),
+            ('<environment_context>'+'<cwd>x</cwd>'*128+'</environment_context>','bounds'),
+            ('<environment_context><cwd>'+'x'*16384+'</cwd></environment_context>','bytes')]
+        for text,status in samples:
+            result=s.component_comparison([{'type':'input_text','text':'<environment_context/>'}],[{'type':'input_text','text':text}])
+            self.assertEqual(result['status'][1],status);self.assertFalse(result['complete']);self.assertIsNone(result['equal'])
+            self.assertEqual(result['changed'],[]);self.assertNotIn('PRIVATE',json.dumps(result));self.assertNotIn('SECRET',json.dumps(result))
+        # A small but deeply nested unsupported shape terminates at its first
+        # unknown parent/child pair, without recursive traversal or publication.
+        self.assertEqual(s.environment_components([{'type':'input_text','text':'<environment_context>'+'<environments>'*12+'</environments>'*12+'</environment_context>'}])['status'],'shape')
+
+    def test_changed_environment_still_blocks_with_component_witness_and_no_progress(self):
+        path,rows,row,entry,env,current,items=self.environment_resume()
+        old='<environment_context><cwd>/PRIVATE</cwd><shell>bash</shell><network enabled="true"><allowed>PRIVATE_DOMAIN</allowed></network></environment_context>'
+        # Independently retained first rollout and entry must both agree before
+        # making the existing audit binding; the rejected text is never a baseline.
+        entry['user_context'][0]['content'][0]['text']=old
+        rows[1]['payload']['content'][0]['text']=old
+        self.write_rollout(path,rows);self.j.audit_first_rollout(row,'alpha')
+        items[:2]=copy.deepcopy(entry['user_context']);items[-2]['content'][0]['text']=old.replace('<cwd>/PRIVATE</cwd>','')
+        self.observed('alpha','resume');before=copy.deepcopy(self.j.entries)
+        with self.assertRaises(ValueError):self.j.request(body(items))
+        witness=copy.deepcopy(self.j.resume_context_rejection);comparison=witness['environment_comparison']
+        self.assertTrue(s.comparison_flag(comparison,'current_prompt_schema'))
+        self.assertFalse(s.comparison_flag(comparison,'exact_environment_content_equal'))
+        self.assertEqual(comparison['prompt']['failed'],0)
+        self.assertEqual(comparison['components']['status'],['parsed','parsed'])
+        self.assertFalse(comparison['components']['equal']&1)
+        self.assertLessEqual(len(t.canonical(witness)),2048);self.assertNotIn('PRIVATE',json.dumps(witness))
+        self.assertEqual(self.j.entries,before);self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['user_context'])
+        self.assertEqual(s.marker(self.root,'alpha',('first',),NONCE)['lines'],1)
+        with self.assertRaises(ValueError):self.j.request(body(items))
+        self.assertEqual(self.j.resume_context_rejection,witness)
+
+    def test_maximal_component_order_witness_keeps_core_binding_under_existing_cap(self):
+        path,rows,row,entry,env,current,items=self.environment_resume()
+        old='<environment_context>'+'<cwd>PRIVATE</cwd>'*127+'</environment_context>'
+        entry['user_context'][0]['content'][0]['text']=old;rows[1]['payload']['content'][0]['text']=old
+        self.write_rollout(path,rows);self.j.audit_first_rollout(row,'alpha')
+        items[:2]=copy.deepcopy(entry['user_context']);items[-2]['content'][0]['text']=old.replace('PRIVATE','OTHER')
+        self.observed('alpha','resume')
+        with self.assertRaises(ValueError):self.j.request(body(items))
+        witness=self.j.resume_context_rejection;comparison=witness['environment_comparison']
+        self.assertLessEqual(len(t.canonical(witness)),2048)
+        self.assertEqual(witness['request'],self.j.last_request)
+        self.assertEqual(witness['harness_sha256'],self.j.harness_sha256)
+        self.assertEqual(len(witness['retained_sha256']),64)
+        self.assertEqual(comparison['body'][2],t.sha(t.canonical(entry['user_context'][0]['content'])))
+        self.assertFalse(s.comparison_flag(comparison,'exact_environment_content_equal'))
+        if 'components' in comparison:self.assertFalse(comparison['components'].get('complete',False))
+        else:self.assertEqual(comparison['component_status'],'overflow')
+        self.assertIsNone(self.j.turn['issued']);self.assertNotIn('PRIVATE',json.dumps(witness))
 
 
 if __name__=='__main__':unittest.main()

@@ -182,7 +182,7 @@ metadata normalization is used to manufacture equality.
 The new environment requires the observed exact envelope and three-key metadata,
 `environments.environment_context`, a unique canonical `msg_` UUIDv7 ID, valid turn
 UUID and finite positive timestamp. The current physical prompt also needs its
-closed `user.text` metadata and canonical `msg_input_` identity; its new turn must
+closed `user.text` metadata and canonical RFC4122 `msg_` UUIDv7 identity; its new turn must
 match the environment and differ from the original environment turn. Timestamps
 need not equal or order across these separately stamped items. They convey no
 authority. Original prefix and call/result remain exact, with strict original
@@ -210,3 +210,55 @@ establish uniqueness; absent optional IDs convey no identity. The same complete
 check drives the bounded witness flags. This adds no full assistant-transcript
 retention, normalization or broader context acceptance. The original zero-extra,
 audited whole-body, turn, causal-order and final-audit rules remain unchanged.
+
+
+The pinned ordinary CLI producer supplies no admitted user-item UUID and assigns
+its current prompt through the owning session's normal `msg_` UUIDv7 generator.
+`msg_input_` belongs to a distinct admitted-input path and is not a compatibility
+alternative here. This correction changes only the fixed one-environment path's
+prompt ID expectation. The original zero-extra path and all original history,
+call/result, all-input-ID uniqueness, turn, audit and whole-body checks remain.
+
+Actual stock `1df7952` retained exact old prefix/call/result and one new
+source-shaped environment, but its canonical content changed from 1,169 to 1,127
+bytes. The current-prompt schema failed; schema-gated false uniqueness/turn flags
+did not prove collisions or unequal turn IDs. Both first-turn markers/checkpoint
+and first durable audits passed; no continuation was issued or accepted. The
+specific environment delta is unknown. The prompt correction does not admit
+this unequal body, and this new candidate has no actual stock result yet.
+
+The first rejection witness stays within 2 KiB. Its compact
+`environment_comparison.checks` contains `[known_mask, true_mask]` using this
+fixed bit order: original pair exact, causal positions, baseline audited,
+baseline schema, new environment schema, current prompt schema, new ID valid,
+complete input ID inventory, new ID unique, prompt ID unique, new turn valid,
+new turn differs from old, new turn equals prompt turn, exact body equality.
+Unknown operands have no known bit; they are not false comparisons. `body` is
+`[old_canonical_bytes, new_canonical_bytes, old_sha256, new_sha256]`.
+
+`prompt` retains only fixed envelope/metadata type masks, unknown-key count,
+ID-family enum, exact expected-text boolean and failed-schema bits. Failed bits
+are envelope, fixed ID family, content shape, metadata key set, turn UUID,
+timestamp and classification, in that order. These checks are independent;
+unrelated malformed metadata does not fabricate an ID collision or turn mismatch.
+No raw key names, values, IDs, paths, timestamps or prompt text are published.
+
+Component diagnostics use a streaming parser with a 16 KiB input sublimit,
+128-element limit and depth eight. DTD/entity declarations, comments and
+processing instructions are rejected before parsing; no document tree or entity expansion
+is used. Only fixed source-rendered parent/child/attribute names are supported.
+Malformed, duplicate, unknown and oversized shapes get fixed statuses and remain
+independent of acceptance. Presence/equality masks and packed order use the
+fixed component order `cwd,status,error,shell,environments,shell_version,
+current_date,timezone,network,filesystem,subagents`; packed order starts at one
+and appends each one-based component index in four bits. Wrapper equality is
+separate. At most two changed components include
+`[component_index, old_bytes, old_sha256, new_bytes, new_sha256]`, with null for
+absence. These hash exact source byte spans from each opening top-level tag to
+the next tag or closing wrapper, including child order, attributes, text and
+following whitespace; they are not normalized XML equality. Whole canonical
+content hashes remain authoritative for body equality. Unsupported parsing and
+truncated changed-component detail are explicit. Entry summaries yield before
+core bindings; an overflowing component projection becomes unavailable. The
+same original rejection is retained, without action/state advancement. No
+component, omission, XML normalization or date/path stripping affects acceptance.

@@ -216,6 +216,131 @@ def input_id_unique(inputs,index,candidate,retained_ids):
     return True,value not in retained_ids and all(item.get('id')!=value for position,item in enumerate(inputs) if position!=index)
 
 
+def prompt_id_family(item):
+    if type(item) is not dict or 'id' not in item:return 'missing'
+    value=item.get('id') if type(item) is dict else None
+    if type(value) is not str:return 'invalid'
+    if value.startswith('msg_input_'):
+        return 'msg-input-uuid' if valid_uuid(value[10:]) else 'invalid'
+    if value.startswith('msg_'):
+        suffix=value[4:]
+        return 'msg-v7' if valid_uuid(suffix) and uuid.UUID(suffix).version==7 and uuid.UUID(suffix).variant==uuid.RFC_4122 else 'invalid'
+    return 'other'
+
+
+def prompt_diagnostic(item,expected):
+    # Independent bits: envelope, identity, content, metadata, turn, time, kind.
+    item=item if type(item) is dict else {};metadata=item.get(METADATA)
+    content=item.get('content');text=(type(content) is list and len(content)==1 and type(content[0]) is dict and
+        set(content[0])=={'type','text'} and content[0].get('type')=='input_text' and type(content[0].get('text')) is str)
+    checks=(set(item)=={'type','role','id','content',METADATA} and item.get('type')=='message' and item.get('role')=='user',
+        prompt_id_family(item)=='msg-v7',text,type(metadata) is dict and set(metadata)=={'turn_id','create_time','content_item_kinds'},
+        type(metadata) is dict and valid_uuid(metadata.get('turn_id')),
+        type(metadata) is dict and valid_timestamp(metadata.get('create_time')),
+        type(metadata) is dict and metadata.get('content_item_kinds')==['user.text'])
+    return {'envelope':shape_mask(item,RESUME_ENVELOPE),'metadata':shape_mask(metadata,RESUME_METADATA) if type(metadata) is dict else 0,
+        'unknown':sum(k not in RESUME_ENVELOPE for k in item)+(sum(k not in RESUME_METADATA for k in metadata) if type(metadata) is dict else 0),
+        'id_family':prompt_id_family(item),'failed':sum((not check)<<bit for bit,check in enumerate(checks)),
+        'exact_text':content==[{'type':'input_text','text':expected}]}
+
+
+ENV_COMPONENTS=('cwd','status','error','shell','environments','shell_version','current_date','timezone','network','filesystem','subagents')
+ENV_CHILDREN={'environment_context':ENV_COMPONENTS,'environments':('environment',),'environment':('cwd','status','error','shell'),
+    'network':('allowed','denied'),'filesystem':('workspace_roots','permission_profile'),'workspace_roots':('root',),
+    'permission_profile':('file_system',),'file_system':('entry',),'entry':('path','glob','special')}
+ENV_ATTRIBUTES=('id','primary','status','type','glob_scan_max_depth','access','escalatable','enabled')
+
+
+def environment_components(content):
+    """Diagnostic-only bounded streaming parse; exact component bytes, never an acceptance oracle."""
+    from xml.parsers import expat
+    result={'status':'shape','presence':0,'order':1,'duplicates':0,'unknown':0,'parts':{},'prefix':None,'suffix':None}
+    if not (type(content) is list and len(content)==1 and type(content[0]) is dict and
+            set(content[0])=={'type','text'} and content[0].get('type')=='input_text' and type(content[0].get('text')) is str):return result
+    if len(content[0]['text'])>16384:result['status']='bytes';return result
+    try:raw=content[0]['text'].encode()
+    except UnicodeError:result['status']='encoding';return result
+    if len(raw)>16384:result['status']='bytes';return result
+    if b'<!' in raw or b'<?' in raw:result['status']='declaration';return result
+    parser=expat.ParserCreate();parser.ordered_attributes=True
+    stack=[];nodes=0;pending=None;start=None;first=None
+    def fail(status):result['status']=status;raise ValueError('unsupported diagnostic structure')
+    def finish(end):
+        nonlocal pending,start
+        if pending is not None:
+            block=raw[start:end];result['parts'].setdefault(pending,[]).append((len(block),sha(block)))
+            pending=None;start=None
+    def opened(name,attributes):
+        nonlocal nodes,pending,start,first
+        nodes+=1
+        if nodes>128 or len(stack)>=8:fail('bounds')
+        if len(attributes)>16:fail('bounds')
+        unknown_attributes=sum(key not in ENV_ATTRIBUTES for key in attributes[::2])
+        if unknown_attributes:result['unknown']+=unknown_attributes;fail('shape')
+        if not stack:
+            if name!='environment_context' or attributes:fail('shape')
+        elif name not in ENV_CHILDREN.get(stack[-1],()):
+            result['unknown']+=1;fail('shape')
+        if len(stack)==1:
+            finish(parser.CurrentByteIndex)
+            if first is None:first=parser.CurrentByteIndex;result['prefix']=sha(raw[:first])
+            index=ENV_COMPONENTS.index(name);bit=1<<index
+            if result['presence']&bit:result['duplicates']+=1
+            result['presence']|=bit;result['order']=(result['order']<<4)|(index+1)
+            pending=name;start=parser.CurrentByteIndex
+        stack.append(name)
+    def closed(name):
+        if len(stack)==1:
+            finish(parser.CurrentByteIndex)
+            if first is None:result['prefix']=sha(raw[:parser.CurrentByteIndex])
+            result['suffix']=sha(raw[parser.CurrentByteIndex:])
+        stack.pop()
+    parser.StartElementHandler=opened;parser.EndElementHandler=closed
+    parser.ExternalEntityRefHandler=lambda *args:0
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+    try:
+        for index in range(0,len(raw),512):parser.Parse(raw[index:index+512],False)
+        parser.Parse(b'',True)
+        result['status']='duplicate' if result['duplicates'] else 'parsed'
+    except expat.ExpatError:result['status']='malformed'
+    except ValueError:pass
+    return result
+
+
+def component_comparison(old,new):
+    original=environment_components(old);current=environment_components(new)
+    supported=original['status']==current['status']=='parsed'
+    changed=[];equal=0
+    if supported:
+        for index,key in enumerate(ENV_COMPONENTS):
+            before=original['parts'].get(key,[]);after=current['parts'].get(key,[])
+            if before==after:equal|=1<<index
+            else:changed.append([index,*(before[0] if before else (None,None)),*(after[0] if after else (None,None))])
+    return {'status':[original['status'],current['status']],'presence':[original['presence'],current['presence']],
+        'order':[original['order'],current['order']],'duplicates':[original['duplicates'],current['duplicates']],
+        'unknown':[original['unknown'],current['unknown']],'equal':equal if supported else None,
+        'wrapper_equal':(original['prefix'],original['suffix'])==(current['prefix'],current['suffix']) if supported else None,'changed':changed[:2],
+        'truncated':len(changed)>2,'complete':supported}
+
+
+ENV_CHECKS=('original_pair_exact','causal_positions_valid','baseline_audited','baseline_schema','closed_environment_schema',
+    'current_prompt_schema','new_message_id_valid','history_id_inventory_supported','new_message_id_unique',
+    'current_prompt_id_unique','new_turn_valid','new_turn_differs_from_old','new_turn_matches_current_prompt','exact_environment_content_equal')
+
+
+def compact_comparison(value):
+    return {'checks':[sum((value[k] is not None)<<bit for bit,k in enumerate(ENV_CHECKS)),
+                      sum((value[k] is True)<<bit for bit,k in enumerate(ENV_CHECKS))],
+        'baseline_count':value['baseline_environment_count'],
+        'body':[value['original_content_bytes'],value['new_content_bytes'],value['original_content_sha256'],value['new_content_sha256']],
+        'prompt':value['prompt'],'components':value['components']}
+
+
+def comparison_flag(value,key):
+    index=ENV_CHECKS.index(key)
+    return bool(value['checks'][1]&(1<<index)) if value['checks'][0]&(1<<index) else None
+
+
 def environment_comparison(journey,contexts,observed,inputs):
     entry=journey.entries[journey.turn['label']];retained=entry['user_context']
     originals=[item for item in retained if type(item.get(METADATA)) is dict and
@@ -223,7 +348,7 @@ def environment_comparison(journey,contexts,observed,inputs):
     baseline=originals[0] if len(originals)==1 else None
     new=contexts[-2] if len(contexts)==len(retained)+2 else None;current=contexts[-1]
     baseline_valid=wire_fragment(baseline,ENVIRONMENT_KIND,'msg_')
-    new_valid=wire_fragment(new,ENVIRONMENT_KIND,'msg_');prompt_valid=wire_fragment(current,'user.text','msg_input_')
+    new_valid=wire_fragment(new,ENVIRONMENT_KIND,'msg_');prompt_valid=wire_fragment(current,'user.text','msg_')
     original_ids={item['id'] for item in [*retained,entry['call'],entry['output']] if type(item.get('id')) is str}
     new_id_valid=type(new) is dict and type(new.get('id')) is str and new['id'].startswith('msg_') and valid_uuid(new['id'][4:])
     new_id_valid=bool(new_id_valid and uuid.UUID(new['id'][4:]).version==7 and uuid.UUID(new['id'][4:]).variant==uuid.RFC_4122)
@@ -232,7 +357,8 @@ def environment_comparison(journey,contexts,observed,inputs):
     environment_ids_supported,environment_unique=input_id_unique(inputs,observed[-2][0],new,original_ids)
     prompt_ids_supported,prompt_unique=input_id_unique(inputs,observed[-1][0],current,original_ids)
     old_turn=baseline[METADATA]['turn_id'] if baseline_valid else None
-    current_turn=current[METADATA]['turn_id'] if prompt_valid else None
+    current_metadata=current.get(METADATA) if type(current) is dict else None
+    current_turn=current_metadata.get('turn_id') if type(current_metadata) is dict else None
     audited=journey.first_rollout_audits.get(journey.turn['label'])==sha(canonical(entry))
     def content(item):return item.get('content') if type(item) is dict else None
     calls=[i for i,item in enumerate(inputs) if type(item) is dict and item.get('type')=='function_call' and item.get('call_id')==entry['issued']['call_id']]
@@ -244,10 +370,10 @@ def environment_comparison(journey,contexts,observed,inputs):
     comparison={'stage':'environment-binding' if positions else 'environment-position','original_pair_exact':pair_exact,'causal_positions_valid':positions,'baseline_environment_count':len(originals),'baseline_audited':audited,
         'baseline_schema':baseline_valid,'closed_environment_schema':new_valid,'current_prompt_schema':prompt_valid,
         'new_message_id_valid':new_id_valid,'history_id_inventory_supported':environment_ids_supported and prompt_ids_supported,
-        'new_message_id_unique':bool(new_id_valid and environment_unique),
-        'current_prompt_id_unique':bool(prompt_valid and prompt_unique),
-        'new_turn_valid':valid_uuid(new_turn),'new_turn_differs_from_old':bool(new_valid and baseline_valid and new_turn!=old_turn),
-        'new_turn_matches_current_prompt':bool(new_valid and prompt_valid and new_turn==current_turn),
+        'new_message_id_unique':environment_unique if new_id_valid and environment_ids_supported else None,
+        'current_prompt_id_unique':prompt_unique if prompt_id_family(current)=='msg-v7' and prompt_ids_supported else None,
+        'new_turn_valid':valid_uuid(new_turn),'new_turn_differs_from_old':new_turn!=old_turn if valid_uuid(new_turn) and valid_uuid(old_turn) else None,
+        'new_turn_matches_current_prompt':new_turn==current_turn if valid_uuid(new_turn) and valid_uuid(current_turn) else None,
         'exact_environment_content_equal':canonical(content(new))==canonical(content(baseline)) if baseline_valid and new_valid else None,
         'original_content_bytes':len(canonical(content(baseline))) if baseline_valid else None,
         'new_content_bytes':len(canonical(content(new))) if new_valid else None,
@@ -256,6 +382,8 @@ def environment_comparison(journey,contexts,observed,inputs):
     valid=(baseline_valid and new_valid and prompt_valid and audited and positions and comparison['new_message_id_unique'] and
            comparison['current_prompt_id_unique'] and comparison['new_turn_differs_from_old'] and
            comparison['new_turn_matches_current_prompt'] and comparison['exact_environment_content_equal'])
+    comparison['prompt']=prompt_diagnostic(current,prompt(journey.turn['label'],'resume',journey.nonce))
+    comparison['components']=component_comparison(content(baseline),content(new))
     return bool(valid),comparison
 
 
@@ -300,6 +428,7 @@ def resume_rejection_witness(journey,observed,inputs,current):
         'retained_sha256':sha(canonical(retained)),'observed_sha256':sha(canonical(contexts)),
         'observed_prefix_sha256':sha(canonical(prefix)),'original_pair_exact':pair,
         'request':journey.last_request,'harness_sha256':journey.harness_sha256,'codex_source_sha':STOCK_SOURCE,
+        'prompt':prompt_diagnostic(contexts[-1] if contexts else None,current),
         'summaries':[],'truncated_summary':False}
     for index in candidates[:4]:
         request_index,item=observed[index];metadata=item.get(METADATA,{})
@@ -441,10 +570,20 @@ class Journey:
                 if self.resume_context_rejection is None:
                     witness=resume_rejection_witness(self,observed,inputs,current)
                     if comparison is not None:
-                        witness['environment_comparison']=comparison
+                        witness.pop('prompt')  # Same diagnostic is bound inside the compact environment comparison.
+                        witness['environment_comparison']=compact_comparison(comparison)
+                        # Prefer source/body/prompt bindings over redundant entry summaries.
                         while len(canonical(witness))>2048 and witness['summaries']:
                             witness['summaries'].pop();witness['truncated_summary']=True
-                        require(len(canonical(witness))<=2048,'environment witness exceeded fixed bound')
+                        changed=witness['environment_comparison']['components']['changed']
+                        while len(canonical(witness))>2048 and changed:
+                            changed.pop();witness['environment_comparison']['components']['truncated']=True
+                        if len(canonical(witness))>2048:
+                            witness['environment_comparison']['components']={'status':['unavailable','unavailable'],'changed':[], 'truncated':True}
+                        if len(canonical(witness))>2048:
+                            # Core hashes/counts and prompt checks always fit; never replace rejection with a witness exception.
+                            witness['environment_comparison'].pop('components')
+                            witness['environment_comparison']['component_status']='overflow'
                     self.resume_context_rejection=witness
             require(no_extra or environment_valid,'prior ordered user context changed/injected/removed')
             resume_mode='one-environment' if environment_valid else 'no-environment'
