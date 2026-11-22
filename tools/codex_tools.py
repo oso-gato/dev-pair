@@ -12,11 +12,13 @@ import json
 import os
 from pathlib import Path
 import resource
+import re
 import selectors
 import shutil
 import shlex
 import signal
 import socket
+import sqlite3
 import stat
 import struct
 import subprocess
@@ -35,6 +37,11 @@ REQUESTS = 64
 MODEL = 'gpt-5.5'
 SYNTHETIC_KEY = 'dev-pair-offline-synthetic-not-a-credential'
 FEATURES = ('plugins','remote_plugin','hooks','shell_snapshot','shell_snapshot_v2','apps','skill_mcp_dependency_install')
+PTY_TOKEN = 'offline-pty-token\n'
+PTY_READY = 'OFFLINE_PTY_READY_169'
+GOAL_OBJECTIVE = 'offline inventory goal; literal /credentials/marker'
+GOAL_COLUMNS = ('thread_id','goal_id','objective','status','token_budget','tokens_used',
+                'time_used_seconds','created_at_ms','updated_at_ms')
 
 
 def require(value, reason):
@@ -211,6 +218,81 @@ def actions(port):
             {'id':'image-deny','kind':'function_call','name':'view_image','arguments':{'path':'/credentials/valid.png'}},
             {'id':'image-alias-deny','kind':'function_call','name':'view_image','arguments':{'path':'/job/src/image-alias'}},
             shell('login-deny',command("from pathlib import Path;Path('/job/src/login-ran').write_text('bad')"),login=True)]
+
+
+def inventory_actions():
+    """Fixed local-only extension; no discovered effectful tool is invoked."""
+    code = """import os,sys,signal,json,pathlib
+signal.alarm(18)
+print('OFFLINE_PTY_READY_169',flush=True)
+token=sys.stdin.readline()
+assert token=='offline-pty-token\\n'
+with open('/job/src/pty-consumed','x') as out:out.write(token)
+denied={}
+for name,mode in [('/credentials/marker','rb'),('/etc/codex/requirements.toml','wb')]:
+ try:
+  with open(name,mode) as out:out.read() if mode=='rb' else out.write(b'forbidden')
+  denied[name]=0
+ except OSError as error:denied[name]=error.errno
+status=dict(v.split(':',1) for v in pathlib.Path('/proc/self/status').read_text().splitlines() if ':' in v)
+print(json.dumps({'consumed':True,'denied':denied,'uid':os.getuid(),'cap_eff':status['CapEff'].strip(),'nnp':status['NoNewPrivs'].strip(),'netns':os.readlink('/proc/self/ns/net')}),flush=True)
+"""
+    def call(ident,name,arguments):return {'id':ident,'kind':'function_call','name':name,'arguments':arguments}
+    def stdin(ident,chars):return call(ident,'write_stdin',{'session_id':None,'chars':chars,'yield_time_ms':1000,'max_output_tokens':1500})
+    search=lambda ident,arguments:{'id':ident,'kind':'tool_search_call','name':'tool_search','arguments':arguments}
+    return [call('pty-start','exec_command',{'cmd':'/usr/bin/python3 -u -c '+shlex.quote(code),'tty':True,'login':False,'workdir':'/job/src','yield_time_ms':250,'max_output_tokens':1500}),
+            stdin('pty-poll',''),stdin('pty-input',PTY_TOKEN),stdin('pty-stale','must-not-run\n'),
+            call('pty-invalid','write_stdin',{'session_id':-1,'chars':'must-not-run\n','yield_time_ms':1000,'max_output_tokens':1500}),
+            call('input-reject','request_user_input',{'questions':[{'id':'offline_choice','header':'Fixture','question':'Synthetic fixture choice?','options':[{'label':'One','description':'Synthetic one'},{'label':'Two','description':'Synthetic two'}]}]}),
+            call('goal-empty','get_goal',{}),call('goal-missing','update_goal',{'status':'complete'}),
+            call('goal-whitespace','create_goal',{'objective':'   '}),call('goal-budget','create_goal',{'objective':'offline rejected budget','token_budget':0}),
+            call('goal-create','create_goal',{'objective':GOAL_OBJECTIVE}),call('goal-duplicate','create_goal',{'objective':'must not replace original'}),
+            call('goal-active','update_goal',{'status':'active'}),call('goal-complete','update_goal',{'status':'complete'}),call('goal-get','get_goal',{}),
+            search('search-positive',{'query':'spawn_agent delegate agent','limit':1}),search('search-whitespace',{'query':' ','limit':1}),search('search-zero',{'query':'spawn_agent','limit':0})]
+
+
+def terminal_header(text):
+    header, separator, output = text.partition('\nOutput:')
+    require(separator and len(header.encode())<=2048,'terminal result header missing or excessive')
+    running=re.findall(r'^Process running with session ID ([0-9]+)$',header,re.M)
+    exited=re.findall(r'^Process exited with code (-?[0-9]+)$',header,re.M)
+    require(len(running)+len(exited)==1,'ambiguous terminal process status')
+    return (int(running[0]) if running else None,int(exited[0]) if exited else None,output)
+
+
+def goal_rows(path,integrity=False):
+    if not path.exists():
+        require(not integrity,'goal database missing after lifecycle');return []
+    require(path.is_file() and not path.is_symlink() and path.stat().st_size<=16*1024**2,'invalid goal database')
+    with sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=.1) as db:
+        db.execute('PRAGMA query_only=ON')
+        if integrity:require(db.execute('PRAGMA integrity_check').fetchall()==[('ok',)],'goal database integrity failed')
+        exists=db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?",('thread_goals',)).fetchall()
+        if not exists:return []
+        result=[dict(zip(GOAL_COLUMNS,row)) for row in db.execute('SELECT '+','.join(GOAL_COLUMNS)+' FROM thread_goals ORDER BY thread_id LIMIT 129')]
+        require(len(result)<=128 and len(canonical(result))<=BODY_BYTES,'goal oracle inventory exceeded')
+        return result
+
+
+def search_definitions(tools):
+    # Exact cached-source namespace and normalized v1 spawn schema. Preserve the
+    # complete returned definition; descriptions are data, never executable.
+    require(type(tools)is list and len(tools)==1,'search-positive blocked: expected one evidenced deferred namespace')
+    namespace=tools[0]
+    require(type(namespace)is dict and namespace.get('type')=='namespace' and namespace.get('name')=='multi_agent_v1'
+            and namespace.get('description')=='Tools for spawning and managing sub-agents.','unknown deferred namespace')
+    children=namespace.get('tools');require(type(children)is list and len(children)==1,'unexpected deferred method inventory')
+    child=children[0];require(type(child)is dict and child.get('type')=='function' and child.get('name')=='spawn_agent'
+                            and child.get('strict') is False and child.get('defer_loading') is True
+                            and 'output_schema' not in child and type(child.get('description'))is str,'unknown normalized spawn definition')
+    schema=child.get('parameters');require(type(schema)is dict and schema.get('type')=='object' and schema.get('additionalProperties') is False
+                                          and not schema.get('required'),'unknown spawn argument schema')
+    props=schema.get('properties');require(type(props)is dict and set(props) in ({'message','items','fork_context','model','reasoning_effort'},
+                                                                               {'message','items','agent_type','fork_context','model','reasoning_effort'}),'unknown spawn properties')
+    for name,value in props.items():
+        require(type(value)is dict and value.get('type')==('array' if name=='items' else 'boolean' if name=='fork_context' else 'string'),'unknown spawn property type')
+    require(type(props['items'].get('items'))is dict,'unknown spawn input-item schema')
+    return tool_inventory(tools)
 
 
 def has_image(value):
