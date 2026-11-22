@@ -386,21 +386,80 @@ def measure_storage(root, live=False, sudo=True, attempts=3):
     return {'bytes': maximum, 'provisional': True, **context}
 
 
-def tooling_recipe():
+TOOL_STAGES = ('run-shell-entered','timeout-launch','payload-entered','upgrade','install','rpm-hash',
+               'cache-clean','payload-complete','timeout-exit')
+
+
+def _stage(stage):
+    require(stage in TOOL_STAGES, 'unknown tooling diagnostic stage')
+    return "printf 'DP_TOOL_STAGE "+stage+"\\n' || :; "
+
+
+def tooling_payload():
     # Freshness is a signed-repository candidate operation, not runtime mutation.
-    operation = ('set -eu; dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 '
+    return ('set -eu; '+_stage('payload-entered')+_stage('upgrade')+
+                 'dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 '
                  '--setopt=keepcache=True --disablerepo="*" --enablerepo=fedora --enablerepo=updates upgrade; '
+                 +_stage('install')+
                  'dnf -y --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --setopt=keepcache=True '
                  '--setopt=install_weak_deps=False --disablerepo="*" --enablerepo=fedora --enablerepo=updates '
                  'install qemu-system-x86-core qemu-img genisoimage python3 seabios-bin; '
+                 +_stage('rpm-hash')+
                  'find /var/cache -type f -name "*.rpm" -exec sha256sum {} + > /tool-rpm-sha256.txt; '
-                 'test -s /tool-rpm-sha256.txt; dnf clean all')
+                 'test -s /tool-rpm-sha256.txt; '+_stage('cache-clean')+'dnf clean all; '+_stage('payload-complete'))
+
+
+def tooling_shell():
     import shlex
-    return (f'FROM {BASE}\nRUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec '
-            + shlex.quote(operation) + '\n'
+    return (_stage('run-shell-entered')+_stage('timeout-launch')+
+            'if /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec '+shlex.quote(tooling_payload())+
+            '; then dp_tool_rc=0; else dp_tool_rc=$?; fi; '
+            'printf \'DP_TOOL_STAGE timeout-exit %s\\n\' "$dp_tool_rc" || :; exit "$dp_tool_rc"')
+
+
+def tooling_recipe():
+    return (f'FROM {BASE}\nRUN '+tooling_shell()+'\n'
             + 'RUN /usr/bin/rpm -qa --qf \'%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}\\n\' | /usr/bin/sort > /tool-rpms.txt\n'
             + 'COPY qemu_entry.py /usr/local/bin/dp-qemu-entry.py\n'
             + 'ENTRYPOINT ["/usr/bin/python3", "/usr/local/bin/dp-qemu-entry.py"]\n')
+
+
+def tooling_stage_evidence(data, truncated=False):
+    observed=[];exit_status=None;last=-1;invalid=False;order_invalid=False;partial=False
+    for line in data.splitlines(keepends=True):
+        if not line.startswith(b'DP_TOOL_STAGE '):continue
+        if not line.endswith(b'\n'):
+            partial=True;continue
+        match=re.fullmatch(rb'DP_TOOL_STAGE ([a-z-]+)(?: ([0-9]{1,3}))?\n',line)
+        if match is None:
+            invalid=True;continue
+        stage=match[1].decode('ascii');number=match[2]
+        if stage not in TOOL_STAGES or (stage=='timeout-exit')!=(number is not None) or number is not None and int(number)>255:
+            invalid=True;continue
+        index=TOOL_STAGES.index(stage)
+        if index<=last:order_invalid=True;continue
+        last=index;observed.append(stage)
+        if number is not None:exit_status=int(number)
+    return {'availability':'unavailable' if truncated or invalid or order_invalid or not observed else 'observed',
+            'observed':observed,'timeout_exit_status':exit_status,'marker_invalid':invalid,'order_invalid':order_invalid,
+            'capture_truncated':bool(truncated),'partial_marker_discarded':partial,
+            'all_stages_observed':observed==list(TOOL_STAGES) and not (truncated or invalid or order_invalid or partial)}
+
+
+def runtime_projection(data):
+    unavailable=lambda reason:{'status':'unavailable','reason':reason}
+    if type(data)is not bytes or len(data)>4096:return unavailable('projection-byte-bound')
+    try:value=json.loads(data,object_pairs_hook=unique_object)
+    except (ValueError,TypeError):return unavailable('invalid-json')
+    if value is None:return unavailable('runtime-not-reported')
+    if type(value)is not dict or set(value)!={'name','package','path','version'}:return unavailable('invalid-object-shape')
+    if type(value['package'])is not str:return unavailable('invalid-package-type')
+    for key,limit in (('name',128),('path',1024),('version',2048)):
+        if type(value[key])is not str or not 0<len(value[key].encode())<=limit:return unavailable('invalid-runtime-field')
+    if not value['path'].startswith('/') or '\0' in value['path']:return unavailable('invalid-runtime-path')
+    result={'status':'observed',**{key:value[key] for key in ('name','path','version')}}
+    if len(json.dumps(result).encode())>4096:return unavailable('retained-object-byte-bound')
+    return result
 
 
 def verification_evidence(directory, source):
@@ -643,7 +702,7 @@ class Probe:
             self.report['storage_measurement_failure'] = exc.diagnostics
             raise
 
-    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False):
+    def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False, tooling_stages=False):
         """Bound logs/time and watch storage while a native child runs."""
         if self.phase_end is not None:
             timeout = min(timeout, self.phase_end - time.monotonic())
@@ -727,6 +786,8 @@ class Probe:
             emit_text('', bytes(log), 12000)
             raise
         finally:
+            if tooling_stages:
+                self.report['tooling_stages']=tooling_stage_evidence(bytes(log),self.log_used>LOG_LIMIT)
             selector.close()
             process.stdout.close()
             if report_pipe is not None:
@@ -815,7 +876,7 @@ class Probe:
         with fedora_oci.image_workspaces(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as (copy_tmp, verification_root):
             with fedora_oci.verified(signed, temporary_parent=verification_root, leased=True) as (plain, proof):
                 def local_image(*args, **kwargs):
-                    operation = 'inspect' if args[:2]==('image','inspect') else args[0] if args and args[0] in ('load','save','build') else None
+                    operation = 'runtime-info' if args==('info','--format={{json .Host.OCIRuntime}}') else 'inspect' if args[:2]==('image','inspect') else args[0] if args and args[0] in ('load','save','build') else None
                     require(operation is not None, 'unsupported local image operation')
                     try:
                         prefix = list(self.podman)
@@ -835,7 +896,7 @@ class Probe:
                             self.image_copy_active=False  # The worker has not been launched.
                             raise
                         self.engine_activity=True  # Even a failed launch may leave owned engine resources.
-                        value=self.bounded(prefix+list(args),seconds,'owned image copy')
+                        value=self.bounded(prefix+list(args),seconds,'owned image copy',tooling_stages=operation=='build')
                         self.image_copy_active=False
                         return value
                     except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
@@ -847,6 +908,9 @@ class Probe:
                         raise
                 base_proof = fedora_oci.import_image(local_image, plain)
             self.report['signed_container_base'] = base_proof
+            self.report['oci_runtime']={'status':'unavailable','reason':'not-collected'}
+            self.report['oci_runtime']=runtime_projection(local_image('info','--format={{json .Host.OCIRuntime}}',timeout=5))
+            self.report['tooling_stages']={'availability':'unavailable','reason':'build-not-started'}
             build = self.root / 'tool-build'
             build.mkdir()
             (build / 'Containerfile').write_text(tooling_recipe())

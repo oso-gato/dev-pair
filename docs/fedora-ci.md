@@ -253,3 +253,21 @@ Report version5 additionally binds the public Fedora verifier dependency hash;
 public-input manifest version2 carries exact signed Fedora source provenance.
 Older report/input contracts are rejected. No console fallback or guest phase
 acceptance is added. Native import/refresh under existing budgets remains unproved.
+
+The single tooling package RUN now emits a finite `DP_TOOL_STAGE` trace: outer
+shell entry, timeout launch, inner entry, upgrade, install, RPM hashing, cache
+cleanup, payload completion and the timeout's numeric exit status. Marker writes
+cannot replace the payload/timeout status. The controller projects only complete
+exact whole lines in order from its existing bounded capture; quoted Containerfile
+RUN text, missing stages, partial lines and truncated capture do not establish
+execution success or identify a cause. The540-second/10-second timeout settings,
+package signature checks, environment, network and resource profile are unchanged.
+
+A fixed owned-engine `info --format={{json .Host.OCIRuntime}}` query records only
+validated bounded runtime name/path/version metadata. It has at most five seconds
+inside the original phase deadline, uses the existing cleared environment/TMPDIR
+and never executes the reported path. Valid package metadata is discarded;
+null, malformed or oversized completed output is explicitly unavailable. A failed
+launched query retains the existing primary failure and unresolved-worker cleanup
+behavior. These diagnostics do not prove native runtime support, explain the
+prior exit125, or establish failed-helper termination/cleanup.
