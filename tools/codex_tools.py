@@ -363,14 +363,18 @@ class Sequence:
             require(self.thread_id in (None,thread),'CLI changed thread identity');self.thread_id=thread
 
     def products(self):
-        result={}
-        for parent,dirs,files in os.walk(self.path('/job/src'),followlinks=False):
-            for name in sorted(dirs+files):
-                require(len(result)<128 and time.monotonic()<self.action_end,'product oracle bound exceeded')
-                path=Path(parent)/name;info=path.lstat();key=str(path.relative_to(self.path('/job/src')))
-                if stat.S_ISLNK(info.st_mode):result[key]={'symlink':os.readlink(path)}
-                elif stat.S_ISREG(info.st_mode):result[key]={'sha256':sha(snapshot(path,16*1024**2,self.action_end))}
-                else:require(stat.S_ISDIR(info.st_mode),'unknown product object')
+        result={};pending=[self.path('/job/src')];count=0;total=0
+        while pending:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    count+=1;require(count<=128 and time.monotonic()<self.action_end,'product oracle bound exceeded')
+                    path=Path(entry.path);info=entry.stat(follow_symlinks=False);key=str(path.relative_to(self.path('/job/src')))
+                    if stat.S_ISLNK(info.st_mode):result[key]={'symlink':os.readlink(path)}
+                    elif stat.S_ISREG(info.st_mode):
+                        total+=info.st_size;require(total<=32*1024**2,'product oracle storage bound exceeded')
+                        result[key]={'sha256':sha(snapshot(path,16*1024**2,self.action_end))}
+                    else:
+                        require(stat.S_ISDIR(info.st_mode),'unknown product object');pending.append(path)
         return result
 
     def goal_state(self,integrity=False):
@@ -461,7 +465,8 @@ class Sequence:
         return result
 
     def oracle(self,action,item):
-        text=output_text(item.get('output'));ident=action['id']
+        payload=item.get('tools') if action['kind']=='tool_search_call' else item.get('output')
+        text=output_text(payload);ident=action['id']
         require(all(sha(self.path(p).read_bytes())==value for p,value in self.protected.items()),'protected fixture changed')
         require('NONCREDENTIAL_AUTHORITY_MARKER' not in text and 'SYNTHETIC_STATE_MARKER' not in text and 'SYNTHETIC_DB_MARKER' not in text,'protected marker leaked')
         rows=json_rows(text)
@@ -482,7 +487,6 @@ class Sequence:
         elif ident.startswith('image-'):require(not has_image(item) and 'Permission denied (os error 13)' in text,'valid forbidden image did not fail access')
         elif ident=='login-deny':require(not self.path('/job/src/login-ran').exists() and 'login shell is disabled by config' in text,'requested login was not rejected')
         else:extra=self.inventory_oracle(action,item,text,rows)
-        payload=item.get('tools') if action['kind']=='tool_search_call' else item.get('output')
         return {'id':ident,'pass':True,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':item.get('type'),'output':payload,'output_sha256':sha(canonical(payload)),
                 'emitted_item':self.emitted.get(ident),'returned_item':item,'partial_product_exists':self.path('/job/src/partial-patch').exists(),'protected_unchanged':True,**(extra if 'extra' in locals() else {})}
 
@@ -492,7 +496,9 @@ class Sequence:
         require(type(body)is dict and body.get('model')==MODEL and isinstance(body.get('input'),list),'unexpected model/request input')
         names=tool_inventory(body.get('tools'));definition_hash=sha(canonical(body['tools']))
         self.inventories.append({'sha256':definition_hash,'names':names});self.definitions[definition_hash]=body['tools']
-        require(self.discovered<=set(names),'discovered definition missing from later request')
+        # Search definitions travel in tool_search_output history. The provider
+        # need not copy them into the request's top-level tools array. Retain
+        # both inventories and their union instead of inventing that invariant.
         outputs=[v for v in body['input'] if isinstance(v,dict) and v.get('type') in OUTPUT_KINDS.values()]
         issued={v['id']:v for v in self.planned[:self.index]}
         for item in body['input']:
@@ -665,6 +671,11 @@ def worker(args):
                       'update_goal':{'goal-missing','goal-active','goal-complete'},'tool_search':{'search-positive','search-whitespace','search-zero'}}
             passed={row['id'] for row in sequence.records if row['pass']}
             covered={name for name,cases in required.items() if cases<=passed}
+            report['coverage_classes']={'actual_child_effects_tested':{'exec_command','apply_patch','view_image','write_stdin'}<=covered,
+                'actual_supervisor_goal_state_tested':{'get_goal','create_goal','update_goal'}<=covered and report.get('goal_database_final',{}).get('integrity')=='ok',
+                'actual_local_registry_metadata_tested':'search-positive' in passed,
+                'current_entrypoint_input_rejected':'input-reject' in passed,
+                'provider_backend_unverified':True,'cross_job_ownership_unverified':True,'renewal_unverified':True}
             report['inventory_disposition']={name:('discovered-effect-surface-unexercised' if name in sequence.discovered else
                 'provider-hosted-backend-unverified' if name=='web_search' else 'current-entrypoint-rejected; interactive-client-unverified' if name=='request_user_input' and 'input-reject' in passed else
                 'local-registry-metadata; invalid-handler-errors-unwitnessed' if name=='tool_search' and name in covered else

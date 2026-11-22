@@ -205,7 +205,9 @@ else:
         self.assertEqual(report['status'],'blocked');self.assertTrue(report['actions'][0]['pass']);self.assertFalse(root.exists())
 
 
-class InventoryExtension(OfflineTools):
+class InventoryExtension(unittest.TestCase):
+    setUp=OfflineTools.setUp
+    body=OfflineTools.body
     def test_fixed_plan_preserves_original_and_32_mandatory_actions(self):
         planned=t.actions(12345)+t.inventory_actions()
         self.assertEqual(len(planned),32);self.assertEqual(len({a['id'] for a in planned}),32)
@@ -319,3 +321,46 @@ class InventoryExtension(OfflineTools):
         seq=t.Sequence([a for a in t.actions(123) if a['id'] in ('patch-deny','image-deny')],self.root,time.monotonic()+5)
         seq.request(self.body());first=self.result('patch-deny','Permission denied (os error 13)','custom_tool_call_output');seq.request(self.body([first]))
         with self.assertRaisesRegex(ValueError,'changed replayed'):seq.request(self.body([dict(first,output='changed'),self.result('image-deny','Permission denied (os error 13)')]))
+
+    def test_empty_search_results_are_never_positive_or_handler_validator_evidence(self):
+        import sqlite3
+        path=self.database();thread='00000000-0000-0000-0000-000000000002'
+        with sqlite3.connect(path) as db:db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',(thread,'owned',t.GOAL_OBJECTIVE,'complete',None,0,0,2,2))
+        # The controller records the unrelated baseline before this synthetic
+        # current-thread row; these assertions concern oracle semantics only.
+        seq=t.Sequence(t.inventory_actions()[-3:],self.root,time.monotonic()+5)
+        seq.goal_initial=[row for row in seq.goal_initial if row['thread_id']!=thread]
+        seq.observe_cli(t.canonical({'type':'thread.started','thread_id':thread}))
+        own=seq.goal_state();seq.goal_identity={k:own[k] for k in ('thread_id','goal_id','objective','token_budget','created_at_ms')}
+        seq.metadata_products=seq.products()
+        def output(ident):return {'type':'tool_search_output','call_id':ident,'status':'completed','execution':'client','tools':[]}
+        with self.assertRaisesRegex(ValueError,'expected one evidenced'):seq.oracle(seq.planned[0],output('search-positive'))
+        result=seq.oracle(seq.planned[1],output('search-whitespace'))
+        self.assertTrue(result['pass']);self.assertFalse(result['handler_validation_witnessed'])
+        self.assertEqual(result['coverage'],'bounded-invalid-input/no-definition')
+        for altered in (dict(output('search-zero'),execution='server'),dict(output('search-zero'),status='failed'),dict(output('search-zero'),error='invented validator error')):
+            with self.assertRaisesRegex(ValueError,'invalid special'):seq.oracle(seq.planned[2],altered)
+        (self.root/'job/src/unplanned-search-effect').write_text('not metadata')
+        with self.assertRaisesRegex(ValueError,'changed product'):seq.oracle(seq.planned[2],output('search-zero'))
+
+    def test_real_pending_pty_is_stopped_on_fixture_failure(self):
+        import pty
+        master,slave=pty.openpty()
+        child=subprocess.Popen([sys.executable,'-c','import os;print("ready",flush=True);os.read(0,1)'],
+                               stdin=slave,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+        os.close(slave)
+        try:
+            self.assertEqual(child.stdout.readline(),b'ready\n');self.assertIsNone(child.poll())
+            with self.assertRaisesRegex(ValueError,'deadline'):t.capture(child,time.monotonic()+.05,[0])
+        finally:
+            t.stop(child);os.close(master)
+        self.assertIsNotNone(child.poll());self.assertLess(child.returncode,0)
+
+    def test_product_metadata_snapshot_never_follows_links_and_has_finite_inventory(self):
+        seq=t.Sequence([],self.root,time.monotonic()+5)
+        outside=self.root/'outside';outside.write_text('must not be read as product')
+        (self.root/'job/src/linked').symlink_to(outside)
+        proof=seq.products();self.assertEqual(proof['linked'],{'symlink':str(outside)})
+        for i in range(129):(self.root/'job/src'/('bounded-'+str(i))).touch()
+        with self.assertRaisesRegex(ValueError,'oracle bound'):seq.products()
+        self.assertEqual(outside.read_text(),'must not be read as product')
