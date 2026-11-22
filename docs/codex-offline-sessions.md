@@ -366,3 +366,13 @@ status/reason/request-delta facts were not retained and its final audits were no
 reached. The source-proven formatter gap is not its established runtime cause.
 This source repair has no stock result; fresh exact review and one separately
 bounded validation remain required. Runtime/job/renewal admission stays false.
+
+
+Unrecognized messages inside the closed negative `error`/`turn.failed` envelopes
+now reject immediately. A first closed rejection stores only its fixed
+classification/event kind/index, raw-line byte count/SHA256 and whether a valid
+reason preceded it. It is retained unchanged; later good CLI/stderr reasons
+cannot clear it or pass the final negative guard. This does not classify ordinary
+stderr diagnostics as structured errors. The 42 reviewed mixed-stream cases and
+existing exact valid/partial/failure streams are local regressions only; the
+560-test full pass belongs to base `86fdc82`, not this narrow changed candidate.

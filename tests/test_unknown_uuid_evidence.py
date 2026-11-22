@@ -103,6 +103,43 @@ class UnknownUUIDTests(unittest.TestCase):
         with self.assertRaises(ValueError):s.check_unknown_uuid(report,j,[sys.executable,'-c','import os;os.write(2,b"PRIVATE"*900)'],j.meter,j.end)
         w=report['unknown_uuid_evidence'];self.assertGreater(w['stderr_bytes'],10);self.assertFalse(w['stderr_capture_complete'])
         self.assertIsNone(w['exit_code']);self.assertFalse(w['natural_exit_observed']);self.assertNotIn('PRIVATE',json.dumps(w))
+    def test_all_42_conflicting_structured_streams_reject_and_preserve_classification(self):
+        bad_messages=('thread/resume transport error: unavailable','authentication failed',TYPED.replace('-32600','-32601'),
+            TYPED.replace(s.UNKNOWN,'00000000-0000-4000-8000-000000000002'),TYPED+'\x00','\x1b[31m'+TYPED,'PRIVATE unclassified error')
+        def event(message,kind):return json.dumps({'type':kind,'message':message} if kind=='error' else {'type':kind,'error':{'message':message}})+'\n'
+        for bad in bad_messages:
+            for kind in ('error','turn.failed'):
+                for placement in ('bad-first','bad-last','stderr-good'):
+                    stdout=event(bad,kind)+event(TYPED,'error') if placement=='bad-first' else event(TYPED,'error')+event(bad,kind) if placement=='bad-last' else event(bad,kind)
+                    stderr=(TYPED+'\n').encode() if placement=='stderr-good' else b''
+                    j,report,error=self.run_child('import os;os.write(1,'+repr(stdout.encode())+');os.write(2,'+repr(stderr)+');raise SystemExit(1)')
+                    self.assertEqual(str(error),'unrecognized negative CLI error');self.assertNotIn('unknown_uuid_rejected',report)
+                    w=report['unknown_uuid_evidence'];rejected=w['cli_rejection']
+                    self.assertEqual(rejected['classification'],'unrecognized-error-message');self.assertEqual(rejected['event_type'],kind)
+                    self.assertEqual(rejected['recognized_reason_before'],placement=='bad-last')
+                    self.assertEqual(rejected['event_index'],int(placement=='bad-last'))
+                    self.assertEqual(rejected['line_sha256'],s.sha(event(bad,kind).rstrip('\n').encode()))
+                    self.assertEqual(w['stage'],'exception');self.assertEqual(w['request_delta'],0);self.assertIsNone(w['exit_code'])
+                    self.assertNotIn('PRIVATE',json.dumps(w));self.assertNotIn(bad,json.dumps(rejected))
+    def test_first_rejection_is_latched_and_ordinary_stderr_noise_remains_distinct(self):
+        j=self.journey();report={};first=[]
+        def runner(*args):
+            with self.assertRaisesRegex(ValueError,'unrecognized negative CLI error'):
+                j.observe_cli(t.canonical({'type':'error','message':'PRIVATE failure'}))
+            first.append(copy.deepcopy(j.negative_evidence['cli_rejection']))
+            with self.assertRaisesRegex(ValueError,'unrecognized negative CLI error'):
+                j.observe_cli(t.canonical({'type':'error','message':TYPED}))
+            self.assertEqual(first[0],j.negative_evidence['cli_rejection'])
+            j.negative_reason_witnessed=True
+            return 1,{'unknown_uuid_reason_witnessed':True,'stderr_bytes':0,'stderr_sha256':s.sha(b''),
+                'stderr_capture_complete':True,'stderr_reason_family':'typed-thread'}
+        with self.assertRaises(ValueError):s.check_unknown_uuid(report,j,[],j.meter,j.end,runner=runner)
+        self.assertEqual(report['unknown_uuid_evidence']['cli_rejection'],first[0]);self.assertNotIn('unknown_uuid_rejected',report)
+        wire=(json.dumps({'type':'error','message':TYPED})+'\n').encode()
+        _,report,error=self.run_child('import os;os.write(1,'+repr(wire)+');os.write(2,b"ordinary diagnostic noise\\n");raise SystemExit(1)')
+        self.assertIsNone(error);self.assertTrue(report['unknown_uuid_rejected'])
+        self.assertIsNone(report['unknown_uuid_evidence']['cli_rejection']);self.assertFalse(report['unknown_uuid_evidence']['stderr_reason'])
+
     def test_final_database_and_both_durable_audits_still_required(self):
         j=self.journey();ids={'alpha':'1','beta':'2'};j.entries={'alpha':{},'beta':{}};j.continuations={'alpha':{},'beta':{}}
         source=Path(self.tmp.name)/'source';source.write_bytes(s.UNCOMMITTED)

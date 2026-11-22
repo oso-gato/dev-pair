@@ -258,7 +258,8 @@ class SessionsTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.j.observe_cli(t.canonical({'type':'turn.completed','usage':{}}))
         with self.assertRaises(ValueError):self.j.finish(0)
         self.j.negative=True;self.j.turn=None
-        self.j.observe_cli(t.canonical({'type':'error','message':'unknown synthetic UUID'}))
+        with self.assertRaisesRegex(ValueError,'unrecognized negative CLI error'):
+            self.j.observe_cli(t.canonical({'type':'error','message':'unknown synthetic UUID'}))
         with self.assertRaises(ValueError):self.j.observe_cli(t.canonical({'type':'thread.started','thread_id':IDS['beta']}))
 
     def test_checkpoint_corruption_cannot_supply_two_matching_claims(self):

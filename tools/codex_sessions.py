@@ -614,6 +614,7 @@ class Journey:
         turn = self.turn
         if self.negative:
             witness=self.negative_evidence
+            require(witness is None or witness.get('cli_rejection') is None,'unrecognized negative CLI error')
             kind=row['type'];allowed=kind in ('error','turn.failed')
             if witness is not None:
                 key=kind if kind in ('error','turn.failed','thread.started') else 'other'
@@ -628,6 +629,14 @@ class Journey:
                     type(row['error']['message']) is str,'malformed negative CLI failure')
                 message=row['error']['message']
             family=unknown_reason_family(message)
+            if family=='none':
+                if witness is not None and witness.get('cli_rejection') is None:
+                    encoded=raw.encode('utf-8','surrogatepass') if type(raw) is str else raw
+                    witness['cli_rejection']={'classification':'unrecognized-error-message','event_type':kind,
+                        'event_index':sum(witness['event_counts'].values())-1,'line_bytes':len(encoded),'line_sha256':sha(encoded),
+                        'recognized_reason_before':self.negative_reason_witnessed}
+                    witness['cli_event_reason']=self.negative_reason_witnessed
+                raise ValueError('unrecognized negative CLI error')
             self.negative_reason_witnessed |= family!='none'
             if witness is not None:
                 witness['cli_event_reason']=self.negative_reason_witnessed
@@ -1073,7 +1082,7 @@ def check_unknown_uuid(report,journey,argv,meter,end,runner=run_turn):
         'requests_before':before,'requests_after':None,'request_delta':None,'captured_bytes':None,
         'stderr_bytes':None,'stderr_retained_bytes':None,'stderr_sha256':None,'stderr_capture_complete':None,
         'stderr_reason':None,'stderr_reason_family':None,'cli_event_reason':None,'cli_reason_family':None,'matched_reason_family':None,
-        'cli_stream_complete':None,'event_counts':{'error':0,'turn.failed':0,'thread.started':0,'other':0},'forbidden_thread_event':False}
+        'cli_stream_complete':None,'cli_rejection':None,'event_counts':{'error':0,'turn.failed':0,'thread.started':0,'other':0},'forbidden_thread_event':False}
     report['unknown_uuid_evidence']=witness;journey.negative_evidence=witness
     journey.negative_reason_witnessed=False
     try:
@@ -1085,7 +1094,7 @@ def check_unknown_uuid(report,journey,argv,meter,end,runner=run_turn):
             stderr_capture_complete=negative.get('stderr_capture_complete'),cli_event_reason=journey.negative_reason_witnessed)
         witness['matched_reason_family']=(witness['stderr_reason_family'] if witness['stderr_reason'] else
             witness['cli_reason_family'] if witness['cli_event_reason'] else 'none')
-        require(type(code) is int and code==1 and journey.requests==before and not witness['forbidden_thread_event'] and
+        require(type(code) is int and code==1 and journey.requests==before and not witness['forbidden_thread_event'] and witness['cli_rejection'] is None and
                 (witness['stderr_reason'] or witness['cli_event_reason']),
                 'unknown UUID rejection reason unproven or model dispatch occurred')
         report['unknown_uuid_rejected']=True

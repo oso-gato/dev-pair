@@ -3,6 +3,32 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 01:15 HKT — reject conflicting structured missing-UUID errors
+
+- Fresh review of `86fdc82` found one P2: an unrecognized structured fatal error
+  could be tolerated while a good missing-rollout reason was OR-latched. All 42
+  transport/authentication/wrong-code/wrong-UUID/control/arbitrary-error cases
+  incorrectly passed across both closed event types and three reason orderings.
+  The immutable CHANGES_REQUIRED receipt remains at
+  `/workspace/artifacts/unknown-uuid-review-86fdc82/review.json`, SHA256
+  `3e7360322c3002add4e4fed6d3fce68477d0256257380d9038a91a41cf21a0b6`.
+- Every unrecognized message in those existing envelopes now rejects immediately,
+  recording a first closed classification/event/index/length/hash and prior-good
+  flag before raising. The first rejection is immutable and also blocks the final
+  guard, so neither earlier nor later good CLI/stderr can override it. Ordinary
+  stderr noise is not reclassified; exact matching, status/request/fallback,
+  partial-capture/unknown and final database/durable-audit guards stay intact.
+- All 42 copied real-child cases now reject; 73 affected tests and ten copied
+  independent checks pass. Reproducers and all declared outputs belong to this
+  new artifact directory; no review evidence was executed in place or overwritten.
+  Focused checks only apply here. The 560-test full pass remains base `86fdc82`
+  evidence; no new full/stock/native proof or retrospective acceptance exists.
+- Native files remain byte-identical to reviewed `2ed389f`. API-selected Sol/high
+  remains backend-unattested. The separate CI/PR/worktrees are untouched; no
+  engine/native/stock/network/authentication/model/VPS/push/deployment occurs.
+  All existing limits remain unchanged; fresh exact review remains required.
+
+
 ### November 23, 2026, 01:04 HKT — exact missing-UUID encoding and negative witness
 
 - Actual stock `1c2ede3` reached both explicit original-UUID continuations and
