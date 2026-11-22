@@ -30,6 +30,9 @@ GIB = 1024 ** 3
 MANIFEST_LIMIT = 65536
 OCI_METADATA_LIMIT = 256 * 1024
 OCI_MIME = 'application/vnd.oci.image.'
+OCI_PLATFORM_FIELDS = 'architecture os os.version os.features variant'
+OCI_RUN_FIELDS = 'User ExposedPorts Env Entrypoint Cmd Volumes WorkingDir Labels StopSignal ArgsEscaped'
+OCI_HISTORY_FIELDS = 'created created_by author comment empty_layer'
 OUTPUT_LIMIT = 1024 * 1024
 OUTER_SECONDS = 600
 INNER_SECONDS = 180
@@ -201,6 +204,14 @@ def hash_layer(stream, maximum, deadline):
         digest.update(data)
 
 
+def archive_fields(value, kind, required, optional=''):
+    # Go's JSON struct decoder also matches field names case-insensitively.
+    # Permit only the canonical spelling of structural keys before import.
+    needed = set(required.split())
+    require(type(value) is dict and needed <= value.keys() <= needed.union(optional.split()),
+            f'invalid development OCI {kind} structural keys')
+
+
 def check_archive_image(path, release, storage_limit, deadline):
     check_archive_headers(path, release['archive_bytes'], deadline)
     with tarfile.open(path, 'r:') as archive:
@@ -210,9 +221,9 @@ def check_archive_image(path, release, storage_limit, deadline):
         used = set()
 
         def descriptor(value, media_types):
-            require(type(value) is dict and {'digest', 'size', 'mediaType'} <= value.keys()
-                    and value.keys() <= {'digest', 'size', 'mediaType', 'annotations', 'platform'},
-                    'invalid development archive descriptor')
+            archive_fields(value, 'descriptor', 'digest size mediaType', 'annotations platform')
+            if 'platform' in value:
+                archive_fields(value['platform'], 'descriptor platform', '', OCI_PLATFORM_FIELDS)
             digest = value['digest']
             require(isinstance(digest, str) and digest in blobs and type(value['size']) is int
                     and value['size'] == blobs[digest].size and value['mediaType'] in media_types,
@@ -236,21 +247,33 @@ def check_archive_image(path, release, storage_limit, deadline):
         require(metadata(members.get('oci-layout')) == {'imageLayoutVersion': '1.0.0'},
                 'unsupported development OCI layout')
         index = metadata(members.get('index.json'))
+        archive_fields(index, 'index', 'schemaVersion manifests', 'mediaType annotations')
         index_media = OCI_MIME + 'index.v1+json'
         manifests = index.get('manifests')
-        require(index.get('schemaVersion') == 2 and index.get('mediaType', index_media) == index_media
+        require(type(index['schemaVersion']) is int and index['schemaVersion'] == 2
+                and index.get('mediaType', index_media) == index_media
                 and type(manifests) is list and len(manifests) == 1,
                 'development OCI archive must select one image')
         manifest_media = OCI_MIME + 'manifest.v1+json'
         manifest_blob = descriptor(manifests[0], (manifest_media,))
         image = metadata(manifest_blob[1], manifest_blob[0])
-        require(image.get('schemaVersion') == 2 and image.get('mediaType', manifest_media) == manifest_media,
+        archive_fields(image, 'manifest', 'schemaVersion config layers', 'mediaType annotations')
+        require(type(image['schemaVersion']) is int and image['schemaVersion'] == 2
+                and image.get('mediaType', manifest_media) == manifest_media,
                 'unsupported development OCI image manifest')
         config_digest, config_member = descriptor(image.get('config'), (OCI_MIME + 'config.v1+json',))
         require(config_digest == 'sha256:' + release['image_id'], 'development archive config identity mismatch')
         config = metadata(config_member, config_digest)
-        require((config.get('os'), config.get('architecture')) == ('linux', 'amd64')
-                and config.get('rootfs') == {'type': 'layers', 'diff_ids': release['diff_ids']},
+        archive_fields(config, 'image config', 'architecture os rootfs', 'config history created author os.version os.features variant')
+        archive_fields(config['rootfs'], 'rootfs', 'type diff_ids')
+        if 'config' in config:
+            archive_fields(config['config'], 'runtime config', '', OCI_RUN_FIELDS)
+        if 'history' in config:
+            require(type(config['history']) is list, 'invalid development OCI history')
+            for entry in config['history']:
+                archive_fields(entry, 'history entry', '', OCI_HISTORY_FIELDS)
+        require((config['os'], config['architecture']) == ('linux', 'amd64')
+                and config['rootfs'] == {'type': 'layers', 'diff_ids': release['diff_ids']},
                 'development archive config platform or ordered layers mismatch')
         layers = image.get('layers')
         require(type(layers) is list and len(layers) == len(release['diff_ids']),
@@ -303,6 +326,9 @@ def file_label(manifest, side):
 
 def selinux_label(value):
     if not isinstance(value, str) or len(value) > 128:
+        return None
+    value = value.removesuffix('\x00')
+    if '\x00' in value:
         return None
     parts = value.split(':', 4)
     if len(parts) != 5 or any(not part for part in parts[:3]) or parts[3] != 's0':
@@ -548,7 +574,7 @@ def proc_snapshot(root, capabilities, nnp, label, uid, gid):
             'effective capability, NNP or seccomp policy mismatch')
     require(status['Uid'].split() == [str(uid)] * 4 and status['Gid'].split() == [str(gid)] * 4
             and status['Groups'].split() in ([], [str(gid)]), 'effective UID, GID or groups policy mismatch')
-    actual = (root / 'attr/current').read_text().strip('\x00\n')
+    actual = (root / 'attr/current').read_text().removesuffix('\n')
     require(same_label(actual, label), 'effective SELinux process label mismatch')
     return {'namespaces': {name: os.readlink(root / 'ns' / name) for name in NS_NAMES},
             'cgroup': (root / 'cgroup').read_text().strip(), 'label': actual}

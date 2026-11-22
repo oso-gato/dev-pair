@@ -77,7 +77,7 @@ def storage_mount(path, ceiling, mountinfo):
 
 
 def check_label(path, expected):
-    actual = os.getxattr(path, 'security.selinux').decode('ascii').rstrip('\x00')
+    actual = os.getxattr(path, 'security.selinux').decode('ascii')
     db.require(db.same_label(actual, expected), f'{path.name} SELinux volume label mismatch')
 
 
