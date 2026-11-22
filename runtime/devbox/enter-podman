@@ -1,0 +1,8 @@
+#!/bin/sh
+# Pinned Distrobox enter may inspect and exec. It cannot create or start a box.
+case "$1" in
+    inspect|exec) ;;
+    *) exit 64 ;;
+esac
+exec /usr/bin/podman --remote=false --runtime=/usr/bin/crun --root=/devbox/graph --runroot=/run/dev-pair \
+    --storage-driver=vfs --events-backend=file --cgroup-manager=cgroupfs "$@"

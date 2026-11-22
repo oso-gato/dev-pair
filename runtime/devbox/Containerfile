@@ -1,0 +1,39 @@
+# TOOLING_IMAGE identifies a separately verified local Fedora 44 tooling image.
+ARG TOOLING_IMAGE
+FROM ${TOOLING_IMAGE}
+ARG SOURCE_SHA
+LABEL org.opencontainers.image.revision=${SOURCE_SHA} \
+      dev-pair.role=devbox \
+      dev-pair.standards=b9d4da5d442ac48dba2e8be62d81b5bdc83690b8 \
+      dev-pair.distrobox=40c3cd724faa434aeb0a23e28776665b92de68bd
+USER 0:0
+COPY controller.py /usr/lib/dev-pair/devbox/controller.py
+COPY containers.conf /usr/lib/dev-pair/devbox/containers.conf
+COPY distrobox-enter /usr/lib/dev-pair/devbox/distrobox-enter
+COPY enter-podman /usr/lib/dev-pair/devbox/bin/podman
+RUN set -eu; \
+    printf '%s\n' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; \
+    grep -q '^VERSION_ID=44$\|^VERSION_ID="44"$' /etc/os-release; \
+    rpm -q podman crun shadow-utils python3 libcap policycoreutils; \
+    test ! -e /usr/bin/sudo; test ! -e /usr/bin/host-spawn; test ! -e /usr/bin/distrobox-host-exec; \
+    test -x /usr/bin/newuidmap; test -x /usr/bin/newgidmap; \
+    printf '%s  %s\n' 75359e1965dcb9897a221db7818be098138154ee11c2eb2de34989a37c4b8bb8 /usr/lib/dev-pair/devbox/distrobox-enter | sha256sum -c -; \
+    groupadd -g 1000 gpt; \
+    useradd -M -d /home/gpt -g 1000 -u 1000 -s /usr/sbin/nologin -K SUB_UID_COUNT=0 -K SUB_GID_COUNT=0 gpt; \
+    usermod -L gpt; \
+    printf 'gpt:1:999\ngpt:1001:64536\n' > /etc/subuid; \
+    cp /etc/subuid /etc/subgid; \
+    mkdir -p /home/gpt /devbox/graph /devbox/job/workspaces /devbox/job/state /devbox/job/cache /admission \
+        /usr/lib/dev-pair/devbox/empty-hooks /usr/lib/dev-pair/devbox/xdg-config; \
+    touch /admission/manifest.json /admission/development.oci.tar; \
+    find / -xdev -type f -perm /6000 -exec chmod a-s {} +; \
+    getcap -r /usr /etc /opt /home > /tmp/devbox-filecaps; \
+    while read -r path rest; do setcap -r "$path"; done < /tmp/devbox-filecaps; \
+    rm /tmp/devbox-filecaps; \
+    setcap cap_setuid=ep /usr/bin/newuidmap; \
+    setcap cap_setgid=ep /usr/bin/newgidmap; \
+    chmod 0444 /usr/lib/dev-pair/devbox/containers.conf /usr/lib/dev-pair/devbox/controller.py; \
+    chmod 0555 /usr/lib/dev-pair/devbox/distrobox-enter /usr/lib/dev-pair/devbox/bin/podman
+USER 1000:1000
+WORKDIR /
+ENTRYPOINT ["/usr/bin/sleep", "600"]
