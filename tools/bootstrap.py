@@ -12,6 +12,7 @@ import ipaddress
 import importlib.util
 import shutil
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -171,6 +172,85 @@ def sudo_denial_projection(role, stdout, stderr, *, complete, status, native_sta
             'hostname_bound': host_verified is True, 'stderr_empty': not stderr,
             'complete_input': complete is True, 'stdout_bytes': len(stdout), 'stderr_bytes': len(stderr),
             'package_supported': supported, 'outcome': 'denied' if accepted else 'blocked'}
+
+PREPARE_COST_STEPS=('pre-prepare','input-admission','host-preflight','context-content','context-source','git-prerequisite',
+    'adapter-source-and-upstream','desired-state','resolved-discovery','packages','operator','host-identity-time',
+    'sudo-package-provenance','dp-maint','maintenance-directories','dp-dev','development-directories','managed-limits',
+    'ingress-guard','tailscale-package-config','tailscale-package','package-inventory','maintenance-gptbox-build',
+    'preparation-completion','finalization','unattributed')
+PREPARE_COST_COLUMNS=('visits','wall_seconds','command_count','accepted','rejected_with_launcher_handle',
+                      'rejected_without_launcher_handle','command_elapsed_seconds')
+PREPARE_COST_SCOPE='emitted-top-level-prepare-and-source-check-callbacks'
+
+
+def cost_finite(value):
+    return type(value) in (int,float) and 0<=value<=3300 and math.isfinite(value)
+
+
+class PrepareCost:
+    """Per-attempt diagnostics; parent elapsed already includes nested controls.
+
+    An obtained launcher handle is not payload execution or cleanup proof. Wall
+    and command durations are separate measurements and must never be added.
+    """
+    def __init__(self,source,context,attempt,started):
+        self.source,self.context,self.attempt=source,context,attempt
+        self.started=self.last=started;self.active='pre-prepare';self.closed=False
+        self.rows={'pre-prepare':[1,0.,0,0,0,0,0.]}
+        self.wall_complete=self.commands_complete=True;self.overflow=False;self.unknown_records=0
+        self.command_records=0;self.elapsed=None;self.outcome='interrupted'
+        self.transition_pending=False;self.command_pending=False
+
+    def tick(self):
+        now=time.monotonic();delta=now-self.last
+        if cost_finite(delta) and cost_finite(now-self.started):
+            row=self.rows[self.active];row[1]=round(row[1]+delta,6);self.elapsed=round(now-self.started,6)
+        else:self.wall_complete=False
+        self.last=now
+
+    def mark(self,step):
+        if self.closed:return
+        self.transition_pending=True
+        self.tick()
+        if step not in PREPARE_COST_STEPS:step='unattributed';self.wall_complete=False
+        row=self.rows.setdefault(step,[0,0.,0,0,0,0,0.]);self.active=step
+        if row[0]<4096:row[0]+=1
+        else:self.overflow=True;self.wall_complete=False
+        self.transition_pending=False
+
+    def command(self,entry):
+        if self.closed:return
+        if self.command_records>=4096:self.overflow=True;self.commands_complete=False;return
+        self.command_pending=True
+        self.command_records+=1
+        step=entry.get('step') if type(entry) is dict else None
+        if (step not in PREPARE_COST_STEPS or type(entry.get('accepted_exit')) is not bool or
+                type(entry.get('launcher_handle_observed')) is not bool or not cost_finite(entry.get('elapsed_seconds')) or
+                entry['accepted_exit'] and not entry['launcher_handle_observed']):
+            self.commands_complete=False;self.unknown_records+=1;self.command_pending=False;return
+        row=self.rows.setdefault(step,[0,0.,0,0,0,0,0.]);row[2]+=1
+        row[3 if entry['accepted_exit'] else 4 if entry['launcher_handle_observed'] else 5]+=1
+        row[6]=round(row[6]+entry['elapsed_seconds'],6) if row[6] is not None else None
+        if not cost_finite(row[6]):self.overflow=True;self.commands_complete=False;row[6]=None
+        self.command_pending=False
+
+    def finish(self,success):
+        if not self.closed:
+            self.tick();self.closed=True;self.outcome='complete' if success else 'interrupted'
+
+    def snapshot(self,budget):
+        if self.transition_pending or self.command_pending:
+            return {'availability':'unavailable','reason':'interrupted-accounting-update'}
+        result={'schema':1,'source_sha':self.source,'context_sha256':self.context,'attempt_id':self.attempt,'phase':'prepare',
+            'phase_budget_sha256':hashlib.sha256(json.dumps(budget,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
+            'status':'overflow' if self.overflow else 'incomplete' if not(self.wall_complete and self.commands_complete) else self.outcome,
+            'wall_complete':self.wall_complete,'commands_complete':self.commands_complete,'elapsed_seconds':self.elapsed,
+            'command_records':self.command_records,'unknown_records':self.unknown_records,
+            'scope':PREPARE_COST_SCOPE,'nested_controls':'included-in-parent-elapsed-not-counted-again',
+            'columns':list(PREPARE_COST_COLUMNS),'steps':self.rows}
+        if len(json.dumps(result,separators=(',',':')).encode())>4096:
+            return {'availability':'unavailable','reason':'projection-overflow'}
+        return result
 
 _PHASE_DEADLINE = contextvars.ContextVar('dev_pair_phase_deadline', default=None)
 
@@ -742,7 +822,8 @@ class Commands:
                 record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
-                          'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
+                          'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None,
+                          'launcher_handle_observed':process is not None}
                 if sudo_probe is not None:
                     record['sudo_denial'] = sudo_denial_projection(sudo_probe['role'], bytes(buffers['stdout']), bytes(buffers['stderr']),
                         complete=capture_complete and cleanup_error is None,
@@ -1273,6 +1354,8 @@ class Bootstrap:
             os.fsync(f.fileno())
 
     def mark_prepare_step(self, value):
+        cost=getattr(self,'prepare_cost',None)
+        if cost is not None:cost.mark(value)
         self.prepare_step = value
         if isinstance(self.run, Commands):
             self.run.current_step = value

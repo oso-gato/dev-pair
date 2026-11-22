@@ -133,6 +133,53 @@ class InitializeTests(unittest.TestCase):
             with self.assertRaisesRegex(b.Blocked, 'context/source'):
                 self.initialize(retry=True)
 
+    def test_prepare_cost_before_eviction_source_scope_and_retry_reset(self):
+        self.app.atomic(b.STATE+'/prepare-diagnostics.json',json.dumps({'recent':[{'SECRET_OLD':'old'}],'failures':[]})+'\n')
+        original=self.app.preparation;counts=iter((12,2))
+        def preparation():
+            result=original();count=next(counts)
+            def prepare(*args,source_check=None,**kwargs):
+                b.Bootstrap.mark_prepare_step(result,'adapter-source-and-upstream');source_check()
+                b.Bootstrap.mark_prepare_step(result,'packages')
+                for _ in range(count):
+                    result.run.diagnostic({'step':'packages','accepted_exit':True,'launcher_handle_observed':True,
+                        'elapsed_seconds':.001,'status':0,'operation_id':'signed-packages'})
+            result.prepare=prepare;return result
+        def inputs(*args):
+            # One real local source-callback command; no Fedora/native claim.
+            self.app.run(sys.executable,'-c','print("private local source fixture")')
+            return {},{}
+        self.app.fail=True
+        with patch.object(self.app,'preparation',side_effect=preparation),patch.object(self.app,'inputs',side_effect=inputs):
+            with self.assertRaises(b.Blocked):self.initialize()
+            first=json.loads(self.app.text(b.STATE+'/initialize.json'));cost=first['prepare_cost']
+            self.assertEqual(cost['command_records'],13)
+            self.assertEqual(cost['steps']['packages'][2],12)
+            self.assertEqual(cost['steps']['adapter-source-and-upstream'][2],1)
+            self.assertEqual(cost['status'],'complete')  # Later adapter failure is independent.
+            history=json.loads(self.app.text(b.STATE+'/prepare-diagnostics.json'))
+            self.assertEqual(len(history['recent']),4);self.assertNotIn('SECRET_OLD',json.dumps(cost))
+            with self.assertRaises(b.Blocked):self.initialize(retry=True)
+            second=json.loads(self.app.text(b.STATE+'/initialize.json'))
+            self.assertNotEqual(second['prepare_cost_attempt'],first['prepare_cost_attempt'])
+            self.assertEqual(second['prepare_cost']['command_records'],3)
+            self.assertEqual(second['prepare_cost']['steps']['packages'][2],2)
+
+    def test_prepare_cost_interruption_keeps_active_step_and_primary_failure(self):
+        original=self.app.preparation
+        def preparation():
+            result=original()
+            def prepare(*args,**kwargs):
+                b.Bootstrap.mark_prepare_step(result,'packages')
+                raise b.Blocked('PRIMARY_PREPARE_FIXTURE')
+            result.prepare=prepare;return result
+        with patch.object(self.app,'preparation',side_effect=preparation):
+            with self.assertRaisesRegex(b.Blocked,'PRIMARY_PREPARE_FIXTURE'):self.initialize()
+        record=json.loads(self.app.text(b.STATE+'/initialize.json'))
+        self.assertEqual(record['prepare'],'blocked');self.assertEqual(record['prepare_cost']['status'],'interrupted')
+        self.assertGreater(record['prepare_cost']['steps']['packages'][1],0)
+        self.assertNotIn('PRIMARY_PREPARE_FIXTURE',json.dumps(record['prepare_cost']))
+
     def test_real_native_registration_and_uid_bound_retry_after_completed_or_prelaunch_context_failure(self):
         original = subprocess.Popen
         for mode in ('completed-command', 'prelaunch-input'):

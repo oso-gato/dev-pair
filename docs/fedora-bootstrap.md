@@ -512,3 +512,49 @@ The existing guest public diagnostics expose this bounded witness even when all
 subprocesses passed but a Python listener gate rejected. No config bodies,
 journals, environment, arbitrary exceptions or password data are exported.
 Local mode/fixture results do not establish native Fedora label/daemon acceptance.
+
+### Preparation cost diagnostics
+
+Shared initialization retains a fresh per-attempt cost summary for its existing
+600-second preparation window. It does not change that deadline or any native
+admission, source, label, relay, ownership or cleanup checks. The initial
+`pre-prepare` slot includes public-key fetch and reconciliation inside that
+window. Initializer admission/source work before the window is excluded.
+Existing `mark_prepare_step` transitions accumulate monotonic wall time and visit
+counts, including repeated steps; `finalization` covers successful phase exit.
+The active step is finalized on failure or interruption. Unknown steps become
+explicitly incomplete `unattributed` time without exporting the supplied name.
+
+Existing outer preparation command callbacks and the existing source-check
+command callback are aggregated once before the four-record journal ring evicts
+entries. Nested control/helper commands have no additional accounting callback:
+their cost is already inside their parent command's elapsed time. Commands that
+never emit a top-level callback are outside this command-count scope. Wall time
+and command elapsed are separate observations and must not be added. Neither is
+payload-only CPU time or an inferred primary failure cause.
+
+`launcher_handle_observed` records only that the controller obtained its owned
+launcher subprocess handle. Diagnostic command categories are mutually exclusive:
+accepted, rejected with that handle, or rejected without that handle. A missing
+handle does not independently prove no descendant existed; a handle does not
+prove the service/payload started or cleanup completed. Historical/manual records
+missing this fact make collection incomplete, rather than assuming false.
+
+The closed summary binds source/context, a new attempt identity and the exact
+preparation budget witness hash. Retries start fresh counters and never scan old
+journal entries into a new attempt. Fixed step rows use the emitted `columns`
+order: visits, wall seconds, command count, accepted count, rejected-with-handle
+count, rejected-without-handle count, command elapsed seconds. Only received
+schema-valid records contribute known command counts. Incomplete/overflow rows
+are partial observations, not full-phase zeroes or upper bounds. Collection is
+bounded to 4096 received command records and 4096 visits per fixed step; overflow
+is explicit. Interruption during an accounting update yields typed unavailable
+evidence. No subprocess or native command is added to obtain diagnostics.
+
+The additional public cost projection is at most 4 KiB inside the unchanged
+64 KiB report ceiling. Unknown fields/steps, stale source/context/attempt/budget,
+nonfinite or invalid metrics reject to unavailable. No argv, output, credential,
+raw exception or arbitrary step name is published. The source/local tests do not
+measure Fedora preparation costs or promise the remaining packages and builds
+fit the existing deadline. A separately reviewed changed native attempt is needed
+before selecting a measured optimization or claiming successful preparation.
