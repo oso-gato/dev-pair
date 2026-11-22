@@ -30,7 +30,8 @@ class ResolvedBatchTests(unittest.TestCase):
     def test_each_original_owner_predicate_still_required(self):
         self.stock_resolved();original=self.inventory
         for replacement in ('"foreign",pid=767','"systemd-resolve",pid=999','"systemd-resolve",pid=767,fd=9),("other",pid=767'):
-            self.inventory=original.replace('"systemd-resolve",pid=767',replacement,1)
+            lines=original.splitlines();index=next(i for i,line in enumerate(lines) if ':5355' in line)
+            lines[index]=lines[index].replace('"systemd-resolve",pid=767',replacement,1);self.inventory='\n'.join(lines)
             with self.assertRaises(b.Blocked):self.app.preflight()
     def test_complete_service_process_and_protected_executable_failures_block(self):
         self.stock_resolved();state=self.resolved_state;account=self.fake.accounts['systemd-resolve']

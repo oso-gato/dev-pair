@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 sys.path[:0]=[str(Path(__file__).resolve().parents[1]/'tools')]
@@ -22,6 +23,10 @@ class SummaryTests(unittest.TestCase):
             self.assertEqual(b.launcher_summary(raw,True),{'availability':'observed','result':result,'code':'exited','status':1})
         self.assertEqual(b.launcher_summary(SUMMARY,True)['status'],15)
         self.assertEqual(b.launcher_summary(b'Finished with result: success\n',True),{'availability':'observed','result':'success'})
+    def test_fractional_native_lifetime_floor_preserves_small_finite_budget(self):
+        for seconds,expected in ((.0011,'0.001s'),(.0049,'0.004s'),(1.2349,'1.234s')):
+            self.assertEqual(b.Commands.native_args(('--property=RuntimeMaxSec=900s',),seconds),('--property=RuntimeMaxSec='+expected,))
+        with self.assertRaises(b.Blocked):b.Commands.native_args(('--property=RuntimeMaxSec=900s',),.0009)
     def test_unknown_duplicate_control_truncated_and_oversized_are_private_unavailable(self):
         for raw,complete in [(b'',True),(SUMMARY,False),(SUMMARY*2,True),(SUMMARY+b'PRIVATE: SECRET\n',True),
             (SUMMARY.replace(b'timeout',b'PRIVATE'),True),(SUMMARY.replace(b'15/TERM',b'15/PRIVATE'),True),
@@ -49,7 +54,7 @@ class LauncherProcessTests(unittest.TestCase):
         for step,argv,stdin,selected in [('tailscale-package',b.TAILSCALE_PACKAGE,None,True),
             ('packages',b.TAILSCALE_PACKAGE,None,False),('tailscale-package',b.TAILSCALE_PACKAGE[:-1]+('other',),None,False),
             ('tailscale-package',b.TAILSCALE_PACKAGE,'',False)]:
-            run=b.Commands();run.native_prefix='dev-pair-initialize-prepare-12345678';run.current_step=step
+            run=b.Commands();run.native_prefix='dev-pair-initialize-prepare-12345678';run.current_step=step;run.deadline=time.monotonic()+3.257
             records=[];run.metadata_diagnostic=records.append
             with patch.object(b.subprocess,'Popen',side_effect=self.runner()),self.assertRaises(b.Blocked):run(*argv,input_text=stdin,timeout=3.257)
             launch=[v for v in self.calls if v[0]=='/usr/bin/systemd-run'][-1]
@@ -65,7 +70,7 @@ class LauncherProcessTests(unittest.TestCase):
                     actual=next(v.rsplit('=',1)[1][:-1] for v in launch if v.startswith('--property='+prop+'='))
                     self.assertEqual(timing[key],round(float(actual)*1000000))
                 self.assertLessEqual(timing['start_us']+timing['runtime_us'],3257000)
-                self.assertLessEqual(timing['helper_margin_us'],100001);self.assertIsNone(timing['phase_remaining_us'])
+                self.assertLessEqual(timing['helper_margin_us'],100001);self.assertIsInstance(timing['phase_remaining_us'],int);self.assertLessEqual(timing['phase_remaining_us'],3257000)
                 self.assertEqual(record['outcome'],'rejected')
                 entry={**record,'diagnostic_identity':{'source_sha':'a'*40,'context_sha256':'b'*64,'phase':'prepare'}}
                 projection=guest.native_failure_projection(entry,{'source_sha':'a'*40,'context_sha256':'b'*64},'prepare')
@@ -73,11 +78,11 @@ class LauncherProcessTests(unittest.TestCase):
                 self.assertNotIn('Finished with result',json.dumps(record));self.assertNotIn('invocation ID',json.dumps(record))
             self.assertEqual(list((self.root/'records').iterdir()),[])
     def test_payload_summary_cannot_populate_launcher_success_and_bad_summary_keeps_failure(self):
-        for wire in (False,True):
+        for wire,valid in ((False,False),(True,False),(False,True)):
             run=b.Commands();run.native_prefix='dev-pair-initialize-prepare-12345678';run.current_step='tailscale-package';records=[];run.metadata_diagnostic=records.append
-            emit=b'Finished with result: success\nPRIVATE: SECRET\n' if not wire else b'Finished with result: success\n'
+            emit=b'Finished with result: success\nPRIVATE: SECRET\n' if not wire and not valid else b'Finished with result: success\n'
             with patch.object(b.subprocess,'Popen',side_effect=self.runner(emit,wire)),self.assertRaises(b.Blocked):run(*b.TAILSCALE_PACKAGE,timeout=3)
-            failure=records[-1]['native_failure'];self.assertEqual(failure['launcher']['summary'],{'availability':'unavailable'})
+            failure=records[-1]['native_failure'];self.assertEqual(failure['launcher']['summary'],{'availability':'observed','result':'success'} if valid else {'availability':'unavailable'})
             self.assertEqual(failure['category'],'decoder-rejected');self.assertNotIn('SECRET',json.dumps(records))
     def test_projection_malformed_secondary_does_not_erase_primary(self):
         value={'point':'relay-finish','category':'decoder-rejected','launcher_handle_observed':True,'status_sampled_before_interrupt':True,
