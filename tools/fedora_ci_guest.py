@@ -991,7 +991,7 @@ def sudo_public_projection(record):
     denials = record.get('sudo_denials', {})
     if type(denials) is not dict:
         return result
-    fields = set(('operation_id role execution_kind payload_exit native_exit relay_verified exact_denial hostname_bound stderr_empty '
+    fields = set(('operation_id role execution_kind relay_applicability payload_exit native_exit relay_verified exact_denial hostname_bound stderr_empty '
                   'complete_input stdout_bytes stderr_bytes package_supported outcome').split())
     for role, operation in (('dp-maint','maintenance-sudo-denial'),('dp-dev','development-sudo-denial')):
         value = denials.get(operation)
@@ -1007,6 +1007,8 @@ def sudo_public_projection(record):
         if not all(type(value[k]) is int and 0 <= value[k] <= 1048576 for k in ('stdout_bytes','stderr_bytes')):
             continue
         if value['execution_kind'] not in ('native','direct'):
+            continue
+        if value['relay_applicability'] != ('required' if value['execution_kind'] == 'native' else 'not-applicable'):
             continue
         transport = ((value['execution_kind'] == 'native' and value['relay_verified'] and value['native_exit'] == 0) or
                      (value['execution_kind'] == 'direct' and not value['relay_verified'] and value['native_exit'] is None))

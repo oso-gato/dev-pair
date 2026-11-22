@@ -145,6 +145,7 @@ def sudo_denial_projection(role, stdout, stderr, *, complete, status, native_sta
     accepted = (complete is True and type(status) is int and status == 0 and transport and
                 host_verified is True and supported and exact and not stderr)
     return {'operation_id': SUDO_ROLES[role], 'role': role, 'execution_kind': execution_kind,
+            'relay_applicability': 'required' if execution_kind == 'native' else 'not-applicable',
             'payload_exit': status if type(status) is int else None,
             'native_exit': native_status if type(native_status) is int else None,
             'relay_verified': relay_verified is True, 'exact_denial': exact,

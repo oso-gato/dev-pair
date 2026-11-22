@@ -69,6 +69,7 @@ class SudoDenialTests(unittest.TestCase):
             self.assertEqual(result['outcome'], 'denied')
             self.assertEqual(result['operation_id'], operation)
             self.assertTrue(result['relay_verified'])
+            self.assertEqual(result['relay_applicability'],'required')
             self.assertEqual(result['payload_exit'], 0)
             self.assertEqual(result['native_exit'], 0)
             self.assertTrue(result['complete_input'])
@@ -174,6 +175,7 @@ class SudoDenialTests(unittest.TestCase):
             self.assertEqual(receipt['outcome'],'denied')
             self.assertEqual(receipt['execution_kind'],'direct')
             self.assertFalse(receipt['relay_verified'])
+            self.assertEqual(receipt['relay_applicability'],'not-applicable')
             self.assertIsNone(receipt['native_exit'])
             self.assertEqual(receipt['payload_exit'],0)
             public = guest.sudo_public_projection({'sudo_package':package, 'sudo_denials':{receipt['operation_id']:receipt}})
@@ -203,7 +205,7 @@ class SudoDenialTests(unittest.TestCase):
         self.assertEqual(selected['denials']['maintenance-sudo-denial'],denied)
         self.assertNotIn('SECRET',json.dumps(selected))
         for key,value in [('outcome','SECRET'),('stdout_bytes',True),('relay_verified',1),
-                          ('role','core'),('native_exit',True),('extra','SECRET')]:
+                          ('role','core'),('native_exit',True),('relay_applicability','not-applicable'),('extra','SECRET')]:
             wrong=copy.deepcopy(record);wrong['sudo_denials']['maintenance-sudo-denial'][key]=value
             self.assertEqual(guest.sudo_public_projection(wrong)['denials'],{})
         for value in (None, [], 'SECRET'):

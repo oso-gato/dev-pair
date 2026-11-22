@@ -239,7 +239,7 @@ role to complete verified relay/payload/native status zero when the existing
 executor is native. The documented standalone prepare path keeps its existing
 trusted-root direct subprocess: complete bounded pipes and the directly waited
 payload status zero apply, with `execution_kind=direct`, no native exit and
-`relay_verified=false` (not applicable). Execution kind comes only from the
+`relay_verified=false` and `relay_applicability=not-applicable`. Execution kind comes only from the
 selected executor branch; a failed native relay never falls back to direct.
 Zero means the query succeeded;
 it is never by itself evidence of denied privileges. Status one, warnings,
