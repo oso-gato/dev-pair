@@ -594,6 +594,7 @@ class Probe:
         self.scratch_identity = (info.st_dev, info.st_ino)
         self.image_copy_active = False
         self.engine_activity = False
+        self.primary_image_failure = None
         self.report = {'version': REPORT_VERSION, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
                        'controller_sha256': file_hash(pathlib.Path(__file__)),
                        'workflow_sha256': file_hash(self.repo / '.github/workflows/fedora-vm.yml'),
@@ -774,9 +775,14 @@ class Probe:
         require(free >= HOST_RESERVE + OVERLAY_LIMIT + OVERHEAD_LIMIT, 'capacity blocked:23GiB initial disk budget required')
         slirp_version = run_small(['/usr/bin/slirp4netns', '--version'], timeout=5).decode()
         require('slirp4netns' in slirp_version, 'preinstalled slirp implementation unavailable')
+        slirp_help = run_small(['/usr/bin/slirp4netns', '--help'], timeout=5)
+        slirp_features = ('--disable-host-loopback', '--netns-type')
+        require(all(re.search(rb'(?<![\w-])'+feature.encode()+rb'(?=[=\s,]|$)', slirp_help)
+                    for feature in slirp_features), 'preinstalled slirp lacks required loopback-denial/path-namespace features')
         version = run_small(self.podman + ['version', '--format=json']).decode()
         self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
                                  'podman': json.loads(version), 'slirp_version': evidence_tail(slirp_version, 1000), 'free_bytes': free, 'memory_bytes': mem,
+                                 'slirp_required_features': list(slirp_features), 'slirp_help_sha256': sha256(slirp_help),
                                  'merge_sha': os.environ.get('DP_MERGE_SOURCE', 'unreported'),
                                  'scratch_device': self.scratch_identity[0], 'scratch_root': str(self.root)}
         self.phase('runner-preflight', 'pass', 'Actual standard-runner OS/source/tools/capacity checked; no host packages installed')
@@ -809,25 +815,36 @@ class Probe:
         with fedora_oci.image_workspaces(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as (copy_tmp, verification_root):
             with fedora_oci.verified(signed, temporary_parent=verification_root, leased=True) as (plain, proof):
                 def local_image(*args, **kwargs):
-                    prefix = list(self.podman)
-                    index = prefix.index('/usr/bin/podman')
-                    seconds = min(kwargs.get('timeout',120),self.phase_end-time.monotonic() if self.phase_end else 120)
-                    require(seconds > 0,'image copy deadline exhausted')
-                    extra = ['/usr/bin/env','-i','PATH=/usr/bin:/bin','TMPDIR='+str(copy_tmp),
-                             '/usr/bin/timeout','--signal=TERM','--kill-after=1s',str(seconds)+'s']
-                    if args[0]=='save': extra += ['/usr/bin/prlimit','--fsize='+str(fedora_oci.SAVE_FILE_LIMIT)+':'+str(fedora_oci.SAVE_FILE_LIMIT)]
-                    prefix[index:index]=extra
-                    self.image_copy_active=True
-                    # The unlinked source spool cannot appear in du; charge it
-                    # independently before launch and throughout observation.
+                    operation = 'inspect' if args[:2]==('image','inspect') else args[0] if args and args[0] in ('load','save','build') else None
+                    require(operation is not None, 'unsupported local image operation')
                     try:
-                        self.storage_measurement()
-                    except BaseException:
-                        self.image_copy_active=False  # The worker has not been launched.
+                        prefix = list(self.podman)
+                        index = prefix.index('/usr/bin/podman')
+                        seconds = min(kwargs.get('timeout',120),self.phase_end-time.monotonic() if self.phase_end else 120)
+                        require(seconds > 0,'image copy deadline exhausted')
+                        extra = ['/usr/bin/env','-i','PATH=/usr/bin:/bin','TMPDIR='+str(copy_tmp),
+                                 '/usr/bin/timeout','--signal=TERM','--kill-after=1s',str(seconds)+'s']
+                        if args[0]=='save': extra += ['/usr/bin/prlimit','--fsize='+str(fedora_oci.SAVE_FILE_LIMIT)+':'+str(fedora_oci.SAVE_FILE_LIMIT)]
+                        prefix[index:index]=extra
+                        self.image_copy_active=True
+                        # The unlinked source spool cannot appear in du; charge it
+                        # independently before launch and throughout observation.
+                        try:
+                            self.storage_measurement()
+                        except BaseException:
+                            self.image_copy_active=False  # The worker has not been launched.
+                            raise
+                        self.engine_activity=True  # Even a failed launch may leave owned engine resources.
+                        value=self.bounded(prefix+list(args),seconds,'owned image copy')
+                        self.image_copy_active=False
+                        return value
+                    except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
+                        # Workspace reconciliation can raise while unwinding.
+                        # Preserve the first bounded operation failure separately
+                        # and re-raise the original, without claiming termination.
+                        if self.primary_image_failure is None:
+                            self.primary_image_failure=(operation,evidence_tail(error,3900))
                         raise
-                    value=self.bounded(prefix+list(args),seconds,'owned image copy')
-                    self.image_copy_active=False
-                    return value
                 base_proof = fedora_oci.import_image(local_image, plain)
             self.report['signed_container_base'] = base_proof
             build = self.root / 'tool-build'
@@ -835,7 +852,7 @@ class Probe:
             (build / 'Containerfile').write_text(tooling_recipe())
             shutil.copyfile(self.repo / 'tools/fedora_ci_qemu.py', build / 'qemu_entry.py')
             (self.root / 'empty-auth.json').write_text('{"auths":{}}\n')
-            self.image = local_image('build', '--pull=never', '--http-proxy=false', '--authfile=' + str(self.root / 'empty-auth.json'),
+            self.image = local_image('build', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--http-proxy=false', '--authfile=' + str(self.root / 'empty-auth.json'),
                                       '--memory=2g', '--cpu-quota=200000', '--force-rm',
                                       '--ulimit=fsize=2147483648:2147483648', '--iidfile=' + str(self.root / 'tool-image'),
                                       '--file=' + str(build / 'Containerfile'), str(build), timeout=600)
@@ -1002,7 +1019,8 @@ class Probe:
             with deadline(self.phase_end - time.monotonic()):
                 self.boot()
         except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
-            self.report['blocker'] = evidence_tail(exc, 4000)
+            primary = self.primary_image_failure if active == 'tooling' else None
+            self.report['blocker'] = evidence_tail('local image '+primary[0]+': '+primary[1] if primary else exc, 4000)
             self.phase(active, 'blocked', self.report['blocker'])
             emit_text('DP_BLOCKED ', self.report['blocker'], 4000)
         finally:
