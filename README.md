@@ -85,9 +85,14 @@ seven complete documents, two original UUID resumptions, four turns and final
 history/helper/marker/SQLite/unknown-UUID audits, with owned cleanup. That is finite
 delivery evidence, not model understanding or production authentication. The
 report summarizes delivery without separate per-startup call/output hashes.
-A separate source repair now keeps GPG cleanup uncertainty and exact live ownership
-sticky across interrupted reap; fresh review and native validation remain required.
-It is a diagnostic correction, not a runtime fix or a diagnosed native34 cause.
+The prior `65bd26b` cleanup repair passed 669 local tests but fresh review found
+four lifecycle defects, so that full pass is not acceptance. The replacement
+source uses a fixed immutable empty ISO home and the direct pinned recipient,
+removing writable-home creation/deletion. Narrow launch-publication signal
+deferral and explicit cancellation/primary arbitration are tested locally.
+Fresh review, a later combined full and separately authorized native validation
+remain required. This is diagnostic capability, not a runtime fix or a diagnosed
+native34 cause; local read-only DAC tests do not prove native ISO behavior.
 
 No production deployment is established.
 

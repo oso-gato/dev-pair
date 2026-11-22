@@ -6,22 +6,21 @@ import json
 import os
 from pathlib import Path
 import re
-import resource
 import selectors
 import secrets
 import signal
-import shutil
 import stat
 import subprocess
-import tempfile
 import time
+import threading
 
 RECIPIENT_SHA='020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c'
 FINGERPRINT='59CD9CD708EEB010F4A1BB6B83B33B576391877E'
 RECIPIENT=Path('/run/dev-pair-payload/native35-recipient.asc')
+HOME=Path('/run/dev-pair-payload/native35-gpg-home')
 PLAIN_LIMIT=8192
 CIPHER_LIMIT=16384
-REASONS=('not-collected','not-selected','incomplete','too-large','no-budget','recipient-unavailable','encryption-unavailable','encryption-cleanup-unresolved','report-budget','invalid')
+REASONS=('not-collected','not-selected','incomplete','too-large','no-budget','recipient-unavailable','home-unavailable','encryption-unavailable','encryption-cleanup-unresolved','report-budget','invalid')
 
 def canonical(value):return json.dumps(value,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()
 def unavailable(reason):return {'schema':1,'availability':'unavailable','reason':reason}
@@ -30,50 +29,71 @@ def digest(value):return hashlib.sha256(value).hexdigest()
 # One live diagnostic owner at most. Never a PID-based adoption registry.
 _PENDING=None
 
-class CleanupUnresolved(Exception):
-    def __init__(self,owner):
-        self.owner=owner
-        super().__init__('encryption cleanup unresolved')
+DIAGNOSTIC_ERRORS=(OSError,ValueError,subprocess.SubprocessError)
 
 def _cleanup_owned(owner):
     process=owner['process']
-    if process is not None:
-        if process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
-            process.wait(timeout=max(0,owner['end']-time.monotonic()))
-        if process.returncode is None:raise ValueError('exit unconfirmed')
-        for stream in (process.stdin,process.stdout,process.stderr):
-            if not stream.closed:stream.close()
-    # Only the held directory inode can authorize removal after confirmed reap.
-    info=os.fstat(owner['fd']);path=owner['home'].lstat()
-    if (info.st_dev,info.st_ino)!=(path.st_dev,path.st_ino) or not stat.S_ISDIR(path.st_mode) or stat.S_ISLNK(path.st_mode) or path.st_uid!=os.getuid():raise ValueError('owned directory changed')
-    shutil.rmtree(owner['home']);os.close(owner['fd']);owner['fd']=None
+    if process is None:return
+    if process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):os.killpg(process.pid,signal.SIGKILL)
+        process.wait(timeout=max(0,owner['end']-time.monotonic()))
+    if process.returncode is None:raise ValueError('exit unconfirmed')
+    for stream in (process.stdin,process.stdout,process.stderr):
+        if stream is not None and not stream.closed:stream.close()
 
 def reconcile_pending():
-    """Live exact ownership only; wait budget is the original end, never reset."""
+    """Live exact child only; original end is immutable, cancellation propagates."""
     global _PENDING
     if _PENDING is None:return True
     try:_cleanup_owned(_PENDING)
-    except BaseException:return False
+    except DIAGNOSTIC_ERRORS:return False
     _PENDING=None;return True
 
-def _encrypt(plain,key,end):
+def _publish_child(owner,args,kwargs):
+    # Main-thread handlers are deferred, not blocked/inherited across exec.
+    if threading.current_thread() is not threading.main_thread():raise ValueError('main thread required')
+    pending={};saved={}
+    def deferred(number,frame):pending.setdefault(number,frame)
+    original_error=None
+    try:
+        with contextlib.ExitStack() as restore:
+            for number in (signal.SIGALRM,signal.SIGINT,signal.SIGTERM,signal.SIGHUP):
+                handler=signal.getsignal(number)
+                if number not in (signal.SIGALRM,signal.SIGINT) and not callable(handler):continue
+                saved[number]=handler
+                signal.signal(number,deferred);restore.callback(signal.signal,number,handler)
+            process=subprocess.Popen(args,**kwargs)
+            owner['process']=process
+    except BaseException as error:
+        original_error=error
+        raise
+    finally:
+        # All previous handlers are restored before original delivery semantics.
+        for number,frame in pending.items():
+            handler=saved[number]
+            if handler==signal.SIG_IGN:continue
+            try:
+                if handler==signal.SIG_DFL:signal.raise_signal(number)
+                else:handler(number,frame)
+            except BaseException:
+                if original_error is None or isinstance(original_error,DIAGNOSTIC_ERRORS):raise
+    return process
+
+def _encrypt(plain,end):
     """Owned stock GPG, no plaintext files/arguments/environment or ambient keys."""
     global _PENDING
     if len(plain)>PLAIN_LIMIT:raise ValueError('capsule size')
-    home=Path(tempfile.mkdtemp(prefix='dev-pair-seal-'));home.chmod(0o700)
-    owner={'home':home,'fd':os.open(home,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW),'process':None,'end':end}
+    owner={'process':None,'end':end}
     operation_end=end-.25
-    process=None;selector=selectors.DefaultSelector();buffers={'stdout':bytearray(),'stderr':bytearray()};position=0
+    process=None;original_error=None;selector=selectors.DefaultSelector();buffers={'stdout':bytearray(),'stderr':bytearray()};position=0
     try:
-        public=home/'recipient.asc';public.write_bytes(key);public.chmod(0o400)
+        _PENDING=owner
         if time.monotonic()>=operation_end:raise ValueError('capsule deadline')
-        process=subprocess.Popen(['/usr/bin/gpg','--no-options','--batch','--no-tty','--homedir',str(home),
-            '--no-autostart','--no-auto-key-retrieve','--trust-model','always','--recipient-file',str(public),
-            '--compress-algo','none','--output','-','--encrypt'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
-            preexec_fn=lambda:resource.setrlimit(resource.RLIMIT_CORE,(0,0)),
-            env={'PATH':'/usr/bin:/bin','HOME':str(home),'LANG':'C','LC_ALL':'C'},start_new_session=True)
-        owner['process']=process
+        args=['/usr/bin/prlimit','--core=0:0','--','/usr/bin/gpg','--no-options','--batch','--no-tty','--homedir',str(HOME),
+            '--no-autostart','--no-auto-key-retrieve','--no-default-keyring','--no-keyring','--no-auto-check-trustdb','--no-random-seed-file',
+            '--trust-model','always','--recipient-file',str(RECIPIENT),'--compress-algo','none','--output','-','--encrypt']
+        process=_publish_child(owner,args,dict(stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+            env={'PATH':'/usr/bin:/bin','HOME':str(HOME),'LANG':'C','LC_ALL':'C'},start_new_session=True))
         for stream in (process.stdin,process.stdout,process.stderr):os.set_blocking(stream.fileno(),False)
         selector.register(process.stdin,selectors.EVENT_WRITE,'stdin');selector.register(process.stdout,selectors.EVENT_READ,'stdout');selector.register(process.stderr,selectors.EVENT_READ,'stderr')
         while selector.get_map():
@@ -92,14 +112,26 @@ def _encrypt(plain,key,end):
                         if len(buffers[event.data])>(CIPHER_LIMIT if event.data=='stdout' else 4096):raise ValueError('capsule capture')
         if process.wait(timeout=max(0,operation_end-time.monotonic()))!=0 or not buffers['stdout']:raise ValueError('capsule encryption')
         return bytes(buffers['stdout'])
+    except BaseException as error:
+        original_error=error
+        raise
     finally:
         try:
             selector.close()
             _cleanup_owned(owner)
-        except BaseException:
-            # Store before raising; no later close can replace this uncertainty.
+        except BaseException as error:
             _PENDING=owner
-            raise CleanupUnresolved(owner) from None
+            if original_error is None or isinstance(original_error,DIAGNOSTIC_ERRORS) and not isinstance(error,DIAGNOSTIC_ERRORS):raise
+            # Preserve the original cancellation/error; uncertainty stays separate.
+        else:_PENDING=None
+
+def _home():
+    # The fixed authenticated payload ISO supplies an empty root-owned RO home.
+    fd=os.open(HOME,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        info=os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_mode&0o222 or os.listdir(fd) or not os.fstatvfs(fd).f_flag&os.ST_RDONLY:raise ValueError('immutable home')
+    finally:os.close(fd)
 
 def _recipient():
     fd=os.open(RECIPIENT,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
@@ -130,15 +162,14 @@ def seal(buffers,payload,identity,end):
         plain=canonical(envelope)
         if len(plain)>PLAIN_LIMIT:return unavailable('too-large')
         if end-time.monotonic()<=0:return unavailable('no-budget')
-        try:key=_recipient()
+        try:_recipient()
         except FileNotFoundError:return unavailable('not-collected')
         except (OSError,ValueError):return unavailable('recipient-unavailable')
-        try:cipher=_encrypt(plain,key,min(end,time.monotonic()+5))
-        except CleanupUnresolved as error:
-            _PENDING=error.owner
-            return unavailable('encryption-cleanup-unresolved')
-        except subprocess.TimeoutExpired:return unavailable('encryption-unavailable')
-        except Exception:return unavailable('encryption-unavailable')
+        try:_home()
+        except (OSError,ValueError):return unavailable('home-unavailable')
+        try:cipher=_encrypt(plain,min(end,time.monotonic()+5))
+        except DIAGNOSTIC_ERRORS:
+            return unavailable('encryption-cleanup-unresolved' if _PENDING is not None else 'encryption-unavailable')
         return {'schema':1,'availability':'sealed','attempt_id':attempt,'identity':identity,'uid':payload['uid'],'status':payload['status'],
             'recipient_sha256':RECIPIENT_SHA,'fingerprint':FINGERPRINT,'ciphertext_bytes':len(cipher),'ciphertext_sha256':digest(cipher),'ciphertext_base64':base64.b64encode(cipher).decode()}
     except (KeyError,TypeError,ValueError,AttributeError):return unavailable('invalid')

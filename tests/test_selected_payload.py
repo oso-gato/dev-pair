@@ -34,12 +34,16 @@ class CapsuleTests(unittest.TestCase):
         if p.returncode:raise AssertionError('synthetic key generation failed')
         cls.key=subprocess.check_output(args+['--export'],env=env,timeout=3)
         cls.env=env;cls.args=args
+        cls.empty=cls.home/'empty';cls.empty.mkdir(mode=0o500)
+        cls.recipient=cls.home/'recipient.asc';cls.recipient.write_bytes(cls.key);cls.recipient.chmod(0o400)
     @classmethod
     def tearDownClass(cls):
         subprocess.run(['/usr/bin/gpgconf','--homedir',str(cls.home),'--kill','gpg-agent'],env=cls.env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=3)
         cls.directory.cleanup()
+    def setUp(self):
+        self.enterContext(patch.object(s,'HOME',self.empty));self.enterContext(patch.object(s,'RECIPIENT',self.recipient))
     def seal(self,buffers,payload,end=None):
-        with patch.object(s,'_recipient',return_value=self.key):return s.seal(buffers,payload,IDENTITY,time.monotonic()+4 if end is None else end)
+        with patch.object(s,'_recipient',return_value=self.key),patch.object(s,'_home',return_value=None):return s.seal(buffers,payload,IDENTITY,time.monotonic()+4 if end is None else end)
     def decrypt(self,cipher):
         p=subprocess.run(self.args+['--decrypt'],input=cipher,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=self.env,timeout=3)
         self.assertEqual(p.returncode,0);return p.stdout
@@ -52,7 +56,7 @@ class CapsuleTests(unittest.TestCase):
                 self.assertLessEqual(len(plain),8192);self.assertEqual(envelope['identity'],IDENTITY);self.assertTrue(s.verify_plaintext(plain,result,EXPECTED,payload))
                 self.assertEqual(envelope['attempt_id'],result['attempt_id']);self.assertEqual(envelope['status'],125)
                 for name,data in buffers.items():self.assertEqual(base64.b64decode(envelope['streams'][name]['base64']),data)
-                self.assertEqual(s.project(result,EXPECTED,payload),result);self.assertEqual(guest.sealed_load_projection(result,EXPECTED,payload),result)
+                self.assertEqual(s.project(result,EXPECTED,payload),result);self.assertEqual(guest.sealed_load_projection(result,EXPECTED,payload),result);self.assertEqual(list(self.empty.iterdir()),[])
                 tampered=bytearray(cipher);tampered[len(tampered)//2]^=1
                 p=subprocess.run(self.args+['--decrypt'],input=tampered,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=self.env,timeout=3)
                 self.assertNotEqual(p.returncode,0)
@@ -66,7 +70,9 @@ class CapsuleTests(unittest.TestCase):
         buffers,payload=operands(b'x'*low);value=self.seal(buffers,payload)
         self.assertEqual(value['availability'],'sealed');self.assertLessEqual(len(self.decrypt(base64.b64decode(value['ciphertext_base64']))),8192)
         buffers,payload=operands(b'x'*high);self.assertEqual(self.seal(buffers,payload)['reason'],'too-large')
-        with self.assertRaises(ValueError):s._encrypt(b'PRIVATE',b'invalid public key',time.monotonic()+2)
+        with tempfile.TemporaryDirectory() as directory:
+            wrong=Path(directory)/'wrong';wrong.write_bytes(b'invalid public key')
+            with patch.object(s,'RECIPIENT',wrong),self.assertRaises(ValueError):s._encrypt(b'PRIVATE',time.monotonic()+2)
         with tempfile.TemporaryDirectory() as directory:
             p=subprocess.run(['/usr/bin/gpg','--no-options','--batch','--no-autostart','--homedir',directory,'--decrypt'],input=base64.b64decode(value['ciphertext_base64']),stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=self.env,timeout=2)
             self.assertNotEqual(p.returncode,0)
@@ -99,6 +105,7 @@ class CapsuleTests(unittest.TestCase):
         values=[item.value for item in lists[0].elts if isinstance(item,ast.Constant)]
         self.assertEqual(values[values.index('-uid'):values.index('-uid')+4],['-uid','0','-gid','0'])
         self.assertIn('native35-recipient.asc=/payload/native35-recipient.asc',values)
+        self.assertIn('native35-gpg-home=/payload/native35-gpg-home',values)
         self.assertIn('manifest.json=/payload/manifest.json',values);self.assertIn('maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz',values)
     def test_bounded_header_variants_and_incomplete_streams(self):
         buffers,payload=operands(b'x'*5100)
@@ -138,11 +145,11 @@ class CapsuleTests(unittest.TestCase):
         original=subprocess.Popen;children=[]
         def launch(args,**kwargs):
             child=original([sys.executable,'-c','import time;time.sleep(10)'],**kwargs);children.append(child);return child
-        with patch.object(s.subprocess,'Popen',side_effect=launch),self.assertRaises(ValueError):s._encrypt(b'PRIVATE',self.key,time.monotonic()+.4)
+        with patch.object(s.subprocess,'Popen',side_effect=launch),self.assertRaises(ValueError):s._encrypt(b'PRIVATE',time.monotonic()+.4)
         self.assertTrue(all(p.returncode is not None for p in children))
         def flood(args,**kwargs):
             child=original([sys.executable,'-c','import os;os.write(1,b"x"*20000)'],**kwargs);children.append(child);return child
-        with patch.object(s.subprocess,'Popen',side_effect=flood),self.assertRaises(ValueError):s._encrypt(b'PRIVATE',self.key,time.monotonic()+2)
+        with patch.object(s.subprocess,'Popen',side_effect=flood),self.assertRaises(ValueError):s._encrypt(b'PRIVATE',time.monotonic()+2)
         self.assertTrue(all(p.returncode is not None for p in children))
     def test_fixed_recipient_symlink_writable_foreign_and_wrong_bytes_reject(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -168,6 +175,8 @@ class CapsuleTests(unittest.TestCase):
         with self.assertRaises(ValueError):guest.encode_report({'diagnostics':value,'other':'x'*65536})
 
 class ChannelTests(previous.RealPayloadTests):
+    def setUp(self):
+        super().setUp();self.enterContext(patch.object(s,'_home',return_value=None))
     def test_real_verified_payload_encrypt_failure_keeps_primary_and_cleanup(self):
         import selected_payload
         # Module is loaded from exact source sibling dynamically; patch its shared GPG launcher.

@@ -322,8 +322,10 @@ verified relay, matching maintenance UID and nonzero payload status can seal a
 capsule. A canonical in-memory envelope includes source/context, unique attempt,
 executor unit/UID, status and complete stdout/stderr counts, hashes and lossless
 base64 bytes. Its maximum is 8 KiB; stock GPG encrypts through private pipes with
-an isolated owned temporary home and the sole pinned public recipient. No
-plaintext file, argv, environment, public tail or fallback is written. GPG's
+the fixed empty read-only payload ISO home and sole pinned public recipient directly.
+It creates no runtime home, key copy, keyring, trustdb or random-seed file. No
+plaintext file, argv, environment, public tail or fallback is written. The existing `/usr/bin/prlimit --core=0:0 -- /usr/bin/gpg` chain replaces a Python
+preexec callback. No signal mask is blocked or inherited across exec. GPG's
 maximum five seconds is clipped to the original command/phase deadline and
 includes a reserved reap interval; ciphertext is capped at 16 KiB. A cleanup
 uncertainty has its own closed unavailable reason and cannot replace the engine's
@@ -348,13 +350,33 @@ separate authorization. Production runtime/jobs, authentication, nested placemen
 hard quota, renewal, tailnet and release/deployment gates remain unclosed.
 
 
-The independent f451b33 review found that a phase signal during final GPG wait
-could lose unconfirmed cleanup and remove the public temporary home. The repair
-retains at most one exact live Popen handle and held directory descriptor; no
-PID-based adoption or persistent cleanup authority is introduced. Any interrupted
-reap or pipe cleanup returns `encryption-cleanup-unresolved` and keeps the owned
-public home while blocking further collection. Bounded reconciliation uses only
-the original end time, never a fresh allowance, and removes the home only after
-confirmed reap plus directory identity checks. A replaced/foreign path is retained.
-The original engine primary and native cleanup failure keep their existing
-precedence. Exact repaired-source review is required before any native35 run.
+The independent f451b33 review found lost cleanup uncertainty. The subsequent
+65bd26b repair passed 669 local tests but fresh review found a launch/publication
+signal gap, replacement-path deletion, swallowed cancellation and unreconcilable
+post-removal descriptor release. Those failures remain evidence; its full pass
+does not close them.
+
+The replacement removes runtime writable home/key-copy/deletion and directory-FD
+reconciliation entirely. The controller stages one fixed empty public directory
+on the existing authenticated payload ISO, with deterministic root UID/GID
+metadata. The helper admits that exact directory only when root-owned,
+nonwritable, empty and on a read-only filesystem; it validates the existing exact
+recipient independently. Actual mounted Fedora behavior remains unproved locally.
+Stock GPG uses no-options/no-autostart/no-auto-key-retrieve/no-default-keyring/
+no-keyring/no-auto-check-trustdb/no-random-seed-file. Owned synthetic-key roundtrips
+use an unchanged empty 0500 home with actual UID1000 DAC write denial, not an
+immutable-mount or hostile-owner proof. The earlier research's failed bwrap setup
+is preserved separately; no confinement workaround is used in the product.
+
+Only the main-thread signal handlers are deferred across Popen return and exact
+owner publication. Prior handlers are restored and pending delivery invokes their
+original semantics immediately, including when process creation fails. No timer
+is reset; no Python preexec callback or inherited blocked mask is used. This is
+operational ownership protection, not a hostile-kernel hard-wall guarantee.
+One actual Popen owner remains only while reap/pipe cleanup is unconfirmed;
+subsequent collection is blocked, and reconciliation uses the original end time.
+Direct KeyboardInterrupt/SystemExit and phase cancellation propagate. Bootstrap
+keeps an already-known engine primary/native cleanup result over a secondary
+diagnostic cancellation; absent an original primary, cancellation propagates.
+No runtime filesystem deletion or path reclamation remains. Fresh exact review,
+a later combined full and a separately scoped native35 run are still required.

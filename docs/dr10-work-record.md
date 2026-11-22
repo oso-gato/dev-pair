@@ -3,6 +3,51 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 05:09 HKT — immutable GPG inputs and cancellation repair
+
+- Fresh review of 65bd26b found four defects despite its 669-test local full pass:
+  real phase signal between Popen return and owner publication lost the child;
+  path-based deletion could remove a replacement; cancellation was swallowed;
+  removal followed by interrupted FD close could not reconcile. The original
+  verdict/reproductions remain immutable. That full pass is base evidence only.
+- Evidence-backed research supports using the exact public recipient directly and
+  a fixed empty read-only home, eliminating runtime mkdir/key copy/rmtree/home-FD
+  cleanup. Research GPG 2.4.7 encrypted 8,192 bytes into 8,525 bytes and authenticated
+  exact decryption; UID1000 0500-home writes were denied and the home stayed empty.
+  This was DAC-only after a preserved failed bwrap setup, not native mount proof.
+- The existing public payload ISO now includes a fixed empty home. Admission checks
+  its directory/type/root ownership/nonwritability/emptiness and read-only filesystem;
+  the recipient retains its exact 673-byte hash and 40-hex fingerprint. Runtime
+  arguments use existing prlimit core0 and stock GPG's source-fixed no-keyring,
+  no-trustdb and no-random-seed flags, without Python preexec or ambient key input.
+  No production private key is read, copied, used or uploaded.
+- Narrow main-thread handler deferral spans actual Popen return through exact child
+  publication. All prior handlers are restored before pending original delivery;
+  failed launch still delivers pending phase cancellation. No signal mask/timer
+  reset, generic signal manager, registry or new cleanup allowance is introduced.
+- At most one actual Popen owner remains while reap/pipe cleanup is unconfirmed.
+  Direct KeyboardInterrupt/SystemExit/phase cancellation propagates; reconciliation
+  does not swallow cancellation. A known engine primary/native cleanup result keeps
+  its existing precedence over a secondary diagnostic cancellation. Confirmed reap
+  and pipe closure are idempotent, with no directory removal or foreign-path state.
+- The final affected run passed 134 tests in 19.775 seconds. Local affected
+  tests and copied, redirected boundary probes cover actual signals
+  at publication, existing phase timer truth, direct cancellation/reconciliation,
+  prlimit/core/mask/argv, exact immutable-input checks, synthetic roundtrip and strict
+  envelope/report/primary privacy bounds. Evidence is under
+  `/workspace/artifacts/native-gpg-immutable-20261122/`. No full suite runs before
+  fresh review; a later root-scoped combined full remains required.
+- All session/dependency/registry/ledger/default policy/helper bytes stay exactly
+  reviewed and stock-passed 64b74b4. Its finite seven-synthetic-document/four-turn/
+  two-original-UUID and final audits remain component evidence, without separate
+  per-startup pair hashes or real model understanding/auth/production admission.
+  Native34 remains signed-load125 with unknown cause; no native35 is executed.
+- Allocation: 20:58:42–21:23:42 UTC, no extension. API-selected GPT-6.1 Sol/high is
+  the builder; backend attestation remains unavailable. Only owned synthetic test
+  keys/processes are used; no stock/native/CI/network/SSH/auth/real-model,
+  push/merge or deployment action occurs. Fresh exact review is still required.
+
+
 ### November 23, 2026, 04:48 HKT — sticky owned GPG cleanup repair
 
 - Fresh f451b33 review confirmed one R1: phase-style SIGALRM/Blocked during final

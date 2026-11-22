@@ -1063,7 +1063,12 @@ class Commands:
                     try:
                         sealed_payload=selected_payload.seal(buffers,payload,getattr(self,'_selected_payload_identity',None),
                             min(command_end,self.execution_deadline() or command_end))
-                    except Exception:sealed_payload={'schema':1,'availability':'unavailable','reason':'encryption-unavailable'}
+                    except BaseException:
+                        # A secondary diagnostic cannot replace an existing primary.
+                        # Without that original primary, cancellation must propagate.
+                        if not primary_pending:raise
+                        sealed_payload={'schema':1,'availability':'unavailable','reason':
+                            'encryption-cleanup-unresolved' if selected_payload._PENDING is not None else 'encryption-unavailable'}
             if probe and self.diagnostic:
                 actual = process.returncode if process is not None else None
                 notify(self.diagnostic,buffers,actual if actual is not None and actual not in ok else status)

@@ -1223,7 +1223,7 @@ def sealed_load_projection(value,expected,payload=None):
     try:
         if type(value) is not dict:return sealed_unavailable('invalid')
         if value.get('availability')=='unavailable':
-            return value if set(value)=={'schema','availability','reason'} and type(value['schema']) is int and value['schema']==1 and value['reason'] in ('not-collected','not-selected','incomplete','too-large','no-budget','recipient-unavailable','encryption-unavailable','encryption-cleanup-unresolved','report-budget','invalid') else sealed_unavailable('invalid')
+            return value if set(value)=={'schema','availability','reason'} and type(value['schema']) is int and value['schema']==1 and value['reason'] in ('not-collected','not-selected','incomplete','too-large','no-budget','recipient-unavailable','home-unavailable','encryption-unavailable','encryption-cleanup-unresolved','report-budget','invalid') else sealed_unavailable('invalid')
         keys={'schema','availability','attempt_id','identity','uid','status','recipient_sha256','fingerprint','ciphertext_bytes','ciphertext_sha256','ciphertext_base64'}
         if not (set(value)==keys and type(value['schema']) is int and value['schema']==1 and value['availability']=='sealed'):raise ValueError("sealed schema")
         if not (type(value['attempt_id']) is str and re.fullmatch('[0-9a-f]{32}',value['attempt_id'])):raise ValueError('attempt')

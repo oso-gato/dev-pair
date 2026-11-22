@@ -964,6 +964,8 @@ class Probe:
         require(file_hash(recipient)=='020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c', 'Diagnostic recipient mismatch')
         shutil.copyfile(recipient,payload/'native35-recipient.asc')
         (payload/'native35-recipient.asc').chmod(0o444)
+        (payload/'native35-gpg-home').mkdir(mode=0o555)
+        (payload/'native35-gpg-home').chmod(0o555)
         shutil.copyfile(helper, payload / 'public_inputs.py')
         (payload / 'public_inputs.py').chmod(0o444)
         shutil.copyfile(self.repo / 'tools/fedora_oci.py', payload / 'fedora_oci.py')
@@ -983,7 +985,7 @@ class Probe:
         # Base disk is excluded from the source ISO to avoid duplication.
         self.helper(self.run_args('/usr/bin/genisoimage') + [self.image, '-quiet', '-output', '/disks/payload.iso',
                     '-volid', 'DPPAYLOAD', '-joliet', '-rock', '-uid', '0', '-gid', '0', '-graft-points',
-                    'native35-recipient.asc=/payload/native35-recipient.asc', 'guest.py=/payload/guest.py', 'public_inputs.py=/payload/public_inputs.py', 'fedora_oci.py=/payload/fedora_oci.py',
+                    'native35-gpg-home=/payload/native35-gpg-home', 'native35-recipient.asc=/payload/native35-recipient.asc', 'guest.py=/payload/guest.py', 'public_inputs.py=/payload/public_inputs.py', 'fedora_oci.py=/payload/fedora_oci.py',
                     'manifest.json=/payload/manifest.json', 'maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz'])
         base_info = json.loads(self.helper(self.run_args('/usr/bin/qemu-img') +
                                           [self.image, 'info', '--output=json', '/payload/base.qcow2']))
