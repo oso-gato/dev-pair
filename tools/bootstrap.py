@@ -134,6 +134,24 @@ def _canonical_role_id(value):
     return result
 
 
+def role_subordinate_range(content, name, uid, start):
+    """Use the same allocation and overlap predicate for provisioning and readback."""
+    wanted = f'{name}:{start}:65536'
+    own = []
+    for line in content.splitlines():
+        parts = line.split(':')
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            raise Blocked('malformed subordinate ID configuration')
+        who, begin, count = parts[0], int(parts[1]), int(parts[2])
+        if who in (name, uid):
+            own.append(line)
+        elif begin < start + 65536 and start < begin + count:
+            raise Blocked('subordinate ID range overlaps an existing account')
+    if own and own != [wanted]:
+        raise Blocked('conflicting subordinate ID allocation')
+    return bool(own)
+
+
 def sudo_package_projection(stdout, stderr, complete, status):
     value = {'availability': 'unavailable', 'supported': False,
              'provenance': 'package-only', 'policy_plugin_verified': False}
@@ -1760,20 +1778,8 @@ class Bootstrap:
         if substart is not None:
             for file in ('/etc/subuid', '/etc/subgid'):
                 content = self.text(file)
-                wanted = f'{name}:{substart}:65536'
-                own = []
-                for line in content.splitlines():
-                    parts = line.split(':')
-                    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-                        raise Blocked('malformed subordinate ID configuration')
-                    who, begin, count = parts[0], int(parts[1]), int(parts[2])
-                    if who in (name, fields[2]):
-                        own.append(line)
-                    elif begin < substart + 65536 and substart < begin + count:
-                        raise Blocked('subordinate ID range overlaps an existing account')
-                if own and own != [wanted]:
-                    raise Blocked('conflicting subordinate ID allocation')
-                if not own:
+                if not role_subordinate_range(content, name, fields[2], substart):
+                    wanted = f'{name}:{substart}:65536'
                     self.atomic(file, content.rstrip('\n') + ('\n' if content else '') + wanted + '\n',
                                 mode=0o644, expected=content)
             self.run('/usr/bin/loginctl', 'enable-linger', name)
@@ -2002,10 +2008,12 @@ class Bootstrap:
         spec.loader.exec_module(module)
         return module
 
-    def check_gptbox_inputs(self, context, expected):
+    def check_gptbox_inputs(self, context, expected, *, expected_role='maintenance'):
         """Python-only input checks before any mutation; does not admit source or runtime."""
+        if expected_role not in ('maintenance', 'development'):
+            raise Blocked('unsupported expected gptbox context role')
         if platform.machine() != 'x86_64':
-            raise Blocked('current pinned Codex context supports x86_64 maintenance builds only')
+            raise Blocked('current pinned Codex context supports x86_64 builds only')
         if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected):
             raise Blocked('a separately trusted context SHA256 is required')
         tool = self.candidate_tool()
@@ -2020,8 +2028,8 @@ class Bootstrap:
                     raise Blocked('gptbox context must be root-owned, protected and nonsymlink')
         try:
             _, manifest = tool._verify_content(source, expected)
-            if manifest['role'] != 'maintenance':
-                raise Blocked('first bootstrap accepts only maintenance-role gptbox contexts')
+            if manifest['role'] != expected_role:
+                raise Blocked(f'this operation accepts only {expected_role}-role gptbox contexts')
         except (OSError, ValueError, subprocess.SubprocessError):
             raise Blocked('gptbox context/source verification failed; no host changes permitted') from None
         return tool, source, manifest
