@@ -153,12 +153,20 @@ class GptboxTests(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.parent.chmod(0o700)
         path.write_text('fixture prepared state, not host evidence')
-        self.app.atomic(g.STATE+'/gptbox-image.json',json.dumps({'source_sha':SOURCE,'context_sha256':EXPECTED,'image_id':'f'*64})+'\n')
+        # Completion is installed after the known synthetic Codex/proof inputs below.
         self.context = self.root / 'input'
         self.context.mkdir()
         import fedora_input_fixture
         fedora_input_fixture.install(self)
         (self.context / 'codex').write_bytes(b'fixture NOT CODEX')
+        import fedora_input_fixture
+        legacy={'kind':'host-maintenance-gptbox-oci-candidate','source_sha':SOURCE,'context_sha256':EXPECTED,'image_id':'f'*64,
+            'base_image':g.FEDORA,'codex_sha256':hashlib.sha256((self.context/'codex').read_bytes()).hexdigest(),
+            'local_tag':'localhost/dev-pair/maintenance-gptbox:'+EXPECTED,'runtime_user':'dp-maint','storage_driver':'vfs',
+            'launch':'blocked: stock Distrobox 1.8.2.5 adds privileged, label=disable and host mounts','distrobox_assembled':False,'runtime_validated':False,
+            'fedora_base':fedora_input_fixture.synthetic_import(lambda *a,**k:None,Path('/synthetic'))}
+        self.app.atomic(g.STATE+'/gptbox-image.json',json.dumps(legacy)+'\n')
+        self.engine.images['f'*64]={'Id':'f'*64,'Architecture':'amd64','Os':'linux','Labels':{'dev-pair.context':EXPECTED,'org.opencontainers.image.revision':SOURCE,'dev-pair.role':'maintenance','dev-pair.standards':g.candidate.STANDARDS,'dev-pair.codex.version':'0.169.0'}}
         self.disk = patch.object(g.shutil, 'disk_usage', return_value=SimpleNamespace(free=16 * 1024 ** 3))
         self.disk.start()
         self.addCleanup(self.disk.stop)

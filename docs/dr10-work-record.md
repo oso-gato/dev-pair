@@ -3,6 +3,27 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 02:23 HKT — one-image review repairs, source only
+
+- The independent one-image review found two failures: diagnostic callbacks could
+  replace the earlier command failure, and public assembly could accept a corrupt
+  prepared completion. The original candidate and failing evidence remain frozen.
+- Command callbacks now retain the pending execution failure and existing cleanup
+  precedence. A callback-only failure remains a closed rejection. Probe metadata
+  requires a successfully recorded current diagnostic, so a failed append cannot
+  modify an earlier recent/failure entry.
+- Public assembly validates the supported legacy or full completion schema, exact
+  pins and signed import proof before adapter effects, then verifies the original
+  immutable image and labels. The original minimal image record remains unchanged.
+  Unknown or corrupt records are rejected without recipe migration.
+- Affected real-pipe, timeout/cleanup, callback matrix, history and lifecycle tests
+  are recorded in `/workspace/artifacts/image-p2-repair-20261122/`. The earlier
+  582-test full pass belongs to frozen 19c30bc only; this repair has no new full
+  suite, native run or deployment proof. All deadlines, admission/security and
+  cleanup bounds remain unchanged. API selection is GPT-6.1 Sol/high; backend
+  attestation is unavailable. Fresh exact-candidate review is still required.
+
+
 ### November 23, 2026, 02:11 HKT — one-image initialization source candidate
 
 - Fresh initialization now holds the existing global bootstrap lock across an

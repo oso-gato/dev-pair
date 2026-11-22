@@ -666,6 +666,7 @@ class Commands:
         process = None
         completed = False
         capture_complete = False
+        primary_pending = False
         special_result = None
         transport = None
         decoder = None
@@ -943,6 +944,7 @@ class Commands:
             completed = True
             return result
         except (OSError, ValueError, subprocess.SubprocessError) as error:
+            primary_pending=True
             capture_failure(error)
             known = {'Lookup directory timestamp did not advance': 'lookup-mtime-not-advanced', 'Unknown manager UnitPath': 'manager-paths-rejected',
                      'Unknown applicable drop-in': 'unknown-drop-in', 'Applicable dependency effects are forbidden': 'dependency-effects',
@@ -965,6 +967,7 @@ class Commands:
             status = 'failed-or-timed-out'
             raise Blocked('command failed or timed out; output withheld') from None
         except BaseException as error:
+            primary_pending=True
             capture_failure(error)
             if admission_stage != 'cache-recheck' or not admission_reason.startswith('cache-'):
                 admission_reason = 'blocked-or-interrupted'
@@ -972,6 +975,12 @@ class Commands:
                 status = 'interrupted-or-failed'
             raise
         finally:
+            callback_failed=False
+            def notify(callback,*values):
+                nonlocal callback_failed
+                try:callback(*values)
+                except Exception:
+                    callback_failed=True  # No raw callback exception enters public diagnostics.
             cleanup_error = None
             if transport is not None:
                 try:
@@ -1005,7 +1014,7 @@ class Commands:
                 process.stderr.close()
             if probe and self.diagnostic:
                 actual = process.returncode if process is not None else None
-                self.diagnostic(buffers, actual if actual is not None and actual not in ok else status)
+                notify(self.diagnostic,buffers,actual if actual is not None and actual not in ok else status)
             if (not probe and self.diagnostic) or self.metadata_diagnostic:
                 record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
@@ -1039,15 +1048,17 @@ class Commands:
                 if not completed or type(status) is int and status != 0:
                     record['native'] = self.native_diagnostic(args)
                 if self.metadata_diagnostic:
-                    self.metadata_diagnostic(dict(record))
+                    notify(self.metadata_diagnostic,dict(record))
                 if public:
                     record.update(output_bytes=total, capture_limit_bytes=maximum,
                                   **{name + '_tail': bytes(data[-8192:]).decode(errors='replace') for name, data in buffers.items()},
                                   **{name + '_truncated': len(data) > 8192 for name, data in buffers.items()})
                 if self.diagnostic and not probe:
-                    self.diagnostic(record)
+                    notify(self.diagnostic,record)
             if cleanup_error is not None:
                 raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime') from None
+            if callback_failed and not primary_pending:
+                raise Blocked('required command diagnostics unavailable; output withheld') from None
 
 def checked_file(path, *, secret=False):
     p = Path(path)

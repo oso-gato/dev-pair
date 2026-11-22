@@ -133,7 +133,9 @@ class Gptbox(Bootstrap):
         image_diagnostic=bool(getattr(self,'image_phase_active',False))
         previous_metadata = self.run.metadata_diagnostic if isinstance(self.run, Commands) else None
         if isinstance(self.run, ProbeCommands):
+            current_diagnostic_recorded=False
             def diagnostic(buffers, status):
+                nonlocal current_diagnostic_recorded
                 path = self.target + '/diagnostics.json'
                 prior = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
                 entry = {'status': status, 'scope': 'credential-free assembly/probe',
@@ -145,7 +147,9 @@ class Gptbox(Bootstrap):
                 if status != 0:
                     prior['failures'] = (prior['failures'] + [entry])[-4:]
                 self.record('diagnostics', prior)
+                current_diagnostic_recorded=True
             def metadata(record):
+                if not current_diagnostic_recorded:raise Blocked('current command diagnostic record unavailable')
                 path = self.target + '/diagnostics.json'
                 history = json.loads(self.text(path, '{"recent":[],"failures":[]}'))
                 selected = {key: record[key] for key in ('operation_id','step','admission_stage', 'admission_outcome', 'admission_reason', 'relay_failure', 'relay_verified', 'native_exit_status', 'accepted_exit', 'elapsed_seconds','native_failure') if key in record}
@@ -363,6 +367,38 @@ class Gptbox(Bootstrap):
             raise Blocked('storage prepared identity mismatch')
         return self.observe_storage('assembled-postcleanup',revision,expected,prepared['image_id'],sealed)
 
+    def _prepared_completion(self,context,expected,revision,manifest):
+        path=self.protected(self.path(STATE+'/gptbox-image.json'))
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as stream:
+            node=os.fstat(stream.fileno())
+            if not stat.S_ISREG(node.st_mode) or node.st_nlink!=1 or stat.S_IMODE(node.st_mode)!=0o600 or node.st_size>16384:raise Blocked('unsafe prepared completion')
+            try:record=json.loads(stream.read(16385),object_pairs_hook=fedora_oci.unique)
+            except (ValueError,UnicodeError):raise Blocked('invalid prepared completion JSON') from None
+        if type(record) is not dict:raise Blocked('invalid prepared completion')
+        common=(record.get('source_sha')==revision and record.get('context_sha256')==expected and record.get('base_image')==FEDORA and
+            record.get('codex_sha256')==manifest['codex']['sha256'] and record.get('distrobox_assembled') is False and record.get('runtime_validated') is False and
+            type(record.get('image_id')) is str and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}',record['image_id']))
+        if not common:raise Blocked('prepared completion target/pins mismatch')
+        if record.get('kind')=='host-maintenance-gptbox-oci-candidate':
+            keys=set('kind source_sha context_sha256 base_image codex_sha256 image_id local_tag runtime_user storage_driver launch distrobox_assembled runtime_validated fedora_base'.split())
+            if not keys<=set(record)<=keys|{'logical_storage'} or record['local_tag']!='localhost/dev-pair/maintenance-gptbox:'+expected or record['runtime_user']!='dp-maint' or record['storage_driver']!='vfs' or record['launch']!='blocked: stock Distrobox 1.8.2.5 adds privileged, label=disable and host mounts':raise Blocked('unsupported legacy prepared completion')
+            if 'logical_storage' in record:
+                value=record['logical_storage']
+                if type(value) is not dict or set(value)!={'logical_size_bytes','layer_count','layer_digests','semantics'} or value['semantics']!='logical-descriptors-not-unique-physical-usage':raise Blocked('invalid legacy logical descriptors')
+                size=value['logical_size_bytes'];layers=value['layer_digests'];count=value['layer_count']
+                if not (size is None or type(size) is int and 0<=size<2**63) or not (layers is None and count is None or type(layers) is list and len(layers)<=128 and type(count) is int and count==len(layers) and all(type(v) is str and re.fullmatch('sha256:[0-9a-f]{64}',v) for v in layers)):raise Blocked('invalid legacy logical descriptors')
+        elif record.get('kind')=='full-adapter-candidate':
+            keys=set('schema kind source_sha context_sha256 standards_sha base_image codex_sha256 distrobox_sha init_sha256 runtime_sha256 inputs_sha256 recipe_sha256 platform distrobox_assembled runtime_validated image_id fedora_base'.split())
+            if set(record)!=keys or type(record['schema']) is not int or record['schema']!=1 or record['standards_sha']!=candidate.STANDARDS or record['distrobox_sha']!=DBX_SHA or record['platform']!={'os':'linux','architecture':'amd64'} or record['runtime_sha256']!=sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes()) or record['init_sha256']!=sha(self.scripts['distrobox-init']):raise Blocked('invalid full prepared completion')
+            build=self.path('/var/lib/dev-pair/artifacts/gptbox-adapter/'+expected+'/build')
+            for name,key in (('inputs.json','inputs_sha256'),('Containerfile','recipe_sha256')):
+                if sha(self.protected(build/name).read_bytes())!=record[key]:raise Blocked('prepared recipe/input hash mismatch')
+        else:raise Blocked('unknown prepared recipe kind')
+        try:fedora_oci.validate_import_proof(record['fedora_base'])
+        except (ValueError,KeyError,TypeError):raise Blocked('prepared signed import proof rejected') from None
+        return record
+
     def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
         self.preflight()
         manifest, self.scripts = self.inputs(context, expected, upstream, revision)
@@ -376,6 +412,7 @@ class Gptbox(Bootstrap):
             return self._assemble_locked(context,expected,upstream,revision,manifest,retry=retry)
 
     def _assemble_locked(self,context,expected,upstream,revision,manifest,*,retry=False,fresh=False,on_prepared=None):
+        prepared=self._prepared_completion(context,expected,revision,manifest) if not fresh else None
         self.target = ROOT + '/' + expected
         self.directory(self.target, mode=0o755)
         previous = json.loads(self.text(self.target + '/attempt.json', '{}'))
@@ -384,7 +421,16 @@ class Gptbox(Bootstrap):
             raise Blocked('changed assembly target requires separately reviewed recovery')
         self.image_stage('executor-setup',revision,expected)
         self.setup_executor(retry=bool(previous and retry))
+        def verify_prepared_image():
+            if prepared is None:return
+            rows=json.loads(self.engine('image','inspect',prepared['image_id']))
+            if type(rows) is not list or len(rows)!=1 or type(rows[0]) is not dict or type(rows[0].get('Id')) is not str or image_id(rows[0]['Id'])!=image_id(prepared['image_id']) or rows[0].get('Os')!='linux' or rows[0].get('Architecture')!='amd64':raise Blocked('prepared immutable image unavailable')
+            labels=rows[0].get('Labels') or (rows[0].get('Config',{}).get('Labels',{}) if type(rows[0].get('Config',{})) is dict else {})
+            wanted={'dev-pair.context':expected,'org.opencontainers.image.revision':revision,'dev-pair.role':'maintenance','dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':'0.169.0'}
+            if prepared['kind']=='full-adapter-candidate':wanted.update({'dev-pair.distrobox':DBX_SHA,'dev-pair.inputs':prepared['inputs_sha256'],'dev-pair.runtime':prepared['runtime_sha256'],'dev-pair.init':prepared['init_sha256'],'dev-pair.codex.sha256':prepared['codex_sha256']})
+            if type(labels) is not dict or any(labels.get(k)!=v for k,v in wanted.items()):raise Blocked('prepared immutable image labels mismatch')
         if self.path(self.target + '/result.json').exists():
+            verify_prepared_image()
             if fresh or self.path(self.target+'/candidate-image.json').exists():
                 if not self.path(self.target+'/candidate-image.json').exists():raise Blocked('completed initialize lacks full candidate record')
                 self._full_candidate(context,expected,revision,manifest,fresh=fresh,on_prepared=on_prepared)
@@ -421,6 +467,7 @@ class Gptbox(Bootstrap):
             self.recover_image_work(expected)
         if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
             raise Blocked('eight GiB free reserve is required before assembly')
+        verify_prepared_image()
         self.record('attempt', {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'count': count})
         base,imported,inputs=self._full_candidate(context,expected,revision,manifest,fresh=fresh,on_prepared=on_prepared)
         if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
