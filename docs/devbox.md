@@ -21,7 +21,7 @@ podman build --pull=never --network=none \
   --iidfile "$build_context/outer.iid" "$build_context"
 ```
 
-The outer Tooling image and built DevBox stay in the host's local `dp-dev` image store after verified transfer. The runtime resolves the full immutable image ID.
+The outer tooling image and built DevBox stay in the host's local `dp-dev` image store after verified transfer. The runtime resolves the full immutable image ID. The launcher's dedicated host Podman config supplies just SETUID and SETGID to the UID 1000 parent's bounding set. Podman 5.8.1 derives the nonroot effective, permitted, inheritable and ambient sets from explicit capability additions. The launcher supplies none and checks all five live sets before running the nested engine. [Podman 5.8.1 capability setup](https://github.com/containers/podman/blob/c6077f645788743258a1a749f8005b4fb3cbe533/pkg/specgen/generate/security_linux.go)
 
 ## Supply the development gptbox
 
@@ -29,7 +29,7 @@ The development release producer must assemble and seal its own gptbox through t
 
 - The source SHA, context hash and full immutable image config ID for a development release, with the associated immutable `dev-pair.role=development`, `dev-pair.context`, `dev-pair.inputs`, `dev-pair.standards`, `dev-pair.distrobox`, `dev-pair.codex.version` and `org.opencontainers.image.revision` labels.
 - The original `/usr/lib/dev-pair/gptbox/inputs.json` with `role=development` and the development source SHA, and the finalizer-generated `sealed.json` binding those input bytes, source and UID/GID 1000. Record both raw file hashes.
-- The ordered OCI rootfs layer DiffIDs and one `podman save --format oci-archive` export of that exact image. Record the archive SHA-256 and byte count. The controller checks the immutable image identity after loading that archive and checks the sealed data through the exact running child.
+- The ordered OCI rootfs layer DiffIDs and one uncompressed `podman save --format oci-archive` tar of that exact image, with plain or gzip-compressed OCI layers. Record the archive SHA-256 and byte count. Before Podman loads it, the controller verifies the exact config and ordered layer contents independently of the local image cache. It checks the imported image identity and verifies the sealed data through the exact running child.
 
 Separate development image construction and export are an outstanding implementation dependency. A maintenance artifact has a separate role and evidence record.
 
@@ -41,6 +41,7 @@ Use a fresh, dedicated development probe leaf under the existing managed role pa
 | --- | --- |
 | `builds/<job>` | Private ext4 or XFS block filesystem mounted at its root, with capacity at or below the approved manifest ceiling and eight GiB remaining on the role filesystem. Loop storage must be fully allocated and verifiable as such. |
 | `builds/<job>/graph` | Private `dp-dev` directory on that filesystem, labeled `container_file_t` at the outer category level. |
+| `builds/<job>/image-copy` | Private `dp-dev` directory on the same bounded filesystem with the same outer label. Podman uses it for archive extraction. The controller checks the mounted directory and the engine's effective image-copy path before loading. |
 | `builds/<job>/inputs/manifest.json` and `development.oci.tar` | Regular read-only files on that filesystem, both labeled `container_file_t` at the outer category level. Provide the manifest hash independently. |
 | `workspaces/<job>`, `state/<job>`, `cache/<job>` | Separate empty private `dp-dev` directories labeled `container_file_t` at the inner category level. The existing runtime creates and removes its write probes in these directories. |
 | `evidence/<job>` | The launcher establishes a private lease and exact container ownership under the existing `evidence` root. This path stays outside both containers. |

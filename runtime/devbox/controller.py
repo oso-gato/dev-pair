@@ -3,6 +3,7 @@
 
 from contextlib import contextmanager
 import errno
+import gzip
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import time
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
@@ -26,11 +28,14 @@ PODMAN = '/usr/bin/podman'
 CRUN = '/usr/bin/crun'
 GIB = 1024 ** 3
 MANIFEST_LIMIT = 65536
+OCI_METADATA_LIMIT = 256 * 1024
+OCI_MIME = 'application/vnd.oci.image.'
 OUTPUT_LIMIT = 1024 * 1024
 OUTER_SECONDS = 600
 INNER_SECONDS = 180
 CLEANUP_SECONDS = 45
 GRAPHROOT = '/devbox/graph'
+IMAGE_COPY_DIR = '/devbox/image-copy'
 RUNROOT = '/run/dev-pair'
 ARCHIVE = '/admission/development.oci.tar'
 MANIFEST = '/admission/manifest.json'
@@ -38,6 +43,7 @@ PARENT_JOB = '/devbox/job'
 JOB_TARGETS = {'workspaces': '/work/job', 'state': '/state', 'cache': '/cache/job'}
 CAP_KEYS = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
 OUTER_CAPS = (0, 0, 0, 0xc0, 0)
+OUTER_BOUNDING = {'CAP_SETUID', 'CAP_SETGID'}
 NS_NAMES = ('user', 'mnt', 'pid', 'ipc', 'uts', 'net')
 STARTED = re.compile(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+(?:Z|[+-][0-9]{2}:[0-9]{2})')
 
@@ -145,6 +151,143 @@ def read_manifest(path, expected, deadline):
     return result
 
 
+def archive_path(name):
+    return '.' if name in ('.', './') else name.removeprefix('./')
+
+
+def check_archive_headers(path, size, deadline):
+    # tarfile handles extended headers internally. Reject them before it can
+    # allocate their declared sizes or use them to change a member's identity.
+    seen = set()
+    zero = bytes(512)
+    require(size % 512 == 0, 'development archive has an invalid tar length')
+    with path.open('rb') as stream:
+        while stream.tell() < size:
+            require(time.monotonic() < deadline, 'development archive header check timed out')
+            raw = stream.read(512)
+            require(len(raw) == 512, 'development archive header is truncated')
+            if raw == zero:
+                require(stream.read(512) == zero, 'development archive tar terminator is missing')
+                while piece := stream.read(1024 * 1024):
+                    require(time.monotonic() < deadline, 'development archive trailer check timed out')
+                    require(not any(piece), 'development archive contains nonzero trailing data')
+                return
+            member = tarfile.TarInfo.frombuf(raw, 'utf-8', 'strict')
+            name = archive_path(member.name)
+            require(name not in seen and len(seen) < 135, 'development archive has duplicate or excessive entries')
+            seen.add(name)
+            if name in ('.', 'blobs', 'blobs/sha256'):
+                require(member.type == tarfile.DIRTYPE and member.size == 0, 'invalid development archive directory')
+            else:
+                require((name in ('index.json', 'oci-layout') or re.fullmatch(r'blobs/sha256/[0-9a-f]{64}', name))
+                        and member.type in (tarfile.REGTYPE, tarfile.AREGTYPE) and member.size > 0,
+                        'unsupported development archive member or header')
+            offset = stream.tell() + ((member.size + 511) // 512) * 512
+            require(offset <= size, 'development archive member is truncated')
+            stream.seek(offset)
+    raise Blocked('development archive tar terminator is missing')
+
+
+def hash_layer(stream, maximum, deadline):
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        require(time.monotonic() < deadline, 'development archive layer check timed out')
+        data = stream.read(min(maximum - size + 1, 1024 * 1024))
+        if not data:
+            return 'sha256:' + digest.hexdigest(), size
+        size += len(data)
+        require(size <= maximum, 'development archive expanded layer budget exceeded')
+        digest.update(data)
+
+
+def check_archive_image(path, release, storage_limit, deadline):
+    check_archive_headers(path, release['archive_bytes'], deadline)
+    with tarfile.open(path, 'r:') as archive:
+        members = {archive_path(member.name): member for member in archive if member.isreg()}
+        blobs = {f'sha256:{name.rsplit("/", 1)[-1]}': member
+                 for name, member in members.items() if name.startswith('blobs/sha256/')}
+        used = set()
+
+        def descriptor(value, media_types):
+            require(type(value) is dict and {'digest', 'size', 'mediaType'} <= value.keys()
+                    and value.keys() <= {'digest', 'size', 'mediaType', 'annotations', 'platform'},
+                    'invalid development archive descriptor')
+            digest = value['digest']
+            require(isinstance(digest, str) and digest in blobs and type(value['size']) is int
+                    and value['size'] == blobs[digest].size and value['mediaType'] in media_types,
+                    'development archive descriptor does not match an OCI blob')
+            used.add(digest)
+            return digest, blobs[digest]
+
+        def metadata(member, digest=None):
+            require(member is not None and member.size <= OCI_METADATA_LIMIT,
+                    'missing or oversized development archive metadata')
+            with archive.extractfile(member) as stream:
+                data = stream.read(OCI_METADATA_LIMIT + 1)
+            require(len(data) == member.size, 'development archive metadata is truncated')
+            if digest is not None:
+                require('sha256:' + hashlib.sha256(data).hexdigest() == digest,
+                        'development archive metadata digest mismatch')
+            value = json_data(data)
+            require(type(value) is dict, 'invalid development archive metadata')
+            return value
+
+        require(metadata(members.get('oci-layout')) == {'imageLayoutVersion': '1.0.0'},
+                'unsupported development OCI layout')
+        index = metadata(members.get('index.json'))
+        index_media = OCI_MIME + 'index.v1+json'
+        manifests = index.get('manifests')
+        require(index.get('schemaVersion') == 2 and index.get('mediaType', index_media) == index_media
+                and type(manifests) is list and len(manifests) == 1,
+                'development OCI archive must select one image')
+        manifest_media = OCI_MIME + 'manifest.v1+json'
+        manifest_blob = descriptor(manifests[0], (manifest_media,))
+        image = metadata(manifest_blob[1], manifest_blob[0])
+        require(image.get('schemaVersion') == 2 and image.get('mediaType', manifest_media) == manifest_media,
+                'unsupported development OCI image manifest')
+        config_digest, config_member = descriptor(image.get('config'), (OCI_MIME + 'config.v1+json',))
+        require(config_digest == 'sha256:' + release['image_id'], 'development archive config identity mismatch')
+        config = metadata(config_member, config_digest)
+        require((config.get('os'), config.get('architecture')) == ('linux', 'amd64')
+                and config.get('rootfs') == {'type': 'layers', 'diff_ids': release['diff_ids']},
+                'development archive config platform or ordered layers mismatch')
+        layers = image.get('layers')
+        require(type(layers) is list and len(layers) == len(release['diff_ids']),
+                'development archive layer count mismatch')
+        plain = OCI_MIME + 'layer.v1.tar'
+        compressed = plain + '+gzip'
+        remaining = storage_limit
+        for layer, expected in zip(layers, release['diff_ids']):
+            digest, member = descriptor(layer, (plain, compressed))
+            with archive.extractfile(member) as stream:
+                actual, size = hash_layer(stream, member.size, deadline)
+            require((actual, size) == (digest, member.size), 'development archive layer blob digest mismatch')
+            if layer['mediaType'] == compressed:
+                with archive.extractfile(member) as stream, gzip.GzipFile(fileobj=stream) as expanded:
+                    actual, size = hash_layer(expanded, remaining, deadline)
+            require(actual == expected, 'development archive ordered layer DiffID mismatch')
+            require(0 < size <= remaining, 'development archive expanded layer budget exceeded')
+            remaining -= size
+        require(set(blobs) == used, 'development archive contains unselected blobs')
+
+
+def load_development_archive(engine, manifest, path):
+    release = manifest['inner']
+    expected = (release['archive_sha256'], release['archive_bytes'])
+    deadline = engine.deadline
+    require(file_hash(path, release['archive_bytes'], deadline)[:2] == expected,
+            'development OCI archive digest or byte count mismatch')
+    try:
+        check_archive_image(path, release, manifest['storage_bytes'], deadline)
+    except (tarfile.TarError, EOFError, OSError) as error:
+        raise Blocked(f'invalid development OCI archive: {error}') from error
+    engine('load development OCI archive', 'load', '--input', str(path), seconds=250)
+    require(file_hash(path, release['archive_bytes'], deadline)[:2] == expected,
+            'development OCI archive changed during import')
+    immutable_image(engine, manifest, 'inner')
+
+
 def label_level(manifest, side):
     return 's0:' + ','.join(f'c{category}' for category in manifest['categories'][side])
 
@@ -156,6 +299,31 @@ def process_label(manifest, side):
 
 def file_label(manifest, side):
     return 'system_u:object_r:container_file_t:' + label_level(manifest, side)
+
+
+def selinux_label(value):
+    if not isinstance(value, str) or len(value) > 128:
+        return None
+    parts = value.split(':', 4)
+    if len(parts) != 5 or any(not part for part in parts[:3]) or parts[3] != 's0':
+        return None
+    categories = set()
+    for token in parts[4].split(','):
+        match = re.fullmatch(r'c(0|[1-9][0-9]{0,3})(?:\.c(0|[1-9][0-9]{0,3}))?', token)
+        if match is None:
+            return None
+        first = int(match[1])
+        last = int(match[2] or match[1])
+        group = range(first, last + 1)
+        if last > 1023 or first > last or categories.intersection(group):
+            return None
+        categories.update(group)
+    return (*parts[:3], frozenset(categories))
+
+
+def same_label(actual, expected):
+    parsed = selinux_label(actual)
+    return parsed is not None and parsed == selinux_label(expected)
 
 
 def local_env(path='/usr/bin:/usr/sbin:/bin'):
@@ -252,7 +420,7 @@ def container_args(name, owner, manifest, side, hooks):
     args = [f'--name={name}', f'--label=dev-pair.devbox-owner={owner}', '--pull=never', '--restart=no',
             f'--timeout={OUTER_SECONDS if outer else INNER_SECONDS}', '--read-only', '--read-only-tmpfs=false',
             '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--network=none', '--pid=private',
-            '--ipc=private', '--uts=private', '--cap-drop=ALL', '--log-driver=k8s-file',
+            '--ipc=private', '--uts=private', '--log-driver=k8s-file',
             '--log-opt=max-size=1mb', '--no-hosts', '--no-hostname', '--dns=none',
             '--image-volume=ignore', '--http-proxy=false', '--sdnotify=ignore', '--systemd=false',
             f'--hooks-dir={hooks}', '--workdir=/', '--unsetenv-all',
@@ -260,11 +428,12 @@ def container_args(name, owner, manifest, side, hooks):
     for path, size in (('/run', '64m' if outer else '16m'), ('/tmp', '64m' if outer else '16m')):
         args.append(f'--tmpfs={path}:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size={size}')
     if outer:
-        return args + ['--cap-add=SETUID', '--cap-add=SETGID',
-                       '--security-opt=label=nested', '--security-opt=label=type:container_engine_t',
+        # The host-only default capability set becomes bounding only for UID 1000.
+        # Podman propagates explicit cap-add entries into the E/P/I/A sets as well.
+        return args + ['--security-opt=label=nested', '--security-opt=label=type:container_engine_t',
                        '--cgroupns=private', '--memory=2g', '--memory-swap=2g', '--pids-limit=512',
                        '--cpus=1', '--rm']
-    return args + ['--security-opt=no-new-privileges', '--security-opt=label=type:container_t',
+    return args + ['--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=label=type:container_t',
                    '--cgroups=disabled', '--cgroupns=host',
                    '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
                    '--env=HOME=/home/gpt', '--env=PATH=/opt/dev-pair/bin:/usr/bin:/bin']
@@ -281,8 +450,8 @@ def inspect_policy(row, identity, owner, manifest, side, mounts):
             and all(host.get(key) == 'private' for key in ('PidMode', 'IpcMode', 'UTSMode'))
             and host.get('UsernsMode') in ('private', 'keep-id'),
             f'{side} runtime readonly/namespace policy mismatch')
-    require(row.get('ProcessLabel') == process_label(manifest, side)
-            and row.get('MountLabel') == file_label(manifest, side), f'{side} SELinux policy mismatch')
+    require(same_label(row.get('ProcessLabel'), process_label(manifest, side))
+            and same_label(row.get('MountLabel'), file_label(manifest, side)), f'{side} SELinux policy mismatch')
     require(config.get('Timeout') == (OUTER_SECONDS if outer else INNER_SECONDS)
             and host.get('RestartPolicy', {}).get('Name', '') in ('', 'no')
             and not host.get('PortBindings') and not host.get('Devices'), f'{side} lifetime/device policy mismatch')
@@ -299,12 +468,15 @@ def inspect_policy(row, identity, owner, manifest, side, mounts):
         actual[target] = (mount['Source'], mount['RW'])
     require(actual == mounts, f'{side} bind allowlist mismatch')
     if outer:
+        require(not host.get('CapAdd') and row['EffectiveCaps'] in (None, [])
+                and set(row.get('BoundingCaps') or []) == OUTER_BOUNDING,
+                'parent inspected bounding-only capability policy mismatch')
         require(host.get('CgroupMode') == 'private' and host.get('Memory') == 2 * GIB
                 and host.get('PidsLimit') == 512 and host.get('NanoCpus') == 1000000000,
                 'parent inspected aggregate cgroup policy mismatch')
     else:
-        require(host.get('Cgroups') == 'disabled' and row.get('EffectiveCaps') == []
-                and row.get('BoundingCaps') == [] and not host.get('CapAdd')
+        require(host.get('Cgroups') == 'disabled' and row['EffectiveCaps'] in (None, [])
+                and row['BoundingCaps'] in (None, []) and not host.get('CapAdd')
                 and config.get('Labels', {}).get('manager') == 'distrobox',
                 'inner cgroup, capability or Distrobox policy mismatch')
 
@@ -377,7 +549,7 @@ def proc_snapshot(root, capabilities, nnp, label, uid, gid):
     require(status['Uid'].split() == [str(uid)] * 4 and status['Gid'].split() == [str(gid)] * 4
             and status['Groups'].split() in ([], [str(gid)]), 'effective UID, GID or groups policy mismatch')
     actual = (root / 'attr/current').read_text().strip('\x00\n')
-    require(actual == label, 'effective SELinux process label mismatch')
+    require(same_label(actual, label), 'effective SELinux process label mismatch')
     return {'namespaces': {name: os.readlink(root / 'ns' / name) for name in NS_NAMES},
             'cgroup': (root / 'cgroup').read_text().strip(), 'label': actual}
 
@@ -430,8 +602,16 @@ def inner_environment():
     env.update({'HOME': '/home/gpt', 'USER': 'gpt', 'LOGNAME': 'gpt', 'DBX_CONTAINER_MANAGER': 'podman',
                 'XDG_CONFIG_HOME': str(BASE / 'xdg-config'), 'XDG_CACHE_HOME': '/tmp',
                 'XDG_RUNTIME_DIR': '/run/user/1000', 'CONTAINERS_CONF': str(BASE / 'containers.conf'),
-                'STORAGE_DRIVER': 'vfs'})
+                'STORAGE_DRIVER': 'vfs', 'TMPDIR': IMAGE_COPY_DIR})
     return env
+
+
+def check_engine_info(info):
+    security, store = info['host']['security'], info['store']
+    require(security.get('rootless') is True and security.get('selinuxEnabled') is True
+            and store['graphDriverName'] == 'vfs' and store['graphRoot'] == GRAPHROOT
+            and store['runRoot'] == RUNROOT, 'nested rootless VFS/SELinux policy mismatch')
+    require(store.get('imageCopyTmpDir') == IMAGE_COPY_DIR, 'nested image import temporary directory mismatch')
 
 
 def helper_caps():
@@ -508,7 +688,7 @@ def controller(expected, owner, seconds):
     require(os.getuid() == os.getgid() == 1000 and os.getgroups() in ([], [1000]), 'controller user mismatch')
     self_proc = Path('/proc/self')
     parent = proc_snapshot(self_proc, OUTER_CAPS, 0, process_label(manifest, 'outer'), 1000, 1000)
-    observed_mounts(self_proc, {GRAPHROOT: True, ARCHIVE: False, MANIFEST: False,
+    observed_mounts(self_proc, {GRAPHROOT: True, IMAGE_COPY_DIR: True, ARCHIVE: False, MANIFEST: False,
                                **{f'{PARENT_JOB}/{key}': True for key in JOB_TARGETS}})
     probe_parent_writes()
     helper_caps()
@@ -521,10 +701,7 @@ def controller(expected, owner, seconds):
     engine = Engine([PODMAN, '--remote=false', '--runtime=' + CRUN, '--root=' + GRAPHROOT, '--runroot=' + RUNROOT,
                      '--storage-driver=vfs', '--events-backend=file', '--cgroup-manager=cgroupfs'], env, end)
     _, info = engine('nested rootless VFS engine', 'info', '--format=json')
-    info = json_data(info)
-    require(info['host']['security'].get('rootless') is True and info['host']['security'].get('selinuxEnabled') is True
-            and info['store']['graphDriverName'] == 'vfs' and info['store']['graphRoot'] == GRAPHROOT
-            and info['store']['runRoot'] == RUNROOT, 'nested rootless VFS/SELinux policy mismatch')
+    check_engine_info(json_data(info))
     _, mappings = engine('nested UID/GID mapping', 'unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map')
     lines = mappings.decode('ascii').splitlines()
     require(len(lines) == 6, 'unexpected engine mapping ranks')
@@ -534,14 +711,7 @@ def controller(expected, owner, seconds):
         require(sorted(triples) == [(0, 1000, 1), (1, 1, 999), (1000, 1001, 64536)],
                 'rootless engine user namespace map mismatch')
     release = manifest['inner']
-    archive = Path(ARCHIVE)
-    archive_identity = (release['archive_sha256'], release['archive_bytes'])
-    require(file_hash(archive, release['archive_bytes'], end)[:2] == archive_identity,
-            'development OCI archive digest or byte count mismatch')
-    engine('load development OCI archive', 'load', '--input', ARCHIVE, seconds=250)
-    require(file_hash(archive, release['archive_bytes'], end)[:2] == archive_identity,
-            'development OCI archive changed during import')
-    immutable_image(engine, manifest, 'inner')
+    load_development_archive(engine, manifest, Path(ARCHIVE))
     name = 'dp-nested-' + owner[:24]
     target = {dest: (f'{PARENT_JOB}/{key}', True) for key, dest in JOB_TARGETS.items()}
     mounts = [bind(src, dest, rw) for dest, (src, rw) in target.items()]
@@ -574,7 +744,7 @@ def controller(expected, owner, seconds):
             check_inner_inputs(engine, identity, release)
             probe = json_data(fixed_entry(engine, identity, 'probe', check, previous))
             require(probe.get('boundary_probe') == 'passed' and probe.get('uid') == 1000
-                    and probe.get('selinux_label') == child['label'], 'Distrobox inner protected-write probe failed')
+                    and same_label(probe.get('selinux_label'), child['label']), 'Distrobox inner protected-write probe failed')
             version = fixed_entry(engine, identity, 'version', check, previous).strip()
             require(version == f'codex-cli {CODEX_VERSION}'.encode(), 'Distrobox Codex version mismatch')
             engine('stop nested development gptbox', 'stop', '--time=5', identity, seconds=15)

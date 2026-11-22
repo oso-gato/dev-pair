@@ -23,7 +23,7 @@ RUN set -eu; \
     usermod -L gpt; \
     printf 'gpt:1:999\ngpt:1001:64536\n' > /etc/subuid; \
     cp /etc/subuid /etc/subgid; \
-    mkdir -p /home/gpt /devbox/graph /devbox/job/workspaces /devbox/job/state /devbox/job/cache /admission \
+    mkdir -p /home/gpt /devbox/graph /devbox/image-copy /devbox/job/workspaces /devbox/job/state /devbox/job/cache /admission \
         /usr/lib/dev-pair/devbox/empty-hooks /usr/lib/dev-pair/devbox/xdg-config; \
     touch /admission/manifest.json /admission/development.oci.tar; \
     find / -xdev -type f -perm /6000 -exec chmod a-s {} +; \
