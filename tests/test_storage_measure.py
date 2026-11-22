@@ -1,6 +1,8 @@
 """Real allocated-block GNUdu differential; descriptor and caller failures closed."""
+from contextlib import redirect_stdout
 import errno
 import hashlib
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -220,14 +222,48 @@ class MeasurementTests(unittest.TestCase):
             return scandir(fd)
         with patch.object(worker.os,'scandir',side_effect=replaced_after_open),self.assertRaisesRegex(worker.ScanError,'identity-changed'):
             worker.scan(self.root,expected)
-    def test_descendant_enoent_only_and_supported_mount_refusal(self):
+    def test_only_descendant_enoent_allows_a_provisional_sample(self):
         (self.root/'file').touch()
         for number in (errno.EACCES,errno.EPERM,errno.EIO,errno.ELOOP):
             with patch.object(worker,'_node',side_effect=OSError(number,'synthetic')),self.assertRaises(OSError):worker.scan(self.root,self.expected())
-        with patch.object(worker,'_node',side_effect=OSError(errno.EXDEV,'synthetic')),self.assertRaisesRegex(worker.ScanError,'^entry-resolve-exdev$'):
-            worker.scan(self.root,self.expected())
         with patch.object(worker,'_node',side_effect=FileNotFoundError(errno.ENOENT,'synthetic')):
             result=worker.scan(self.root,self.expected());self.assertEqual(result['status'],'provisional');self.assertGreater(result['allocated_bytes'],0)
+
+    def test_entry_resolution_and_reopen_exdev_report_distinct_failures(self):
+        entry=self.root/'directory';entry.mkdir();(entry/'file').touch()
+        expected=self.expected();sha=ci.file_hash(Path(worker.__file__))
+        argv=[worker.__file__,'--root',str(self.root),'--sha256',sha]
+        for key,value in expected.items():
+            argv.extend(('--'+key,str(value)))
+        open_node=worker._node
+        cases=(
+            ('entry-resolve-exdev',(1,2),[True,False],1),
+            ('entry-reopen-exdev',(2,),[True,True],2),
+        )
+        for reason,reject_attempts,expected_attempts,entries in cases:
+            attempts=[]
+            def reject_entry(parent,name,*,same_mount=True):
+                if name==entry.name:
+                    attempts.append(same_mount)
+                    if len(attempts) in reject_attempts:
+                        raise OSError(errno.EXDEV,'synthetic entry boundary')
+                return open_node(parent,name,same_mount=same_mount)
+
+            with self.subTest(reason=reason):
+                output=StringIO()
+                with patch.object(worker,'_node',side_effect=reject_entry),patch.object(sys,'argv',argv),redirect_stdout(output):
+                    code=worker.main()
+                self.assertEqual(attempts,expected_attempts)
+                self.assertEqual(code,2)
+                result=subprocess.CompletedProcess([],code,output.getvalue().encode(),b'')
+                with self.assertRaises(ci.StorageMeasurementBlocked) as caught:
+                    ci.parse_storage(self.root,result,expected,sha)
+                projected=caught.exception.diagnostics['worker']
+                self.assertEqual(projected['status'],'failed')
+                self.assertIsNone(projected['allocated_bytes'])
+                self.assertEqual(projected['counters']['entries'],entries)
+                self.assertEqual(projected['reason'],reason)
+
     def test_parser_no_total_is_never_a_usable_integer_and_typed_failure_survives(self):
         expected=self.expected();sha=ci.file_hash(Path(worker.__file__))
         for kind in ('integer-no-total','wrong-root','wrong-source','extra','bool-size','signal','partial','unknown-failure'):

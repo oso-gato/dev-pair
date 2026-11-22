@@ -285,7 +285,7 @@ def parse_storage(root,result,expected,worker_sha):
                 'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
                 'bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev',
                 'bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev',
-                'entry-reopen-missing','entry-resolve-exdev','entry-limit','inode-limit','depth-limit','deadline',
+                'entry-reopen-missing','entry-resolve-exdev','entry-reopen-exdev','entry-limit','inode-limit','depth-limit','deadline',
                 'enumeration-disappeared',
             ),'invalid worker failure')
             raise StorageMeasurementBlocked('storage worker reported bounded failure',{**storage_diagnostics(root,result),'worker':value})

@@ -24,7 +24,7 @@ REASONS=(
     'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
     'bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev',
     'bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev',
-    'entry-reopen-missing','entry-resolve-exdev','entry-limit','inode-limit','depth-limit','deadline',
+    'entry-reopen-missing','entry-resolve-exdev','entry-reopen-exdev','entry-limit','inode-limit','depth-limit','deadline',
     'enumeration-disappeared',
 )
 class ScanError(ValueError):pass
@@ -189,7 +189,7 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                     if crossed:raise ScanError('entry-reopen-missing') from None
                     raise
                 except OSError as error:
-                    if error.errno==errno.EXDEV:raise ScanError('entry-resolve-exdev') from None
+                    if error.errno==errno.EXDEV:raise ScanError('entry-reopen-exdev') from None
                     raise
                 try:
                     require(_node_identity(os.fstat(after))==node_identity,'identity-changed')
