@@ -85,6 +85,29 @@ class InitializeTests(unittest.TestCase):
         with patch.object(g, 'github_keys', return_value='fixture public key only\n'):
             return self.app.initialize('/context', CONTEXT, '/upstream', SOURCE, ['192.0.2.9/32'], apply=True, **kwargs)
 
+    def test_prepare_budget_snapshot_survives_later_adapter_failure_and_cleanup(self):
+        original=self.app.preparation
+        def preparation():
+            result=original()
+            result.role_directory_batches={role:{'role':role,'checked_lookups':2,'completed_directories':8,'outcome':'complete'}
+                                           for role in ('maintenance','development')}
+            return result
+        self.app.fail=True
+        with patch.object(self.app,'preparation',side_effect=preparation):
+            with self.assertRaises(b.Blocked):self.initialize()
+        record=json.loads(self.app.text(b.STATE+'/initialize.json'))
+        self.assertEqual(record['prepare_budget_witness']['configured_seconds'],g.PREPARE_EXECUTION)
+        self.assertFalse(record['prepare_budget_witness']['timer_fired'])
+        self.assertFalse(record['prepare_budget_witness']['deadline_reached_at_exit'])
+        self.assertEqual(record['role_directory_batches']['maintenance']['completed_directories'],8)
+        self.assertIn('cleanup-resources',self.app.order)
+        import fedora_ci_guest as guest
+        expected={'source_sha':SOURCE,'context_sha256':CONTEXT,'distrobox_sha':g.DBX_SHA}
+        public=guest.public_diagnostics(self.app.state,expected)['prepare_progress']['observations']
+        self.assertEqual(public['budget']['configured_seconds'],600)
+        self.assertEqual(public['source_sha'],SOURCE)
+        self.assertFalse(public['budget']['timer_fired'])
+
     def test_separate_locks_partial_failure_and_explicit_exact_target_reapply(self):
         self.app.fail = True
         with self.assertRaisesRegex(b.Blocked, 'fixture assembly'):

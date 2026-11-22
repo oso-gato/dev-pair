@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import shlex
 import json
+import math
 import os
 import pathlib
 import platform
@@ -1020,6 +1021,38 @@ def sudo_public_projection(record):
     return result
 
 
+def prepare_observations(state, expected):
+    # Reuse the exact target/admission validation before admitting timing or
+    # owner evidence. Durations do not establish a primary failure cause.
+    initialize_projection(state,expected,None)
+    result = {'source_sha':expected['source_sha'],'context_sha256':expected['context_sha256'],
+              'budget':{'availability':'unavailable'},'role_directories':{}}
+    def finite(value,low,high):
+        return type(value) in (int,float) and low <= value <= high and math.isfinite(value)
+    witness=state.get('prepare_budget_witness')
+    fields={'configured_seconds','effective_seconds','elapsed_seconds','deadline_reached_at_exit','timer_fired'}
+    if (type(witness) is dict and set(witness)==fields and type(witness['configured_seconds']) is int and
+            witness['configured_seconds']==600 and finite(witness['effective_seconds'],0.000001,600) and
+            finite(witness['elapsed_seconds'],0,3300) and
+            all(type(witness[k]) is bool for k in ('deadline_reached_at_exit','timer_fired')) and
+            witness['deadline_reached_at_exit'] == (witness['elapsed_seconds'] >= witness['effective_seconds'])):
+        result['budget']={'availability':'observed',**witness}
+    elapsed=state.get('prepare_elapsed_seconds')
+    result['prepare_elapsed_seconds']=elapsed if finite(elapsed,0,3300) else None
+    batches=state.get('role_directory_batches',{})
+    if type(batches) is dict:
+        for role in ('maintenance','development'):
+            value=batches.get(role)
+            if (type(value) is dict and set(value)=={'role','checked_lookups','completed_directories','outcome'} and
+                    value['role']==role and type(value['checked_lookups']) is int and 0<=value['checked_lookups']<=2 and
+                    type(value['completed_directories']) is int and 0<=value['completed_directories']<=8 and
+                    (value['completed_directories']==0 or value['checked_lookups']==2) and
+                    value['outcome'] in ('complete','blocked') and
+                    (value['outcome']!='complete' or value['checked_lookups']==2 and value['completed_directories']==8)):
+                result['role_directories'][role]=dict(value)
+    return result
+
+
 def public_diagnostics(state_root, expected):
     selected = {}
     for name, path in (('prepare', state_root / 'prepare-diagnostics.json'),
@@ -1061,7 +1094,8 @@ def public_diagnostics(state_root, expected):
         state = read_json(state_root / 'initialize.json')
         initialize_projection(state, expected, None)
         selected['prepare_progress'] = {'step': safe_text(state.get('prepare_step', 'unavailable'), 80),
-                                        'source_verification': state.get('source_verification', {'outcome': 'unavailable'})}
+                                        'source_verification': state.get('source_verification', {'outcome': 'unavailable'}),
+                                        'observations':prepare_observations(state,expected)}
     except (OSError, ValueError, KeyError):
         selected['prepare_progress'] = {'step': 'unavailable', 'source_verification': {'outcome': 'unavailable'}}
     try:

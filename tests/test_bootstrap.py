@@ -115,6 +115,10 @@ class Fake:
         return ''
 
 class FixtureBootstrap(b.Bootstrap):
+    def _directory_as(self, name, mode, uid, gid, *, change_owner, check_gid=False):
+        # Explicit local ownership fixture, never evidence for distinct Fedora UIDs.
+        return super()._directory_as(name,mode,os.getuid(),os.getgid(),change_owner=False,check_gid=check_gid)
+
     def directory(self, name, mode=0o700, owner=None):
         # Real filesystem safety/mode checks; account/chown are command fixtures only.
         return super().directory(name, mode, owner=None)

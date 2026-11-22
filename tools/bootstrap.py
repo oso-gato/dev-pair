@@ -4,6 +4,7 @@ import argparse
 import base64
 import contextlib
 import contextvars
+from dataclasses import dataclass
 import fcntl
 import hashlib
 import http.client
@@ -105,6 +106,24 @@ class Blocked(Exception):
 SUDO_PACKAGE_QUERY = ('/usr/bin/rpm', '-qf', '/usr/bin/sudo', '--queryformat',
                       '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n')
 SUDO_ROLES = {'dp-maint': 'maintenance-sudo-denial', 'dp-dev': 'development-sudo-denial'}
+ROLE_DIRECTORIES = {'dp-maint':'maintenance','dp-dev':'development'}
+ROLE_CHILDREN = ('workspaces','checkpoints','evidence','deliverables','builds','cache','state')
+
+
+@dataclass(frozen=True)
+class _RoleIdentity:
+    name: str
+    uid: int
+    gid: int
+
+
+def _canonical_role_id(value):
+    if type(value) is not str or len(value) > 11 or re.fullmatch(r'[1-9][0-9]{0,9}\n',value) is None:
+        raise Blocked('managed role identity is not canonical')
+    result = int(value[:-1])
+    if not 1000 <= result <= 4294967294:
+        raise Blocked('managed role identity is outside supported bounds')
+    return result
 
 
 def sudo_package_projection(stdout, stderr, complete, status):
@@ -182,6 +201,7 @@ class Commands:
 
     @contextlib.contextmanager
     def phase(self, seconds, prefix, native=True):
+        self.phase_budget_witness = None
         previous = self.deadline, self.native_prefix
         started = time.monotonic()
         old_timer = signal.getitimer(signal.ITIMER_REAL)
@@ -191,7 +211,10 @@ class Commands:
         remaining = phase_deadline - time.monotonic()
         if remaining <= 0:
             raise Blocked('phase execution budget exhausted')
+        timer_fired = False
         def expired(signum, frame):
+            nonlocal timer_fired
+            timer_fired = True
             raise Blocked('phase execution budget exhausted')
         old_handler = signal.getsignal(signal.SIGALRM)
         token = None
@@ -203,8 +226,13 @@ class Commands:
             signal.setitimer(signal.ITIMER_REAL, remaining)
             yield
         finally:
-            elapsed = time.monotonic() >= phase_deadline
+            observed = time.monotonic()
+            elapsed = observed >= phase_deadline
             signal.setitimer(signal.ITIMER_REAL, 0)
+            self.phase_budget_witness = {'configured_seconds':seconds,
+                'effective_seconds':phase_deadline-started,
+                'elapsed_seconds':max(0,observed-started),
+                'deadline_reached_at_exit':elapsed,'timer_fired':timer_fired}
             self.deadline, self.native_prefix = previous
             if token is not None:
                 _PHASE_DEADLINE.reset(token)
@@ -233,6 +261,8 @@ class Commands:
     @staticmethod
     def operation_id(args):
         # IDs are fixed enums; never echo argv, paths or environment.
+        if len(args) == 3 and args[0] == '/usr/bin/id' and args[1] in ('-u','-g') and args[2] in ROLE_DIRECTORIES:
+            return ROLE_DIRECTORIES[args[2]]+'-owner-'+('uid' if args[1]=='-u' else 'gid')
         if len(args) == 4 and args[:3] == ('/usr/bin/sudo', '-l', '-U') and args[3] in SUDO_ROLES:
             return SUDO_ROLES[args[3]]
         if args == SUDO_PACKAGE_QUERY:
@@ -871,6 +901,7 @@ class Bootstrap:
         self.root, self.run = Path(root), run or Commands()
         self.state = self.path(STATE)
         self.hostname_verified = False
+        self.role_directory_batches = {}
 
     def path(self, value):
         return self.root / value.lstrip('/')
@@ -1247,19 +1278,26 @@ class Bootstrap:
         self.mark_prepare_step(action)
         self.event(action, 'begin')
         try:
-            callback()
+            result = callback()
         except BaseException:
             self.event(action, 'interrupted-or-failed')
             raise
         self.event(action, 'complete')
+        return result
 
     def directory(self, name, mode=0o700, owner=None):
-        # Traverse by descriptors: a runtime-owned parent cannot redirect root's chmod/chown.
         relative = Path(name)
         if not relative.is_absolute() or '..' in relative.parts:
             raise Blocked('invalid managed directory')
         uid = int(self.run('/usr/bin/id', '-u', owner).strip()) if owner else (0 if self.root == Path('/') else os.getuid())
         gid = int(self.run('/usr/bin/id', '-g', owner).strip()) if owner else os.getgid()
+        return self._directory_as(name, mode, uid, gid, change_owner=bool(owner))
+
+    def _directory_as(self, name, mode, uid, gid, *, change_owner, check_gid=False):
+        # Private descriptor primitive, not a public arbitrary-owner interface.
+        relative = Path(name)
+        if not relative.is_absolute() or '..' in relative.parts:
+            raise Blocked('invalid managed directory')
         fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             parts = relative.parts[1:]
@@ -1277,15 +1315,38 @@ class Bootstrap:
                 if leaf:
                     if created:
                         os.fchmod(fd, mode)
-                        if owner:
+                        if change_owner:
                             os.fchown(fd, uid, gid)
                     info = os.fstat(fd)
-                    if stat.S_IMODE(info.st_mode) != mode or info.st_uid != uid:
+                    if stat.S_IMODE(info.st_mode) != mode or info.st_uid != uid or check_gid and info.st_gid != gid:
                         raise Blocked(f'conflicting directory: {name}')
         except OSError:
             raise Blocked('unsafe or conflicting managed directory traversal') from None
         finally:
             os.close(fd)
+
+    def _role_directories(self, verified):
+        if type(verified) is not _RoleIdentity or verified.name not in ROLE_DIRECTORIES:
+            raise Blocked('role directory batch requires verified fixed account')
+        role = ROLE_DIRECTORIES[verified.name]
+        evidence = {'role':role,'checked_lookups':0,'completed_directories':0,'outcome':'blocked'}
+        try:
+            uid = _canonical_role_id(self.run('/usr/bin/id','-u',verified.name))
+            if type(verified.uid) is not int or uid != verified.uid:
+                raise Blocked('managed role UID binding mismatch')
+            evidence['checked_lookups'] = 1
+            gid = _canonical_role_id(self.run('/usr/bin/id','-g',verified.name))
+            if type(verified.gid) is not int or gid != verified.gid:
+                raise Blocked('managed role GID binding mismatch')
+            evidence['checked_lookups'] = 2
+            base = '/var/lib/dev-pair/'+role
+            for path in (base,*(base+'/'+name for name in ROLE_CHILDREN)):
+                self._directory_as(path,0o700,uid,gid,change_owner=True,check_gid=True)
+                evidence['completed_directories'] += 1
+            evidence['outcome'] = 'complete'
+        finally:
+            # Counts only, never an owner pair reusable by a later call/retry.
+            self.role_directory_batches[role] = dict(evidence)
 
     def identity(self, name, shell, substart=None):
         marker = f'{STATE}/identity-{name}.json'
@@ -1326,6 +1387,7 @@ class Bootstrap:
                     self.atomic(file, content.rstrip('\n') + ('\n' if content else '') + wanted + '\n',
                                 mode=0o644, expected=content)
             self.run('/usr/bin/loginctl', 'enable-linger', name)
+        return {'name':fields[0],'uid':fields[2],'gid':fields[3]}
 
     def password_operator(self, password):
         marker = f'{STATE}/operator-password-set'
@@ -1356,9 +1418,12 @@ class Bootstrap:
     def restricted_identity(self, who, begin, package):
         if not self.hostname_verified or who not in SUDO_ROLES:
             raise Blocked('sudo denial requires verified host and fixed role')
-        self.identity(who, '/usr/sbin/nologin', begin)
+        identity = self.identity(who, '/usr/sbin/nologin', begin)
         self.run('/usr/bin/sudo', '-l', '-U', who, timeout=10,
                  sudo_probe={'role': who, 'host_verified': self.hostname_verified, 'package': package})
+        if type(identity) is not dict or identity.get('name') != who:
+            raise Blocked('managed role account name binding mismatch')
+        return _RoleIdentity(who,_canonical_role_id(identity['uid']+'\n'),_canonical_role_id(identity['gid']+'\n'))
 
     def reserve_mosh_ports(self):
         # The early public mosh drop also covers established UDP. Reserve its port
@@ -1488,10 +1553,9 @@ class Bootstrap:
             self.mark_prepare_step('sudo-package-provenance')
             sudo_package = self.run(*SUDO_PACKAGE_QUERY, timeout=10, sudo_package=True)
             for who, begin, role in [('dp-maint', 1000000, 'maintenance'), ('dp-dev', 1065536, 'development')]:
-                self.step(who, lambda who=who, begin=begin: self.restricted_identity(who, begin, sudo_package))
-                self.directory(f'/var/lib/dev-pair/{role}', owner=who)
-                for directory in ('workspaces', 'checkpoints', 'evidence', 'deliverables', 'builds', 'cache', 'state'):
-                    self.directory(f'/var/lib/dev-pair/{role}/{directory}', owner=who)
+                verified = self.step(who, lambda who=who, begin=begin: self.restricted_identity(who, begin, sudo_package))
+                self.step(role+'-directories',lambda verified=verified:self._role_directories(verified))
+                del verified
             self.mark_prepare_step('managed-limits')
             self.atomic('/etc/dev-pair/limits.json', json.dumps({
                 'jobs_enabled': False, 'per_role_memory_max': '2G', 'per_role_tasks_max': 512,

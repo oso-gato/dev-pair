@@ -272,6 +272,24 @@ existing conflicting users/configuration fails. Linger permits future systemd
 user supervision. User-slice limits are 2GiB memory, 512 tasks and 100% CPU per
 role. Durable 0700 role directories live under `/var/lib/dev-pair/{maintenance,development}`:
 workspaces, checkpoints, evidence, deliverables, builds, cache and state.
+For each fixed role, the successful account/locked-group/sudo checks return a
+private typed account binding. A contiguous batch resolves that role's canonical
+UID/GID once through the existing checked executor and cross-checks both against
+the binding before any ownership effects. The pair is local to those eight
+operations: it is never persisted or reused across role, exception, reapply or
+process restart. General `directory()` callers still resolve fresh every time.
+This reduces ownership lookups from 32 to four across both role batches, avoiding
+28 native launches; it does not promise that preparation fits its unchanged
+600-second phase budget.
+
+The batch preserves descriptor traversal/O_NOFOLLOW and checks existing mode,
+UID and GID, rejecting conflicts without adoption. Safe partial directories may
+remain after interruption; retry repeats both checked lookups and validates them.
+The trusted-root account database/private-group boundary is unchanged; no direct
+NSS lookup or general identity/admission cache is introduced. Fixed directory
+substeps and role UID/GID operation IDs retain bounded progress counts, never
+raw account output or reusable identity numbers.
+
 Directory creation/ownership changes use nonfollowing directory descriptors, so mutable runtime-owned parents cannot redirect root writes. No recursive ownership change, cleanup, data deletion or automatic account
 adoption occurs. Existing storage is preserved. Runtime jobs remain disabled:
 the 20GiB storage budget, 8GiB reserve and seven-day inactive retention are

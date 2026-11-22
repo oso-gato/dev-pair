@@ -630,6 +630,11 @@ class Gptbox(Bootstrap):
                     save()
             prepare_started = time.monotonic()
             adapter_started = None
+            def snapshot_prepare_observations():
+                witness = getattr(preparation.run,'phase_budget_witness',None)
+                record['prepare_budget_witness'] = dict(witness) if type(witness) is dict else None
+                record['role_directory_batches'] = {key:dict(value) for key,value in
+                    getattr(preparation,'role_directory_batches',{}).items()}
             try:
                 with preparation.run.phase(PREPARE_EXECUTION, 'dev-pair-initialize-prepare'):
                     keys = github_keys()
@@ -641,6 +646,7 @@ class Gptbox(Bootstrap):
                                                          {'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'})
                     preparation.prepare('core', keys, sources, context, expected, password=password,
                                         source_check=source_check)
+                snapshot_prepare_observations()
                 record.update(phase='maintenance-gptbox', prepare='complete',
                               prepare_elapsed_seconds=round(time.monotonic() - prepare_started, 3))
                 self.target = ROOT + '/' + expected
@@ -653,6 +659,7 @@ class Gptbox(Bootstrap):
                 save()
                 return record
             except BaseException:
+                snapshot_prepare_observations()
                 # Preserve successful prerequisite phase independently. Native
                 # per-command and OCI lifetimes remain finite after interruption.
                 if record['prepare'] != 'complete':

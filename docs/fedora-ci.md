@@ -290,3 +290,16 @@ is explicitly package-only, with loaded-policy-plugin verification false. Unknow
 versions/backends/grammar block. No extra privileges, package workaround, changed
 native executor semantics or larger resource/deadline/capture/report limits are
 introduced; local parser/process tests are not Fedora policy acceptance.
+
+
+Preparation now records a source/context-bound timing witness before later
+adapter or cleanup phases can overwrite runner state. It reports the unchanged
+configured budget, effective clipped budget, finite elapsed seconds,
+`deadline_reached_at_exit`, and `timer_fired`. Only the existing actual SIGALRM
+handler sets the last bit. Elapsed time or deadline crossing alone is not a
+primary-cause diagnosis: cleanup after another failure may cross the deadline.
+Missing, malformed, nonfinite, oversized or wrong-target witnesses remain
+unavailable. Private preparation elapsed time is projected only after the same
+strict checks. Bounded per-role directory counts and fixed lookup/substep IDs
+identify progress without exporting argv, raw ID output or exception strings.
+No time/resource/admission/cleanup ceiling is raised or reset.
