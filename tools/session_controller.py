@@ -15,11 +15,11 @@ import stat
 import time
 import uuid
 
-VERSION=2
+VERSION=3
 ROWS=32
 BYTES=1048576
 ACTIVE=('reserved','launching','running')
-STATES=(*ACTIVE,'completed-turn','failed','uncertain')
+STATES=(*ACTIVE,'completed-turn','failed','uncertain','deferred')
 STANDARDS='b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SHARED={'GOVERNANCE.md':'3cc14e3b86a9920dcbc82a7b08a3a0270bab67bf6cad8262f584aafa0fce016d',
         'ENGINEERING-STANDARDS.md':'8b10a0a16647cb213863d9d7e5af7a20ab06b6a20f6964d9068b08f9f90eb195',
@@ -45,6 +45,9 @@ def session(value):
 
 def private_file(path):
     node=path.lstat();require(stat.S_ISREG(node.st_mode) and node.st_uid==os.getuid() and node.st_nlink==1 and stat.S_IMODE(node.st_mode)==0o600,'unsafe controller file')
+
+class DispatchFrozen(ValueError):
+    pass
 
 class ExistingOperation(ValueError):
     def __init__(self,row):
@@ -90,7 +93,7 @@ def validate_binding(value):
 
 class Registry:
     def __init__(self,directory,binding=None,*,readonly=False):
-        self.db=None;self.fd=None;self.ledger=None;self.control_fds={};self.control_nodes=None;self.owner_active=False
+        self.db=None;self.fd=None;self.ledger=None;self.control_fds={};self.control_nodes=None;self.owner_active=False;self.owner_token=None
         try:self._open(directory,binding,readonly=readonly)
         except BaseException:
             self.close();raise
@@ -130,16 +133,16 @@ class Registry:
             self.initializing=True
             with self.transaction():
                 for sql in SQL_SCHEMA.values():self.db.execute(sql)
-                for key,value in (('version',VERSION),('registry_id','registry-'+uuid.uuid4().hex),('binding',binding),('generation',0),('control_identity',self.control_nodes)):
+                for key,value in (('version',VERSION),('registry_id','registry-'+uuid.uuid4().hex),('binding',binding),('generation',0),('control_identity',self.control_nodes),('dispatch',{'schema':1,'generation':0,'state':'open','identity':None,'snapshot':None})):
                     self.db.execute('INSERT INTO metadata VALUES (?,?)',(key,canonical(value)))
                 self.db.execute('PRAGMA user_version='+str(VERSION))
             self.initializing=False
         try:
             self.validate_schema()
-            rows=self.db.execute('SELECT key,value FROM metadata LIMIT 6').fetchall()
-            require(len(rows)==5 and len({row[0] for row in rows})==5,'ambiguous controller metadata')
+            rows=self.db.execute('SELECT key,value FROM metadata LIMIT 7').fetchall()
+            require(len(rows)==6 and len({row[0] for row in rows})==6,'ambiguous controller metadata')
             self.meta={key:loads(value) for key,value in rows}
-            require(set(self.meta)=={'version','registry_id','binding','generation','control_identity'} and type(self.meta['version']) is int and self.meta['version']==VERSION,'invalid controller metadata')
+            require(set(self.meta)=={'version','registry_id','binding','generation','control_identity','dispatch'} and type(self.meta['version']) is int and self.meta['version']==VERSION,'invalid controller metadata')
             require(canonical(self.meta['control_identity'])==canonical(self.control_nodes),'controller control-file identity changed')
             validate_binding(self.meta['binding']);token(self.meta['registry_id'])
             require(type(self.meta['generation']) is int and self.meta['generation']>=0,'invalid controller generation')
@@ -157,14 +160,15 @@ class Registry:
             require(self.db.execute('PRAGMA index_list('+name+')').fetchall()==[(0,index,1,'pk',0)],'unsupported controller uniqueness')
             require(self.db.execute('PRAGMA index_xinfo('+index+')').fetchall()==[(0,0,key,0,'BINARY',1),(1,-1,None,0,'BINARY',0)],'unsupported controller primary key')
     def validate_metadata(self):
-        stored=self.db.execute('SELECT key,value FROM metadata LIMIT 6').fetchall()
-        require(len(stored)==5 and len({row[0] for row in stored})==5,'ambiguous controller metadata')
+        stored=self.db.execute('SELECT key,value FROM metadata LIMIT 7').fetchall()
+        require(len(stored)==6 and len({row[0] for row in stored})==6,'ambiguous controller metadata')
         current={key:loads(value) for key,value in stored}
         require(set(current)==set(self.meta),'unknown controller metadata')
         for key in ('version','registry_id','binding','control_identity'):
             require(canonical(current[key])==canonical(self.meta[key]),'controller metadata identity changed')
         require(canonical(current['control_identity'])==canonical(self.control_nodes),'controller control-file identity changed')
         generation=current['generation'];require(type(generation) is int and 0<=generation<=2147483647,'invalid controller generation')
+        self.validate_dispatch(current['dispatch'])
         return generation
     def check_files(self):
         node=self.root.lstat();held=os.fstat(self.fd)
@@ -203,7 +207,7 @@ class Registry:
         try:
             try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:raise ValueError('controller owner busy') from None
-            self.owner_active=True;self.check_files()
+            self.owner_active=True;self.owner_token=uuid.uuid4().hex;self.check_files()
             primary_pending=False
             try:yield
             except BaseException:
@@ -213,7 +217,7 @@ class Registry:
                 except Exception:
                     if not primary_pending:raise ValueError('controller control-file identity changed') from None
         finally:
-            if self.owner_active:fcntl.flock(fd,fcntl.LOCK_UN);self.owner_active=False
+            if self.owner_active:fcntl.flock(fd,fcntl.LOCK_UN);self.owner_active=False;self.owner_token=None
     def row(self,operation):
         token(operation)
         matches=[row for row in self.inventory()['operations'] if row['operation']==operation]
@@ -221,14 +225,14 @@ class Registry:
         return matches[0] if matches else None
     def validate_row(self,operation,body):
         require(type(body) is str and len(body.encode())<=4096,'controller row byte bound')
-        value=loads(body);keys=set('operation request_sha256 logical_session mode expected_uuid uuid state sequence exit_code capture_complete owner_pid deadline reason checkpoint_id checkpoint_sha256 cleanup launch_handle_observed prompt_sha256 prompt_bytes'.split())
+        value=loads(body);keys=set('operation request_sha256 logical_session mode expected_uuid uuid state sequence exit_code capture_complete owner_pid deadline reason checkpoint_id checkpoint_sha256 cleanup launch_handle_observed prompt_sha256 prompt_bytes owner_lease'.split())
         require(type(value) is dict and set(value)==keys and value['operation']==operation and value['state'] in STATES,'invalid controller operation')
         digest(value['request_sha256']);token(value['logical_session']);token(value['checkpoint_id']);digest(value['checkpoint_sha256']);digest(value['prompt_sha256'])
         require(type(value['prompt_bytes']) is int and 0<value['prompt_bytes']<=262144,'invalid stored prompt length')
         expected=self.request_identity(value['logical_session'],value['prompt_sha256'],value['prompt_bytes'],value['expected_uuid'],{key:value[key] for key in ('checkpoint_id','checkpoint_sha256')})
         require(value['request_sha256']==expected,'stored operation request binding changed')
-        require(value['cleanup'] in ('not-observed','owned-child-reaped','unresolved') and (value['launch_handle_observed'] is None or type(value['launch_handle_observed']) is bool),'invalid controller cleanup observation')
-        require(value['mode'] in ('start','resume') and type(value['sequence']) is int and 0<=value['sequence']<=2097152 and value['reason'] in ('none','rejected','owner-loss','cleanup-unresolved'),'invalid controller state')
+        require(value['cleanup'] in ('not-observed','owned-child-reaped','unresolved','not-launched') and (value['launch_handle_observed'] is None or type(value['launch_handle_observed']) is bool),'invalid controller cleanup observation')
+        require(value['mode'] in ('start','resume') and type(value['sequence']) is int and 0<=value['sequence']<=2097152 and value['reason'] in ('none','rejected','owner-loss','cleanup-unresolved','freeze-before-launch'),'invalid controller state')
         for key in ('expected_uuid','uuid'):
             if value[key] is not None:session(value[key])
         require(value['exit_code'] is None or type(value['exit_code']) is int and -255<=value['exit_code']<=255,'invalid controller exit')
@@ -239,6 +243,10 @@ class Registry:
         state=value['state']
         require(state=='reserved' or value['sequence']>=1,'invalid controller state sequence')
         require(value['uuid'] is None or value['launch_handle_observed'] is True,'UUID without owned launcher observation')
+        require(value['owner_lease'] is None or type(value['owner_lease']) is str and re.fullmatch('[0-9a-f]{32}',value['owner_lease']),'invalid operation owner lease')
+        require((value['cleanup']=='not-launched')==(state=='deferred') and (value['launch_handle_observed'] is not False or state=='deferred'),'contradictory not-launched evidence')
+        if state=='deferred':require(value['sequence']>=1 and value['owner_lease'] is not None and value['uuid'] is None and value['launch_handle_observed'] is False and value['cleanup']=='not-launched' and value['reason']=='freeze-before-launch' and value['exit_code'] is None and value['capture_complete'] is None,'invalid deferred controller state')
+        if state in ('launching','running','completed-turn','failed'):require(value['owner_lease'] is not None,'missing operation owner lease')
         if state=='reserved':require(value['sequence']==0 and value['uuid'] is None and value['launch_handle_observed'] is None and value['cleanup']=='not-observed' and value['reason']=='none','invalid reserved controller state')
         if state=='launching':require(value['uuid'] is None and value['launch_handle_observed'] is None and value['cleanup']=='not-observed' and value['reason']=='none','invalid launching controller state')
         if state=='running':require(value['launch_handle_observed'] is True and value['reason']=='none','invalid running controller state')
@@ -247,6 +255,74 @@ class Registry:
         if state=='failed':require(type(value['exit_code']) is int and value['exit_code']!=0 and value['capture_complete'] is True and value['cleanup']=='owned-child-reaped' and value['launch_handle_observed'] is True and value['reason']=='rejected','invalid failed controller result')
         if state=='completed-turn':require(value['reason']=='none','invalid completed controller reason')
         return value
+    def validate_dispatch(self,value):
+        require(type(value) is dict and set(value)=={'schema','generation','state','identity','snapshot'} and type(value['schema']) is int and value['schema']==1 and type(value['generation']) is int and 0<=value['generation']<=2147483647 and value['state'] in ('open','frozen'),'invalid dispatch metadata')
+        ident=value['identity']
+        if value['generation']==0:
+            require(value['state']=='open' and ident is None and value['snapshot'] is None,'invalid initial dispatch state');return value
+        require(type(ident) is dict and set(ident)=={'registry_id','attempt','token','generation','requested_generation','binding_sha256'},'invalid freeze identity')
+        token(ident['attempt']);token(ident['registry_id']);digest(ident['binding_sha256'])
+        require(ident['registry_id']==self.meta['registry_id'] and ident['binding_sha256']==sha(canonical(self.meta['binding']).encode()) and type(ident['token']) is str and re.fullmatch('[0-9a-f]{32}',ident['token']) and type(ident['generation']) is int and ident['generation']==value['generation'] and type(ident['requested_generation']) is int and ident['requested_generation']==ident['generation']-1,'freeze binding changed')
+        snapshot=value['snapshot']
+        if snapshot is not None:
+            require(type(snapshot) is dict and set(snapshot)=={'schema','freeze','binding','registry_generation','operations','sessions','unbound_operations','quiescent','runtime_admitted'} and snapshot['schema']==1 and type(snapshot['schema']) is int and snapshot['freeze']==ident and snapshot['binding']==self.meta['binding'] and snapshot['quiescent'] is True and snapshot['runtime_admitted'] is False,'invalid freeze snapshot')
+            require(type(snapshot['registry_generation']) is int and 0<=snapshot['registry_generation']<=2147483647 and type(snapshot['operations']) is list and len(snapshot['operations'])<=ROWS,'invalid snapshot bounds')
+            rows=[self.validate_row(row['operation'],canonical(row)) for row in snapshot['operations']]
+            require(len({row['operation'] for row in rows})==len(rows) and all(self.safe_drained(row) for row in rows),'invalid snapshot operations')
+            require(snapshot['sessions']==[{'logical_session':a,'uuid':b} for a,b in sorted({(r['logical_session'],r['uuid']) for r in rows if r['uuid'] is not None})] and snapshot['unbound_operations']==[r['operation'] for r in rows if r['uuid'] is None],'incomplete freeze snapshot')
+        return value
+    def dispatch(self):
+        rows=self.db.execute("SELECT value FROM metadata WHERE key='dispatch'").fetchall();require(len(rows)==1,'ambiguous dispatch metadata')
+        return self.validate_dispatch(loads(rows[0][0]))
+    def store_dispatch(self,value):
+        self.validate_dispatch(value)
+        self.db.execute("UPDATE metadata SET value=? WHERE key='dispatch'",(canonical(value),))
+        self.db.execute("UPDATE metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='generation'")
+        self.validate_metadata() # Reject overflow inside the transaction, before acknowledgement.
+    def freeze_binding(self,binding):
+        validate_binding(binding);require(canonical(binding)==canonical(self.meta['binding']),'freeze caller binding changed')
+    def request_freeze(self,attempt,generation,binding):
+        token(attempt);require(type(generation) is int and 0<=generation<2147483647,'invalid freeze generation');self.freeze_binding(binding)
+        with self.transaction():
+            self.inventory();value=self.dispatch()
+            if value['state']=='frozen':
+                ident=value['identity'];require(ident['attempt']==attempt and ident['requested_generation']==generation,'freeze request collision');return ident
+            require(value['generation']==generation,'stale freeze generation')
+            ident={'registry_id':self.meta['registry_id'],'attempt':attempt,'token':uuid.uuid4().hex,'generation':generation+1,'requested_generation':generation,'binding_sha256':sha(canonical(binding).encode())}
+            self.store_dispatch({'schema':1,'generation':generation+1,'state':'frozen','identity':ident,'snapshot':None})
+            return ident
+    def freeze_match(self,receipt,binding):
+        self.freeze_binding(binding);value=self.dispatch()
+        require(type(receipt) is dict and canonical(value['identity'])==canonical(receipt),'stale or forged freeze token');return value
+    def abort_freeze(self,receipt,binding):
+        with self.transaction():
+            self.inventory();value=self.freeze_match(receipt,binding);self.current_checkpoint()
+            if value['state']=='open':return value
+            value['state']='open';value['snapshot']=None;self.store_dispatch(value);return value
+    @staticmethod
+    def safe_drained(row):
+        return row['state']=='deferred' and row['launch_handle_observed'] is False and row['cleanup']=='not-launched' or row['state'] in ('completed-turn','failed') and row['launch_handle_observed'] is True and row['cleanup']=='owned-child-reaped'
+    def seal_snapshot(self,receipt,binding):
+        with self.owner():
+            with self.transaction():
+                inventory=self.inventory();value=self.freeze_match(receipt,binding)
+                require(value['state']=='frozen','dispatch is not frozen')
+                if value['snapshot'] is not None:return value['snapshot']
+                require(all(self.safe_drained(row) for row in inventory['operations']),'controller draining or cleanup uncertain')
+                snapshot={'schema':1,'freeze':value['identity'],'binding':self.meta['binding'],'registry_generation':inventory['generation']+1,'operations':inventory['operations'],'sessions':inventory['sessions'],'unbound_operations':[r['operation'] for r in inventory['operations'] if r['uuid'] is None],'quiescent':True,'runtime_admitted':False}
+                require(len(canonical(snapshot).encode())<=BYTES,'freeze snapshot byte bound')
+                value['snapshot']=snapshot;self.store_dispatch(value);self.inventory();return snapshot
+    def admit_launch(self,operation):
+        require(self.owner_active and self.owner_token is not None,'launch requires current owner lease')
+        deferred=False
+        with self.transaction():
+            row=self.row(operation);require(row is not None and row['state']=='reserved' and row['owner_lease']==self.owner_token,'launch reservation owner mismatch')
+            deferred=self.dispatch()['state']=='frozen'
+            row.update(state='deferred' if deferred else 'launching');row['sequence']+=1
+            if deferred:row.update(reason='freeze-before-launch',launch_handle_observed=False,cleanup='not-launched')
+            self.write(row)
+        if deferred:raise DispatchFrozen('dispatch frozen before launch; no child launched')
+        return row
     def current_checkpoint(self):
         import job_protocol as p
         require(self.ledger is not None and self.ledger.controller_id==self.meta['binding']['controller_id'],'trusted ledger unavailable')
@@ -282,7 +358,10 @@ class Registry:
                 if row['mode']=='resume':require(origin['state']=='completed-turn' and row['expected_uuid']==origin['uuid'],'conflicting logical session UUID')
                 if row['uuid'] is not None:require(row['uuid']==origin['uuid'],'substituted logical session UUID')
             sessions=sorted({(r['logical_session'],r['uuid']) for r in rows if r['uuid'] is not None})
-            return {'version':VERSION,'registry_id':self.meta['registry_id'],'controller_id':self.meta['binding']['controller_id'],'generation':generation,'operations':rows,'sessions':[{'logical_session':a,'uuid':b} for a,b in sessions],'scope':'all positive operations for this controller; negative fixture probe is separate','runtime_admitted':False}
+            dispatch=self.dispatch()
+            if dispatch['state']=='frozen' and dispatch['snapshot'] is not None:
+                require(dispatch['snapshot']['operations']==rows and dispatch['snapshot']['registry_generation']==generation,'sealed registry inventory changed')
+            return {'dispatch':dispatch,'version':VERSION,'registry_id':self.meta['registry_id'],'controller_id':self.meta['binding']['controller_id'],'generation':generation,'operations':rows,'sessions':[{'logical_session':a,'uuid':b} for a,b in sessions],'scope':'all positive operations for this controller; negative fixture probe is separate','runtime_admitted':False}
         finally:
             if owned:self.db.execute('COMMIT')
     def write(self,row):
@@ -301,16 +380,23 @@ class Registry:
             checkpoint={key:prior[key] for key in ('checkpoint_id','checkpoint_sha256')} if prior is not None else self.current_checkpoint()
             request=self.request_identity(logical_session,sha(prompt.encode()),len(prompt.encode()),resume,checkpoint)
             if prior is not None:require(prior['request_sha256']==request,'operation request collision');return prior,False
+            require(self.dispatch()['state']=='open','controller dispatch frozen')
             require(type(deadline) in (int,float) and time.monotonic()<deadline<=time.monotonic()+180,'invalid original controller deadline')
             require(len(rows)<ROWS,'controller row bound')
             require(not any(r['state'] in (*ACTIVE,'uncertain') and (r['logical_session']==logical_session or resume is not None and r['uuid']==resume) for r in rows),'session already active or uncertain')
             if resume is None:require(not any(r['logical_session']==logical_session for r in rows),'start identity already exists')
             else:require(any(r['logical_session']==logical_session and r['uuid']==resume and r['state']=='completed-turn' for r in rows),'resume not bound to completed owned session')
-            row={'operation':operation,'request_sha256':request,'logical_session':logical_session,'mode':'resume' if resume else 'start','expected_uuid':resume,'uuid':None,'state':'reserved','sequence':0,'exit_code':None,'capture_complete':None,'owner_pid':os.getpid(),'deadline':deadline,'reason':'none','cleanup':'not-observed','launch_handle_observed':None,'prompt_sha256':sha(prompt.encode()),'prompt_bytes':len(prompt.encode()),**checkpoint}
+            row={'operation':operation,'request_sha256':request,'logical_session':logical_session,'mode':'resume' if resume else 'start','expected_uuid':resume,'uuid':None,'state':'reserved','sequence':0,'exit_code':None,'capture_complete':None,'owner_pid':os.getpid(),'deadline':deadline,'reason':'none','cleanup':'not-observed','launch_handle_observed':None,'prompt_sha256':sha(prompt.encode()),'prompt_bytes':len(prompt.encode()),'owner_lease':self.owner_token if self.owner_active else None,**checkpoint}
             self.write(row);return row,True
     def update(self,operation,**values):
+        require(set(values)<= {'state','reason','exit_code','capture_complete','cleanup','launch_handle_observed','uuid'},'immutable controller operation binding')
+        if values.get('state')=='launching':
+            require(set(values)=={'state'},'invalid launch admission');return self.admit_launch(operation)
         with self.transaction():
-            row=self.row(operation);require(row is not None,'unknown controller operation');row.update(values);row['sequence']+=1;self.write(row)
+            row=self.row(operation);require(row is not None,'unknown controller operation')
+            require(row['state']!='deferred','deferred operation is observe-only')
+            require(row['state']!='reserved' or values.get('state') in (None,'uncertain'),'reserved launch requires admission')
+            row.update(values);row['sequence']+=1;self.write(row)
         return row
     def uncertain(self):
         with self.transaction():
@@ -332,6 +418,9 @@ class Observer:
     def inventory(self):
         value=self.registry.inventory();held=self.owner_held()
         value['operations']=[self.project(row,held) for row in value['operations']]
+        snapshot=value['dispatch']['snapshot']
+        if snapshot is not None:
+            value['dispatch']['snapshot']={'schema':1,'sha256':sha(canonical(snapshot).encode()),'registry_generation':snapshot['registry_generation'],'operation_count':len(snapshot['operations']),'quiescent':value['dispatch']['state']=='frozen'}
         value['owner_lease_observed']='held' if held else 'unheld'
         return value
     def reattach(self,operation):
@@ -342,7 +431,7 @@ class Observer:
 class TurnOwner:
     """Owns one source-fixed adapter invocation; observers never receive its handle."""
     def __init__(self,registry,operation):self.registry=registry;self.operation=operation;self.uuid=None;self.started=False;self.completed=False
-    def launching(self):self.registry.update(self.operation,state='launching')
+    def launching(self):self.registry.admit_launch(self.operation)
     def child(self,process):
         require(process.pid>0,'child handle unavailable');self.registry.update(self.operation,state='running',launch_handle_observed=True)
     def cleanup(self,complete):

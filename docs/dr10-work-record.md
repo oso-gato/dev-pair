@@ -3,6 +3,54 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 05:52 HKT — durable per-registry freeze and drain
+
+- Published bf68f2f passed fresh review and its one 682-test combined suite in
+  96.415 seconds. Native35 passed hosted 682 checks in 79.307 seconds, then failed
+  controller tooling storage measurement before source payload/Fedora boot. The
+  sample exited -6 with no usable total; no capacity exhaustion/headroom or abort
+  cause is established. Image-copy worker cleanup remained unresolved and scratch
+  was preserved. No guest/encrypted diagnostic exists. Root queued a separate
+  native source repair; all native/crypto/workflow bytes stay unchanged here.
+- Registry format 3 persists one bounded freeze identity/token/generation and
+  optional sealed snapshot under existing FULL-synchronous transactions. Formats
+  1/2 and unknown/corrupt state reject without automatic migration/reset/deletion.
+  Ledger v1 and its backup schema are byte-identical. Existing row/file/deadline/
+  capture bounds remain; snapshot duplication counts against the same 1 MiB.
+- Freeze acknowledgement is committed before return. It can request drain while
+  the owner lease is held; it is not a quiescence claim. Both new reserve and the
+  atomic actual reserved-to-launch admission are fenced. Already admitted launch
+  may finish under its original deadline. Current lease nonce plus held validated
+  lease distinguishes deferred-before-launch from old/unleased owner uncertainty.
+  Deferred records say no handle/not-launched, never child-reaped, and remain
+  observe-only. No abort or duplicate operation silently resumes/replays them.
+- Sealing requires exclusive lease and every row safe: no active/uncertain or
+  unconfirmed cleanup, including failed rows. Full operation/UUID/unbound-origin,
+  request/checkpoint/progress/cleanup/binding/generation evidence is persisted.
+  Read-only observers expose complete rows and a bounded snapshot digest reference.
+  Exact-token abort checks unchanged binding/current trusted job, preserves all
+  rows/deadlines/uncertainty, clears the snapshot and cannot thaw a later generation.
+- Real process/SQLite tests cover lease-held drain, actual owned sleeping child,
+  launch/freeze and reserve/freeze serialization, crash before/after commit,
+  restart/owner-loss, deferred proof, stale/reused attempt tokens, new benign resume,
+  corrupt/omitted/duplicate snapshot state, replaced lease, all 32 unbound rows,
+  failed cleanup and generation exhaustion. The broader affected run passed 131
+  checks in 10.314 seconds after correcting one test's invalid model-name input;
+  its original failed expectation is retained. A final post-write generation-bound
+  validation closes overflow before freeze acknowledgement; all 16 freeze-specific
+  checks then passed in 1.705 seconds. No full/stock/native run is claimed here.
+- Evidence is under `/workspace/artifacts/dispatch-freeze-20261122/`. This is one
+  private per-controller fixture registry, not both roles, a global session catalog,
+  atomic cross-database/source/credential backup, replacement or nightly renewal.
+  The earlier actual64 stock delivery remains historical baseline; changed format-3
+  controller source needs fresh review and later separately scoped validation.
+  All production runtime/jobs/auth/nested/storage/quota/tailnet/release/Hostinger
+  gates remain open. No private document text or diagnostic key is copied.
+- Allocation: 21:35:55–22:00:55 UTC without extension. API-selected GPT-6.1 Sol/high
+  remains the builder; backend attestation is unavailable. No stock/native/CI,
+  network/SSH/auth/real-model, push/merge or deployment occurs in this unit.
+
+
 ### November 23, 2026, 05:24 HKT — coherent handler transitions
 
 - Fresh e7689ba review found one coherent R1 at both ends of handler deferral.

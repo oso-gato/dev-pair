@@ -37,7 +37,7 @@ python3 tools/session_controller.py --registry /private/controller/session-regis
   --operation turn-alpha-first
 ```
 
-Registry format 2 validates the complete supported SQLite table definitions,
+Registry format 3 validates the complete supported SQLite table definitions,
 columns, primary-key indexes and uniqueness before projection or mutation. It
 also checks the full bounded row set, each stored request hash and the single
 logical-session origin/UUID relationship. Unsupported or corrupt schemas and
@@ -49,7 +49,7 @@ The registry retains descriptors for both the database and lease, persists their
 device/inode identities and compares them with the current paths on reopen,
 reads, mutations and owner entry/exit. Replacing, unlinking or recreating either
 file is an unavailable/conflicting state, never a fresh unlocked lease. Observers
-use the same verified lease inode. Existing format-1 registry files are rejected
+use the same verified lease inode. Existing format-1 and format-2 registry files are rejected
 without migration; this does not change the v1 job ledger or its backup schema.
 This is a protected same-UID controller consistency boundary, not a claim against
 arbitrary malicious controller code or production state replacement.
@@ -194,7 +194,7 @@ The interruption point is after completed first-turn checkpoints, using the same
 binary and state across process restart. This does not prove in-flight operation
 replay safety, all production sessions, authentication, image/version migration,
 replacement/rollback, Fedora/Podman/Distrobox placement, nightly scheduling,
-atomic dispatch freeze, full session/platform recovery or R9/R11 acceptance.
+role-wide dispatch freeze, full session/platform recovery or R9/R11 acceptance.
 
 A later reviewed durable-projection candidate passed both first rollout audits,
 including complete projected contexts and exact original call/result pairs. Its
@@ -477,3 +477,65 @@ startup record to match. Invalid order rejects before a continuation tool is
 issued; it does not rely on the final audit. The original valid first/resume and
 durable paths remain required. The 639-test full result belongs to the earlier
 candidate; this narrow repair has affected checks and needs fresh review.
+
+
+### Durable per-registry dispatch pause
+
+Registry format 3 adds one bounded freeze record to the existing private SQLite
+metadata. Formats 1/2 and unknown versions reject without migration, row reset or
+state deletion. The v1 job ledger and strict ledger backup schema are unchanged.
+This is a trusted same-UID controller component for the existing 32-row registry;
+it is not a catalog of both production roles or a renewal/replacement scheduler.
+
+An already configured trusted controller can call:
+
+```python
+binding = registry.meta['binding']
+generation = registry.inventory()['dispatch']['generation']
+freeze = registry.request_freeze('maintenance-attempt', generation, binding)
+# Busy lease or active/uncertain rows mean draining, never a successful snapshot.
+snapshot = registry.seal_snapshot(freeze, binding)
+registry.abort_freeze(freeze, binding)
+```
+
+The acknowledgement follows a fully synchronous commit. The exact request is
+idempotent; a changed request, stale generation or changed binding rejects. A
+freeze can commit while the current owner lease is held, and therefore initially
+means only that draining was requested. New reservations are fenced, and the
+actual reserved-to-launch admission is checked atomically in the same SQLite
+serialization order. A launch admitted first may drain under its original
+operation deadline. A freeze committed first prevents the new child launch.
+
+Only a reservation made under that same currently held, descriptor-checked lease
+can be marked `deferred`: `launch_handle_observed=false`, cleanup `not-launched`.
+It is never labeled child-reaped. An unleased, prior-owner or uncertain reservation
+cannot acquire that evidence retroactively. Its PID is not authority. Deferred
+operations remain retained and observe-only; abort does not execute them, replay
+an old operation or reset its deadline. A new supported operation still needs its
+ordinary trusted current checkpoint/session binding and owner lease.
+
+Sealing acquires the existing exclusive lease nonblocking, validates the complete
+registry transaction and rejects every active/uncertain row or unconfirmed
+cleanup. A failed exit alone is insufficient. The durable snapshot contains every
+operation, known UUID/session, unbound origin, request/checkpoint hash, progress,
+cleanup, full immutable binding, exact freeze token and registry generation.
+Its duplicate storage counts against the unchanged 1 MiB state bound. The
+read-only observer returns complete operation rows and a bounded snapshot digest
+reference instead of duplicating all snapshot rows. It does not freeze, thaw,
+write SQLite, signal or adopt a process.
+
+The freeze persists after coordinator restart. Lost owners remain uncertain and
+block sealing. The exact token/generation and unchanged controller/job/source/
+runtime/model/standards binding are required for abort. An old or duplicate token
+cannot clear a later freeze even when its attempt name is reused. Abort retains
+operation state/uncertainty and clears the sealed snapshot before new dispatch,
+so later inventory cannot inherit stale quiescence evidence. These checkpoints
+are references: they do not atomically back up Ledger, Codex, source, credentials
+or storage, prove capacity, admit an agent, or provide full role-wide renewal.
+
+Local real SQLite/process/child tests cover commit/crash/reopen, reserve/launch
+races, drain/defer/snapshot/abort/new benign progress, stale tokens, old/corrupt
+schemas, replaced leases, complete bounded inventory and generation exhaustion.
+The changed controller needs fresh review and later separately scoped integration
+validation; the earlier finite stock PASS is historical baseline evidence and is
+not relabeled as a stock run on this format-3 candidate.

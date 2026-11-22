@@ -97,6 +97,17 @@ Fresh review, a later combined full and separately authorized native validation
 remain required. This is diagnostic capability, not a runtime fix or a diagnosed
 native34 cause; local read-only DAC tests do not prove native ISO behavior.
 
+Published `bf68f2f` passed fresh review and 682 local tests in 96.415 seconds.
+Native35 passed hosted checks, then stopped before Fedora at a failed controller
+storage measurement; no usable capacity sample or encrypted guest diagnostic was
+produced, and image-copy cleanup remained unresolved with scratch preserved.
+A separate native source repair is queued. The current source-only controller
+adds durable format-3 freeze/drain/snapshot/abort for its existing private registry,
+with new reservation and leased launch fencing. Snapshots require complete safe
+inventory; exact-token abort preserves uncertainty and never replays deferred work.
+This has affected local evidence only, requires fresh review, and does not provide
+role-wide session inventory, authenticated renewal or production admission.
+
 No production deployment is established.
 
 <a id="dr2-8"></a>
