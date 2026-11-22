@@ -36,9 +36,84 @@ data. SQLite `BEGIN IMMEDIATE`, full synchronous commits and rollback journaling
 atomically reserve attempts and commit results. Do not copy an open SQLite file
 as a backup: use SQLite's backup API or stop all controllers before copying the
 complete state directory. No cleanup command exists: source, artifacts, evidence,
-checkpoints and deliverables are never deleted by this tool. Actual backup/restore,
-role mount enforcement, storage quotas and retention admission need integration
-and real boundary validation before jobs are enabled.
+checkpoints and deliverables are never deleted by this tool. The bounded local
+backup/restore path below preserves this ledger only. Role mount enforcement,
+storage quotas and retention admission still need integration and real boundary
+validation before jobs are enabled.
+
+## Private ledger backup and clean-destination restoration
+
+The trusted local controller can snapshot its ledger without copying an open
+SQLite file:
+
+```sh
+python3 tools/jobs.py --state /private/controller-state backup /private/new-backup
+python3 tools/jobs.py --state /private/new-restored-state restore /private/new-backup
+```
+
+Both destinations must be absent. Existing directories, files, symlinks and
+foreign-owned paths are preserved and rejected; there is no replace, merge,
+cleanup or retry operation. Parents must already exist under trusted nonsymlink
+ancestors. This is the same trusted controller UID/operator-managed filesystem
+boundary as normal ledger use, not protection against a hostile controller or
+concurrent same-UID ancestor replacement. The reserved leaf is mode `0700` and
+its files are owned mode `0600`, regular and single-link.
+
+A fixed trusted child has a 10-second total operation envelope, including bounded
+termination/reaping, a 16 MiB snapshot/file ceiling and a 256 MiB address-space
+ceiling. SQLite backup uses finite 64-page steps with a deadline callback and a
+bounded busy wait. Source transactions continue; the backup is one consistent
+committed database state. These are small local component limits, not deployed
+filesystem quotas. No cap increases or unbounded rescue retries are supported.
+Limits also include 4,096 rows per ordinary table, 8,192 events and a 16 KiB
+manifest. Limits exhausted or termination unresolved means blocked, with partial
+owned state preserved.
+
+The backup contains `snapshot.sqlite3`, a strict version-1 `manifest.json`, a
+reservation identity (`RECOVERY`) and an atomic no-replace `COMPLETE` marker.
+The manifest records snapshot length/SHA256, database/protocol version, backup
+identity, source recovery/protocol implementation hashes, logical controller ID,
+row counts and ordered table identity hashes covering checkpoints, requests,
+attempts, results and events. These hashes identify data and provenance; they do
+not authenticate a backup or remotely attest its controller.
+
+Restore reserves a fresh destination, marks it incomplete, copies only the bounded
+snapshot, and validates it through a read-only SQLite connection before normal
+mutable Ledger construction. Validation requires SQLite integrity, the exact
+supported schema/version, no extra tables, indexes, triggers or views, valid
+protocol envelopes, canonical bodies and a replay of the fixed data history.
+The replay checks current checkpoint references, request budgets and identities,
+unique reservations, result bindings, reconciliation and consumed progress against
+all stored tables. Supplied SQL, extensions, migrations, commands and referenced
+paths are never executed. Unsupported versions, truncation, hash/length changes,
+missing records or invalid history block admission.
+
+Data and manifest are fsynced before atomic completion publication; the private
+leaf and parent are also synced. A killed operation retains recognizable incomplete
+staging. An existing empty directory is now refused by Ledger rather than silently
+initialized, closing interruption between destination reservation and its first
+marker. A partially copied ledger cannot be opened without its matching completion
+identity. Do not manually remove markers to bypass failed validation. There is no
+automatic reclamation of incomplete or foreign paths.
+
+The logical controller ID, model/standards/agreement pins, exact candidates and
+tests, ordered events, historical results, pending requests and in-flight attempts
+remain unchanged. A separate restoration instance identifies this local copy.
+Completed duplicate requests return their stored result even if an artifact is
+missing. An interrupted attempt still blocks execution and checkpoint replacement
+until explicit existing reconciliation; restoration never reissues it. Old pending
+requests whose library recipe identity differs remain blocked until a fresh
+checkpoint/request. Historical records are never rewritten to match current code.
+
+Only the ledger and recovery manifest are backed up. Source trees, referenced
+artifacts/evidence, Codex state, credentials and secret directories are not copied
+or traversed. Referenced evidence availability remains a separate dependency.
+Reports contain IDs, hashes and counts, not ledger payloads. Stop the original
+controller before using a restored copy for continuation: this provides no
+concurrent writable replica coordination, automatic failover or external host
+effect reconciliation. Local SQLite/process tests verify this component; host
+transport, quotas, Codex/session renewal, deployment rollback and full platform
+backup/restoration remain unverified.
 
 ## Protocol and recovery
 
@@ -168,7 +243,7 @@ A `fedora-host` boundary or unsupported recipe/capability returns blocked before
 reading the artifact. No local result is relabeled as Fedora evidence. Live
 host/systemd/SELinux checks, actual failure-driven code repair through the pair,
 authenticated role transport, isolated job execution, job/session restoration,
-backup restoration and quotas/cleanup remain required. Run
+full platform backup restoration and quotas/cleanup remain required. Run
 `python3 -m unittest discover -s tests -p test_jobs.py -v` for the local protocol
 journey, killed-process recovery, real concurrent controllers, transaction
 rollback, identity/collision/budget denial and filesystem boundary checks.

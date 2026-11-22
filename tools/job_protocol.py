@@ -235,11 +235,17 @@ class Ledger:
                         (not ancestor.st_mode & 0o022 or
                          ancestor.st_uid == 0 and ancestor.st_mode & stat.S_ISVTX),
                         'state ancestors must be trusted and not writable by other principals')
+        existed = self.root.exists()
         self.root.mkdir(mode=0o700, parents=False, exist_ok=True)
         info = self.root.lstat()
         require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
                 stat.S_IMODE(info.st_mode) == 0o700, 'state directory must be controller-owned mode 0700')
         self.path = self.root / 'ledger.sqlite3'
+        # A crash after exclusive destination reservation must never silently
+        # initialize an empty ledger or admit a partially restored database.
+        require(not existed or self.path.exists(), 'incomplete existing ledger directory')
+        from ledger_recovery import check_admission
+        check_admission(self.root)
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
         except FileExistsError:

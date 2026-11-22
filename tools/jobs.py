@@ -40,9 +40,19 @@ def main(argv=None):
     child.add_argument('--boundary', choices=['local-protocol', 'fedora-host'], default='local-protocol')
     commands.add_parser('events')
     commands.add_parser('recipe')
+    for command in ('backup', 'restore'):
+        child = commands.add_parser(command, help='bounded trusted-local ledger recovery')
+        child.add_argument('directory', type=pathlib.Path,
+                           help='new backup destination, or completed backup source for restore')
     args = parser.parse_args(argv)
     if args.command == 'recipe':
         print(canonical(recipe_identity()))
+        return 0
+    if args.command in ('backup', 'restore'):
+        from ledger_recovery import run
+        source, destination = ((args.state, args.directory) if args.command == 'backup'
+                               else (args.directory, args.state))
+        print(canonical(run(args.command, source, destination)))
         return 0
     ledger = Ledger(args.state)
     try:
