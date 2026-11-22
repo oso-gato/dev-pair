@@ -231,7 +231,42 @@ These mechanisms were informed by A11's pinned host reference; historical
 bootstrap code/policy was not copied or executed.
 
 `dp-maint` and `dp-dev` are separate locked, nologin runtime accounts with private
-groups, no sudo grants (checked using `sudo -l`) and explicit SSH denial. Each receives 65536
+groups, no sudo grants and explicit SSH denial. The fixed `sudo -l -U` probe
+requires a successful complete listing whose entire C-locale stdout is exactly
+`User dp-maint is not allowed to run sudo on erebus.` (or `dp-dev`), followed by
+one LF, with empty stderr. It binds the previously verified hostname and fixed
+role to complete verified relay/payload/native status zero when the existing
+executor is native. The documented standalone prepare path keeps its existing
+trusted-root direct subprocess: complete bounded pipes and the directly waited
+payload status zero apply, with `execution_kind=direct`, no native exit and
+`relay_verified=false` (not applicable). Execution kind comes only from the
+selected executor branch; a failed native relay never falls back to direct.
+Zero means the query succeeded;
+it is never by itself evidence of denied privileges. Status one, warnings,
+Defaults/permission headings, extra bytes, malformed/truncated output or unknown
+grammar block account-step completion and subsequent role-directory/image setup.
+
+A fixed guest RPM query reads only NAME, VERSION, RELEASE and ARCH for the owner
+of `/usr/bin/sudo`, through the same bounded guest executor and phase deadline.
+The supported grammar is limited to the sudo package version `1.9.17`, Fedora44
+release `<number>.p2.fc44`, and x86_64/aarch64. Unknown owners (including sudo-rs),
+versions or metadata block. The retained package projection accepts at most
+512 ASCII bytes; the existing aggregate 1 MiB transport ceiling is unchanged.
+This is package-only provenance, with `policy_plugin_verified=false`; it does not
+attest the executable bytes or a loaded policy plugin against a hostile root.
+Within the existing trusted-root provisioning boundary, the supported evaluator's
+complete exact denial is the observed no-grants predicate. No sudo configuration
+or full `sudo -V` dump is collected.
+
+Both success and rejection retain bounded typed evidence under stable
+`maintenance-sudo-denial` and `development-sudo-denial` IDs: role, verified exit
+integers, execution kind, relay/completeness/host/denial/stderr booleans, captured byte counts and
+fixed outcome. At most two role receipts and one package projection survive
+recent-history rotation. Policy listings, argv, environment and credentials are
+withheld from diagnostics and public reports. This parser/transport repair still
+requires actual changed-candidate Fedora validation for both roles.
+
+Each account receives 65536
 nonoverlapping subordinate UIDs/GIDs, beginning at 1000000 and 1065536; overlap or
 existing conflicting users/configuration fails. Linger permits future systemd
 user supervision. User-slice limits are 2GiB memory, 512 tasks and 100% CPU per

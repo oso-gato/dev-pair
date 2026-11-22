@@ -55,7 +55,10 @@ class ProbeCommands(Commands):
     """Bounded diagnostics only for credential-free assembly/probe operations."""
     diagnostic = None
 
-    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900, sudo_probe=None, sudo_package=False):
+        if sudo_probe is not None or sudo_package:
+            return super().__call__(*args, ok=ok, input_text=input_text, timeout=timeout,
+                                    sudo_probe=sudo_probe, sudo_package=sudo_package)
         if self.diagnostic is None:
             return super().__call__(*args, ok=ok, input_text=input_text, timeout=timeout)
         if input_text is not None:
@@ -591,6 +594,10 @@ class Gptbox(Bootstrap):
                 history['recent'] = (history['recent'] + [entry])[-4:]
                 if entry.get('accepted_exit') is not True:
                     history['failures'] = (history['failures'] + [entry])[-4:]
+                if 'sudo_package' in entry:
+                    history['sudo_package'] = entry['sudo_package']
+                if entry.get('operation_id') in ('maintenance-sudo-denial', 'development-sudo-denial') and 'sudo_denial' in entry:
+                    history.setdefault('sudo_denials', {})[entry['operation_id']] = entry['sudo_denial']
                 self.atomic(location, json.dumps(history, sort_keys=True) + '\n', expected=self.text(location) or None)
             save()
             def register(unit):

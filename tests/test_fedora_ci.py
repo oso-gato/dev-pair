@@ -51,6 +51,23 @@ class FedoraCITests(unittest.TestCase):
             self.assertEqual(observed,{'status':'unavailable'})
             self.assertNotIn('SECRET',json.dumps(observed))
 
+    def test_sudo_typed_evidence_survives_recent_history_without_policy_text(self):
+        import bootstrap
+        expected=fixture_inputs();state=self.root/'state';state.mkdir()
+        package=bootstrap.sudo_package_projection(b'sudo\t1.9.17\t10.p2.fc44\tx86_64\n',b'',True,0)
+        denials={}
+        for role,operation in bootstrap.SUDO_ROLES.items():
+            denials[operation]=bootstrap.sudo_denial_projection(role,
+                ('User '+role+' is not allowed to run sudo on erebus.\n').encode(),b'',complete=True,
+                status=0,native_status=0,relay_verified=True,host_verified=True,package=package)
+        history={'recent':[],'failures':[],'sudo_package':package,'sudo_denials':denials,
+                 'ignored_raw_policy':'SECRET-POLICY-CANARY'}
+        (state/'prepare-diagnostics.json').write_text(json.dumps(history))
+        observed=guest.public_diagnostics(state,expected)['prepare']['sudo_evidence']
+        self.assertEqual(observed['denials'],denials)
+        self.assertFalse(observed['package']['policy_plugin_verified'])
+        self.assertNotIn('SECRET',json.dumps(observed))
+
     def test_actual_official_checksum_signature_and_tamper_rejection(self):
         inputs = ROOT / 'tests/data/fedora44'
         result = ci.verify_checksum(inputs / 'fedora.gpg', inputs / 'CHECKSUM', self.root / 'good')

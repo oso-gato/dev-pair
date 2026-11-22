@@ -33,11 +33,13 @@ class Fake:
         self.password_inputs = []
         self.password_set = False
 
-    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900, sudo_probe=None, sudo_package=False):
         self.calls.append(args)
         if self.fail and self.fail(args):
             raise b.Blocked('injected command failure (output withheld)')
         exe = Path(args[0]).name
+        if sudo_package:
+            return b.sudo_package_projection(b'sudo\t1.9.17\t10.p2.fc44\tx86_64\n', b'', True, 0)
         if exe == 'chpasswd':
             self.password_inputs.append(input_text)
             self.password_set = True
@@ -47,8 +49,16 @@ class Fake:
             return 'erebus\n'
         if exe == 'sudo':
             if args[-1] in ('dp-maint', 'dp-dev'):
-                self.assert_no_sudo_expected = ok == (1,)
-                return ''
+                self.assert_no_sudo_expected = ok == (0,) and sudo_probe is not None
+                if not self.assert_no_sudo_expected:
+                    raise b.Blocked('synthetic sudo fixture requires content predicate')
+                receipt = b.sudo_denial_projection(args[-1],
+                    ('User ' + args[-1] + ' is not allowed to run sudo on erebus.\n').encode(), b'',
+                    complete=True, status=0, native_status=0, relay_verified=True,
+                    host_verified=sudo_probe['host_verified'], package=sudo_probe['package'])
+                if receipt['outcome'] != 'denied':
+                    raise b.Blocked('synthetic sudo predicate rejected')
+                return receipt
             return 'Matching Defaults entries for core: authenticate\n    (ALL) PASSWD: ALL\n'
         if exe == 'systemd-run':
             operation = args[args.index('--storage-driver=vfs') + 1:]
@@ -893,6 +903,18 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(self.fake.node['BackendState'], 'Stopped')
         self.assertFalse(self.app.path(b.STATE + '/node.json').exists())
         self.assertFalse(any(call[:2] == ('/usr/bin/tailscale', 'up') for call in self.fake.calls))
+
+    def test_sudo_denial_failure_prevents_role_completion_directories_and_jobs(self):
+        self.fake.fail = lambda args: args == ('/usr/bin/sudo','-l','-U','dp-maint')
+        with self.assertRaises(b.Blocked): self.prepare()
+        events = [json.loads(line) for line in self.app.text(b.STATE+'/journal.jsonl').splitlines()]
+        self.assertFalse(any(e['action']=='dp-maint' and e['status']=='complete' for e in events))
+        self.assertTrue(any(e['action']=='dp-maint' and e['status']=='interrupted-or-failed' for e in events))
+        self.assertNotIn('dp-dev',self.fake.accounts)
+        self.assertFalse(self.app.path('/var/lib/dev-pair/maintenance').exists())
+        self.assertFalse(self.app.path('/etc/dev-pair/limits.json').exists())
+        self.assertFalse(self.app.path(b.STATE+'/prepared').exists())
+        self.assertFalse(any(call[0]=='/usr/bin/systemd-run' for call in self.fake.calls))
 
     def test_core_password_stdin_and_completed_retry_never_relocks_or_resets(self):
         self.prepare()

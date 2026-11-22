@@ -102,6 +102,56 @@ KEYS_FETCH_ATTEMPTS = 3
 class Blocked(Exception):
     pass
 
+SUDO_PACKAGE_QUERY = ('/usr/bin/rpm', '-qf', '/usr/bin/sudo', '--queryformat',
+                      '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n')
+SUDO_ROLES = {'dp-maint': 'maintenance-sudo-denial', 'dp-dev': 'development-sudo-denial'}
+
+
+def sudo_package_projection(stdout, stderr, complete, status):
+    value = {'availability': 'unavailable', 'supported': False,
+             'provenance': 'package-only', 'policy_plugin_verified': False}
+    if complete is not True or type(status) is not int or status != 0 or stderr or len(stdout) > 512:
+        return value
+    try:
+        text = stdout.decode('ascii')
+    except UnicodeError:
+        return value
+    match = re.fullmatch(r'([A-Za-z0-9_.+-]{1,64})\t([A-Za-z0-9_.+-]{1,64})\t([A-Za-z0-9_.+-]{1,64})\t([A-Za-z0-9_+-]{1,32})\n', text)
+    if match is None:
+        return value
+    value.update(availability='observed', **dict(zip(('name', 'version', 'release', 'arch'), match.groups())))
+    value['supported'] = (value['name'] == 'sudo' and value['version'] == '1.9.17' and
+                          re.fullmatch(r'[0-9]+\.p2\.fc44', value['release']) is not None and
+                          value['arch'] in ('x86_64', 'aarch64'))
+    return value
+
+
+def sudo_denial_projection(role, stdout, stderr, *, complete, status, native_status,
+                           relay_verified, host_verified, package, execution_kind='native'):
+    if type(role) is not str or role not in SUDO_ROLES:
+        raise Blocked('unsupported sudo denial role')
+    expected = ('User ' + role + ' is not allowed to run sudo on erebus.\n').encode('ascii')
+    exact = stdout == expected
+    supported = (type(package) is dict and set(package) == {'availability', 'supported', 'provenance',
+                 'policy_plugin_verified', 'name', 'version', 'release', 'arch'} and
+                 package['availability'] == 'observed' and package['supported'] is True and
+                 package['provenance'] == 'package-only' and package['policy_plugin_verified'] is False and
+                 package['name'] == 'sudo' and package['version'] == '1.9.17' and
+                 type(package['release']) is str and len(package['release']) <= 64 and
+                 re.fullmatch(r'[0-9]+\.p2\.fc44', package['release']) is not None and
+                 package['arch'] in ('x86_64', 'aarch64'))
+    transport = ((execution_kind == 'native' and type(native_status) is int and native_status == 0 and relay_verified is True) or
+                 (execution_kind == 'direct' and native_status is None and relay_verified is False))
+    accepted = (complete is True and type(status) is int and status == 0 and transport and
+                host_verified is True and supported and exact and not stderr)
+    return {'operation_id': SUDO_ROLES[role], 'role': role, 'execution_kind': execution_kind,
+            'payload_exit': status if type(status) is int else None,
+            'native_exit': native_status if type(native_status) is int else None,
+            'relay_verified': relay_verified is True, 'exact_denial': exact,
+            'hostname_bound': host_verified is True, 'stderr_empty': not stderr,
+            'complete_input': complete is True, 'stdout_bytes': len(stdout), 'stderr_bytes': len(stderr),
+            'package_supported': supported, 'outcome': 'denied' if accepted else 'blocked'}
+
 _PHASE_DEADLINE = contextvars.ContextVar('dev_pair_phase_deadline', default=None)
 
 
@@ -182,6 +232,10 @@ class Commands:
     @staticmethod
     def operation_id(args):
         # IDs are fixed enums; never echo argv, paths or environment.
+        if len(args) == 4 and args[:3] == ('/usr/bin/sudo', '-l', '-U') and args[3] in SUDO_ROLES:
+            return SUDO_ROLES[args[3]]
+        if args == SUDO_PACKAGE_QUERY:
+            return 'sudo-package-provenance'
         if args == ('/usr/sbin/getenforce',):
             return 'selinux-enforcement'
         if (len(args) == 7 and args[:2] == ('/usr/bin/systemctl', 'show') and args[-1] == 'systemd-resolved.service' and
@@ -307,10 +361,20 @@ class Commands:
         if failed:
             raise Blocked('native cleanup unresolved; retained ownership record and finite lifetime')
 
-    def __call__(self, *args, ok=(0,), input_text=None, timeout=900):
-        return self._call(*args, ok=ok, input_text=input_text, timeout=timeout)
+    def __call__(self, *args, ok=(0,), input_text=None, timeout=900, sudo_probe=None, sudo_package=False):
+        return self._call(*args, ok=ok, input_text=input_text, timeout=timeout,
+                          sudo_probe=sudo_probe, sudo_package=sudo_package)
 
-    def _call(self, *args, ok=(0,), input_text=None, timeout=900, maximum=1048576, probe=False):
+    def _call(self, *args, ok=(0,), input_text=None, timeout=900, maximum=1048576, probe=False,
+              sudo_probe=None, sudo_package=False):
+        if sudo_probe is not None:
+            if (type(sudo_probe) is not dict or set(sudo_probe) != {'role', 'host_verified', 'package'} or
+                    type(sudo_probe['role']) is not str or sudo_probe['role'] not in SUDO_ROLES or
+                    args != ('/usr/bin/sudo', '-l', '-U', sudo_probe['role']) or
+                    ok != (0,) or input_text is not None or probe or sudo_package):
+                raise Blocked('unsupported sudo denial operation')
+        if sudo_package and (args != SUDO_PACKAGE_QUERY or ok != (0,) or input_text is not None or probe):
+            raise Blocked('unsupported sudo package operation')
         timeout = self.limit_timeout(timeout)
         stdin_data = input_text.encode() if input_text is not None else None
         if stdin_data is not None and len(stdin_data) > 16384:
@@ -338,6 +402,9 @@ class Commands:
                     '--property=TasksMax=512', '--property=CPUQuota=100%',
                     '/usr/bin/env', '-i', 'PATH=/usr/sbin:/usr/bin', 'LANG=C', 'LC_ALL=C', 'HOME=/root', *args)
         env = {'PATH': '/usr/sbin:/usr/bin', 'LANG': 'C', 'LC_ALL': 'C', 'HOME': '/root'}
+        # Frozen from the selected executor branch, never caller metadata or a
+        # fallback following failed native admission/relay verification.
+        native_execution = bool(args and args[0] == '/usr/bin/systemd-run')
         started = time.monotonic()
         command_end = min(started + timeout, self.execution_deadline() or float('inf'))
         buffers = {'stdout': bytearray(), 'stderr': bytearray()}
@@ -345,6 +412,8 @@ class Commands:
         status = 'not-started'
         process = None
         completed = False
+        capture_complete = False
+        special_result = None
         transport = None
         decoder = None
         relay_sha = None
@@ -554,9 +623,23 @@ class Commands:
             if decoder is not None:
                 decoder.finish(status, relay_uid, relay_sha)
                 relay_verified = True
+            capture_complete = True
+            if sudo_probe is not None:
+                special_result = sudo_denial_projection(sudo_probe['role'], bytes(buffers['stdout']), bytes(buffers['stderr']),
+                    complete=capture_complete, status=decoder.control['status'] if decoder is not None else status,
+                    native_status=status if native_execution else None, relay_verified=relay_verified,
+                    execution_kind='native' if native_execution else 'direct',
+                    host_verified=sudo_probe['host_verified'], package=sudo_probe['package'])
+                if special_result['outcome'] != 'denied':
+                    raise Blocked('sudo denial predicate rejected; policy output withheld')
+            elif sudo_package:
+                special_result = sudo_package_projection(bytes(buffers['stdout']), bytes(buffers['stderr']),
+                                                          capture_complete and (relay_verified or not native_execution), status)
+                if not special_result['supported']:
+                    raise Blocked('unsupported or unavailable guest sudo package provenance')
             if (decoder is not None and status == relay.ERROR_STATUS) or status not in ok:
                 raise Blocked('%s failed (exit %s; output withheld)' % (Path(original[0]).name, status))
-            result = bytes(buffers['stdout']).decode() if input_text is None else ''
+            result = special_result if sudo_probe is not None or sudo_package else bytes(buffers['stdout']).decode() if input_text is None else ''
             completed = True
             return result
         except (OSError, ValueError, subprocess.SubprocessError) as error:
@@ -626,6 +709,18 @@ class Commands:
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',
                           'accepted_exit': completed, 'allowed_exit_statuses': list(ok), 'status': status,
                           'elapsed_seconds': round(time.monotonic() - started, 3), 'sensitive_stdin': input_text is not None}
+                if sudo_probe is not None:
+                    record['sudo_denial'] = sudo_denial_projection(sudo_probe['role'], bytes(buffers['stdout']), bytes(buffers['stderr']),
+                        complete=capture_complete and cleanup_error is None,
+                        status=(decoder.control['status'] if decoder is not None and decoder.control is not None else
+                                process.returncode if not native_execution and process is not None else None),
+                        native_status=process.returncode if native_execution and process is not None else None,
+                        execution_kind='native' if native_execution else 'direct',
+                        relay_verified=relay_verified, host_verified=sudo_probe['host_verified'], package=sudo_probe['package'])
+                if sudo_package:
+                    record['sudo_package'] = sudo_package_projection(bytes(buffers['stdout']), bytes(buffers['stderr']),
+                        capture_complete and (relay_verified or not native_execution) and cleanup_error is None,
+                        process.returncode if process is not None else None)
                 if unit is not None:
                     record['admission_stage'] = admission_stage
                     record['admission_outcome'] = 'accepted' if completed else 'blocked'
@@ -774,6 +869,7 @@ class Bootstrap:
     def __init__(self, root=Path('/'), run=None):
         self.root, self.run = Path(root), run or Commands()
         self.state = self.path(STATE)
+        self.hostname_verified = False
 
     def path(self, value):
         return self.root / value.lstrip('/')
@@ -1249,11 +1345,19 @@ class Bootstrap:
         self.run('/usr/bin/hostnamectl', 'set-hostname', 'erebus')
         if self.run('/usr/bin/hostnamectl', '--static').strip() != 'erebus':
             raise Blocked('persistent hostname observation failed')
+        self.hostname_verified = True
         self.run('/usr/bin/systemctl', 'enable', '--now', 'chronyd.service')
         self.run('/usr/bin/chronyc', 'tracking')
         self.reserve_mosh_ports()
         # Daemon observation is not proof of synchronized time; acceptance uses real host evidence.
         self.atomic('/etc/profile.d/90-dev-pair-core-tmux.sh', OPERATOR_PROFILE, mode=0o644)
+
+    def restricted_identity(self, who, begin, package):
+        if not self.hostname_verified or who not in SUDO_ROLES:
+            raise Blocked('sudo denial requires verified host and fixed role')
+        self.identity(who, '/usr/sbin/nologin', begin)
+        self.run('/usr/bin/sudo', '-l', '-U', who, timeout=10,
+                 sudo_probe={'role': who, 'host_verified': self.hostname_verified, 'package': package})
 
     def reserve_mosh_ports(self):
         # The early public mosh drop also covers established UDP. Reserve its port
@@ -1380,10 +1484,10 @@ class Bootstrap:
             self.step('operator', lambda: (self.identity(name, '/bin/bash'), self.ssh_operator(name, key),
                                          self.password_operator(password)))
             self.step('host-identity-time', self.host_identity)
+            self.mark_prepare_step('sudo-package-provenance')
+            sudo_package = self.run(*SUDO_PACKAGE_QUERY, timeout=10, sudo_package=True)
             for who, begin, role in [('dp-maint', 1000000, 'maintenance'), ('dp-dev', 1065536, 'development')]:
-                self.step(who, lambda who=who, begin=begin: self.identity(who, '/usr/sbin/nologin', begin))
-                # sudo -l exits 1 only when this user has no permitted commands.
-                self.run('/usr/bin/sudo', '-l', '-U', who, ok=(1,))
+                self.step(who, lambda who=who, begin=begin: self.restricted_identity(who, begin, sudo_package))
                 self.directory(f'/var/lib/dev-pair/{role}', owner=who)
                 for directory in ('workspaces', 'checkpoints', 'evidence', 'deliverables', 'builds', 'cache', 'state'):
                     self.directory(f'/var/lib/dev-pair/{role}/{directory}', owner=who)
