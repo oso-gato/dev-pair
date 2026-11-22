@@ -3,6 +3,37 @@
 ## Latest continuation checkpoint
 
 
+### November 22, 2026, 23:37 HKT — hosted native29 fixture portability correction
+
+- Published `048e96532e00dc28b1db65facf9a5558f9eca8df` passed fresh combined
+  source/local review, but native [run29](https://github.com/oso-gato/dev-pair/actions/runs/45038447317)
+  stopped in its 525 hosted tests after 65.551 seconds: two failures and four
+  errors, all in relay artifact fixtures. Fedora was SKIPPED; no controller or
+  guest report, phase/relay/image/storage observation or native cleanup exists.
+  Checkout job cleanup succeeded. This is not a new product-native failure.
+- Completed traces share `Relay artifact traversal unavailable` before intended
+  positive/fault checks. Tests injected root ownership but preserved possibly
+  private external checkout ancestry. The exact failing ancestor was not
+  retained; no particular home/runner directory or permission is attributed.
+  Diagnosis `/workspace/artifacts/resume-20261122/run29-native-diagnosis.json`,
+  SHA256 `59e7db8dcef2ad44e38a2eff439e8726a4ddd92234a60b0efeb397b325e28936`.
+- This test-only correction models the trusted installed namespace using exact
+  pre-observed device/inode identities of ancestors outside the owned fixture.
+  In-fixture modes/inodes, actual0077 creation/new0755 directories, helper0444,
+  private0700/FIFO0600, conflicts/replacement/interruption and FD cleanup checks
+  remain real. The private-outer regression reproduces the old dependency and
+  preserves a true in-fixture private-parent rejection. No shared checkout/home/
+  platform path is chmodded, product traversal weakened or expected fault hidden.
+- Reader provenance uses the actual invoking fixture UID and same file owner,
+  without a fixed UID1000 or distinct-owner claim. Product files and existing
+  native/stock/resource/security/cleanup bounds are byte-identical to048e965.
+  The separate actual stock filesystem/cwd/shell difference remains a blocked
+  coordination diagnosis; no environment-body acceptance or new filesystem
+  diagnostic is mixed into this unit. Fresh review precedes one changed native30.
+  API-selected GPT-6.1 Sol/high remains backend-unattested. No stock/native/CI,
+  credentials, VPS, main/push or production deployment occurs in this unit.
+
+
 ### November 22, 2026, 23:20 HKT — combined fixture foundation and diagnostic closure candidate
 
 - Isolated merge `7bdefd4b59e35743e0e7bcffce394bbb59e4facc` preserves exact

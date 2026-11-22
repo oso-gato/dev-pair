@@ -311,3 +311,14 @@ surplus counterpart. Only a unique surplus field comparison with matching
 multiplicity is reported; ambiguous duplicates are unavailable. Balanced alias
 rows cannot conceal an inode change by becoming the replacement counterpart.
 The original ordered tuple inequality still blocks, including order-only changes.
+
+
+Relay staging tests model the installed root namespace outside each owned
+fixture explicitly. Only pre-observed external ancestor device/inode identities
+receive protected/traversable metadata in the test adapter; fixture base and
+descendant modes, identities, links, umask and all faults remain real. No host
+checkout/home/platform directory is chmodded. A deliberately private external
+layout reproduces the old test dependence, while an actual private0700 parent
+inside the fixture still rejects without mutation. Reader subprocesses retain
+the actual invoking fixture UID and share file ownership; their success does
+not prove distinct-owner dp-maint, root-owned production traversal or SELinux.

@@ -1,4 +1,4 @@
-"""Real umask/descriptor/path effects; root ownership is explicitly injected."""
+"""Real owned fixture effects; installed root/outer ancestry is explicitly modeled."""
 import hashlib
 import os
 from pathlib import Path
@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 import native_io as io
+from relay_artifact_fixture import root_observation
 
 
 class RelayDirectoryModes(unittest.TestCase):
@@ -20,8 +21,7 @@ class RelayDirectoryModes(unittest.TestCase):
         self.source=self.base/'tools/native_relay.py';self.source.write_bytes(Path(io.__file__).with_name('native_relay.py').read_bytes());self.source.chmod(0o644)
         self.root=self.base/'libexec'/'dev-pair-native-io';self.digest=hashlib.sha256(self.source.read_bytes()).hexdigest()
         self.lstat=Path.lstat;self.fstat=os.fstat
-        def root_info(info):
-            values=list(info);values[4]=0;return os.stat_result(values)
+        root_info=root_observation(self.base,self.lstat)
         self.root_info=root_info
         for boundary in (patch.object(io,'__file__',str(self.base/'tools/native_io.py')),patch.object(io,'RELAY_ROOT',self.root),
                 patch.object(Path,'lstat',lambda p:root_info(self.lstat(p))),patch.object(io.os,'fstat',lambda fd:root_info(self.fstat(fd)))):
@@ -42,12 +42,12 @@ class RelayDirectoryModes(unittest.TestCase):
             with patch.object(io.os,'fchmod',side_effect=AssertionError('unexpected chmod on reuse')):
                 self.assertEqual(io.stage_relay(),(target,digest))
             self.assertEqual(self.mode(private),0o700);self.assertEqual(self.mode(fifo),0o600)
-            result=subprocess.run([sys.executable,'-c','import os,pathlib,sys;assert os.geteuid()!=0;assert pathlib.Path(sys.argv[1]).read_bytes()==pathlib.Path(sys.argv[2]).read_bytes();print("non-root fixture read")',str(target),str(self.source)],
+            result=subprocess.run([sys.executable,'-c','import os,pathlib,sys;assert os.geteuid()==int(sys.argv[3]);assert pathlib.Path(sys.argv[1]).read_bytes()==pathlib.Path(sys.argv[2]).read_bytes();print(os.geteuid())',str(target),str(self.source),str(os.geteuid())],
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=3)
             self.assertEqual(result.returncode,0,result.stderr)
-            self.assertEqual(result.stdout,b'non-root fixture read\n')
-            # This child is really non-root, but shares the fixture file owner.
-            # Distinct dp-maint ownership, SELinux and Fedora execution are unproved.
+            self.assertEqual(result.stdout,(str(os.geteuid())+'\n').encode())
+            # Reader retains the actual invoking fixture UID and file owner;
+            # this is not distinct-owner dp-maint/SELinux/Fedora execution proof.
         finally:os.umask(previous)
 
     def test_existing_restrictive_shared_and_legacy_directories_block_without_chmod(self):
@@ -114,6 +114,41 @@ class RelayDirectoryModes(unittest.TestCase):
         target.unlink();os.link(foreign,target)
         with self.assertRaisesRegex(ValueError,'collision'):io.stage_relay()
         self.assertEqual(target.stat().st_nlink,2);self.assertEqual(foreign.read_bytes(),self.source.read_bytes())
+
+    def test_private_external_layout_is_modeled_but_private_fixture_parent_is_real(self):
+        outer=self.base/'private-checkout';outer.mkdir(mode=0o700)
+        installed=outer/'owned-fixture';installed.mkdir(mode=0o755);installed.chmod(0o755)
+        tools=installed/'tools';tools.mkdir(mode=0o755);tools.chmod(0o755)
+        source=tools/'native_relay.py';source.write_bytes(self.source.read_bytes());source.chmod(0o644)
+        def uid_only(info):
+            fields=list(info);fields[4]=0;return os.stat_result(fields)
+        def boundaries(observation):
+            from contextlib import ExitStack
+            stack=ExitStack()
+            stack.enter_context(patch.object(io,'__file__',str(tools/'native_io.py')))
+            stack.enter_context(patch.object(io,'RELAY_ROOT',installed/'libexec'/'artifacts'))
+            stack.enter_context(patch.object(Path,'lstat',lambda path:observation(self.lstat(path))))
+            stack.enter_context(patch.object(io.os,'fstat',lambda fd:observation(self.fstat(fd))))
+            return stack
+        # Reproduce the old fixture dependence without asserting any particular
+        # unobserved ancestor in the hosted CI environment caused native29.
+        with boundaries(uid_only),self.assertRaisesRegex(ValueError,'traversal'):
+            io.stage_relay()
+        self.assertFalse((installed/'libexec').exists())
+        observation=root_observation(installed,self.lstat)
+        raw=self.lstat(outer);projected=observation(raw)
+        self.assertEqual((raw.st_dev,raw.st_ino),(projected.st_dev,projected.st_ino))
+        self.assertEqual(stat.S_IMODE(raw.st_mode),0o700);self.assertEqual(stat.S_IMODE(projected.st_mode),0o755)
+        with boundaries(observation):
+            target,digest=io.stage_relay()
+            self.assertEqual(self.mode(target.parent),0o755);self.assertEqual(self.mode(target),0o444)
+            self.assertEqual(target.read_bytes(),source.read_bytes())
+            private=installed/'private-parent';private.mkdir(mode=0o700)
+            self.assertEqual(stat.S_IMODE(observation(self.lstat(private)).st_mode),0o700)
+            with patch.object(io,'RELAY_ROOT',private/'artifacts'),patch.object(io.os,'fchmod',side_effect=AssertionError('private parent chmod')):
+                with self.assertRaisesRegex(ValueError,'traversal'):io.stage_relay()
+            self.assertFalse((private/'artifacts').exists());self.assertEqual(self.mode(private),0o700)
+        self.assertEqual(self.mode(outer),0o700)
 
 
 if __name__=='__main__':unittest.main()

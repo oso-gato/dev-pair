@@ -10,6 +10,7 @@ import sys
 import unittest
 import time
 from unittest.mock import patch, mock_open
+from relay_artifact_fixture import root_observation
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import native_relay as r
 
@@ -173,15 +174,13 @@ class RelayTests(unittest.TestCase):
         import native_io as io
         import tempfile
         import stat
-        # Only root ownership is injected. Actual regular files, modes, links,
-        # protected ancestry, exclusive creation and bytes are exercised.
+        # Root ownership and exact outer installed ancestry are fixture boundaries.
+        # Owned fixture modes, files, links, identity and bytes remain real.
         lstat, fstat = Path.lstat, os.fstat
-        def root_info(info):
-            fields = list(info); fields[4] = 0
-            return os.stat_result(fields)
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as temp:
             base = Path(temp)
-            base.chmod(0o755)  # Artifact ancestry must be traversable by dp-maint.
+            base.chmod(0o755)  # Only this owned fixture path is changed.
+            root_info = root_observation(base, lstat)
             (base / 'tools').mkdir(mode=0o755)
             source = base / 'tools/native_relay.py'
             source.write_bytes(HELPER.read_bytes()); source.chmod(0o644)
