@@ -181,6 +181,7 @@ class RelayTests(unittest.TestCase):
             return os.stat_result(fields)
         with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]) as temp:
             base = Path(temp)
+            base.chmod(0o755)  # Artifact ancestry must be traversable by dp-maint.
             (base / 'tools').mkdir(mode=0o755)
             source = base / 'tools/native_relay.py'
             source.write_bytes(HELPER.read_bytes()); source.chmod(0o644)

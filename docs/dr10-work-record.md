@@ -3,6 +3,51 @@
 ## Latest continuation checkpoint
 
 
+### November 22, 2026, 23:02 HKT — restrictive-umask relay staging and native28 cache diagnosis
+
+- Native [run28](https://github.com/oso-gato/dev-pair/actions/runs/45034350875),
+  published `122688fd16cb03497483c5e51122d983e9b463bb`, passed 466 hosted
+  tests and all nine tooling stages, signed inputs/source admission and actual
+  enforcing Fedora boot. Preparation stopped after 315.831 seconds at the first
+  operator command, before a launcher existed. Its actual 600-second alarm did
+  not fire. The exact final configuration snapshots differed; no changed row,
+  actor, credential, effective-profile or SELinux cause is established. dp-maint,
+  Tailscale setup, role batches, images and storage stages were not reached in
+  this run. Outer cleanup passed; guest cleanup remains unverified. Earlier
+  run27 first-maintenance rejection is still unresolved, not replaced by run28.
+- Diagnosis `/workspace/artifacts/resume-20261122/run28-native-failure-diagnosis.json`,
+  SHA256 `7323586efbcb15a3c3e3dae9a7b983571ce9a3a0af239e5f96614eb5dbdb24d9`,
+  binds the completed report/controller/log and source findings. This source
+  slice adds only row counts, order-only equality, fixed known-path class/index
+  and changed-field mask from the already captured snapshots. No rescan,
+  subprocess, retry, ignored timestamp or relaxed comparison is introduced.
+  Public evidence retains exact source/context/phase/stage binding within the
+  existing 1,536-byte failure and 64 KiB report limits.
+- Separately, source proves `mkdir(0755)` under the service's umask 0077 creates
+  relay directories as 0700. Root could read a helper that dp-maint could not
+  traverse. No actual run27/28 directory-mode evidence attributes either failure
+  to this defect. New fixed artifact ancestors/directories now get descriptor-
+  bound 0755 only following exclusive creation, identity/root/protection checks.
+  Existing ancestors require traversal and remain untouched. Existing restrictive
+  or unsafe paths block; no generic legacy-0700 repair, broad cleanup or global
+  umask change occurs. Exact 0444 immutable helper/hash/link checks remain.
+  Private stream roots 0700 and FIFO/stdin 0600 are unchanged.
+- Real local tests cover umask 0077 creation, reuse, restrictive/foreign/symlink/
+  inode-exchanged paths and interrupted creation. Root ownership is injected in
+  this unprivileged fixture. A real UID 1000 child reads the staged helper, but
+  shares its actual fixture owner; distinct-owner dp-maint/SELinux execution is
+  not proven. A single-ID user namespace cannot switch to another mapped UID.
+  No actual engine/native/CI, credentials or VPS is touched by this source unit.
+- Frozen session `7298586` remains separate: local tests passed but fresh review
+  requires diagnostic P2 repairs for nested duplicate/misplaced attribute shape
+  classification and an unrelated-schema-gated old-turn comparison. There is no
+  stock result or acceptance bypass claim for that candidate; no session edit is
+  mixed here. API-selected GPT-6.1 Sol/high continues with backend unattested.
+  Fresh review and one separately scoped changed native attempt are required;
+  hard quotas, nested runtime, jobs/auth/renewal, tailnet, release enforcement and
+  Hostinger acceptance remain open. No production admission or deployment.
+
+
 ### November 22, 2026, 22:38 HKT — native27 closed; diagnostic source candidate
 
 - Published PR13 source is `de85467e6238504203cdfe7ad10222b93f9a2b29`.

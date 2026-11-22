@@ -92,30 +92,54 @@ def stage_relay():
         require(len(data) == info.st_size and len(data) <= 65536, 'Relay source changed')
     digest = hashlib.sha256(data).hexdigest()
     target = RELAY_ROOT / digest / 'relay.py'
-    for path in reversed(target.parent.parents):
-        if not path.exists():
-            path.mkdir(mode=0o755)
-        info = path.lstat()
-        require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'Unprotected relay artifact ancestor')
+    descriptors=[];chain=[]
+    flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
+    def verify_directory(fd):
+        info=os.fstat(fd)
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid==0 and not info.st_mode & 0o022,
+                'Unprotected relay artifact directory')
+        return info
+    def same(left,right):return (left.st_dev,left.st_ino)==(right.st_dev,right.st_ino)
+    def verify_chain():
+        for parent,name,fd in chain:
+            info=verify_directory(fd)
+            require(info.st_mode & 0o001 and same(info,os.stat(name,dir_fd=parent,follow_symlinks=False)),
+                    'Relay artifact traversal or identity unavailable')
     try:
-        target.parent.mkdir(mode=0o755)
-    except FileExistsError:
-        pass
-    info = target.parent.lstat()
-    require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'Unprotected relay artifact directory')
-    try:
-        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o444)
-    except FileExistsError:
-        fd = None
-    if fd is not None:
-        with os.fdopen(fd, 'wb') as output:
-            os.fchmod(output.fileno(), 0o444)
-            output.write(data); output.flush(); os.fsync(output.fileno())
-    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o444 and info.st_nlink == 1 and info.st_size == len(data) and
-                stream.read(65537) == data, 'Relay artifact collision preserved')
+        parent=os.open(target.anchor,flags);descriptors.append(parent)
+        require(verify_directory(parent).st_mode & 0o001,'Relay artifact traversal unavailable')
+        for name in target.parent.parts[1:]:
+            created=False
+            try:os.mkdir(name,0o755,dir_fd=parent);created=True
+            except FileExistsError:pass
+            before=os.stat(name,dir_fd=parent,follow_symlinks=False)
+            require(stat.S_ISDIR(before.st_mode),'Unprotected relay artifact ancestor')
+            fd=os.open(name,flags,dir_fd=parent);descriptors.append(fd)
+            require(same(before,verify_directory(fd)),'Relay artifact directory identity changed')
+            chain.append((parent,name,fd))
+            # Only successful exclusive creation authorizes this descriptor's
+            # mode change. Existing shared or dedicated ancestors are untouched.
+            if created:
+                os.fchmod(fd,0o755)
+                require(stat.S_IMODE(verify_directory(fd).st_mode)==0o755,'Relay artifact directory mode unavailable')
+            require(verify_directory(fd).st_mode & 0o001,'Relay artifact traversal unavailable')
+            verify_chain();parent=fd
+        try:fd=os.open(target.name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o444,dir_fd=parent)
+        except FileExistsError:fd=None
+        if fd is not None:
+            with os.fdopen(fd,'wb') as output:
+                os.fchmod(output.fileno(),0o444)
+                output.write(data);output.flush();os.fsync(output.fileno())
+        fd=os.open(target.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+        with os.fdopen(fd,'rb') as stream:
+            info=os.fstat(stream.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_uid==0 and stat.S_IMODE(info.st_mode)==0o444 and
+                    info.st_nlink==1 and info.st_size==len(data) and stream.read(65537)==data and
+                    same(info,os.stat(target.name,dir_fd=parent,follow_symlinks=False)), 'Relay artifact collision preserved')
+        verify_chain()
+    finally:
+        for fd in reversed(descriptors):
+            with contextlib.suppress(OSError):os.close(fd)
     return target, digest
 
 
@@ -222,6 +246,52 @@ def configuration_snapshot(paths, unit, owned_mask=False, end=None):
                 require(configuration_identity(directory.lstat()) == configuration_identity(before),
                         'Concurrent configuration mutation')
     return tuple(snapshot)
+
+
+def configuration_mismatch(before,after,unit):
+    """Fixed diagnostic projection of captured rows only; never an admission rule."""
+    from collections import Counter
+    if before==after:return None
+    unavailable={'availability':'unavailable'}
+    try:
+        unit=canonical_unit(unit);stem=unit.removesuffix('.service')
+        names=[unit]+[stem[:match.end()]+'.service' for match in re.finditer('-',stem)]+['service']
+        bases=sorted({value.replace('/lib/systemd/','/usr/lib/systemd/',1) if value.startswith('/lib/systemd/') else value for value in LOOKUP_PATHS})
+        def classify(path):
+            for index,base in enumerate(bases):
+                if path==base:return 'lookup-directory',index
+                if path=='/run/systemd/system/'+unit+'.d':return 'owned-mask-directory',bases.index('/run/systemd/system')
+                if path=='/run/systemd/system/'+unit+'.d/'+MASK:return 'owned-mask',bases.index('/run/systemd/system')
+                if path=='/usr/lib/systemd/system/service.d':return 'global-mask-directory',bases.index('/usr/lib/systemd/system')
+                if path=='/usr/lib/systemd/system/service.d/'+MASK:return 'global-mask',bases.index('/usr/lib/systemd/system')
+                if any(path==base+'/'+name+suffix for name in names for suffix in ('.d','.wants','.requires','.upholds')):
+                    return 'applicable-directory',index
+            raise ValueError('unknown snapshot path')
+        require(type(before) is tuple and type(after) is tuple and len(before)<=1024 and len(after)<=1024,'Snapshot diagnostic bound')
+        for row in (*before,*after):
+            require(type(row) is tuple and len(row) in (2,6,7) and type(row[0]) is str and len(row[0])<=512,'Snapshot diagnostic shape')
+            kind,_=classify(row[0])
+            require((len(row)==2 and row[1] is None and kind=='lookup-directory') or
+                (len(row) in (6,7) and all(type(value) is int and 0<=value<2**64 for value in row[1:]) and
+                 (len(row)==7)==(kind in ('owned-mask','global-mask'))),'Snapshot diagnostic fields')
+        left=Counter(before);right=Counter(after);order_only=left==right
+        sequence=next((i for i,(old,new) in enumerate(zip(before,after)) if old!=new),min(len(before),len(after)))
+        old=before[sequence] if sequence<len(before) else None;new=after[sequence] if sequence<len(after) else None
+        fields=0
+        if not order_only:
+            old=next((row for row in before if left[row]>right[row]),None)
+            if old is not None:new=next((row for row in after if row[0]==old[0] and row!=old),None)
+            else:new=next(row for row in after if right[row]>left[row])
+            if old is None or new is None or len(old)==2 or len(new)==2:fields=1
+            else:
+                def values(row):return (*row[1:5],row[-1],row[5] if len(row)==7 else None)
+                fields=sum((a!=b)<<(bit+1) for bit,(a,b) in enumerate(zip(values(old),values(new))))
+        kind,index=classify((old or new)[0])
+        return {'availability':'observed','stage':'cache-final-comparison','rows':[len(before),len(after)],
+            'order_only_equal':order_only,'row_index':before.index(old) if old is not None else after.index(new),
+            'row_side':'before' if old is not None else 'after','path_class':kind,'lookup_index':index,
+            'changed_fields':fields,'truncated':False}
+    except (ValueError,TypeError,IndexError,StopIteration):return unavailable
 
 
 CGROUP_ROOT = Path('/sys/fs/cgroup/system.slice')

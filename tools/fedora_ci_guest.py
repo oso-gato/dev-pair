@@ -1159,7 +1159,7 @@ def native_failure_projection(entry,expected,phase=None):
                 identity['source_sha']==expected['source_sha'] and identity['context_sha256']==expected['context_sha256'] and
                 identity['phase'] in ('prepare','maintenance-gptbox') and (phase is None or identity['phase']==phase), 'Native failure identity mismatch')
         value=entry.get('native_failure');keys={'point','category','launcher_handle_observed','status_sampled_before_interrupt','launcher_status_before_interrupt','decoder'}
-        require(type(value) is dict and set(value)==keys and value['point'] in NATIVE_FAILURE_POINTS and
+        require(type(value) is dict and keys<=set(value)<=keys|{'cache_comparison'} and value['point'] in NATIVE_FAILURE_POINTS and
                 value['category'] in NATIVE_FAILURE_CATEGORIES, 'Native failure schema mismatch')
         require(type(value['launcher_handle_observed']) is bool and type(value['status_sampled_before_interrupt']) is bool,
                 'Native failure flags mismatch')
@@ -1168,6 +1168,23 @@ def native_failure_projection(entry,expected,phase=None):
         require((value['launcher_handle_observed'] or not value['status_sampled_before_interrupt']) and
                 (value['status_sampled_before_interrupt'] or status is None), 'Native failure status mismatch')
         decoder=value['decoder']
+        if 'cache_comparison' in value:
+            cache=value['cache_comparison']
+            require(entry.get('admission_stage')=='cache-recheck' and entry.get('admission_reason')=='cache-final-comparison',
+                    'Cache witness stage mismatch')
+            if cache!={'availability':'unavailable'}:
+                require(type(cache) is dict and set(cache)=={'availability','stage','rows','order_only_equal','row_index','row_side',
+                    'path_class','lookup_index','changed_fields','truncated'} and cache['availability']=='observed' and
+                    cache['stage']=='cache-final-comparison','Cache witness schema mismatch')
+                require(type(cache['rows']) is list and len(cache['rows'])==2 and all(type(v) is int and 0<=v<=1024 for v in cache['rows']) and
+                    type(cache['order_only_equal']) is bool and cache['truncated'] is False and cache['row_side'] in ('before','after') and
+                    type(cache['row_index']) is int and 0<=cache['row_index']<cache['rows'][0 if cache['row_side']=='before' else 1],
+                    'Cache witness counters invalid')
+                require(cache['path_class'] in ('lookup-directory','owned-mask-directory','owned-mask','global-mask-directory','global-mask','applicable-directory') and
+                    type(cache['lookup_index']) is int and 0<=cache['lookup_index']<12 and
+                    type(cache['changed_fields']) is int and 0<=cache['changed_fields']<128 and
+                    (not cache['order_only_equal'] or cache['changed_fields']==0 and cache['rows'][0]==cache['rows'][1]),
+                    'Cache witness classification invalid')
         if decoder!={'availability':'unavailable'}:
             require(type(decoder) is dict and set(decoder)=={'reason','maximum','raw_bytes','raw_bytes_clamped','data_frames','frame_kind',
                 'header_present','body_present','control_present','failure_present','partial_frame','complete'}, 'Decoder witness schema mismatch')

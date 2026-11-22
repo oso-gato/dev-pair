@@ -29,7 +29,7 @@ import urllib.request
 import uuid
 
 try:
-    from native_io import NativeTransport, pipe_pair, expected_uid, stage_relay, verify_labels, relay, lookup_paths, configuration_snapshot, verify_inactive_cgroup
+    from native_io import NativeTransport, pipe_pair, expected_uid, stage_relay, verify_labels, relay, lookup_paths, configuration_snapshot, configuration_mismatch, verify_inactive_cgroup
 except ModuleNotFoundError:
     _io_spec = importlib.util.spec_from_file_location('dev_pair_native_io', Path(__file__).with_name('native_io.py'))
     _io_module = importlib.util.module_from_spec(_io_spec)
@@ -37,6 +37,7 @@ except ModuleNotFoundError:
     NativeTransport, pipe_pair = _io_module.NativeTransport, _io_module.pipe_pair
     expected_uid, stage_relay, verify_labels, relay = _io_module.expected_uid, _io_module.stage_relay, _io_module.verify_labels, _io_module.relay
     lookup_paths, configuration_snapshot, verify_inactive_cgroup = _io_module.lookup_paths, _io_module.configuration_snapshot, _io_module.verify_inactive_cgroup
+    configuration_mismatch = _io_module.configuration_mismatch
 
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
@@ -535,7 +536,7 @@ class Commands:
         relay_verified = False
         admission_stage = 'not-native'
         admission_reason = 'none'
-        failure_point='not-reached';failure_category=None;failure_witness=None
+        failure_point='not-reached';failure_category=None;failure_witness=None;cache_comparison=None
         def capture_failure(error):
             nonlocal failure_witness
             if failure_witness is not None or not native_execution:return
@@ -550,6 +551,7 @@ class Commands:
             failure_witness={'point':failure_point,'category':category,'launcher_handle_observed':process is not None,
                 'status_sampled_before_interrupt':sampled,'launcher_status_before_interrupt':observed,
                 'decoder':decoder.witness() if decoder is not None else {'availability':'unavailable'}}
+            if cache_comparison is not None:failure_witness['cache_comparison']=cache_comparison
         launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
@@ -640,6 +642,7 @@ class Commands:
                 final = configuration_snapshot(paths, unit, owned_mask=True, end=command_end)
                 admission_reason = 'cache-final-comparison'
                 if after != final:
+                    cache_comparison=configuration_mismatch(after,final,unit)
                     raise Blocked('configuration changed before native launch')
                 admission_reason = 'cache-transport-verification'
                 transport.verify()
