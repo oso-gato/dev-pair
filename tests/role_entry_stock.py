@@ -21,7 +21,7 @@ import gptbox_runtime as runtime
 
 MODEL = 'gpt-6.2-sol'
 EFFORT = 'high'
-PROMPT = b'Return the result of this synthetic headless role turn.'
+PROMPT = b'Return the result of this synthetic headless role turn.\n'.ljust(16 * 1024, b'x')
 DIRECTIVE = 'Synthetic managed startup for a single local role turn.'
 ANSWER = 'Synthetic headless role turn completed.'
 PORT = 39162
