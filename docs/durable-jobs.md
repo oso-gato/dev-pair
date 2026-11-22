@@ -91,8 +91,9 @@ missing records or invalid history block admission.
 Data and manifest are fsynced before atomic completion publication; the private
 leaf and parent are also synced. A killed operation retains recognizable incomplete
 staging. An existing empty directory is now refused by Ledger rather than silently
-initialized, closing interruption between destination reservation and its first
-marker. A partially copied ledger cannot be opened without its matching completion
+initialized. Ownership of a new directory comes only from successful exclusive
+creation, so a concurrent restore reservation cannot be mistaken for our own
+fresh directory. A partially copied ledger cannot be opened without its matching completion
 identity. Do not manually remove markers to bypass failed validation. There is no
 automatic reclamation of incomplete or foreign paths.
 

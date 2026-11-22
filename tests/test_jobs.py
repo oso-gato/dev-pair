@@ -473,6 +473,83 @@ class DurableJobsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'incomplete'): protocol.Ledger(empty)
         self.assertFalse((empty/'ledger.sqlite3').exists())
 
+    def test_recovery_normal_initializer_cannot_admit_concurrent_restore_reservation(self):
+        from unittest import mock
+        import ledger_recovery as recovery
+        self.prepared()
+        backup = self.root/'race-backup'
+        self.cli('backup',backup)
+        destination = self.root/'race-destination'
+        original_mkdir = pathlib.Path.mkdir
+        process = None
+        # Schedule a real restore after Ledger has checked ancestors but before
+        # its mkdir. Pause the restore after exclusive reservation, before its
+        # first marker. This is ordinary entry-point concurrency, not mutation.
+        def reserve_before_mkdir(path,*args,**kwargs):
+            nonlocal process
+            if path == destination and process is None:
+                code = ('import sys,time;sys.path.insert(0,sys.argv[1]);import ledger_recovery as r;'
+                        'original=r.trusted_directory\n'
+                        'def reserve(path,**kwargs):\n'
+                        ' result=original(path,**kwargs)\n'
+                        ' if kwargs.get("create"):print("reserved",flush=True);sys.stdin.read(1)\n'
+                        ' return result\n'
+                        'r.trusted_directory=reserve\n'
+                        'print(r.p.canonical(r.restore(sys.argv[2],sys.argv[3],time.monotonic()+10)),flush=True)')
+                process = subprocess.Popen([sys.executable,'-c',code,str(ROOT/'tools'),str(backup),str(destination)],
+                                           stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                self.assertEqual(process.stdout.readline().strip(),'reserved')
+            return original_mkdir(path,*args,**kwargs)
+        before = self.cli('events')
+        try:
+            with mock.patch.object(pathlib.Path,'mkdir',reserve_before_mkdir):
+                with self.assertRaisesRegex(ValueError,'incomplete existing ledger directory'):
+                    protocol.Ledger(destination)
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(list(destination.iterdir()),[])
+            self.assertEqual(self.cli('events'),before)
+            # The blocked opener did not poison or overwrite the winner. Let
+            # the same restore complete and open its validated existing ledger.
+            output,error = process.communicate(input='x',timeout=5)
+            self.assertEqual(process.returncode,0,error)
+            restored = json.loads(output)
+            ledger = protocol.Ledger(destination)
+            try:
+                self.assertEqual(ledger.controller_id,restored['controller_id'])
+                self.assertEqual(ledger.events(),before)
+            finally:
+                ledger.close()
+        finally:
+            if process is not None:
+                if process.poll() is None:process.kill();process.communicate(timeout=2)
+                for stream in (process.stdin,process.stdout,process.stderr):
+                    if stream is not None:stream.close()
+
+    def test_recovery_initializer_reuses_completed_concurrent_normal_ledger(self):
+        from unittest import mock
+        destination = self.root/'normal-initialization-race'
+        original_mkdir = pathlib.Path.mkdir
+        winner = None
+        def initialize_before_mkdir(path,*args,**kwargs):
+            nonlocal winner
+            if path == destination and winner is None:
+                code = ('import sys;sys.path.insert(0,sys.argv[1]);from job_protocol import Ledger;'
+                        'd=Ledger(sys.argv[2]);print(d.controller_id);d.close()')
+                result = subprocess.run([sys.executable,'-c',code,str(ROOT/'tools'),str(destination)],
+                                        capture_output=True,text=True,timeout=5)
+                self.assertEqual(result.returncode,0,result.stderr)
+                winner = result.stdout.strip()
+            return original_mkdir(path,*args,**kwargs)
+        with mock.patch.object(pathlib.Path,'mkdir',initialize_before_mkdir):
+            ledger = protocol.Ledger(destination)
+        try:
+            self.assertEqual(ledger.controller_id,winner)
+            self.assertEqual(ledger.events(),[])
+            self.assertFalse((destination/'RECOVERY').exists())
+            self.assertEqual((destination/'ledger.sqlite3').stat().st_mode & 0o777,0o600)
+        finally:
+            ledger.close()
+
     def test_recovery_two_real_restores_cannot_replace_destination(self):
         self.prepared()
         backup = self.root/'backup';self.cli('backup', backup)
