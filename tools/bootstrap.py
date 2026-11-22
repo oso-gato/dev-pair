@@ -736,12 +736,6 @@ class Commands:
                 start_us = int(startup * 1000) * 1000
                 runtime_us = round(float(runtime) * 1000000)
                 helper_end = command_end - min(.1, remaining / 2)
-                if launcher_selected:
-                    observed=time.monotonic();phase_end=self.execution_deadline()
-                    launch_timing={'availability':'observed','start_us':start_us,'runtime_us':runtime_us,
-                        'command_remaining_us':max(0,int((command_end-observed)*1000000)),
-                        'phase_remaining_us':None if phase_end is None else max(0,int((phase_end-observed)*1000000)),
-                        'helper_margin_us':max(0,int((command_end-helper_end)*1000000))}
                 admission_stage = 'effective-profile'
                 failure_point='transport-verification'
                 transport.verify()
@@ -758,6 +752,12 @@ class Commands:
                         *node_args, '--maximum', str(maximum), '--deadline', str(helper_end), '--helper', relay_sha, '--', *args[payload:])
                 for _ in range(2):
                     launcher_pairs.append(pipe_pair())
+                if launcher_selected:
+                    observed=time.monotonic();phase_end=self.execution_deadline()
+                    launch_timing={'availability':'observed','start_us':start_us,'runtime_us':runtime_us,
+                        'command_remaining_us':max(0,int((command_end-observed)*1000000)),
+                        'phase_remaining_us':None if phase_end is None else max(0,int((phase_end-observed)*1000000)),
+                        'helper_margin_us':max(0,int((command_end-helper_end)*1000000))}
                 failure_point='launcher-start'
                 process = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=launcher_pairs[0][1],
                                            stderr=launcher_pairs[1][1], start_new_session=True, close_fds=True)

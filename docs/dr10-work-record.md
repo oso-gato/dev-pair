@@ -3,6 +3,25 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 00:49 HKT — native30 launcher diagnostic source slice
+
+- Actual native30 passed 526 hosted tests and reached the Tailscale signed-package
+  step. The owned launcher exited 1 before interruption with no relay frame;
+  the prepare timer did not fire. This does not establish a payload/package
+  exit, service result, authentication failure or root cause. Outer cleanup
+  passed; guest cleanup, prepared images and storage samples were not verified.
+- Only the fixed root prepare Tailscale signed-package selector omits `--quiet`.
+  Separate launcher capture remains inside the existing combined byte budget;
+  a closed C-locale parser exposes typed service-result/status facts and actual
+  constructed start/runtime timing, never raw launcher text. Existing relay,
+  profile, status, deadline and cleanup predicates remain authoritative.
+- This first source commit is explicitly untested while the independent session
+  reviewer owns the local process-test slot. Affected checks, one final combined
+  full suite and fresh exact review remain required. No stock/native/CI/network,
+  authentication/model/VPS/push/deployment occurs; Sol/high is API-selected with
+  backend attestation unavailable. Native30 cause and release gates remain open.
+
+
 ### November 23, 2026, 00:44 HKT — preserve aggregate core at the diagnostic cap
 
 - Fresh review of `8679593` retained a P2: a 2,050-byte combined core lost

@@ -1151,6 +1151,30 @@ NATIVE_FAILURE_CATEGORIES=('decoder-rejected','wait-timeout','io-error','text-de
                            'blocked-or-interrupted','deadline','output-limit','status-rejected')
 
 
+def launcher_projection(value):
+    """Validate diagnostics from the selected owned launcher, never admission."""
+    unavailable={'availability':'unavailable'}
+    try:
+        require(type(value) is dict and set(value)=={'summary','timing','bytes','complete'},'Launcher shape')
+        require(type(value['bytes']) is int and 0<=value['bytes']<=1048577 and type(value['complete']) is bool,'Launcher counters')
+        summary=value['summary'];timing=value['timing']
+        if summary!=unavailable:
+            require(type(summary) is dict and set(summary) in ({'availability','result'},{'availability','result','code','status'}) and
+                summary['availability']=='observed' and summary['result'] in ('success','resources','protocol','timeout','exit-code','signal',
+                'core-dump','watchdog','start-limit-hit','oom-kill','exec-condition') and value['complete'] and value['bytes']<=8192,'Launcher summary')
+            if 'code' in summary:
+                require(summary['code'] in ('exited','killed','dumped') and type(summary['status']) is int and
+                    (0<=summary['status']<=255 if summary['code']=='exited' else 1<=summary['status']<=64),'Launcher status')
+        if timing!=unavailable:
+            require(type(timing) is dict and set(timing)=={'availability','start_us','runtime_us','command_remaining_us','phase_remaining_us','helper_margin_us'} and
+                timing['availability']=='observed','Launcher timing')
+            require(all(type(timing[k]) is int and 0<=timing[k]<=900000000 for k in ('start_us','runtime_us','command_remaining_us','helper_margin_us')) and
+                0<timing['start_us']<=5000000 and timing['runtime_us']>0 and timing['helper_margin_us']<=100001 and
+                (timing['phase_remaining_us'] is None or type(timing['phase_remaining_us']) is int and 0<=timing['phase_remaining_us']<=900000000),'Launcher timing bounds')
+        return value
+    except (ValueError,KeyError,TypeError):return unavailable
+
+
 def native_failure_projection(entry,expected,phase=None):
     unavailable={'availability':'unavailable'}
     try:
@@ -1159,7 +1183,7 @@ def native_failure_projection(entry,expected,phase=None):
                 identity['source_sha']==expected['source_sha'] and identity['context_sha256']==expected['context_sha256'] and
                 identity['phase'] in ('prepare','maintenance-gptbox') and (phase is None or identity['phase']==phase), 'Native failure identity mismatch')
         value=entry.get('native_failure');keys={'point','category','launcher_handle_observed','status_sampled_before_interrupt','launcher_status_before_interrupt','decoder'}
-        require(type(value) is dict and keys<=set(value)<=keys|{'cache_comparison'} and value['point'] in NATIVE_FAILURE_POINTS and
+        require(type(value) is dict and keys<=set(value)<=keys|{'cache_comparison','launcher'} and value['point'] in NATIVE_FAILURE_POINTS and
                 value['category'] in NATIVE_FAILURE_CATEGORIES, 'Native failure schema mismatch')
         require(type(value['launcher_handle_observed']) is bool and type(value['status_sampled_before_interrupt']) is bool,
                 'Native failure flags mismatch')
@@ -1200,6 +1224,10 @@ def native_failure_projection(entry,expected,phase=None):
             require(decoder['complete']==(decoder['control_present'] and not decoder['partial_frame']) and
                     (not decoder['complete'] or not decoder['header_present'] and not decoder['body_present']), 'Decoder completion mismatch')
         result={'availability':'observed','identity':dict(identity),**value}
+        if 'launcher' in result:
+            selected=(identity['phase']=='prepare' and entry.get('step')=='tailscale-package' and entry.get('operation_id')=='signed-packages')
+            result['launcher']=launcher_projection(value['launcher']) if selected else unavailable
+            if len(json.dumps(result,separators=(',',':')).encode())>1536:result['launcher']=unavailable
         require(len(json.dumps(result,separators=(',',':')).encode())<=1536, 'Native failure projection bound')
         return result
     except (ValueError,KeyError,TypeError,AttributeError):return unavailable
