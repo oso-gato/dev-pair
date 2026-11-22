@@ -60,7 +60,11 @@ That result retains the same synthetic/finite admission limits. The next source
 candidate adds actual managed-directive and complete synthetic document delivery
 through a fixed existing helper before work, with exact replay and durable audits.
 Private real documents remain in the separate verified private loader, not fixture
-captures. This changed fixture has no new stock pass or model-compliance claim. No production deployment is established.
+captures. This changed fixture has no new stock pass or model-compliance claim. Independent startup review found one resumed causal-order defect: moved original
+startup evidence could permit work before final audit rejection. A narrow source
+repair now checks startup-before-original-work-and-current-prompt before issuing
+continuation. Affected checks pass; fresh review and changed stock evidence remain
+required. No production deployment is established.
 
 <a id="dr2-8"></a>
 **DR2.8** The [storage observation component](docs/storage-observation.md) measures bounded filesystem usage and checks explicit peak-capacity arithmetic. Independent review verified sparse-growth accounting and reserve boundaries. Unknown measurements block; matching samples do not prove quiescence, reserve capacity or enforce quotas. Hard storage limits and safe cleanup remain required before jobs can run.

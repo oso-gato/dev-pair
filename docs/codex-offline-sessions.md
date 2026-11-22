@@ -466,3 +466,14 @@ placement/authentication, model understanding and compliance remain unverified.
 The original state policy/tool-inventory fixture stays unchanged; this session
 policy/layout/helper identity has its own explicit digests. Fresh source review
 and a separately authorized changed stock run remain necessary.
+
+
+The first startup-delivery review found that an unchanged startup pair could be
+moved after original work or after the resume prompt. The later durable audit
+rejected it, but only after continuation work had been issued. The resumed wire
+admission gate now requires the retained startup call/result to precede the exact
+retained original work pair and current prompt, and requires its checkpointed
+startup record to match. Invalid order rejects before a continuation tool is
+issued; it does not rely on the final audit. The original valid first/resume and
+durable paths remain required. The 639-test full result belongs to the earlier
+candidate; this narrow repair has affected checks and needs fresh review.

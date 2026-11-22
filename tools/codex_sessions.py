@@ -846,6 +846,11 @@ class Journey:
             entry = self.entries[label]
             current_positions = [observed[-1][0]]
             first_call, first_output = self.pair(inputs, entry['issued'])
+            if startup_bound is not None:
+                startup_call,startup_output=self.pair(inputs,startup_bound['issued'])
+                require(canonical(startup_bound)==canonical(entry.get('startup')) and
+                        startup_call[0]<startup_output[0]<first_call[0]<first_output[0]<current_positions[0],
+                        'startup delivery crossed original work or continuation')
             require(all(i < first_call[0] for i,_ in observed[:len(entry['user_context'])]) and
                     own_positions[0] < first_call[0] < first_output[0] < current_positions[0] and
                     canonical(first_call[1]) == canonical(entry['call']) and canonical(first_output[1]) == canonical(entry['output']),

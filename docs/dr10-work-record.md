@@ -3,6 +3,32 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 04:16 HKT — startup R1 causal-order repair
+
+- Independent review of frozen 84eaf47 found one high-priority R1: unchanged
+  startup call/result moved after original work, or after the resume prompt, still
+  issued and completed continuation progress. Durable audit rejection occurred too
+  late. Its 639-test full pass remains base evidence, not acceptance of this defect.
+  Original review, reproduction and author receipt remain immutable.
+- The resumed request gate now requires checkpointed startup identity equality
+  and startup-call < startup-output < original-work-call < original-work-output <
+  current-prompt before any continuation tool response. Existing full bodies,
+  exact managed/user history, call IDs and result checks remain. Rejection happens
+  before progress dispatch, without undoing or pretending away earlier effects.
+- Regressions cover both reported placements and all ten interleavings consistent
+  with individually ordered startup/original pairs: the original order stays valid,
+  all nine invalid alternatives reject, retained state and the original one-line
+  marker remain unchanged. Existing real helper/first/resume/durable checks pass.
+  The independently copied/redirected reproducer rejects both prior bypasses.
+- Evidence is under `/workspace/artifacts/startup-causal-repair-20261122/`.
+  This narrow unit runs affected checks only; no full, stock or native rerun.
+  Native/default policy/tools/registry/ledger and all resource/privacy limits stay
+  unchanged. Fresh exact review is required before later combined validation.
+- Allocation: 20:13:18–20:25:18 UTC, without extension. API-selected GPT-6.1
+  Sol/high remains the builder; backend attestation is unavailable. No network,
+  real model/auth, CI/SSH/push/merge or deployment action occurred.
+
+
 ### November 23, 2026, 04:08 HKT — immutable startup directive and full document delivery
 
 - Reviewed de99a97 passed its frozen 630-test suite and independent review. Native34

@@ -156,3 +156,32 @@ class StartupTests(unittest.TestCase):
             with patch.object(d.controller,'SHARED',hashes),patch.object(d.subprocess,'Popen',side_effect=launch),self.assertRaises(ValueError) as seen:
                 d.load_private(repo,cache,REV,time.monotonic()+3)
             self.assertNotIn('SENTINEL',str(seen.exception));self.assertTrue(children and all(p.returncode is not None and p.stdout.closed and p.stderr.closed for p in children))
+
+
+    def test_every_retained_startup_pair_interleaving_rejects_before_continuation_effect(self):
+        import itertools
+        original=self.finish_first();before=(self.root/'job/src/session-alpha.jsonl').read_bytes()
+        records=copy.deepcopy(self.j.records);entries=copy.deepcopy(self.j.entries);startup_records=copy.deepcopy(self.j.startup_records)
+        current=f.message(s.prompt('alpha','resume',f.NONCE));pieces={'SC':original[2],'SO':original[3],'WC':original[4],'WO':original[5],'P':current}
+        checked=0
+        for order in itertools.permutations(pieces):
+            if not (order.index('SC')<order.index('SO') and order.index('WC')<order.index('WO')<order.index('P')):continue
+            with self.subTest(order=order):
+                self.fixture.observed('alpha','resume');history=copy.deepcopy(original[:2]+[pieces[key] for key in order])
+                if order==('SC','SO','WC','WO','P'):
+                    self.j.request(f.body(history));self.assertEqual(self.j.turn['issued']['call_id'],'session-alpha-resume')
+                else:
+                    with self.assertRaisesRegex(ValueError,'startup delivery crossed original work or continuation'):self.j.request(f.body(history))
+                    self.assertIsNone(self.j.turn['issued']);self.assertIsNone(self.j.turn['returned']);self.assertIsNone(self.j.turn['user_context'])
+                    self.assertFalse(self.j.turn['finished'])
+                self.assertEqual((self.root/'job/src/session-alpha.jsonl').read_bytes(),before)
+                self.assertEqual(self.j.entries,entries);self.assertEqual(self.j.records,records);self.assertEqual(self.j.startup_records,startup_records)
+                checked+=1
+        self.assertEqual(checked,10)
+
+    def test_retained_startup_checkpoint_identity_cannot_be_substituted_before_dispatch(self):
+        original=self.finish_first();self.fixture.observed('alpha','resume')
+        self.j.entries['alpha']['startup']['position']=999
+        with self.assertRaisesRegex(ValueError,'startup delivery crossed original work or continuation'):
+            self.j.request(f.body(original+[f.message(s.prompt('alpha','resume',f.NONCE))]))
+        self.assertIsNone(self.j.turn['issued']);self.assertEqual(s.marker(self.root,'alpha',('first',),f.NONCE)['lines'],1)
