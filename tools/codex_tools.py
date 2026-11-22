@@ -370,6 +370,7 @@ class Sequence:
         self.goal_context=None;self.last_outputs=[];self.last_request_identity=None
         self.search_source=None
         self.thread_id=None;self.pty_id=None;self.pty_retired=False;self.pty_completion_added=False
+        self.pty_payload='';self.pty_payload_calls=[]
         self.goal_initial=goal_rows(self.path('/state/sqlite/goals_1.sqlite'));self.goal_identity=None;self.metadata_products=None
         self.protected={p:sha(self.path(p).read_bytes()) for p in ('/credentials/marker','/credentials/valid.png','/state/codex/marker','/state/sqlite/marker','/etc/codex/requirements.toml','/state/codex/config.toml')}
 
@@ -463,19 +464,28 @@ class Sequence:
             running,exited,output=terminal_header(text)
             if running is not None:
                 require(ident=='pty-input' and running==self.pty_id and not self.pty_completion_added,'PTY did not complete within finite poll plan')
+            else:require(exited==0,'PTY child did not exit successfully')
+            # Each stock interaction drains only its new bytes. Remove the
+            # renderer's one header/body separator, then join the owned payload
+            # stream so an early or fragmented proof survives the sole poll.
+            payload=output.removeprefix('\n')
+            require(len(self.pty_payload.encode())+len(payload.encode())<=BODY_BYTES,'PTY retained payload bound exceeded')
+            self.pty_payload+=payload;self.pty_payload_calls.append(ident)
+            if running is not None:
                 self.pty_completion_added=True
                 self.planned.insert(self.index,{'id':'pty-complete','kind':'function_call','name':'write_stdin',
                     'arguments':{'session_id':self.pty_id,'chars':'','yield_time_ms':5000,'max_output_tokens':1500}})
             else:
-                require(exited==0,'PTY child did not exit successfully')
                 require(any(row.get('consumed') is True and row.get('uid')==1000 and row.get('nnp')=='1'
                             and type(row.get('cap_eff'))is str and int(row['cap_eff'],16)==0
                             and row.get('netns')!=os.readlink('/proc/self/ns/net')
                             and row.get('denied',{}).get('/credentials/marker') in (2,13)
-                            and row.get('denied',{}).get('/etc/codex/requirements.toml') in (13,30) for row in rows),'PTY child consumption/confinement not proved')
+                            and row.get('denied',{}).get('/etc/codex/requirements.toml') in (13,30) for row in json_rows(self.pty_payload)),'PTY child consumption/confinement not proved')
                 self.pty_retired=True
             require(marker.read_bytes()==PTY_TOKEN.encode(),'PTY exact-once product effect missing')
-            result={'session_id':self.pty_id,'phase':'retired' if self.pty_retired else 'completion-pending','product_sha256':sha(marker.read_bytes())}
+            result={'session_id':self.pty_id,'phase':'retired' if self.pty_retired else 'completion-pending','product_sha256':sha(marker.read_bytes()),
+                    'retained_payload_bytes':len(self.pty_payload.encode()),'retained_payload_sha256':sha(self.pty_payload.encode()),
+                    'retained_payload_calls':list(self.pty_payload_calls)}
         elif ident in ('pty-stale','pty-invalid'):
             wanted=self.pty_id if ident=='pty-stale' else -1
             require(self.pty_retired and self.pty_id is not None and wanted is not None
@@ -564,7 +574,7 @@ class Sequence:
         # completion poll. Commit those admissions only after the whole request,
         # including source-bound supervisor context, validates.
         fields=('index','finished','action_end','emitted','returned','planned','discovered','goal_identity','goal_context','search_source',
-                'metadata_products','pty_id','pty_retired','pty_completion_added')
+                'metadata_products','pty_id','pty_retired','pty_completion_added','pty_payload','pty_payload_calls')
         before={name:copy.deepcopy(getattr(self,name)) for name in fields};count=len(self.records)
         self.incoming_admitted=False
         try:return self._request(body)

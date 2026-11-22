@@ -489,3 +489,73 @@ class InventoryExtension(unittest.TestCase):
         with patch.object(t.time,'time',return_value=fixed_now):seq.request(dict(body,input=[fixture['returned_item']]))
         self.assertTrue(seq.finished);self.assertTrue(seq.records[0]['pass'])
         self.assertEqual(seq.records[0]['discovered_names'],['multi_agent_v1.spawn_agent'])
+
+    def pty_pending(self):
+        marker=self.root/'job/src/pty-consumed'
+        if marker.exists():marker.unlink()
+        seq=t.Sequence(t.inventory_actions()[:5],self.root,time.monotonic()+5)
+        seq.request(self.body())
+        start='Process running with session ID 41\nOutput:\n'+t.PTY_READY+'\n'
+        seq.request(self.body([self.result('pty-start',start)]))
+        seq.request(self.body([self.result('pty-poll','Process running with session ID 41\nOutput:\n')]))
+        marker.write_text(t.PTY_TOKEN)
+        return seq,marker
+
+    def pty_proof(self):
+        return json.dumps({'consumed':True,'uid':1000,'cap_eff':'0','nnp':'1','netns':'different',
+                           'denied':{'/credentials/marker':13,'/etc/codex/requirements.toml':30}})+'\n'
+
+    def test_pty_complete_proof_early_and_empty_final_poll_retires_owned_session(self):
+        seq,marker=self.pty_pending();proof=self.pty_proof()
+        poll=seq.request(self.body([self.result('pty-input','Process running with session ID 41\nOutput:\n'+proof)]))
+        self.assertEqual(self.wire_item(poll)['call_id'],'pty-complete')
+        self.assertEqual(seq.pty_payload,proof);self.assertEqual(seq.pty_payload_calls,['pty-input'])
+        seq.request(self.body([self.result('pty-complete','Process exited with code 0\nOutput:\n')]))
+        self.assertTrue(seq.pty_retired);self.assertEqual(marker.read_text(),t.PTY_TOKEN)
+        self.assertEqual(seq.pty_payload_calls,['pty-input','pty-complete']);self.assertEqual(len(seq.planned),6)
+        seq.request(self.body([self.result('pty-stale','write_stdin failed: Unknown process id 41')]))
+        seq.request(self.body([self.result('pty-invalid','write_stdin failed: Unknown process id -1')]))
+        self.assertTrue(seq.finished);self.assertTrue(all(row['pass'] for row in seq.records))
+
+    def test_pty_fragmented_proof_joins_payload_bytes_without_rendered_header_separator(self):
+        proof=self.pty_proof()
+        for split in (1,proof.index('true')+2,len(proof)-2):
+            seq,marker=self.pty_pending()
+            seq.request(self.body([self.result('pty-input','Process running with session ID 41\nOutput:\n'+proof[:split])]))
+            seq.request(self.body([self.result('pty-complete','Process exited with code 0\nOutput:\n'+proof[split:])]))
+            self.assertTrue(seq.pty_retired);self.assertEqual(seq.pty_payload,proof)
+            self.assertEqual(marker.read_text(),t.PTY_TOKEN)
+
+    def test_pty_retained_proof_does_not_override_exit_id_marker_or_poll_failure(self):
+        for final,proof,change in (('Process exited with code 0\nOutput:\n','',False),
+                                  ('Process exited with code 17\nOutput:\n',self.pty_proof(),False),
+                                  ('Process running with session ID 41\nOutput:\n',self.pty_proof(),False),
+                                  ('Process running with session ID 999\nOutput:\n',self.pty_proof(),False),
+                                  ('Process exited with code 0\nOutput:\n',self.pty_proof(),True)):
+            seq,marker=self.pty_pending()
+            seq.request(self.body([self.result('pty-input','Process running with session ID 41\nOutput:\n'+proof)]))
+            before=(seq.pty_payload,list(seq.pty_payload_calls),len(seq.planned))
+            if change:marker.write_text('changed actual file')
+            with self.subTest(final=final,change=change),self.assertRaises(ValueError):
+                seq.request(self.body([self.result('pty-complete',final)]))
+            self.assertFalse(seq.pty_retired);self.assertEqual((seq.pty_payload,seq.pty_payload_calls,len(seq.planned)),before)
+            self.assertEqual(marker.read_text(),'changed actual file' if change else t.PTY_TOKEN)
+        seq,marker=self.pty_pending()
+        with self.assertRaises(ValueError):seq.request(self.body([self.result('pty-input','Process running with session ID 999\nOutput:\n'+self.pty_proof())]))
+        self.assertEqual(seq.pty_payload,'');self.assertFalse(seq.pty_completion_added);self.assertEqual(len(seq.planned),5)
+
+    def test_pty_payload_and_pending_poll_plan_roll_back_when_same_request_context_rejects(self):
+        seq,marker=self.pty_pending()
+        incoming=self.result('pty-input','Process running with session ID 41\nOutput:\n'+self.pty_proof())
+        unknown={'type':'function_call_output','name':'forged','namespace':'agent','output':'not admitted'}
+        with self.assertRaises(ValueError):seq.request(self.body([incoming,unknown]))
+        self.assertEqual(seq.pty_payload,'');self.assertEqual(seq.pty_payload_calls,[])
+        self.assertFalse(seq.pty_completion_added);self.assertFalse(seq.pty_retired);self.assertEqual(len(seq.planned),5)
+        self.assertEqual(marker.read_text(),t.PTY_TOKEN)
+        self.assertFalse(seq.records[-1]['pass']);self.assertEqual(seq.records[-1]['request_admission'],'rolled-back')
+        self.assertEqual(seq.last_outputs,[incoming,unknown])
+        seq.request(self.body([incoming]));self.assertEqual(seq.pty_payload,self.pty_proof())
+        self.assertEqual(len(seq.planned),6)
+        overflow=t.BODY_BYTES-len(seq.pty_payload.encode())+1
+        with self.assertRaisesRegex(ValueError,'retained payload bound'):
+            seq.oracle(seq.planned[3],self.result('pty-complete','Process exited with code 0\nOutput:\n'+'x'*overflow))

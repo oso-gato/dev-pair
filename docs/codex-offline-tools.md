@@ -49,6 +49,12 @@ UID/capabilities/NNP and attempts the known denied read and protected-code write
 Its18-second alarm and the existing action/experiment deadlines bound input wait.
 The optional completion poll is inserted once only if the input result is still
 running; remaining running state blocks instead of polling indefinitely.
+Input and completion responses drain different bytes. The fixture retains at
+most256KiB of payload associated with the bound PTY across those two responses,
+removing only each rendered header separator so fragmented JSON rejoins exactly.
+Final exit0, exact product bytes and complete consumption/confinement proof remain
+mandatory. This retained state participates in incoming-request rollback; it
+adds no poll or capture-budget allowance.
 
 Nine goal actions exercise initial absence, missing-goal update, empty objective,
 nonpositive budget, create, duplicate create, forbidden active update, complete
