@@ -186,6 +186,7 @@ class FedoraOCI(unittest.TestCase):
     def test_derived_index_can_omit_type_but_signed_source_still_requires_it(self):
         def without_type(index):index.pop('mediaType');return index
         source,pins=self.graph()
+        omitted,_=self.graph(alter=self.alter_index(without_type))
         path,changed=self.graph(alter=self.alter_index(without_type),gzip_time=1)
         self.assertEqual(pins['CONFIG'],changed['CONFIG'])
         self.assertEqual(pins['DIFF'],changed['DIFF'])
@@ -194,14 +195,14 @@ class FedoraOCI(unittest.TestCase):
             for key,value in pins.items():stack.enter_context(patch.object(f,key,value))
             f.parse_oci(source,time.monotonic()+2)
             with self.assertRaisesRegex(ValueError,'unsupported OCI index'):
-                f.parse_oci(path,time.monotonic()+2)
+                f.parse_oci(omitted,time.monotonic()+2)
             proof=f.parse_oci(path,time.monotonic()+2,derived=True)
             self.assertEqual(proof['manifest_sha256'],changed['MANIFEST'])
             self.assertEqual(proof['config_sha256'],pins['CONFIG'])
             self.assertEqual(proof['compressed_layer_sha256'],changed['LAYER'])
             self.assertEqual(proof['diff_id_sha256'],pins['DIFF'])
             with self.assertRaisesRegex(ValueError,'unsupported OCI index'):
-                f.import_image(lambda *a,**k:self.fail('engine reached unsigned transport'),path)
+                f.import_image(lambda *a,**k:self.fail('engine reached unsigned transport'),omitted)
             for declared in (None,pins['DIFF']):
                 altered,_=self.graph(alter=self.alter_index(without_type),raw=b'changed rootfs',declared_diff=declared)
                 with self.subTest(declared=declared),self.assertRaises(ValueError):
