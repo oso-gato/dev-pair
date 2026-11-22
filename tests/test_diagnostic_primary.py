@@ -23,21 +23,64 @@ class CallbackPrecedenceTests(unittest.TestCase):
                     with self.assertRaises(b.Blocked) as seen:run._call(sys.executable,'-c',script,probe=probe)
                     self.assertEqual(set(calls),{'diagnostic','metadata'});self.assertNotIn('PRIVATE',str(seen.exception))
                     self.assertIn('exit 7' if primary else 'required command diagnostics unavailable',str(seen.exception))
-    def test_real_native_timeout_cleanup_precedence_and_no_public_callback_values(self):
+    def native_timeout_case(self, *, cleanup, injected=None):
+        """Real child/relay/FIFOs; only manager identity and optional failure are synthetic."""
         with tempfile.TemporaryDirectory() as tmp:
-            root=install(self,tmp);calls=[];dispatch=manager(subprocess.Popen,calls)
+            root=install(self,tmp);calls=[];launchers=[];callbacks=[];records=[];owned_at_launch=[]
+            dispatch=manager(subprocess.Popen,calls)
+            def tracked(args,**kwargs):
+                process=dispatch(args,**kwargs)
+                if args[0]=='/usr/bin/systemd-run':
+                    launchers.append(process)
+                    owned_at_launch.append(bool(list((root/'records').iterdir())) and bool(list((root/'streams').iterdir())))
+                return process
+            run=b.Commands()
+            def diagnostic(*values):
+                callbacks.append('diagnostic');raise OSError('PRIVATE callback')
+            def metadata(record):
+                callbacks.append('metadata');records.append(record);raise OSError('PRIVATE callback2')
+            run.diagnostic=diagnostic;run.metadata_diagnostic=metadata
+            original_interrupt=run.interrupt
+            def interrupt(*values):
+                original_interrupt(*values)
+                if cleanup:raise b.Blocked('PRIVATE unresolved cleanup')
+            original_selector=b.selectors.DefaultSelector;injected_once=[]
+            def selector_factory():
+                selector=original_selector();original_select=selector.select
+                def select(*values,**kwargs):
+                    if injected is not None and launchers and not injected_once:
+                        injected_once.append(True);raise injected
+                    return original_select(*values,**kwargs)
+                selector.select=select
+                return selector
             args=('/usr/bin/systemd-run','--unit=dev-pair-gptbox-'+'a'*64+'.service','--description=dev-pair-owned-dev-pair-gptbox-'+'a'*64+'.service','--wait','--collect','--property=RuntimeMaxSec=3')
+            with patch.object(b.subprocess,'Popen',side_effect=tracked),patch.object(b.selectors,'DefaultSelector',side_effect=selector_factory),patch.object(run,'interrupt',side_effect=interrupt) as interrupted,self.assertRaises(b.Blocked) as seen:
+                run(*args,sys.executable,'-c','import time;time.sleep(2)',timeout=.25 if injected is None else 3)
+            expected={'command deadline exceeded; output withheld','command failed or timed out; output withheld'}
+            if cleanup:expected={'native cleanup unresolved; retained ownership record and finite lifetime'}
+            elif injected is not None:
+                expected={'command deadline exceeded; output withheld' if isinstance(injected,b.Blocked) else 'command failed or timed out; output withheld'}
+            self.assertIn(str(seen.exception),expected);self.assertNotIn('PRIVATE',str(seen.exception))
+            self.assertEqual(len(launchers),1);self.assertEqual(owned_at_launch,[True]);interrupted.assert_called_once()
+            self.assertTrue(any(args[:2]==('/usr/bin/systemctl','show') for args in calls))
+            self.assertIs(interrupted.call_args.args[0],launchers[0])
+            self.assertIsNotNone(launchers[0].returncode)
+            self.assertTrue(launchers[0].stdout.closed);self.assertTrue(launchers[0].stderr.closed)
+            self.assertEqual(sorted(callbacks),['diagnostic','metadata'])
+            self.assertTrue(records[0]['native_failure']['launcher_handle_observed'])
+            self.assertTrue(records[0]['native_failure']['status_sampled_before_interrupt'])
+            self.assertEqual(list((root/'records').iterdir()),[])
+            self.assertEqual(list((root/'streams').iterdir()),[])
+            if injected is not None:self.assertEqual(injected_once,[True])
+    def test_real_native_timeout_cleanup_precedence_and_no_public_callback_values(self):
+        for cleanup in (False,True):
+            with self.subTest(cleanup=cleanup):self.native_timeout_case(cleanup=cleanup)
+    def test_injected_native_primary_and_cleanup_precedence_after_real_launch(self):
+        for kind in ('deadline','wait-timeout'):
             for cleanup in (False,True):
-                run=b.Commands();run.diagnostic=lambda *a:(_ for _ in ()).throw(OSError('PRIVATE callback'))
-                run.metadata_diagnostic=lambda *a:(_ for _ in ()).throw(OSError('PRIVATE callback2'))
-                original=run.interrupt
-                def interrupt(*values):
-                    original(*values)
-                    if cleanup:raise b.Blocked('PRIVATE unresolved cleanup')
-                with patch.object(b.subprocess,'Popen',side_effect=dispatch),patch.object(run,'interrupt',side_effect=interrupt),self.assertRaises(b.Blocked) as seen:
-                    run(*args,sys.executable,'-c','import time;time.sleep(2)',timeout=.25)
-                self.assertNotIn('PRIVATE',str(seen.exception));self.assertIn('cleanup unresolved' if cleanup else 'command failed or timed out',str(seen.exception))
-                self.assertEqual(list((root/'records').iterdir()),[])
+                with self.subTest(primary=kind,cleanup=cleanup):
+                    primary=b.Blocked('command deadline exceeded; output withheld') if kind=='deadline' else subprocess.TimeoutExpired('PRIVATE argv',3)
+                    self.native_timeout_case(cleanup=cleanup,injected=primary)
     def test_caller_active_exception_does_not_hide_callback_only_failure(self):
         run=b.Commands();run.metadata_diagnostic=lambda *a:(_ for _ in ()).throw(OSError('PRIVATE'))
         try:raise ValueError('outer caller exception')

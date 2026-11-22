@@ -3,6 +3,28 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 03:36 HKT — hosted32 timeout fixture portability
+
+- Native32 on reviewed 498e96f stopped in hosted tests: 588 tests in 79.813
+  seconds, with one timeout-fixture assertion failure. Fedora was skipped; no VM,
+  controller or guest result exists. The fixture expected only the generic fixed
+  timeout primary, while this run correctly returned the existing deadline
+  primary. Earlier local execution had returned the generic primary. Neither
+  observation establishes an underlying product failure or Fedora acceptance.
+- This test-only repair recognizes exactly those two complete primary messages.
+  It independently checks real launcher creation, interrupt/reap, pipe closure,
+  owned transport creation/removal and callback execution. Cleanup-failure cases
+  use subtests, so an earlier case cannot prevent their execution. Deterministic
+  post-launch injected failures cover each primary and existing cleanup precedence;
+  private callback/argv text remains absent from public errors.
+- Production tools, workflow, security/admission decisions and every runtime/test
+  budget remain unchanged. Affected and frozen combined results are retained in
+  `/workspace/artifacts/hosted32-timeout-fixture-20261122/`. Fresh exact review and
+  separately authorized changed native evidence are still required; no stock,
+  native or deployment action occurred in this unit. API selection remains
+  GPT-6.1 Sol/high; backend attestation is unavailable.
+
+
 ### November 23, 2026, 02:23 HKT — one-image review repairs, source only
 
 - The independent one-image review found two failures: diagnostic callbacks could
