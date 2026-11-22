@@ -19,16 +19,16 @@ python3 -m unittest discover -s tests -p test_host_handoff.py -v
 ```
 
 The check requires Linux with unprivileged user, mount, PID and network
-namespaces, a protected non-setuid `/usr/bin/bwrap`, `/usr/bin/python3`, and
-OpenSSL to provision fixture credentials. The application receives a sealed
-single-file Python artifact, an inherited loopback listener and one writable
-attempt directory at `/data`. The sandbox uses read-only system files, a
-private PID and network namespace, and no controller state or credential
-mounts. The test exercises closure of both application processes and denial
-of access to an outside file and unrelated loopback listener. Files have a
-1 MiB per-file limit. Artifact and application response sizes, execution time,
-memory and connections are bounded. The scratch path should be on disposable
-local storage.
+namespaces, a protected non-setuid `/usr/bin/bwrap`, `/usr/bin/python3`,
+`libseccomp.so.2`, and OpenSSL to provision fixture credentials. The application
+receives a sealed single-file Python artifact, an inherited loopback listener
+and one writable host-backed SQLite file limited to 1 MiB. Each instance keeps
+SQLite sidecars and other temporary data in a separate, 1 MiB tmpfs. Kernel
+limits govern tmpfs metadata. The sandbox uses read-only system files, private
+PID and network namespaces, and a seccomp filter that denies starting more
+processes or threads. Only one instance runs at a time under a 128 MiB address
+space limit. The test checks fork and access denial, the aggregate tmpfs data
+limit and a closed app listener after a controller interruption.
 
 For a separately provisioned local run, the controller uses `jobs.py job`
 and `jobs.py checkpoint` to create the job and its current checkpoint. Obtain
@@ -58,8 +58,10 @@ checks the same completed ID. If the controller is killed after a database
 effect, the attempt stays in flight and the owned scratch remains available
 for inspection. A restarted controller refuses to execute or consume that
 attempt. The generic local reconciliation command also refuses this attempt
-type. A normal completion removes the disposable data after stopping both
-instances and keeps the result in the ledger.
+type. SQLite sidecars are disposable, so an interrupted write may require
+manual inspection of the retained primary database. A normal completion
+removes the disposable data after stopping both instances and keeps the result
+in the ledger.
 
 ## Verification boundary
 

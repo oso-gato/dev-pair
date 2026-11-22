@@ -20,7 +20,9 @@ import job_protocol as p
 
 APP = '''\
 import argparse
+import errno
 import json
+import os
 import pathlib
 import socket
 import sqlite3
@@ -32,6 +34,17 @@ parser.add_argument('command', choices=['serve'])
 parser.add_argument('--database')
 parser.add_argument('--listen-fd', type=int)
 args = parser.parse_args()
+try:
+    child = os.fork()
+except PermissionError:
+    pass
+else:
+    if child == 0:
+        os._exit(0)
+    os.waitpid(child, 0)
+    raise AssertionError('candidate started a second process')
+limit = os.statvfs('/data')
+assert limit.f_blocks * limit.f_frsize == 1024 * 1024
 assert not pathlib.Path(OUTSIDE).exists()
 try:
     pathlib.Path(OUTSIDE).read_text()
@@ -46,6 +59,18 @@ if CANARY_PORT:
         pass
     else:
         raise AssertionError('unrelated controller listener was reachable')
+    first = pathlib.Path('scratch-one')
+    second = pathlib.Path('scratch-two')
+    first.write_bytes(bytes(768 * 1024))
+    try:
+        second.write_bytes(bytes(768 * 1024))
+    except OSError as error:
+        assert error.errno == errno.ENOSPC
+    else:
+        raise AssertionError('scratch exceeded its aggregate byte limit')
+    finally:
+        first.unlink()
+        second.unlink(missing_ok=True)
 db = sqlite3.connect(args.database)
 db.execute('CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, title TEXT, done INTEGER)')
 if MODE == 'forget':
@@ -89,7 +114,9 @@ server.socket.close()
 server.socket = socket.socket(fileno=args.listen_fd)
 port = server.socket.getsockname()[1]
 if MODE == 'stall':
-    pathlib.Path('listening-port').write_text(str(port))
+    db.execute('CREATE TABLE fixture_port (port INTEGER)')
+    db.execute('INSERT INTO fixture_port VALUES (?)', (port,))
+    db.commit()
 print(f'http://127.0.0.1:{port}', flush=True)
 server.serve_forever()
 '''
@@ -100,6 +127,11 @@ server.serve_forever()
 class AuthenticatedHandoffTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        try:
+            with h.process_filter():
+                pass
+        except OSError as exc:
+            raise unittest.SkipTest('local libseccomp is unavailable') from exc
         check = subprocess.run([str(h.BWRAP), '--unshare-all', '--unshare-user', '--disable-userns',
                                 '--ro-bind', '/usr', '/usr', '--symlink', 'usr/lib', '/lib',
                                 '--symlink', 'usr/lib64', '/lib64', '--', '/usr/bin/true'],
@@ -328,11 +360,11 @@ class AuthenticatedHandoffTests(unittest.TestCase):
                             if db.execute('SELECT name FROM sqlite_master WHERE name=?', ('items',)).fetchone():
                                 rows = db.execute('SELECT id,title,done FROM items').fetchall()
                                 if rows and rows[0][2]:
+                                    port = db.execute('SELECT port FROM fixture_port').fetchone()[0]
                                     break
                     self.assertLess(time.monotonic(), deadline, 'item completion was never committed')
                     time.sleep(0.02)
                 workspace = databases[0].parent
-                port = int((workspace / 'listening-port').read_text())
                 executor.kill()
                 executor.wait(timeout=3)
                 _, stderr = client.communicate(timeout=4)
@@ -357,6 +389,24 @@ class AuthenticatedHandoffTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT id,title,done FROM items').fetchall(), rows)
         with self.assertRaises(ConnectionRefusedError):
             socket.create_connection(('127.0.0.1', port), timeout=1).close()
+
+    def test_pending_previous_json_implementation_remains_blocked_after_restore(self):
+        artifact = self.write('old-data.json', b'{"message":"ready"}')
+        previous = 'cfa3dc15cdeef81852e296bffe6a9d9774cb7fff6aa1708a40454b8e646ff788'
+        checkpoint = p.envelope('checkpoint', job_id=self.job['job_id'], checkpoint_id='cp-old-json',
+                                candidate={'source_revision': 'f' * 40, 'artifact_sha256': p.sha256(artifact.read_bytes())},
+                                test={'recipe': p.RECIPE, 'recipe_sha256': previous, 'revision': previous},
+                                summary='Recorded against the previous implementation', evidence=[])
+        self.jobs('checkpoint', self.write('cp-old.json', p.canonical(checkpoint).encode()))
+        self.jobs('request', self.job['job_id'], 'old-json', '--reason', 'Test historically pending data',
+                  '--expected-message', 'ready')
+        backup, restored = self.root / 'backup', self.root / 'restored'
+        self.jobs('backup', backup)
+        self.run_cli('jobs.py', '--state', restored, 'restore', backup)
+        self.state = restored
+        result = self.jobs('execute-local', 'old-json', '--artifact', artifact)
+        self.assertEqual(result['status'], 'blocked')
+        self.assertIn('changed trusted local recipe identity', result['diagnostics'])
 
 
 if __name__ == '__main__':

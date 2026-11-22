@@ -21,8 +21,6 @@ VERSION = 1
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 RECIPE = 'local-json-message-v1'
 APP_PROCESS_BOUNDARY = 'local-app-process'
-# The existing JSON recipe is unchanged from the immediate baseline.
-BASE_JSON_RECIPE_SHA256 = 'cfa3dc15cdeef81852e296bffe6a9d9774cb7fff6aa1708a40454b8e646ff788'
 MAX_MESSAGE = 65536
 # Requests reserve three quarters of the envelope for executor diagnostics,
 # per-check actual/verdict fields, identity and reconciliation evidence. These
@@ -494,9 +492,7 @@ class Ledger:
         reason = None
         if request['boundary'] != 'local-protocol':
             reason = 'No verified Fedora host executor/transport; host checks remain blocked'
-        elif request['test'] not in (recipe_identity(),
-                                     {'revision': BASE_JSON_RECIPE_SHA256, 'recipe': RECIPE,
-                                      'recipe_sha256': BASE_JSON_RECIPE_SHA256}):
+        elif request['test'] != recipe_identity():
             reason = 'Unsupported or changed trusted local recipe identity'
         elif request['capabilities'] != ['local-json-read'] or request['permitted_effects'] != ['read-artifact', 'write-ledger']:
             reason = 'Requested capability/effects are outside the fixed local controller policy'
