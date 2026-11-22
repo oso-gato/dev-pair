@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-from bootstrap import Bootstrap, Blocked, STATE, Commands, github_keys, operator_password, validate_sources
+from bootstrap import Bootstrap, Blocked, STATE, Commands, PrepareCost, github_keys, operator_password, validate_sources
 import candidate
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
@@ -588,7 +588,9 @@ class Gptbox(Bootstrap):
                           'assembly_native': ASSEMBLY_LIFETIME, 'runtime_native': RUNTIME_LIFETIME}}
             def save():
                 self.atomic(path, json.dumps(record, sort_keys=True) + '\n', expected=self.text(path) or None)
+            cost=None
             def diagnostic(entry):
+                if cost is not None:cost.command(entry)
                 location = STATE + '/prepare-diagnostics.json'
                 history = json.loads(self.text(location, '{"recent":[],"failures":[]}'))
                 history['recent'] = (history['recent'] + [entry])[-4:]
@@ -616,7 +618,8 @@ class Gptbox(Bootstrap):
                     status = metadata['status']
                     diagnostic({'operation': 'withheld', 'operation_id': 'source-git-read',
                                 'step': 'adapter-source-and-upstream', 'status': status,
-                                'accepted_exit': metadata['accepted_exit'], 'outcome': metadata['outcome']})
+                                'accepted_exit': metadata['accepted_exit'], 'outcome': metadata['outcome'],
+                                **{key:metadata[key] for key in ('elapsed_seconds','launcher_handle_observed') if key in metadata}})
                 try:
                     self.run.metadata_diagnostic = source_diagnostic
                     self.source_stage = 'input-content'
@@ -629,10 +632,15 @@ class Gptbox(Bootstrap):
                     self.run.metadata_diagnostic = previous
                     save()
             prepare_started = time.monotonic()
+            record['prepare_cost_attempt']=os.urandom(16).hex()
+            cost=PrepareCost(revision,expected,record['prepare_cost_attempt'],prepare_started)
+            preparation.prepare_cost=cost
             adapter_started = None
             def snapshot_prepare_observations():
+                cost.finish(record['prepare']=='complete')
                 witness = getattr(preparation.run,'phase_budget_witness',None)
                 record['prepare_budget_witness'] = dict(witness) if type(witness) is dict else None
+                record['prepare_cost']=cost.snapshot(witness)
                 record['role_directory_batches'] = {key:dict(value) for key,value in
                     getattr(preparation,'role_directory_batches',{}).items()}
             try:
@@ -646,6 +654,8 @@ class Gptbox(Bootstrap):
                                                          {'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'})
                     preparation.prepare('core', keys, sources, context, expected, password=password,
                                         source_check=source_check)
+                    cost.mark('finalization')
+                cost.finish(True)
                 snapshot_prepare_observations()
                 record.update(phase='maintenance-gptbox', prepare='complete',
                               prepare_elapsed_seconds=round(time.monotonic() - prepare_started, 3))

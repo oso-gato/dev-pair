@@ -1021,6 +1021,56 @@ def sudo_public_projection(record):
     return result
 
 
+PREPARE_COST_STEPS=('pre-prepare','input-admission','host-preflight','context-content','context-source','git-prerequisite',
+    'adapter-source-and-upstream','desired-state','resolved-discovery','packages','operator','host-identity-time',
+    'sudo-package-provenance','dp-maint','maintenance-directories','dp-dev','development-directories','managed-limits',
+    'ingress-guard','tailscale-package-config','tailscale-package','package-inventory','maintenance-gptbox-build',
+    'preparation-completion','finalization','unattributed')
+PREPARE_COST_COLUMNS=('visits','wall_seconds','command_count','accepted','rejected_with_launcher_handle',
+                      'rejected_without_launcher_handle','command_elapsed_seconds')
+PREPARE_COST_SCOPE='emitted-top-level-prepare-and-source-check-callbacks'
+
+
+def prepare_cost_projection(state,expected,budget_available):
+    unavailable={'availability':'unavailable'}
+    value=state.get('prepare_cost')
+    if (type(value) is dict and set(value)=={'availability','reason'} and value.get('availability')=='unavailable' and
+            value.get('reason') in ('projection-overflow','interrupted-accounting-update')):return dict(value)
+    try:
+        require(budget_available, 'Prepare cost phase witness unavailable')
+        keys=set(('schema source_sha context_sha256 attempt_id phase phase_budget_sha256 status wall_complete commands_complete elapsed_seconds '
+                  'command_records unknown_records scope nested_controls columns steps').split())
+        require(type(value) is dict and set(value)==keys and type(value['schema']) is int and value['schema']==1,
+                'Invalid prepare cost fields')
+        require(value['source_sha']==expected['source_sha'] and value['context_sha256']==expected['context_sha256'] and
+                type(value['attempt_id']) is str and re.fullmatch('[0-9a-f]{32}',value['attempt_id']) and
+                value['attempt_id']==state.get('prepare_cost_attempt') and value['phase']=='prepare', 'Prepare cost target mismatch')
+        digest=hashlib.sha256(json.dumps(state['prepare_budget_witness'],sort_keys=True,separators=(',',':')).encode()).hexdigest()
+        require(value['phase_budget_sha256']==digest and value['scope']==PREPARE_COST_SCOPE and
+                value['nested_controls']=='included-in-parent-elapsed-not-counted-again' and value['columns']==list(PREPARE_COST_COLUMNS),
+                'Invalid prepare cost binding/scope')
+        def count(item):return type(item) is int and 0<=item<=4096
+        def finite(item):return type(item) in (int,float) and 0<=item<=3300 and math.isfinite(item)
+        require(all(type(value[k]) is bool for k in ('wall_complete','commands_complete')) and
+                value['status'] in ('complete','interrupted','incomplete','overflow') and
+                (value['status'] in ('complete','interrupted'))==(value['wall_complete'] and value['commands_complete']),
+                'Invalid prepare cost completeness')
+        require(count(value['command_records']) and count(value['unknown_records']) and
+                (finite(value['elapsed_seconds']) or value['elapsed_seconds'] is None and not value['wall_complete']), 'Invalid prepare cost totals')
+        rows=value['steps'];require(type(rows) is dict and set(rows)<=set(PREPARE_COST_STEPS), 'Unknown prepare cost step')
+        for row in rows.values():
+            require(type(row) is list and len(row)==7 and count(row[0]) and finite(row[1]) and all(count(v) for v in row[2:6]) and
+                    row[2]==sum(row[3:6]) and (finite(row[6]) or row[6] is None and not value['commands_complete']), 'Invalid prepare cost row')
+        require(sum(row[2] for row in rows.values())+value['unknown_records']==value['command_records'] and
+                (not value['commands_complete'] or value['unknown_records']==0), 'Prepare cost command accounting mismatch')
+        require(not value['wall_complete'] or abs(sum(row[1] for row in rows.values())-value['elapsed_seconds'])<=.01,
+                'Prepare cost wall accounting mismatch')
+        result={'availability':'observed',**value}
+        require(len(json.dumps(result,separators=(',',':')).encode())<=4096, 'Prepare cost projection bound')
+        return result
+    except (ValueError,TypeError,KeyError):return unavailable
+
+
 def prepare_observations(state, expected):
     # Reuse the exact target/admission validation before admitting timing or
     # owner evidence. Durations do not establish a primary failure cause.
@@ -1050,6 +1100,7 @@ def prepare_observations(state, expected):
                     value['outcome'] in ('complete','blocked') and
                     (value['outcome']!='complete' or value['checked_lookups']==2 and value['completed_directories']==8)):
                 result['role_directories'][role]=dict(value)
+    result['cost']=prepare_cost_projection(state,expected,result['budget'].get('availability')=='observed')
     return result
 
 
