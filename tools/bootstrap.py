@@ -256,6 +256,53 @@ class PrepareCost:
 _PHASE_DEADLINE = contextvars.ContextVar('dev_pair_phase_deadline', default=None)
 
 
+TAILSCALE_PACKAGE = ('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1', '--disablerepo=*',
+    '--enablerepo=fedora', '--enablerepo=updates', '--enablerepo=tailscale-stable', 'install', 'tailscale')
+LAUNCHER_RESULTS = frozenset(('success','resources','protocol','timeout','exit-code','signal','core-dump',
+    'watchdog','start-limit-hit','oom-kill','exec-condition'))
+
+def launcher_summary(raw, complete):
+    """Closed C-locale systemd-run summary; never returns captured text."""
+    unavailable = {'availability':'unavailable'}
+    if not complete or len(raw)>8192 or any(c<32 and c!=10 or c>126 for c in raw):return unavailable
+    try:
+        fields={};seen=set()
+        for line in raw.decode('ascii').splitlines():
+            if not line:continue
+            match=re.fullmatch(r' *([^:]+): (.+)',line)
+            if not match:return unavailable
+            key,value=match.groups()
+            if key in seen:return unavailable
+            seen.add(key)
+            if key=='Finished with result':
+                if value not in LAUNCHER_RESULTS:return unavailable
+                fields['result']=value
+            elif key=='Main processes terminated with':
+                match=re.fullmatch(r'code=(exited|killed|dumped), status=([0-9]{1,3})/([A-Z0-9_-]+|n/a)',value)
+                if not match:return unavailable
+                code,number,label=match.groups();number=int(number)
+                signals={'HUP':1,'INT':2,'QUIT':3,'ILL':4,'TRAP':5,'ABRT':6,'BUS':7,'FPE':8,'KILL':9,
+                    'USR1':10,'SEGV':11,'USR2':12,'PIPE':13,'ALRM':14,'TERM':15,'CHLD':17,'CONT':18,'STOP':19,
+                    'TSTP':20,'TTIN':21,'TTOU':22,'XCPU':24,'XFSZ':25,'VTALRM':26,'PROF':27,'WINCH':28,'SYS':31}
+                exits={0:'SUCCESS',1:'FAILURE',2:'INVALIDARGUMENT',3:'NOTIMPLEMENTED',4:'NOPERMISSION',5:'NOTINSTALLED',6:'NOTCONFIGURED',7:'NOTRUNNING',
+                    200:'CHDIR',203:'EXEC',204:'MEMORY',205:'LIMITS',216:'GROUP',217:'USER',218:'CAPABILITIES',226:'NAMESPACE'}
+                if code=='exited':
+                    if number>255 or label!=exits.get(number,'n/a'):return unavailable
+                elif signals.get(label)!=number:return unavailable
+                fields.update(code=code,status=number)
+            elif key=='Running as unit':
+                if not re.fullmatch(r'dev-pair-initialize-prepare-[0-9a-f]{8}-[0-9a-f]{8}\.service(?:; invocation ID: [0-9a-f]{32})?',value):return unavailable
+            elif key in ('Service runtime','CPU time consumed'):
+                if not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]+)?(?:us|ms|s|min|h|d|w|month|y) ?)+',value):return unavailable
+            elif key=='Memory peak':
+                if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?[BKMGTPE]?(?: \(swap: [0-9]+(?:\.[0-9]+)?[BKMGTPE]?\))?',value):return unavailable
+            elif key in ('IP Traffic','IO Bytes'):
+                if not re.fullmatch(r'(?:received|sent|read|written) [0-9]+(?:\.[0-9]+)?[BKMGTPE]?(?:, (?:sent|written) [0-9]+(?:\.[0-9]+)?[BKMGTPE]?)?',value):return unavailable
+            else:return unavailable
+        return {'availability':'observed',**fields} if 'result' in fields else unavailable
+    except (ValueError,UnicodeError):return unavailable
+
+
 class Commands:
     """Bounded execution with secret-safe, explicitly public diagnostics."""
     deadline = None
@@ -499,6 +546,9 @@ class Commands:
         unit = None
         description = None
         register_root_wrapper = False
+        launcher_selected = (self.current_step == 'tailscale-package' and original == TAILSCALE_PACKAGE and
+            input_text is None and not probe and bool(self.native_prefix) and
+            re.fullmatch(r'dev-pair-initialize-prepare-[0-9a-f]{8}', self.native_prefix) is not None)
         # Existing user transient units are already native executors. Tighten
         # their ceilings rather than putting them outside the phase budget.
         if args and args[0] == '/usr/bin/systemd-run':
@@ -523,6 +573,7 @@ class Commands:
         started = time.monotonic()
         command_end = min(started + timeout, self.execution_deadline() or float('inf'))
         buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+        launcher_capture=bytearray();launcher_bytes=0;launcher_eof=set();launch_timing=None
         total = 0
         status = 'not-started'
         process = None
@@ -552,6 +603,10 @@ class Commands:
                 'status_sampled_before_interrupt':sampled,'launcher_status_before_interrupt':observed,
                 'decoder':decoder.witness() if decoder is not None else {'availability':'unavailable'}}
             if cache_comparison is not None:failure_witness['cache_comparison']=cache_comparison
+            if launcher_selected:
+                failure_witness['launcher']={'summary':launcher_summary(bytes(launcher_capture),len(launcher_eof)==2 and launcher_bytes<=8192),
+                    'bytes':min(launcher_bytes,maximum+1),'complete':len(launcher_eof)==2 and launcher_bytes<=8192,
+                    'timing':launch_timing or {'availability':'unavailable'}}
         launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
@@ -672,7 +727,7 @@ class Commands:
                             continue
                         if key != 'RuntimeMaxSec':
                             raise Blocked('unknown native property rejected')
-                    prefix.append(value)
+                    if not (launcher_selected and value=='--quiet'):prefix.append(value)
                 if not any(value == '--service-type=exec' for value in prefix):
                     if any(value.startswith('--service-type=') for value in prefix):
                         raise Blocked('native service type mismatch')
@@ -681,6 +736,12 @@ class Commands:
                 start_us = int(startup * 1000) * 1000
                 runtime_us = round(float(runtime) * 1000000)
                 helper_end = command_end - min(.1, remaining / 2)
+                if launcher_selected:
+                    observed=time.monotonic();phase_end=self.execution_deadline()
+                    launch_timing={'availability':'observed','start_us':start_us,'runtime_us':runtime_us,
+                        'command_remaining_us':max(0,int((command_end-observed)*1000000)),
+                        'phase_remaining_us':None if phase_end is None else max(0,int((phase_end-observed)*1000000)),
+                        'helper_margin_us':max(0,int((command_end-helper_end)*1000000))}
                 admission_stage = 'effective-profile'
                 failure_point='transport-verification'
                 transport.verify()
@@ -742,6 +803,7 @@ class Commands:
                     failure_point='pipe-read'
                     block = os.read(descriptor, 8192 if decoder is not None and key.data == 'stderr' else min(8192, maximum - total + 1))
                     if not block:
+                        if launcher_selected and key.data.startswith('launcher_'):launcher_eof.add(key.data)
                         selector.unregister(key.fileobj)
                         continue
                     if decoder is not None and key.data=='stderr':failure_point='relay-feed'
@@ -752,8 +814,12 @@ class Commands:
                             failure_category='output-limit'
                             raise Blocked('command output byte budget exceeded; output withheld')
                         if input_text is None:
-                            name = 'stderr' if key.data.startswith('launcher_') else key.data
-                            buffers[name].extend(chunk)
+                            if launcher_selected and key.data.startswith('launcher_'):
+                                launcher_bytes+=len(chunk)
+                                launcher_capture.extend(chunk[:max(0,8192-len(launcher_capture))])
+                            else:
+                                name = 'stderr' if key.data.startswith('launcher_') else key.data
+                                buffers[name].extend(chunk)
             failure_point='launcher-wait'
             status = process.wait(timeout=1)
             if time.monotonic() >= command_end:
