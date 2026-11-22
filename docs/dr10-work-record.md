@@ -3,6 +3,42 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 04:39 HKT — fixed staged startup dependency closure
+
+- The single stock attempt on reviewed 78c1355 stopped before Journey/listener:
+  codex_state imported public_inputs, whose immutable-sibling fallback could not
+  find /opt/fedora_oci.py. Nine baseline checks passed, but no positive turn, UUID,
+  request, continuation or final audit was reached. The failure receipt remains
+  immutable at `/workspace/artifacts/session-stock-startup-78c1355-20261122/evidence.json`,
+  SHA256 ae29503f06b24d447f3d63a3d72ffa51a6cb1c6038e13bd8b62bdc034440bfb1.
+- One fixed module tuple now drives the existing immutable source snapshots and
+  read-only /opt mounts. Adding fedora_oci.py also includes its exact digest in
+  the existing aggregate source identity. No package/image verification behavior,
+  arbitrary dependency search, new executor or relaxed history oracle is added.
+- The regression copies exactly that fixed set outside the checkout and uses real
+  isolated Python imports with no ambient repository fallback. Omitting the one
+  dependency must fail; the complete set must import and execute pure synthetic
+  startup/policy operations. Source/hash/mode/mount checks retain fixed readonly
+  destinations and reject missing or extra module inputs.
+- The affected suite passed 116 tests in 8.224 seconds, including the real
+  isolated missing/complete staged import regression. Owned children were reaped
+  and fixtures removed. No full suite ran: root deferred it until a separate
+  confirmed native cleanup diagnostic repair is included.
+- Native/bootstrap/gptbox/workflow/encryption bytes remain exactly frozen f451b33.
+  Its independent review confirmed a GPG cleanup-interruption diagnostic defect:
+  unconfirmed child reap can be mislabeled ordinary encryption-unavailable while
+  the temporary home is removed. That separate repair is queued; crypto is
+  diagnostic only and native34's cause is unknown. Registry/ledger/default policy/helper bytes remain unchanged too.
+  Actual CLI argv, managed startup before work, history/helper and unknown-UUID
+  rejection/final audits are preserved. No new stock acceptance is claimed.
+- This separate allocation is 20:35:19–20:50:19 UTC, including test-slot waiting,
+  without extension. Validation/evidence is recorded under
+  `/workspace/artifacts/startup-staged-dependency-20261122/`; fresh review and one
+  separately authorized changed stock attempt remain required. API selection stays
+  GPT-6.1 Sol/high, with backend attestation unavailable. No stock/native/CI,
+  network/SSH, auth/model, push/merge or deployment action occurs in this unit.
+
+
 ### November 23, 2026, 04:33 HKT — sealed selected-load diagnostic source
 
 - Native34 on reviewed de99a97 completed enforcing Fedora host prerequisites in

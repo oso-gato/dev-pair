@@ -37,6 +37,25 @@ canonical = t.canonical
 sha = t.sha
 
 
+# Fixed immutable worker dependency closure, shared by snapshots and mounts.
+SESSION_MODULES=('codex_tools.py','session_helper.py','session_controller.py','job_protocol.py',
+    'ledger_recovery.py','startup_delivery.py','codex_state.py','public_inputs.py','fedora_oci.py')
+
+def session_sources():
+    return (('worker.py',Path(__file__)),*((name,Path(__file__).with_name(name)) for name in SESSION_MODULES))
+
+def stage_session_sources(root,end):
+    files={}
+    for name,source in session_sources():
+        path=Path(root)/name;path.write_bytes(t.snapshot(source,131072,end));path.chmod(0o444);files[name]=path
+    return files
+
+def session_source_mounts(files):
+    require(set(files)=={'worker.py',*SESSION_MODULES},'session source snapshot set mismatch')
+    return ['--ro-bind',str(files['worker.py']),'/opt/tool_boundary.py',
+        *sum((['--ro-bind',str(files[name]),'/opt/'+name] for name in SESSION_MODULES),[])]
+
+
 class MetadataRejected(ValueError):
     def __init__(self, stage):
         require(stage in ('metadata-schema','metadata-turn-id','metadata-timestamp','pair-turn-mismatch'),
@@ -1354,9 +1373,7 @@ def main():
         catalog=t.snapshot(args.catalog,1048576,runner.end);require(sha(catalog)==CATALOG_SHA,'unreviewed fixture catalog')
         selected=[m for m in json.loads(catalog,object_pairs_hook=t.unique)['models'] if m.get('slug')==t.MODEL]
         require(len(selected)==1,'fixture catalog model absent/ambiguous')
-        files={}
-        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__)),('session_helper.py',Path(helper.__file__)),('session_controller.py',Path(controller.__file__)),('job_protocol.py',Path(__file__).with_name('job_protocol.py')),('ledger_recovery.py',Path(__file__).with_name('ledger_recovery.py')),('startup_delivery.py',Path(startup.__file__)),('codex_state.py',Path(state.__file__)),('public_inputs.py',Path(state.__file__).with_name('public_inputs.py'))):
-            path=Path(root)/name;path.write_bytes(t.snapshot(source,131072,runner.end));path.chmod(0o444);files[name]=path
+        files=stage_session_sources(root,runner.end)
         models=Path(root)/'models.json';models.write_bytes(catalog);models.chmod(0o444)
         receipt={'startup':startup_receipt,'identity':{'source_revision':subprocess.check_output(['/usr/bin/git','-C',str(Path(__file__).resolve().parent.parent),'rev-parse','HEAD'],text=True).strip(),'source_sha256':sha(canonical({name:sha(path.read_bytes()) for name,path in files.items()})),'runtime_sha256':sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes()),'binary_sha256':state.CODEX_SHA,'policy_sha256':sha(canonical(policy)),'layout_sha256':sha(canonical({**state.layout(),'immutable':[*state.layout()['immutable'],startup.ROOT,'/opt/startup_delivery.py']}))}}
         startup_path=Path(root)/'session-startup.json';startup_path.write_bytes(canonical(receipt));startup_path.chmod(0o444)
@@ -1366,8 +1383,7 @@ def main():
         index=argv.index('--cap-drop');del argv[index:index+2]
         index=argv.index('--unshare-all')+1
         argv[index:index]=['--uid','0','--gid','0','--cap-drop','ALL','--cap-add','CAP_NET_ADMIN','--cap-add','CAP_SETPCAP','--cap-add','CAP_SETFCAP']
-        index=argv.index('--remount-ro');argv[index:index]=['--ro-bind',str(files['worker.py']),'/opt/tool_boundary.py',
-            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(files['session_helper.py']),'/opt/session_helper.py',*sum((['--ro-bind',str(files[name]),'/opt/'+name] for name in ('session_controller.py','job_protocol.py','ledger_recovery.py','startup_delivery.py','codex_state.py','public_inputs.py')),[]),'--ro-bind',str(startup_documents),startup.ROOT,'--ro-bind',str(startup_path),'/opt/session-startup.json','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
+        index=argv.index('--remount-ro');argv[index:index]=[*session_source_mounts(files),'--ro-bind',str(startup_documents),startup.ROOT,'--ro-bind',str(startup_path),'/opt/session-startup.json','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
         process=subprocess.Popen(argv,env=state.ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                  start_new_session=True,preexec_fn=state.child_limits)
         try:

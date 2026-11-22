@@ -76,8 +76,13 @@ continuation. Affected checks pass; fresh review and changed stock evidence rema
 required. Reviewed `78c1355` closes startup replay ordering before continuation. Its one
 changed stock attempt stopped before the CLI/listener at a missing staged
 `fedora_oci.py` dependency: nine baseline checks passed, but no turn, UUID, request
-or final audit was reached. The dependency repair is queued separately; startup
-delivery on that stock candidate is not yet proved.
+or final audit was reached. A narrow source repair now adds `fedora_oci.py` to the fixed immutable snapshot,
+read-only mounts and aggregate source identity. An isolated staged import regression
+checks that exact dependency closure; changed stock delivery remains unproved.
+The native encrypted diagnostic remains a separate source change with a confirmed
+cleanup-interruption review finding queued for repair, not a runtime fix or a
+diagnosed cause. This dependency repair passed 116 affected tests; a combined full
+suite waits for that native repair, and changed stock delivery is still unproved.
 
 No production deployment is established.
 
