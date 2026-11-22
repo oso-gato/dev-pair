@@ -230,7 +230,10 @@ class Commands:
             elapsed = observed >= phase_deadline
             signal.setitimer(signal.ITIMER_REAL, 0)
             self.phase_budget_witness = {'configured_seconds':seconds,
-                'effective_seconds':phase_deadline-started,
+                # Absolute-clock addition/subtraction may round slightly above
+                # the configured duration. Bound only the reported observation;
+                # the actual deadline, timer and expiry decision stay intact.
+                'effective_seconds':min(seconds,max(0,phase_deadline-started)),
                 'elapsed_seconds':max(0,observed-started),
                 'deadline_reached_at_exit':elapsed,'timer_fired':timer_fired}
             self.deadline, self.native_prefix = previous

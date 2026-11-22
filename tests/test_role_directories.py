@@ -1,6 +1,7 @@
 """Real local filesystem/timer behavior; role NSS, Fedora and root admission are fixtures."""
 import copy
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -132,6 +133,59 @@ class RoleDirectories(unittest.TestCase):
 
 
 class PhaseWitness(unittest.TestCase):
+    def test_cancellation_clamps_witness_without_changing_absolute_execution(self):
+        for started in (256.,1e6,float(2**40),float(2**45)):
+            configured=.05;deadline=started+configured;difference=deadline-started
+            for observed in (math.nextafter(deadline,-math.inf),deadline,math.nextafter(deadline,math.inf)):
+                run=b.Commands();reached=observed>=deadline
+                with self.subTest(started=started,observed=observed):
+                    with patch.object(b.time,'monotonic',side_effect=[started,started,observed]), \
+                            patch.object(b.signal,'getitimer',return_value=(0.,0.)), \
+                            patch.object(b.signal,'getsignal',return_value=b.signal.SIG_DFL), \
+                            patch.object(b.signal,'signal'),patch.object(b.signal,'setitimer') as timer:
+                        def execute():
+                            with run.phase(configured,'deterministic-local',native=False):
+                                self.assertEqual(run.deadline,deadline)
+                                self.assertEqual(b._PHASE_DEADLINE.get(),deadline)
+                        if reached:
+                            with self.assertRaises(b.Blocked):execute()
+                        else:execute()
+                    witness=run.phase_budget_witness
+                    self.assertEqual(witness['effective_seconds'],min(configured,difference))
+                    self.assertLessEqual(witness['effective_seconds'],configured)
+                    self.assertEqual(witness['deadline_reached_at_exit'],reached)
+                    self.assertEqual(witness['elapsed_seconds']>=witness['effective_seconds'],reached)
+                    self.assertFalse(witness['timer_fired'])  # No actual SIGALRM was delivered.
+                    self.assertEqual(timer.call_args_list[0].args,(b.signal.ITIMER_REAL,difference))
+                    self.assertIsNone(run.deadline);self.assertIsNone(b._PHASE_DEADLINE.get())
+        # Exact hosted failure and a much larger cancellation error are deterministic.
+        self.assertEqual((256.+.05)-256.,0.05000000000001137)
+        self.assertGreater(((2.**40)+.05)-(2.**40),.05)
+
+    def test_clipped_parent_timer_is_restored_without_budget_reset(self):
+        started=float(2**40);configured=.05;old_remaining=.015
+        deadline=started+old_remaining;observed=math.nextafter(deadline,-math.inf)
+        run=b.Commands()
+        with patch.object(b.time,'monotonic',side_effect=[started,started,observed,observed]), \
+                patch.object(b.signal,'getitimer',return_value=(old_remaining,0.)), \
+                patch.object(b.signal,'getsignal',return_value=b.signal.SIG_DFL), \
+                patch.object(b.signal,'signal'),patch.object(b.signal,'setitimer') as timer:
+            with run.phase(configured,'deterministic-parent',native=False):
+                self.assertEqual(run.deadline,deadline)
+        self.assertEqual(run.phase_budget_witness['effective_seconds'],deadline-started)
+        self.assertFalse(run.phase_budget_witness['deadline_reached_at_exit'])
+        self.assertFalse(run.phase_budget_witness['timer_fired'])
+        self.assertEqual(timer.call_args_list[-1].args,(b.signal.ITIMER_REAL,deadline-observed,0.))
+        self.assertLessEqual(timer.call_args_list[-1].args[1],old_remaining)
+        # An unrepresentable tiny duration still blocks before starting any timer.
+        run=b.Commands()
+        with patch.object(b.time,'monotonic',return_value=float(2**50)), \
+                patch.object(b.signal,'getitimer',return_value=(0.,0.)), \
+                patch.object(b.signal,'setitimer') as timer:
+            with self.assertRaises(b.Blocked):
+                with run.phase(configured,'unrepresentable-local',native=False):self.fail('unrepresentable deadline admitted')
+        timer.assert_not_called();self.assertIsNone(run.phase_budget_witness)
+
     def subprocess_witness(self,mode):
         code='''import json,signal,sys,time
 sys.path.insert(0,sys.argv[1]);import bootstrap as b
