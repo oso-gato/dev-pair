@@ -364,3 +364,33 @@ class InventoryExtension(unittest.TestCase):
         for i in range(129):(self.root/'job/src'/('bounded-'+str(i))).touch()
         with self.assertRaisesRegex(ValueError,'oracle bound'):seq.products()
         self.assertEqual(outside.read_text(),'must not be read as product')
+
+    def test_named_goal_context_requires_correlated_creation_and_actual_database_identity(self):
+        import sqlite3
+        path=self.database();thread='00000000-0000-0000-0000-000000000003'
+        planned=[a for a in t.inventory_actions() if a['id'] in ('goal-create','goal-duplicate')]
+        seq=t.Sequence(planned,self.root,time.monotonic()+5)
+        seq.observe_cli(t.canonical({'type':'thread.started','thread_id':thread}));seq.metadata_products=seq.products()
+        context={'type':'function_call_output','namespace':'agent','name':'goal_objective','output':t.GOAL_OBJECTIVE}
+        with self.assertRaisesRegex(ValueError,'established create'):seq.observe_goal_context(context)
+        seq.request(self.body())
+        with sqlite3.connect(path) as db:db.execute('INSERT INTO thread_goals VALUES (?,?,?,?,?,?,?,?,?)',(thread,'owned',t.GOAL_OBJECTIVE,'active',None,0,0,2,2))
+        payload={'goal':{'threadId':thread,'objective':t.GOAL_OBJECTIVE,'status':'active','tokensUsed':0,'timeUsedSeconds':0}}
+        result=self.result('goal-create',json.dumps(payload))
+        seq.request(self.body([context,result]))
+        self.assertEqual(seq.goal_context['caused_by_call_id'],'goal-create');self.assertEqual(seq.goal_context['goal_id'],'owned')
+        seq.observe_goal_context(context)
+        for bad in (dict(context,output='changed'),dict(context,name='other'),dict(context,namespace='functions'),dict(context,call_id=None)):
+            with self.assertRaisesRegex(ValueError,'unknown uncorrelated'):seq.observe_goal_context(bad)
+        with sqlite3.connect(path) as db:db.execute('UPDATE thread_goals SET goal_id=? WHERE thread_id=?',('foreign replacement',thread))
+        with self.assertRaisesRegex(ValueError,'database identity'):seq.observe_goal_context(context)
+
+    def test_goal_context_exception_never_admits_generic_orphan_null_or_duplicate_outputs(self):
+        context={'type':'function_call_output','namespace':'agent','name':'goal_objective','output':t.GOAL_OBJECTIVE}
+        for items in ([context],[context,context],[dict(context,call_id=None)],[dict(context,call_id='unissued')]):
+            seq=t.Sequence([a for a in t.actions(123) if a['id']=='patch-deny'],self.root,time.monotonic()+5)
+            seq.request(self.body());last=self.result('patch-deny','Permission denied (os error 13)','custom_tool_call_output')
+            with self.assertRaises(ValueError):seq.request(self.body(items+[last]))
+            self.assertIsNone(seq.goal_context);self.assertFalse(seq.finished)
+            self.assertEqual(seq.last_outputs,items+[last])
+            self.assertIsNotNone(seq.last_request_identity)

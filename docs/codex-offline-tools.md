@@ -32,7 +32,7 @@ before creating the listener or supervisor. It mounts no ambient HOME/auth/proxy
 or credentials. This is a fixture identity delta, not distinct root/job ownership
 acceptance. The supervisor alone gets a synthetic key; child environment is cleared.
 
-Fourteen finite actions independently inspect product effects and unchanged
+The original fourteen actions independently inspect product effects and unchanged
 protected objects: shell positive/negative, allowed and forbidden cwd requests,
 escalation/login rejection, denied connection to the live fixture, direct patch,
 forbidden/partial patch, intercepted shell patch and identical valid PNG
@@ -40,6 +40,35 @@ allow/denial through direct and symlink paths. Wrong-path, unsupported-tool and
 invalid-image errors cannot count as denial. Failed actions and actual partial
 product effects are retained. The denied cwd request may execute confined at the
 HOME fallback; its actual cwd and absolute-target denial remain visible.
+
+The fixed expansion has32 mandatory actions and at most one explicit completion
+poll (33 maximum). It adds five owned-PTY actions: start with a bound header ID,
+empty poll, exact-once input consumption, retired-ID rejection and invalid-ID
+rejection. The continued child independently writes the product marker, reports
+UID/capabilities/NNP and attempts the known denied read and protected-code write.
+Its18-second alarm and the existing action/experiment deadlines bound input wait.
+The optional completion poll is inserted once only if the input result is still
+running; remaining running state blocks instead of polling indefinitely.
+
+Nine goal actions exercise initial absence, missing-goal update, empty objective,
+nonpositive budget, create, duplicate create, forbidden active update, complete
+and final get. The controller binds the actual CLI `thread.started` UUID to
+read-only SQLite row snapshots, parameterized lookup, stable goal identity,
+unchanged unrelated rows and final database integrity after supervisor stop.
+Usage may advance legitimately; token entitlement/spending and recovery are
+unverified. The objective contains a literal protected path as data, and product
+file snapshots must remain unchanged during these supervisor operations.
+
+One valid input request observes rejection under the unchanged current exec/
+Default configuration, followed by subsequent tool work. It does not establish
+interactive answer/client correlation. Three special client `tool_search_call`
+items use object arguments and require correlated `tool_search_output` kinds.
+Positive search requires the actual advertised Multi-agent source and its exact
+cached-source namespace/function schema; the fixture never invokes the discovered
+`spawn_agent`. Complete definitions and every request inventory are retained and
+hashed. Empty invalid-input results establish bounded no-definition behavior
+only: the same completed/client/empty shape can encode errors or cancellation,
+so it cannot prove a particular handler validator without a separate witness.
 
 Each action record retains its emitted call kind and the actual returned output
 kind. The pinned stock source maps `function_call` to `function_call_output` and
@@ -50,13 +79,26 @@ replayed history, must match its issued ID and kind. Unknown, orphan, duplicate
 or cross-kind outputs cannot advance the sequence or pass an action. Older
 reports without these fields do not establish observed wire kinds.
 
+Stock successful goal creation can also inject a source-defined named untrusted
+context item (`context-fragments/src/additional_context.rs` and
+`ext/goal/src/tool.rs` at the same pinned source). The fixture recognizes only
+`function_call_output` with omitted call ID, namespace `agent`, name
+`goal_objective` and the exact planned objective, first alongside a correlated
+successful create result and its actual thread/database identity. It records
+this supervisor context separately and permits only unchanged replay. Other
+uncorrelated items block. A protocol rejection retains bounded complete output
+items, request hash/size and issued IDs for diagnosis under the existing caps.
+
 Actual request tool inventories are hashed and classified from completed checks.
 Unknown/unexercised surfaces block inventory closure and overall status, even when
-all fourteen actions pass. In the observed direct-tool fixture, goals,
-write_stdin, tool_search, request_user_input and provider-hosted web_search remain
-unclosed. This is deliberately partial representative coverage; PTY/session
-continuation, helper-in-script patch routes, additional permission modes, complete
-loader discovery and auth/backend-dependent tools remain later gates.
+all planned actions pass. Provider-hosted web_search, discovered untested
+collaboration tools, interactive input/client behavior, cross-job ownership and
+renewal remain gates. Same-session PTY continuation, one thread's supervisor goal
+state, local registry metadata and current-mode input rejection are separate
+coverage classes. Search definitions in history need not be copied into the
+request's top-level tools array; the report inventories their union. Helper-in-
+script patch routes, additional permission modes, complete loader discovery and
+auth/backend-dependent paths remain later acceptance work.
 
 The total envelope is180s with20s per action clipped to remaining time,64 private
 connections/requests,256KiB bodies/lines,2MiB combined capture (64KiB reserved for
@@ -76,6 +118,10 @@ ownership remain separate runtime gates.
 Local tests cover matching IDs, orphan/duplicate output rejection, protected
 mutation, invalid denial oracles, exact image bytes, real capture time/output
 limits, detached-child cleanup, FIFO/oversize snapshots and cleanup failure.
+Expansion checks cover dynamic header-only PTY binding, one conditional poll,
+real pending-PTY termination, exact input effects, read-only goal identity/foreign
+row preservation, special search wire/kind/byte accounting, ambiguous empty search
+results, named context causal binding and bounded product metadata snapshots.
 They open no host listener and make no model request. Fedora/Podman/SELinux,
 production endpoint/catalog integrity, credential lifecycle, complete tools and
 loaders, identity ownership and hard storage enforcement remain unverified.

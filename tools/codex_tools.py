@@ -347,6 +347,7 @@ class Sequence:
         self.planned=planned;self.root=Path(root);self.end=end;self.meter=meter or Meter();self.action_end=min(end,time.monotonic()+ACTION_SECONDS)
         self.index=0;self.requests=0;self.records=[];self.inventories=[];self.error=None;self.finished=False
         self.emitted={};self.returned={};self.definitions={};self.discovered=set()
+        self.goal_context=None;self.last_outputs=[];self.last_request_identity=None
         self.thread_id=None;self.pty_id=None;self.pty_retired=False;self.pty_completion_added=False
         self.goal_initial=goal_rows(self.path('/state/sqlite/goals_1.sqlite'));self.goal_identity=None;self.metadata_products=None
         self.protected={p:sha(self.path(p).read_bytes()) for p in ('/credentials/marker','/credentials/valid.png','/state/codex/marker','/state/sqlite/marker','/etc/codex/requirements.toml','/state/codex/config.toml')}
@@ -385,6 +386,25 @@ class Sequence:
         own=goal_rows(self.path('/state/sqlite/goals_1.sqlite'),thread_id=self.thread_id)
         require(len(own)<=1,'multiple thread goals')
         return own[0] if own else None
+
+    def observe_goal_context(self,item):
+        # Stock goal creation injects named untrusted supervisor context, not an
+        # output of a model-issued tool call. Accept only that exact source form
+        # after the actual create result and read-only database oracle agree.
+        require(set(item)=={'type','name','namespace','output'} and item['type']=='function_call_output'
+                and item['name']=='goal_objective' and item['namespace']=='agent'
+                and item['output']==GOAL_OBJECTIVE,'unknown uncorrelated supervisor context')
+        require(self.goal_identity is not None,'goal context has no established create result')
+        own=self.goal_state()
+        require(own is not None and {k:own[k] for k in self.goal_identity}==self.goal_identity,'goal context database identity mismatch')
+        digest=sha(canonical(item))
+        if self.goal_context is None:
+            require(self.index and self.planned[self.index-1]['id']=='goal-create' and own['status']=='active',
+                    'goal context was not caused by correlated creation')
+            self.meter.add(len(canonical(item['output'])))
+            self.goal_context={'item':item,'sha256':digest,'thread_id':self.thread_id,'goal_id':own['goal_id'],
+                               'caused_by_call_id':'goal-create','kind':'source-bound-untrusted-supervisor-context'}
+        else:require(self.goal_context['sha256']==digest,'supervisor goal context replay changed')
 
     def inventory_oracle(self,action,item,text,rows):
         ident=action['id'];result={}
@@ -494,12 +514,18 @@ class Sequence:
         require(not self.finished,'request after finite sequence finished')
         require(time.monotonic()<self.action_end,'tool action deadline exceeded')
         require(type(body)is dict and body.get('model')==MODEL and isinstance(body.get('input'),list),'unexpected model/request input')
+        serialized=canonical(body);require(len(serialized)<=BODY_BYTES,'request body byte limit exceeded')
+        self.last_request_identity={'sha256':sha(serialized),'bytes':len(serialized)}
         names=tool_inventory(body.get('tools'));definition_hash=sha(canonical(body['tools']))
         self.inventories.append({'sha256':definition_hash,'names':names});self.definitions[definition_hash]=body['tools']
         # Search definitions travel in tool_search_output history. The provider
         # need not copy them into the request's top-level tools array. Retain
         # both inventories and their union instead of inventing that invariant.
-        outputs=[v for v in body['input'] if isinstance(v,dict) and v.get('type') in OUTPUT_KINDS.values()]
+        all_outputs=[v for v in body['input'] if isinstance(v,dict) and v.get('type') in OUTPUT_KINDS.values()]
+        self.last_outputs=all_outputs
+        context=[v for v in all_outputs if v['type']=='function_call_output' and 'call_id' not in v]
+        require(len(context)<=1,'duplicate uncorrelated supervisor context')
+        outputs=[v for v in all_outputs if v not in context]
         issued={v['id']:v for v in self.planned[:self.index]}
         for item in body['input']:
             if isinstance(item,dict) and 'call_id' in item:
@@ -522,6 +548,7 @@ class Sequence:
                 self.records.append({'id':action['id'],'pass':False,'tool':action['name'],'emitted_call_kind':action['kind'],'returned_output_kind':matches[0]['type'],'emitted_item':self.emitted.get(action['id']),
                                      'returned_item':matches[0],'output':payload,'check_error':str(error),'partial_product_exists':self.path('/job/src/partial-patch').exists()})
                 raise
+        for item in context:self.observe_goal_context(item)
         rid='offline-response-'+str(self.index)
         events=[{'type':'response.created','response':{'id':rid}}]
         if self.index<len(self.planned):
@@ -663,6 +690,10 @@ def worker(args):
                           http_requests=sequence.requests,http_connections=server.connections,planned_actions=len(sequence.planned),transport_error=sequence.error,
                           actual_thread_id=sequence.thread_id,pty_session_id=sequence.pty_id,pty_retired=sequence.pty_retired,
                           conditional_completion_poll_used=sequence.pty_completion_added)
+            report['supervisor_goal_context']=sequence.goal_context
+            if sequence.error is not None:
+                report['protocol_rejection_witness']={'request_identity':sequence.last_request_identity,'outputs':sequence.last_outputs,
+                    'outputs_sha256':sha(canonical(sequence.last_outputs)),'issued_call_ids':sorted(sequence.emitted)}
             names=sorted({v for row in sequence.inventories for v in row['names']}|sequence.discovered)
             required={'exec_command':{'shell-allow','shell-deny','cwd-allow','cwd-deny','escalation-deny','network-deny','login-deny'},
                       'apply_patch':{'patch-allow','patch-deny','patch-partial','patch-intercept'},'view_image':{'image-allow','image-deny','image-alias-deny'},
