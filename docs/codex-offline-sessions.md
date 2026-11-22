@@ -436,3 +436,33 @@ cannot clear it or pass the final negative guard. This does not classify ordinar
 stderr diagnostics as structured errors. The 42 reviewed mixed-stream cases and
 existing exact valid/partial/failure streams are local regressions only; the
 560-test full pass belongs to base `86fdc82`, not this narrow changed candidate.
+
+
+The startup-delivery component now overlays only this session fixture's immutable
+requirements with a short `additional_developer_instructions` directive. The
+stock base instructions remain intact. The separate developer message uses the
+pinned managed markers; its cap check reserves the source-defined replacement
+notice and framing within 10,000 estimated tokens (40,000 bytes). All seven real
+documents exceed that inline budget, so their contents are never truncated or
+summarized into the directive.
+
+Seven source-fixed complete synthetic documents are staged read-only for the
+finite experiment. One exact existing exec_command reads all seven through the
+fixed helper, within the original 1,500-token output allowance. Before issuing
+progress work, the server requires the exact managed directive, complete document
+bodies and one canonical causal helper call/result pair in the next actual model
+request. A digest or marker alone is insufficient. The same full evidence must
+remain unchanged on resumed wire history and in the durable rollout; no repeated
+read or policy migration is silently substituted. Existing user/context, helper
+Popen/PPID, registry, effect and unknown-UUID checks still apply.
+
+`startup_delivery.load_private` separately verifies complete actual document
+bytes against the pinned cache and project Git revision, exposing fixed document
+IDs only to its private caller. Its Git identity lookup uses bounded capture,
+deadline and owned cleanup. Private corpus objects refuse fixture output/staging;
+only synthetic content may enter the offline model loop. Receipts expose hashes,
+lengths and IDs, not private bodies. Real managed delivery after production
+placement/authentication, model understanding and compliance remain unverified.
+The original state policy/tool-inventory fixture stays unchanged; this session
+policy/layout/helper identity has its own explicit digests. Fresh source review
+and a separately authorized changed stock run remain necessary.

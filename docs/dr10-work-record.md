@@ -3,6 +3,43 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 04:08 HKT — immutable startup directive and full document delivery
+
+- Reviewed de99a97 passed its frozen 630-test suite and independent review. Native34
+  then completed enforcing Fedora host setup in 541.513 seconds under 600, but
+  signed load returned 125 after 54.124 seconds. Complete 2,143-byte stderr remained
+  hash-only and unknown; images were not completed. Exact owned and outer cleanup
+  passed. The source/runtime cause is not established; no native edits occur here.
+- Reviewed e6c4cc6 passed one corrected-wrapper finite stock validation in 3.417
+  seconds, 12 requests and 390,662 captured bytes, with cleanup complete. The earlier
+  validator's staging/file-limit failure remains historical wrapper evidence.
+  This result does not validate the newly changed startup-delivery fixture.
+- A session-only immutable requirements overlay now supplies a short managed
+  additional_developer_instructions message with the exact pinned developer-role
+  markers. Original stock base instructions and default state/tool-inventory policy
+  remain. The source-defined replacement/framing reserve is included in the 10,000
+  estimated-token cap. All seven real documents are not inlined, shortened or
+  replaced by hashes; a separate full-byte private loader verifies project revision
+  and exact shared-cache hashes, with bounded Git lookup and fixed-ID byte access.
+- The offline path uses only seven small complete synthetic documents and one fixed
+  existing exec helper. Full body/call/result and managed-message equality/ordering
+  must appear in the next model request before any progress action. The original
+  startup evidence is retained on resume and audited in durable history. The helper
+  preserves actual owned CLI/helper authority, original limits and all existing
+  UUID/marker/user-history/negative/final audits. Policy/layout/helper digests change
+  explicitly; registry-v2/ledger/native/bootstrap/image/workflow bytes do not.
+- Private corpora cannot be emitted or staged by the fixture interface. Public
+  receipts contain only fixed IDs, counts, lengths and hashes; model understanding,
+  compliance, real authentication and production startup delivery are unverified.
+  Source tests are under `/workspace/artifacts/managed-startup-delivery-20261122/`.
+  One failed wording-edit regression is preserved, followed by corrected passes.
+  Fresh exact review and separately authorized changed stock evidence are required.
+- This unit is bounded by 19:49:11–20:14:11 UTC without extension. Builder API
+  selection remains GPT-6.1 Sol/high, backend unattested. No stock/native/CI/SSH,
+  external auth/model or deployment action occurred. All production runtime/job,
+  nested/storage/renewal/tailnet/release/Hostinger gates remain open.
+
+
 ### November 23, 2026, 03:33 HKT — protected XDG config and signed-load payload evidence
 
 - Native33 on 505f591 passed 589 hosted tests and completed host prerequisites in

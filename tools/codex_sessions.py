@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import codex_tools as t
 import session_helper as helper
 import session_controller as controller
+import startup_delivery as startup
 
 CATALOG_SHA = '1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10'
 LABELS = ('alpha', 'beta')
@@ -555,9 +556,11 @@ def compact_helper_witness(witness):
 
 class Journey:
     """Evidence is retained from first turns, never supplied by a resume caller."""
-    def __init__(self, root, end, meter, nonce, helper_binary=None):
+    def __init__(self, root, end, meter, nonce, helper_binary=None, startup_corpus=None):
         require(type(nonce) is str and re.fullmatch('[0-9a-f]{32}',nonce), 'invalid synthetic nonce')
         self.root = Path(root); self.end = end; self.meter = meter; self.nonce = nonce
+        require(startup_corpus is None or startup_corpus.manifest['mode']=='synthetic-fixture','private corpus forbidden in offline fixture')
+        self.startup_corpus=startup_corpus;self.startup_records={}
         self.requests = 0; self.error = None; self.action_end = end
         self.helper_binary=helper_binary;self.owned_child=None;self.child_turn=None;self.child_ready=threading.Event();self.child_lock=threading.Lock()
         self.turn_helper=None;self.helper_origins={};self.helper_rejection=None
@@ -577,6 +580,7 @@ class Journey:
         self.turn = {'label': label, 'phase': phase, 'expected_uuid': expected_uuid, 'uuid': None,
                      'issued': None, 'returned': None, 'finished': False, 'started': 0, 'completed': 0,
                      'user_context':None,'resume_mode':None,'resume_environment':None}
+        if self.startup_corpus is not None:self.turn.update(startup_issued=None,startup_managed=None,startup_managed_position=None)
         self.turn_helper=None;self.child_ready.clear()
         self.cli_ready.clear(); self.action_end = min(self.end, time.monotonic() + t.ACTION_SECONDS)
 
@@ -732,6 +736,32 @@ class Journey:
         compact_helper_witness(witness)
         self.resume_context_rejection=witness
 
+    def startup_action(self,label):
+        return {'type':'function_call','call_id':'startup-'+label,'name':'exec_command',
+            'arguments':json.dumps({'cmd':t.command("import sys;sys.path.insert(0,'/opt');import startup_delivery as d;raise SystemExit(d.emit_fixed())"),
+                                   'login':False,'yield_time_ms':10000,'max_output_tokens':1500})}
+
+    def startup_check(self,inputs,observed):
+        if self.startup_corpus is None:return None,None,None
+        turn=self.turn;label=turn['label'];position,message=startup.managed(inputs,self.startup_corpus)
+        retained=self.startup_records.get(label)
+        if retained is None and turn.get('startup_issued') is None:
+            require(turn['phase']=='first','resume lacks original startup delivery')
+            return 'issue',message,None
+        issued=retained['issued'] if retained else turn['startup_issued']
+        expected_managed=retained['managed'] if retained else turn['startup_managed']
+        expected_position=retained['position'] if retained else turn['startup_managed_position']
+        require(position==expected_position and canonical(message)==canonical(expected_managed),'managed startup wire changed or moved')
+        call,output=self.pair(inputs,issued)
+        original_context=observed[:len(self.entries[label]['user_context'])] if turn['phase']=='resume' else observed
+        require(position<call[0]<output[0] and all(i<call[0] for i,_ in original_context),'startup delivery causal order')
+        _,status,payload=t.terminal_header(output[1]['output'])
+        require(status==0 and payload=='\n'+self.startup_corpus.output().decode()+'\n','complete startup document bodies not delivered')
+        if retained:
+            require(canonical(call[1])==canonical(retained['call']) and canonical(output[1])==canonical(retained['output']),'startup call/result replay changed')
+            return 'retained',message,None
+        return 'verified',message,{'issued':copy.deepcopy(issued),'call':copy.deepcopy(call[1]),'output':copy.deepcopy(output[1]),'managed':copy.deepcopy(message),'position':position}
+
     def request(self, body):
         turn = self.turn
         require(turn is not None and not turn['finished'] and time.monotonic() < self.action_end, 'request outside fixed turn')
@@ -807,7 +837,11 @@ class Journey:
                 require(canonical(contexts) == canonical(turn['user_context']), 'continuation user context changed')
         other = next(value for value in LABELS if value != label)
         require(('OFFLINE_SESSION_' + other.upper() + '_') not in encoded.decode(), 'cross-session context present')
+        startup_state,startup_message,startup_pending=self.startup_check(inputs,observed)
         allowed = {}
+        startup_bound=self.startup_records.get(label)
+        if startup_bound is not None:allowed[startup_bound['issued']['call_id']]=startup_bound['issued']
+        elif turn.get('startup_issued') is not None:allowed[turn['startup_issued']['call_id']]=turn['startup_issued']
         if phase == 'resume':
             entry = self.entries[label]
             current_positions = [observed[-1][0]]
@@ -828,6 +862,8 @@ class Journey:
         pending = None
         if turn['issued'] is not None:
             call, output = self.pair(inputs, turn['issued'])
+            if startup_bound is not None:
+                _,startup_output=self.pair(inputs,startup_bound['issued']);require(startup_output[0]<call[0],'work precedes startup documents')
             require(all(i < call[0] for i,_ in observed), 'user context moved across current action')
             require(call[0] > (current_positions[0] if phase == 'resume' else own_positions[0]), 'new action precedes current context')
             _, status, payload = t.terminal_header(output[1]['output'])
@@ -847,14 +883,19 @@ class Journey:
                     sum(v[3]==observed_helper['path'] for v in model['entries'])==1,
                     'original environment does not bind owned helper')
         # All incoming evidence is checked before acceptance bookkeeping changes.
-        rid = 'session-fixture-' + label + '-' + phase + ('-final' if pending else '-action')
+        rid = 'session-fixture-' + label + '-' + phase + ('-startup' if startup_state=='issue' else '-final' if pending else '-action')
         events = [{'type':'response.created','response':{'id':rid}}]
         if turn['user_context'] is None:
             if phase=='first' and observed_helper is not None:self.helper_origins[label]=observed_helper
             turn['user_context'] = copy.deepcopy(contexts)
             if phase=='resume':
                 turn['resume_mode']=resume_mode;turn['resume_environment']=copy.deepcopy(resume_environment)
-        if pending is None:
+        if startup_state=='issue':
+            issued=self.startup_action(label);turn['startup_issued']=issued;turn['startup_managed']=copy.deepcopy(startup_message);turn['startup_managed_position']=startup.managed(inputs,self.startup_corpus)[0]
+            events.append({'type':'response.output_item.done','item':issued})
+        elif pending is None:
+            if startup_pending is not None:self.startup_records[label]=startup_pending
+            require(self.startup_corpus is None or label in self.startup_records,'work before complete startup delivery')
             issued = action(label,phase,self.nonce); turn['issued'] = issued
             events.append({'type':'response.output_item.done','item':issued})
         else:
@@ -878,6 +919,9 @@ class Journey:
             self.continuations[label]={'user_context':copy.deepcopy(turn['user_context']),
                 'resume_mode':turn['resume_mode'],'resume_environment':copy.deepcopy(turn['resume_environment']),
                 'issued':copy.deepcopy(turn['issued']),**copy.deepcopy(turn['returned'])}
+        if self.startup_corpus is not None:
+            require(label in self.startup_records,'startup delivery not retained')
+            if phase=='first':self.entries[label]['startup']=copy.deepcopy(self.startup_records[label])
         self.records.append({'label':label,'phase':phase,'uuid':turn['uuid'], 'context_sha256':sha(canonical(turn['user_context'])),
                              'user_context_count':len(turn['user_context']),
                              'resume_mode':turn['resume_mode'] if phase=='resume' else 'first-turn',
@@ -981,6 +1025,8 @@ def rollout_proof(root, row, entry, continuation=None, journey=None, checkpoint_
         require(canonical(expected[:original_count])==canonical(entry['user_context']) and
                 len(expected)==original_count+(2 if continuation is not None and continuation.get('resume_mode')=='one-environment' else 1 if continuation is not None else 0), 'unbound continuation context')
         allowed={entry['issued']['call_id']:entry}
+        startup_bound=entry.get('startup')
+        if startup_bound is not None:allowed[startup_bound['issued']['call_id']]=startup_bound
         if continuation is not None:allowed[continuation['issued']['call_id']]=continuation
         stage='orphan-history'
         for item in items:
@@ -1000,6 +1046,12 @@ def rollout_proof(root, row, entry, continuation=None, journey=None, checkpoint_
             require(positions[0]<positions[1], 'reordered durable call/result');pairs[call_id]=positions
         stage='causal-order'
         original_call,original_output=pairs[entry['issued']['call_id']]
+        if startup_bound is not None:
+            require(journey is not None and journey.startup_corpus is not None,'startup audit corpus unavailable')
+            managed_index,managed=startup.managed(items,journey.startup_corpus,durable=True)
+            require(canonical(managed)==canonical(startup_bound['managed']),'durable managed startup changed')
+            start_call,start_output=pairs[startup_bound['issued']['call_id']]
+            require(managed_index<start_call<start_output<original_call,'durable startup delivery moved')
         user_positions=[i for i,item in enumerate(items) if item.get('role')=='user']
         require(all(i<original_call for i in user_positions[:original_count]), 'prior context follows original call')
         if continuation is not None:
@@ -1199,13 +1251,22 @@ def worker(args):
         require(identity['uid']==identity['gid']==1000 and identity['uid_map'].split()==['1000','0','1'] and
                 identity['gid_map'].split()==['1000','0','1'],'fixed single-identity namespace mismatch')
         meter=t.Meter(args.captured_seed,args.captured_seed+args.output_limit)
-        journey=Journey('/',args.end,meter,uuid.uuid4().hex,helper_binary='/opt/codex')
+        corpus=startup.read_bundle(startup.ROOT)
+        import codex_state as startup_state
+        import tomllib
+        actual_requirements=tomllib.loads(Path('/etc/codex/requirements.toml').read_text())
+        expected_requirements=startup_state.generated_policy()['requirements'];expected_requirements['additional_developer_instructions']=corpus.directive()
+        require(canonical(actual_requirements)==canonical(expected_requirements),'immutable startup requirements changed')
+        journey=Journey('/',args.end,meter,uuid.uuid4().hex,helper_binary='/opt/codex',startup_corpus=corpus)
         source=Path('/job/src/uncommitted-session-source');source.write_bytes(UNCOMMITTED)
         initial=database('/',integrity=True)
         server=t.FixtureServer(('127.0.0.1',0),t.Handler);server.connections=0;server.sequence=journey
         thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.05},daemon=True);thread.start()
         port=server.server_address[1]
         receipt=json.loads(Path('/opt/session-startup.json').read_bytes(),object_pairs_hook=t.unique)
+        session_policy=startup_state.generated_policy();session_policy['requirements']=expected_requirements
+        session_layout={**startup_state.layout(),'immutable':[*startup_state.layout()['immutable'],startup.ROOT,'/opt/startup_delivery.py']}
+        require(receipt['identity']['policy_sha256']==sha(canonical(session_policy)) and receipt['identity']['layout_sha256']==sha(canonical(session_layout)) and corpus.manifest['project_revision']==receipt['identity']['source_revision'],'startup policy/layout/source receipt mismatch')
         registry=fixture_registry('/result',receipt);journey.controller_registry=registry;journey.controller_port=port
         report['controller_startup']=receipt['startup']
         for label in LABELS:
@@ -1252,6 +1313,8 @@ def worker(args):
                 report.update(status='blocked',managed_inventory={'availability':'unavailable','reason':'registry-rejected'})
             finally:registry.close()
             report['managed_inventory_boundary']='positive fixed turns only; actual unknown-UUID diagnostic remains separately audited'
+        if journey is not None and journey.startup_corpus is not None:
+            report['startup_delivery']={**journey.startup_corpus.receipt(),'wire_delivery_sessions':sorted(journey.startup_records),'model_understanding_verified':False}
         data=canonical(report)+b'\n';require(len(data)<=t.REPORT_BYTES,'session report exceeded')
         fd=os.open('/result/report.json',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(data)
@@ -1275,17 +1338,22 @@ def main():
     require(ctypes.CDLL(None).prctl(36,1,0,0,0)==0,'owned subreaper unavailable')
     root=tempfile.mkdtemp(prefix='dev-pair-sessions-');runner=None;safe=False
     try:
-        startup=controller.startup_receipt(Path(__file__).resolve().parent.parent,args.standards_cache,started+t.SECONDS)
+        startup_receipt=controller.startup_receipt(Path(__file__).resolve().parent.parent,args.standards_cache,started+t.SECONDS)
         runner=state.Harness(root,args.binary);runner.end=min(runner.end,started+t.SECONDS)
         report['state_component']=runner.exercise()
+        revision=subprocess.check_output(['/usr/bin/git','-C',str(Path(__file__).resolve().parent.parent),'rev-parse','HEAD'],text=True).strip()
+        corpus=startup.synthetic(revision);startup_documents=corpus.stage(Path(root)/'startup-documents')
+        policy=state.generated_policy();policy['requirements']['additional_developer_instructions']=corpus.directive()
+        requirements_path=runner.fixture/'etc/codex/requirements.toml';requirements_path.write_text(state.toml(policy['requirements']));requirements_path.chmod(0o444)
+        report['managed_startup_inputs']=corpus.receipt()
         catalog=t.snapshot(args.catalog,1048576,runner.end);require(sha(catalog)==CATALOG_SHA,'unreviewed fixture catalog')
         selected=[m for m in json.loads(catalog,object_pairs_hook=t.unique)['models'] if m.get('slug')==t.MODEL]
         require(len(selected)==1,'fixture catalog model absent/ambiguous')
         files={}
-        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__)),('session_helper.py',Path(helper.__file__)),('session_controller.py',Path(controller.__file__)),('job_protocol.py',Path(__file__).with_name('job_protocol.py')),('ledger_recovery.py',Path(__file__).with_name('ledger_recovery.py'))):
+        for name,source in (('worker.py',Path(__file__)),('codex_tools.py',Path(t.__file__)),('session_helper.py',Path(helper.__file__)),('session_controller.py',Path(controller.__file__)),('job_protocol.py',Path(__file__).with_name('job_protocol.py')),('ledger_recovery.py',Path(__file__).with_name('ledger_recovery.py')),('startup_delivery.py',Path(startup.__file__)),('codex_state.py',Path(state.__file__)),('public_inputs.py',Path(state.__file__).with_name('public_inputs.py'))):
             path=Path(root)/name;path.write_bytes(t.snapshot(source,131072,runner.end));path.chmod(0o444);files[name]=path
         models=Path(root)/'models.json';models.write_bytes(catalog);models.chmod(0o444)
-        receipt={'startup':startup,'identity':{'source_revision':subprocess.check_output(['/usr/bin/git','-C',str(Path(__file__).resolve().parent.parent),'rev-parse','HEAD'],text=True).strip(),'source_sha256':sha(canonical({name:sha(path.read_bytes()) for name,path in files.items()})),'runtime_sha256':sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes()),'binary_sha256':state.CODEX_SHA,'policy_sha256':sha(canonical(state.generated_policy())),'layout_sha256':sha(canonical(state.layout()))}}
+        receipt={'startup':startup_receipt,'identity':{'source_revision':subprocess.check_output(['/usr/bin/git','-C',str(Path(__file__).resolve().parent.parent),'rev-parse','HEAD'],text=True).strip(),'source_sha256':sha(canonical({name:sha(path.read_bytes()) for name,path in files.items()})),'runtime_sha256':sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes()),'binary_sha256':state.CODEX_SHA,'policy_sha256':sha(canonical(policy)),'layout_sha256':sha(canonical({**state.layout(),'immutable':[*state.layout()['immutable'],startup.ROOT,'/opt/startup_delivery.py']}))}}
         startup_path=Path(root)/'session-startup.json';startup_path.write_bytes(canonical(receipt));startup_path.chmod(0o444)
         result=Path(root)/'result';result.mkdir(mode=0o700)
         argv=runner.argv(['/usr/bin/python3','-I','/opt/tool_boundary.py','--setup','--host-netns',str(os.stat('/proc/self/ns/net').st_ino),
@@ -1294,7 +1362,7 @@ def main():
         index=argv.index('--unshare-all')+1
         argv[index:index]=['--uid','0','--gid','0','--cap-drop','ALL','--cap-add','CAP_NET_ADMIN','--cap-add','CAP_SETPCAP','--cap-add','CAP_SETFCAP']
         index=argv.index('--remount-ro');argv[index:index]=['--ro-bind',str(files['worker.py']),'/opt/tool_boundary.py',
-            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(files['session_helper.py']),'/opt/session_helper.py',*sum((['--ro-bind',str(files[name]),'/opt/'+name] for name in ('session_controller.py','job_protocol.py','ledger_recovery.py')),[]),'--ro-bind',str(startup_path),'/opt/session-startup.json','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
+            '--ro-bind',str(files['codex_tools.py']),'/opt/codex_tools.py','--ro-bind',str(files['session_helper.py']),'/opt/session_helper.py',*sum((['--ro-bind',str(files[name]),'/opt/'+name] for name in ('session_controller.py','job_protocol.py','ledger_recovery.py','startup_delivery.py','codex_state.py','public_inputs.py')),[]),'--ro-bind',str(startup_documents),startup.ROOT,'--ro-bind',str(startup_path),'/opt/session-startup.json','--ro-bind',str(models),'/opt/models.json','--bind',str(result),'/result']
         process=subprocess.Popen(argv,env=state.ENV,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                  start_new_session=True,preexec_fn=state.child_limits)
         try:
