@@ -3,6 +3,46 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 01:44 HKT — exact maintenance launcher diagnostic
+
+- Native31 on `2ed389f` passed 553 hosted tests, enforcing boot/preparation,
+  Tailscale and package-inventory commands, then the context-owned maintenance
+  candidate launcher exited 1 before interruption with zero relay bytes. Its
+  600-second prepare timer did not fire at 598.599 seconds; service result,
+  payload execution and cause remain unknown. Outer cleanup passed; guest
+  cleanup, prepared/assembled images and image storage samples are unverified.
+- After existing source/context verification and checked UID lookup, an ephemeral
+  diagnostic scope selects only the fixed maintenance unit/description/owner,
+  protected storage/runroot/TMPDIR/profile and reviewed load/save/build/inspect
+  argv. The summary's optional unit announcement must match that exact context
+  unit. Current non-quiet flags, payloads, constructed timers, resources, source
+  admission, relay/status predicates and exact-owned cleanup are unchanged.
+  No new query, executor, source shortcut or broader systemd selection exists.
+- The existing 8KiB launcher accumulator and 1,536-byte source/context/phase-bound
+  projection retain typed service/timing facts and a closed suboperation enum.
+  Invalid/oversized secondary diagnostics remain unavailable without erasing the
+  primary failure. Tests exercise the maximum closed-schema cache/decoder plus
+  summary/timing/executor combination and preserve useful fields under the bound.
+- Real builder/import source and tempfile path construction feed the selector in
+  a private filesystem fixture, with only that fixture root mapped to production
+  `/`. Signed graph and distinct-UID boundaries are explicitly injected; this
+  is argument-shape evidence, not Fedora or signature acceptance. Prior inspect,
+  load, import inspect, save, build and final inspect all opt in. Existing builder
+  argv AST matches the base after removing only the diagnostic call scope.
+- Initial 100 affected tests passed. Two additional test setup errors are retained:
+  the valid combined witness fit the cap instead of overflowing, and the fake
+  engine initially left an empty save-back archive. Corrected fixtures/expectations
+  preserve product rules. Final affected validation passes 103 tests. Coordinator
+  deferred a new full suite to the later combined image-phase candidate; no full
+  run or external/native/stock/CI/push/deployment occurred in this unit.
+- Actual finite session `f54afb5` PASS remains separate and immutable: four effects,
+  both original UUID continuations, unknown-UUID negative, final database/rollout
+  audits and cleanup passed. Receipt SHA256
+  `540cd375197172abe01308c042b236841cdb8e8f688f5302be10ab0feb00ab9e`.
+  Its session/helper/fixture source bytes are preserved. API-selected Sol/high
+  remains backend-unattested; broad runtime/auth/renewal/release gates stay open.
+
+
 ### November 23, 2026, 01:15 HKT — reject conflicting structured missing-UUID errors
 
 - Fresh review of `86fdc82` found one P2: an unrecognized structured fatal error

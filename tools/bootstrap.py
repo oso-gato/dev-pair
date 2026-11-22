@@ -261,7 +261,7 @@ TAILSCALE_PACKAGE = ('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1', '--disablerepo
 LAUNCHER_RESULTS = frozenset(('success','resources','protocol','timeout','exit-code','signal','core-dump',
     'watchdog','start-limit-hit','oom-kill','exec-condition'))
 
-def launcher_summary(raw, complete):
+def launcher_summary(raw, complete, expected_unit=None):
     """Closed C-locale systemd-run summary; never returns captured text."""
     unavailable = {'availability':'unavailable'}
     if not complete or len(raw)>8192 or any(c<32 and c!=10 or c>126 for c in raw):return unavailable
@@ -291,7 +291,8 @@ def launcher_summary(raw, complete):
                 elif signals.get(label)!=number:return unavailable
                 fields.update(code=code,status=number)
             elif key=='Running as unit':
-                if not re.fullmatch(r'dev-pair-initialize-prepare-[0-9a-f]{8}-[0-9a-f]{8}\.service(?:; invocation ID: [0-9a-f]{32})?',value):return unavailable
+                pattern=(re.escape(expected_unit) if expected_unit is not None else r'dev-pair-initialize-prepare-[0-9a-f]{8}-[0-9a-f]{8}\.service')
+                if not re.fullmatch(pattern+r'(?:; invocation ID: [0-9a-f]{32})?',value):return unavailable
             elif key in ('Service runtime','CPU time consumed'):
                 if not re.fullmatch(r'(?:[0-9]+(?:\.[0-9]+)?(?:us|ms|s|min|h|d|w|month|y) ?)+',value):return unavailable
             elif key=='Memory peak':
@@ -312,6 +313,51 @@ class Commands:
     native_register = None
     _cleanup_deadline = None
     current_step = 'unscoped'
+    _maintenance_launcher_binding = None
+
+    @contextlib.contextmanager
+    def maintenance_launcher(self, context, uid):
+        # Diagnostic scope is entered only after build_gptbox source/context
+        # validation and checked UID lookup. It grants no launch authority.
+        previous=self._maintenance_launcher_binding
+        self._maintenance_launcher_binding=(context,uid)
+        try:yield
+        finally:self._maintenance_launcher_binding=previous
+
+    def maintenance_launcher_selection(self,args,input_text,probe):
+        binding=self._maintenance_launcher_binding
+        if not all(type(value) is str for value in args):return None
+        if self.current_step!='maintenance-gptbox-build' or input_text is not None or probe or binding is None:return None
+        context,uid=binding
+        if (type(context) is not str or not re.fullmatch('[0-9a-f]{64}',context) or type(uid) is not str or
+            not re.fullmatch('[1-9][0-9]{0,9}',uid) or not 1000<=int(uid)<=4294967294):return None
+        unit='dev-pair-gptbox-'+context+'.service'
+        base=('/usr/bin/systemd-run','--wait','--collect','--service-type=exec','--uid=dp-maint','--unit='+unit,
+            '--description=dev-pair-owned-'+unit,'--property=RuntimeMaxSec=600','--property=TimeoutStopSec=10',
+            '--property=KillMode=control-group','--property=MemoryMax=2G','--property=TasksMax=512','--property=CPUQuota=100%',
+            '/usr/bin/env','-i','HOME=/home/dp-maint','USER=dp-maint','LOGNAME=dp-maint','PATH=/usr/sbin:/usr/bin',
+            'XDG_RUNTIME_DIR=/run/user/'+uid)
+        if args[:len(base)]!=base:return None
+        rest=args[len(base):];work='/var/lib/dev-pair/artifacts/gptbox-image-work/'+context
+        temporary=('TMPDIR='+work+'/image-copy',)
+        limited=('/usr/bin/prlimit','--fsize=201326592:201326592')
+        is_copy=rest[:1]==temporary
+        if is_copy:rest=rest[1:]
+        is_save=rest[:2]==limited
+        if is_save:rest=rest[2:]
+        engine=('/usr/bin/podman','--root','/var/lib/dev-pair/maintenance/images','--runroot',
+            '/run/user/'+uid+'/dev-pair-gptbox-build','--storage-driver=vfs')
+        if rest[:len(engine)]!=engine:return None
+        operation=rest[len(engine):];stage='/var/lib/dev-pair/artifacts/gptbox/'+context
+        archive=re.escape(work+'/verification-work/')+r'dev-pair-fedora-[a-z0-9_]{8}/'
+        image='sha256:9eaa56a730854ae53f57e58c16179d09c2fa1f4157a5d69ccb39647e33c6464d'
+        selected=None
+        if is_copy and not is_save and len(operation)==3 and operation[:2]==('load','--input') and re.fullmatch(archive+r'base\.oci\.tar',operation[2]):selected='load'
+        elif is_copy and is_save and len(operation)==5 and operation[:3]==('save','--format=oci-archive','--output') and operation[4]==image and re.fullmatch(archive+r'imported\.oci\.tar',operation[3]):selected='save'
+        elif not is_save and len(operation)==3 and operation[:2]==('image','inspect') and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}',operation[2]):selected='inspect'
+        elif is_copy and not is_save and operation==('build','--quiet','--network=slirp4netns:allow_host_loopback=false','--pull=never','--format=oci',
+            '--label','dev-pair.context='+context,'--tag','localhost/dev-pair/maintenance-gptbox:'+context,'--file',stage+'/Containerfile',stage):selected='build'
+        return {'context_sha256':context,'unit':unit,'suboperation':selected} if selected is not None else None
 
     def execution_deadline(self):
         # Explicit cleanup controls are finite and may run after an execution
@@ -546,9 +592,11 @@ class Commands:
         unit = None
         description = None
         register_root_wrapper = False
-        launcher_selected = (self.current_step == 'tailscale-package' and original == TAILSCALE_PACKAGE and
+        tailscale_launcher = (self.current_step == 'tailscale-package' and original == TAILSCALE_PACKAGE and
             input_text is None and not probe and bool(self.native_prefix) and
             re.fullmatch(r'dev-pair-initialize-prepare-[0-9a-f]{8}', self.native_prefix) is not None)
+        maintenance_launcher=self.maintenance_launcher_selection(original,input_text,probe)
+        launcher_selected=tailscale_launcher or maintenance_launcher is not None
         # Existing user transient units are already native executors. Tighten
         # their ceilings rather than putting them outside the phase budget.
         if args and args[0] == '/usr/bin/systemd-run':
@@ -604,9 +652,11 @@ class Commands:
                 'decoder':decoder.witness() if decoder is not None else {'availability':'unavailable'}}
             if cache_comparison is not None:failure_witness['cache_comparison']=cache_comparison
             if launcher_selected:
-                failure_witness['launcher']={'summary':launcher_summary(bytes(launcher_capture),len(launcher_eof)==2 and launcher_bytes<=8192),
+                failure_witness['launcher']={'summary':launcher_summary(bytes(launcher_capture),len(launcher_eof)==2 and launcher_bytes<=8192,
+                        maintenance_launcher['unit'] if maintenance_launcher is not None else None),
                     'bytes':min(launcher_bytes,maximum+1),'complete':len(launcher_eof)==2 and launcher_bytes<=8192,
                     'timing':launch_timing or {'availability':'unavailable'}}
+                if maintenance_launcher is not None:failure_witness['launcher']['executor']=dict(maintenance_launcher)
         launcher_pairs = []
         selector = selectors.DefaultSelector()
         try:
@@ -631,6 +681,8 @@ class Commands:
                     raise Blocked('finite native lifetime is required')
                 command_end = min(command_end, started + min(native_limits))
                 transport = NativeTransport(unit, deadline=command_end)
+                if maintenance_launcher is not None and transport.canonical!=maintenance_launcher['unit']:
+                    maintenance_launcher=None;launcher_selected=tailscale_launcher
                 # Observe before allocation/registration: an existing busy/foreign
                 # unit is a collision, never this attempt's cleanup authority.
                 control = Commands()
@@ -727,7 +779,7 @@ class Commands:
                             continue
                         if key != 'RuntimeMaxSec':
                             raise Blocked('unknown native property rejected')
-                    if not (launcher_selected and value=='--quiet'):prefix.append(value)
+                    if not (tailscale_launcher and value=='--quiet'):prefix.append(value)
                 if not any(value == '--service-type=exec' for value in prefix):
                     if any(value.startswith('--service-type=') for value in prefix):
                         raise Blocked('native service type mismatch')
@@ -1935,6 +1987,9 @@ class Bootstrap:
                 'PATH=/usr/sbin:/usr/bin', f'XDG_RUNTIME_DIR=/run/user/{uid}',
                 '/usr/bin/podman', '--root', str(self.path(storage)),
                 '--runroot', f'/run/user/{uid}/dev-pair-gptbox-build', '--storage-driver=vfs']
+        def candidate_execute(*argv, **kwargs):
+            scope=self.run.maintenance_launcher(expected,uid) if isinstance(self.run,Commands) else contextlib.nullcontext()
+            with scope:return self.run(*argv,**kwargs)
         tag = f'localhost/dev-pair/maintenance-gptbox:{expected}'
         record_path = f'{STATE}/gptbox-image.json'
         intent = {'context_sha256': expected, 'local_tag': tag, 'source_sha': manifest['source_sha']}
@@ -1946,7 +2001,7 @@ class Bootstrap:
                     or prior.get('base_image') != manifest['fedora']['image'] or prior.get('codex_sha256') != manifest['codex']['sha256']
                     or not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', prior.get('image_id', ''))):
                 raise Blocked('protected gptbox completion record conflicts')
-            inspect = self.run(*base, 'image', 'inspect', prior['image_id'], ok=(0, 125))
+            inspect = candidate_execute(*base, 'image', 'inspect', prior['image_id'], ok=(0, 125))
             if not inspect:
                 raise Blocked('recorded gptbox artifact is missing; explicit recovery required')
         else:
@@ -1970,14 +2025,14 @@ class Bootstrap:
                         if args[0] == 'save':
                             index = prefix.index('/usr/bin/podman')
                             prefix[index:index] = ['/usr/bin/prlimit', '--fsize=' + str(tool.fedora_oci.SAVE_FILE_LIMIT) + ':' + str(tool.fedora_oci.SAVE_FILE_LIMIT)]
-                        return self.run(*prefix, *args, **kwargs)
+                        return candidate_execute(*prefix, *args, **kwargs)
                     import_proof = tool.fedora_oci.import_image(local_image, plain, uid=int(uid))
                 built_id = local_image('build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--format=oci',
                          '--label', f'dev-pair.context={expected}', '--tag', tag,
                          '--file', str(self.path(stage) / 'Containerfile'), str(self.path(stage))).strip()
             if not re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}', built_id):
                 raise Blocked('gptbox build returned no unambiguous immutable image ID')
-            inspect = self.run(*base, 'image', 'inspect', built_id)
+            inspect = candidate_execute(*base, 'image', 'inspect', built_id)
         try:
             images = json.loads(inspect)
             if not isinstance(images, list) or len(images) != 1:

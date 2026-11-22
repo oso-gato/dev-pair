@@ -1151,11 +1151,17 @@ NATIVE_FAILURE_CATEGORIES=('decoder-rejected','wait-timeout','io-error','text-de
                            'blocked-or-interrupted','deadline','output-limit','status-rejected')
 
 
-def launcher_projection(value):
+def launcher_projection(value,context=None):
     """Validate diagnostics from the selected owned launcher, never admission."""
     unavailable={'availability':'unavailable'}
     try:
-        require(type(value) is dict and set(value)=={'summary','timing','bytes','complete'},'Launcher shape')
+        keys={'summary','timing','bytes','complete'}
+        require(type(value) is dict and set(value)==(keys|{'executor'} if context is not None else keys),'Launcher shape')
+        if context is not None:
+            executor=value['executor']
+            require(type(context) is str and re.fullmatch('[0-9a-f]{64}',context) and type(executor) is dict and
+                set(executor)=={'context_sha256','unit','suboperation'} and executor['context_sha256']==context and
+                executor['unit']=='dev-pair-gptbox-'+context+'.service' and executor['suboperation'] in ('load','save','build','inspect'),'Launcher executor')
         require(type(value['bytes']) is int and 0<=value['bytes']<=1048577 and type(value['complete']) is bool,'Launcher counters')
         summary=value['summary'];timing=value['timing']
         if summary!=unavailable:
@@ -1225,8 +1231,10 @@ def native_failure_projection(entry,expected,phase=None):
                     (not decoder['complete'] or not decoder['header_present'] and not decoder['body_present']), 'Decoder completion mismatch')
         result={'availability':'observed','identity':dict(identity),**value}
         if 'launcher' in result:
-            selected=(identity['phase']=='prepare' and entry.get('step')=='tailscale-package' and entry.get('operation_id')=='signed-packages')
-            result['launcher']=launcher_projection(value['launcher']) if selected else unavailable
+            tailscale=(identity['phase']=='prepare' and entry.get('step')=='tailscale-package' and entry.get('operation_id')=='signed-packages')
+            maintenance=(identity['phase']=='prepare' and entry.get('step')=='maintenance-gptbox-build' and entry.get('operation_id')=='candidate-native-executor')
+            result['launcher']=(launcher_projection(value['launcher'],expected['context_sha256']) if maintenance else
+                launcher_projection(value['launcher']) if tailscale else unavailable)
             if len(json.dumps(result,separators=(',',':')).encode())>1536:result['launcher']=unavailable
         require(len(json.dumps(result,separators=(',',':')).encode())<=1536, 'Native failure projection bound')
         return result
