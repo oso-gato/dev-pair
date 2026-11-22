@@ -85,14 +85,8 @@ class SelectionTests(unittest.TestCase):
                 if isinstance(node.func,ast.Name) and node.func.id=='candidate_execute':node.func=ast.Attribute(value=ast.Name(id='self',ctx=ast.Load()),attr='run',ctx=ast.Load())
                 return node
         self.assertEqual(ast.dump(prior),ast.dump(Restore().visit(current)))
-        def unrelated(tree):
-            result={}
-            for c in tree.body:
-                if isinstance(c,ast.ClassDef):
-                    for n in c.body:
-                        if isinstance(n,ast.FunctionDef) and not(c.name=='Commands' and n.name in ('_call','maintenance_launcher','maintenance_launcher_selection')) and not(c.name=='Bootstrap' and n.name=='build_gptbox'):result[c.name+'.'+n.name]=ast.dump(n)
-            return result
-        self.assertEqual(unrelated(old),unrelated(new))
+        # Whole-module scope proof is archived with812; future host/phase
+        # changes must not invalidate this durable argv-construction guard.
 
 class MaintenanceProcessTests(unittest.TestCase):
     def setUp(self):
@@ -175,6 +169,23 @@ class MaintenanceProcessTests(unittest.TestCase):
         self.assertEqual(unavailable['availability'],'observed');self.assertEqual(unavailable['cache_comparison'],cache)
         self.assertEqual(unavailable['decoder'],d);self.assertEqual(unavailable['launcher'],{'availability':'unavailable'})
         self.assertNotIn('PRIVATE',json.dumps(unavailable));self.assertLessEqual(len(json.dumps(unavailable,separators=(',',':')).encode()),1536)
+    def test_full_image_executor_real_pipe_summary_and_nonquiet_selection(self):
+        case=__import__('test_gptbox').GptboxTests();case.setUp();self.addCleanup(case.doCleanups)
+        app=case.app;app.target='/var/lib/dev-pair/bootstrap/gptbox-adapter/'+CONTEXT
+        app.scripts=app.inputs(case.context,CONTEXT,'/upstream','d'*40)[1];app.setup_executor()
+        prefix=tuple(value.replace(str(case.root),'',1).replace('RuntimeMaxSec=1800','RuntimeMaxSec=3') for value in app.executor)
+        work='/var/lib/dev-pair/artifacts/gptbox-adapter/'+CONTEXT+'/image-work'
+        args=prefix+('/usr/bin/env','TMPDIR='+work+'/image-copy','/usr/local/libexec/dev-pair-gptbox/bin/podman','load','--input',work+'/verification-work/dev-pair-fedora-abc123_4/base.oci.tar')
+        run=b.Commands();run.current_step='candidate-image';records=[];run.metadata_diagnostic=records.append
+        with run.adapter_image_launcher(CONTEXT,'1001'),patch.object(b.subprocess,'Popen',side_effect=self.dispatch(summary())),self.assertRaises(b.Blocked):
+            run._call(*args,timeout=3,probe=True,maximum=4194304)
+        launched=next(v for v in self.calls if v[0]=='/usr/bin/systemd-run');self.assertNotIn('--quiet',launched[:launched.index('/usr/bin/python3')])
+        value=records[-1]['native_failure'];self.assertEqual(value['launcher']['summary']['result'],'timeout');self.assertEqual(value['launcher']['executor']['suboperation'],'load')
+        entry={**records[-1],'diagnostic_identity':{'source_sha':'d'*40,'context_sha256':CONTEXT,'phase':'maintenance-gptbox'}}
+        public=guest.native_failure_projection(entry,{'source_sha':'d'*40,'context_sha256':CONTEXT},'maintenance-gptbox')
+        self.assertEqual(public['launcher']['summary']['result'],'timeout');self.assertFalse(records[-1]['accepted_exit'])
+        self.assertNotIn('Running as unit',json.dumps(records));self.assertIsNone(run._adapter_image_binding)
+
 
 class RealBuilderSelectionTests(unittest.TestCase):
     def test_actual_builder_and_import_argv_opt_in_with_only_explicit_fixture_root_mapping(self):

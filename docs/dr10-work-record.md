@@ -3,6 +3,42 @@
 ## Latest continuation checkpoint
 
 
+### November 23, 2026, 02:11 HKT — one-image initialization source candidate
+
+- Fresh initialization now holds the existing global bootstrap lock across an
+  internal source-bound host-ready handoff and adapter transaction. All ordered
+  source/security barriers and standalone minimal preparation remain. Host600
+  cost/timer evidence is explicitly scoped to host prerequisites; logical prepare
+  remains pending until the full candidate is verified and published.
+- The existing full adapter constructor runs once under adapter1620/image600,
+  within initialize2280. It retains signed import/save-back/full-graph checks,
+  explicit slirp/no-host-loopback, pull-never/no inherited proxy, signed packages
+  and native RUN540. Full immutable ID/platform/input labels and a closed private
+  versioned source/context/Codex/Distrobox/init/runtime/input/recipe record are
+  verified before storage/marker publication. Genuine assembly/sealing and two
+  frozen cycles use that ID unchanged. Legacy public assembly remains compatible;
+  contradictory records are not silently migrated.
+- Typed image subphases and exact full-executor launcher summary/timing now survive
+  failures, without raw tails or added queries. Earliest image/relay errors survive
+  workspace-unwind and diagnostic-write failures; partial ownership cleanup begins
+  even before prepared completion. Existing attempts, cleanup caps, resources,
+  absolute deadlines, context/record/private-path checks and guest closed evidence
+  remain enforced. Late image-phase failure removes only its new owned marker.
+- New transaction tests cover one import/save/build, host-only non-admission,
+  failure boundaries, stale/closed/proof/inspection rejection, marker interruption
+  and reuse, phase clipping, late exit, primary precedence and exact diagnostics.
+  The final affected run passed 157 tests. Initial syntax/fixture/mapping failures
+  are retained in this unit's artifacts. A one-time whole-module AST scope proof
+  from diagnostic812 is archived with that candidate; durable exact builder argv
+  and real-pipe behavior checks remain, without rejecting intentional phase work.
+- The frozen candidate receives one bounded combined full suite next; fresh exact
+  review and authorized native evidence remain required. All runtime caps are
+  unchanged. Session/worker/helper inputs remain exact to the finite stock PASS
+  on `f54afb5`; no stock rerun, native/CI/network/auth/model/VPS/push/deployment
+  occurs here. API-selected Sol/high remains backend-unattested; no timing fit,
+  image-size, hard quota, broad runtime/renewal or release claim is made.
+
+
 ### November 23, 2026, 01:44 HKT — exact maintenance launcher diagnostic
 
 - Native31 on `2ed389f` passed 553 hosted tests, enforcing boot/preparation,

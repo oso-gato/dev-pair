@@ -35,6 +35,7 @@ class Engine:
         self.starts = 0
         self.stale_logs = False
         self.app = None
+        self.images={}
 
     def __call__(self, *args, **kwargs):
         self.calls.append((args, kwargs))
@@ -55,11 +56,16 @@ class Engine:
         if 'distrobox-enter' in ' '.join(args[:position]):
             return ''
         if command[:2] == ('image', 'inspect'):
+            if command[-1] in self.images:return json.dumps([self.images[command[-1]]])
             return json.dumps([{'Id': SEALED, 'Labels': {'dev-pair.context': EXPECTED, 'dev-pair.distrobox': g.DBX_SHA, 'org.opencontainers.image.revision': SOURCE}}])
         if command[0] == 'pull':
             return ''
         if command[0] == 'build':
             self.build = Path(command[-1])
+            import re
+            line=next(v for v in (self.build/'Containerfile').read_text().splitlines() if v.startswith('LABEL '))
+            labels=dict(v.split('=',1) for v in line[6:].split())
+            self.images[BASE]={'Id':BASE,'Labels':labels,'Architecture':'amd64','Os':'linux'}
             return BASE
         if command[0] == 'commit':
             return SEALED
@@ -121,7 +127,7 @@ class Fixture(g.Gptbox):
 
     def inputs(self, context, expected, upstream, revision):
         # No production CLI fixture bypass exists. Tests inject the external provenance boundary.
-        return {}, {'distrobox-init': b'upstream fixture NOT DISTROBOX\n', 'distrobox-enter': b'entry fixture NOT DISTROBOX\n'}
+        return {'codex':{'sha256':hashlib.sha256(Path(context,'codex').read_bytes()).hexdigest()}}, {'distrobox-init': b'upstream fixture NOT DISTROBOX\n', 'distrobox-enter': b'entry fixture NOT DISTROBOX\n'}
 
     def directory(self, name, mode=0o700, owner=None):
         return super().directory(name, mode, owner=None)

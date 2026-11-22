@@ -49,20 +49,19 @@ class InitializeFixture(g.Gptbox):
                 app.order.append('fixture-native-reconcile')
         class Preparation:
             run = LocalCommands()
-            def prepare(self, *args, source_check=None, **kwargs):
-                with app.lock():
-                    source_check()
-                    app.order.append('prepare')
-                    app.atomic(b.STATE + '/prepared', 'fixture prerequisite only\n')
+            def _host_prerequisites(self, *args, source_check=None, **kwargs):
+                source_check()
+                app.order.append('prepare')
+                return {'fixture':'host prerequisite only'}
         return Preparation()
 
-    def assemble(self, *args, **kwargs):
-        with self.lock():
-            self.order.append('assemble')
-            if self.fail:
-                raise b.Blocked('fixture assembly failure')
-            return {'source_sha': SOURCE, 'context_sha256': CONTEXT, 'job_admission': False,
-                    'fixture': 'no engine acceptance'}
+    def _validate_host_ready(self,*args):return {'fixture':'not host acceptance'}
+
+    def _assemble_locked(self,*args,on_prepared=None,**kwargs):
+        self.order.append('assemble')
+        if on_prepared:on_prepared()
+        if self.fail:raise b.Blocked('fixture assembly failure')
+        return {'source_sha':SOURCE,'context_sha256':CONTEXT,'job_admission':False,'fixture':'no engine acceptance'}
 
     def setup_executor(self, retry=False):
         self.order.append('cleanup-executor')
@@ -127,7 +126,7 @@ class InitializeTests(unittest.TestCase):
         with patch.object(self.app.run, 'reconcile_native') as reconcile:
             self.assertEqual(self.initialize(retry=True)['phase'], 'complete')
             self.assertIn('--unit=dev-pair-initialize-cleanup-12345678-12345678', reconcile.call_args.args[0])
-        self.assertEqual(self.app.order[-2:], ['prepare', 'assemble'])
+        self.assertEqual(self.app.order[-2:], ['identity', 'assemble'])
         self.assertEqual(self.initialize()['phase'], 'complete')
         with patch.object(self.app, 'check_gptbox_inputs', return_value=(None, Path('/context'), {'source_sha': '2' * 40})):
             with self.assertRaisesRegex(b.Blocked, 'context/source'):
@@ -138,13 +137,13 @@ class InitializeTests(unittest.TestCase):
         original=self.app.preparation;counts=iter((12,2))
         def preparation():
             result=original();count=next(counts)
-            def prepare(*args,source_check=None,**kwargs):
+            def _host_prerequisites(*args,source_check=None,**kwargs):
                 b.Bootstrap.mark_prepare_step(result,'adapter-source-and-upstream');source_check()
                 b.Bootstrap.mark_prepare_step(result,'packages')
                 for _ in range(count):
                     result.run.diagnostic({'step':'packages','accepted_exit':True,'launcher_handle_observed':True,
                         'elapsed_seconds':.001,'status':0,'operation_id':'signed-packages'})
-            result.prepare=prepare;return result
+            result._host_prerequisites=_host_prerequisites;return result
         def inputs(*args):
             # One real local source-callback command; no Fedora/native claim.
             self.app.run(sys.executable,'-c','print("private local source fixture")')
@@ -169,10 +168,10 @@ class InitializeTests(unittest.TestCase):
         original=self.app.preparation
         def preparation():
             result=original()
-            def prepare(*args,**kwargs):
+            def _host_prerequisites(*args,**kwargs):
                 b.Bootstrap.mark_prepare_step(result,'packages')
                 raise b.Blocked('PRIMARY_PREPARE_FIXTURE')
-            result.prepare=prepare;return result
+            result._host_prerequisites=_host_prerequisites;return result
         with patch.object(self.app,'preparation',side_effect=preparation):
             with self.assertRaisesRegex(b.Blocked,'PRIMARY_PREPARE_FIXTURE'):self.initialize()
         record=json.loads(self.app.text(b.STATE+'/initialize.json'))
@@ -192,7 +191,7 @@ class InitializeTests(unittest.TestCase):
                     def preparation(app):
                         class Preparation:
                             run = b.Commands()
-                            def prepare(preparation, *args, source_check=None, **kwargs):
+                            def _host_prerequisites(preparation, *args, source_check=None, **kwargs):
                                 source_check()
                                 if app.interrupt_prepare and mode == 'prelaunch-input':
                                     def unresolved(args, env):
@@ -513,6 +512,8 @@ class InitializeTests(unittest.TestCase):
         run.metadata_diagnostic = previous_metadata
         self.assertIsNone(run.diagnostic)
         observed = []
+        process_dispatch=patch.object(b.subprocess,'Popen',side_effect=manager(subprocess.Popen,[]))
+        process_dispatch.start();self.addCleanup(process_dispatch.stop)
         def source_child(size):
             def inputs(*args):
                 # This is the production source_check closure reached from
@@ -526,13 +527,13 @@ class InitializeTests(unittest.TestCase):
             return inputs
         with patch.object(self.app, 'inputs', side_effect=source_child(32)):
             self.assertEqual(self.initialize()['phase'], 'complete')
-        self.assertEqual(observed, [32])
+        self.assertEqual(observed, [32,32])
         self.assertIs(run.metadata_diagnostic, previous_metadata)
         self.assertIsNone(run.diagnostic)
         with patch.object(self.app, 'inputs', side_effect=source_child(1100000)):
             with self.assertRaisesRegex(b.Blocked, 'output byte budget'):
                 self.initialize()
-        self.assertEqual(observed, [32])
+        self.assertEqual(observed, [32,32])
         self.assertIs(run.metadata_diagnostic, previous_metadata)
         self.assertIsNone(run.diagnostic)
         record = json.loads(self.app.text(b.STATE + '/initialize.json'))

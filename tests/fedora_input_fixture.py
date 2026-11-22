@@ -16,7 +16,12 @@ def synthetic_verified(source, **kwargs):
 def synthetic_import(engine, plain, uid=None, seconds=120):
     engine('load', '--input', str(plain))
     engine('save', '--format=oci-archive', '--output', str(plain.parent / 'fixture-export'), fedora_oci.IMAGE)
-    return {'source': dict(fedora_oci.PROVENANCE), 'fixture': 'NOT a native import verdict'}
+    return {'source':dict(fedora_oci.PROVENANCE),'imported_config':'sha256:'+fedora_oci.CONFIG,'imported_manifest':'sha256:'+fedora_oci.MANIFEST,
+        'conversion':'source manifest/config retained on load; storage save gzip representation derived and fully rehashed',
+        'saveback':{'manifest_sha256':fedora_oci.MANIFEST,'config_sha256':fedora_oci.CONFIG,'compressed_layer_sha256':fedora_oci.LAYER,'diff_id_sha256':fedora_oci.DIFF,
+            'derivation':'storage export gzip recompression allowed; exact source config bytes and rootfs diff stream required'},
+        'verification':'Source archive chain plus exported config-byte/rootfs-diff equality and full derived descriptor/blob graph',
+        'failure_recovery':'Import is nontransactional; unreferenced store layers may remain, no broad prune/removal'}
 
 
 def install(test):

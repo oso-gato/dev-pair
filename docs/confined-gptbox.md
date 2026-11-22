@@ -143,3 +143,25 @@ Native execution now shares the [manager-opened stream transport](native-command
 Diagnostic-enabled probes retain4MiB aggregate capture; the ordinary/source-check
 path stays1MiB. Private FIFO/stdin ownership and actual Fedora access remain
 required runtime checks; no payload file-size restriction is introduced.
+
+
+### One full image for fresh initialization
+
+Fresh initialization now passes an internal freshly verified host-ready handoff
+into the locked adapter transaction. The full existing adapter recipe is built
+once; it is not relabelled as the original minimal Containerfile. Signed local
+Fedora import/save-back verification, pinned inputs and expanded recipe hashes,
+immutable image/platform and labels are checked before the closed versioned
+candidate record and prepared storage observation/marker are published. Genuine
+upstream initialization, finalizer attestation, sealing and both frozen
+boundary/version cycles consume that same immutable base ID and keep their
+existing security, ownership, retry and timeout limits. Public assembly after
+legacy standalone preparation still preserves the original minimal record.
+
+The selected full-image executor alone exposes closed bounded launcher summary,
+constructed timing and load/save/build/inspect identity; its required non-quiet
+launcher does not relax relay/profile/status admission. Image-stage records are
+fixed typed evidence, not a payload-execution or cleanup claim. Raw image
+launcher/payload diagnostic tails are withheld. No full native image, storage
+quota, timing fit, authenticated runtime or renewal acceptance follows from local
+source tests.

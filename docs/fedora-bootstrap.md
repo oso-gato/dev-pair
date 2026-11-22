@@ -558,3 +558,27 @@ raw exception or arbitrary step name is published. The source/local tests do not
 measure Fedora preparation costs or promise the remaining packages and builds
 fit the existing deadline. A separately reviewed changed native attempt is needed
 before selecting a measured optimization or claiming successful preparation.
+
+
+### Internal initialization handoff
+
+The public `prepare` operation retains its original behavior, including the
+minimal maintenance image when a context is supplied. It has no host-only
+success/defer-image flag. `initialize` instead holds both its journey lock and
+the existing bootstrap lock through a private host-prerequisites routine and
+adapter transaction. The protected versioned host-ready record binds freshly
+reconverged source/context/standards/bootstrap, desired-state and package hashes;
+its existence never skips convergence or admits a prepared image.
+
+Host work remains under 600 seconds. The existing 1,620-second adapter ceiling
+then encloses one full image phase (600), real assembly and both runtime cycles,
+all clipped to the original 2,280-second initialization deadline. These are
+ceilings, not summed reservations. Candidate records bind immutable image ID,
+platform/labels, signed OCI import/save-back proof, exact Codex/Distrobox/runtime,
+inputs and expanded recipe hashes. Record/storage persistence precedes the
+prepared marker, and logical preparation completes only after image phase exit.
+A late publication failure removes only this attempt's new exact owned marker;
+image evidence remains for explicit bounded retry. Unknown schemas or conflicting
+minimal/full records block without silent migration. Standalone legacy minimal
+records retain their original storage identity when public assembly builds its
+separate full adapter base.

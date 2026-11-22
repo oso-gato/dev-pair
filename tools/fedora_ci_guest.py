@@ -551,7 +551,12 @@ def validate_inputs(value):
 
 
 def validate_initialization(value, expected):
-    require(type(value) is dict and set(value) == INITIALIZATION_KEYS, 'invalid initialization evidence fields')
+    new=type(value) is dict and value.get('state_schema')==2
+    require(type(value) is dict and set(value)==(INITIALIZATION_KEYS|{'state_schema','host_prerequisites','candidate_image'} if new else INITIALIZATION_KEYS),'invalid initialization evidence fields')
+    if new:
+        require(type(value['state_schema']) is int and all(value[k] in ('pending','complete','blocked') for k in ('host_prerequisites','candidate_image')) and
+            (value['prepare']!='complete' or value['host_prerequisites']==value['candidate_image']=='complete') and
+            (value['candidate_image']!='complete' or value['prepare']==value['host_prerequisites']=='complete'),'invalid host/image completion state')
     require(value['source_sha'] == expected['source_sha'] and value['context_sha256'] == expected['context_sha256'] and
             value['distrobox_sha'] == expected['distrobox_sha'], 'initialization evidence target mismatch')
     require(value['exit_status'] is None or type(value['exit_status']) is int, 'invalid initializer exit status')
@@ -896,6 +901,11 @@ def initialize_projection(state, expected, exit_status):
               'prepared_image_id': None, 'assembled_image_id': None, 'boundary_and_version_cycles': 0,
               'runtime_container_removed': False, 'job_admission': False,
               'prepared_image_verified': False, 'assembled_image_verified': False, 'packages_sha256': None, 'package_count': 0}
+    schema=state.get('schema',1)
+    require(type(schema) is int and schema in (1,2),'Unsupported initialization schema')
+    if schema==2:
+        require(state.get('prepare_budget_scope')=='host-prerequisites' and type(state.get('adapter_commenced')) is bool,'Invalid host phase scope')
+        result.update(state_schema=2,host_prerequisites=state.get('host_prerequisites'),candidate_image=state.get('candidate_image'))
     if state['maintenance_gptbox'] == 'complete':
         observed = state.get('result', {})
         require(observed.get('source_sha') == expected['source_sha'] and observed.get('context_sha256') == expected['context_sha256'] and
@@ -938,6 +948,8 @@ def storage_public_projection(state_root,expected,source):
         prepared=read_json(state_root/'gptbox-image.json',16384)
         require(type(prepared) is dict and prepared['source_sha']==expected['source_sha'] and prepared['context_sha256']==expected['context_sha256'],
                 'Storage prepared identity mismatch')
+        if prepared.get('kind')=='full-adapter-candidate':validate_full_candidate(prepared,expected,source)
+        elif prepared.get('kind') not in (None,'host-maintenance-gptbox-oci-candidate'):raise ValueError('Unknown prepared recipe kind')
         require(type(prepared['image_id']) is str, 'Storage image identity missing')
         image=prepared['image_id'].removeprefix('sha256:')
         require(re.fullmatch('[0-9a-f]{64}',image), 'Storage image identity missing')
@@ -958,6 +970,20 @@ def storage_public_projection(state_root,expected,source):
     return result
 
 
+def validate_full_candidate(record,expected,source):
+    keys=set('schema kind source_sha context_sha256 standards_sha base_image codex_sha256 distrobox_sha init_sha256 runtime_sha256 inputs_sha256 recipe_sha256 platform distrobox_assembled runtime_validated image_id fedora_base'.split())
+    require(type(record) is dict and set(record)==keys and type(record['schema']) is int and record['schema']==1 and
+        record['kind']=='full-adapter-candidate' and record['source_sha']==expected['source_sha'] and record['context_sha256']==expected['context_sha256'] and
+        record['standards_sha']==expected['standards_sha'] and record['codex_sha256']==expected['codex_sha256'] and record['distrobox_sha']==expected['distrobox_sha'] and
+        record['platform']=={'os':'linux','architecture':'amd64'} and record['distrobox_assembled'] is False and record['runtime_validated'] is False and
+        all(type(record[k]) is str and re.fullmatch('[0-9a-f]{64}',record[k]) for k in ('image_id','init_sha256','runtime_sha256','inputs_sha256','recipe_sha256')) and
+        record['runtime_sha256']==digest(source/'tools/gptbox_runtime.py'),'Full candidate completion mismatch')
+    spec=importlib.util.spec_from_file_location('public_full_candidate_oci',source/'tools/fedora_oci.py')
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+    require(record['base_image']==module.IMAGE,'Full candidate signed base mismatch');module.validate_import_proof(record['fedora_base'])
+    return record
+
+
 def image_evidence(expected, projection, state_root, source, end, logical_observations=None):
     images = []
     if projection['prepare'] == 'complete':
@@ -966,6 +992,7 @@ def image_evidence(expected, projection, state_root, source, end, logical_observ
         require(desired['gptbox_context_sha256'] == expected['context_sha256'] and desired['standards_sha'] == expected['standards_sha'] and
                 record['source_sha'] == expected['source_sha'] and record['context_sha256'] == expected['context_sha256'] and
                 record['codex_sha256'] == expected['codex_sha256'] and desired['bootstrap_sha256'] == digest(source / 'tools/bootstrap.py'), 'Prepared image evidence does not match target')
+        if projection.get('state_schema')==2:validate_full_candidate(record,expected,source)
         packages = read_bytes(state_root / 'packages.txt', 32768)
         lines = packages.decode('utf-8').splitlines()
         require(0 < len(lines) <= 1000 and all(any(line.startswith(name + '-') for line in lines) for name in ('podman', 'distrobox', 'tailscale')),
@@ -999,6 +1026,8 @@ def image_evidence(expected, projection, state_root, source, end, logical_observ
         if index == 0:
             require(labels.get('dev-pair.role') == 'maintenance' and labels.get('dev-pair.standards') == expected['standards_sha'] and
                     labels.get('dev-pair.codex.version') == '0.169.0', 'Actual prerequisite image labels mismatch')
+            if projection.get('state_schema')==2:
+                require(all(labels.get(k)==record[v] for k,v in (('dev-pair.inputs','inputs_sha256'),('dev-pair.runtime','runtime_sha256'),('dev-pair.init','init_sha256'),('dev-pair.codex.sha256','codex_sha256'))),'Actual full image input labels mismatch')
             projection['prepared_image_verified'] = True
         else:
             require(labels.get('dev-pair.distrobox') == expected['distrobox_sha'], 'Actual sealed image upstream mismatch')
@@ -1081,9 +1110,9 @@ def prepare_cost_projection(state,expected,budget_available):
                 'Invalid prepare cost fields')
         require(value['source_sha']==expected['source_sha'] and value['context_sha256']==expected['context_sha256'] and
                 type(value['attempt_id']) is str and re.fullmatch('[0-9a-f]{32}',value['attempt_id']) and
-                value['attempt_id']==state.get('prepare_cost_attempt') and value['phase']=='prepare', 'Prepare cost target mismatch')
+                value['attempt_id']==state.get('prepare_cost_attempt') and value['phase']==('host-prerequisites' if state.get('schema')==2 else 'prepare'), 'Prepare cost target mismatch')
         digest=hashlib.sha256(json.dumps(state['prepare_budget_witness'],sort_keys=True,separators=(',',':')).encode()).hexdigest()
-        require(value['phase_budget_sha256']==digest and value['scope']==PREPARE_COST_SCOPE and
+        require(value['phase_budget_sha256']==digest and value['scope']==('emitted-top-level-host-prerequisites-and-source-check-callbacks' if state.get('schema')==2 else PREPARE_COST_SCOPE) and
                 value['nested_controls']=='included-in-parent-elapsed-not-counted-again' and value['columns']==list(PREPARE_COST_COLUMNS),
                 'Invalid prepare cost binding/scope')
         def count(item):return type(item) is int and 0<=item<=4096
@@ -1113,7 +1142,7 @@ def prepare_observations(state, expected):
     # owner evidence. Durations do not establish a primary failure cause.
     initialize_projection(state,expected,None)
     result = {'source_sha':expected['source_sha'],'context_sha256':expected['context_sha256'],
-              'budget':{'availability':'unavailable'},'role_directories':{}}
+              'budget':{'availability':'unavailable'},'budget_scope':state.get('prepare_budget_scope','legacy-prepare'),'role_directories':{}}
     def finite(value,low,high):
         return type(value) in (int,float) and low <= value <= high and math.isfinite(value)
     witness=state.get('prepare_budget_witness')
@@ -1232,7 +1261,8 @@ def native_failure_projection(entry,expected,phase=None):
         result={'availability':'observed','identity':dict(identity),**value}
         if 'launcher' in result:
             tailscale=(identity['phase']=='prepare' and entry.get('step')=='tailscale-package' and entry.get('operation_id')=='signed-packages')
-            maintenance=(identity['phase']=='prepare' and entry.get('step')=='maintenance-gptbox-build' and entry.get('operation_id')=='candidate-native-executor')
+            maintenance=((identity['phase']=='prepare' and entry.get('step')=='maintenance-gptbox-build' or
+                identity['phase']=='maintenance-gptbox' and entry.get('step')=='candidate-image') and entry.get('operation_id')=='candidate-native-executor')
             result['launcher']=(launcher_projection(value['launcher'],expected['context_sha256']) if maintenance else
                 launcher_projection(value['launcher']) if tailscale else unavailable)
             if len(json.dumps(result,separators=(',',':')).encode())>1536:result['launcher']=unavailable
@@ -1243,6 +1273,14 @@ def native_failure_projection(entry,expected,phase=None):
 
 def public_diagnostics(state_root, expected, source=None):
     selected = {'storage_observations':storage_public_projection(state_root,expected,source)}
+    selected['image_progress']={'availability':'unavailable'}
+    try:
+        stage=read_json(state_root/'gptbox-adapter'/expected['context_sha256']/'image-progress.json',2048)
+        require(type(stage) is dict and set(stage)=={'schema','source_sha','context_sha256','phase','stage'} and type(stage['schema']) is int and stage['schema']==1 and
+            stage['source_sha']==expected['source_sha'] and stage['context_sha256']==expected['context_sha256'] and stage['phase']=='candidate-image' and
+            stage['stage'] in ('executor-setup','input-staging','signed-import','build','immutable-inspect','completion-record','storage','prepared-marker','assembly','runtime','complete'),'Invalid image stage')
+        selected['image_progress']={'availability':'observed',**stage}
+    except (OSError,ValueError,KeyError,TypeError):pass
     for name, path in (('prepare', state_root / 'prepare-diagnostics.json'),
                        ('adapter', state_root / 'gptbox-adapter' / expected['context_sha256'] / 'diagnostics.json')):
         try:

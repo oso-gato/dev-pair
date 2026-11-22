@@ -285,6 +285,21 @@ def imported(rows):
             'imported_manifest':'sha256:'+MANIFEST, 'conversion':'none; exact digest equality required'}
 
 
+def validate_import_proof(record):
+    keys={'source','imported_config','imported_manifest','conversion','saveback','verification','failure_recovery'}
+    require(type(record) is dict and set(record)==keys and record['source']==PROVENANCE and
+        record['imported_config']=='sha256:'+CONFIG and record['imported_manifest']=='sha256:'+MANIFEST,'invalid stored Fedora import proof')
+    derived=record['saveback']
+    require(type(derived) is dict and set(derived)=={'manifest_sha256','config_sha256','compressed_layer_sha256','diff_id_sha256','derivation'} and
+        derived['config_sha256']==CONFIG and derived['diff_id_sha256']==DIFF and
+        all(type(derived[k]) is str and re.fullmatch('[0-9a-f]{64}',derived[k]) for k in ('manifest_sha256','compressed_layer_sha256')) and
+        derived['derivation']=='storage export gzip recompression allowed; exact source config bytes and rootfs diff stream required','invalid stored derived graph proof')
+    require(record['conversion']=='source manifest/config retained on load; storage save gzip representation derived and fully rehashed' and
+        record['verification']=='Source archive chain plus exported config-byte/rootfs-diff equality and full derived descriptor/blob graph' and
+        record['failure_recovery']=='Import is nontransactional; unreferenced store layers may remain, no broad prune/removal','invalid stored import completion')
+    return record
+
+
 def import_image(engine, plain, uid=None, seconds=120):
     """Local-only import and save-back proof; failed imports may retain store data."""
     capture_regular = _public_inputs().capture_regular

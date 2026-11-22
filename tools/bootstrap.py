@@ -194,7 +194,8 @@ class PrepareCost:
     An obtained launcher handle is not payload execution or cleanup proof. Wall
     and command durations are separate measurements and must never be added.
     """
-    def __init__(self,source,context,attempt,started):
+    def __init__(self,source,context,attempt,started,phase='prepare'):
+        self.phase=phase
         self.source,self.context,self.attempt=source,context,attempt
         self.started=self.last=started;self.active='pre-prepare';self.closed=False
         self.rows={'pre-prepare':[1,0.,0,0,0,0,0.]}
@@ -242,12 +243,12 @@ class PrepareCost:
     def snapshot(self,budget):
         if self.transition_pending or self.command_pending:
             return {'availability':'unavailable','reason':'interrupted-accounting-update'}
-        result={'schema':1,'source_sha':self.source,'context_sha256':self.context,'attempt_id':self.attempt,'phase':'prepare',
+        result={'schema':1,'source_sha':self.source,'context_sha256':self.context,'attempt_id':self.attempt,'phase':self.phase,
             'phase_budget_sha256':hashlib.sha256(json.dumps(budget,sort_keys=True,separators=(',',':')).encode()).hexdigest(),
             'status':'overflow' if self.overflow else 'incomplete' if not(self.wall_complete and self.commands_complete) else self.outcome,
             'wall_complete':self.wall_complete,'commands_complete':self.commands_complete,'elapsed_seconds':self.elapsed,
             'command_records':self.command_records,'unknown_records':self.unknown_records,
-            'scope':PREPARE_COST_SCOPE,'nested_controls':'included-in-parent-elapsed-not-counted-again',
+            'scope':('emitted-top-level-host-prerequisites-and-source-check-callbacks' if self.phase=='host-prerequisites' else PREPARE_COST_SCOPE),'nested_controls':'included-in-parent-elapsed-not-counted-again',
             'columns':list(PREPARE_COST_COLUMNS),'steps':self.rows}
         if len(json.dumps(result,separators=(',',':')).encode())>4096:
             return {'availability':'unavailable','reason':'projection-overflow'}
@@ -314,6 +315,7 @@ class Commands:
     _cleanup_deadline = None
     current_step = 'unscoped'
     _maintenance_launcher_binding = None
+    _adapter_image_binding = None
 
     @contextlib.contextmanager
     def maintenance_launcher(self, context, uid):
@@ -324,9 +326,46 @@ class Commands:
         try:yield
         finally:self._maintenance_launcher_binding=previous
 
+    @contextlib.contextmanager
+    def adapter_image_launcher(self,context,uid):
+        previous=self._adapter_image_binding;self._adapter_image_binding=(context,uid)
+        try:yield
+        finally:self._adapter_image_binding=previous
+
+    def adapter_image_selection(self,args,input_text):
+        if self.current_step!='candidate-image' or input_text is not None:return None
+        context,uid=self._adapter_image_binding
+        if type(context) is not str or not re.fullmatch('[0-9a-f]{64}',context) or type(uid) is not str or not re.fullmatch('[1-9][0-9]{0,9}',uid):return None
+        unit='dev-pair-gptbox-'+context+'.service';control='/usr/local/libexec/dev-pair-gptbox'
+        fixed=('/usr/bin/systemd-run','--unit='+unit,'--description=dev-pair-owned-'+unit,'--quiet','--wait','--collect','--service-type=exec','--uid=dp-maint')
+        if args[:8]!=fixed or len(args)<23 or not args[8].startswith('--property=RuntimeMaxSec='):return None
+        try:
+            duration=float(args[8].split('=',2)[2])
+            if not math.isfinite(duration) or not 0<duration<=600:return None
+        except ValueError:return None
+        tail=('--property=TimeoutStopSec=10','--property=KillMode=control-group','--property=MemoryMax=2G','--property=TasksMax=512','--property=CPUQuota=100%',
+            '/usr/bin/env','-i','PATH='+control+'/bin:/usr/bin:/usr/sbin:/bin','HOME='+control+'/home','USER=gpt','LOGNAME=gpt',
+            'XDG_RUNTIME_DIR=/run/user/'+uid,'CONTAINERS_CONF='+control+'/containers.conf','DBX_CONTAINER_MANAGER=podman')
+        if args[9:23]!=tail:return None
+        rest=args[23:];work='/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/image-work';wrapper=control+'/bin/podman'
+        temporary=('/usr/bin/env','TMPDIR='+work+'/image-copy',wrapper)
+        copied=rest[:3]==temporary
+        if copied:operation=rest[3:]
+        elif rest[:1]==(wrapper,):operation=rest[1:]
+        else:return None
+        archive=re.escape(work+'/verification-work/')+r'dev-pair-fedora-[a-z0-9_]{8}/'
+        image='sha256:9eaa56a730854ae53f57e58c16179d09c2fa1f4157a5d69ccb39647e33c6464d';selected=None
+        if copied and len(operation)==3 and operation[:2]==('load','--input') and re.fullmatch(archive+r'base\.oci\.tar',operation[2]):selected='load'
+        elif copied and len(operation)==5 and operation[:3]==('save','--format=oci-archive','--output') and operation[4]==image and re.fullmatch(archive+r'imported\.oci\.tar',operation[3]):selected='save'
+        elif len(operation)==3 and operation[:2]==('image','inspect') and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}',operation[2]):selected='inspect'
+        elif copied and operation==('build','--quiet','--network=slirp4netns:allow_host_loopback=false','--pull=never','--http-proxy=false','--file',
+                '/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/build/Containerfile','/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/build'):selected='build'
+        return {'context_sha256':context,'unit':unit,'suboperation':selected} if selected else None
+
     def maintenance_launcher_selection(self,args,input_text,probe):
         binding=self._maintenance_launcher_binding
         if not all(type(value) is str for value in args):return None
+        if self._adapter_image_binding is not None:return self.adapter_image_selection(args,input_text)
         if self.current_step!='maintenance-gptbox-build' or input_text is not None or probe or binding is None:return None
         context,uid=binding
         if (type(context) is not str or not re.fullmatch('[0-9a-f]{64}',context) or type(uid) is not str or
@@ -779,7 +818,7 @@ class Commands:
                             continue
                         if key != 'RuntimeMaxSec':
                             raise Blocked('unknown native property rejected')
-                    if not (tailscale_launcher and value=='--quiet'):prefix.append(value)
+                    if not ((tailscale_launcher or maintenance_launcher is not None and self._adapter_image_binding is not None) and value=='--quiet'):prefix.append(value)
                 if not any(value == '--service-type=exec' for value in prefix):
                     if any(value.startswith('--service-type=') for value in prefix):
                         raise Blocked('native service type mismatch')
@@ -1783,6 +1822,13 @@ class Bootstrap:
             raise
 
     def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None):
+        return self._converge_host(name,key,sources,gptbox_context,expected_context,password=password,source_check=source_check)
+
+    def _host_prerequisites(self, name, key, sources, context, expected, *, password=None, source_check=None):
+        # Caller holds the existing global bootstrap lock through image/assembly.
+        return self._converge_host(name,key,sources,context,expected,password=password,source_check=source_check,host_only=True,locked=True)
+
+    def _converge_host(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None,host_only=False,locked=False):
         self.mark_prepare_step('input-admission')
         if gptbox_context is not None and (not isinstance(expected_context, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_context)):
             raise Blocked('a separately trusted context SHA256 is required before preparation')
@@ -1804,8 +1850,8 @@ class Bootstrap:
             self.check_gptbox_inputs(gptbox_context, expected_context)
             if self.path('/usr/bin/git').exists():
                 self.mark_prepare_step('context-source')
-                self.validate_gptbox_context(gptbox_context, expected_context)
-        with self.lock():
+                _,_,host_manifest=self.validate_gptbox_context(gptbox_context, expected_context)
+        with contextlib.nullcontext() if locked else self.lock():
             if gptbox_context is not None:
                 if not self.path('/usr/bin/git').exists():
                     self.step('git-prerequisite', lambda: self.run('/usr/bin/dnf', '-y',
@@ -1813,7 +1859,7 @@ class Bootstrap:
                               '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'))
                 self.mark_prepare_step('context-source')
                 # Full source verification precedes desired binding, accounts, ingress and normal packages.
-                self.validate_gptbox_context(gptbox_context, expected_context)
+                _,_,host_manifest=self.validate_gptbox_context(gptbox_context, expected_context)
                 if source_check:
                     self.mark_prepare_step('adapter-source-and-upstream')
                     source_check()
@@ -1860,6 +1906,18 @@ class Bootstrap:
             self.mark_prepare_step('package-inventory')
             versions = self.run('/usr/bin/rpm', '-q', *PACKAGES, 'tailscale')
             self.atomic(f'{STATE}/packages.txt', versions, expected=self.text(f'{STATE}/packages.txt') or None)
+            if host_only:
+                # Freshly reconverged evidence, never an admission/cache oracle.
+                ready={'schema':1,'kind':'host-prerequisites','source_sha':host_manifest['source_sha'],
+                    'context_sha256':expected_context,'standards_sha':STANDARDS,'bootstrap_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    'desired_sha256':hashlib.sha256(desired.encode()).hexdigest(),'packages_sha256':hashlib.sha256(versions.encode()).hexdigest()}
+                old_ready=self.text(STATE+'/host-ready.json')
+                if old_ready:
+                    previous=json.loads(old_ready,object_pairs_hook=relay.unique)
+                    if type(previous) is not dict or set(previous)!=set(ready) or any(previous[k]!=v for k,v in ready.items() if k!='packages_sha256'):
+                        raise Blocked('host prerequisite record target conflict')
+                self.atomic(STATE+'/host-ready.json',json.dumps(ready,sort_keys=True)+'\n',expected=old_ready or None)
+                return ready
             if gptbox_context is not None:
                 self.step('maintenance-gptbox-build', lambda: self.build_gptbox(gptbox_context, expected_context))
             self.mark_prepare_step('preparation-completion')
