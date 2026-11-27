@@ -43,7 +43,14 @@ RUNROOT = '/run/dev-pair'
 ARCHIVE = '/admission/development.oci.tar'
 MANIFEST = '/admission/manifest.json'
 PARENT_JOB = '/devbox/job'
+PARENT_BUILD = PARENT_JOB + '/build'
+JOB_BUILD = '/build/job'
 JOB_TARGETS = {'workspaces': '/work/job', 'state': '/state', 'cache': '/cache/job'}
+ROLE_READONLY = ('/etc/codex', '/run/dev-pair-turn', '/run/dev-pair-provider',
+                 *(f'/state/codex/{name}' for name in ('config.toml', 'hooks.json', 'AGENTS.md', 'AGENTS.override.md',
+                                                     'skills', 'plugins', 'rules', 'agents', 'shell_snapshots',
+                                                     '.tmp/plugins', '.tmp/marketplaces')))
+ADMISSION_ROLE = {target: f'/admission/role/{index}' for index, target in enumerate(ROLE_READONLY)}
 CAP_KEYS = ('CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb')
 OUTER_CAPS = (0, 0, 0, 0xc0, 0)
 OUTER_BOUNDING = {'CAP_SETUID', 'CAP_SETGID'}
@@ -295,12 +302,16 @@ def check_archive_image(path, release, storage_limit, deadline):
         require(set(blobs) == used, 'development archive contains unselected blobs')
 
 
-def load_development_archive(engine, manifest, path):
+def load_development_archive(engine, manifest, path, *, reuse=False):
     release = manifest['inner']
     expected = (release['archive_sha256'], release['archive_bytes'])
     deadline = engine.deadline
     require(file_hash(path, release['archive_bytes'], deadline)[:2] == expected,
             'development OCI archive digest or byte count mismatch')
+    if reuse:
+        status, _ = engine('check exact development image cache', 'image', 'exists', release['image_id'], allowed=(0, 1))
+        if status == 0:
+            return immutable_image(engine, manifest, 'inner', role_turn=True)
     try:
         check_archive_image(path, release, manifest['storage_bytes'], deadline)
     except (tarfile.TarError, EOFError, OSError) as error:
@@ -308,6 +319,8 @@ def load_development_archive(engine, manifest, path):
     engine('load development OCI archive', 'load', '--input', str(path), seconds=250)
     require(file_hash(path, release['archive_bytes'], deadline)[:2] == expected,
             'development OCI archive changed during import')
+    if reuse:
+        return immutable_image(engine, manifest, 'inner', role_turn=True)
     immutable_image(engine, manifest, 'inner')
 
 
@@ -417,7 +430,7 @@ class Engine:
         return rows[0]
 
 
-def immutable_image(engine, manifest, side):
+def immutable_image(engine, manifest, side, *, role_turn=False):
     release = manifest[side]
     row = engine.inspect('image', release['image_id'])
     require(engine_id(row.get('Id')) == release['image_id'] and row.get('Os') == 'linux'
@@ -427,12 +440,18 @@ def immutable_image(engine, manifest, side):
                 'org.opencontainers.image.revision': release['source_sha']}
     if side == 'inner':
         expected.update({'dev-pair.context': release['context_sha256'],
-                         'dev-pair.inputs': release['inputs_sha256'],
-                         'dev-pair.codex.version': CODEX_VERSION})
+                         'dev-pair.inputs': release['inputs_sha256']})
+        if not role_turn:
+            expected['dev-pair.codex.version'] = CODEX_VERSION
         require(row['RootFS']['Layers'] == release['diff_ids'], 'loaded image layer identities mismatch')
     labels = row.get('Labels') or row.get('Config', {}).get('Labels') or {}
     require(all(labels.get(key) == value for key, value in expected.items()),
             f'{side} image role or provenance mismatch')
+    if role_turn:
+        version = labels.get('dev-pair.codex.version')
+        require(type(version) is str and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version),
+                'exact image lacks a stable Codex version')
+        return version
 
 
 def bind(source, target, rw, *, executable=False):
@@ -602,7 +621,7 @@ def observed_mounts(root, binds):
     for target, is_writable in binds.items():
         options, _ = find(target)
         expected = {'nosuid', 'nodev', 'rw' if is_writable else 'ro'}
-        if target != GRAPHROOT:
+        if target not in (GRAPHROOT, PARENT_BUILD, JOB_BUILD):
             expected.add('noexec')
         require(expected <= options, f'effective mount flags differ at {target}')
 
@@ -690,8 +709,9 @@ def check_inner_inputs(engine, identity, release):
             'separate development-role frozen assembly identity missing')
 
 
-def fixed_entry(engine, identity, operation, check, started):
-    require(operation in ('probe', 'version'), 'unsupported Distrobox capability operation')
+def fixed_entry(engine, identity, operation, check, started, job=None):
+    require(operation in ('probe', 'version') and job is None or operation == 'job-turn' and job is not None,
+            'unsupported Distrobox capability operation')
     def live():
         row = engine.inspect('container', identity)
         check(row)
@@ -701,21 +721,28 @@ def fixed_entry(engine, identity, operation, check, started):
     try:
         _, output = bounded([str(BASE / 'distrobox-enter'), '--name', identity, '--no-tty', '--no-workdir',
                              '--clean-path', '--', '/usr/bin/python3', '-I', GPTBOX + '/runtime.py',
-                             'entry', operation], engine.deadline, env=engine.env)
+                             'entry', operation, *(job or ())], engine.deadline, env=engine.env,
+                            seconds=150 if job else 30)
     except Blocked as error:
         raise Blocked(f'pinned Distrobox {operation}: {error}') from error
     live()
     return output
 
 
-def controller(expected, owner, seconds):
+def controller(expected, owner, seconds, operation=None, request_sha=None):
     end = time.monotonic() + seconds
     manifest = read_manifest(Path(MANIFEST), expected, end)
+    if operation is not None:
+        require(re.fullmatch(r'[a-z0-9][a-z0-9-]{0,63}', operation) and hex_id(request_sha)
+                and file_hash(Path(ADMISSION_ROLE['/run/dev-pair-turn']) / 'request.json', 4096, end)[0] == request_sha,
+                'protected development operation identity mismatch')
+    job = (manifest['job'], operation, request_sha) if operation else None
     require(os.getuid() == os.getgid() == 1000 and os.getgroups() in ([], [1000]), 'controller user mismatch')
     self_proc = Path('/proc/self')
     parent = proc_snapshot(self_proc, OUTER_CAPS, 0, process_label(manifest, 'outer'), 1000, 1000)
     observed_mounts(self_proc, {GRAPHROOT: True, IMAGE_COPY_DIR: True, ARCHIVE: False, MANIFEST: False,
-                               **{f'{PARENT_JOB}/{key}': True for key in JOB_TARGETS}})
+                               **{f'{PARENT_JOB}/{key}': True for key in JOB_TARGETS},
+                               **({PARENT_BUILD: True, **dict.fromkeys(ADMISSION_ROLE.values(), False)} if job else {})})
     probe_parent_writes()
     helper_caps()
     require(file_hash(BASE / 'distrobox-enter', MANIFEST_LIMIT, end)[0] == ENTER_SHA256,
@@ -737,10 +764,15 @@ def controller(expected, owner, seconds):
         require(sorted(triples) == [(0, 1000, 1), (1, 1, 999), (1000, 1001, 64536)],
                 'rootless engine user namespace map mismatch')
     release = manifest['inner']
-    load_development_archive(engine, manifest, Path(ARCHIVE))
+    if job:
+        codex_version = load_development_archive(engine, manifest, Path(ARCHIVE), reuse=True)
+    else:
+        load_development_archive(engine, manifest, Path(ARCHIVE))
     name = 'dp-nested-' + owner[:24]
     target = {dest: (f'{PARENT_JOB}/{key}', True) for key, dest in JOB_TARGETS.items()}
-    mounts = [bind(src, dest, rw) for dest, (src, rw) in target.items()]
+    if job:
+        target.update({JOB_BUILD: (PARENT_BUILD, True), **{dest: (source, False) for dest, source in ADMISSION_ROLE.items()}})
+    mounts = [bind(src, dest, rw, executable=dest == JOB_BUILD) for dest, (src, rw) in target.items()]
     cycles = []
     def check(row):
         inspect_policy(row, identity, owner, manifest, 'inner', target)
@@ -753,7 +785,7 @@ def controller(expected, owner, seconds):
         identity = engine_id(created.decode('ascii').strip())
         check(engine.inspect('container', identity))
         previous = None
-        for _ in range(2):
+        for _ in range(1 if job else 2):
             engine('start nested development gptbox', 'start', identity)
             state = ready(engine, identity, check, previous)['State']
             previous = state['StartedAt']
@@ -761,13 +793,22 @@ def controller(expected, owner, seconds):
             require(type(pid) is int and pid > 1, 'inner PID is unavailable to parent')
             proc = Path('/proc') / str(pid)
             child = proc_snapshot(proc, (0, 0, 0, 0, 0), 1, process_label(manifest, 'inner'), 1000, 1000)
-            observed_mounts(proc, dict.fromkeys(JOB_TARGETS.values(), True))
+            observed_mounts(proc, {dest: writable for dest, (_, writable) in target.items()})
             require(child['cgroup'] == parent['cgroup']
                     and all(child['namespaces'][key] != parent['namespaces'][key] for key in NS_NAMES),
                     'inner process does not have private namespaces inside the outer cgroup')
             for kind in ('uid', 'gid'):
                 child[kind + '_map'] = ids((proc / (kind + '_map')).read_text(), [(1, 999), (1001, 64536)], 1000)
             check_inner_inputs(engine, identity, release)
+            if job:
+                version = fixed_entry(engine, identity, 'version', check, previous).strip()
+                require(version == f'codex-cli {codex_version}'.encode(), 'actual role binary version differs from exact image')
+                require(end - time.monotonic() > 155, 'insufficient time for the role turn and owned cleanup')
+                turn = json_data(fixed_entry(engine, identity, 'job-turn', check, previous, job))
+                require(turn.get('schema') == 2 and turn.get('operation') == operation and turn.get('job') == manifest['job']
+                        and turn.get('role') == 'development' and turn.get('request_sha256') == request_sha,
+                        'development turn receipt identity mismatch')
+                break
             probe = json_data(fixed_entry(engine, identity, 'probe', check, previous))
             require(probe.get('boundary_probe') == 'passed' and probe.get('uid') == 1000
                     and same_label(probe.get('selinux_label'), child['label']), 'Distrobox inner protected-write probe failed')
@@ -775,6 +816,10 @@ def controller(expected, owner, seconds):
             require(version == f'codex-cli {CODEX_VERSION}'.encode(), 'Distrobox Codex version mismatch')
             engine('stop nested development gptbox', 'stop', '--time=5', identity, seconds=15)
             cycles.append({'started_at': previous, 'proc': child, 'probe': probe, 'version': version.decode('ascii')})
+    if job:
+        return {'kind': 'dev-pair-devbox-job-v1', 'manifest_sha256': expected, 'owner': owner,
+                'inner_container_id': identity, 'inner_image_id': release['image_id'], 'child': child,
+                'started_at': previous, 'inner_removed': True, 'codex_version': codex_version, 'turn': turn}
     return {'kind': 'dev-pair-devbox-probe-v1', 'manifest_sha256': expected, 'owner': owner,
             'inner_container_id': identity, 'inner_image_id': release['image_id'], 'cycles': cycles,
             'inner_removed': True, 'job_admission': False}
@@ -788,10 +833,10 @@ if __name__ == '__main__':
     try:
         signal.signal(signal.SIGTERM, interrupt)
         signal.signal(signal.SIGINT, interrupt)
-        require(len(sys.argv) == 4, 'expected manifest digest, ownership token and probe seconds')
+        require(len(sys.argv) in (4, 6), 'expected manifest digest, ownership token, budget and paired operation inputs')
         budget = int(sys.argv[3])
         require(0 < budget < OUTER_SECONDS - CLEANUP_SECONDS, 'invalid nested time budget')
-        print(json.dumps(controller(hex_id(sys.argv[1]), hex_id(sys.argv[2]), budget), sort_keys=True))
+        print(json.dumps(controller(hex_id(sys.argv[1]), hex_id(sys.argv[2]), budget, *sys.argv[4:]), sort_keys=True))
     except (Blocked, OSError, KeyError, ValueError, TypeError, IndexError, subprocess.TimeoutExpired) as error:
         print(f'DevBox controller blocked: {error}', file=sys.stderr)
         sys.exit(2)

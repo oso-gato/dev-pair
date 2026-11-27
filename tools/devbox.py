@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one exact, offline DevBox and its nested development gptbox probe."""
+"""Run an exact DevBox and its nested development gptbox."""
 
 import argparse
 from contextlib import contextmanager
@@ -144,13 +144,18 @@ def check_label(path, expected):
     db.require(db.same_label(actual, expected), f'{path.name} SELinux volume label mismatch')
 
 
-def placement(account, manifest, actual_manifest):
+def placement(account, manifest, actual_manifest, job_turn=None):
     job = manifest['job']
     build = ROOT / 'builds' / job
     build_stat = private_dir(build, account)
     mountinfo = Path('/proc/self/mountinfo').read_text()
     storage = storage_mount(build, manifest['storage_bytes'], mountinfo)
     inputs = build / 'inputs'
+    if job_turn:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from gptbox_runtime import host_job_inputs
+
+        inputs /= job_turn[0]
     graph = build / 'graph'
     image_copy = build / 'image-copy'
     for directory in (graph, image_copy):
@@ -175,8 +180,20 @@ def placement(account, manifest, actual_manifest):
         source = ROOT / key / job
         private_dir(source, account)
         check_label(source, db.file_label(manifest, 'inner'))
-        db.require(next(source.iterdir(), None) is None, 'development probe requires fresh synthetic job data leaves')
+        if job_turn is None:
+            db.require(next(source.iterdir(), None) is None, 'development probe requires fresh synthetic job data leaves')
         mounts[f'{db.PARENT_JOB}/{key}'] = (str(source), True)
+    if job_turn:
+        _, operation, request_sha = job_turn
+        work = build / 'work'
+        db.require(private_dir(work, account).st_dev == build_stat.st_dev, 'job build must use bounded storage')
+        check_label(work, db.file_label(manifest, 'inner'))
+        mounts[db.PARENT_BUILD] = (str(work), True)
+        role_mounts, _ = host_job_inputs('development', job, operation, request_sha, account.pw_gid)
+        db.require(role_mounts.keys() == db.ADMISSION_ROLE.keys(), 'development role mount policy mismatch')
+        for target, (source, writable) in role_mounts.items():
+            check_label(Path(source), db.file_label(manifest, 'inner'))
+            mounts[db.ADMISSION_ROLE[target]] = (source, writable)
     sources = {Path(source) for source, _ in mounts.values()} | {inputs}
     for line in mountinfo.splitlines():
         target = Path(line.split()[4])
@@ -186,7 +203,7 @@ def placement(account, manifest, actual_manifest):
 
 
 @contextmanager
-def ownership(account, job, admission):
+def ownership(account, job, admission, *, job_turn=False):
     base = ROOT / 'evidence'
     private_dir(base, account)
     root = base / job
@@ -201,10 +218,10 @@ def ownership(account, job, admission):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise db.Blocked('the selected development leaf is in use') from error
-        path = root / 'owner.json'
+        path = root / ('owner-' + db.hex_id(admission) + '.json' if job_turn else 'owner.json')
         if not os.path.lexists(path):
             value = {'manifest_sha256': admission, 'owner': os.urandom(32).hex()}
-            stage = root / 'owner.new'
+            stage = path.with_suffix('.new')
             fd = os.open(stage, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
             with os.fdopen(fd, 'w') as output:
                 info = os.fstat(fd)
@@ -290,11 +307,12 @@ def validate_result(receipt, admission, owner, manifest):
                    and db.same_label(cycle['probe']['selinux_label'], label), 'nested probe evidence mismatch')
 
 
-def launch(engine, manifest, admission, account, owner, hooks, mounts):
+def launch(engine, manifest, admission, account, owner, hooks, mounts, job_turn=None):
     name = 'dp-devbox-' + owner[:24]
     image = manifest['outer']['image_id']
     with db.owned_container(engine, name, owner, image):
-        mount_args = [db.bind(src, dest, rw, executable=dest == db.GRAPHROOT) for dest, (src, rw) in mounts.items()]
+        mount_args = [db.bind(src, dest, rw, executable=dest in (db.GRAPHROOT, db.PARENT_BUILD))
+                      for dest, (src, rw) in mounts.items()]
         _, result = engine('create confined DevBox', 'create',
                            *db.container_args(name, owner, manifest, 'outer', hooks), *mount_args,
                            '--entrypoint=/usr/bin/sleep', image, str(db.OUTER_SECONDS))
@@ -312,20 +330,44 @@ def launch(engine, manifest, admission, account, owner, hooks, mounts):
         db.require(budget > 0, 'insufficient time left for nested entry and cleanup')
         _, output = engine('execute immutable nested controller', 'exec', '--user=1000:1000', identity,
                            '/usr/bin/python3', '-I', str(db.BASE / 'controller.py'), admission, owner,
-                           str(budget), seconds=budget + db.CLEANUP_SECONDS)
+                           str(budget), *(job_turn[1:] if job_turn else ()), seconds=budget + db.CLEANUP_SECONDS)
         receipt = db.json_data(output)
-        validate_result(receipt, admission, owner, manifest)
+        if job_turn:
+            validate_job_result(receipt, admission, owner, manifest, job_turn)
+        else:
+            validate_result(receipt, admission, owner, manifest)
         db.require(observe_parent(inspect(), manifest, account) == parent, 'outer DevBox changed during nested entry')
         enforcing(engine.deadline)
     return {'outer_container_id': identity, 'outer_image_id': image, 'parent': parent, 'outer_removed': True, **receipt}
 
 
+def validate_job_result(receipt, admission, owner, manifest, job_turn):
+    db.fields(receipt, 'kind manifest_sha256 owner inner_container_id inner_image_id child started_at inner_removed codex_version turn',
+              'nested role receipt')
+    db.require(receipt['kind'] == 'dev-pair-devbox-job-v1' and receipt['manifest_sha256'] == admission
+               and receipt['owner'] == owner and receipt['inner_image_id'] == manifest['inner']['image_id']
+               and receipt['inner_removed'] is True and db.STARTED.fullmatch(receipt['started_at'])
+               and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', receipt['codex_version'])
+               and db.same_label(receipt['child']['label'], db.process_label(manifest, 'inner')),
+               'inner role identity mismatch')
+    db.hex_id(receipt['inner_container_id'])
+    turn = receipt['turn']
+    db.require(turn['schema'] == 2 and turn['request_sha256'] == job_turn[2] and turn['operation'] == job_turn[1]
+               and turn['role'] == 'development' and turn['job'] == manifest['job']
+               and turn['status'] in ('completed-turn', 'failed-turn'), 'inner operation receipt mismatch')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('run',))
+    parser.add_argument('command', choices=('run',))
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--sha256', required=True, help='independently recorded manifest SHA-256')
+    parser.add_argument('--operation', help='run one protected live job turn in the exact placement')
+    parser.add_argument('--request-sha256', help='independently recorded immutable role request digest')
     args = parser.parse_args()
+    if (args.operation is None) != (args.request_sha256 is None):
+        parser.error('--operation and --request-sha256 are required together')
+    job_turn = (args.sha256, args.operation, args.request_sha256) if args.operation is not None else None
     end = time.monotonic() + db.OUTER_SECONDS
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, db.interrupt)
@@ -338,16 +380,16 @@ def main():
         engine = db.Engine([db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd'],
                            host_env(account), end)
         db.immutable_image(engine, manifest, 'outer')
-        with ownership(account, manifest['job'], args.sha256) as (owner, hooks):
+        with ownership(account, manifest['job'], args.sha256, job_turn=bool(job_turn)) as (owner, hooks):
             db.remove_owned(engine, 'dp-devbox-' + owner[:24], owner, manifest['outer']['image_id'])
-            mounts, storage = placement(account, manifest, args.manifest)
-            receipt = launch(engine, manifest, args.sha256, account, owner, hooks, mounts)
+            mounts, storage = placement(account, manifest, args.manifest, job_turn)
+            receipt = launch(engine, manifest, args.sha256, account, owner, hooks, mounts, job_turn)
         print(json.dumps({**receipt, 'storage': storage, 'standards_sha': db.STANDARDS,
                           'outer_source_sha': manifest['outer']['source_sha'],
                           'inner_source_sha': manifest['inner']['source_sha'],
                           'archive_sha256': manifest['inner']['archive_sha256']}, sort_keys=True))
-        return 0
-    except (db.Blocked, OSError, KeyError, ValueError, TypeError, IndexError) as error:
+        return 2 if job_turn and receipt['turn']['status'] != 'completed-turn' else 0
+    except (RuntimeError, OSError, KeyError, ValueError, TypeError, IndexError) as error:
         print(f'DevBox blocked: {error}', file=sys.stderr)
         return 2
 

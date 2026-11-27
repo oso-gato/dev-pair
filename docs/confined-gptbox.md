@@ -190,3 +190,67 @@ failure/launcher, command capture, report, timeout/resource/security and cleanup
 bounds stay unchanged. Matching native Podman/Fedora and distinct-owner DAC
 acceptance remain required; local synthetic-engine and real-pipe tests do not
 establish them. Standalone minimal preparation is unchanged.
+
+## Install protected CI maintenance releases
+
+Use the host-only route when protected CI supplies the maintenance image.
+Prepare the host from the verified public-input extraction of the reviewed
+checkout, maintenance context and pinned Distrobox checkout. Mount the
+dedicated, fully allocated managed ext4 and leave the required physical host
+reserve before applying this command.
+
+```sh
+/usr/bin/python3 /root/dev-pair-bootstrap-source/tools/gptbox.py prepare-maintenance-host \
+  --context "$MAINTENANCE_CONTEXT" --expected-context-sha256 "$MAINTENANCE_CONTEXT_SHA" \
+  --distrobox-source "$VERIFIED_DISTROBOX_CHECKOUT" --source-sha "$HOST_PREPARATION_SOURCE_SHA" \
+  --bootstrap-source "$AUTHORIZED_BOOTSTRAP_CIDR" --password-file "$CORE_PASSWORD_FILE" --apply
+```
+
+The source, context and access checks also run in preview mode. Use
+`--provider-ssh` on the CIDR route when the approved provider console uses an
+SSH-backed transport. For the independently verified out-of-band transport,
+use the signed `--console-receipt` instead of a bootstrap CIDR. The existing
+bootstrap authority validates the actual transport. The host-only command
+prepares host prerequisites, restricted service accounts, private roots and
+the fixed maintenance gateway. It publishes the protected host prepared
+marker after verification. An interrupted preparation retains its exact
+target, with one explicit same-target retry. The local build route remains
+available through `initialize` and `assemble`.
+
+The release installer runs this pair of checks against the exact accepted
+role artifact. It runs `preflight` before rootless OCI load, then `verify`
+after measuring the imported image and writing the protected, boot-bound
+`maintenance-import.json` in the release intake directory.
+
+```sh
+/usr/bin/python3 -B "$VERIFIED_HOST_DRIVER/tools/gptbox.py" verify-installed-maintenance \
+  --phase preflight --platform-sha256 "$PLATFORM_SHA" --context-sha256 "$MAINTENANCE_CONTEXT_SHA" \
+  --source-sha "$RELEASE_SOURCE_SHA" --image "$MAINTENANCE_IMAGE_ID" \
+  --oci-manifest-sha256 "$MAINTENANCE_MANIFEST_SHA"
+```
+
+Use the same exact arguments with `--phase verify` for the post-import check.
+The driver reads the signed portable index, protected intake receipt and
+producer metadata bound to the index. It independently inspects the intended
+rootless VFS store and selected OCI manifest, config, layers and labels. The
+imported image then completes two credential-free, confined Distrobox
+probe/version cycles. Each cycle also reads and checks the image-owned input
+and Distrobox seal. Probe cleanup verifies the exact owned container is gone
+and removes its empty temporary leaves.
+
+The protected local admission lives at
+`/var/lib/dev-pair/bootstrap/gptbox-adapter/<context>/imported-releases/<platform>/<image>/<boot>.json`.
+Each immutable receipt binds the current boot, signed platform and producer
+record to the selected image. Releases that reuse the same artifact each keep
+their own proof, so rollback retains the original release's evidence.
+Re-observe the installed image through the installer after reboot to publish
+the new boot-specific proof. The original CI producer result stays in the
+portable artifact. The locally assembled route checks the protected candidate,
+bounded assembly attempt and resource inventory, Distrobox attestation and
+completion that bind the selected sealed image.
+The normal [maintenance role entry](role-entry.md) accepts the exact local
+admission and still applies its separate job and provider gates.
+
+The source-level fixture exercises the CLI, protected records, ordering,
+two simulated native cycles and cleanup. The release installer and image
+need verification together on the designated enforcing Fedora host.
