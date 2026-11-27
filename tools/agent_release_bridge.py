@@ -12,7 +12,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 from typing import NamedTuple
 import zipfile
@@ -23,6 +22,9 @@ WORKFLOW = 'agent-refresh.yml'
 REPOSITORY = 'oso-gato/dev-pair'
 TOKYO = timezone(timedelta(hours=9))
 OBSERVATION_SECONDS = 300
+NIGHT_LENGTH = timedelta(hours=5, minutes=15, seconds=30)
+NIGHT_TERMINAL = {'publisher-failed', 'missed-publication', 'missed-observation', 'publication-expired',
+                  'observation-unavailable', 'queued', 'no-new-image', 'rejected'}
 TOOL_FIELDS = ('codex_version', 'codex_source_sha', 'codex_sha256')
 BINDING_FIELDS = {'schema', 'release_sha256', 'platform_sha256', 'base_platform_sha256',
                   'site_config_sha256', 'plan_sha256', 'intake_sha256'}
@@ -30,6 +32,11 @@ BINDING_FIELDS = {'schema', 'release_sha256', 'platform_sha256', 'base_platform_
 
 class BridgeError(ValueError):
     pass
+
+
+class Publication(NamedTuple):
+    status: str
+    run: int | None
 
 
 class Candidate(NamedTuple):
@@ -44,17 +51,22 @@ def require(condition, reason):
         raise BridgeError(reason)
 
 
+def nightly_period(now):
+    local = now.astimezone(TOKYO)
+    start = local.replace(hour=4, minute=0, second=0, microsecond=0)
+    if now < start:
+        start -= timedelta(days=1)
+    return start.astimezone(timezone.utc), (start + NIGHT_LENGTH).astimezone(timezone.utc)
+
+
 def selection_window(now, on_demand):
     if on_demand:
         return now - timedelta(hours=6), now, 'workflow_dispatch'
-    local = now.astimezone(TOKYO)
-    start = local.replace(hour=4, minute=0, second=0, microsecond=0)
-    if not start <= local <= start + timedelta(hours=5, minutes=15):
-        return None
-    return start.astimezone(timezone.utc), now, 'schedule'
+    start, cutoff = nightly_period(now)
+    return (start, now, 'schedule') if now <= cutoff else None
 
 
-def publisher_runs(values, source, window):
+def matching_runs(values, source, window):
     start, end, event = window
     rows = values.get('workflow_runs')
     require(type(rows) is list and len(rows) <= 8, 'unexpected publisher run inventory')
@@ -62,7 +74,6 @@ def publisher_runs(values, source, window):
     for row in rows:
         run = row.get('id')
         if (row.get('event') != event or row.get('head_sha') != source or row.get('head_branch') != 'main'
-                or row.get('status') != 'completed' or row.get('conclusion') != 'success'
                 or row.get('run_attempt') != 1 or row.get('path') != '.github/workflows/' + WORKFLOW
                 or row.get('repository', {}).get('full_name') != REPOSITORY
                 or row.get('head_repository', {}).get('full_name') != REPOSITORY):
@@ -73,9 +84,18 @@ def publisher_runs(values, source, window):
                 'invalid protected publisher creation time')
         created = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
         if start <= created <= end:
-            runs.append((created, run))
-    require(len({run for _, run in runs}) == len(runs), 'ambiguous publisher run ID')
-    return [run for _, run in sorted(runs, reverse=True)]
+            status = row.get('status')
+            conclusion = row.get('conclusion')
+            require(type(status) is str and (conclusion is None or type(conclusion) is str),
+                    'invalid protected publisher state')
+            runs.append((created, run, status, conclusion))
+    require(len({run for _, run, _, _ in runs}) == len(runs), 'ambiguous publisher run ID')
+    return sorted(runs, reverse=True)
+
+
+def publisher_runs(values, source, window):
+    return [run for _, run, status, conclusion in matching_runs(values, source, window)
+            if status == 'completed' and conclusion == 'success']
 
 
 def stable_version(version):
@@ -117,6 +137,8 @@ class Site:
         self.resolver = site.Resolver(self.controller)
         self.control = self.controller.control
         self.offer = renewal.trusted_directory(self.control / 'offers') / 'agent.json'
+        self.nightly_status = self.control / 'agent-nightly.json'
+        self.offer_owner = self.control / 'agent-bridge-offer.json'
 
     @contextlib.contextmanager
     def lease(self):
@@ -154,29 +176,104 @@ class Site:
             return 'busy', state
         return 'ready', state
 
-    def discover(self, window):
+    @contextlib.contextmanager
+    def discovery_directory(self):
+        directory = self.control / 'agent-discovery'
+        directory.mkdir(mode=0o700, exist_ok=True)
+        node = directory.lstat()
+        require(stat.S_ISDIR(node.st_mode) and node.st_uid == os.geteuid() and
+                stat.S_IMODE(node.st_mode) == 0o700, 'unsafe owned agent discovery directory')
+        subject = directory / 'platform.json'
+
+        def reset():
+            if os.path.lexists(subject):
+                node = subject.lstat()
+                require(stat.S_ISREG(node.st_mode) and node.st_uid == os.geteuid() and node.st_nlink == 1
+                        and not node.st_mode & 0o022, 'unsafe retained partial agent discovery subject')
+                subject.unlink()
+
+        reset()
+        require(not any(directory.iterdir()), 'unexpected entry in owned agent discovery directory')
+        try:
+            yield directory
+        finally:
+            reset()
+
+    def publisher(self, window, end):
         f, p = self.intake, self.protocol
-        end = time.monotonic() + OBSERVATION_SECONDS
         f.protected(f.ROOT, directory=True)
         branch = f.read_api('branches/main', end)
         require(branch.get('protected') is True, 'agent publisher requires independently protected main')
         source = p.hex_id(branch.get('commit', {}).get('sha'), 40)
         event = window[2]
-        rows = f.read_api(f'actions/workflows/{WORKFLOW}/runs?branch=main&event={event}&status=completed&per_page=8', end)
-        runs = publisher_runs(rows, source, window)
+        rows = f.read_api(f'actions/workflows/{WORKFLOW}/runs?branch=main&event={event}&per_page=8', end)
+        return source, matching_runs(rows, source, window)
+
+    def discover(self, window):
+        f, p = self.intake, self.protocol
+        end = time.monotonic() + OBSERVATION_SECONDS
+        source, runs = self.publisher(window, end)
         if not runs:
-            return None
-        run = runs[0]
+            return Publication('awaiting-publication', None)
+        _, run, status, conclusion = runs[0]
+        if status != 'completed':
+            return Publication('publisher-running', run)
+        if conclusion != 'success':
+            return Publication('publisher-failed', run)
         f.checked_run(f.read_api(f'actions/runs/{run}', end), source, run, True)
         artifacts = f.artifacts(f.read_api(f'actions/runs/{run}/artifacts?per_page=100', end), source, True)
-        with tempfile.TemporaryDirectory(dir=f.ROOT, prefix='.agent-discovery-') as directory:
-            stage = Path(directory)
+        with self.discovery_directory() as stage:
             name = f.release.artifact_name('subjects', source)
             f.fetch_artifact(artifacts, name, stage, {'platform.json': (None, p.CONTROL_LIMIT)}, end)
             raw = (stage / 'platform.json').read_bytes()
             index = p.portable_index(p.json_bytes(raw), source, run)
             require(raw == p.canonical(index), 'publisher index has noncanonical bytes')
         return Candidate(run, source, hashlib.sha256(raw).hexdigest(), index)
+
+    def record_nightly(self, start, result):
+        with self.controller.lock():
+            status, _ = self.transition()
+            if status != 'ready':
+                return result
+            binding, index = self.live()
+            prior = self.renewal.read_json(self.nightly_status) if os.path.lexists(self.nightly_status) else {}
+            period = start.isoformat()
+            if prior.get('scheduled_at', '') > period:
+                raise BridgeError('nightly observation time regressed')
+            if (prior.get('scheduled_at') == period and prior.get('status') in NIGHT_TERMINAL and
+                    result['status'] not in NIGHT_TERMINAL):
+                return result
+            observed = {'schema': 1, 'scheduled_at': period, 'status': result['status'], 'run': result.get('run'),
+                        'retained_release_sha256': binding['release_sha256'],
+                        'retained_platform_sha256': binding['platform_sha256'],
+                        'retained_codex_version': index['components']['maintenance-agent']['codex_version']}
+            if 'platform_sha256' in result:
+                observed['candidate_platform_sha256'] = result['platform_sha256']
+            if prior != observed:
+                self.renewal.replace_json(self.nightly_status, observed)
+            return result
+
+    def nightly(self, now):
+        start, cutoff = nightly_period(now)
+        if now <= cutoff:
+            return self.record_nightly(start, self.cycle((start, now, 'schedule')))
+        with self.lease():
+            if os.path.lexists(self.nightly_status):
+                prior = self.renewal.read_json(self.nightly_status)
+                if prior.get('scheduled_at') == start.isoformat() and prior.get('status') in NIGHT_TERMINAL:
+                    return prior
+            try:
+                _, runs = self.publisher((start, cutoff, 'schedule'), time.monotonic() + OBSERVATION_SECONDS)
+                if not runs:
+                    result = {'status': 'missed-publication'}
+                else:
+                    _, run, status, conclusion = runs[0]
+                    outcome = ('publication-expired' if status != 'completed' else
+                               'missed-observation' if conclusion == 'success' else 'publisher-failed')
+                    result = {'status': outcome, 'run': run}
+            except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.SubprocessError):
+                result = {'status': 'observation-unavailable'}
+            return self.record_nightly(start, result)
 
     def stage(self, candidate, binding):
         f = self.intake
@@ -211,7 +308,47 @@ class Site:
         subprocess.run(['/usr/bin/python3', '-EBs', str(tool), *arguments], env=self.intake.native_env(),
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=timeout, check=True)
 
-    def pending(self, offer, binding, state):
+    def owned(self):
+        if not os.path.lexists(self.offer_owner):
+            return []
+        own = self.renewal.read_json(self.offer_owner)
+        require(type(own) is dict and set(own) == {'schema', 'offers'} and type(own['schema']) is int and
+                own['schema'] == 1 and type(own['offers']) is list and 0 < len(own['offers']) <= 2,
+                'invalid agent bridge offer ownership')
+        return [self.protocol.hex_id(value) for value in own['offers']]
+
+    def publish_offer(self, offer):
+        r = self.renewal
+        owned = self.owned()
+        previous = r.identity(r.read_json(self.offer)) if os.path.lexists(self.offer) else None
+        identity = r.identity(offer)
+        custody = [previous, identity] if previous in owned and previous != identity else [identity]
+        r.replace_json(self.offer_owner, {'schema': 1, 'offers': custody})
+        r.replace_json(self.offer, offer)
+        if len(custody) > 1:
+            r.replace_json(self.offer_owner, {'schema': 1, 'offers': [identity]})
+
+    def supersedable(self, old, binding, candidate, state):
+        r = self.renewal
+        if (r.identity(old) not in self.owned() or old['previous_release_sha256'] != binding['release_sha256'] or
+                old['site_config_sha256'] != binding['site_config_sha256'] or
+                (state is not None and state['request']['operation'] == old['operation'])):
+            return False
+        request = self.control / 'requests' / 'agent.json'
+        if os.path.lexists(request):
+            return False
+        attempts = self.control / 'attempts'
+        for position, attempt in enumerate(attempts.iterdir()):
+            require(position < r.MAX_ATTEMPTS, 'renewal attempt inventory exceeds its bound')
+            journal = r.read_json(r.trusted_directory(attempt) / 'journal.json')
+            if journal['request']['operation'] == old['operation']:
+                return False
+        _, previous, _ = self.resolver.index(old['platform_sha256'])
+        a, b = (stable_version(value['components']['maintenance-agent']['codex_version'])
+                for value in (previous, candidate.index))
+        return a < b
+
+    def pending(self, offer, binding, state, candidate=None):
         if not os.path.lexists(self.offer):
             return False
         r = self.renewal
@@ -226,6 +363,8 @@ class Site:
         if state is not None and state['request']['operation'] == old['operation'] and \
                 state['phase'] in ('rejected', 'rolled-back'):
             return False
+        if candidate is not None and self.supersedable(old, binding, candidate, state):
+            return 'supersede-owned'
         return 'other-offer'
 
     def dispatch(self):
@@ -242,6 +381,8 @@ class Site:
             candidate = self.discover(window)
             if candidate is None:
                 return {'status': 'awaiting-publication'}
+            if isinstance(candidate, Publication):
+                return {'status': candidate.status} if candidate.run is None else {'status': candidate.status, 'run': candidate.run}
             if not eligible(candidate, binding, previous):
                 return {'status': 'no-new-image', 'run': candidate.run}
             offer = {'schema': 2, 'scope': 'agent', 'operation': f'agent-ci-{candidate.run}-{candidate.digest[:24]}',
@@ -253,20 +394,27 @@ class Site:
                 status, state = self.transition()
                 if status != 'ready' or self.live()[0] != binding:
                     return {'status': 'predecessor-changed'}
-                pending = self.pending(offer, binding, state)
-                if pending and pending != 'queued':
+                pending = self.pending(offer, binding, state, candidate)
+                if pending and pending not in ('queued', 'supersede-owned'):
                     return {'status': pending, 'run': candidate.run}
+                old_offer = self.renewal.identity(self.renewal.read_json(self.offer)) if pending == 'supersede-owned' else None
             self.stage(candidate, binding)
+            if pending == 'supersede-owned':
+                version = candidate.index['components']['maintenance-agent']['codex_version']
+                require(self.intake.release.official_version() == version, 'replacement is not the current official stable')
             with self.controller.lock():
                 status, state = self.transition()
                 if status != 'ready' or self.live()[0] != binding:
                     return {'status': 'predecessor-changed'}
-                pending = self.pending(offer, binding, state)
-                if pending and pending != 'queued':
-                    return {'status': pending, 'run': candidate.run}
+                final_pending = self.pending(offer, binding, state, candidate)
+                if final_pending and (final_pending not in ('queued', 'supersede-owned') or
+                                      final_pending == 'supersede-owned' and
+                                      self.renewal.identity(self.renewal.read_json(self.offer)) != old_offer):
+                    return {'status': 'other-offer' if final_pending == 'supersede-owned' else final_pending,
+                            'run': candidate.run}
                 self.resolver.resolve(offer)
-                if not pending:
-                    self.renewal.replace_json(self.offer, offer)
+                if final_pending != 'queued':
+                    self.publish_offer(offer)
             self.dispatch()
         return {'status': 'queued', 'run': candidate.run, 'platform_sha256': candidate.digest}
 
@@ -281,13 +429,6 @@ def main():
     require(os.getuid() == os.geteuid() == 0, 'protected agent bridge operator required')
     os.umask(0o077)
     now = datetime.now(timezone.utc)
-    windows = [selection_window(now, args.on_demand)]
-    if args.poll:
-        windows.append(selection_window(now, True))
-    windows = [window for window in windows if window is not None]
-    if not windows:
-        print('{"status":"outside-nightly-window"}')
-        return
     sys.path.insert(0, str(INSTALL))
     import platform_release_intake as intake
     import platform_release_protocol as protocol
@@ -295,10 +436,14 @@ def main():
     import renewal_site
 
     site = Site(renewal, renewal_site, intake, protocol)
-    for window in windows:
-        result = site.cycle(window)
-        if result['status'] not in ('awaiting-publication', 'no-new-image'):
-            break
+    if args.on_demand:
+        result = site.cycle(selection_window(now, True))
+    else:
+        result = site.nightly(now)
+        if args.poll and result['status'] not in ('queued', 'renewal-busy'):
+            manual = site.cycle(selection_window(now, True))
+            if manual['status'] != 'awaiting-publication':
+                result = manual
     print(json.dumps(result, sort_keys=True))
 
 

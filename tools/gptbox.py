@@ -299,13 +299,17 @@ class Gptbox(Bootstrap):
             if recorded.encode() != data:
                 raise Blocked('adapter revision does not identify executing source')
 
-    def use_ci_tooling(self, expected_digest):
-        """Use only the tooling attached to the authenticated disposable producer request."""
+    def ci_producer_source(self):
         source = Path('/root/dev-pair-ci-inputs/dev-pair')
         if (self.root != Path('/') or os.getuid() != 0 or os.geteuid() != 0 or
                 Path(__file__).resolve().parents[1] != source or
                 Path('/proc/self/cgroup').read_text().strip() != '0::/system.slice/dev-pair-ci-provision.service'):
             raise Blocked('refresh tooling is confined to the authenticated native CI producer')
+        return source
+
+    def use_ci_tooling(self, expected_digest):
+        """Use only the tooling attached to the authenticated disposable producer request."""
+        source = self.ci_producer_source()
         request_path = Path('/var/lib/dev-pair/ci-executor/request.json')
         request = json.loads(self.protected_bytes(request_path, 65536, 0o600), object_pairs_hook=fedora_oci.unique)
         incoming = request['inputs']
@@ -314,11 +318,12 @@ class Gptbox(Bootstrap):
                 incoming.get('refresh_tooling_sha256') != raw_digest(expected_digest) or
                 incoming.get('scenario', 'maintenance') != self.role or 'platform_export' not in incoming):
             raise Blocked('native CI request does not authorize this exact refresh role or evidence')
-        self.source(revision)
+        # The authenticated guest has already verified the exact payload bytes.
+        # Leave Git-object verification to inputs() after the signed prerequisite.
+        helper_path = self.protected(source / 'tools/public_inputs.py')
         helper = fedora_oci._public_inputs()
-        helper_path = self.protected(Path(helper.__file__))
-        if self.run('/usr/bin/git', '-C', str(source), 'show', revision + ':tools/public_inputs.py').encode() != helper_path.read_bytes():
-            raise Blocked('refresh input verification helper differs from reviewed source')
+        if Path(helper.__file__) != helper_path:
+            raise Blocked('refresh input verification helper is outside the admitted checkout')
         evidence = source.parent / 'evidence'
         raw = self.protected_bytes(evidence / 'tooling.json', 65536, 0o444)
         tooling = helper.tooling_record(json.loads(raw, object_pairs_hook=fedora_oci.unique), revision)
@@ -369,11 +374,15 @@ class Gptbox(Bootstrap):
             if recorded.encode() != path.read_bytes():
                 raise Blocked('upstream Distrobox script does not match exact Git object')
             scripts[name] = path.read_bytes()
-        self.protected(Path(fedora_oci._public_inputs().__file__))
-        actual = self.run('/usr/bin/git','-C',str(Path(__file__).resolve().parents[1]),'show',revision+':tools/public_inputs.py')
-        if actual.encode() != Path(fedora_oci._public_inputs().__file__).read_bytes():
-            raise Blocked('executing public input dependency differs from reviewed source')
+        self.verify_public_input_source(revision)
         return manifest, scripts
+
+    def verify_public_input_source(self, revision):
+        helper = self.protected(Path(fedora_oci._public_inputs().__file__))
+        repo = Path(__file__).resolve().parents[1]
+        actual = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/public_inputs.py')
+        if actual.encode() != helper.read_bytes():
+            raise Blocked('executing public input dependency differs from reviewed source')
 
     def execute(self, *args, timeout=120, ok=(0,)):
         prefix = [value.replace('RuntimeMaxSec=1800', 'RuntimeMaxSec=' + str(timeout)) for value in self.executor]
@@ -1657,7 +1666,10 @@ class Gptbox(Bootstrap):
                     console_receipt=None):
         self.preflight()
         sources = self.validate_bootstrap_access(sources, console_receipt)
-        _, _, manifest = self.check_gptbox_inputs(context, expected)
+        if self.ci_tooling_request is None:
+            _, _, manifest = self.check_gptbox_inputs(context, expected)
+        else:
+            manifest = self.context_inputs(context, expected, revision)
         if manifest['source_sha'] != revision or not re.fullmatch(r'[0-9a-f]{40}', revision or ''):
             raise Blocked('initialize context/source target mismatch')
         # Python-only protection/content admission precedes even the narrow Git

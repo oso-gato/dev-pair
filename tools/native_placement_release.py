@@ -59,6 +59,13 @@ def read_index(producer, platform_sha):
     return root, index
 
 
+def local_predecessor(producer, root, identity, index):
+    from platform_release_protocol import site_predecessor
+
+    proof = metadata(producer, root / 'site-predecessor.json', mode=0o600)
+    return site_predecessor(proof, identity, index['base_platform_sha256'])
+
+
 def read_part(producer, root, index, role):
     from platform_release import portable_image, publication_evidence
     from platform_release_protocol import COMPONENT, image_record
@@ -117,6 +124,7 @@ class Candidate:
     tooling: dict
     entry: dict
     geometry: dict
+    schema: int = 2
 
 
 def candidate(producer, identity, job):
@@ -148,12 +156,13 @@ def candidate(producer, identity, job):
               'selected job is outside the protected site inventory')
     outer_path = producer.protected(base_root / 'devbox/devbox.oci.tar')
     inner_path = producer.protected(root / 'development/development.oci.tar')
-    previous = index['previous_platform_sha256']
+    previous = (local_predecessor(producer, root, identity, index) if index['schema'] == 3
+                else index['previous_platform_sha256'])
     boot = machine(settings, time.monotonic() + 30)
     return Candidate(identity, base, site, index['source_sha'], job, previous, root, boot,
                      outer_part, outer_path, inner, inner_path, inner_part['oci_manifest_sha256'],
                      digest(n.image_inputs_bytes(inner)), index['components']['development-agent'],
-                     stage_source(producer, base_root, base_index), jobs[job])
+                     stage_source(producer, base_root, base_index), jobs[job], index['schema'])
 
 
 def rootfs_evidence(archive, blobs, layers, end):
@@ -312,6 +321,17 @@ def current_selection(producer, item):
         db.hex_id(binding[key])
     if binding['platform_sha256'] == item.identity or item.base != item.identity:
         n.require(binding['base_platform_sha256'] == item.base, 'selected stable base differs')
+    if item.schema == 3:
+        root, index = read_index(producer, item.identity)
+        n.require(local_predecessor(producer, root, item.identity, index) == item.previous,
+                  'local release predecessor changed during placement')
+        selected = binding['platform_sha256']
+        prior_root, prior_index = read_index(producer, selected)
+        raw = producer.protected_bytes(prior_root / 'intake.json', db.MANIFEST_LIMIT, 0o600)
+        if prior_index['schema'] == 3:
+            local_predecessor(producer, prior_root, selected, prior_index)
+            raw += producer.protected_bytes(prior_root / 'site-predecessor.json', db.MANIFEST_LIMIT, 0o600)
+        n.require(digest(raw) == binding['intake_sha256'], 'selected platform intake evidence changed')
     return reference
 
 

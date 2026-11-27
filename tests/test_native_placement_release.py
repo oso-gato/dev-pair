@@ -278,7 +278,7 @@ class TestCurrentSelection(unittest.TestCase):
         self.site = self.root / 'site-current.json'
         self.bindings = self.root / 'platform-bindings'
         self.bindings.mkdir()
-        self.item = SimpleNamespace(previous='d' * 64, identity=PLATFORM, site=SITE, base=BASE)
+        self.item = SimpleNamespace(previous='d' * 64, identity=PLATFORM, site=SITE, base=BASE, schema=2)
         self.ref = 'c' * 64
         self.enterContext(patch.object(g, 'RENEWAL', self.root))
 

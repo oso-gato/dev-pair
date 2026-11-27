@@ -1,5 +1,6 @@
 import contextlib
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -42,12 +43,23 @@ class LocalSite(bridge.Site):
         self.current = current
         self.state = None
         self.candidate = None
+        self.control = directory
         self.offer = directory / 'offer.json'
+        self.offer_owner = directory / 'agent-bridge-offer.json'
+        self.nightly_status = directory / 'agent-nightly.json'
+        (directory / 'requests').mkdir()
+        (directory / 'attempts').mkdir()
+        self.publisher_rows = []
+        self.known = {current.digest: current.index}
+        self.protocol = SimpleNamespace(hex_id=lambda value: value)
+        self.intake = SimpleNamespace(release=SimpleNamespace(official_version=lambda: self.candidate.index['components']['maintenance-agent']['codex_version']))
         self.controller = SimpleNamespace(lock=self.lock)
         self.site = SimpleNamespace(offer_record=lambda offer, scope: offer)
         self.renewal = SimpleNamespace(read_json=lambda path: json.loads(path.read_bytes()),
+                                       identity=lambda value: hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest(),
+                                       MAX_ATTEMPTS=32, trusted_directory=lambda path: path,
                                        replace_json=lambda path, value: path.write_text(json.dumps(value)))
-        self.resolver = SimpleNamespace(resolve=self.resolve)
+        self.resolver = SimpleNamespace(resolve=self.resolve, index=lambda value: (None, self.known[value], None))
         self.trace = []
         self.locked = False
         self.race = None
@@ -82,9 +94,13 @@ class LocalSite(bridge.Site):
         self.trace.append(('discover', window[2]))
         return self.candidate
 
+    def publisher(self, window, end):
+        return SOURCE, self.publisher_rows
+
     def stage(self, candidate, binding):
         assert not self.locked
         self.trace.append(('verify-and-install', candidate.run, binding['platform_sha256']))
+        self.known[candidate.digest] = candidate.index
         if self.race:
             self.current = self.race
             self.binding = self.binding_for(self.race)
@@ -144,6 +160,68 @@ class AgentBridgeTests(unittest.TestCase):
                 self.assertEqual(site.trace[-1], ('reconcile', candidate.digest))
                 site.accept()
                 self.assertEqual(site.cycle(later_window)['status'], 'no-new-image')
+
+    def test_failed_and_missed_nights_bind_retained_exact_site_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            current = release(1, '0.169.0', '4', '5')
+            site = LocalSite(Path(directory), current)
+            site.candidate = bridge.Publication('publisher-running', 8)
+            self.assertEqual(site.nightly(timestamp(26, 20))['status'], 'publisher-running')
+            site.candidate = bridge.Publication('publisher-failed', 8)
+            self.assertEqual(site.nightly(timestamp(26, 22))['status'], 'publisher-failed')
+            retained = json.loads(site.nightly_status.read_bytes())
+            self.assertEqual((retained['run'], retained['retained_platform_sha256']), (8, current.digest))
+            self.assertEqual(site.nightly(timestamp(27, 0, 30))['status'], 'publisher-failed')
+            site.publisher_rows = []
+            self.assertEqual(site.nightly(timestamp(28, 0, 30))['status'], 'missed-publication')
+            self.assertEqual(json.loads(site.nightly_status.read_bytes())['retained_release_sha256'],
+                             site.binding['release_sha256'])
+            self.assertFalse(site.offer.exists())
+
+    def test_owned_unactivated_offer_superseded_only_after_newer_verified_staging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = LocalSite(Path(directory), release(1, '0.169.0', '4', '5'))
+            first = release(2, '0.170.0', '6', '7')
+            site.candidate = first
+            self.assertEqual(site.cycle(bridge.selection_window(timestamp(26, 22), False))['status'], 'queued')
+            old = site.offer.read_bytes()
+            new = release(3, '0.171.0', '8', '9')
+            site.candidate = new
+            window = bridge.selection_window(timestamp(27, 22), False)
+            request = site.control / 'requests/agent.json'
+            request.write_text('{}')
+            self.assertEqual(site.cycle(window)['status'], 'other-offer')
+            self.assertEqual(site.offer.read_bytes(), old)
+            request.unlink()
+            owned = site.offer_owner.read_bytes()
+            site.offer_owner.unlink()
+            self.assertEqual(site.cycle(window)['status'], 'other-offer')
+            self.assertEqual(site.offer.read_bytes(), old)
+            site.offer_owner.write_bytes(owned)
+            self.assertEqual(site.cycle(window)['status'], 'queued')
+            self.assertEqual(json.loads(site.offer.read_bytes())['platform_sha256'], new.digest)
+            self.assertIn(first.digest, site.known)
+
+    def test_interrupted_discovery_reopens_only_its_owned_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            site = LocalSite(Path(directory), release(1, '0.169.0', '4', '5'))
+            scratch = site.control / 'agent-discovery'
+            scratch.mkdir(mode=0o700)
+            partial = scratch / 'platform.json'
+            partial.write_bytes(b'partial transport')
+            unrelated = site.control / 'unrelated'
+            unrelated.write_bytes(b'preserved')
+            with site.discovery_directory() as stage:
+                self.assertEqual(stage, scratch)
+                self.assertFalse(partial.exists())
+                partial.write_bytes(b'complete')
+            self.assertFalse(partial.exists())
+            self.assertEqual(unrelated.read_bytes(), b'preserved')
+            partial.symlink_to(unrelated)
+            with self.assertRaisesRegex(bridge.BridgeError, 'unsafe retained'):
+                with site.discovery_directory():
+                    self.fail('symlink was admitted')
+            self.assertEqual(unrelated.read_bytes(), b'preserved')
 
     def test_requires_new_eligible_signed_identity_and_keeps_legacy_exact_chain(self):
         original = release(1, '0.169.0', '4', '5')

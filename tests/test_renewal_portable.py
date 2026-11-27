@@ -92,7 +92,7 @@ class PortableSiteTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
-    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None, local_prior=None, run=None):
+    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None, local_prior=None, run=None, native=False):
         source = source_code * 40
         roles = ('maintenance', 'development') if agent else ('maintenance', 'development', 'devbox', 'host')
         index = {'schema': 3 if local_prior is not None else 2, 'kind': site.AGENT if agent else site.FULL, 'repository': 'oso-gato/dev-pair',
@@ -124,6 +124,28 @@ class PortableSiteTests(unittest.TestCase):
                     inner = {**{key: value for key, value in image.items() if key != 'role'},
                              'inputs_sha256': '5'*64, 'sealed_sha256': '6'*64}
                 capabilities = {'maintenance': {'result_sha256': '9'*64}, 'development': inner, 'devbox': {}}
+                if native:
+                    import fedora_oci
+                    base_proof = {'source': fedora_oci.PROVENANCE, 'imported_config': 'sha256:' + fedora_oci.CONFIG,
+                                  'imported_manifest': 'sha256:' + fedora_oci.MANIFEST,
+                                  'conversion': 'source manifest/config retained on load; storage save gzip representation derived and fully rehashed',
+                                  'saveback': {'manifest_sha256': '3'*64, 'config_sha256': fedora_oci.CONFIG,
+                                               'compressed_layer_sha256': '4'*64, 'diff_id_sha256': fedora_oci.DIFF,
+                                               'derivation': 'storage export gzip recompression allowed; exact source config bytes and rootfs diff stream required'},
+                                  'verification': 'Source archive chain plus exported config-byte/rootfs-diff equality and full derived descriptor/blob graph',
+                                  'failure_recovery': 'Import is nontransactional; unreferenced store layers may remain, no broad prune/removal'}
+                    if role == 'maintenance':
+                        result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': source, 'context_sha256': context,
+                                  'distrobox_sha': site.DBX_SOURCE, 'assembled_image_id': image['image_id'], 'boundary_and_version_cycles': 2,
+                                  'runtime_container_removed': True, 'job_admission': False, 'fedora_base': base_proof,
+                                  'runtime_container_id': '4'*64, 'authentication': 'not verified', 'model_access': 'not verified',
+                                  'nested_placement': 'not verified',
+                                  'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}
+                        capabilities[role] = {'result': result, 'result_sha256': r.sha(site.image_inputs_bytes(result))}
+                    elif role == 'devbox':
+                        image['diff_ids'].append('sha256:' + '8'*64)
+                        capabilities[role] = {'tooling_image_id': '9'*64, 'tooling_diff_ids': image['diff_ids'][:1],
+                                              'tooling_recipe_sha256': '8'*64, 'signed_base': base_proof}
                 filenames = {role + '.oci.tar': archive, 'part.json': self.canonical({'schema': 1, 'image': image,
                               'oci_manifest_sha256': oci, 'producer': capabilities[role]})}
             files[role] = filenames

@@ -46,3 +46,15 @@ must have its verified physical reserve. A base plus two successful agent refres
 fits the package count. Later acquisition requires the existing bounded retained
 release policy to reconcile old packages with dependency and rollback evidence.
 The bridge performs no package pruning and preserves the active and recovery bytes.
+
+The latest scheduled outcome is written to the protected renewal control directory
+as `agent-nightly.json`. It records the observed run or missed window and the exact
+retained site release, platform and Codex version. A late observation can see a
+failed or missed run without attempting activation outside the schedule window.
+Discovery uses a separate fixed scratch directory, which reclaims only its owned
+partial portable index on a later attempt.
+
+An obsolete bridge-owned offer can be replaced only after independent verification
+and same-boot staging of a newer current official stable. The exact predecessor
+must still be active and no agent request or matching renewal attempt may exist.
+The prior installed evidence stays available for scoped recovery.

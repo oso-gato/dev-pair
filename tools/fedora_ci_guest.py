@@ -1665,12 +1665,14 @@ def development_readback(source, expected, built, end):
     sys.path.insert(0, str(tools))
     try:
         spec.loader.exec_module(module)
+        app = module.DevelopmentGptbox()
+        if 'refresh_tooling_sha256' in expected:
+            app.use_ci_tooling(expected['refresh_tooling_sha256'])
+            app.source(expected['source_sha'])
+            app.verify_public_input_source(expected['source_sha'])
     finally:
         sys.path.pop(0)
         sys.dont_write_bytecode = old_cache
-    app = module.DevelopmentGptbox()
-    if 'refresh_tooling_sha256' in expected:
-        app.use_ci_tooling(expected['refresh_tooling_sha256'])
     return development_release_evidence(module, app, expected, built, end)
 
 
