@@ -1499,8 +1499,7 @@ class Live:
 
         intake, end = Intake(), time.monotonic() + 45
         if not os.path.lexists(intake.site / 'repositories.json'):
-            raise Pending('owner-catalogue-source-gap', 'The first approved owner catalogue has no automatic producer.',
-                          source_gap=True)
+            raise Pending('owner-catalogue-selection', 'The first owner catalogue needs an inspected and confirmed repository and provider scope.')
         failures = (Blocked, BootstrapBlocked, OSError, ValueError, RuntimeError, TypeError, KeyError, subprocess.SubprocessError)
         try:
             repositories, slots = intake.catalogue_settings()

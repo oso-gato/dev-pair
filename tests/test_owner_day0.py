@@ -48,13 +48,14 @@ class DayZeroTests(unittest.TestCase):
         self.entry.call = Mock(return_value={'phase': 'ready', 'owner_terminal': None,
             'timers': {'dev-pair-checklist-spool.timer': {'next': ['scheduled']}},
             'held_features': ['agent-renewal', 'owner-intake'],
-            'pending_features': {'agent-renewal': 'release-read-custody', 'owner-intake': 'owner-catalogue'}})
+            'pending_features': {'agent-renewal': 'release-read-custody', 'owner-intake': 'owner-catalogue-selection'}})
         self.entry.commission(self.identity, SOURCE)
         _, _, stage, details = self.entry.stage.call_args.args
         self.assertEqual(stage, 'managed-listener-ready')
         self.assertIn('Checklist cleanup is scheduled.', details)
         self.assertIn('Agent renewal is held pending release read custody.', details)
-        self.assertIn('Owner intake is held pending owner catalogue.', details)
+        self.assertIn('Owner intake is held pending owner catalogue selection.', details)
+        self.assertIn('/usr/libexec/dev-pair/tools/owner_intake.py --inspect-site.', details)
         self.assertNotIn('terminal is available', details)
 
     def test_gitless_kit_verification_and_signed_prerequisite(self):

@@ -637,8 +637,14 @@ class DayZero:
             lines = ['The managed checklist listener is ready.']
             for name in sorted(observed.get('timers', {})):
                 lines.append(f'{timer_labels[name]} is scheduled.')
-            for name, reason in sorted(observed.get('pending_features', {}).items()):
+            pending = observed.get('pending_features', {})
+            for name, reason in sorted(pending.items()):
                 lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
+                if name == 'owner-intake' and reason == 'owner-catalogue-selection':
+                    lines.append('Inspect the first owner setup with /usr/bin/python3 -IB '
+                                 '/usr/libexec/dev-pair/tools/owner_intake.py --inspect-site.')
+            if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
+                lines.append('Owner jobs remain held.')
             for units in observed.get('retained_services', {}).values():
                 for unit in units:
                     lines.append(f'{unit} is still running from an earlier launch.')

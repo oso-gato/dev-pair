@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -IB
 """Accept a confirmed owner brief through the existing product conductor."""
 
+import argparse
 import contextlib
 import fcntl
 import os
@@ -10,6 +11,7 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -23,6 +25,7 @@ from startup_delivery import IDS, load_private
 
 SITE = Path('/etc/dev-pair/product-intake')
 CREDENTIALS = Path('/etc/dev-pair/provider-credentials')
+BILLING_EVIDENCE = Path('/etc/dev-pair/provider-evidence')
 ROOT = candidate.ROOT
 CATALOGUE = ROOT / 'product-jobs'
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -236,11 +239,11 @@ class Intake:
         p.require(type(plan['development_manifests']) is dict, 'The approved job layout is unavailable.')
         return controller, selected, plan['development_manifests']
 
-    def slot(self, job, dev_manifest):
+    def slot(self, job, dev_manifest, *, staging=None):
         from gptbox import capture_release_file
         from provider_broker import grant_document, reserved_cost
 
-        slot = self.site / 'slots' / job
+        slot = self.site / 'slots' / job if staging is None else staging
         settings = p.loads(checked_file(slot / 'profile.json'))
         p.fields(settings, 'schema host_seconds build_seconds turn_seconds allowance_ref spend_microusd expires_unix pricing')
         p.number(settings['schema'], 1, 1)
@@ -751,6 +754,418 @@ class Intake:
         p.require(not git('status', '--porcelain', '--untracked-files=all'), 'The approved role checkout is not clean.')
 
 
+class SitePending(Exception):
+    def __init__(self, prerequisite, message):
+        self.observation = {'phase': 'pending', 'prerequisite': prerequisite, 'message': message}
+
+
+def selected_site(intake):
+    from bootstrap import Blocked, Bootstrap
+    from commission_host import AUTOMATIC_POLICY, Blocked as CommissionBlocked, Live, read_policy
+
+    if not os.path.lexists(AUTOMATIC_POLICY):
+        raise SitePending('core-commissioning', 'Finish the protected core installation with ./day0.sh resume.')
+    raw = checked_file(Path(AUTOMATIC_POLICY))
+    policy = read_policy(raw, p.loads(raw)['source_sha'])
+    bootstrap = Bootstrap()
+    bootstrap.run.deadline = time.monotonic() + 45
+    live = Live(candidate.KIT, bootstrap)
+    try:
+        controller, selected, manifests = intake.release_slots()
+        binding = live.verify_selection(controller, selected, policy)
+        guard = bootstrap.verify_final_guard()
+        p.require(bootstrap.destination_identity()['machine_id'] == policy['machine_id'],
+                  'Owner setup belongs to a different inspected machine.')
+    except (Blocked, CommissionBlocked, OSError, ValueError, KeyError, TypeError) as exc:
+        raise SitePending('core-commissioning', 'Verify the selected core release and private tailnet cutover.') from exc
+    site_sha = binding['site_config_sha256']
+    site = live.installer.site_configuration(live.installer.SITE_CONFIGS / (site_sha + '.json'), site_sha)
+    name = guard['target']['dns_name']
+    label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+    p.require(type(name) is str and re.fullmatch(label + r'\.' + label + r'\.ts\.net', name),
+              'Current verified tailnet DNS is unavailable.')
+    return controller, selected, manifests, site, binding, 'https://' + name + '/'
+
+
+def development_labels(path, component, expected_bytes, deadline):
+    from devbox import db
+
+    config_sha = component['artifact_sha256']
+    p.digest(config_sha)
+    protect_directory(path.parent)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        node = os.fstat(stream.fileno())
+        p.require(stat.S_ISREG(node.st_mode) and node.st_uid == 0 and node.st_nlink == 1 and
+                  not node.st_mode & 0o222 and 0 < node.st_size == expected_bytes <= 16 * 1024**3,
+                  'Approved DevBox OCI archive is not a protected bounded file.')
+        db.check_archive_headers(path, node.st_size, deadline)
+        with tarfile.open(fileobj=stream, mode='r:') as archive:
+            selected = None
+            for index, entry in enumerate(archive):
+                p.require(index < 512 and time.monotonic() < deadline, 'DevBox archive metadata exceeded its bound.')
+                if db.archive_path(entry.name) != 'blobs/sha256/' + config_sha:
+                    continue
+                p.require(selected is None and entry.isfile() and 0 < entry.size <= db.OCI_METADATA_LIMIT,
+                          'Invalid or repeated DevBox OCI config.')
+                with archive.extractfile(entry) as config:
+                    raw = config.read(db.OCI_METADATA_LIMIT + 1)
+                p.require(p.sha256(raw) == config_sha, 'DevBox OCI config digest changed.')
+                selected = db.json_data(raw)['config']['Labels']
+        p.require(selected is not None, 'The selected DevBox archive lacks the exact OCI config.')
+        seen = path.lstat()
+        p.require((seen.st_dev, seen.st_ino, seen.st_size, seen.st_ctime_ns) ==
+                  (node.st_dev, node.st_ino, node.st_size, node.st_ctime_ns), 'DevBox OCI archive changed during selection.')
+        return selected
+
+
+def role_site_profiles(intake, controller, selected, binding, job, manifest_sha, geometry):
+    import gptbox_runtime
+    from devbox import db
+    from gptbox import Commands, Gptbox, ROOT as MAINTENANCE_ROOT
+    from gptbox_runtime import BUILD, JOB_INPUTS, PROVIDER_DIR
+    from platform_release_intake import retained_index
+
+    policy_runtime = p.sha256(Path(gptbox_runtime.__file__).read_bytes())
+    release = controller.release(selected)
+    selected_index = retained_index(binding['platform_sha256'])[1]
+    path = intake.root / 'development/builds' / job / 'inputs' / manifest_sha / 'manifest.json'
+    manifest = db.read_manifest(path, manifest_sha, time.monotonic() + 10)
+    p.require(manifest['job'] == job and manifest['categories'] == geometry['categories'] and
+              manifest['storage_bytes'] == geometry['storage_bytes'], 'Current DevBox slot differs from site authority.')
+    outer, inner = manifest['categories']['outer'], manifest['categories']['inner']
+    other, = set(outer) - set(inner)
+    # The three reserved categories provide a distinct pair for the sibling maintenance role.
+    levels = {'development': inner, 'maintenance': sorted((inner[0], other))}
+    maintenance = release['components']['maintenance-agent']
+    context, revision, artifact = (maintenance[key] for key in ('config_sha256', 'source_revision', 'artifact_sha256'))
+    commands = Commands()
+    commands.deadline = time.monotonic() + 45
+    engine = Gptbox(run=commands)
+    engine.preflight(managed_runtime=True)
+    engine.target = MAINTENANCE_ROOT + '/' + context
+    with engine.lock():
+        engine.admitted_maintenance_image(context, revision, artifact, binding['platform_sha256'])
+        observed = {'maintenance': engine.maintenance_labels(context, revision, artifact)}
+    development = release['components']['development-agent']
+    p.require((manifest['inner']['image_id'], manifest['inner']['source_sha']) ==
+              (development['artifact_sha256'], development['source_revision']), 'Selected DevBox role differs from its signed release.')
+    observed['development'] = development_labels(path.with_name('development.oci.tar'), development,
+                                                 manifest['inner']['archive_bytes'], time.monotonic() + 15)
+    roles = {}
+    for role, name in ROLES.items():
+        account = pwd.getpwnam(name)
+        row = selected_index['components'][role + '-agent']
+        component = release['components'][role + '-agent']
+        label = 'system_u:object_r:container_file_t:s0:' + ','.join('c' + str(category) for category in levels[role])
+        labels = observed[role]
+        binary = row['codex_sha256']
+        runtime = labels['dev-pair.runtime']
+        p.digest(binary)
+        p.digest(runtime)
+        p.require(runtime == policy_runtime, 'The selected role needs a matching verified host seed-policy renderer.')
+        p.require(labels['dev-pair.role'] == role and labels['dev-pair.standards'] == p.STANDARDS and
+                  labels['dev-pair.codex.sha256'] == binary and
+                  labels['dev-pair.codex.version'] == row['codex_version'] and
+                  labels['org.opencontainers.image.revision'] == component['source_revision'] and
+                  labels['dev-pair.context'] == component['config_sha256'],
+                  'Selected role labels do not bind the verified runtime and stock binary.')
+        placement = ['/work/job', '/state', '/cache/job']
+        if role == 'development':
+            placement.append(BUILD)
+        layout = {'job': job, 'role': role, 'site_config_sha256': binding['site_config_sha256'],
+                  'manifest_sha256': manifest_sha, 'uid': account.pw_uid, 'gid': account.pw_gid,
+                  'selinux_label': label, 'readonly_mounts': JOB_INPUTS,
+                  'provider_mount': str(PROVIDER_DIR), 'work_storage': placement}
+        roles[role] = {'runtime_sha256': runtime, 'binary_sha256': binary,
+                       'layout_sha256': p.identity(layout), 'layout': layout}
+    return roles
+
+
+def owner_provider(options):
+    from commission_host import Blocked, Live
+    from provider_broker import PROFILE, reserved_cost
+
+    if options.profile is None:
+        raise SitePending('provider-profile', 'Select the independently authorized direct API profile for the first owner slot.')
+    if options.profile != PROFILE:
+        raise SitePending('unsupported-provider-profile', 'The installed broker needs a direct OpenAI API key and bounded allowance.')
+    if options.credential_ref is None:
+        raise SitePending('provider-credential', 'Select a protected scoped credential reference. Keep its value out of the terminal.')
+    p.token(options.credential_ref)
+    try:
+        stamp = Live.credential_stamp(CREDENTIALS / options.credential_ref)
+    except FileNotFoundError as exc:
+        raise SitePending('provider-credential', 'The selected root-private API credential file is absent.') from exc
+    except (Blocked, OSError) as exc:
+        raise SitePending('provider-credential-custody', 'Verify root ownership and private mode for the selected API credential.') from exc
+    p.require(stamp[-1] <= MAX_INPUT, 'The protected provider credential exceeds the admitted size.')
+    pricing = {'max_context_tokens': options.context_tokens, 'input_microusd_per_million': options.input_rate,
+               'output_microusd_per_million': options.output_rate, 'observed_models': options.observed_model}
+    limits = {'max_requests': options.requests, 'max_request_bytes': options.request_bytes,
+              'max_output_tokens': options.output_tokens, 'seconds': options.turn_seconds}
+    if (None in pricing.values() or None in limits.values() or options.spend_microusd is None or options.expires_unix is None):
+        raise SitePending('provider-allowance', 'Supply the actual approved cap, expiry, response bounds and model tariff from your provider authority.')
+    for value, low, high in ((options.host_seconds, 25, 60), (options.build_seconds, 20, 240),
+                             (options.turn_seconds, 10, 120), (options.expires_unix, 1, 2**63 - 1),
+                             (pricing['max_context_tokens'], 1024, 2000000), (pricing['input_microusd_per_million'], 1, 10**9),
+                             (pricing['output_microusd_per_million'], 1, 10**9),
+                             (limits['max_output_tokens'], 16, 65536)):
+        p.number(value, low, high)
+    if options.expires_unix <= time.time() + 2 * (options.host_seconds + options.build_seconds + options.turn_seconds) + 60:
+        raise SitePending('provider-allowance-expired', 'The approved API allowance must cover the full bounded first job.')
+    proofs = {}
+    for kind in ('context', 'tariff'):
+        try:
+            raw = checked_file(BILLING_EVIDENCE / options.credential_ref / (MODEL + '.' + kind), 1024 * 1024)
+        except FileNotFoundError as exc:
+            raise SitePending('provider-billing-evidence', 'Install the reviewed full billable context and worst applicable tariff evidence.') from exc
+        p.require(bool(raw), 'Provider billing evidence is empty.')
+        proofs[kind] = raw
+        pricing[kind + '_evidence_sha256'] = p.sha256(raw)
+    p.number(limits['max_requests'], 1, 32)
+    p.number(options.spend_microusd, 1, 100000000)
+    role_spend = reserved_cost(dict(pricing, **limits)) * limits['max_requests']
+    p.require(0 < role_spend and 2 * role_spend <= options.spend_microusd,
+              'Approved spend does not cover both requested role operation limits.')
+    settings = {'schema': 1, 'host_seconds': options.host_seconds, 'build_seconds': options.build_seconds,
+                'turn_seconds': options.turn_seconds, 'allowance_ref': options.credential_ref,
+                'spend_microusd': options.spend_microusd, 'expires_unix': options.expires_unix, 'pricing': pricing}
+    return settings, dict(limits, spend_microusd=role_spend), proofs, stamp
+
+
+def first_source(intake, repository, workload):
+    from session_controller import SHARED
+
+    tree = intake.site / 'repositories' / repository
+    try:
+        acquired = protect_directory(tree / 'acquired')
+        startup = protect_directory(tree / 'startup')
+        config = {key: fixed_git(path, 'rev-parse', '--verify', 'HEAD').decode().strip()
+                  for key, path in (('commit', acquired), ('startup_revision', startup))}
+        for value in config.values():
+            p.digest(value, 40)
+        startup_git = lambda *args, **kw: fixed_git(startup, *args, **kw)
+        revision = config['startup_revision']
+        verify_acquired_git(startup_git, startup, {'repository': repository, 'acquired_commit': revision,
+                            'acquired_tree': startup_git('rev-parse', '--verify', revision + '^{tree}').decode().strip()},
+                            checklist=False)
+        _, _, _, source_tree, startup_sha = intake.source(repository, config, checklist=workload == CHECKLIST)
+    except FileNotFoundError as exc:
+        raise SitePending('owner-repository-inputs', 'Install the approved Git acquisition, project startup checkout and private standards cache.') from exc
+    adoption = fixed_git(startup, 'show', revision + ':STANDARDS.md', cap=262144).decode()
+    pins = re.findall(r'https://github\.com/oso-gato/standards/blob/([a-zA-Z0-9._-]+)/([^\s)]+)', adoption)
+    p.require(set(pins) == {(p.STANDARDS, name) for name in SHARED},
+              'The selected project must adopt all three exact shared standards references.')
+    return config, source_tree, startup_sha
+
+
+def seed_role(path, layout):
+    from codex_state import toml
+    from gptbox_runtime import LOADER_DIRS, LOADER_FILES, role_policy
+
+    group = layout['gid']
+    label = layout['selinux_label'].encode()
+
+    def metadata(leaf, mode):
+        directory = mode == 0o750
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_DIRECTORY if directory else 0)
+        fd = os.open(leaf, flags)
+        try:
+            node = os.fstat(fd)
+            p.require(node.st_uid == 0 and (stat.S_ISDIR(node.st_mode) if directory else
+                      stat.S_ISREG(node.st_mode) and node.st_nlink == 1), 'First owner seed stage changed.')
+            os.fchown(fd, 0, group)
+            os.setxattr(fd, 'security.selinux', label)
+            os.fchmod(fd, mode)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    dirs = ['requirements', 'turn/startup', *('loaders/' + name for name in LOADER_DIRS)]
+    for name in dirs:
+        (path / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+    requirements, configuration = role_policy(
+        'Read the complete verified startup documents supplied by the controller and follow the authorized product agreement.',
+        live=True, development=layout['role'] == 'development')
+    contents = {'requirements/requirements.toml': toml(requirements).encode(),
+                'loaders/config.toml': toml(configuration).encode(),
+                'loaders/hooks.json': b'{"hooks":{}}\n',
+                'turn/request.json': b'{}\n', 'turn/approval.json': b'{}\n',
+                'turn/prompt.txt': b'Prepared at job dispatch.\n', 'turn/startup/manifest.json': b'{}\n'}
+    contents.update({f'loaders/{name}': b'' for name in LOADER_FILES if f'loaders/{name}' not in contents})
+    contents.update({f'turn/startup/{name}.txt': b'Prepared at job confirmation.\n' for name in IDS})
+    for name, data in contents.items():
+        leaf = path / name
+        write_private(leaf, data)
+        metadata(leaf, 0o440)
+    for folder, _, _ in os.walk(path, topdown=False):
+        metadata(Path(folder), 0o750)
+
+
+class FirstCatalogue:
+    """Materialize an exact root-confirmed first slot before it can admit jobs."""
+
+    def __init__(self, intake):
+        self.intake = intake
+        self.site = intake.site
+        self.catalogue = self.site / 'repositories.json'
+
+    def configured(self, approval=None):
+        if not os.path.lexists(self.catalogue):
+            return None
+        repositories, slots = self.intake.catalogue_settings()
+        if approval is not None:
+            retained = read_private(self.site / 'slots' / slots[0] / '.first-approval', 4096)
+            p.require(p.loads(retained) == {'confirm_sha256': approval,
+                                           'catalogue_sha256': p.sha256(checked_file(self.catalogue))},
+                      'The existing owner catalogue belongs to another approval.')
+        return {'phase': 'configured', 'repositories': sorted(repositories), 'slots': slots}
+
+    def preview(self, options):
+        from bootstrap import Blocked
+        from provider_broker import grant_document
+
+        if options.repository is None or options.workload is None:
+            raise SitePending('owner-catalogue-selection',
+                              'Select the authorized repository and workload. Run owner_intake.py --inspect-site --help for the bounded inputs.')
+        repository = repository_id(options.repository)
+        config, source_tree, startup_sha = first_source(self.intake, repository, options.workload)
+        settings, grant, proofs, credential = owner_provider(options)
+        controller, release, manifests, site, binding, destination = selected_site(self.intake)
+        if options.destination is not None:
+            p.require(options.destination == destination, 'Selected destination differs from the approved private site.')
+        config.update(destination=destination, workloads=[options.workload])
+        slots = self.site / 'slots'
+        if os.path.lexists(slots):
+            protect_directory(slots)
+        choices = [job for job in sorted(site['jobs']) if job in manifests and self.intake.slot_unused(job) and
+                   not os.path.lexists(self.intake.queue / (job + '.json'))]
+        if not choices:
+            raise SitePending('owner-slot-capacity', 'No unused approved job slot is available for the first owner catalogue.')
+        job = choices[0]
+        try:
+            roles = role_site_profiles(self.intake, controller, release, binding, job, manifests[job], site['jobs'][job])
+        except (Blocked, FileNotFoundError) as exc:
+            raise SitePending('owner-role-profile', 'Complete the verified selected role images and exact DevBox slot placement.') from exc
+        for role in roles.values():
+            layout = role['layout']
+            pricing = {key: settings['pricing'][key] for key in ('max_context_tokens', 'input_microusd_per_million',
+                                                                  'output_microusd_per_million', 'observed_models')}
+            grant_document(p.canonical(dict(grant, **pricing, schema=1, auth_profile=options.profile,
+                request_sha256='0' * 64, allowance_sha256='0' * 64, peer_uid=layout['uid'], peer_gid=layout['gid'],
+                allowance_ref=settings['allowance_ref'], expires_unix=settings['expires_unix'])).encode())
+            role['credential_ref'] = options.credential_ref
+            role['grant'] = grant
+        catalogue = {'schema': 1, 'repositories': {repository: config}, 'slots': [job]}
+        plan = {'catalogue': catalogue, 'release_sha256': release, 'site_config_sha256': binding['site_config_sha256'],
+                'development_manifest_sha256': manifests[job], 'standards_sha': p.STANDARDS,
+                'source_tree': source_tree, 'startup_sha256': startup_sha, 'provider_profile': options.profile,
+                'provider_model': MODEL, 'provider_effort': 'high', 'credential_stamp': credential,
+                'slot_profile': settings, 'roles': roles}
+        return plan, proofs
+
+    @contextlib.contextmanager
+    def lock(self):
+        path = protect_directory(self.site) / '.first-catalogue.lock'
+        flags = os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(path, flags, 0o600), 'rb') as stream:
+            p.private_file(path)
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+
+    def initialize(self, options):
+        from platform_release_intake import durable_record
+        from platform_release_protocol import canonical as release_bytes
+        from renewal import Renewal
+
+        approval = options.confirm_sha256
+        p.digest(approval)
+        existing = self.configured(approval)
+        if existing is not None:
+            return existing
+        with self.lock(), Renewal(self.intake.root, None).lock(shared=True):
+            existing = self.configured(approval)
+            if existing is not None:
+                return existing
+            plan, proofs = self.preview(options)
+            p.require(p.identity(plan) == approval, 'The first owner selection changed. Inspect and confirm the exact current selection.')
+            job, = plan['catalogue']['slots']
+            slots = protect_directory(self.site)
+            slots = private_leaf(slots / 'slots')
+            destination = slots / job
+            proof = {'confirm_sha256': approval, 'catalogue_sha256': p.sha256(release_bytes(plan['catalogue']))}
+            manifest = plan['development_manifest_sha256']
+            with tempfile.TemporaryDirectory(prefix='.first-slot-', dir=slots) as temporary:
+                staged = Path(temporary) / job
+                staged.mkdir(mode=0o700)
+                exact_private(staged / 'profile.json', p.canonical(plan['slot_profile']).encode())
+                exact_private(staged / '.first-approval', p.canonical(proof).encode())
+                for kind, raw in proofs.items():
+                    exact_private(staged / (MODEL + '.' + kind), raw)
+                for role, row in plan['roles'].items():
+                    folder = private_leaf(staged / role)
+                    values = {key: value for key, value in row.items() if key != 'layout'}
+                    exact_private(folder / 'profile.json', p.canonical(values).encode())
+                    seed_role(folder / 'seed', row['layout'])
+                    sync_directory(folder)
+                verified = self.intake.slot(job, manifest, staging=staged)
+                if os.path.lexists(destination):
+                    trusted_directory(destination)
+                    p.require(p.loads(read_private(destination / '.first-approval', 4096)) == proof and
+                              self.intake.slot(job, manifest) == verified,
+                              'A staged owner slot belongs to another approval.')
+                else:
+                    staged.rename(destination)
+                    sync_directory(slots)
+            # The public catalogue is the commit marker. O_TMPFILE plus a no-replace link preserves older authority.
+            durable_record(self.catalogue, plan['catalogue'])
+        return self.configured(approval)
+
+
+def catalogue_command(intake, argv):
+    p.require(os.getuid() == os.geteuid() == 0 and not os.environ.get('SUDO_USER'),
+              'Use the protected root commissioning terminal for first owner setup.')
+    parser = argparse.ArgumentParser(prog='owner_intake.py', description='Inspect and confirm the exact first owner site.')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--inspect-site', action='store_true')
+    mode.add_argument('--initialize-site', action='store_true')
+    parser.add_argument('--repository')
+    parser.add_argument('--workload', choices=tuple(WORKLOADS))
+    parser.add_argument('--destination')
+    parser.add_argument('--profile')
+    parser.add_argument('--credential-ref')
+    parser.add_argument('--spend-microusd', type=int)
+    parser.add_argument('--expires-unix', type=int)
+    parser.add_argument('--context-tokens', type=int)
+    parser.add_argument('--input-rate', type=int)
+    parser.add_argument('--output-rate', type=int)
+    parser.add_argument('--observed-model', action='append')
+    parser.add_argument('--requests', type=int)
+    parser.add_argument('--request-bytes', type=int)
+    parser.add_argument('--output-tokens', type=int)
+    parser.add_argument('--host-seconds', type=int, default=45)
+    parser.add_argument('--build-seconds', type=int, default=120)
+    parser.add_argument('--turn-seconds', type=int, default=90)
+    parser.add_argument('--confirm-sha256')
+    options = parser.parse_args(argv)
+    first = FirstCatalogue(intake)
+    p.require(options.initialize_site == (options.confirm_sha256 is not None), 'Initialize requires the exact inspected confirmation SHA-256.')
+    try:
+        if options.initialize_site:
+            report = first.initialize(options)
+        else:
+            report = first.configured()
+            if report is None:
+                plan, _ = first.preview(options)
+                public = {key: value for key, value in plan.items() if key != 'credential_stamp'}
+                report = {'phase': 'awaiting-confirmation', 'scope': public, 'confirm_sha256': p.identity(plan)}
+        respond(report)
+    except SitePending as wait:
+        respond(wait.observation)
+    return 0
+
+
 def respond(result):
     print(p.canonical(result), flush=True)
 
@@ -776,6 +1191,8 @@ def main():
     try:
         p.require(os.geteuid() == 0, 'The installed intake service requires its protected account.')
         intake = Intake()
+        if sys.argv[1:2] in (['--inspect-site'], ['--initialize-site']):
+            return catalogue_command(intake, sys.argv[1:])
         if sys.argv[1:] == ['--reconcile'] and not os.environ.get('SUDO_USER'):
             return intake.reconcile()
         if len(sys.argv) == 3 and sys.argv[1] == '--prepare' and not os.environ.get('SUDO_USER'):

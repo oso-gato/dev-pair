@@ -105,6 +105,61 @@ a freshly approved logical ID and manifest.
 
 ### Repository and slot inputs
 
+On a new commissioned site, follow the first owner setup command shown by
+`./day0.sh resume` in the same protected root terminal.
+
+```sh
+/usr/bin/python3 -IB /usr/libexec/dev-pair/tools/owner_intake.py --inspect-site --help
+```
+
+Select one authorized repository and workload. The controller reads the canonical
+Git origin, acquired commit, reviewed startup revision, and exact private
+standards cache from the protected locations below. It selects an unused
+slot from the verified live site and role manifest. It displays the private
+tailnet destination from the current verified cutover. An optional
+`--destination` must match that complete HTTPS URL.
+
+Use the direct API profile only with the actual approved account scope. Supply
+the root-private credential **reference** and the approved budget, expiration
+and request limits. Place the independently reviewed billing documents
+`gpt-6.2-sol.context` and `gpt-6.2-sol.tariff` under
+`/etc/dev-pair/provider-evidence/CREDENTIAL_REF/`. Put the key itself through
+the existing credential custody path at `/etc/dev-pair/provider-credentials/CREDENTIAL_REF`.
+The command reads credential metadata and checks the billing documents. The
+broker checks actual provider admission after the separate job agreement.
+
+Run the following with values from the actual authorization. The role model
+is GPT-6.2 Sol High. Repeat `--observed-model` for each identity included in the
+approved billing contract. The two role ceilings are calculated from the
+verified full-input ceiling, approved output ceiling and request count.
+
+```sh
+/usr/bin/python3 -IB /usr/libexec/dev-pair/tools/owner_intake.py --inspect-site \
+  --repository "$approved_repository" --workload "$approved_workload" \
+  --profile openai-api-key --credential-ref "$approved_credential_ref" \
+  --spend-microusd "$approved_job_cap" --expires-unix "$approved_expiry" \
+  --context-tokens "$approved_context" --input-rate "$approved_input_rate" \
+  --output-rate "$approved_output_rate" --observed-model "$approved_response_model" \
+  --requests "$approved_requests" --request-bytes "$approved_request_bytes" \
+  --output-tokens "$approved_output_tokens"
+```
+
+Rates are in millionths of a dollar per million tokens. The host, build
+and turn bounds shown in the preview can be reduced through the corresponding
+`--*-seconds` options within the verified adapter's limits. Review the displayed
+source, destination, roles and limits. Repeat the same inputs with
+`--initialize-site` in place of `--inspect-site` and add
+`--confirm-sha256 "$inspected_confirmation_sha256"`. A changed source, proof,
+credential or placement requires a fresh inspection. Then resume Day 0 to
+advance the existing optional activation checks. The normal owner command
+separately previews and confirms each actual job before admitting its provider
+allowance.
+
+Initialization publishes one first catalogue and preserves any existing
+protected catalogue or job history. It can join an interrupted publication
+with the same confirmation. The initialized seed uses the selected role
+runtime's verified policy renderer and the actual allocated SELinux labels.
+
 Keep the following under `/etc/dev-pair/product-intake` in root custody. The
 catalogue `repositories.json` has schema 1 and the fields `schema`,
 `repositories` and `slots`. The repository map binds each allowed
@@ -162,9 +217,12 @@ the role workspace and state inventories.
 
 ```sh
 /usr/bin/python3 -B -m unittest discover -s tests -p test_owner_intake.py -v
+unshare --user --map-root-user /usr/bin/python3 -B -m unittest discover -s tests -p test_first_owner_catalogue.py -v
 ```
 
 The local checks use real Git objects, private durable files and the regular
 product submission path with fixture approval, placement and systemd seams.
+Set `DEV_PAIR_TEST_STANDARDS_CACHE` to the verified private cache path to
+exercise the read-only first-catalogue preview with the actual pinned corpus.
 The installed sudo rule, enforcing Fedora labels, actual provider allowance,
 role placement and owner reconnect journey require native acceptance.
