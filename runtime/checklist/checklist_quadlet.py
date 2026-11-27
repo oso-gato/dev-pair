@@ -23,6 +23,7 @@ STORAGE = Path('/var/lib/dev-pair/checklist-validation')
 HOME = Path('/var/lib/dev-pair/checklist-executor')
 FENCE = Path('/var/lib/dev-pair/renewal-fence')
 APPROVAL = Path('/etc/dev-pair/checklist/approval.json')
+GETENFORCE = '/usr/bin/getenforce'
 ACCOUNT = 'dp-checklist'
 NETWORK = 'dev-pair-checklist-internal'
 CHECK_SECONDS = 25
@@ -169,29 +170,32 @@ def storage_identity(path):
     for leaf in ('graph', 'attempts'):
         p.require(trusted_directory(path / leaf).stat().st_dev == device,
                   'checklist writable leaf is outside the dedicated filesystem')
-    return [f'storage-bytes:{capacity}', f'storage-inodes:{limits.f_files}']
+    return [f'storage-bytes:{capacity}', f'storage-inodes:{limits.f_files}', f'storage-fsid:{limits.f_fsid}']
 
 
 def capture(argv, deadline, env):
     output = bytearray()
-    with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, start_new_session=True) as child, selectors.DefaultSelector() as sel:
-        sel.register(child.stdout, selectors.EVENT_READ)
-        try:
-            while sel.get_map():
-                if not sel.select(remaining(deadline)):
-                    raise TimeoutError('host command exceeded its deadline')
-                data = os.read(child.stdout.fileno(), min(4096, MAX_CAPTURE + 1 - len(output)))
-                if not data:
-                    break
-                output.extend(data)
-                p.require(len(output) <= MAX_CAPTURE, 'host command exceeded its output limit')
-            code = child.wait(timeout=remaining(deadline))
-        except BaseException:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(child.pid, signal.SIGKILL)
-            child.wait(timeout=1)
-            raise
+    with selectors.DefaultSelector() as sel:
+        remaining(deadline)
+        with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, start_new_session=True) as child:
+            try:
+                sel.register(child.stdout, selectors.EVENT_READ)
+                while True:
+                    if not sel.select(remaining(deadline)):
+                        raise TimeoutError('host command exceeded its deadline')
+                    data = os.read(child.stdout.fileno(), min(4096, MAX_CAPTURE + 1 - len(output)))
+                    if not data:
+                        break
+                    output.extend(data)
+                    p.require(len(output) <= MAX_CAPTURE, 'host command exceeded its output limit')
+                code = child.wait(timeout=remaining(deadline))
+            except BaseException:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait(timeout=1)
+                raise
+    remaining(deadline)
     return code, bytes(output)
 
 
@@ -247,12 +251,18 @@ def rootless_environment():
     bus = (runtime / 'bus').lstat()
     p.require(stat.S_ISSOCK(bus.st_mode) and bus.st_uid == account.pw_uid,
               'the checklist executor user systemd bus is unavailable')
-    for command in ('/usr/bin/podman', '/usr/bin/systemctl', '/usr/sbin/getenforce', '/usr/bin/rm'):
-        protected(command, file=True)
+    for command in ('/usr/bin/podman', '/usr/bin/systemctl', GETENFORCE, '/usr/bin/rm'):
+        verify_executable(command)
     env = {'HOME': account.pw_dir, 'USER': ACCOUNT, 'PATH': '/usr/bin:/usr/sbin',
            'XDG_RUNTIME_DIR': str(runtime), 'LC_ALL': 'C.UTF-8',
            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(runtime / 'bus')}
     return runtime, env
+
+
+def verify_executable(command):
+    path = protected(command, file=True)
+    p.require(os.access(path, os.X_OK), 'required protected host executable is not executable')
+    return path
 
 
 def subordinate_ids(path, identity, live):
@@ -288,6 +298,7 @@ class Quadlet:
         self.candidate = candidate
         self.budget = budget
         self.logs = []
+        self.storage_evidence = []
         self.path_created = False
         self.unit_written = False
         self.unit_stage = self.unit_path.with_suffix('.pending')
@@ -303,23 +314,25 @@ class Quadlet:
         p.require(code in admit, stage + ' did not complete')
         return code, data.decode('utf-8').strip()
 
-    def systemd(self, stage, deadline, *args):
-        return self.command(stage, ['/usr/bin/systemctl', '--user', '--no-pager', '--no-ask-password', *args], deadline)[1]
+    def systemd(self, stage, deadline, *args, admit=(0,)):
+        return self.command(stage, ['/usr/bin/systemctl', '--user', '--no-pager', '--no-ask-password', *args],
+                            deadline, admit=admit)[1]
 
     def podman(self, stage, deadline, *args, admit=(0,)):
         return self.command(stage, ['/usr/bin/podman', '--root', str(self.graph),
                                     '--runroot', str(self.runroot), *args], deadline, admit=admit)
 
     def enforcing(self, deadline):
-        text = self.command('selinux', ['/usr/sbin/getenforce'], deadline)[1]
+        text = self.command('selinux', [GETENFORCE], deadline)[1]
         p.require(text == 'Enforcing', 'checklist host requires enforcing SELinux')
 
     def prepare(self, deadline, request_sha):
         self.enforcing(deadline)
-        evidence = storage_identity(STORAGE)
+        self.storage_evidence = storage_identity(STORAGE)
         p.require(next((STORAGE / 'attempts').iterdir(), None) is None,
                   'unresolved checklist resources require operator reconciliation')
         for directory in (self.unit_path.parent.parent, self.unit_path.parent, self.runroot):
+            remaining(deadline)
             directory.mkdir(mode=0o700, exist_ok=True)
             trusted_directory(directory)
         _, network = self.podman('network-check', deadline, 'network', 'inspect', '--format',
@@ -343,9 +356,12 @@ class Quadlet:
         self.image_id = identity[1]
         code, _ = self.podman('verify-name-unoccupied', deadline, 'container', 'exists', self.name, admit=(0, 1))
         p.require(code == 1, 'preexisting checklist container identity is reserved')
+        remaining(deadline)
         self.path.mkdir(mode=0o700)
         self.path_created = True
+        remaining(deadline)
         self.data.mkdir(mode=0o700)
+        remaining(deadline)
         write_private(self.path / 'operation.json', p.canonical({
             'attempt_id': self.path.name, 'request_sha256': request_sha, 'unit': self.unit,
             'image': self.image, 'image_id': self.image_id,
@@ -356,19 +372,22 @@ class Quadlet:
         content = render(template, name=self.name, image=self.image, data=self.data, graph=self.graph,
                          runroot=self.runroot, seconds=self.budget // 2)
         flags = os.O_WRONLY | os.O_NOFOLLOW | os.O_CREAT | os.O_EXCL
+        remaining(deadline)
         with os.fdopen(os.open(self.unit_stage, flags, 0o600), 'wb') as stream:
             self.unit_stage_owned = True
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+        remaining(deadline)
         os.link(self.unit_stage, self.unit_path, follow_symlinks=False)
         self.unit_written = True
+        remaining(deadline)
         self.unit_stage.unlink()
         self.unit_stage_owned = False
         self.systemd('load-quadlet', deadline, 'daemon-reload')
         manager = self.manager(deadline)
         p.require(manager['ActiveState'] == 'inactive', 'checklist unit must initially be inactive')
-        return evidence + ['image-id:' + self.image_id, 'selinux:enforcing']
+        return ['image-id:' + self.image_id, 'selinux:enforcing']
 
     def manager(self, deadline):
         output = self.systemd('inspect-manager', deadline, 'show',
@@ -383,6 +402,7 @@ class Quadlet:
 
     def service(self, action, deadline):
         p.require(action in ('start', 'restart'), 'unsupported checklist service action')
+        remaining(deadline)
         if action == 'restart':
             write_private(self.path / 'restart-requested', b'restart\n')
             sync_directory(self.path)
@@ -413,6 +433,7 @@ class Quadlet:
 
     def cleanup(self, deadline):
         if self.unit_stage_owned:
+            remaining(deadline)
             self.unit_stage.unlink()
         if self.unit_written:
             self.manager(deadline)
@@ -420,9 +441,29 @@ class Quadlet:
             p.require(self.manager(deadline)['ActiveState'] == 'inactive', 'owned checklist service did not stop')
             code, _ = self.podman('verify-container-absent', deadline, 'container', 'exists', self.name, admit=(0, 1))
             p.require(code == 1, 'owned checklist container remained after stop')
+            remaining(deadline)
             self.unit_path.unlink()
             self.systemd('unload-quadlet', deadline, 'daemon-reload')
         if self.path_created:
             self.command('remove-test-data', ['/usr/bin/rm', '-rf', '--one-file-system', '--', str(self.path)], deadline)
             p.require(not self.path.exists(), 'owned checklist test data remained after cleanup')
             sync_directory(self.path.parent)
+
+    def verify_absent(self, deadline, staged):
+        self.enforcing(deadline)
+        storage = storage_identity(STORAGE)
+        if staged is not None and staged['cleanup']['status'] == 'complete':
+            sampled = [entry for entry in staged['evidence'] if entry.startswith('storage-fsid:')]
+            p.require(len(sampled) == 1 and sampled[0] in storage,
+                      'checklist filesystem identity changed since the staged observation')
+        p.require(not any(os.path.lexists(path) for path in (self.path, self.unit_path, self.unit_stage)),
+                  'matching checklist workspace or unit source is still present')
+        output = self.systemd('verify-unit-absent', deadline, 'show',
+                              '--property=LoadState,ActiveState,MainPID,ControlPID', self.unit, admit=(0, 1))
+        fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+        p.require(fields.get('LoadState') == 'not-found' and fields.get('ActiveState') == 'inactive' and
+                  fields.get('MainPID', '0') == fields.get('ControlPID', '0') == '0',
+                  'matching checklist systemd unit is present or its state is uncertain')
+        code, _ = self.podman('verify-container-absent', deadline, 'container', 'exists', self.name, admit=(0, 1))
+        p.require(code == 1, 'matching checklist container is still present')
+        remaining(deadline)

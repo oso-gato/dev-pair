@@ -5,6 +5,7 @@ import os
 import pathlib
 import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import host_handoff as h
 import job_protocol as p
+import ledger_recovery as recovery
 
 RUNTIME = h.host_runtime()
 APP = ROOT / 'examples/checklist/checklist.py'
@@ -32,6 +34,7 @@ class FixtureService:
         self.path_created = False
         self.child = None
         self.logs = []
+        self.storage_evidence = ['storage-fsid:123']
         self.actions = []
 
     def prepare(self, deadline, request_sha):
@@ -71,6 +74,9 @@ class FixtureService:
             raise OSError('fixture cleanup lost')
         shutil.rmtree(self.path)
         self.logs.append('cleanup:exit-0')
+
+    def verify_absent(self, deadline, staged):
+        p.require(not self.path.exists(), 'fixture matching workspace is still present')
 
 
 class QuadletHandoffTests(unittest.TestCase):
@@ -195,10 +201,116 @@ class QuadletHandoffTests(unittest.TestCase):
         self.assertTrue((self.services[0].path / 'checklist.sqlite3').is_file())
         with self.assertRaisesRegex(ValueError, 'execution refused'):
             self.dispatch('execute', request)
+        with self.assertRaisesRegex(ValueError, 'matching workspace'):
+            self.dispatch('reconcile', request)
         with self.assertRaisesRegex(ValueError, 'unresolved'):
             self.ledger.reconcile(request['request_id'], 'Synthetic local probe', ['fixture'])
         self.assertEqual(self.services[0].actions, ['start', 'restart'])
-        self.assertEqual(len(self.services), 1)
+        self.assertEqual([service.actions for service in self.services], [['start', 'restart'], []])
+
+    def round_trip(self, name):
+        end = time.monotonic() + 5
+        backup, restored = (self.path / (part + '-' + name) for part in ('backup', 'restore'))
+        recovery.backup(self.path / 'ledger', backup, end)
+        recovery.restore(backup, restored, end)
+        return contextlib.closing(p.Ledger(restored))
+
+    def test_controller_exit_before_arming_closes_original_zero_effect(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        with self.round_trip('pending') as restored:
+            self.assertEqual(restored.status(request['request_id'])['state'], 'pending')
+        code = '''
+import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+import job_protocol as p
+request = p.loads(sys.stdin.buffer.read())
+ledger = p.Ledger(sys.argv[2])
+ledger.begin(request['request_id'], authenticated_request=request)
+os.kill(os.getpid(), signal.SIGKILL)
+'''
+        exited = subprocess.run([PYTHON, '-IB', '-c', code, str(ROOT / 'tools'), str(self.path / 'ledger')],
+                                input=p.canonical(request).encode(), timeout=4)
+        self.assertEqual(exited.returncode, -signal.SIGKILL)
+        before = self.dispatch('status', request)
+        self.assertEqual(before['state'], 'in-flight')
+        with self.round_trip('in-flight') as restored:
+            self.assertEqual(restored.status(request['request_id']), before)
+            self.assertEqual(restored.host_effect_state(request, before['attempt_id']), (False, None))
+        closed = self.dispatch('reconcile', request)
+        self.assertEqual(closed['attempt_id'], before['attempt_id'])
+        self.assertEqual(closed['status'], 'blocked')
+        self.assertEqual(closed['effects'], [])
+        self.assertEqual(self.dispatch('execute', request), closed)
+        self.assertEqual(self.dispatch('consume', request)['progress'], 'blocked')
+        self.assertEqual([service.actions for service in self.services], [[]])
+        self.request(1)
+        with self.round_trip('closed') as restored:
+            self.assertEqual(restored.status(request['request_id'])['result'], closed)
+
+    def test_cleaned_staged_observation_can_publish_after_executor_loss(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        with mock.patch.object(self.ledger, 'close_host_effect', side_effect=OSError('controller lost before commit')):
+            with self.assertRaisesRegex(OSError, 'before commit'):
+                self.dispatch('execute', request)
+        before = self.dispatch('status', request)
+        self.assertEqual(before['state'], 'in-flight')
+        self.ledger.close()
+        self.ledger = p.Ledger(self.path / 'ledger')
+        self.addCleanup(self.ledger.close)
+        armed, stored = self.ledger.host_effect_state(request, before['attempt_id'])
+        self.assertTrue(armed)
+        self.assertEqual(stored['status'], 'pass')
+        with self.round_trip('staged') as restored:
+            self.assertEqual(restored.host_effect_state(request, before['attempt_id']), (True, stored))
+        self.assertEqual(self.dispatch('reconcile', request), stored)
+        self.assertEqual(self.dispatch('consume', request), {'progress': 'host-checks-passed', 'result': stored})
+        self.assertEqual([service.actions for service in self.services], [['start', 'restart'], []])
+        with self.round_trip('recovered') as restored:
+            self.assertEqual(restored.status(request['request_id'])['result'], stored)
+
+    def test_arming_without_a_verdict_remains_unresolved_even_when_paths_are_empty(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        attempt, _ = self.ledger.begin(request['request_id'], authenticated_request=request)
+        self.ledger.arm_host_effect(request, attempt)
+        with self.assertRaisesRegex(ValueError, 'lacks a durable observation'):
+            self.dispatch('reconcile', request)
+        self.assertEqual(self.dispatch('status', request)['attempt_id'], attempt)
+        self.assertEqual(self.services, [])
+
+    def test_backup_rejects_generic_reconciliation_on_legacy_quadlet_request(self):
+        request = self.request(0)
+        request['capabilities'] = [capability for capability in request['capabilities'] if capability != p.HOST_EFFECT_RECEIPT]
+        self.ledger.submit(request, authenticated=True)
+        attempt, _ = self.ledger.begin(request['request_id'], authenticated_request=request)
+        with self.assertRaisesRegex(ValueError, 'unresolved'):
+            self.ledger.reconcile(request['request_id'], 'Generic reconciliation', ['fixture'])
+        closure = dict(p.effect_identity(request, attempt), mode='zero-effect', evidence=p.HOST_ABSENCE_EVIDENCE)
+        result = p.closed_host_result(request, attempt, self.id, False, None, closure)
+        with self.ledger.transaction():
+            self.ledger.event('reconciliation', {'request_id': request['request_id'], 'attempt_id': attempt,
+                                                 'diagnostics': result['diagnostics'], 'evidence': result['evidence']})
+            self.ledger._store_result(result)
+        with self.assertRaisesRegex(ValueError, 'unexpected application reconciliation'):
+            self.round_trip('impossible-legacy')
+
+    def test_backup_rejects_missing_host_closure_transaction(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        self.dispatch('execute', request)
+        # Remove the closure and retain a contiguous event sequence, so the missing transition is the rejection.
+        with self.ledger.transaction():
+            close = self.ledger.db.execute('SELECT sequence FROM events WHERE event=?', (p.HOST_EFFECT_CLOSED,)).fetchone()[0]
+            self.ledger.db.execute('DELETE FROM events WHERE sequence=?', (close,))
+            self.ledger.db.execute('UPDATE events SET sequence=? WHERE sequence=?', (close, close + 1))
+        with self.assertRaisesRegex(ValueError, 'matching verified closure'):
+            self.round_trip('forged-closure')
 
     def test_generated_service_refuses_wrong_container_and_keeps_cleanup_owned(self):
         attempt = '24446e50-09f0-4065-8c46-784cc29313a4'
@@ -215,7 +327,7 @@ class QuadletHandoffTests(unittest.TestCase):
 
         def capture(argv, deadline, env):
             observed.append(argv)
-            if argv[0] == '/usr/sbin/getenforce':
+            if argv[0] == RUNTIME.GETENFORCE:
                 return 0, b'Enforcing'
             if argv[0] == '/usr/bin/rm':
                 shutil.rmtree(unit.path)
@@ -245,14 +357,15 @@ class QuadletHandoffTests(unittest.TestCase):
         with mock.patch.multiple(RUNTIME, STORAGE=storage, capture=capture,
                                  storage_identity=lambda path: ['fixture-bounded-storage']):
             unit = RUNTIME.Quadlet(runtime, {}, attempt, image, candidate, 30)
-            unit.prepare(0, '6' * 64)
+            end = time.monotonic() + 5
+            unit.prepare(end, '6' * 64)
             receipt = p.loads((unit.path / 'operation.json').read_bytes())
             self.assertEqual(receipt['image_id'], image_id)
             self.assertEqual(receipt['unit'], unit.unit)
             self.assertEqual(receipt['attempt_id'], attempt)
             with self.assertRaisesRegex(ValueError, 'image or process'):
-                unit.service('start', 0)
-            unit.cleanup(0)
+                unit.service('start', end)
+            unit.cleanup(end)
         self.assertFalse(unit.unit_path.exists())
         self.assertFalse(unit.path.exists())
         self.assertTrue(any('stop' in argv and unit.unit in argv for argv in observed))
@@ -264,6 +377,107 @@ class QuadletHandoffTests(unittest.TestCase):
             RUNTIME.capture([PYTHON, '-c', "print('a' * 65536)"], time.monotonic() + 2, environment)
         with self.assertRaises(TimeoutError):
             RUNTIME.capture([PYTHON, '-c', 'import time; time.sleep(30)'], time.monotonic() + 0.1, environment)
+
+    def test_expired_work_and_cleanup_start_no_commands_or_intents(self):
+        deadline = time.monotonic() - 1
+        with mock.patch.object(RUNTIME, 'STORAGE', self.path), \
+                mock.patch.object(RUNTIME.subprocess, 'Popen', wraps=subprocess.Popen) as popen:
+            unit = RUNTIME.Quadlet(self.path, {}, '24446e50-09f0-4065-8c46-784cc29313a4', None, self.candidates[0], 30)
+            unit.path.mkdir(parents=True)
+            unit.unit_stage.parent.mkdir(parents=True)
+            unit.unit_stage.write_bytes(b'owned temporary unit')
+            unit.unit_stage_owned = True
+            unit.path_created = True
+            with self.assertRaises(TimeoutError):
+                RUNTIME.capture(['/usr/bin/true'], deadline, {})
+            with self.assertRaises(TimeoutError):
+                unit.service('restart', deadline)
+            with self.assertRaises(TimeoutError):
+                unit.cleanup(deadline)
+            self.assertFalse((unit.path / 'restart-requested').exists())
+            self.assertTrue(unit.unit_stage.is_file())
+            popen.assert_not_called()
+
+    def test_fedora_merged_usr_uses_the_same_canonical_checked_executable(self):
+        usr = self.path / 'usr'
+        (usr / 'bin').mkdir(parents=True)
+        (usr / 'sbin').symlink_to('bin', target_is_directory=True)
+        target = usr / 'bin/getenforce'
+        target.write_text('#!/bin/sh\nprintf Enforcing')
+        target.chmod(0o755)
+        selected = self.path / pathlib.Path(RUNTIME.GETENFORCE).relative_to('/')
+        original = pathlib.Path.lstat
+
+        def trusted_owner(path):
+            info = list(original(path))
+            if path in (target, *target.parents):
+                info[0] &= ~0o022
+                info[4] = 0  # Project root ownership onto the real merged-/usr fixture.
+            return os.stat_result(info)
+
+        with mock.patch.object(pathlib.Path, 'lstat', trusted_owner):
+            with self.assertRaisesRegex(ValueError, 'canonical paths'):
+                RUNTIME.verify_executable(usr / 'sbin/getenforce')
+            self.assertEqual(RUNTIME.verify_executable(selected), target)
+        with mock.patch.object(RUNTIME, 'GETENFORCE', str(selected)):
+            unit = RUNTIME.Quadlet(self.path, {}, '24446e50-09f0-4065-8c46-784cc29313a4', None, self.candidates[0], 30)
+            unit.enforcing(time.monotonic() + 2)
+        self.assertEqual(unit.logs, ['selinux:exit-0'])
+
+    def test_reconciliation_checks_the_same_store_and_real_paths_before_manager_absence(self):
+        with mock.patch.object(RUNTIME, 'STORAGE', self.path):
+            unit = RUNTIME.Quadlet(self.path, {}, '24446e50-09f0-4065-8c46-784cc29313a4', None, self.candidates[0], 30)
+        observed = {'cleanup': {'status': 'complete'}, 'evidence': ['storage-fsid:42']}
+        end = time.monotonic() + 2
+        manager = 'LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlPID=0'
+        with mock.patch.object(unit, 'enforcing'), mock.patch.object(unit, 'systemd', return_value=manager) as systemd, \
+                mock.patch.object(unit, 'podman', return_value=(1, '')) as podman, \
+                mock.patch.object(RUNTIME, 'storage_identity', return_value=['storage-fsid:71']) as storage:
+            with self.assertRaisesRegex(ValueError, 'filesystem identity changed'):
+                unit.verify_absent(end, observed)
+            systemd.assert_not_called()
+            storage.return_value = ['storage-fsid:42']
+            unit.path.mkdir(parents=True)
+            with self.assertRaisesRegex(ValueError, 'workspace.*still present'):
+                unit.verify_absent(end, observed)
+            systemd.assert_not_called()
+            unit.path.rmdir()
+            systemd.return_value = manager.replace('not-found', 'loaded')
+            with self.assertRaisesRegex(ValueError, 'systemd unit is present'):
+                unit.verify_absent(end, observed)
+            podman.assert_not_called()
+            systemd.return_value = manager
+            podman.return_value = (0, '')
+            with self.assertRaisesRegex(ValueError, 'container is still present'):
+                unit.verify_absent(end, observed)
+            podman.return_value = (1, '')
+            unit.verify_absent(end, observed)
+            self.assertIn(unit.name, podman.call_args.args)
+
+    def test_installed_recovery_helper_bytes_change_the_cli_recipe_and_grant(self):
+        sources = (h.SELF, h.JOB_PROTOCOL, h.LEDGER_RECOVERY, h.HOST_RUNTIME, RUNTIME.TEMPLATE)
+        for source in sources:
+            staged = self.path / source.relative_to(ROOT)
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, staged)
+        command = [PYTHON, '-EBs', str(self.path / h.SELF.relative_to(ROOT)), 'recipe', '--host']
+        before = p.loads(subprocess.check_output(command, timeout=4))
+        self.assertEqual(before, h.recipe_identity(host=True))
+        helper = self.path / h.LEDGER_RECOVERY.relative_to(ROOT)
+        with helper.open('ab') as stream:
+            stream.write(b'\n# Changed installed helper bytes.\n')
+        after = p.loads(subprocess.check_output(command, timeout=4))
+        self.assertNotEqual(before['recipe_sha256'], after['recipe_sha256'])
+        self.assertNotEqual(before['revision'], after['revision'])
+        request = self.request(0)
+        original = p.identity(request)
+        self.allowed = original
+        self.dispatch('submit', request)
+        with mock.patch.object(h, 'LEDGER_RECOVERY', helper):
+            with self.assertRaisesRegex(ValueError, 'different recipe'):
+                h.check_request(request, self.id, self.principals, host=True)
+            self.assertEqual(self.dispatch('status', request)['request'], request)
+        self.assertNotEqual(original, p.identity(dict(request, test=after)))
 
     def test_protected_receipt_binds_exact_candidate_request_and_machine(self):
         request = self.request(0)

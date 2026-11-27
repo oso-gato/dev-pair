@@ -150,7 +150,7 @@ def validate_database(path, deadline):
             p.require(obj[key] == record_id, 'record identity mismatch')
             records[kind, record_id] = obj
         jobs, requests, seen_records = {}, {}, set()
-        reconciliation = None
+        reconciliation = closed_host = None
         def record(kind, key):
             p.require((kind, key) in records, 'missing referenced record')
             return records[kind, key]
@@ -166,7 +166,8 @@ def validate_database(path, deadline):
                       0 < at < 1e12, 'invalid event ordering or timestamp')
             obj = p.loads(body)
             p.require(body == p.canonical(obj), 'noncanonical event')
-            p.require(reconciliation is None or event == 'result', 'incomplete reconciliation transaction')
+            p.require(reconciliation is None and closed_host is None or event == 'result',
+                      'incomplete reconciliation or host closure transaction')
             if event in ('job', 'checkpoint', 'request'):
                 p.validate(obj, event)
                 key = obj[{'job': 'job_id', 'checkpoint': 'checkpoint_id', 'request': 'request_id'}[event]]
@@ -201,6 +202,24 @@ def validate_database(path, deadline):
                 p.require(str(uuid.UUID(obj['attempt_id'])) == obj['attempt_id'] and
                           obj['request_sha256'] == p.identity(req), 'reservation identity mismatch')
                 row.update(state='in-flight', attempt=obj['attempt_id'])
+            elif event in (p.HOST_EFFECT_ARMED, p.HOST_RESULT_STAGED, p.HOST_EFFECT_CLOSED):
+                p.require(type(obj) is dict and 'request_id' in obj, 'invalid host effect event')
+                p.token(obj['request_id'])
+                req = record('request', obj['request_id'])
+                current(req)
+                row = requests.get(obj['request_id'])
+                p.require(row is not None and row['state'] == 'in-flight' and p.host_effect_journal(req),
+                          'host effect event outside a journaled in-flight attempt')
+                armed, staged, attempt = row.get('armed', False), row.get('staged'), row['attempt']
+                if event == p.HOST_EFFECT_ARMED:
+                    p.require(not armed and obj == p.effect_identity(req, attempt), 'host arming identity mismatch')
+                    row['armed'] = True
+                elif event == p.HOST_RESULT_STAGED:
+                    p.require(armed and staged is None, 'host observation without one arming event')
+                    p.validate_staged_host_result(req, obj, attempt, controller)
+                    row['staged'] = obj
+                else:
+                    closed_host = p.closed_host_result(req, attempt, controller, armed, staged, obj)
             elif event == 'result':
                 p.validate(obj, 'result')
                 req = record('request', obj['request_id'])
@@ -208,6 +227,9 @@ def validate_database(path, deadline):
                 p.require(obj['request_id'] in requests, 'result before request')
                 row = requests[obj['request_id']]
                 p.require(row['state'] == 'in-flight' and row['attempt'] == obj['attempt_id'], 'attempt identity mismatch')
+                if p.host_effect_journal(req) or closed_host is not None:
+                    p.require(closed_host == obj, 'host result lacks its matching verified closure')
+                    closed_host = None
                 if reconciliation is not None:
                     p.require(obj['request_id'] == reconciliation['request_id'] and obj['status'] == 'blocked' and
                               obj['diagnostics'] == reconciliation['diagnostics'] and
@@ -220,7 +242,7 @@ def validate_database(path, deadline):
                 p.fields(obj, 'request_id attempt_id diagnostics evidence')
                 p.text(obj['diagnostics']); p.references(obj['evidence'])
                 req = record('request', obj['request_id'])
-                p.require(req['boundary'] != p.APP_PROCESS_BOUNDARY, 'unexpected application reconciliation')
+                p.require(req['boundary'] not in p.AUTHENTICATED_BOUNDARIES, 'unexpected application reconciliation')
                 p.require(obj['request_id'] in requests and obj['evidence'] and
                           requests[obj['request_id']]['state'] == 'in-flight' and
                           requests[obj['request_id']]['attempt'] == obj['attempt_id'],
@@ -240,7 +262,7 @@ def validate_database(path, deadline):
                 jobs[req['job_id']][1] = progress
             else:
                 raise ValueError('unknown recovery event')
-        p.require(reconciliation is None, 'incomplete reconciliation transaction')
+        p.require(reconciliation is None and closed_host is None, 'incomplete reconciliation or host closure transaction')
         p.require(seen_records == set(records), 'missing historical record event')
         p.require(sorted(tables['jobs']) == sorted((key, *value) for key, value in jobs.items()),
                   'job checkpoint or progress mismatch')

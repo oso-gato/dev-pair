@@ -82,7 +82,8 @@ and VPS access policy remain open. See R7.6, R7.9 and R7.17–R7.18.
 The host adapter uses the same version 1 job messages and SQLite ledger. Its
 boundary is `fedora-checklist-quadlet`. The recipe is
 `checklist-quadlet-persistence-v1`. `recipe --host` prints the exact identity,
-which covers the controller, protocol, host runtime and Quadlet template.
+which covers the controller, protocol, ledger recovery helper, host runtime
+and Quadlet template.
 The candidate carries the 40-character Git revision and the raw 64-character
 SHA-256 of the single-platform OCI manifest. The registry reference in the
 approval includes the `@sha256:` prefix.
@@ -217,14 +218,26 @@ same stored result and effect ID. A historical `status` can read its exact
 stored request and result after a new checkpoint.
 
 Loss of a client connection leaves execution and the durable result under
-host control. If the host executor dies or cannot prove cleanup, the
-ledger keeps the attempt in flight. Its private workspace includes
-`operation.json`, and `restart-requested` is written before attempting the
-restart. The generic ledger reconciliation command refuses to close this
-attempt. The executor preserves uncertain resources for operator inspection.
-Renewal can inventory the state and defer activation while effects remain
-uncertain. The authorized reconciliation path for closing an uncertain
-native attempt still needs verification.
+host control. The ledger records an arming event before the executor starts
+the recipe and records the observed verdict before cleanup. It exposes the
+verdict as a result only after cleanup is confirmed. If the executor dies
+or cleanup is uncertain, status shows the original attempt in flight. The
+workspace contains `operation.json` and the executor writes
+`restart-requested` before issuing that action.
+
+The trusted conductor can use `send reconcile --host` with the same exact
+request and TLS profile. The host inspects the matching systemd unit,
+rootless container and workspace within the cleanup time allowance. When
+all three are absent, a durable observation and matching storage identity
+allow the original result to be published. An unarmed reservation with
+the same absence proof closes as blocked with the original attempt ID and
+zero effects. That closure allows a fresh request. The command makes no
+application writes and issues no lifecycle commands. If resources still
+exist, storage identity changed or an armed attempt lacks a durable
+observation, the attempt stays in flight for operator inspection. Snapshot
+backup and restore validate the same ledger transitions, including the
+host-specific evidence. The controller's generic reconciliation route
+continues to block authenticated host effects.
 
 ### Tailnet release
 
@@ -252,8 +265,9 @@ route.
 
 The local component test exercises actual checklist HTTP in subprocesses,
 with a fixture manager and OCI metadata. It verifies failure and repair
-feedback, no duplicate restart, credential and grant bindings, and retained
-uncertain effects. The fixture's induced failure is a test input. Native
+feedback, no duplicate restart, credential and grant bindings, interrupted
+reservation and observation recovery, and retained uncertain effects.
+The fixture's induced failure is a test input. Native
 Fedora validation still needs independent evidence of the real user manager,
 rootless confinement, SELinux labels, application and network boundaries.
 The authenticated DevBox repair, producer receipt, controlled deployment and

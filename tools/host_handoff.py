@@ -32,7 +32,7 @@ EFFECTS = ['create-item', 'complete-item', 'restart-owned-service', 'remove-disp
 CLEANUP = {'plan': 'Stop only the owned child processes and remove the attempt database',
            'preserve': ['source', 'checkpoints', 'evidence', 'deliverables']}
 OPERATIONS = ('submit', 'execute', 'consume')
-HOST_OPERATIONS = (*OPERATIONS, 'status')
+HOST_OPERATIONS = (*OPERATIONS, 'status', 'reconcile')
 WIRE_SECONDS = 3
 MAX_APP_RESPONSE = 8192
 MAX_FILE_BYTES = 1024 * 1024
@@ -40,6 +40,7 @@ BWRAP = pathlib.Path('/usr/bin/bwrap')
 APP_PYTHON = pathlib.Path('/usr/bin/python3')
 SELF = pathlib.Path(__file__).resolve()
 JOB_PROTOCOL = pathlib.Path(p.__file__).resolve()
+LEDGER_RECOVERY = pathlib.Path(sys.modules['ledger_recovery'].__file__).resolve()
 LIBC = ctypes.CDLL(None, use_errno=True)
 # Linux UAPI constants also cover Python builds that omit these names.
 ADD_SEALS = getattr(fcntl, 'F_ADD_SEALS', 1033)
@@ -51,7 +52,8 @@ RECIPE_SHA256 = p.sha256(SELF.read_bytes())
 RECIPE_REVISION = p.identity({'adapter': RECIPE_SHA256, 'protocol': p.sha256(JOB_PROTOCOL.read_bytes())})
 HOST_RUNTIME = SELF.parent.parent / 'runtime/checklist/checklist_quadlet.py'
 HOST_RECIPE = 'checklist-quadlet-persistence-v1'
-HOST_CAPABILITIES = ['rootless-quadlet', 'enforcing-selinux', 'loopback-http', 'owned-service-restart']
+HOST_CAPABILITIES = ['rootless-quadlet', 'enforcing-selinux', 'loopback-http', 'owned-service-restart',
+                     p.HOST_EFFECT_RECEIPT]
 HOST_EFFECTS = ['create-item', 'complete-item', 'restart-owned-service', 'remove-disposable-data']
 HOST_CLEANUP = dict(CLEANUP, plan='Stop the owned Quadlet and remove its disposable test data')
 HOST_REASON = 'Observe persistence across an approved rootless systemd service restart on Fedora'
@@ -60,7 +62,8 @@ HOST_REASON = 'Observe persistence across an approved rootless systemd service r
 def recipe_identity(*, host=False):
     if host:
         implementation = p.identity({'adapter': RECIPE_SHA256, 'runtime': p.sha256(HOST_RUNTIME.read_bytes()),
-                                     'quadlet': p.sha256(HOST_RUNTIME.with_name('acceptance.container').read_bytes())})
+                                     'quadlet': p.sha256(HOST_RUNTIME.with_name('acceptance.container').read_bytes()),
+                                     'ledger-recovery': p.sha256(LEDGER_RECOVERY.read_bytes())})
         return {'recipe': HOST_RECIPE, 'recipe_sha256': implementation,
                 'revision': p.identity({'implementation': implementation, 'protocol': p.sha256(JOB_PROTOCOL.read_bytes())})}
     return {'recipe': RECIPE, 'recipe_sha256': RECIPE_SHA256, 'revision': RECIPE_REVISION}
@@ -410,9 +413,7 @@ def dispatch(ledger, scratch, artifact, size, rules, job_id, candidate, principa
     return ledger.finish(run_attempt(ledger, request, attempt, scratch, artifact, rules))
 
 
-def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
-    end = time.monotonic() + request['budgets']['seconds']
-    deadline = end - runtime.CLEANUP_SECONDS
+def observe_host_attempt(ledger, request, attempt, unit, authorization, runtime, deadline):
     title = 'Checklist restart test ' + attempt
     evidence = [*authorization, 'effect-id:' + attempt, 'kernel-release:' + os.uname().release]
     effects = []
@@ -475,11 +476,7 @@ def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
     except (OSError, ValueError, subprocess.SubprocessError, http.client.HTTPException) as exc:
         error = str(exc) if type(exc) is ValueError else type(exc).__name__
         diagnostic = bounded_diagnostic(stage + ': ' + error)
-    finally:
-        try:
-            unit.cleanup(end)
-        except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            raise ValueError('host effect remains in flight after unresolved Quadlet cleanup') from exc
+    evidence.extend(unit.storage_evidence)
     logs = 'host-steps:' + ','.join(unit.logs)
     p.text(logs, 1200)
     check = dict(request['checks'][0], actual=actual, status=status, diagnostics=diagnostic, exit_status=None,
@@ -494,6 +491,22 @@ def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
                       request_sha256=p.identity(request), attempt_id=attempt, executor=executor, status=status,
                       checks=[check], diagnostics=diagnostic, evidence=[*evidence, logs],
                       effects=effects, cleanup=cleanup)
+
+
+def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
+    end = time.monotonic() + request['budgets']['seconds']
+    deadline = end - runtime.CLEANUP_SECONDS
+    time_left(deadline)
+    ledger.arm_host_effect(request, attempt)
+    try:
+        verdict = observe_host_attempt(ledger, request, attempt, unit, authorization, runtime, deadline)
+        ledger.stage_host_result(request, verdict)
+    finally:
+        try:
+            unit.cleanup(end)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValueError('host effect remains in flight after unresolved Quadlet cleanup') from exc
+    return ledger.close_host_effect(request, attempt, 'cleaned', ['owned-cleanup-completed'])
 
 
 def bounded_diagnostic(text):
@@ -530,13 +543,21 @@ def dispatch_host(ledger, runtime, env, runtime_dir, approval, principals, packe
         if status['state'] == 'completed':
             ledger.current(request)
             return status['result']
+        if operation == 'reconcile':
+            attempt = status['attempt_id']
+            armed, staged = ledger.host_effect_state(request, attempt)
+            p.require(not armed or staged is not None, 'armed host effect lacks a durable observation; replay refused')
+            unit = runtime.Quadlet(runtime_dir, env, attempt, None, request['candidate'], request['budgets']['seconds'])
+            unit.verify_absent(time.monotonic() + runtime.CLEANUP_SECONDS, staged)
+            return ledger.close_host_effect(request, attempt, 'recovered-result' if armed else 'zero-effect',
+                                            p.HOST_ABSENCE_EVIDENCE)
         p.require(status['state'] == 'pending', 'unresolved in-flight effects require reconciliation; execution refused')
         image, authorization = runtime.approval(approval, request)
         attempt, previous = ledger.begin(request_id, authenticated_request=request)
         if previous is not None:
             return previous
         unit = runtime.Quadlet(runtime_dir, env, attempt, image, request['candidate'], request['budgets']['seconds'])
-        return ledger.finish(run_host_attempt(ledger, request, attempt, unit, authorization, runtime))
+        return run_host_attempt(ledger, request, attempt, unit, authorization, runtime)
 
 
 def serve_connections(listener, lifetime, context, expected_peer, dispatch_packet):
@@ -568,7 +589,7 @@ def serve_host(args):
     p.number(args.lifetime, 1, 600)
     p.number(args.port, 0, 65535)
     runtime = host_runtime()
-    for code in (SELF, JOB_PROTOCOL, HOST_RUNTIME, runtime.TEMPLATE, pathlib.Path(sys.modules['ledger_recovery'].__file__)):
+    for code in (SELF, JOB_PROTOCOL, HOST_RUNTIME, runtime.TEMPLATE, LEDGER_RECOVERY):
         runtime.protected(code, file=True)
     directory, env = runtime.rootless_environment()
     state = trusted_directory(args.state)
@@ -645,7 +666,7 @@ def check_reply(operation, data, request, controller):
             return
     elif operation == 'consume':
         p.fields(data, 'progress result')
-    result = data if operation == 'execute' else data['result']
+    result = data if operation in ('execute', 'reconcile') else data['result']
     p.validate(result, 'result')
     p.match_result(request, result, controller)
     if operation in ('submit', 'status'):
@@ -719,7 +740,7 @@ def main(argv=None):
         budget = {'seconds': args.seconds, 'artifact_bytes': args.artifact_bytes, 'spend_usd': 0}
         result = produce_request(checkpoint, args.request_id, args.controller_id, principals, budget, host=args.host)
     else:
-        p.require(args.host or args.operation in OPERATIONS, 'status requires the protected host recipe')
+        p.require(args.host or args.operation in OPERATIONS, 'operation requires the protected host recipe')
         message = p.loads(sys.stdin.buffer.read(p.MAX_MESSAGE + 1))
         if args.operation == 'status':
             check_host_status_request(message, args.controller_id, principals)
