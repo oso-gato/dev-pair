@@ -161,7 +161,7 @@ def protected_publication(producer, revision, context):
 
 
 def used_categories():
-    _, raw = command('/usr/bin/ps', '-e', '-o', 'label=')
+    _, raw = command('/usr/bin/ps', '-e', '-ww', '-o', 'label=')
     found = set()
     for value in raw.decode('ascii').splitlines():
         value = value.strip()
@@ -323,7 +323,9 @@ def filesystem_uuid(device):
 
 
 def reserve(path, additional=0):
-    require(free_space(path) >= GUEST_RESERVE + additional, 'eight GiB host reserve would be crossed')
+    available = free_space(path)
+    require(available >= GUEST_RESERVE + additional, 'eight GiB host reserve would be crossed')
+    return available
 
 
 class Volume:
@@ -414,7 +416,8 @@ class Volume:
 
     def observe(self, device):
         devbox.private_dir(self.target, self.placement.account)
-        return validate_mount(device, self.target, self.capacity)
+        return {**validate_mount(device, self.target, self.capacity), 'filesystem_uuid': self.info['uuid'],
+                'backing_bytes': self.capacity, 'mount': str(self.target)}
 
 
 def current_boot():
@@ -592,7 +595,8 @@ class Placement:
                                      *args, seconds=seconds + 22, allowed=allowed)
         except BaseException as error:
             try:
-                self.reconcile(interrupted=not re.search(r'command exit [1-9][0-9]?(?:\D|$)', str(error)))
+                payload_failed = re.search(r'command exit 2 .*DevBox blocked:', str(error))
+                self.reconcile(interrupted=not payload_failed)
             except (db.Blocked, OSError, ValueError, subprocess.SubprocessError) as cleanup:
                 raise db.Blocked(f'{error}. Managed unit cleanup unresolved: {cleanup}') from None
             raise
@@ -600,7 +604,9 @@ class Placement:
         return status, output
 
     def engine(self, *args, timeout=30):
-        _, raw = self.managed(*PODMAN, *args, seconds=timeout, copy=True)
+        limit = fedora_oci.SAVE_FILE_LIMIT
+        prefix = ('/usr/bin/prlimit', f'--fsize={limit}:{limit}', '--') if args[0] == 'save' else ()
+        _, raw = self.managed(*prefix, *PODMAN, *args, seconds=timeout, copy=True)
         return raw
 
     def inspect(self, kind, image):
@@ -701,10 +707,10 @@ class Placement:
         reserve(self.record.parent, additional)
         outer_sample = outer.mount(self.initialize_outer)
         build_sample = build.mount(self.initialize_build)
-        reserve(devbox.ROOT)
-        reserve(home)
         self.leaves()
-        return {'outer': outer_sample, 'build': build_sample, 'minimum_host_free_bytes': GUEST_RESERVE}
+        return {'outer': outer_sample, 'build': build_sample, 'minimum_host_free_bytes': GUEST_RESERVE,
+                'host_available_bytes': {'role': reserve(devbox.ROOT), 'home': reserve(home),
+                                         'backing': reserve(self.record.parent)}}
 
     def recipe(self, parent, name, data):
         path = parent / name
@@ -735,6 +741,14 @@ class Placement:
             self.producer.directory(str(path.parent), mode=0o755)
             self.recipe(path.parent, path.name, data)
 
+    def import_fedora_base(self):
+        # The service can outlive the foreground launcher. Keep its bounded
+        # verification spool if control ends with an uncertain service outcome.
+        with fedora_oci.verified(self.cache, temporary_parent=self.inputs_path, leased=True) as (plain, signature):
+            proof = fedora_oci.import_image(lambda *args, timeout: self.engine(*args, timeout=timeout),
+                                            plain, uid=self.account.pw_uid)
+        return proof, signature
+
     def prepare_images(self, retry):
         request = self.state['request']
         store = self.engine_store()
@@ -751,9 +765,7 @@ class Placement:
             self.recipe(tooling, 'Containerfile', TOOLING_RECIPE)
             for name, data in self.files.items():
                 self.recipe(outer, name, data)
-            with fedora_oci.verified(self.cache, temporary_parent=self.inputs_path) as (plain, signature):
-                base = fedora_oci.import_image(lambda *args, timeout: self.engine(*args, timeout=timeout),
-                                               plain, uid=self.account.pw_uid)
+            base, signature = self.import_fedora_base()
             prefix = ('build', '--quiet', '--pull=never', '--http-proxy=false', '--format=oci')
             tool_id = db.engine_id(self.engine(*prefix, '--network=slirp4netns:allow_host_loopback=false',
                                                '--file', str(tooling / 'Containerfile'), str(tooling),
@@ -846,8 +858,6 @@ class Placement:
                 and consumer.get('archive_sha256') == self.inner['archive_sha256'],
                 'managed DevBox result does not prove the exact offline placement')
         self.check_categories()
-        reserve(devbox.ROOT)
-        reserve(self.record.parent)
         after_storage = self.establish_storage()
         report = {'kind': 'dev-pair-native-placement-v1', 'job': self.job, 'boot_id': self.boot,
                   'job_admission': False, 'result': consumer, 'storage': after_storage, 'store': store,

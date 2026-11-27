@@ -1,5 +1,6 @@
 """Local storage ownership, release custody and managed-entry checks for the native bridge."""
 
+from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
@@ -190,6 +191,52 @@ class TestManagedEntry(unittest.TestCase):
             candidate.reconcile(interrupted=True)
             proof.assert_called_once_with(unit)
             self.assertIsNone(candidate.state['activity'])
+
+    def test_untyped_systemd_failure_preserves_uncertainty_and_primary(self):
+        candidate = self.placement()
+        missing = (4, b'LoadState=not-found\nActiveState=inactive\n')
+        manager_failure = db.Blocked('timeout: command exit 2 — systemd launcher failed')
+        with patch.object(n, 'command', side_effect=[missing, manager_failure, missing]), \
+                patch.object(n, 'verify_inactive_cgroup') as proof:
+            with self.assertRaisesRegex(db.Blocked, 'systemd launcher failed.*cleanup unresolved'):
+                candidate.managed('/usr/bin/podman', 'load', seconds=30)
+        self.assertIsNotNone(candidate.state['activity'])
+        proof.assert_not_called()
+
+    def test_uncertain_signed_base_import_keeps_its_spool_on_bounded_storage(self):
+        candidate = self.placement()
+        candidate.cache = Path('/protected/cache')
+        candidate.inputs_path = Path(self.enterContext(TemporaryDirectory()))
+        failure = db.Blocked('owned systemd cleanup unresolved')
+
+        @contextmanager
+        def verified(cache, *, temporary_parent, leased):
+            self.assertEqual(cache, candidate.cache)
+            with n.fedora_oci._verification_tree(temporary_parent, leased) as scratch:
+                archive = Path(scratch) / 'base.oci.tar'
+                archive.write_bytes(b'signed archive fixture')
+                yield archive, {'verified': True}
+
+        def import_image(engine, archive, *, uid):
+            self.assertEqual(uid, candidate.account.pw_uid)
+            return engine('load', str(archive), timeout=5)
+
+        with patch.object(n.fedora_oci, 'verified', verified), \
+                patch.object(n.fedora_oci, 'import_image', import_image), \
+                patch.object(candidate, 'managed', side_effect=failure):
+            with self.assertRaisesRegex(db.Blocked, 'cleanup unresolved'):
+                candidate.import_fedora_base()
+        records = list(candidate.inputs_path.glob('dev-pair-fedora-*/base.oci.tar'))
+        self.assertEqual([record.read_bytes() for record in records], [b'signed archive fixture'])
+
+    def test_signed_base_save_limits_file_size_within_bounded_copy_path(self):
+        candidate = self.placement()
+        candidate.managed = Mock(return_value=(0, b''))
+        candidate.engine('save', '--output', '/bounded/archive.oci.tar', timeout=5)
+        argv = candidate.managed.call_args.args
+        limit = n.fedora_oci.SAVE_FILE_LIMIT
+        self.assertEqual(argv[:3], ('/usr/bin/prlimit', f'--fsize={limit}:{limit}', '--'))
+        self.assertEqual(candidate.managed.call_args.kwargs, {'copy': True, 'seconds': 5})
 
     def test_foreign_unit_is_never_stopped(self):
         candidate = self.placement()

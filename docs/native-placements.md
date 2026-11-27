@@ -81,7 +81,9 @@ uses the managed user's tmpfs, and the empty offline workspace, state and
 cache leaves remain under their managed role roots.
 
 The tool verifies Fedora's official signed archive, imports it by config ID,
-and checks the save-back graph. It then builds the tooling layer from signed
+and checks the save-back graph. Its verification spool lives inside the bounded
+filesystem and stays available when a managed import is unresolved. It then
+builds the tooling layer from signed
 Fedora package repositories inside a disposable rootless build. That phase
 needs public package access through the isolated builder network. The outer
 DevBox build uses the exact verified tooling image and pinned Distrobox entry,
