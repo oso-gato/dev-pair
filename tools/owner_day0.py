@@ -498,8 +498,7 @@ class DayZero:
 
     def finalize(self):
         if self.app.status()['phase'] == 'tailnet-only':
-            self.app.verify_final_guard()
-            self.app.verify_final_ssh()
+            self.app.refresh_workload_gate()
             return True
         admitted = HANDOFF / 'cutover.json'
         if os.path.lexists(admitted):
@@ -603,7 +602,7 @@ class DayZero:
                 driver = local_file(Path('/usr/libexec/dev-pair/renewal/driver'))
                 connection = {key: os.environ[key] for key in ('SSH_CONNECTION', 'SSH_CLIENT') if key in os.environ}
                 subprocess.run(['/usr/bin/python3', '-IB', str(driver), 'access-probe'], env={**ENV, **connection},
-                               input=encoding({'role': role, 'source_sha': revision}), timeout=450, check=True)
+                               input=encoding({'role': role, 'source_sha': revision}), timeout=660, check=True)
                 return
             if response is None:
                 sys.stdout.buffer.write(encoding(self.app.access_cutover_binding(revision, workload=workload)))
@@ -681,6 +680,8 @@ class DayZero:
                 expected = pin(desired['gptbox_context_sha256'])
                 if not image and not self.resume_maintenance(identity, historical, expected, tty):
                     return
+            if report.get('phase') != 'tailnet-only':
+                self.app.publish_workload_gate('held')
             self.stage(identity, revision, 'host-bootstrap-complete',
                        'The confined maintenance gptbox passed both offline probe cycles. Workloads remain held.')
             if not self.enroll(tty):

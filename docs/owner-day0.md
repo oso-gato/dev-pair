@@ -48,6 +48,14 @@ runs the confined role checks through the same named core tailnet SSH path and
 returns the next signed bundle for `access-response`. The provider and owner
 intake grants still independently control normal jobs. [Commissioning](host-commissioning.md)
 
+When a replacement changes the selected role release or images, the existing
+approval holds job and application dispatch until a fresh workload review
+binds the replacement. A protected rollback can reuse the retained approval
+for its exact previous placement. An unattended replacement also needs a
+prospective observation route to test the candidate before changing the live
+selection. Optional owner and provider activation needs its own supported
+policy transition and approved grants.
+
 If you ran a reviewed offline-only bootstrap, retain its checkout, journals and
 local gptbox. Stage the separately reviewed continuation checkout in its own
 standard directory, then run `./day0.sh resume` there. The installer verifies

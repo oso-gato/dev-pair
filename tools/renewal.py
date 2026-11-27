@@ -503,7 +503,9 @@ class Renewal:
             _, state = self.transition()
             require(state is None or state['phase'] in TERMINAL, 'role dispatch frozen by renewal')
             require(not os.path.lexists(self.root / 'renewal-fence' / 'frozen'), 'role dispatch frozen pending host observation')
-            yield self.live_release()
+            release = self.live_release()
+            protocol.require_workload_access(self.root, release=release)
+            yield release
 
     def registry_path(self, role, job):
         require(role in ROLES, 'unknown role')
@@ -683,6 +685,7 @@ class Renewal:
     def apply(self, scope):
         require(scope in SCOPE_COMPONENTS, 'unknown renewal scope')
         with self.lock():
+            protocol.require_workload_access(self.root)
             attempt, state = self.transition()
             if state is not None:
                 if state['phase'] not in TERMINAL or self.unfinished_thaw(attempt, state):
@@ -743,6 +746,7 @@ class Renewal:
 
     def refresh_agent_target(self):
         """Ask only the independently configured candidate service for an approval."""
+        protocol.require_workload_access(self.root)
         attempt, state = self.transition()
         if state is not None and (state['phase'] not in TERMINAL or self.unfinished_thaw(attempt, state)):
             return True

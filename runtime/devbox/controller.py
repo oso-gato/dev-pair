@@ -729,7 +729,7 @@ def fixed_entry(engine, identity, operation, check, started, job=None):
     return output
 
 
-def controller(expected, owner, seconds, operation=None, request_sha=None):
+def controller(expected, owner, seconds, operation=None, request_sha=None, *, probe_version=None):
     end = time.monotonic() + seconds
     manifest = read_manifest(Path(MANIFEST), expected, end)
     if operation is not None:
@@ -764,8 +764,10 @@ def controller(expected, owner, seconds, operation=None, request_sha=None):
         require(sorted(triples) == [(0, 1000, 1), (1, 1, 999), (1000, 1001, 64536)],
                 'rootless engine user namespace map mismatch')
     release = manifest['inner']
-    if job:
+    if job or probe_version:
         codex_version = load_development_archive(engine, manifest, Path(ARCHIVE), reuse=True)
+        if probe_version:
+            require(codex_version == probe_version, 'selected probe version differs from the immutable development image')
     else:
         load_development_archive(engine, manifest, Path(ARCHIVE))
     name = 'dp-nested-' + owner[:24]
@@ -813,7 +815,7 @@ def controller(expected, owner, seconds, operation=None, request_sha=None):
             require(probe.get('boundary_probe') == 'passed' and probe.get('uid') == 1000
                     and same_label(probe.get('selinux_label'), child['label']), 'Distrobox inner protected-write probe failed')
             version = fixed_entry(engine, identity, 'version', check, previous).strip()
-            require(version == f'codex-cli {CODEX_VERSION}'.encode(), 'Distrobox Codex version mismatch')
+            require(version == f'codex-cli {probe_version or CODEX_VERSION}'.encode(), 'Distrobox Codex version mismatch')
             engine('stop nested development gptbox', 'stop', '--time=5', identity, seconds=15)
             cycles.append({'started_at': previous, 'proc': child, 'probe': probe, 'version': version.decode('ascii')})
     if job:
@@ -836,7 +838,14 @@ if __name__ == '__main__':
         require(len(sys.argv) in (4, 6), 'expected manifest digest, ownership token, budget and paired operation inputs')
         budget = int(sys.argv[3])
         require(0 < budget < OUTER_SECONDS - CLEANUP_SECONDS, 'invalid nested time budget')
-        print(json.dumps(controller(hex_id(sys.argv[1]), hex_id(sys.argv[2]), budget, *sys.argv[4:]), sort_keys=True))
+        arguments = sys.argv[4:]
+        if arguments[:1] == ['--probe-version']:
+            require(len(arguments) == 2 and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', arguments[1]),
+                    'invalid approved offline probe version')
+            result = controller(hex_id(sys.argv[1]), hex_id(sys.argv[2]), budget, probe_version=arguments[1])
+        else:
+            result = controller(hex_id(sys.argv[1]), hex_id(sys.argv[2]), budget, *arguments)
+        print(json.dumps(result, sort_keys=True))
     except (Blocked, OSError, KeyError, ValueError, TypeError, IndexError, subprocess.TimeoutExpired) as error:
         print(f'DevBox controller blocked: {error}', file=sys.stderr)
         sys.exit(2)

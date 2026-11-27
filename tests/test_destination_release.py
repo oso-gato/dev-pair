@@ -19,6 +19,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bootstrap as b
 import destination_release as d
+import job_protocol as jobs
 import release_trust as t
 
 SOURCE = 'a' * 40
@@ -67,9 +68,10 @@ class BootstrapAccessTests(unittest.TestCase):
                     'execution_route': 'provider-recovery', 'provider_recovery': 'hostinger://test-vps/recovery',
                     'public_addresses': {'ipv4': '8.8.4.4', 'ipv6': None},
                     'tailnet_addresses': {'ipv4': '100.64.0.5', 'ipv6': 'fd7a:115c:a1e0::5'}}
-            role_selection = {'release_sha256': '5' * 64}
+            role_selection = {'release_sha256': '5' * 64, 'maintenance_image': 'a' * 64, 'development_image': 'b' * 64,
+                              'devbox_image': 'c' * 64, 'development_manifest': 'd' * 64, 'job': 'checklist'}
 
-            def sign(core, **overrides):
+            def sign(core, *, legacy=False, **overrides):
                 scope = b.CORE_ACCESS_CUTOVER if core else b.WORKLOAD_ACCESS_CUTOVER
                 expected = app.access_probe_plan(DNS, data['provider_recovery'], data['public_addresses'], core_only=core)
                 rows = [{'test': test, 'family': family, 'endpoint': endpoint, 'vantage': principal,
@@ -78,6 +80,9 @@ class BootstrapAccessTests(unittest.TestCase):
                 payload = {**data, 'kind': scope, 'probes': rows, **overrides}
                 if not core:
                     payload.setdefault('role_artifacts', role_selection)
+                if legacy:
+                    for field in ('kind', 'tailnet_addresses', 'role_artifacts'):
+                        del payload[field]
                 receipt.write_text(json.dumps(payload))
                 signature = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(key), '-n', 'dev-pair-destination'],
                                            input=receipt.read_bytes(), capture_output=True, check=True).stdout
@@ -86,6 +91,7 @@ class BootstrapAccessTests(unittest.TestCase):
             desired = json.dumps({'bootstrap_sources': access})
             app.directory('/var/lib/dev-pair', mode=0o755)
             app.directory(b.STATE, mode=0o700)
+            app.directory('/var/lib/dev-pair/renewal', mode=0o700)
             app.atomic(b.STATE + '/prepared', desired)
             app.atomic(b.STATE + '/desired.json', desired)
             temporary_guard = app.guard_rules(access)
@@ -98,8 +104,9 @@ class BootstrapAccessTests(unittest.TestCase):
                   patch.object(app, 'identity_fields', return_value=(data['tailnet'], data['node_id'])),
                   patch.object(app, 'access_keys_digest', return_value=data['keys_sha256']),
                   patch.object(app, 'observed_ssh_peer', return_value=None), patch.object(app, 'verify_final_ssh'),
+                  patch.object(jobs, 'require_workload_access'),
                   patch.object(app, 'guard_hash', return_value='6' * 64),
-                  patch.object(app, 'access_workload_selection', return_value=role_selection)):
+                  patch.object(app, 'access_workload_selection', return_value=role_selection) as current):
                 fail_check = True
                 sign(True)
                 with self.assertRaisesRegex(b.Blocked, 'fixture guard preflight'):
@@ -110,6 +117,9 @@ class BootstrapAccessTests(unittest.TestCase):
                 self.assertEqual(app.finalize(str(receipt))['access_scope'], 'core')
                 with self.assertRaisesRegex(b.Blocked, 'workload access'):
                     app.verify_workload_access()
+                sign(False, legacy=True)
+                with self.assertRaisesRegex(b.Blocked, 'separate exact signed workload'):
+                    app.finalize(str(receipt))
                 sign(False, role_artifacts={'release_sha256': '7' * 64})
                 with self.assertRaisesRegex(b.Blocked, 'selected installed role'):
                     app.finalize(str(receipt))
@@ -117,6 +127,27 @@ class BootstrapAccessTests(unittest.TestCase):
                 sign(False)
                 self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
                 self.assertEqual(app.verify_workload_access()['role_artifacts'], role_selection)
+                marker = app.path('/var/lib/dev-pair/' + jobs.WORKLOAD_ACCESS)
+                self.assertEqual(json.loads(marker.read_text())['release_sha256'], role_selection['release_sha256'])
+                updated = {**role_selection, 'release_sha256': '7' * 64, 'development_image': '8' * 64}
+                current.return_value = updated
+                with self.assertRaisesRegex(b.Blocked, 'required for the current role placement'):
+                    app.verify_workload_access()
+                with self.assertRaisesRegex(b.Blocked, 'selected installed role'):
+                    app.finalize(str(receipt))
+                app.hold_changed_workload_access(updated['release_sha256'])
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+                sign(False, role_artifacts=updated)
+                self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
+                self.assertEqual(app.verify_workload_access()['role_artifacts'], updated)
+                self.assertEqual(json.loads(marker.read_text())['images']['development'], updated['development_image'])
+                app.hold_changed_workload_access('9' * 64)
+                with patch.object(app, 'own_workload_rollback', return_value=False) as rollback:
+                    app.restore_retained_workload_gate(updated['release_sha256'])
+                    self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+                    rollback.return_value = True
+                    app.restore_retained_workload_gate(updated['release_sha256'])
+                    self.assertEqual(json.loads(marker.read_text())['phase'], 'admitted')
                 self.assertEqual(len([call for call in nft_commands if '--check' not in call]), 1)
 
     def test_stripped_ssh_binding_denies_existing_scoped_path(self):

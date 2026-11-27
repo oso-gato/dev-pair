@@ -1,6 +1,7 @@
 import contextlib
 import configparser
 import copy
+import json
 import os
 import pathlib
 import select
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -166,6 +168,56 @@ class QuadletHandoffTests(unittest.TestCase):
                                    {'operation': action, 'request': request})
         h.check_reply(action, data, request, self.id)
         return data
+
+    def test_managed_access_gate_preserves_readback_and_blocks_real_effect_until_admitted(self):
+        flag = self.path / p.WORKLOAD_ACCESS
+        fence = self.path / 'renewal-fence'
+        fence.mkdir(exist_ok=True)
+        (fence / 'selected-host.json').touch()
+        original_check = p.require_workload_access
+        real_lstat, real_fstat = pathlib.Path.lstat, os.fstat
+        ancestry = {self.path, *self.path.parents}
+
+        def projected_lstat(path):
+            node = real_lstat(path)
+            return SimpleNamespace(st_uid=0, st_mode=node.st_mode & ~0o022) if path in ancestry else node
+
+        def projected_fstat(fd):
+            node = real_fstat(fd)
+            if flag.exists() and node.st_ino == flag.stat().st_ino and node.st_dev == flag.stat().st_dev:
+                return SimpleNamespace(st_uid=0, st_mode=node.st_mode, st_nlink=node.st_nlink, st_size=node.st_size)
+            return node
+
+        def write_gate(phase):
+            admitted = phase == 'admitted'
+            scope = {'schema': 1, 'phase': phase, 'release_sha256': 'd' * 64 if admitted else None,
+                     'images': {role: 'e' * 64 for role in ('maintenance', 'development', 'devbox')} if admitted else None}
+            flag.write_text(json.dumps(scope))
+            flag.chmod(0o644)
+
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        with (mock.patch.object(p, 'require_workload_access', side_effect=lambda: original_check(self.path)),
+              mock.patch.object(pathlib.Path, 'lstat', projected_lstat), mock.patch.object(os, 'fstat', projected_fstat)):
+            with self.assertRaisesRegex(ValueError, 'managed workload access observation is unavailable'):
+                self.dispatch('submit', request)
+            write_gate('held')
+            with self.assertRaisesRegex(ValueError, 'review is pending'):
+                self.dispatch('submit', request)
+            self.assertEqual(self.services, [])
+            write_gate('admitted')
+            original_check(self.path, release='d' * 64, images={'development': 'e' * 64})
+            with self.assertRaisesRegex(ValueError, 'selected role image'):
+                original_check(self.path, images={'development': '9' * 64})
+            self.assertEqual(self.dispatch('submit', request)['state'], 'pending')
+            write_gate('held')
+            self.assertEqual(self.dispatch('status', request)['state'], 'pending')
+            with self.assertRaisesRegex(ValueError, 'review is pending'):
+                self.dispatch('execute', request)
+            self.assertEqual(self.services, [])
+            write_gate('admitted')
+            self.assertEqual(self.dispatch('execute', request)['status'], 'pass')
+            self.assertEqual(len(self.services), 1)
 
     def test_restart_failure_repair_and_exact_replay(self):
         failing = self.request(0)

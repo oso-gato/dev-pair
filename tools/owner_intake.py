@@ -403,6 +403,7 @@ class Intake:
     def confirm(self, job, token):
         p.digest(token)
         with self.lock():
+            p.require_workload_access(self.root)
             saved = self.record(job)
             p.require(saved['agreement_token'] == token and p.identity(saved['preview']) == token,
                       'The agreement draft has changed. Review its exact new digest.')
@@ -439,6 +440,7 @@ class Intake:
         self.save(job, saved)
 
     def schedule(self, job, saved, deadline):
+        p.require_workload_access(self.root)
         if saved['phase'] == 'blocked' and 'recovery' not in saved and saved['diagnostics'] in LEGACY_SCHEDULING_FAILURES:
             state = self.published(job, saved['plan'])
             if state is None or state['phase'] != 'submitted':
@@ -472,6 +474,7 @@ class Intake:
             self.save(job, saved)
 
     def reconcile(self):
+        p.require_workload_access(self.root)
         end = time.monotonic() + 20
         queue = trusted_directory(self.queue)
         for count, path in enumerate(queue.glob('*.json'), 1):
@@ -513,6 +516,7 @@ class Intake:
         return status
 
     def prepare(self, job):
+        p.require_workload_access(self.root)
         # The root-owned unit continues if the caller leaves immediately after confirmation.
         with self.lock():
             record = self.record(job)

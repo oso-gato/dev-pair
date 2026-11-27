@@ -3011,11 +3011,69 @@ class Bootstrap:
             raise Blocked('tailnet-only destination firewall and SSH cutover are unverified')
         return state
 
-    def verify_workload_access(self):
+    def verify_workload_access(self, *, recovery_release=None):
+        from job_protocol import require_workload_access
+
         state = self.verify_final_guard()
         if state.get('scope') is not None:
             raise Blocked('independent workload access checks have not been admitted')
+        recovering = recovery_release is not None and self.own_workload_rollback(recovery_release)
+        if 'role_artifacts' in state and self.access_workload_selection(allow_fenced=recovering) != state['role_artifacts']:
+            raise Blocked('independent workload access checks are required for the current role placement')
+        reference = state.get('role_artifacts', {}).get('release_sha256')
+        require_workload_access(self.path('/var/lib/dev-pair'), release=reference)
         return state
+
+    def publish_workload_gate(self, phase, roles=None):
+        from job_protocol import WORKLOAD_ACCESS
+
+        path = '/var/lib/dev-pair/' + WORKLOAD_ACCESS
+        before = checked_file(self.path(path)).read_text() if os.path.lexists(self.path(path)) else None
+        images = {role: roles[role + '_image'] for role in ('maintenance', 'development', 'devbox')} if roles else None
+        raw = json.dumps({'schema': 1, 'phase': phase, 'release_sha256': roles['release_sha256'] if roles else None,
+                          'images': images}, sort_keys=True) + '\n'
+        self.atomic(path, raw, mode=0o644, expected=before)
+
+    def refresh_workload_gate(self):
+        import renewal
+
+        with self.lock():
+            state = self.verify_final_guard()
+            self.verify_final_ssh()
+            roles = state.get('role_artifacts')
+            if state.get('scope') == 'core':
+                self.publish_workload_gate('held')
+            elif roles is None:
+                self.publish_workload_gate('legacy')
+            else:
+                with renewal.Renewal(self.path('/var/lib/dev-pair'), None).lock(shared=True):
+                    if self.access_workload_selection() == roles:
+                        self.publish_workload_gate('admitted', roles)
+                    else:
+                        self.publish_workload_gate('held')
+
+    def hold_changed_workload_access(self, release):
+        data = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
+        roles = data.get('role_artifacts')
+        if data.get('scope') == 'core' or roles is not None and roles['release_sha256'] != release:
+            self.publish_workload_gate('held')
+
+    def own_workload_rollback(self, release):
+        import renewal
+
+        attempt, state = renewal.Renewal(self.path('/var/lib/dev-pair'), None).transition()
+        marker = self.path('/var/lib/dev-pair/renewal-fence/frozen')
+        return (state is not None and state['phase'] in ('rolling-back', 'rollback-verifying', 'rollback-accepted')
+                and state['request']['previous_sha256'] == release and os.path.lexists(marker)
+                and renewal.read_json(marker) == attempt.name)
+
+    def restore_retained_workload_gate(self, reference):
+        state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
+        roles = state.get('role_artifacts')
+        if (roles is not None and roles['release_sha256'] == reference and self.own_workload_rollback(reference)
+                and self.access_workload_selection(allow_fenced=True) == roles):
+            self.verify_final_ssh()
+            self.publish_workload_gate('admitted', roles)
 
     def verify_final_ssh(self):
         self.run('/usr/sbin/sshd', '-t')
@@ -3109,13 +3167,13 @@ class Bootstrap:
             raise Blocked('both admitted Tailscale address families are required')
         return addresses
 
-    def access_workload_selection(self):
+    def access_workload_selection(self, *, allow_fenced=False):
         import renewal as renewal
 
         self.verify_final_guard()
         control = self.path('/var/lib/dev-pair/renewal')
         chosen = renewal.read_json(control / 'current.json')
-        if chosen != renewal.read_json(control / 'site-current.json') or os.path.lexists(
+        if chosen != renewal.read_json(control / 'site-current.json') or not allow_fenced and os.path.lexists(
                 self.path('/var/lib/dev-pair/renewal-fence/frozen')):
             raise Blocked('the selected private role placement is not settled')
         release = renewal.Renewal(self.path('/var/lib/dev-pair'), None).release(chosen)
@@ -3178,10 +3236,17 @@ class Bootstrap:
     def finalize(self, evidence):
         if os.geteuid() != 0:
             raise Blocked('root required for destination cutover')
-        with self.lock():
+        with contextlib.ExitStack() as operations:
+            operations.enter_context(self.lock())
             if not self.path(f'{STATE}/prepared').exists():
                 raise Blocked('prepare must complete before cutover')
             data, live, core_only = self.cutover_evidence(evidence)
+            if data.get('kind') == WORKLOAD_ACCESS_CUTOVER:
+                import renewal
+
+                operations.enter_context(renewal.Renewal(self.path('/var/lib/dev-pair'), None).lock(shared=True))
+                if self.access_workload_selection() != data['role_artifacts']:
+                    raise Blocked('the selected role placement changed before signed workload activation')
             peer = self.observed_ssh_peer()
             if data['execution_route'] == 'tailnet-core':
                 self.named_tailnet_peer(live, peer)
@@ -3203,16 +3268,23 @@ class Bootstrap:
             if prior.get('phase') == 'complete':
                 self.verify_final_guard()
                 self.verify_final_ssh()
-                if prior.get('scope') == 'core' and not core_only:
+                scoped_workload = data.get('kind') == WORKLOAD_ACCESS_CUTOVER
+                if prior.get('scope') == 'core' and not (core_only or scoped_workload):
+                    raise Blocked('the named administrator stage requires a separate exact signed workload review')
+                if scoped_workload:
                     if data['expires_at'] <= time.time():
                         raise Blocked('fresh workload observations required before activation')
                     accepted = {key: value for key, value in prior.items() if key != 'scope'}
                     accepted.update(core_keys_sha256=data['keys_sha256'], acl_sha256=data['acl_sha256'],
                                     provider_recovery=data['provider_recovery'], public_addresses=data['public_addresses'],
                                     access_receipt_sha256=hashlib.sha256(checked_file(evidence).read_bytes()).hexdigest())
-                    if 'role_artifacts' in data:
-                        accepted['role_artifacts'] = data['role_artifacts']
+                    accepted['role_artifacts'] = data['role_artifacts']
                     self.atomic(CUTOVER, json.dumps(accepted, sort_keys=True) + '\n', expected=prior_raw)
+                    self.publish_workload_gate('admitted', data['role_artifacts'])
+                elif prior.get('scope') == 'core':
+                    self.publish_workload_gate('held')
+                elif 'role_artifacts' not in prior:
+                    self.publish_workload_gate('legacy')
                 return self.status()
             if current not in (temporary, permanent) or (not prior and current != temporary):
                 raise Blocked('bootstrap ingress configuration differs from protected intent')
@@ -3224,6 +3296,8 @@ class Bootstrap:
             self.run('/usr/bin/systemctl', 'is-active', 'dev-pair-bootstrap-guard.service')
             if data['expires_at'] <= time.time():
                 raise Blocked('fresh independent access observations required before cutover')
+            if core_only:
+                self.publish_workload_gate('held')
             pending = json.dumps({'phase': 'applying', 'target': target}, sort_keys=True) + '\n'
             self.atomic(CUTOVER, pending)
             # On retry only roll forward. The root-owned marker and external recovery permit
@@ -3252,6 +3326,8 @@ class Bootstrap:
             if core_only:
                 record['scope'] = 'core'
             self.atomic(CUTOVER, json.dumps(record, sort_keys=True) + '\n', expected=pending)
+            if not core_only:
+                self.publish_workload_gate('legacy')
             self.event('access-cutover', 'complete')
             return self.status()
 

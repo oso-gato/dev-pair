@@ -41,14 +41,15 @@ class NativeRecoveryTests(unittest.TestCase):
         host.verify_final_guard.return_value = {'target': {'source_sha': source}, 'scope': 'core'}
         host.destination_identity.return_value = identity
         host.access_workload_selection.return_value = selection
-        release = {'components': {'host': {}, 'maintenance-agent': {}}}
+        release = {'components': {'host': {}, 'maintenance-agent': {}, 'development-agent': {'codex_version': '0.170.0'}}}
         plan = {'maintenance_context_sha256': '7' * 64}
         development = {'kind': 'dev-pair-devbox-probe-v1', 'manifest_sha256': selection['development_manifest'],
                        'inner_image_id': selection['development_image'], 'outer_image_id': selection['devbox_image'],
                        'inner_removed': True, 'outer_removed': True, 'cycles': [{}, {}], 'job_admission': False}
         run = Mock(side_effect=[r.json_bytes({**claim, 'boot_id': identity['boot_id']}), r.json_bytes(development)])
         config = {'run': run, 'admit_release': lambda _: (release, plan), 'live_host': lambda _: (Path('/protected'), 100),
-                  'retained_maintenance': lambda *_: (claim, identity['boot_id'], 'site')}
+                  'retained_maintenance': lambda *_: (claim, identity['boot_id'], 'site'),
+                  'private_devbox_probe': lambda *_: nullcontext()}
         with (patch.dict(probe.__globals__, config), patch.object(b, 'Bootstrap', return_value=host),
               patch.object(r, 'Renewal', return_value=SimpleNamespace(lock=nullcontext))):
             for role in ('maintenance', 'development'):
@@ -59,7 +60,8 @@ class NativeRecoveryTests(unittest.TestCase):
             self.assertIn('verify-installed-maintenance', maintain)
             self.assertEqual(maintain[maintain.index('--image') + 1], selection['maintenance_image'])
             self.assertEqual(develop[:4], ['/usr/sbin/runuser', '--user', 'dp-dev', '--'])
-            self.assertEqual(develop[-2:], ['--sha256', selection['development_manifest']])
+            self.assertEqual(develop[-5:], ['--sha256', selection['development_manifest'], '--access-probe',
+                                           '--probe-codex-version', '0.170.0'])
             self.assertNotIn('--operation', develop)
             host.observed_ssh_peer.return_value = {**peer, 'device': 'eth0'}
             with self.assertRaisesRegex(b.Blocked, 'named core tailnet'):
@@ -187,7 +189,7 @@ class NativeRecoveryTests(unittest.TestCase):
                     started.append(channel)
 
             changes = {'ROOT': root, 'CONTROL': control,
-                       'verify_workload_access': lambda: None,
+                       'verify_workload_access': lambda *_: None,
                        'admit_release': lambda _: ({'components': parts}, plan),
                        'live_host': lambda _: (root, 100), 'unit': broker,
                        'owned_file': lambda path, limit, expected_uid=0: r.read_private(path, limit),

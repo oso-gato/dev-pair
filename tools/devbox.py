@@ -4,11 +4,13 @@
 import argparse
 from contextlib import contextmanager
 import fcntl
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
 import pwd
 import re
+import shutil
 import signal
 import stat
 import sys
@@ -144,20 +146,46 @@ def check_label(path, expected):
     db.require(db.same_label(actual, expected), f'{path.name} SELinux volume label mismatch')
 
 
-def placement(account, manifest, actual_manifest, job_turn=None):
+def access_probe_root(build, digest):
+    return build / ('.access-probe-' + db.hex_id(digest))
+
+
+def probe_owner(root, manifest, device):
+    node = root.lstat()
+    db.require(root.resolve(strict=True) == root and stat.S_ISDIR(node.st_mode) and node.st_dev == device and
+               (node.st_uid, node.st_gid, stat.S_IMODE(node.st_mode)) == (0, 0, 0o755),
+               'private access probe requires its root-owned bounded directory')
+    check_label(root, db.file_label(manifest, 'outer'))
+    return sha256(str(root).encode()).hexdigest()
+
+
+def clear_probe_data(root):
+    for key in db.JOB_TARGETS:
+        for entry in (root / key).iterdir():
+            if entry.is_symlink() or not entry.is_dir():
+                entry.unlink()
+            else:
+                shutil.rmtree(entry)
+
+
+def placement(account, manifest, actual_manifest, job_turn=None, *, access_probe=None):
     job = manifest['job']
     build = ROOT / 'builds' / job
     build_stat = private_dir(build, account)
     mountinfo = Path('/proc/self/mountinfo').read_text()
     storage = storage_mount(build, manifest['storage_bytes'], mountinfo)
     inputs = build / 'inputs'
+    if job_turn or access_probe:
+        inputs /= job_turn[0] if job_turn else access_probe
     if job_turn:
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from gptbox_runtime import host_job_inputs
-
-        inputs /= job_turn[0]
-    graph = build / 'graph'
-    image_copy = build / 'image-copy'
+    probe = access_probe_root(build, access_probe) if access_probe else None
+    if probe:
+        probe_owner(probe, manifest, build_stat.st_dev)
+    storage_root = probe or build
+    graph = storage_root / 'graph'
+    image_copy = storage_root / 'image-copy'
     for directory in (graph, image_copy):
         db.require(private_dir(directory, account).st_dev == build_stat.st_dev,
                    f'{directory.name} must remain on bounded development storage')
@@ -177,10 +205,12 @@ def placement(account, manifest, actual_manifest, job_turn=None):
               db.ARCHIVE: (str(archive), False),
               db.MANIFEST: (str(actual_manifest), False)}
     for key in db.JOB_TARGETS:
-        source = ROOT / key / job
-        private_dir(source, account)
+        source = probe / key if probe else ROOT / key / job
+        node = private_dir(source, account)
+        if probe:
+            db.require(node.st_dev == build_stat.st_dev, 'private access probe data escapes the bounded filesystem')
         check_label(source, db.file_label(manifest, 'inner'))
-        if job_turn is None:
+        if job_turn is None and probe is None:
             db.require(next(source.iterdir(), None) is None, 'development probe requires fresh synthetic job data leaves')
         mounts[f'{db.PARENT_JOB}/{key}'] = (str(source), True)
     if job_turn:
@@ -289,7 +319,7 @@ def observe_parent(row, manifest, account):
     return observed
 
 
-def validate_result(receipt, admission, owner, manifest):
+def validate_result(receipt, admission, owner, manifest, *, version=db.CODEX_VERSION):
     db.fields(receipt, 'kind manifest_sha256 owner inner_container_id inner_image_id cycles inner_removed job_admission',
               'nested receipt')
     db.require(receipt['kind'] == 'dev-pair-devbox-probe-v1' and receipt['manifest_sha256'] == admission
@@ -302,12 +332,12 @@ def validate_result(receipt, admission, owner, manifest):
                'two independent nested starts are required')
     for cycle in cycles:
         label = db.process_label(manifest, 'inner')
-        db.require(cycle['version'] == f'codex-cli {db.CODEX_VERSION}' and cycle['probe']['boundary_probe'] == 'passed'
+        db.require(cycle['version'] == f'codex-cli {version}' and cycle['probe']['boundary_probe'] == 'passed'
                    and db.same_label(cycle['proc']['label'], label)
                    and db.same_label(cycle['probe']['selinux_label'], label), 'nested probe evidence mismatch')
 
 
-def launch(engine, manifest, admission, account, owner, hooks, mounts, job_turn=None):
+def launch(engine, manifest, admission, account, owner, hooks, mounts, job_turn=None, *, probe_version=None):
     name = 'dp-devbox-' + owner[:24]
     image = manifest['outer']['image_id']
     with db.owned_container(engine, name, owner, image):
@@ -328,14 +358,15 @@ def launch(engine, manifest, admission, account, owner, hooks, mounts, job_turn=
         parent = observe_parent(inspect(), manifest, account)
         budget = int(engine.deadline - time.monotonic()) - db.CLEANUP_SECONDS - 5
         db.require(budget > 0, 'insufficient time left for nested entry and cleanup')
+        arguments = job_turn[1:] if job_turn else ('--probe-version', probe_version) if probe_version else ()
         _, output = engine('execute immutable nested controller', 'exec', '--user=1000:1000', identity,
                            '/usr/bin/python3', '-I', str(db.BASE / 'controller.py'), admission, owner,
-                           str(budget), *(job_turn[1:] if job_turn else ()), seconds=budget + db.CLEANUP_SECONDS)
+                           str(budget), *arguments, seconds=budget + db.CLEANUP_SECONDS)
         receipt = db.json_data(output)
         if job_turn:
             validate_job_result(receipt, admission, owner, manifest, job_turn)
         else:
-            validate_result(receipt, admission, owner, manifest)
+            validate_result(receipt, admission, owner, manifest, version=probe_version or db.CODEX_VERSION)
         db.require(observe_parent(inspect(), manifest, account) == parent, 'outer DevBox changed during nested entry')
         enforcing(engine.deadline)
     return {'outer_container_id': identity, 'outer_image_id': image, 'parent': parent, 'outer_removed': True, **receipt}
@@ -364,26 +395,52 @@ def main():
     parser.add_argument('--sha256', required=True, help='independently recorded manifest SHA-256')
     parser.add_argument('--operation', help='run one protected live job turn in the exact placement')
     parser.add_argument('--request-sha256', help='independently recorded immutable role request digest')
+    parser.add_argument('--access-probe', action='store_true', help='test only the selected immutable private placement')
+    parser.add_argument('--probe-codex-version', help='version from the independently approved selected development release')
     args = parser.parse_args()
     if (args.operation is None) != (args.request_sha256 is None):
         parser.error('--operation and --request-sha256 are required together')
+    if args.access_probe or args.probe_codex_version is not None:
+        if (not args.access_probe or args.operation is not None or
+                not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', args.probe_codex_version or '')):
+            parser.error('--access-probe requires the approved version and accepts no job operation')
     job_turn = (args.sha256, args.operation, args.request_sha256) if args.operation is not None else None
     end = time.monotonic() + db.OUTER_SECONDS
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, db.interrupt)
     try:
+        if job_turn:
+            from job_protocol import require_workload_access
+
+            require_workload_access(ROOT.parent)
         account = host_account()
         enforcing(end)
         db.require(args.manifest.is_absolute() and args.manifest.resolve(strict=True) == args.manifest,
                    'use the absolute, nonsymlink manifest path')
         manifest = db.read_manifest(args.manifest, args.sha256, end)
+        if job_turn:
+            require_workload_access(ROOT.parent, images={'development': manifest['inner']['image_id'],
+                                                         'devbox': manifest['outer']['image_id']})
         engine = db.Engine([db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd'],
                            host_env(account), end)
         db.immutable_image(engine, manifest, 'outer')
-        with ownership(account, manifest['job'], args.sha256, job_turn=bool(job_turn)) as (owner, hooks):
+        if args.access_probe:
+            mounts, storage = placement(account, manifest, args.manifest, access_probe=args.sha256)
+            build = ROOT / 'builds' / manifest['job']
+            probe = access_probe_root(build, args.sha256)
+            owner = probe_owner(probe, manifest, build.stat().st_dev)
+            hooks = probe / 'empty-hooks'
+            db.require(private_dir(hooks, account).st_dev == build.stat().st_dev and next(hooks.iterdir(), None) is None,
+                       'private access probe hooks must be empty and on the bounded filesystem')
+            check_label(hooks, db.file_label(manifest, 'outer'))
             db.remove_owned(engine, 'dp-devbox-' + owner[:24], owner, manifest['outer']['image_id'])
-            mounts, storage = placement(account, manifest, args.manifest, job_turn)
-            receipt = launch(engine, manifest, args.sha256, account, owner, hooks, mounts, job_turn)
+            clear_probe_data(probe)
+            receipt = launch(engine, manifest, args.sha256, account, owner, hooks, mounts, probe_version=args.probe_codex_version)
+        else:
+            with ownership(account, manifest['job'], args.sha256, job_turn=bool(job_turn)) as (owner, hooks):
+                db.remove_owned(engine, 'dp-devbox-' + owner[:24], owner, manifest['outer']['image_id'])
+                mounts, storage = placement(account, manifest, args.manifest, job_turn)
+                receipt = launch(engine, manifest, args.sha256, account, owner, hooks, mounts, job_turn)
         print(json.dumps({**receipt, 'storage': storage, 'standards_sha': db.STANDARDS,
                           'outer_source_sha': manifest['outer']['source_sha'],
                           'inner_source_sha': manifest['inner']['source_sha'],

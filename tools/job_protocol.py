@@ -19,6 +19,7 @@ import uuid
 
 VERSION = 1
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
+WORKLOAD_ACCESS = 'workload-access.json'
 RECIPE = 'local-json-message-v1'
 APP_PROCESS_BOUNDARY = 'local-app-process'
 APP_QUADLET_BOUNDARY = 'fedora-checklist-quadlet'
@@ -40,6 +41,44 @@ MAX_RECONCILIATION_BYTES = 8192
 def require(ok, message):
     if not ok:
         raise ValueError(message)
+
+
+def require_workload_access(root=pathlib.Path('/var/lib/dev-pair'), *, release=None, images=None):
+    """Read the root controller's public, credential-free authorization state."""
+    flag = root / WORKLOAD_ACCESS
+    try:
+        fd = os.open(flag, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        try:
+            (root / 'renewal-fence' / 'selected-host.json').lstat()
+        except FileNotFoundError:
+            return  # No newly managed host selection in the legacy/local path.
+        raise ValueError('managed workload access observation is unavailable') from None
+    with os.fdopen(fd, 'rb') as stream:
+        for parent in (root, *root.parents):
+            node = parent.lstat()
+            require(stat.S_ISDIR(node.st_mode) and node.st_uid == 0 and not node.st_mode & 0o022,
+                    'unprotected workload access ancestry')
+        node = os.fstat(stream.fileno())
+        require(stat.S_ISREG(node.st_mode) and (node.st_uid, node.st_nlink, stat.S_IMODE(node.st_mode)) == (0, 1, 0o644)
+                and 0 < node.st_size <= 512, 'unprotected workload access observation')
+        raw = stream.read(513)
+    require(len(raw) <= 512, 'workload access observation changed')
+    gate = loads(raw)
+    fields(gate, 'schema phase release_sha256 images')
+    require(type(gate['schema']) is int and gate['schema'] == 1 and gate['phase'] in ('legacy', 'held', 'admitted'),
+            'invalid workload access observation')
+    if gate['phase'] == 'admitted':
+        digest(gate['release_sha256'])
+        fields(gate['images'], 'maintenance development devbox')
+        for value in gate['images'].values():
+            digest(value)
+        require(release is None or release == gate['release_sha256'], 'current release requires independent workload access review')
+        require(images is None or all(gate['images'].get(role) == image for role, image in images.items()),
+                'selected role image requires independent workload access review')
+    else:
+        require(gate['phase'] == 'legacy' and gate['release_sha256'] is None and gate['images'] is None,
+                'independent workload access review is pending')
 
 
 def canonical(value):

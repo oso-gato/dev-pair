@@ -112,7 +112,10 @@ standard output to its authorized or restored observation transcript. The
 destination checks the actual SSH daemon session and `tailscale0` route, then
 runs the selected confined maintenance or nested DevBox probe twice. The
 bounded offline probes use the existing SSH listener and leave jobs held. The
-collector verifies the machine, boot, address and exact selected role images
+development probe reads the published immutable manifest and archive from their
+digest-addressed paths. It uses separate labeled scratch within the bounded
+development allocation and reaps its own containers and scratch. The collector
+verifies the machine, boot, address and exact selected role images
 before signing the observation. The denied, public and loss clients must try
 the same named SSH command and verify denial. Restore the named route and run
 the actual probe again before issuing the final workload bundle. The owner

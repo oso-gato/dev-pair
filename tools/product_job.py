@@ -679,6 +679,7 @@ def record_pause(state, reason, now):
 
 
 def work(job):
+    p.require_workload_access(ROOT)
     root = trusted_directory(job_path(job))
     value = plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
     p.require(value['job_id'] == job, 'durable product plan identity changed')
@@ -711,6 +712,7 @@ def work(job):
 
 
 def submit(path):
+    p.require_workload_access(ROOT)
     raw = candidate.protected_file(path)
     value = plan(raw)
     source_approval(value)

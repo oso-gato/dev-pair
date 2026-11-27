@@ -1,6 +1,7 @@
 """Local DevBox contract tests. Fedora confinement needs the native runner."""
 
 from copy import deepcopy
+from contextlib import redirect_stderr, redirect_stdout
 import gzip
 import hashlib
 import io
@@ -20,6 +21,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import devbox
 from devbox import db
+import job_protocol
 
 
 OUTER = '1' * 64
@@ -123,6 +125,67 @@ class TestManifest(unittest.TestCase):
             self.load(payload, '0' * 64)
         with self.assertRaisesRegex(db.Blocked, 'duplicate'):
             self.load(payload[:-1] + b', "job": "duplicate"}')
+
+    def test_access_probe_cli_selects_actual_immutable_inputs_and_separate_data(self):
+        value = manifest()
+        raw = json.dumps(value).encode()
+        reference = admission(raw)
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'development'
+            build = root / 'builds' / value['job']
+            inputs = build / 'inputs' / reference
+            inputs.mkdir(parents=True)
+            build.chmod(0o700)
+            path = inputs / 'manifest.json'
+            path.write_bytes(raw)
+            archive = inputs / 'development.oci.tar'
+            archive.write_bytes(b'x' * value['inner']['archive_bytes'])
+            for leaf in (path, archive):
+                leaf.chmod(0o444)
+            probe = devbox.access_probe_root(build, reference)
+            probe.mkdir(mode=0o755)
+            for name in ('graph', 'image-copy', 'empty-hooks', *db.JOB_TARGETS):
+                (probe / name).mkdir(mode=0o700)
+            live = root / 'state' / value['job']
+            live.mkdir(parents=True)
+            (live / 'prior.json').write_text('retained live data')
+            (probe / 'state' / 'interrupted').write_text('owned probe scratch')
+            account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            args = ['devbox.py', 'run', '--manifest', str(path), '--sha256', reference,
+                    '--access-probe', '--probe-codex-version', '0.170.0']
+
+            def execute(_engine, selected, selected_digest, _account, owner, hooks, mounts, *, probe_version):
+                self.assertEqual((selected, selected_digest, owner, hooks, probe_version),
+                                 (value, reference, OWNER, probe / 'empty-hooks', '0.170.0'))
+                self.assertEqual(mounts[db.MANIFEST], (str(path), False))
+                self.assertEqual(mounts[db.ARCHIVE], (str(archive), False))
+                self.assertEqual(mounts[db.GRAPHROOT], (str(probe / 'graph'), True))
+                for name in db.JOB_TARGETS:
+                    self.assertEqual(mounts[f'{db.PARENT_JOB}/{name}'], (str(probe / name), True))
+                    self.assertEqual(list((probe / name).iterdir()), [])
+                return {'job_admission': False}
+
+            with (patch.object(sys, 'argv', args), patch.object(devbox, 'ROOT', root),
+                  patch.object(devbox.signal, 'signal'), patch.object(devbox, 'host_account', return_value=account),
+                  patch.object(devbox, 'enforcing'), patch.object(devbox, 'host_env'),
+                  patch.object(devbox, 'check_label'), patch.object(devbox, 'probe_owner', return_value=OWNER),
+                  patch.object(devbox, 'storage_mount', return_value={'device': 'fixture'}),
+                  patch.object(db, 'immutable_image'), patch.object(db, 'remove_owned') as remove,
+                  patch.object(devbox, 'launch', side_effect=execute),
+                  redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as error):
+                self.assertEqual(devbox.main(), 0, error.getvalue())
+                remove.assert_called_once()
+                self.assertIs(json.loads(output.getvalue())['job_admission'], False)
+                args[args.index('--sha256') + 1] = '7' * 64
+                self.assertEqual(devbox.main(), 2)
+                self.assertIn('manifest SHA-256 mismatch', error.getvalue())
+                args[args.index('--sha256') + 1] = reference
+                args[-3:] = ['--operation', 'approved-turn', '--request-sha256', '8' * 64]
+                with patch.object(job_protocol, 'require_workload_access', side_effect=ValueError('workload review is pending')):
+                    self.assertEqual(devbox.main(), 2)
+                self.assertIn('workload review is pending', error.getvalue())
+                remove.assert_called_once()
+            self.assertEqual((live / 'prior.json').read_text(), 'retained live data')
 
     def test_invalid_roles_aliases_fields_categories_and_storage(self):
         invalid = [

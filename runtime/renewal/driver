@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -219,7 +220,11 @@ def release_action(action, payload):
                                                             'component': release['components']['host']})
             unit('start', 'dev-pair-managed-host-release.service', timeout=105)
         observe_host(reference, release['components']['host'])
+        from bootstrap import Bootstrap
+        bootstrap = Bootstrap()
+        bootstrap.hold_changed_workload_access(reference)
         r.replace_json(selector, reference)
+        bootstrap.restore_retained_workload_gate(reference)
     if action == 'quiesce':
         owned = sorted((CONTROL / 'owned-turns').iterdir())
         if owned:
@@ -605,13 +610,48 @@ def observed_progress(path, payload, uid):
     return proof
 
 
-def verify_workload_access():
+def verify_workload_access(recovery_release=None):
     from bootstrap import Bootstrap, Blocked as BootstrapBlocked
 
     try:
-        Bootstrap().verify_workload_access()
+        Bootstrap().verify_workload_access(recovery_release=recovery_release)
     except BootstrapBlocked as exc:
         raise ValueError(str(exc)) from exc
+
+
+@contextlib.contextmanager
+def private_devbox_probe(manifest_path, admission):
+    import devbox
+    import native_placements as native
+
+    manifest = devbox.db.read_manifest(manifest_path, admission, time.monotonic() + 12)
+    job = manifest['job']
+    build = devbox.ROOT / 'builds' / job
+    path = devbox.access_probe_root(build, admission)
+    r.require(manifest_path == build / 'inputs' / admission / 'manifest.json',
+              'private probe does not select the approved immutable input leaf')
+    account = r.pwd.getpwnam('dp-dev')
+    outer, inner = (devbox.db.file_label(manifest, side) for side in ('outer', 'inner'))
+    devbox.private_dir(build, account)
+    devbox.storage_mount(build, manifest['storage_bytes'], Path('/proc/self/mountinfo').read_text())
+    with native.directory_fd(build) as parent:
+        r.require(not any(name.startswith('.access-probe-') and name != path.name for name in os.listdir(parent)),
+                  'a prior scoped placement probe requires exact recovery before selecting another release')
+        with native.private_child(parent, path.name, 0, 0, mode=0o755, label=outer) as (root_fd, _):
+            found = os.fstat(root_fd)
+            r.require(found.st_dev == os.fstat(parent).st_dev, 'private probe escapes bounded storage')
+            for name in ('graph', 'image-copy', 'empty-hooks', *devbox.db.JOB_TARGETS):
+                label = inner if name in devbox.db.JOB_TARGETS else outer
+                with native.private_child(root_fd, name, account.pw_uid, account.pw_gid, label=label) as (fd, _):
+                    r.require(os.fstat(fd).st_dev == found.st_dev, 'private probe data escapes bounded storage')
+            yield
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            r.require((current.st_dev, current.st_ino) == (found.st_dev, found.st_ino) and shutil.rmtree.avoids_symlink_attacks,
+                      'private probe directory exchanged before cleanup')
+            r.require(not any(Path(row[4]).is_relative_to(path) for row in native.mount_rows()),
+                      'private probe mount remains after the confined run')
+            shutil.rmtree(path.name, dir_fd=parent)
+            os.fsync(parent)
 
 
 def access_probe(payload):
@@ -646,15 +686,20 @@ def access_probe(payload):
             cycles = result['boundary_and_version_cycles']
         else:
             manifest = selection['development_manifest']
+            path = development_manifest(selection['job'], manifest)
+            version = release['components']['development-agent']['codex_version']
             command = [RUNUSER, '--user', 'dp-dev', '--', PYTHON, '-EBs', str(bundle / 'tools/devbox.py'), 'run',
-                       '--manifest', str(development_manifest(selection['job'], manifest)), '--sha256', manifest]
-            result = r.loads(run(command, timeout=210))
-            r.require(result['kind'] == 'dev-pair-devbox-probe-v1' and result['manifest_sha256'] == manifest and
-                      result['inner_image_id'] == selection['development_image'] and
-                      result['outer_image_id'] == selection['devbox_image'] and
-                      result['inner_removed'] is result['outer_removed'] is True,
-                      'exact nested DevBox and development probe failed')
-            cycles = len(result['cycles'])
+                       '--manifest', str(path), '--sha256', manifest, '--access-probe', '--probe-codex-version', version]
+            with private_devbox_probe(path, manifest):
+                result = r.loads(run(command, timeout=620))
+                r.require(result['kind'] == 'dev-pair-devbox-probe-v1' and result['manifest_sha256'] == manifest and
+                          result['inner_image_id'] == selection['development_image'] and
+                          result['outer_image_id'] == selection['devbox_image'] and
+                          result['inner_removed'] is result['outer_removed'] is True,
+                          'exact nested DevBox and development probe failed')
+                cycles = len(result['cycles'])
+                r.require(cycles == 2 and result['job_admission'] is False,
+                          'private development diagnostic did not complete both confined probe cycles')
         r.require(type(cycles) is int and cycles == 2 and result['job_admission'] is False and
                   host.destination_identity() == identity and host.observed_ssh_peer() == peer,
                   'live named route or probe changed before observation completed')
@@ -664,7 +709,7 @@ def access_probe(payload):
 
 def turn(action, payload):
     if action != 'observe-progress':
-        verify_workload_access()
+        verify_workload_access(payload['release_sha256'] if action == 'resume-without-effects' else None)
     role, job, operation = (payload[key] for key in ('role', 'job', 'operation'))
     reference = payload['release_sha256']
     r.require(r.read_json(CONTROL / 'site-current.json') == reference, 'role selected a stale release')

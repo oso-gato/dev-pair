@@ -539,6 +539,7 @@ def dispatch_host(ledger, runtime, env, runtime_dir, approval, principals, packe
     request_id = request['request_id']
     storage_fsid = history.environment['storage_fsid']
     with runtime.dispatch_gate():
+        p.require_workload_access()
         tracked = history.lookup(request) is not None
         if not tracked:
             check_request(request, ledger.controller_id, principals, host=True)
