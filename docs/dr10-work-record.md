@@ -2,6 +2,27 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026, 08:56 UTC — native results and local candidates
+
+- The development host entry at `ad0654a779a9c3466264b68106bee1c36a77497e`
+  passed fresh GPT-6.2 Astra High review and all 26 focused review tests.
+  Source is preserved on `codex/development-host-entry-62`. Local integration
+  `16f226c` preserves all five reviewed files. Native validation remains pending.
+- Native 39 (`6af83ef`) passed 763 hosted tests with 12 skips, then stopped
+  before Fedora at `bind-source-before-exdev`. Native 40 (`78df068`) passed 766
+  hosted tests with 13 unnamed skips and isolated the rejection to
+  `bind-source-before-exdev-parent-open`. Both ended with no usable storage
+  total or guest report. Image-copy cleanup remained unresolved and scratch was
+  retained. The native path and mount topology remain unknown.
+  [Run 39](https://github.com/oso-gato/dev-pair/actions/runs/45964385361) ·
+  [Run 40](https://github.com/oso-gato/dev-pair/actions/runs/45966445531)
+- The proposed storage proof at `ac1b3fb8aa5e2221fc00cf563d342f34adb432cd`
+  passed 36 author checks with no skips. In the local tmpfs fixture, the
+  candidate and GNU `du` both counted 16,384 live bytes. The covered backing
+  tree measured 40,960 bytes. Fresh independent review and native validation
+  remain pending. Draft PR 13 is at `78df068` and local integration is at
+  `16f226c` at this checkpoint.
+
 ### November 27, 2026, 08:14 UTC — reviewed storage repair and CI recipient
 
 - Native 38 reached `bind-source-before-exdev` before Fedora started. Its exact
