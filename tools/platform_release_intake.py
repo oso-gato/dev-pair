@@ -30,9 +30,11 @@ from platform_release_protocol import (
 
 GITHUB = '/usr/bin/gh'
 ROOT = Path('/var/lib/dev-pair/platform-releases')
-TRUST = Path('/usr/libexec/dev-pair/tools/release_trust.py')
+TRUST = Path(__file__).resolve().with_name('release_trust.py')
 API = 'repos/' + release.REPOSITORY + '/'
 CONTROL_SECONDS = 900
+INITIAL_RUN_LIMIT = 8
+PLATFORM_WORKFLOW = 'platform-release.yml'
 ZIP_OVERHEAD = 1024 * 1024
 META_LIMIT = 256 * 1024
 TRANSFER_INODES = 512 + 24  # Installer reserve plus a complete transfer's control and payload leaves.
@@ -43,6 +45,12 @@ TRANSFER_PREFIX = '.intake-stage-'
 BOOT_PATTERN = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 ENV = {'PATH': '/usr/bin:/usr/sbin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8',
        'GH_PROMPT_DISABLED': '1', 'GH_NO_UPDATE_NOTIFIER': '1', 'GH_HOST': 'github.com'}
+
+
+class InitialReleaseUnavailable(Blocked):
+    def __init__(self, phase, reason):
+        super().__init__(reason)
+        self.phase = phase
 
 
 def native_env():
@@ -135,7 +143,7 @@ def portable_volume(*, for_recovery=False):
 
 def checked_run(value, source, run, agent):
     event = ('schedule', 'workflow_dispatch') if agent else ('push',)
-    path = '.github/workflows/agent-refresh.yml' if agent else '.github/workflows/platform-release.yml'
+    path = '.github/workflows/' + ('agent-refresh.yml' if agent else PLATFORM_WORKFLOW)
     require(value.get('id') == run and value.get('run_attempt') == 1 and value.get('event') in event and
             value.get('status') == 'completed' and value.get('conclusion') == 'success' and
             value.get('path') == path and value.get('head_sha') == source and
@@ -143,7 +151,7 @@ def checked_run(value, source, run, agent):
             value.get('head_repository', {}).get('full_name') == release.REPOSITORY, 'protected platform publisher run unavailable')
 
 
-def artifacts(raw, source, agent):
+def artifacts(raw, source, agent, *, allow_expired=False):
     values = raw.get('artifacts')
     roles = (*ROLES, 'host') if not agent else ROLES[:2]
     names = {release.artifact_name(part, source) for part in (*roles, 'subjects')}
@@ -155,7 +163,7 @@ def artifacts(raw, source, agent):
     for row in values:
         name, identifier = row.get('name'), row.get('id')
         require(name in names and name not in result and type(identifier) is int and identifier > 0 and
-                row.get('expired') is False and type(row.get('digest')) is str and
+                type(row.get('expired')) is bool and (allow_expired or not row['expired']) and type(row.get('digest')) is str and
                 re.fullmatch(r'sha256:[0-9a-f]{64}', row['digest']) and
                 type(row.get('size_in_bytes')) is int and row['size_in_bytes'] > 0, 'publisher artifact is expired or ambiguous')
         result[name] = row
@@ -211,7 +219,7 @@ def fetch_artifact(rows, name, destination, wanted, end):
 
 def verify_subject(path, identity, source, run, role, end):
     verify = protected(TRUST)
-    subprocess.run(['/usr/bin/python3', '-B', str(verify), 'verify', '--component', role, '--source-sha', source,
+    subprocess.run(['/usr/bin/python3', '-EBs', str(verify), 'verify', '--component', role, '--source-sha', source,
                     '--subject', str(protected(path)), '--sha256', identity, '--run-id', str(run)],
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, env=native_env(), timeout=seconds(end, 120), check=True)
 
@@ -345,7 +353,8 @@ def recover_transfer():
             type(record['schema']) is int and record['schema'] == 1 and re.fullmatch(BOOT_PATTERN, record['boot_id']) and
             re.fullmatch('[0-9a-f]{24}', record['nonce']) and record['root_inode'] == ROOT.lstat().st_ino,
             'portable transfer lease differs from its fixed protected scope')
-    target = ROOT / hex_id(record['platform_sha256'])
+    identity = record['platform_sha256']
+    target = ROOT / hex_id(identity) if identity is not None else None
     stage = ROOT / (TRANSFER_PREFIX + record['nonce'])
     device, inode, size, mounts = portable_volume(for_recovery=True)
     volume = [device, inode, size, list(mounts)]
@@ -354,7 +363,7 @@ def recover_transfer():
             (record['boot_id'] != boot_identity() or saved == volume),
             'portable transfer lease backing or mount identity changed')
     if os.path.lexists(stage):
-        require(not os.path.lexists(target), 'portable transfer workspace and published target both exist')
+        require(target is None or not os.path.lexists(target), 'portable transfer workspace and published target both exist')
         for path in transfer_entries(stage, raw, device):
             if path.is_dir():
                 path.rmdir()
@@ -362,7 +371,7 @@ def recover_transfer():
                 path.unlink()
             release.sync_directory(path.parent)
         stage.rmdir()
-    elif os.path.lexists(target):
+    elif target is not None and os.path.lexists(target):
         require(protected(target, directory=True).lstat().st_dev == device and transfer_record(target / TRANSFER_TICKET)[0] == raw,
                 'portable transfer lease does not match published target custody')
         retained_index(target.name)
@@ -375,8 +384,10 @@ def recover_transfer():
 def transfer_workspace(identity):
     lease = ROOT / TRANSFER_LEASE
     nonce = secrets.token_hex(12)
-    stage, target = ROOT / (TRANSFER_PREFIX + nonce), ROOT / identity
-    require(not any(os.path.lexists(path) for path in (lease, stage, target)), 'portable transfer lease or target already exists')
+    stage = ROOT / (TRANSFER_PREFIX + nonce)
+    target = ROOT / hex_id(identity) if identity is not None else None
+    require(not any(os.path.lexists(path) for path in (lease, stage, target) if path is not None),
+            'portable transfer lease or target already exists')
     device, inode, size, mounts = portable_volume()
     value = {'schema': 1, 'platform_sha256': identity, 'nonce': nonce, 'boot_id': boot_identity(),
              'root_inode': ROOT.lstat().st_ino, 'volume': [device, inode, size, list(mounts)]}
@@ -386,10 +397,11 @@ def transfer_workspace(identity):
         release.sync_directory(ROOT)
         durable_record(stage / TRANSFER_TICKET, value)
         yield stage
-        release.sync_directory(stage)
-        require(not os.path.lexists(target), 'portable transfer publication target appeared')
-        stage.rename(target)
-        release.sync_directory(ROOT)
+        if target is not None:
+            release.sync_directory(stage)
+            require(not os.path.lexists(target), 'portable transfer publication target appeared')
+            stage.rename(target)
+            release.sync_directory(ROOT)
     finally:
         recover_transfer()
 
@@ -605,6 +617,109 @@ def intake_lock():
         os.close(fd)
 
 
+def initial_runs(source, end):
+    branch = read_api('branches/main', end)
+    require(branch.get('protected') is True, 'initial full release discovery requires protected main')
+    if branch.get('commit', {}).get('sha') != source:
+        raise InitialReleaseUnavailable('initial-source-not-published',
+                                        'the reviewed checkout is not the current protected-main release source')
+    listing = read_api(f'actions/workflows/{PLATFORM_WORKFLOW}/runs?branch=main&event=push&status=success'
+                       f'&head_sha={source}&per_page={INITIAL_RUN_LIMIT}', end)
+    rows = listing.get('workflow_runs')
+    require(type(rows) is list and type(listing.get('total_count')) is int and
+            len(rows) == listing['total_count'] <= INITIAL_RUN_LIMIT,
+            'initial full release run inventory is incomplete or exceeds its safe selection bound')
+    seen = set()
+    candidates = []
+    for row in rows:
+        require(type(row) is dict, 'invalid initial full release run listing')
+        run = row.get('id')
+        require(type(run) is int and 0 < run < 2**63 and run not in seen,
+                'initial full release run identifiers are invalid or ambiguous')
+        seen.add(run)
+        if (type(row.get('run_attempt')) is int and row['run_attempt'] == 1 and
+                row.get('path') == '.github/workflows/' + PLATFORM_WORKFLOW and
+                row.get('event') == 'push' and row.get('status') == 'completed' and row.get('conclusion') == 'success' and
+                row.get('head_branch') == 'main' and row.get('head_sha') == source and
+                (row.get('repository') or {}).get('full_name') == release.REPOSITORY and
+                (row.get('head_repository') or {}).get('full_name') == release.REPOSITORY):
+            candidates.append(run)
+    return sorted(candidates, reverse=True)
+
+
+def bootstrap_payloads(index):
+    archives = {role: row['files']['host.tar' if role == 'host' else release.archive_name(role)]
+                for role, row in index['transports'].items()}
+    return index['components'], archives
+
+
+def unselected_site():
+    control = ROOT.parent / 'renewal'
+    require(not any(os.path.lexists(control / name) for name in ('current.json', 'site-current.json')),
+            'an existing or interrupted site selection prevents automatic initial intake')
+
+
+def acquire_initial(source, end):
+    """Select an initial protected release while the caller holds the intake lock."""
+    source = hex_id(source, 40)
+    require(os.getuid() == os.geteuid() == 0, 'protected initial release operator required')
+    protected(ROOT, directory=True)
+    unselected_site()
+    recover_transfer()
+    entries = staged_paths(end)
+    if entries:
+        require(len(entries) == 1, 'automatic initial intake found multiple staged packages')
+        directory = entries[0]
+        _, index, _ = retained_index(directory.name)
+        require(index['kind'] == 'dev-pair-platform-release' and index['source_sha'] == source and
+                index['previous_platform_sha256'] is None and not os.path.lexists(directory / RETIREMENT),
+                'staged package is not the exact requested initial full release')
+        verify_local_parts(directory, index, end)
+        return release.readonly_json(protected(directory / 'intake.json'), 0)[1]
+
+    require(Path(GITHUB).is_file() and protected(TRUST).is_file(), 'protected read-only release tooling unavailable')
+    intake_limit(ROOT, [META_LIMIT, 2 * CONTROL_LIMIT], ZIP_OVERHEAD)
+    selected = None
+    missing_assets = False
+    for run in initial_runs(source, end):
+        checked_run(read_api(f'actions/runs/{run}', end), source, run, False)
+        inventory = read_api(f'actions/runs/{run}/artifacts?per_page=100', end)
+        if type(inventory.get('total_count')) is int and inventory['total_count'] == 0 and inventory.get('artifacts') == []:
+            missing_assets = True
+            continue
+        rows = artifacts(inventory, source, False, allow_expired=True)
+        if any(row['expired'] for row in rows.values()):
+            missing_assets = True
+            continue
+        with transfer_workspace(None) as stage:
+            subject = stage / 'platform.json'
+            fetch_artifact(rows, release.artifact_name('subjects', source), stage,
+                           {'platform.json': (None, CONTROL_LIMIT)}, end)
+            raw, index = release.readonly_json(subject, 0)
+            portable_index(index, source, run)
+            require(raw == canonical(index) and index['kind'] == 'dev-pair-platform-release',
+                    'protected push did not publish a canonical full platform subject')
+            if index['previous_platform_sha256'] is not None:
+                continue
+            identity = hashlib.sha256(raw).hexdigest()
+            for role in (*ROLES, 'host'):
+                verify_subject(subject, identity, source, run, role, end)
+            payloads = bootstrap_payloads(index)
+            if selected is None:
+                selected = run, identity, payloads
+            else:
+                require(selected[2] == payloads, 'protected initial full publications disagree on deployed artifact identities')
+    if selected is None:
+        if missing_assets:
+            raise InitialReleaseUnavailable('initial-release-artifacts-expired',
+                                            'no eligible initial full publication has a complete unexpired artifact set')
+        raise InitialReleaseUnavailable('initial-full-release-selection',
+                                        'no successful initial full publication exists for the exact reviewed source')
+    run, identity, _ = selected
+    unselected_site()
+    return acquire(source, run, identity, None, end)
+
+
 def acquire(source, run, expected, previous, end, *, agent=False):
     hex_id(source, 40)
     hex_id(expected)
@@ -664,6 +779,7 @@ def acquire(source, run, expected, previous, end, *, agent=False):
             wanted = {name: (item['sha256'], item['bytes']) for name, item in transport['files'].items()}
             fetch_artifact(rows, transport['name'], target, wanted, end)
         verify_local_parts(stage, value, end)
+        checked_run(read_api(f'actions/runs/{run}', end), source, run, agent)
         branch = read_api('branches/main', end)
         require(branch.get('protected') is True and branch.get('commit', {}).get('sha') == source,
                 'protected main changed before release staging')
@@ -681,18 +797,27 @@ def acquire(source, run, expected, previous, end, *, agent=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', required=True)
-    parser.add_argument('--run-id', required=True, type=int)
-    parser.add_argument('--platform-sha256', required=True)
+    parser.add_argument('--run-id', type=int)
+    parser.add_argument('--platform-sha256')
     parser.add_argument('--agent-only', action='store_true')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--previous')
     mode.add_argument('--initial', action='store_true')
     args = parser.parse_args()
+    automatic = args.run_id is None and args.platform_sha256 is None
+    if automatic:
+        if not args.initial or args.agent_only:
+            parser.error('automatic discovery requires --initial and a full release')
+    elif args.run_id is None or args.platform_sha256 is None:
+        parser.error('--run-id and --platform-sha256 belong together')
     os.umask(0o077)
     require(os.getuid() == os.geteuid() == 0, 'protected release operator required')
     with intake_lock():
-        result = acquire(args.source, args.run_id, args.platform_sha256, args.previous,
-                         time.monotonic() + CONTROL_SECONDS, agent=args.agent_only)
+        end = time.monotonic() + CONTROL_SECONDS
+        if automatic:
+            result = acquire_initial(args.source, end)
+        else:
+            result = acquire(args.source, args.run_id, args.platform_sha256, args.previous, end, agent=args.agent_only)
     print(release.canonical(result).decode(), end='')
     return 0
 
@@ -700,6 +825,9 @@ def main():
 if __name__ == '__main__':
     try:
         sys.exit(main())
+    except InitialReleaseUnavailable as exc:
+        print(f'platform intake pending ({exc.phase}): {exc}', file=sys.stderr)
+        sys.exit(3)
     except (Blocked, ValueError, OSError, KeyError, TypeError, AttributeError, zipfile.BadZipFile, subprocess.SubprocessError) as exc:
         print('platform intake blocked: ' + str(exc)[:800], file=sys.stderr)
         sys.exit(2)

@@ -82,6 +82,24 @@ read-only GitHub CLI identity and site configuration before running intake.
 ```
 
 Use `--initial` for the approved first package with an empty staging store.
+For automatic initial selection, supply the reviewed checkout's full source
+revision and omit both the run ID and platform digest.
+
+```sh
+/usr/bin/python3 -B /usr/libexec/dev-pair/tools/platform_release_intake.py \
+  --initial --source "$REVIEWED_SOURCE"
+```
+
+This requires independently provisioned release trust, protected GitHub read
+access and a measured archive filesystem. The checkout must identify current
+protected main and have a successful first-attempt full publication with no
+prior release. Every eligible subject passes the same four component
+attestations. When eligible publications carry the same deployable bytes,
+the intake chooses the highest run ID. Incompatible signed publications
+block selection. An already staged exact initial release can resume before any
+live selector exists. An unpublished checkout, an absent qualifying run or an
+expired package reports the corresponding pending condition.
+
 Intake verifies the Actions transport, portable attestation for each admitted
 component, and compatible retained prior components. It extracts only the
 declared files under explicit compressed, expanded and time limits. It verifies
