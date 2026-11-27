@@ -198,7 +198,7 @@ def git_runner(workspace, role, end, *, allow_bundle=False):
         min(end, time.monotonic() + 10), cap=cap)
 
 
-def approved_source(git, workspace, approval, revision):
+def approved_checkout(git, workspace, approval, revision):
     p.digest(revision, 40)
     repository, base = approval['repository'], approval['acquired_commit']
     origin = git('config', '--local', '--no-includes', '--get-all', 'remote.origin.url').decode().removesuffix('\n')
@@ -209,6 +209,13 @@ def approved_source(git, workspace, approval, revision):
               git('rev-parse', '--verify', base + '^{tree}').decode().strip() == approval['acquired_tree'],
               'checkout source or acquired tree changed')
     git('merge-base', '--is-ancestor', base, revision)
+    tree = git('rev-parse', '--verify', revision + '^{tree}').decode().strip()
+    p.digest(tree, 40)
+    return tree
+
+
+def approved_source(git, workspace, approval, revision):
+    approved_checkout(git, workspace, approval, revision)
     record = git('ls-tree', '--full-tree', '-z', revision, '--', APP)
     match = re.fullmatch(rb'100(?:644|755) blob ([0-9a-f]{40})\texamples/checklist/checklist\.py\0', record)
     p.require(match, 'authorized commit must contain the fixed checklist source as one regular blob')
@@ -219,17 +226,18 @@ def approved_source(git, workspace, approval, revision):
     return blob
 
 
-def mirror_maintenance(job, approval, revision, end):
+def mirror_maintenance(job, approval, revision, end, *, checklist=True):
     maintenance = ROOT / 'maintenance/workspaces' / job
     development = ROOT / 'development/workspaces' / job
     source = git_runner(development, 'dp-dev', end)
     target = git_runner(maintenance, 'dp-maint', end, allow_bundle=True)
     base = approval['acquired_commit']
+    verify = approved_source if checklist else approved_checkout
     head = target('rev-parse', '--verify', 'HEAD').decode().strip()
     if head == revision:
-        approved_source(target, maintenance, approval, revision)
+        verify(target, maintenance, approval, revision)
         return
-    approved_source(target, maintenance, approval, base)
+    verify(target, maintenance, approval, base)
     # Checkout must not evaluate repository-provided commands or overwrite maintenance work.
     allowed = r'(?:core\.(?:repositoryformatversion|filemode|bare|logallrefupdates)|remote\.origin\.(?:url|fetch)|' \
               r'branch\.[A-Za-z0-9/_.-]+\.(?:remote|merge)|user\.(?:name|email))'
@@ -254,7 +262,7 @@ def mirror_maintenance(job, approval, revision, end):
         target('fetch', '--quiet', '--no-tags', '--no-auto-maintenance', '--no-write-fetch-head',
                '--recurse-submodules=no', bundle.name, 'HEAD:refs/dev-pair/candidates/' + revision)
     target('checkout', '--quiet', '--no-overwrite-ignore', '--detach', revision)
-    approved_source(target, maintenance, approval, revision)
+    verify(target, maintenance, approval, revision)
 
 
 def candidate_image(info, image, revision=None):

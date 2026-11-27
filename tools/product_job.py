@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit and follow a protected dev-pair job through the checklist host adapter."""
+"""Submit and follow a protected dev-pair product job."""
 import argparse
 import fcntl
 import json
@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import ssl
 import stat
 import subprocess
@@ -27,7 +28,17 @@ Q_CLIENT = Path('/etc/dev-pair/checklist-client')
 SYSTEMCTL = '/usr/bin/systemctl'
 PYTHON = '/usr/bin/python3'
 HOST_PORT = 19425
-TERMINAL = {'passed', 'blocked'}
+CHECKLIST_ADAPTER = 'checklist-quadlet'
+LOCAL_ADAPTER = 'devbox-development'
+EXTERNAL_ADAPTER = 'devbox-development-needs-host'
+TERMINAL = {'passed', 'blocked', 'local-validation-recorded', 'awaiting-external-validation'}
+LOCAL_HEAD_MARKER = 'dev-pair-local-head:'
+LOCAL_HEAD_COMMAND = (
+    'test -z "$(/usr/bin/git -C /work/job status --porcelain=v1 --untracked-files=all)" && '
+    """printf 'dev-pair-local-head:%s\\n' "$(/usr/bin/git -C /work/job rev-parse --verify HEAD)" """
+).strip()
+LOCAL_TEST_PREFIX = 'cd /work/job && ' + LOCAL_HEAD_COMMAND + ' && ('
+LOCAL_TEST_SUFFIX = ') && ' + LOCAL_HEAD_COMMAND
 RENEWAL_PAUSES = {'checklist dispatch is frozen by renewal', 'role dispatch frozen by renewal',
                   'role dispatch frozen pending host observation'}
 RETRY_SECONDS = 180
@@ -47,7 +58,8 @@ def plan(raw):
     p.number(value['schema'], 1, 1)
     job, agreement = value['job_id'], value['agreement']
     p.require(type(job) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', job), 'invalid product job ID')
-    p.require(value['adapter'] == 'checklist-quadlet', 'product job requires an authorized validation adapter')
+    p.require(value['adapter'] in (CHECKLIST_ADAPTER, LOCAL_ADAPTER, EXTERNAL_ADAPTER),
+              'product job requires an authorized validation adapter')
     p.fields(agreement, 'repository initial_commit brief host_seconds build_seconds turn_seconds')
     p.text(agreement['repository'], 201)
     p.digest(agreement['initial_commit'], 40)
@@ -129,7 +141,7 @@ def closed_write(path, body):
     sync_directory(path.parent)
 
 
-def proposal(events):
+def proposal(events, *, local=False):
     last = None
     for line in events.splitlines():
         event = json.loads(line)
@@ -140,10 +152,74 @@ def proposal(events):
     last = last.strip()
     fenced = re.fullmatch(r'```(?:json)?\s*([^`]+)\s*```', last, re.DOTALL)
     row = p.loads((fenced[1].strip() if fenced else last).encode())
-    p.fields(row, 'candidate_sha summary')
+    blocker = local and type(row) is dict and 'validation_blocker' in row
+    p.fields(row, 'candidate_sha summary validation_blocker' if blocker else 'candidate_sha summary')
     p.digest(row['candidate_sha'], 40)
     p.text(row['summary'], 1000)
+    if blocker:
+        p.text(row['validation_blocker'], 500)
+        return row
+    if local:
+        row['local_validation'] = observed_validation(events, row['candidate_sha'])
     return row
+
+
+def local_validation_script(command):
+    if type(command) is not str or not 0 < len(command.encode()) <= 4096:
+        return False
+    if command.startswith(LOCAL_TEST_PREFIX):
+        script = command
+    else:
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            return False
+        if (len(argv) < 3 or argv[0] not in ('bash', 'sh', '/bin/bash', '/bin/sh', '/usr/bin/bash', '/usr/bin/sh')
+                or argv[1:-1] not in (['-c'], ['-lc'], ['-l', '-c'])):
+            return False
+        script = argv[-1]
+    return (script.startswith(LOCAL_TEST_PREFIX) and script.endswith(LOCAL_TEST_SUFFIX) and
+            bool(script[len(LOCAL_TEST_PREFIX):-len(LOCAL_TEST_SUFFIX)].strip()))
+
+
+def observed_validation(events, revision):
+    """Read a stock command result and its Git witness from the retained turn."""
+    starts, matched = {}, None
+    marker = LOCAL_HEAD_MARKER + revision
+    for line in events.splitlines():
+        event = json.loads(line)
+        item = event.get('item')
+        if type(item) is not dict or item.get('type') != 'command_execution':
+            continue
+        item_id, command = item.get('id'), item.get('command')
+        if type(item_id) is not str or not re.fullmatch(r'item_[0-9]{1,6}', item_id):
+            continue
+        if event.get('type') == 'item.started':
+            if local_validation_script(command):
+                p.require(item_id not in starts, 'duplicate stock local validation start')
+                starts[item_id] = command
+        elif event.get('type') == 'item.completed' and item_id in starts:
+            expected = starts.pop(item_id)
+            output = item.get('aggregated_output')
+            if command != expected or type(output) is not str:
+                continue
+            lines = output.splitlines()
+            if not lines or lines[0] != marker:
+                continue
+            matched = None
+            if (item.get('status') == 'completed' and type(item.get('exit_code')) is int and item['exit_code'] == 0
+                    and len(lines) >= 2 and lines[-1] == marker and
+                    [row for row in lines if row.startswith(LOCAL_HEAD_MARKER)] == [marker, marker]):
+                matched = {'candidate_sha': revision, 'item_id': item_id, 'exit_status': 0,
+                           'command_sha256': p.sha256(command.encode()), 'output_sha256': p.sha256(output.encode())}
+    p.require(matched is not None, 'no successful stock test witnessed the final commit before and after local validation')
+    return matched
+
+
+def local_recipe():
+    implementation = p.sha256(Path(__file__).read_bytes())
+    return {'recipe': 'devbox-local-command-observation-v1',
+            'revision': implementation, 'recipe_sha256': implementation}
 
 
 def read_role(path, uid, limit):
@@ -194,6 +270,8 @@ class FedoraJob:
         p.require(p.loads(output) == body, 'durable ledger acknowledgement changed')
 
     def build(self, ordinal, revision):
+        if self.plan['adapter'] != CHECKLIST_ADAPTER:
+            return self.local_checkpoint(ordinal, revision)
         with self.runtime.dispatch_gate():
             end = time.monotonic() + self.agreement['build_seconds']
             path, admitted = candidate.build(self.job, self.agreement['repository'], self.agreement_sha, revision, end)
@@ -203,6 +281,31 @@ class FedoraJob:
                                 candidate=admitted['candidate'], test=h.recipe_identity(host=True),
                                 summary='Source verified in the rootless checklist build adapter',
                                 evidence=['candidate-receipt-sha256:' + p.sha256(candidate.protected_file(path))])
+            self.ledger('checkpoint', checkpoint)
+        return checkpoint
+
+    def local_checkpoint(self, ordinal, revision):
+        with self.runtime.dispatch_gate():
+            end = time.monotonic() + self.agreement['build_seconds']
+            app = ROOT / 'development/workspaces' / self.job
+            git = candidate.git_runner(app, 'dp-dev', end)
+            tree = candidate.approved_checkout(git, app, self.approval, revision)
+            p.require(not git('status', '--porcelain=v1', '--untracked-files=all'),
+                      'development candidate has retained changes outside the tested commit')
+            if ordinal == 2:
+                candidate.mirror_maintenance(self.job, self.approval, revision, end, checklist=False)
+                mirror = ROOT / 'maintenance/workspaces' / self.job
+                target = candidate.git_runner(mirror, 'dp-maint', end)
+                p.require(candidate.approved_checkout(target, mirror, self.approval, revision) == tree and
+                          not target('status', '--porcelain=v1', '--untracked-files=all'),
+                          'maintenance candidate differs from the tested commit')
+                p.require(candidate.approved_checkout(git, app, self.approval, revision) == tree and
+                          not git('status', '--porcelain=v1', '--untracked-files=all'),
+                          'development candidate changed during final verification')
+            source = p.identity({'repository': self.agreement['repository'], 'revision': revision, 'tree': tree})
+            checkpoint = p.envelope('checkpoint', job_id=self.job, checkpoint_id=self.job + '-c' + str(ordinal),
+                candidate={'source_revision': revision, 'artifact_sha256': source}, test=local_recipe(),
+                summary='Verified Git candidate and tree for confined DevBox validation', evidence=['git-tree:' + tree])
             self.ledger('checkpoint', checkpoint)
         return checkpoint
 
@@ -264,7 +367,22 @@ class FedoraJob:
     def turn(self, role, checkpoint, first=None):
         operation = self.job + ('-maintenance' if role == 'maintenance' else '-development')
         brief = self.agreement['brief']
-        if role == 'maintenance':
+        local = self.plan['adapter'] != CHECKLIST_ADAPTER
+        if local and role == 'maintenance':
+            prompt = ('Review the agreed product outcome and validation scope. Inspect the approved repository read-only. '
+                      'Record which validation is possible in DevBox and which requested boundary needs a separate adapter. '
+                      'Keep the checkout clean. Take no host or external actions.\n\n' + brief)
+        elif local:
+            prompt = ('Implement the approved product agreement in this confined DevBox workspace. Use local dependencies '
+                      'and ordinary repository test commands. Keep all effects in the authorized workspace. '
+                      'Record the agreed outcome, acceptance and validation boundary in the project requirements and architecture. '
+                      'External operations require a separate admitted adapter. Commit the candidate, leave the tree clean, '
+                      'and run a real relevant test command in the shell with this exact prefix and suffix around it:\n'
+                      + LOCAL_TEST_PREFIX + '<repo test command>' + LOCAL_TEST_SUFFIX +
+                      '\nThe witness must report the same final HEAD before and after the test. End with only JSON containing '
+                      'candidate_sha (full HEAD) and summary (one line). '
+                      'If the agreed check cannot run, also include validation_blocker (one line).\n\n' + brief)
+        elif role == 'maintenance':
             prompt = ('Review the approved product brief and confirm the host-only checklist persistence check. '
                       'Use the fixed host recipe. Do not execute administrative commands or change the checkout.\n\n' + brief)
         else:
@@ -304,7 +422,7 @@ class FedoraJob:
                   output['runtime_admitted'] is True and output['status'] == 'completed-turn' and
                   self.gptbox.completed_turn(events) == result['uuid'], 'retained authenticated role result changed')
         return {'session_uuid': result['uuid'], 'operation': operation, 'events_sha256': output['events_sha256'],
-                **(proposal(events) if role == 'development' else {})}
+                **(proposal(events, local=local) if role == 'development' else {})}
 
     def host_test(self, ordinal, checkpoint):
         controller, job, checked = self.controller.ledger.checkpoint(self.job)
@@ -369,6 +487,27 @@ def execute(value, state, backend, save):
 
     initial = step('initial', 'building', backend.build, 1, value['agreement']['initial_commit'])
     step('maintenance', 'maintenance-turn', backend.turn, 'maintenance', initial)
+    if value['adapter'] != CHECKLIST_ADAPTER:
+        development = step('development', 'development-turn', backend.turn, 'development', initial)
+        revision = development['candidate_sha']
+        p.require('validation_blocker' not in development,
+                  'DevBox local validation stopped. ' + development.get('validation_blocker', ''))
+        evidence = development['local_validation']
+        p.require(evidence['candidate_sha'] == revision and evidence['exit_status'] == 0,
+                  'observed local validation does not bind the proposed candidate')
+        final = step('repair', 'binding-local-candidate', backend.build, 2, revision)
+        p.require(final['candidate']['source_revision'] == revision, 'verified checkout differs from tested candidate')
+        state['local_validation'] = dict(evidence, session_uuid=development['session_uuid'],
+                                         events_sha256=development['events_sha256'], checkpoint_id=final['checkpoint_id'],
+                                         source_changed=revision != initial['candidate']['source_revision'])
+        external = value['adapter'] == EXTERNAL_ADAPTER
+        state['phase'] = 'awaiting-external-validation' if external else 'local-validation-recorded'
+        observed = f'Local DevBox command completed with exit 0 at Git {revision}.'
+        state['diagnostics'] = (observed + ' The requested external check requires an approved adapter.'
+                                if external else observed)
+        state.pop('retry', None)
+        save(state)
+        return
     first = step('first', 'host-check', backend.host_test, 1, initial)
     p.require(first['progress'] in ('host-checks-passed', 'repair-required'), 'first host check is blocked')
     developed = step('development', 'development-turn', backend.turn, 'development', initial, first)

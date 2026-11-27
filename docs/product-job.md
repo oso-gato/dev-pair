@@ -13,6 +13,36 @@ revision. The first build and validation adapter expects
 result measures that criterion and records the two admitted role turns.
 Other acceptance checks in a brief need their own agreed evidence.
 
+## General development in DevBox
+
+Use the approved plan adapter `devbox-development` when local development and
+test evidence in DevBox fits the outcome. Use
+`devbox-development-needs-host` when local work can proceed and the accepted
+brief calls for a separate external validation environment. The plan keeps
+the same schema, and its adapter, repository, brief, limits and initial
+commit remain part of its agreement identity. The authorized Git repository
+can contain a different product. General development checks the approved
+origin, commit and tree and uses the same private startup approval and
+ordinary role and provider custody.
+
+The maintenance turn reviews scope and validation feasibility with its
+existing restrictions. DevBox implements and commits the approved change.
+The protected conductor retains the original session identity and a
+successful stock command start and completion from the admitted role turn.
+The command observes the exact clean Git HEAD immediately before and after
+the repository's local test. The conductor compares that evidence with the
+final checkout, verifies ancestry, and mirrors the same clean commit to
+the maintenance checkout for renewal. The command runs inside the existing
+DevBox placement and its normal operating and provider limits. The
+conductor records the command and output hashes, candidate, checkpoint,
+exit status and original session UUID.
+
+`local-validation-recorded` indicates observed DevBox test evidence at the
+saved candidate. `awaiting-external-validation` keeps the same local evidence
+and the agreed external check pending until an admitted adapter is available.
+The generic modes issue no checklist restart or external host request.
+Independent acceptance and controlled release still use their normal paths.
+
 ## Prepare the authorized job
 
 Provision the existing maintenance and nested DevBox placements, the

@@ -3,6 +3,7 @@ import io
 import os
 from pathlib import Path
 import pwd
+import shlex
 import socket
 import struct
 import subprocess
@@ -186,6 +187,99 @@ class ProductJobTests(unittest.TestCase):
         self.assertEqual(effects, [('build', 1, source), ('maintenance', source), ('host', 1, source),
                                    ('interrupted',), ('development', 'effect-1'), ('build', 2, repaired),
                                    ('host', 2, repaired)])
+
+    def test_general_repository_records_actual_local_test_and_holds_only_external_boundary(self):
+        workspace, _, _ = self.source_workspace()
+        self.git(workspace, 'rm', candidate.APP)
+        (workspace / 'product.txt').write_text('Old product result\n')
+        (workspace / 'test_product.py').write_text(
+            'import pathlib\nimport unittest\n'
+            'class ProductTest(unittest.TestCase):\n'
+            '    def test_agreed_result(self):\n'
+            '        self.assertEqual(pathlib.Path("product.txt").read_text().strip(), "Approved change")\n')
+        self.git(workspace, 'add', '--all')
+        self.git(workspace, 'commit', '-m', 'General product, no checklist source')
+        initial = self.git(workspace, 'rev-parse', 'HEAD')
+        approval = dict(repository=self.repo, acquired_commit=initial,
+                        acquired_tree=self.git(workspace, 'rev-parse', 'HEAD^{tree}'))
+        maintenance = self.root / 'maintenance/workspaces/demo'
+        maintenance.parent.mkdir(parents=True)
+        (self.root / 'maintenance/conductor-inputs').mkdir(mode=0o700)
+        subprocess.run(['/usr/bin/git', 'clone', '--no-local', str(workspace), str(maintenance)], check=True,
+                       capture_output=True, timeout=4)
+        self.git(maintenance, 'remote', 'set-url', 'origin', 'https://github.com/' + self.repo)
+        value = job.plan(p.canonical(dict(self.value, adapter=job.EXTERNAL_ADAPTER,
+            agreement=dict(self.value['agreement'], initial_commit=initial,
+                           brief='Change the document result and record the deployment observation as pending.'))))
+        backend = object.__new__(job.FedoraJob)
+        backend.runtime = mock.Mock(dispatch_gate=contextlib.nullcontext)
+        backend.plan, backend.agreement, backend.approval, backend.job = value, value['agreement'], approval, 'demo'
+        backend.ledger = mock.Mock()
+        backend.host_test = mock.Mock(side_effect=AssertionError('general mode cannot use the host recipe'))
+        role_effects = []
+
+        def turn(role, checkpoint):
+            role_effects.append((role, checkpoint['candidate']['source_revision']))
+            if role == 'maintenance':
+                return {'session_uuid': 'unchanged-maintenance-uuid'}
+            (workspace / 'product.txt').write_text('Approved change\n')
+            self.git(workspace, 'add', 'product.txt')
+            self.git(workspace, 'commit', '-m', 'Complete agreed product change')
+            revision = self.git(workspace, 'rev-parse', 'HEAD')
+            script = job.LOCAL_TEST_PREFIX + '/usr/bin/python3 -B -m unittest test_product.py' + job.LOCAL_TEST_SUFFIX
+            actual = subprocess.run(['/bin/sh', '-c', script.replace('/work/job', shlex.quote(str(workspace)))],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, timeout=5)
+            command = shlex.join(['/bin/bash', '-lc', script])
+            item = {'type': 'command_execution', 'id': 'item_7', 'command': command}
+            rows = [
+                {'type': 'item.started', 'item': dict(item, status='in_progress', exit_code=None, aggregated_output='')},
+                {'type': 'item.completed', 'item': dict(item, status='completed', exit_code=actual.returncode,
+                                                        aggregated_output=actual.stdout.decode())},
+                {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': p.canonical(
+                    {'candidate_sha': revision, 'summary': 'The agreed local product test passed.'})}},
+            ]
+            events = '\n'.join(map(p.canonical, rows)).encode()
+            developed = job.proposal(events, local=True)
+            return dict(developed, session_uuid='unchanged-development-uuid', events_sha256=p.sha256(events))
+
+        backend.turn = turn
+        state = dict.fromkeys(('initial', 'maintenance', 'first', 'development', 'repair', 'final'))
+        persisted = self.root / 'general.json'
+        with self.local_git(), mock.patch.object(job, 'ROOT', self.root):
+            job.execute(value, state, backend, lambda row: job.durable_json(persisted, row))
+            restored = p.loads(persisted.read_bytes())
+            job.execute(value, restored, backend, lambda row: job.durable_json(persisted, row))
+            local = job.plan(p.canonical(dict(value, adapter=job.LOCAL_ADAPTER)))
+            self.assertNotEqual(job.agreement_sha(local), job.agreement_sha(value))
+        self.assertEqual(restored['phase'], 'awaiting-external-validation')
+        self.assertEqual(p.loads(persisted.read_bytes())['phase'], 'awaiting-external-validation')
+        outcome = restored['local_validation']
+        self.assertEqual(outcome['session_uuid'], 'unchanged-development-uuid')
+        self.assertTrue(outcome['source_changed'])
+        revision = self.git(workspace, 'rev-parse', 'HEAD')
+        self.assertEqual((outcome['candidate_sha'], self.git(maintenance, 'rev-parse', 'HEAD')), (revision, revision))
+        self.assertEqual(role_effects, [('maintenance', initial), ('development', initial)])
+        backend.host_test.assert_not_called()
+
+    def test_general_validation_requires_a_successful_witness_of_the_final_revision(self):
+        revision = 'a' * 40
+        marker = job.LOCAL_HEAD_MARKER + revision
+        command = job.LOCAL_TEST_PREFIX + '/usr/bin/python3 -B -m unittest' + job.LOCAL_TEST_SUFFIX
+        item = {'id': 'item_1', 'type': 'command_execution', 'command': command}
+        rows = [{'type': 'item.started', 'item': item},
+                {'type': 'item.completed', 'item': dict(item, status='completed', exit_code=0,
+                                                       aggregated_output=marker + '\nOK\n' + marker)}]
+        read = lambda entries: job.observed_validation('\n'.join(map(p.canonical, entries)).encode(), revision)
+        self.assertEqual(read(rows)['exit_status'], 0)
+        renamed = dict(item, id='item_2')
+        later_failure = rows + [{'type': 'item.started', 'item': renamed},
+            {'type': 'item.completed', 'item': dict(renamed, status='failed', exit_code=1,
+                                                   aggregated_output=marker + '\nTest failed\n')}]
+        for events in (rows[1:], later_failure,
+                       rows[:1] + [{'type': 'item.completed', 'item': dict(rows[1]['item'],
+                           aggregated_output=marker + '\nOK\n' + job.LOCAL_HEAD_MARKER + 'b' * 40)}]):
+            with self.assertRaisesRegex(ValueError, 'no successful stock test'):
+                read(events)
 
     def test_invalid_or_unapproved_product_inputs_fail_closed(self):
         with self.assertRaisesRegex(ValueError, 'authorized validation adapter'):
