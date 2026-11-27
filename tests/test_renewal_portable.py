@@ -92,10 +92,10 @@ class PortableSiteTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
-    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None):
+    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None, local_prior=None):
         source = source_code * 40
         roles = ('maintenance', 'development') if agent else ('maintenance', 'development', 'devbox', 'host')
-        index = {'schema': 2, 'kind': site.AGENT if agent else site.FULL, 'repository': 'oso-gato/dev-pair',
+        index = {'schema': 3 if local_prior is not None else 2, 'kind': site.AGENT if agent else site.FULL, 'repository': 'oso-gato/dev-pair',
                  'source_sha': source, 'publisher_run': 22 if agent else 11, 'standards_sha': r.STANDARDS,
                  'contracts': {'ledger': 1, 'state': 1, 'release_policy': 1},
                  'previous_platform_sha256': older, 'base_platform_sha256': base, 'components': {}, 'transports': {}}
@@ -136,6 +136,10 @@ class PortableSiteTests(unittest.TestCase):
         (directory / 'platform.json').write_bytes(raw)
         intake = {key: index[key] for key in ('source_sha', 'publisher_run', 'kind')}
         r.replace_json(directory / 'intake.json', {'schema': 2, 'platform_sha256': portable, **intake})
+        if local_prior is not None:
+            binding = {'schema': 1, 'platform_sha256': portable, 'base_platform_sha256': base,
+                       'previous_platform_sha256': local_prior}
+            (directory / 'site-predecessor.json').write_bytes(self.canonical(binding))
         for role, contents in files.items():
             (directory / role).mkdir(mode=0o700)
             for filename, data in contents.items():
@@ -240,6 +244,40 @@ class PortableSiteTests(unittest.TestCase):
             self.controller.active_request('agent')
         with self.assertRaisesRegex(ValueError, 'site or boot'):
             self.resolve_site(offer)
+
+    def test_two_site_chained_offers_bind_each_exact_active_predecessor_and_keep_base(self):
+        import platform_release_protocol as protocol
+        if not hasattr(protocol, 'site_predecessor'):
+            self.skipTest('combined schema 3 release protocol is required')
+        platform, _ = self.stage('a')
+        initial = self.resolve_site(self.offer(platform))
+        current = initial['release_sha256']
+        control = self.controller.control
+        for name in ('current.json', 'site-current.json'):
+            r.replace_json(control / name, current)
+        first, _ = self.stage('b', agent=True, base=platform, local_prior=platform)
+        first_offer = self.offer(first, current)
+        first_selected = self.resolve_site(first_offer)
+        for name in ('current.json', 'site-current.json'):
+            r.replace_json(control / name, first_selected['release_sha256'])
+        self.assertEqual(self.resolve_site(first_offer), first_selected)
+        second, _ = self.stage('c', agent=True, base=platform, stable='3.0.0', local_prior=first)
+        second_offer = self.offer(second, first_selected['release_sha256'])
+        second_selected = self.resolve_site(second_offer)
+        self.assertEqual(second_selected['base_platform_sha256'], platform)
+        self.assertEqual(second_selected['platform_sha256'], second)
+        first_image = self.controller.release(first_selected['release_sha256'])['components']
+        second_image = self.controller.release(second_selected['release_sha256'])['components']
+        self.assertEqual(first_image['host'], second_image['host'])
+        self.assertEqual(first_image['devbox'], second_image['devbox'])
+        self.assertNotEqual(first_image['maintenance-agent'], second_image['maintenance-agent'])
+        with self.assertRaisesRegex(ValueError, 'stale local predecessor'):
+            self.resolve_site(self.offer(second, current))
+        proof = self.root / 'platform-releases' / second / 'site-predecessor.json'
+        binding = r.read_json(proof)
+        proof.write_bytes(self.canonical({**binding, 'previous_platform_sha256': platform}))
+        with self.assertRaisesRegex(ValueError, 'changes independently staged predecessor'):
+            self.resolve_site(second_offer)
 
     def test_uninstalled_manifest_change_and_foreign_site_geometry_fail_before_admission(self):
         platform, parent = self.stage('a')

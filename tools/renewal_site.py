@@ -325,7 +325,18 @@ class Resolver:
         r.require(r.loads(admission) == {'schema': 2, 'platform_sha256': reference, 'source_sha': value['source_sha'],
                                         'publisher_run': value['publisher_run'], 'kind': value['kind']},
                   'missing exact protected F/D intake result')
+        if value['schema'] == 3:
+            _, local = self.site_predecessor(directory, reference, value)
+            admission += local
         return directory, value, r.sha(admission)
+
+    def site_predecessor(self, directory, reference, value):
+        from platform_release_protocol import canonical, site_predecessor
+
+        raw = protected_bytes(directory / 'site-predecessor.json', 4096)
+        binding = r.loads(raw)
+        r.require(raw == canonical(binding), 'local portable predecessor proof is noncanonical')
+        return site_predecessor(binding, reference, value['base_platform_sha256']), raw
 
     def store(self, path, value):
         if os.path.lexists(path):
@@ -364,7 +375,22 @@ class Resolver:
             predecessor = offer['previous_release_sha256']
             if current != predecessor:
                 r.require(published['platform_sha256'] == platform, 'agent offer has a stale local predecessor')
-            else:
+            if index['schema'] == 3:
+                r.require(r.read_json(self.control / 'site-current.json') == current,
+                          'site and admitted release selectors differ')
+                local_prior = published if predecessor == current else r.read_json(
+                    self.control / 'platform-bindings' / (predecessor + '.json'))
+                portable_prior, _ = self.site_predecessor(directory, platform, index)
+                r.require(local_prior['release_sha256'] == predecessor and
+                          local_prior['site_config_sha256'] == site_hash and
+                          local_prior['base_platform_sha256'] == published['base_platform_sha256'] and
+                          local_prior['platform_sha256'] == portable_prior,
+                          'site-chained offer changes independently staged predecessor evidence')
+                if predecessor != current:
+                    _, _, local_intake = self.index(portable_prior)
+                    r.require(local_prior['intake_sha256'] == local_intake,
+                              'retained local predecessor intake evidence changed')
+            elif current == predecessor:
                 r.require(index['previous_platform_sha256'] == published['platform_sha256'], 'agent offer changes its portable predecessor')
             base_sha = index['base_platform_sha256']
             r.require(base_sha == published['base_platform_sha256'], 'agent offer changes its retained portable base')
