@@ -422,13 +422,13 @@ def observe_host_attempt(ledger, request, attempt, unit, authorization, runtime,
     actual = 'The checklist restart observation could not complete'
     status = 'blocked'
 
-    def http(port, method, path, expected, body=None):
+    def request_app(port, method, path, expected, body=None):
         return app_http(port, deadline, method, path, expected, body, authority=runtime.APP_AUTHORITY)
 
     def ready_items(port):
         while True:
             try:
-                return http(port, 'GET', '/items', 200)
+                return request_app(port, 'GET', '/items', 200)
             except (ConnectionRefusedError, ConnectionResetError, http.client.RemoteDisconnected):
                 time.sleep(min(0.05, time_left(deadline)))
 
@@ -437,15 +437,16 @@ def observe_host_attempt(ledger, request, attempt, unit, authorization, runtime,
         stage = 'start the approved Quadlet'
         port, first_invocation, first_container = unit.service('start', deadline)
         evidence.extend(['first-invocation:' + first_invocation, 'first-container:' + first_container])
-        stage = 'create and complete the test item'
+        stage = 'wait for checklist HTTP readiness'
         try:
             p.require(ready_items(port) == [], 'disposable checklist data was not initially empty')
-            item = http(port, 'POST', '/items', 201, {'title': title})
+            stage = 'create and complete the test item'
+            item = request_app(port, 'POST', '/items', 201, {'title': title})
             valid_item(item)
             p.require(item['title'] == title and item['done'] is False, 'unexpected item from create')
             effects.append('Created a uniquely named test item')
             expected = dict(item, done=True)
-            completed = http(port, 'POST', '/items/' + str(item['id']) + '/complete', 200)
+            completed = request_app(port, 'POST', '/items/' + str(item['id']) + '/complete', 200)
             valid_item(completed)
             p.require(completed == expected, 'unexpected item from complete')
             effects.append('Completed the test item')
@@ -458,9 +459,10 @@ def observe_host_attempt(ledger, request, attempt, unit, authorization, runtime,
                   'restart did not replace both the systemd invocation and container')
         evidence.extend(['second-invocation:' + second_invocation, 'second-container:' + second_container])
         effects.append('Replaced the owned systemd invocation and container using the same data mount')
-        stage = 'verify the completed item after restart'
+        stage = 'wait for checklist HTTP readiness after restart'
         try:
             observed = ready_items(port)
+            stage = 'verify the completed item after restart'
             p.require(type(observed) is list, 'invalid checklist item list')
             for entry in observed:
                 valid_item(entry)

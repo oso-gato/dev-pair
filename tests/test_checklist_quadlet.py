@@ -6,6 +6,7 @@ import pathlib
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -79,6 +80,36 @@ class FixtureService:
         p.require(not self.path.exists(), 'fixture matching workspace is still present')
 
 
+class DelayedFixtureService(FixtureService):
+    """Publish a bound address before its ordinary checklist process accepts HTTP."""
+
+    listener = None
+
+    def service(self, action, deadline):
+        self.stop()
+        self.actions.append(action)
+        self.listener = socket.socket()
+        self.listener.bind(('127.0.0.1', 0))
+        self.logs.append(action + ':exit-0')
+        phase = str(len(self.actions))
+        return self.listener.getsockname()[1], phase * 32, phase * 64
+
+    def accept_http(self):
+        self.listener.listen(4)
+        descriptor = self.listener.fileno()
+        self.child = subprocess.Popen([PYTHON, '-IB', str(APP), 'serve', '--listen-fd', str(descriptor),
+                                       '--database', str(self.path / 'checklist.sqlite3')],
+                                      pass_fds=(descriptor,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def stop(self):
+        try:
+            super().stop()
+        finally:
+            if self.listener is not None:
+                self.listener.close()
+                self.listener = None
+
+
 class QuadletHandoffTests(unittest.TestCase):
     def setUp(self):
         workspace = tempfile.TemporaryDirectory()
@@ -121,10 +152,10 @@ class QuadletHandoffTests(unittest.TestCase):
         p.require(not self.frozen, 'fixture renewal has frozen mutation')
         yield
 
-    def dispatch(self, action, request, *, forget=False, cleanup_lost=False):
+    def dispatch(self, action, request, *, forget=False, cleanup_lost=False, service_type=FixtureService):
         def factory(runtime, env, attempt, image, candidate, budget, *, storage_fsid):
             self.assertEqual(storage_fsid, 123)
-            service = FixtureService(self.path / attempt, forget=forget, cleanup_lost=cleanup_lost)
+            service = service_type(self.path / attempt, forget=forget, cleanup_lost=cleanup_lost)
             self.services.append(service)
             self.addCleanup(service.stop)
             return service
@@ -170,6 +201,49 @@ class QuadletHandoffTests(unittest.TestCase):
         self.ledger = p.Ledger(self.path / 'ledger', host_history=self.history)
         self.addCleanup(self.ledger.close)
         self.assertEqual(self.dispatch('status', repaired)['result'], passed)
+
+    def test_http_waits_for_real_delayed_listeners_at_start_and_restart(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        original = h.app_http
+        delays = []
+
+        def start_listener_after_refusal(port, deadline, method, path, expected, body=None, *, authority):
+            try:
+                return original(port, deadline, method, path, expected, body, authority=authority)
+            except ConnectionRefusedError:
+                self.assertEqual((method, path), ('GET', '/items'))
+                unit = self.services[-1]
+                delays.append(unit.actions[-1])
+                unit.accept_http()
+                raise
+
+        with mock.patch.object(h, 'app_http', side_effect=start_listener_after_refusal):
+            result = self.dispatch('execute', request, service_type=DelayedFixtureService)
+        self.assertEqual(delays, ['start', 'restart'])
+        self.assertEqual(result['status'], 'pass')
+        self.assertEqual(result['cleanup']['status'], 'complete')
+        self.assertEqual(self.dispatch('consume', request)['progress'], 'host-checks-passed')
+        self.assertEqual(self.dispatch('execute', request), result)
+        self.assertEqual([unit.actions for unit in self.services], [['start', 'restart']])
+
+    def test_http_that_never_becomes_ready_records_blocked_result_and_cleans_up(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        # Keep the real monotonic deadline and project a short work allowance.
+        with mock.patch.object(RUNTIME, 'CLEANUP_SECONDS', self.budget['seconds'] - 0.5):
+            result = self.dispatch('execute', request, service_type=DelayedFixtureService)
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['diagnostics'], 'wait for checklist HTTP readiness: TimeoutError')
+        self.assertEqual(result['cleanup']['status'], 'complete')
+        self.assertEqual(result['effects'], [])
+        self.assertEqual(self.dispatch('status', request)['result'], result)
+        self.assertEqual(self.dispatch('consume', request)['progress'], 'blocked')
+        self.assertEqual(self.dispatch('execute', request), result)
+        self.assertEqual([unit.actions for unit in self.services], [['start']])
+        self.assertFalse(self.services[0].path.exists())
 
     def test_permission_and_renewal_scope_and_status(self):
         request = self.request(0)
