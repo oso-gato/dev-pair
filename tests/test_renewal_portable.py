@@ -92,11 +92,11 @@ class PortableSiteTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
-    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None, local_prior=None):
+    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None, local_prior=None, run=None):
         source = source_code * 40
         roles = ('maintenance', 'development') if agent else ('maintenance', 'development', 'devbox', 'host')
         index = {'schema': 3 if local_prior is not None else 2, 'kind': site.AGENT if agent else site.FULL, 'repository': 'oso-gato/dev-pair',
-                 'source_sha': source, 'publisher_run': 22 if agent else 11, 'standards_sha': r.STANDARDS,
+                 'source_sha': source, 'publisher_run': run if run is not None else (22 if agent else 11), 'standards_sha': r.STANDARDS,
                  'contracts': {'ledger': 1, 'state': 1, 'release_policy': 1},
                  'previous_platform_sha256': older, 'base_platform_sha256': base, 'components': {}, 'transports': {}}
         files, role_evidence = {}, {}
