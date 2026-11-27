@@ -46,6 +46,13 @@ def show(record):
             if result['status'] != 'pass':
                 print(result['diagnostics'], flush=True)
 
+    if record.get('promotion'):
+        release = record['promotion']
+        print('Delivery ' + release['phase'].replace('-', ' '), flush=True)
+        for key in ('reason', 'pull_url', 'destination', 'image'):
+            if release.get(key):
+                print(release[key].replace('-', ' ') if key == 'reason' else release[key], flush=True)
+
 
 def review(record):
     show(record)

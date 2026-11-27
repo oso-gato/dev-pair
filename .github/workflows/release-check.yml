@@ -10,7 +10,14 @@ permissions:
 
 jobs:
   release-source-check:
-    if: github.repository == 'oso-gato/dev-pair' && github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.repository == 'oso-gato/dev-pair' &&
+      (github.event.pull_request.head.repo.full_name == github.repository ||
+       (vars.CHECKLIST_PRODUCT_FORK != '' &&
+        vars.CHECKLIST_PRODUCT_DEVELOPER_ID != '' &&
+        github.event.pull_request.head.repo.full_name == vars.CHECKLIST_PRODUCT_FORK &&
+        github.event.pull_request.user.id == fromJSON(vars.CHECKLIST_PRODUCT_DEVELOPER_ID || '0') &&
+        startsWith(github.event.pull_request.head.ref, 'dev-pair-products/')))
     runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:

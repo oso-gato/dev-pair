@@ -620,6 +620,22 @@ def read_state(root):
     return p.loads(read_private(root / 'state.json', p.MAX_MESSAGE))
 
 
+def read_progress(root):
+    state = read_state(root)
+    release = root / 'promotion.json'
+    if os.path.lexists(release):
+        delivery = p.loads(read_private(release, p.MAX_MESSAGE))
+        value = plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
+        p.require(delivery['version'] == 1 and delivery['job_id'] == state['job_id'] == value['job_id'] and
+                  delivery['plan_sha256'] == p.identity(value), 'promotion evidence belongs to a different agreement')
+        summary = {key: delivery[key] for key in ('phase', 'reason', 'pull_url', 'merged_source',
+                                                  'destination', 'destination_receipt_sha256') if key in delivery}
+        if 'release' in delivery:
+            summary['image'] = delivery['release']['subject']
+        state['promotion'] = summary
+    return state
+
+
 def pause_reason(error):
     if isinstance(error, HostReplyLost):
         return 'host-reply-interrupted'
@@ -728,7 +744,7 @@ def main(argv=None):
             previous = None
             end = time.monotonic() + 120
             while True:
-                result = read_state(root)
+                result = read_progress(root)
                 if args.action == 'status' or result['phase'] in TERMINAL or time.monotonic() >= end:
                     break
                 if result != previous:
