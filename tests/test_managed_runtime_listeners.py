@@ -101,7 +101,9 @@ class RuntimeListeners(unittest.TestCase):
             return 'inactive\n'
         if args[:2] == ('/usr/bin/systemctl', 'show') or args[:3] == ('/usr/bin/systemctl', '--user', 'show'):
             fields = next(part for part in args if part.startswith('--property=')).split('=', 1)[1].split(',')
-            return '\n'.join(key + '=' + self.units[args[-1]][key] for key in fields)
+            facts = self.units[args[-1]]
+            return '\n'.join(key + '=' + facts[key] for key in fields if key in facts
+                             and (key not in profile.COMMAND_HOOKS or facts[key]))
         if args == ('/usr/sbin/getenforce',):
             return 'Enforcing\n'
         if args[:2] == ('/usr/sbin/sshd', '-T'):
@@ -155,7 +157,7 @@ class RuntimeListeners(unittest.TestCase):
                 self.put('/var/lib/dev-pair/renewal-fence/frozen', json.dumps('boot'))
         command = b.CHECKLIST_ENTRY if managed else ' '.join(self.q_command)
         self.units[Q_UNIT] = {
-            **dict.fromkeys(profile.PROPERTIES, ''), 'Id': Q_UNIT, 'MainPID': Q_PROC, 'ActiveState': 'active',
+            **dict.fromkeys(profile.PROPERTIES, ''), 'Id': Q_UNIT, 'LoadState': 'loaded', 'MainPID': Q_PROC, 'ActiveState': 'active',
             'ControlGroup': Q_GROUP, 'User': 'dp-checklist', 'Group': 'dp-checklist',
             'FragmentPath': '/etc/systemd/system/' + b.CHECKLIST_UNIT,
             'DropInPaths': b.CHECKLIST_OVERRIDE if managed else '', 'ExecMainStartTimestampMonotonic': '1729',
@@ -247,6 +249,19 @@ class RuntimeListeners(unittest.TestCase):
             self.units[Q_UNIT]['ExecStartPre'] = ''
             self.put(profile.VENDOR, vendor + 'ExecStartPre=/usr/bin/false\n', mode=0o644)
             self.assert_blocks()
+
+    def test_stock_omissions_still_require_loaded_state_and_active_launch(self):
+        self.handoff(managed=True)
+        self.runtime()
+        unit = self.units[Q_UNIT]
+        unit['ExecCondition'] = '{ path=/usr/bin/false ; argv[]=/usr/bin/false ; }'
+        self.assert_blocks()
+        unit['ExecCondition'] = ''
+        unit['LoadState'] = 'not-found'
+        self.assert_blocks()
+        unit['LoadState'] = 'loaded'
+        del unit['ExecStart']
+        self.assert_blocks()
 
     def test_settled_site_requires_matching_component_and_live_handoff(self):
         self.handoff(managed=True)

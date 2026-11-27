@@ -1626,13 +1626,14 @@ class Bootstrap:
                         *args, timeout=5)
 
     def runtime_unit(self, unit, properties, *, uid=None):
+        from systemd_service_profile import manager_properties
+
         args = ('show', '--all', '--property=' + ','.join(properties), unit)
         command = ('/usr/bin/systemctl',)
         raw = (self.run(*command, *args, timeout=5) if uid is None else
                self.runtime_user_command(uid, *command, '--user', *args))
-        rows = [line.split('=', 1) for line in raw.splitlines()]
-        facts = dict(rows)
-        if (len(rows) != len(facts) or set(facts) != set(properties) or facts['Id'] != unit
+        facts = manager_properties(raw, properties)
+        if (facts['Id'] != unit
                 or facts['ActiveState'] != 'active' or not re.fullmatch(r'[1-9][0-9]{0,9}', facts['MainPID'])
                 or int(facts['MainPID']) <= 1
                 or not re.fullmatch(r'/(?:[A-Za-z0-9_@./-]|\\x[0-9a-f]{2})+', facts['ControlGroup'])
@@ -1691,11 +1692,12 @@ class Bootstrap:
         unit = CHECKLIST_UNIT.replace('@.', f'@{uid}.')
         fragment = '/etc/systemd/system/' + CHECKLIST_UNIT
         profile.protected(self.path(fragment), 0, 8192, mode=0o644)
-        properties = ('Id', 'MainPID', 'ActiveState', 'ControlGroup', 'User', 'Group', 'FragmentPath',
+        properties = ('Id', 'LoadState', 'MainPID', 'ActiveState', 'ControlGroup', 'User', 'Group', 'FragmentPath',
                       'DropInPaths', 'ExecStart', 'ExecMainStartTimestampMonotonic', *profile.PROPERTIES)
         facts = self.runtime_unit(unit, properties)
         profile.observe(facts, (CHECKLIST_OVERRIDE,) if managed else (), self.path, self.run)
-        if (endpoint != '127.0.0.1:19425' or facts['MainPID'] != pid or facts['User'] != CHECKLIST_OWNER
+        if (endpoint != '127.0.0.1:19425' or facts['LoadState'] != 'loaded'
+                or facts['MainPID'] != pid or facts['User'] != CHECKLIST_OWNER
                 or facts['Group'] != CHECKLIST_OWNER or facts['FragmentPath'] != fragment
                 or not facts['ControlGroup'].startswith('/system.slice/')
                 or not facts['ControlGroup'].endswith('/' + unit)
