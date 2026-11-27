@@ -850,7 +850,7 @@ class Destination(Bootstrap):
                     require(not recovery_running and recovery_result == 'success' and self.recovery_start() > minimum_start,
                             'production release requires current boot renewal recovery')
                     self.require_recovery_enabled()
-                    guard = self.verify_final_guard()
+                    guard = self.verify_workload_access()
                     _, dns = self.tailscale_state()
                     require(guard['target']['dns_name'] == dns, 'checklist proxy differs from independently verified cutover')
                     self.storage_ready(LIVE, uid)

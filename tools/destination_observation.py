@@ -2,6 +2,7 @@
 """Observe the fixed private checklist journey and assemble D's independent receipt."""
 
 import argparse
+import base64
 import hashlib
 import http.client
 import ipaddress
@@ -19,7 +20,7 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
-from bootstrap import Blocked, Bootstrap, checked_file, relay
+from bootstrap import Blocked, Bootstrap, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
 from release_trust import DIGEST, SHA, require
 
 SIGNERS = '/etc/dev-pair/destination-observer/allowed_signers'
@@ -58,6 +59,13 @@ SITE_RELEASE = {'negative_routes', 'tailnet_addresses'}
 BINDING = {'version', 'kind', 'job_id', 'source_sha', 'machine_id', 'boot_id', 'dns_name',
            'provider_recovery', 'public_addresses'}
 BINDING_RELEASE = RELEASE - SITE_RELEASE
+CORE_BINDING = (BINDING - {'provider_recovery', 'public_addresses'}) | {'node_id', 'tailnet', 'keys_sha256', 'tailnet_addresses'}
+CORE_SITE = SITE | {'tailnet', 'acl_sha256', 'execution_route'}
+SCOPED_ACCESS = {CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER}
+ACCESS_KINDS = {'access-cutover', *SCOPED_ACCESS}
+ROLE_ARTIFACTS = {'release_sha256', 'job', 'development_manifest', 'maintenance_image', 'development_image', 'devbox_image'}
+MAX_ACCESS_PART = 16384
+MAX_ACCESS_ENVELOPE = 2 * (4 * ((MAX_ACCESS_PART + 2) // 3)) + 128
 
 
 def encoding(data):
@@ -156,10 +164,17 @@ def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):
 
 
 def validate_plan(plan, now):
-    require(type(plan) is dict and plan.get('kind') in {'checklist-release', 'access-cutover'},
+    require(type(plan) is dict and plan.get('kind') in {'checklist-release', *ACCESS_KINDS},
             'unsupported destination observation plan')
     checklist = plan['kind'] == 'checklist-release'
-    keys(plan, PLAN | (RELEASE if checklist else ACCESS))
+    scoped = plan['kind'] in SCOPED_ACCESS
+    workload = plan['kind'] == WORKLOAD_ACCESS_CUTOVER
+    fields = set(RELEASE if checklist else ACCESS)
+    if scoped:
+        fields |= {'tailnet_addresses'}
+    if workload:
+        fields |= {'role_artifacts'}
+    keys(plan, PLAN | fields)
     require(type(plan['version']) is int and plan['version'] == 1
             and matches(SHA, plan['source_sha']) and matches(r'[0-9a-f]{32}', plan['machine_id'])
             and canonical_uuid(plan['boot_id']) and canonical_uuid(plan['ceremony_id'])
@@ -180,6 +195,16 @@ def validate_plan(plan, now):
                 and matches(NAME, plan['node_id']) and matches(NAME, plan['tailnet'])
                 and plan['execution_route'] in ('tailnet-core', 'provider-recovery'),
                 'access plan lacks checked node, key and ACL information')
+        if scoped:
+            keys(plan['tailnet_addresses'], set(FAMILIES))
+            require(plan['job_id'] == 'host-access' and Bootstrap.access_addresses(
+                {'TailscaleIPs': list(plan['tailnet_addresses'].values())}) == plan['tailnet_addresses'],
+                'core review lacks both verified Tailscale destination addresses')
+        if workload:
+            roles = plan['role_artifacts']
+            keys(roles, ROLE_ARTIFACTS)
+            require(matches(JOB, roles['job']) and all(matches(DIGEST, roles[key]) for key in ROLE_ARTIFACTS - {'job'}),
+                    'workload review lacks the exact selected local role and DevBox artifacts')
         return
     require(matches(SHA, plan['release_source']) and matches(IMAGE, plan['image'])
             and matches(DIGEST, plan['guard_sha256'])
@@ -208,8 +233,9 @@ def validate_plan(plan, now):
 
 
 def probe_plan(plan):
-    if plan['kind'] == 'access-cutover':
-        return Bootstrap.access_probe_plan(plan['dns_name'], plan['provider_recovery'], plan['public_addresses'])
+    if plan['kind'] in ACCESS_KINDS:
+        return Bootstrap.access_probe_plan(plan['dns_name'], plan['provider_recovery'], plan['public_addresses'],
+                                           core_only=plan['kind'] == CORE_ACCESS_CUTOVER)
     expected = {}
     dns = plan['dns_name']
     endpoint = f'https://{dns}/'
@@ -252,12 +278,18 @@ def export_release(job):
 
 
 def prepare_plan(binding, site, now, previous):
-    require(type(binding) is dict and binding.get('kind') in ('access-cutover', 'checklist-release'),
+    require(type(binding) is dict and binding.get('kind') in {'checklist-release', *ACCESS_KINDS},
             'unsupported protected destination binding')
     checklist = binding['kind'] == 'checklist-release'
-    keys(site, SITE | (SITE_RELEASE if checklist else ACCESS))
-    keys(binding, BINDING | (BINDING_RELEASE if checklist else set()))
-    require(all(binding[key] == site[key] for key in BINDING & SITE),
+    scoped = binding['kind'] in SCOPED_ACCESS
+    workload = binding['kind'] == WORKLOAD_ACCESS_CUTOVER
+    keys(site, CORE_SITE if scoped else SITE | (SITE_RELEASE if checklist else ACCESS))
+    fields = CORE_BINDING if scoped else BINDING | (BINDING_RELEASE if checklist else set())
+    keys(binding, fields | ({'role_artifacts'} if workload else set()))
+    if workload:
+        require(site['kind'] == CORE_ACCESS_CUTOVER, 'use the previously admitted independent access site')
+        site = {**site, 'kind': WORKLOAD_ACCESS_CUTOVER}
+    require(all(binding[key] == site[key] for key in binding.keys() & site.keys()),
             'destination binding differs from independently admitted site endpoints')
     clocks = {key: previous[key] for key in ('issued_at', 'expires_at', 'ceremony_id')} if previous else {
         'issued_at': now, 'expires_at': now + LIFETIME, 'ceremony_id': str(uuid.uuid4())}
@@ -466,7 +498,7 @@ def configured_signers():
 
 
 def external_method(plan, test, family):
-    if plan['kind'] == 'access-cutover':
+    if plan['kind'] in ACCESS_KINDS:
         return 'independent-access-session'
     if test == 'remote-root':
         return 'independent-openssh-session'
@@ -477,11 +509,26 @@ def external_method(plan, test, family):
     raise Blocked('this check can be issued only by its fixed native collector')
 
 
+def expected_role_probe(plan, test, family):
+    if plan['kind'] == WORKLOAD_ACCESS_CUTOVER and test in (
+            'maintenance-authorized', 'maintenance-restored', 'development-authorized', 'development-restored'):
+        return {'role': test.split('-', 1)[0], 'source_sha': plan['source_sha'], 'boot_id': plan['boot_id'],
+                'machine_id': plan['machine_id'], 'address': plan['tailnet_addresses'][family],
+                'role_artifacts': plan['role_artifacts'], 'probe_cycles': 2, 'job_admission': False}
+    return None
+
+
 def external_probe(plan, plan_sha, test, family, expected, transcript, now):
     require((test, family) in expected, 'the external check is outside the admitted ceremony')
     method = external_method(plan, test, family)
-    return make_probe(plan, plan_sha, test, family, expected, method,
-                      {'transcript_sha256': digest(transcript)}, now)
+    detail = {'transcript_sha256': digest(transcript)}
+    proof = expected_role_probe(plan, test, family)
+    if proof:
+        reading = json.loads(transcript, object_pairs_hook=relay.unique)
+        require(reading == proof and type(reading['probe_cycles']) is int,
+                'authorized route lacks the exact confined role probe result')
+        detail['role_probe'] = proof
+    return make_probe(plan, plan_sha, test, family, expected, method, detail, now)
 
 
 def event_record(plan, plan_sha, event, before, after, transcript, now):
@@ -546,9 +593,13 @@ def check_probe(plan, plan_sha, record, test, family, expected):
                 and detail['control_before'] in (200, 204) and detail['control_after'] in (200, 204),
                 'negative observation lacks actual selected denial and independent healthy controls')
     else:
-        keys(detail, {'transcript_sha256'})
+        proof = expected_role_probe(plan, test, family)
+        keys(detail, {'transcript_sha256'} | ({'role_probe'} if proof else set()))
         require(record['method'] == external_method(plan, test, family) and matches(DIGEST, detail['transcript_sha256']),
                 'external access observation lacks its independently retained transcript')
+        if proof:
+            require(encoding(detail['role_probe']) == encoding(proof) and digest(encoding(proof)) == detail['transcript_sha256'],
+                    'signed role observation differs from its expected exact route and confined probe')
     return record
 
 
@@ -584,13 +635,15 @@ def check_release_sequence(plan, observations, events, now):
     return original, events['reboot']['after']
 
 
-def check_access_recovery(observations):
+def check_access_recovery(observations, *, core=False):
     reopened = observations['reopened-recovery', 'provider']['observed_at']
     during = observations['recovery-during-loss', 'provider']['observed_at']
+    lost_tests = ('lost-ssh', 'lost-mosh') if core else ('lost-ssh', 'lost-mosh', 'maintenance-lost', 'development-lost')
+    restored_tests = ('restored-ssh',) if core else ('restored-ssh', 'maintenance-restored', 'development-restored')
     lost = [observations[test, family]['observed_at'] for family in FAMILIES
-            for test in ('lost-ssh', 'lost-mosh', 'maintenance-lost', 'development-lost')]
+            for test in lost_tests]
     restored = [observations[test, family]['observed_at'] for family in FAMILIES
-                for test in ('restored-ssh', 'maintenance-restored', 'development-restored')]
+                for test in restored_tests]
     require(reopened < min(during, *lost) and max(during, *lost) < min(restored),
             'access observations must reopen independent recovery before loss and restore private access afterward')
 
@@ -602,7 +655,10 @@ def assembled_receipt(plan, plan_sha, directory, *, now, verify):
     require(now < data['expires_at'], 'the independent observation plan has expired')
     observations, rows = {}, []
     for (test, family), (_, vantage, _) in sorted(expected.items()):
-        if plan['kind'] == 'checklist-release' and test == 'public-app' and plan['public_addresses'][family] is None:
+        provider_absence = (plan['kind'] == 'checklist-release' and test == 'public-app' or
+                            plan['kind'] in SCOPED_ACCESS and test in
+                            ('public-ssh', 'public-mosh', 'maintenance-public', 'development-public'))
+        if provider_absence and plan['public_addresses'][family] is None:
             signer = observer_principal('provider')
         else:
             signer = observer_principal(vantage)
@@ -617,9 +673,14 @@ def assembled_receipt(plan, plan_sha, directory, *, now, verify):
         rows[-1]['evidence_sha256'] = proof_hash
     Bootstrap().verify_access_probes({**data, 'probes': rows}, expected)
     data['probes'] = rows
-    if plan['kind'] == 'access-cutover':
-        check_access_recovery(observations)
+    if plan['kind'] in ACCESS_KINDS:
+        core = plan['kind'] == CORE_ACCESS_CUTOVER
+        check_access_recovery(observations, core=core)
         data.update({key: plan[key] for key in ACCESS | {'provider_recovery', 'public_addresses'}})
+        if plan['kind'] in SCOPED_ACCESS:
+            data.update(kind=plan['kind'], tailnet_addresses=plan['tailnet_addresses'])
+        if plan['kind'] == WORKLOAD_ACCESS_CUTOVER:
+            data['role_artifacts'] = plan['role_artifacts']
     else:
         events = {}
         for event, vantage in EVENTS.items():
@@ -636,6 +697,24 @@ def assembled_receipt(plan, plan_sha, directory, *, now, verify):
     return data
 
 
+def access_envelope(payload, signature):
+    require(all(0 < len(part) <= MAX_ACCESS_PART for part in (payload, signature)),
+            'signed access receipt or signature exceeds its bound')
+    return encoding({'receipt': base64.b64encode(payload).decode('ascii'),
+                     'signature': base64.b64encode(signature).decode('ascii')})
+
+
+def read_access_envelope(stream):
+    data = stream.read(MAX_ACCESS_ENVELOPE + 1)
+    require(0 < len(data) <= MAX_ACCESS_ENVELOPE, 'access response envelope exceeds its bound')
+    parts = json.loads(data, object_pairs_hook=relay.unique)
+    keys(parts, {'receipt', 'signature'})
+    require(all(type(value) is str for value in parts.values()), 'access response must contain encoded signed files')
+    payload, signature = (base64.b64decode(parts[key], validate=True) for key in ('receipt', 'signature'))
+    access_envelope(payload, signature)
+    return payload, signature
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', type=Path, help='independently signed observation plan')
@@ -643,6 +722,8 @@ def arguments():
     stages = parser.add_subparsers(dest='stage', required=True)
     export = stages.add_parser('export-release', help='read the exact settled release from protected J/D state')
     export.add_argument('job')
+    bundle = stages.add_parser('bundle-access', help='stream the independently signed access receipt for the owner')
+    bundle.add_argument('--receipt', type=Path, required=True)
     begin = stages.add_parser('begin', help='prepare a plan from the admitted site profile and observed destination binding')
     begin.add_argument('--binding', type=Path, required=True)
     begin.add_argument('--site', type=Path, required=True)
@@ -667,6 +748,11 @@ def main():
     try:
         if args.stage == 'export-release':
             sys.stdout.buffer.write(encoding(export_release(args.job)))
+            return 0
+        if args.stage == 'bundle-access':
+            path = args.receipt
+            sys.stdout.buffer.write(access_envelope(bounded_file(path, MAX_ACCESS_PART),
+                                    bounded_file(path.with_name(path.name + '.sig'), MAX_ACCESS_PART)))
             return 0
         require(args.directory is not None, 'select the private ceremony evidence directory')
         directory = state_dir(args.directory)

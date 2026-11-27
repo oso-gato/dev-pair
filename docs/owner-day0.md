@@ -23,19 +23,40 @@ login is restricted to tailnet sources and destinations. An already available
 independently signed provider proof can instead authorize the zero-public-SSH
 setup route. The final access review still checks external reachability.
 
-After verified tailnet enrollment, keep the independent provider recovery
-terminal available and test `core` SSH from your tailnet. The final access
-controller requires independent authorized, denied, public and provider
-observations of the intended routes. This setup does not yet automate the
-pre-cutover role availability and evidence handoff. The initial SSH route stays
-available until the separate review succeeds. [Recovery and access verification](destination-release.md)
+After tailnet enrollment, keep the independent provider recovery terminal
+available and test `core` SSH from your tailnet. In the selected root terminal,
+run `./day0.sh access-request > ../access-request.json` from the verified checkout.
+Send the generated request to your independent access verifier on the
+authenticated controller channel. The verifier checks the actual named
+administrator, outside clients and provider recovery and returns one signed
+bundle. Place it beside the checkout and run
+`./day0.sh access-response < ../signed-access.bundle` in the selected
+root terminal. The installer verifies the bundle against the live machine, boot,
+tailnet node and keys before closing the initial SSH route. Run `./day0.sh resume`
+to continue. [Independent access verification](destination-observation.md)
 
 The first bootstrap builds and verifies the confined maintenance gptbox using
 public signed build inputs. Both offline probe cycles must pass before the host
 reports completion. Reapply checks the recorded result and immutable image. A
 separately approved full platform release, site policy, and provider access are
 needed for later authenticated workloads. They are consumed by the protected
-commissioning entry as available. [Commissioning](host-commissioning.md)
+commissioning entry as available. After protected commissioning installs the
+role images, `./day0.sh access-request --workloads > ../workload-access-request.json`
+requests the separate role
+review for those exact images and the selected DevBox placement. The verifier
+runs the confined role checks through the same named core tailnet SSH path and
+returns the next signed bundle for `access-response`. The provider and owner
+intake grants still independently control normal jobs. [Commissioning](host-commissioning.md)
+
+If you ran a reviewed offline-only bootstrap, retain its checkout, journals and
+local gptbox. Stage the separately reviewed continuation checkout in its own
+standard directory, then run `./day0.sh resume` there. The installer verifies
+the earlier completed maintenance proof and original production-source bytes
+before recording the new controller identity. It reuses your earlier sealed
+image and named core setup. Keep using the originally reviewed checkout if its
+maintenance initialization was interrupted before completion. The standard
+public checkout and offline kit paths let the new command locate the original
+protected Git tree when the historical commit contains test-only changes.
 
 ## Optional offline source kit
 

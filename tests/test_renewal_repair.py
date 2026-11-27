@@ -1,4 +1,5 @@
 """Production parser and durable launch regressions on private local data."""
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import tempfile
 import shlex
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import uuid
 
 REPO = Path(__file__).resolve().parents[1]
@@ -19,9 +20,57 @@ TOOLS = REPO / 'tools'
 SCRIPT = REPO / 'runtime' / 'renewal' / 'driver'
 sys.path.insert(0, str(TOOLS))
 import renewal as r
+import bootstrap as b
 
 
 class NativeRecoveryTests(unittest.TestCase):
+    def test_private_role_probe_checks_real_named_route_then_dispatches_exact_offline_adapters(self):
+        probe = runpy.run_path(str(SCRIPT))['access_probe']
+        source = 'a' * 40
+        identity = {'machine_id': 'b' * 32, 'boot_id': '5edb2370-cd2e-4f63-b180-b84db50f524b'}
+        selection = {'release_sha256': '0' * 64, 'job': 'checklist', 'development_manifest': '1' * 64,
+                     'maintenance_image': '2' * 64, 'development_image': '3' * 64, 'devbox_image': '4' * 64}
+        claim = {'platform_sha256': '5' * 64, 'source_sha': source, 'oci_manifest_sha256': '6' * 64,
+                 'boundary_and_version_cycles': 2, 'job_admission': False}
+        peer = {'local': '100.64.0.10', 'device': 'tailscale0', 'core': True}
+        live = {'TailscaleIPs': [peer['local']]}
+        host = Mock()
+        host.named_tailnet_peer.side_effect = b.Bootstrap().named_tailnet_peer
+        host.observed_ssh_peer.return_value = peer
+        host.tailscale_state.return_value = (live, 'erebus.fixture.ts.net')
+        host.verify_final_guard.return_value = {'target': {'source_sha': source}, 'scope': 'core'}
+        host.destination_identity.return_value = identity
+        host.access_workload_selection.return_value = selection
+        release = {'components': {'host': {}, 'maintenance-agent': {}}}
+        plan = {'maintenance_context_sha256': '7' * 64}
+        development = {'kind': 'dev-pair-devbox-probe-v1', 'manifest_sha256': selection['development_manifest'],
+                       'inner_image_id': selection['development_image'], 'outer_image_id': selection['devbox_image'],
+                       'inner_removed': True, 'outer_removed': True, 'cycles': [{}, {}], 'job_admission': False}
+        run = Mock(side_effect=[r.json_bytes({**claim, 'boot_id': identity['boot_id']}), r.json_bytes(development)])
+        config = {'run': run, 'admit_release': lambda _: (release, plan), 'live_host': lambda _: (Path('/protected'), 100),
+                  'retained_maintenance': lambda *_: (claim, identity['boot_id'], 'site')}
+        with (patch.dict(probe.__globals__, config), patch.object(b, 'Bootstrap', return_value=host),
+              patch.object(r, 'Renewal', return_value=SimpleNamespace(lock=nullcontext))):
+            for role in ('maintenance', 'development'):
+                actual = probe({'role': role, 'source_sha': source})
+                self.assertEqual(actual, {'role': role, 'source_sha': source, **identity, 'role_artifacts': selection,
+                                          'probe_cycles': 2, 'job_admission': False, 'address': peer['local']})
+            maintain, develop = (call.args[0] for call in run.call_args_list)
+            self.assertIn('verify-installed-maintenance', maintain)
+            self.assertEqual(maintain[maintain.index('--image') + 1], selection['maintenance_image'])
+            self.assertEqual(develop[:4], ['/usr/sbin/runuser', '--user', 'dp-dev', '--'])
+            self.assertEqual(develop[-2:], ['--sha256', selection['development_manifest']])
+            self.assertNotIn('--operation', develop)
+            host.observed_ssh_peer.return_value = {**peer, 'device': 'eth0'}
+            with self.assertRaisesRegex(b.Blocked, 'named core tailnet'):
+                probe({'role': 'maintenance', 'source_sha': source})
+            self.assertEqual(run.call_count, 2)
+        turn = probe.__globals__['turn']
+        with (patch.object(b, 'Bootstrap', return_value=host),
+              patch.object(host, 'verify_workload_access', side_effect=b.Blocked('independent workload access checks pending'))):
+            with self.assertRaisesRegex(ValueError, 'independent workload access'):
+                turn('turn', {})
+
     def test_only_exact_empty_probe_leaves_are_eligible_for_infrastructure_exclusion(self):
         check = runpy.run_path(str(SCRIPT))['check_probe_trees']
         with tempfile.TemporaryDirectory() as temp:
@@ -138,6 +187,7 @@ class NativeRecoveryTests(unittest.TestCase):
                     started.append(channel)
 
             changes = {'ROOT': root, 'CONTROL': control,
+                       'verify_workload_access': lambda: None,
                        'admit_release': lambda _: ({'components': parts}, plan),
                        'live_host': lambda _: (root, 100), 'unit': broker,
                        'owned_file': lambda path, limit, expected_uid=0: r.read_private(path, limit),

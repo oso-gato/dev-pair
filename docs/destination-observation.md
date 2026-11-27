@@ -71,4 +71,52 @@ The assembler waits for every required check and verifies the signature against 
 
 The assembler also accepts separately measured pre-cutover access records against D's existing `Bootstrap.access_probe_plan`. Use a protected `kind: access-cutover` site profile with the same common site fields plus `node_id`, `tailnet`, `keys_sha256`, `acl_sha256`, and `execution_route`. Its independently checked binding carries the common exact job, platform source, machine, boot, DNS, recovery and provider addresses. Use `record-access TEST FAMILY --observed-at EPOCH --transcript FILE` for each actual typed access observation and `assemble` for the cutover schema. Confirm the initial operator scope and independently verified provider recovery through the [existing destination commissioning entry](destination-release.md). Generating initial access observations remains a native commissioning task.
 
+## Review the named SSH and workload routes
+
+Use the owner-generated `day0.sh access-request` output as `begin --binding`.
+The independent site profile selects `kind` `core-access-cutover`, the exact
+`dns_name` and `tailnet`, each named `clients` entry, `provider_recovery`, both
+`public_addresses` (null only on provider-confirmed absence), the measured
+`acl_sha256` and the intended `execution_route`. The controller supplies
+`version: 1`. Determine the provider addresses and policy from the independently
+held inventory. The host-generated request supplies the live machine and boot,
+the enrolled node, tailnet addresses and the installed core key digest. Verify
+those facts before signing the plan. Continue to use the separate observation
+and final access-review signing authorities described above.
+
+For the administrator stage measure the named key login, invalid-key and
+password rejection, password-gated sudo, script and transfer, mosh/tmux reconnect,
+denial from the unauthorized tailnet and public clients, and loss and recovery
+on both address families. Reopen independent provider recovery before testing
+tailnet failure. In the protected provider-SSH window the public test measures
+denial of the named core route while the scoped initial provider route stays
+available. The resulting cutover verifies the live firewall and effective SSH
+configuration before recording the initial route closed. When the provider
+confirms a public family is absent, it signs those absence observations.
+
+After `assemble` and the existing final access-review signature, use
+`bundle-access --receipt /protected/ceremony/destination-receipt.json` to export
+one bounded stream. Return it through the authenticated controller channel.
+The owner runs `day0.sh access-response` with the stream on stdin. No private
+signing key is installed on the destination. If the selected verifier or an
+independent vantage is unavailable, keep the applicable protected bootstrap
+or recovery route and leave the corresponding stage pending.
+
+Once the core cutover and approved private placement are complete, use the
+owner's `access-request --workloads` output. Prepare a fresh plan with the same
+independent core site profile. On an authorized client, connect to `core` with
+the verified host key and each planned tailnet address. Within that SSH session,
+run `sudo --preserve-env=SSH_CONNECTION,SSH_CLIENT /absolute/reviewed/checkout/day0.sh access-probe maintenance`
+and the corresponding `access-probe development` command. Capture each command's
+standard output to its authorized or restored observation transcript. The
+destination checks the actual SSH daemon session and `tailscale0` route, then
+runs the selected confined maintenance or nested DevBox probe twice. The
+bounded offline probes use the existing SSH listener and leave jobs held. The
+collector verifies the machine, boot, address and exact selected role images
+before signing the observation. The denied, public and loss clients must try
+the same named SSH command and verify denial. Restore the named route and run
+the actual probe again before issuing the final workload bundle. The owner
+imports that bundle with the same `access-response` command. Job authorization,
+provider spending and application-specific validation remain independent gates.
+
 The source fixture drove the stock checklist through Chromium over loopback, then read the same item after restarting the application process. A separate bounded loopback TLS test exercised direct negative HTTP, healthy control and certificate rejection. Receipt tests used disposable local OpenSSH keys and fixture recovery records. The real VPS, Tailnet policy, named SSH/mosh, independent provider terminal, reboot, rollback, clean restore and external signing custody have not been exercised.

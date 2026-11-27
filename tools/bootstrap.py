@@ -55,6 +55,8 @@ ATTENDED_ACCESS = 'attended-local-recovery'
 ATTENDED_RECEIPT = '/run/dev-pair-day0/recovery.json'
 GUARD_PATH = '/etc/dev-pair/bootstrap.nft'
 CUTOVER = STATE + '/access-cutover.json'
+CORE_ACCESS_CUTOVER = 'core-access-cutover'
+WORKLOAD_ACCESS_CUTOVER = 'workload-access-cutover'
 TRUST_SIGNERS = '/etc/dev-pair/trust/allowed_signers'
 CHECKLIST_OWNER = 'dp-checklist'
 CHECKLIST_HOME = '/var/lib/dev-pair/checklist-executor'
@@ -1339,8 +1341,12 @@ class Bootstrap:
             raise Blocked('unsupported signed evidence')
         return data
 
-    def recent_destination_evidence(self, path, principal, keys, *, lifetime):
+    def recent_destination_evidence(self, path, principal, keys, *, lifetime, core_access=False):
         data = self.signed_evidence(path, principal, 'dev-pair-destination')
+        if core_access and data.get('kind') == CORE_ACCESS_CUTOVER:
+            keys = keys | {'kind', 'tailnet_addresses'}
+        if core_access and data.get('kind') == WORKLOAD_ACCESS_CUTOVER:
+            keys = keys | {'kind', 'tailnet_addresses', 'role_artifacts'}
         identity = self.destination_identity()
         if (set(data) != {'version', 'source_sha', 'issued_at', 'expires_at', *identity, *keys}
                 or any(data.get(key) != value for key, value in identity.items())
@@ -1873,7 +1879,7 @@ class Bootstrap:
             raise ValueError('Tailscale Serve differs from the exact checklist route')
 
     def runtime_serve(self, sockets):
-        guard = self.verify_final_guard()
+        guard = self.verify_workload_access()
         live, dns = self.tailscale_state()
         if guard['target']['dns_name'] != dns:
             raise ValueError('checklist tailnet address differs from admitted cutover')
@@ -2998,10 +3004,17 @@ class Bootstrap:
 
     def verify_final_guard(self):
         state = json.loads(checked_file(self.path(CUTOVER)).read_text(), object_pairs_hook=relay.unique)
-        if (state.get('phase') != 'complete' or state.get('guard_sha256') != self.guard_hash()
+        if (state.get('phase') != 'complete' or state.get('scope') not in (None, 'core')
+                or state.get('guard_sha256') != self.guard_hash()
                 or checked_file(self.path(GUARD_PATH)).read_text() != self.guard_rules([], tailnet_only=True)
                 or checked_file(self.path(SSH_CUTOVER)).read_text() != SSH_CUTOVER_CONFIG):
             raise Blocked('tailnet-only destination firewall and SSH cutover are unverified')
+        return state
+
+    def verify_workload_access(self):
+        state = self.verify_final_guard()
+        if state.get('scope') is not None:
+            raise Blocked('independent workload access checks have not been admitted')
         return state
 
     def verify_final_ssh(self):
@@ -3052,7 +3065,7 @@ class Bootstrap:
         return value if family == 'ipv4' else f'[{value}]'
 
     @classmethod
-    def access_probe_plan(cls, dns, recovery, public_addresses):
+    def access_probe_plan(cls, dns, recovery, public_addresses, *, core_only=False):
         if type(public_addresses) is not dict or set(public_addresses) != {'ipv4', 'ipv6'}:
             raise Blocked('both provider public address families must be recorded')
         ssh, mosh = f'ssh://core@{dns}:22', f'udp://{dns}:60000-61000'
@@ -3071,7 +3084,7 @@ class Bootstrap:
                 ('lost-mosh', mosh, 'authorized', 'deny'), ('restored-ssh', ssh, 'authorized', 'allow'),
             ):
                 expected[name, family] = (endpoint, vantage, outcome)
-            for role in ('maintenance', 'development'):
+            for role in (() if core_only else ('maintenance', 'development')):
                 endpoint = f'{ssh}/{role}'
                 for event, vantage, outcome in (('authorized', 'authorized', 'allow'), ('denied', 'denied', 'deny'),
                                                 ('public', 'public', 'deny'), ('lost', 'authorized', 'deny'),
@@ -3082,30 +3095,96 @@ class Bootstrap:
             expected[step, 'provider'] = (recovery, 'provider', 'allow')
         return expected
 
-    def finalize(self, evidence):
-        if os.geteuid() != 0:
-            raise Blocked('root required for destination cutover')
-        data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
-                                                {'node_id', 'tailnet', 'dns_name', 'keys_sha256', 'acl_sha256', 'probes',
-                                                 'execution_route', 'provider_recovery', 'public_addresses'},
-                                                lifetime=1800)
+    @staticmethod
+    def access_addresses(live):
+        addresses = {}
+        networks = {4: ipaddress.ip_network('100.64.0.0/10'), 6: ipaddress.ip_network('fd7a:115c:a1e0::/48')}
+        for value in live['TailscaleIPs']:
+            address = ipaddress.ip_address(value)
+            family = 'ipv' + str(address.version)
+            if str(address) != value or family in addresses or address not in networks[address.version]:
+                raise Blocked('current Tailscale address identity differs')
+            addresses[family] = value
+        if set(addresses) != {'ipv4', 'ipv6'}:
+            raise Blocked('both admitted Tailscale address families are required')
+        return addresses
+
+    def access_workload_selection(self):
+        import renewal as renewal
+
+        self.verify_final_guard()
+        control = self.path('/var/lib/dev-pair/renewal')
+        chosen = renewal.read_json(control / 'current.json')
+        if chosen != renewal.read_json(control / 'site-current.json') or os.path.lexists(
+                self.path('/var/lib/dev-pair/renewal-fence/frozen')):
+            raise Blocked('the selected private role placement is not settled')
+        release = renewal.Renewal(self.path('/var/lib/dev-pair'), None).release(chosen)
+        raw = renewal.read_private(control / 'plans' / (release['plan_sha256'] + '.json'), renewal.MAX_CONTROL)
+        if renewal.sha(raw) != release['plan_sha256']:
+            raise Blocked('private role launch plan digest differs')
+        plan = renewal.loads(raw)['development_manifests']
+        if type(plan) is not dict or not plan:
+            raise Blocked('the selected private role placement has no approved development manifest')
+        job = sorted(plan)[0]
+        renewal.token(job)
+        renewal.digest(plan[job])
+        return {'release_sha256': chosen, 'job': job, 'development_manifest': plan[job],
+                **{role + '_image': release['components'][component]['artifact_sha256'] for role, component in
+                   (('maintenance', 'maintenance-agent'), ('development', 'development-agent'), ('devbox', 'devbox'))}}
+
+    def access_cutover_binding(self, source, *, workload=False):
+        self.destination_source(source)
+        with self.lock():
+            live, dns = self.tailscale_state()
+            tailnet, node = self.identity_fields(live)
+            if not self.path(STATE + '/prepared').is_file():
+                raise Blocked('prepared maintenance host required for access review')
+            result = {'version': 1, 'kind': CORE_ACCESS_CUTOVER, 'job_id': 'host-access', 'source_sha': source,
+                      **self.destination_identity(), 'dns_name': dns, 'tailnet': tailnet, 'node_id': node,
+                      'tailnet_addresses': self.access_addresses(live), 'keys_sha256': self.access_keys_digest()}
+            if workload:
+                result.update(kind=WORKLOAD_ACCESS_CUTOVER, role_artifacts=self.access_workload_selection())
+            return result
+
+    def access_keys_digest(self):
+        return hashlib.sha256(checked_file(self.path('/etc/ssh/dev-pair-keys/core')).read_bytes()).hexdigest()
+
+    def cutover_evidence(self, evidence):
+        required = {'node_id', 'tailnet', 'dns_name', 'keys_sha256', 'acl_sha256', 'probes',
+                    'execution_route', 'provider_recovery', 'public_addresses'}
+        data = self.recent_destination_evidence(evidence, 'dev-pair-access-review', required, lifetime=1800, core_access=True)
         if (type(data['acl_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', data['acl_sha256'])
                 or data['execution_route'] not in ('tailnet-core', 'provider-recovery')
                 or type(data['provider_recovery']) is not str
                 or not re.fullmatch(r'hostinger://[A-Za-z0-9_-]{1,100}/recovery', data['provider_recovery'])):
             raise Blocked('named access, independent recovery and ingress evidence is incomplete')
+        live, dns = self.tailscale_state()
+        core_only = data.get('kind') == CORE_ACCESS_CUTOVER
+        scoped = core_only or data.get('kind') == WORKLOAD_ACCESS_CUTOVER
+        if (self.identity_fields(live) != (data['tailnet'], data['node_id']) or dns != data['dns_name']
+                or self.access_keys_digest() != data['keys_sha256']
+                or scoped and self.access_addresses(live) != data['tailnet_addresses']):
+            raise Blocked('cutover evidence does not bind current node, addresses and core keys')
+        if data.get('kind') == WORKLOAD_ACCESS_CUTOVER and self.access_workload_selection() != data['role_artifacts']:
+            raise Blocked('workload observations differ from the selected installed role placement')
+        self.verify_access_probes(data, self.access_probe_plan(dns, data['provider_recovery'], data['public_addresses'],
+                                                             core_only=core_only))
+        return data, live, core_only
+
+    def named_tailnet_peer(self, live, peer):
+        if not peer or peer['local'] not in live.get('TailscaleIPs', []) or peer['device'] != 'tailscale0' or not peer['core']:
+            raise Blocked('operation requires the live named core tailnet SSH route')
+
+    def finalize(self, evidence):
+        if os.geteuid() != 0:
+            raise Blocked('root required for destination cutover')
         with self.lock():
             if not self.path(f'{STATE}/prepared').exists():
                 raise Blocked('prepare must complete before cutover')
-            live, dns = self.tailscale_state()
-            if (self.identity_fields(live) != (data['tailnet'], data['node_id']) or dns != data['dns_name']
-                    or hashlib.sha256(checked_file(self.path('/etc/ssh/dev-pair-keys/core')).read_bytes()).hexdigest() != data['keys_sha256']):
-                raise Blocked('cutover evidence does not bind current node and core keys')
-            self.verify_access_probes(data, self.access_probe_plan(dns, data['provider_recovery'], data['public_addresses']))
+            data, live, core_only = self.cutover_evidence(evidence)
             peer = self.observed_ssh_peer()
             if data['execution_route'] == 'tailnet-core':
-                if not peer or peer['local'] not in live.get('TailscaleIPs', []) or peer['device'] != 'tailscale0' or not peer['core']:
-                    raise Blocked('cutover requires the live named tailnet SSH route')
+                self.named_tailnet_peer(live, peer)
             elif peer:
                 raise Blocked('cutover requires the admitted independent provider recovery terminal')
             desired = json.loads(checked_file(self.path(f'{STATE}/desired.json')).read_text(), object_pairs_hook=relay.unique)
@@ -3124,11 +3203,27 @@ class Bootstrap:
             if prior.get('phase') == 'complete':
                 self.verify_final_guard()
                 self.verify_final_ssh()
+                if prior.get('scope') == 'core' and not core_only:
+                    if data['expires_at'] <= time.time():
+                        raise Blocked('fresh workload observations required before activation')
+                    accepted = {key: value for key, value in prior.items() if key != 'scope'}
+                    accepted.update(core_keys_sha256=data['keys_sha256'], acl_sha256=data['acl_sha256'],
+                                    provider_recovery=data['provider_recovery'], public_addresses=data['public_addresses'],
+                                    access_receipt_sha256=hashlib.sha256(checked_file(evidence).read_bytes()).hexdigest())
+                    if 'role_artifacts' in data:
+                        accepted['role_artifacts'] = data['role_artifacts']
+                    self.atomic(CUTOVER, json.dumps(accepted, sort_keys=True) + '\n', expected=prior_raw)
                 return self.status()
             if current not in (temporary, permanent) or (not prior and current != temporary):
                 raise Blocked('bootstrap ingress configuration differs from protected intent')
             if not prior and (self.path(SSH_CUTOVER).exists() or self.path(SSH_CUTOVER).is_symlink()):
                 raise Blocked('unowned OpenSSH cutover configuration')
+            proposed = STATE + '/tailnet-only.nft'
+            self.atomic(proposed, permanent)
+            self.run('/usr/sbin/nft', '--check', '-f', str(self.path(proposed)))
+            self.run('/usr/bin/systemctl', 'is-active', 'dev-pair-bootstrap-guard.service')
+            if data['expires_at'] <= time.time():
+                raise Blocked('fresh independent access observations required before cutover')
             pending = json.dumps({'phase': 'applying', 'target': target}, sort_keys=True) + '\n'
             self.atomic(CUTOVER, pending)
             # On retry only roll forward. The root-owned marker and external recovery permit
@@ -3146,9 +3241,6 @@ class Bootstrap:
                 self.atomic('/etc/systemd/system/' + unit + '.d/50-dev-pair-guard.conf', TAILSCALE_UNIT, mode=0o644)
             self.run('/usr/bin/systemctl', 'daemon-reload')
             self.run('/usr/bin/systemctl', 'reload', 'sshd.service')
-            proposed = STATE + '/tailnet-only.nft'
-            self.atomic(proposed, permanent)
-            self.run('/usr/sbin/nft', '--check', '-f', str(self.path(proposed)))
             self.atomic(GUARD_PATH, permanent, expected=temporary)
             self.run('/usr/sbin/nft', '-f', str(self.path(GUARD_PATH)))
             self.run('/usr/bin/systemctl', 'is-active', 'dev-pair-bootstrap-guard.service')
@@ -3157,12 +3249,15 @@ class Bootstrap:
                       'provider_recovery': data['provider_recovery'],
                       'public_addresses': data['public_addresses'],
                       'access_receipt_sha256': hashlib.sha256(checked_file(evidence).read_bytes()).hexdigest()}
+            if core_only:
+                record['scope'] = 'core'
             self.atomic(CUTOVER, json.dumps(record, sort_keys=True) + '\n', expected=pending)
             self.event('access-cutover', 'complete')
             return self.status()
 
     def status(self):
-        cutover = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique).get('phase')
+        state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
+        cutover = state.get('phase')
         access = json.loads(self.text(f'{STATE}/desired.json', '{}'), object_pairs_hook=relay.unique)
         return {'prepared': self.path(f'{STATE}/prepared').exists(),
                 'initialization': json.loads(self.text(f'{STATE}/initialize.json', '"not requested"')),
@@ -3171,6 +3266,7 @@ class Bootstrap:
                 'enrollment_recorded': self.path(f'{STATE}/node.json').exists(),
                 'phase': 'tailnet-only' if cutover == 'complete' else 'temporary-bootstrap',
                 'access_cutover': cutover or 'independent evidence required',
+                'access_scope': ('core' if state.get('scope') == 'core' else 'full') if cutover == 'complete' else None,
                 'root_and_initial_ssh_retained': cutover is None and (access.get('bootstrap_sources') != [] or
                                                                     access.get('bootstrap_transport') == ATTENDED_ACCESS),
                 'runtime_acceptance': 'not verified', 'state': STATE,

@@ -4,6 +4,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
 import json
+import io
 from pathlib import Path
 import select
 import shutil
@@ -332,6 +333,51 @@ class ReceiptTests(unittest.TestCase):
             path.write_bytes(o.encoding({**record, 'observed_at': NOW - 7}))
             with self.assertRaisesRegex(o.Blocked, 'before loss'):
                 o.assembled_receipt(plan, plan_sha, directory, now=NOW, verify=verify)
+
+    def test_host_selected_core_and_workload_plans_have_separate_exact_proofs(self):
+        site = {key: self.plan[key] for key in o.SITE}
+        site.update(kind=o.CORE_ACCESS_CUTOVER, tailnet='example', acl_sha256='c' * 64,
+                    execution_route='provider-recovery', public_addresses={'ipv4': '8.8.8.8', 'ipv6': None})
+        binding = {'version': 1, 'kind': o.CORE_ACCESS_CUTOVER, 'job_id': 'host-access', 'source_sha': 'a' * 40,
+                   'machine_id': MACHINE, 'boot_id': BOOT, 'dns_name': DNS, 'node_id': 'node', 'tailnet': 'example',
+                   'keys_sha256': 'b' * 64, 'tailnet_addresses': {'ipv4': '100.64.0.16', 'ipv6': 'fd7a:115c:a1e0::16'}}
+        roles = {key: 'e' * 64 for key in o.ROLE_ARTIFACTS - {'job'}} | {'job': 'checklist'}
+        selected = o.prepare_plan(binding, site, NOW - 60, None)
+        self.assertNotIn(('maintenance-authorized', 'ipv4'), o.probe_plan(selected))
+        with self.assertRaisesRegex(o.Blocked, 'differs'):
+            o.prepare_plan({**binding, 'tailnet': 'foreign'}, site, NOW - 60, None)
+        for workload in (False, True):
+            if workload:
+                chosen = {**binding, 'kind': o.WORKLOAD_ACCESS_CUTOVER, 'role_artifacts': roles}
+                selected = o.prepare_plan(chosen, site, NOW - 60, None)
+            expected = o.probe_plan(selected)
+            plan_sha = o.digest(o.encoding(selected))
+            with tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                for test, family in expected:
+                    stamp = NOW - (45 if test == 'reopened-recovery' else 10 if 'restored' in test else 30)
+                    exact = o.expected_role_probe(selected, test, family)
+                    if exact:
+                        with self.assertRaisesRegex(o.Blocked, 'exact confined'):
+                            o.external_probe(selected, plan_sha, test, family, expected,
+                                             o.encoding({**exact, 'address': '100.64.0.5'}), stamp)
+                    transcript = o.encoding(exact) if exact else b'independent fixture observation'
+                    probe = o.external_probe(selected, plan_sha, test, family, expected, transcript, stamp)
+                    (directory / o.record_name(test, family)).write_bytes(o.encoding(probe))
+
+                def verify(path, principal):
+                    record = json.loads(path.read_bytes())
+                    provider_absence = record['family'] == 'ipv6' and record['vantage'] == 'public'
+                    self.assertEqual(principal, o.observer_principal('provider' if provider_absence else record['vantage']))
+                    return record, o.digest(path.read_bytes())
+
+                receipt = o.assembled_receipt(selected, plan_sha, directory, now=NOW, verify=verify)
+                payload, sig = o.read_access_envelope(io.BytesIO(o.access_envelope(o.encoding(receipt), b'detached fixture')))
+                self.assertEqual((json.loads(payload), sig), (receipt, b'detached fixture'))
+                self.assertEqual(receipt['kind'], selected['kind'])
+                self.assertEqual(receipt.get('role_artifacts'), roles if workload else None)
+                with self.assertRaisesRegex(o.Blocked, 'exceeds'):
+                    o.read_access_envelope(io.BytesIO(b'x' * (o.MAX_ACCESS_ENVELOPE + 1)))
 
 
 if __name__ == '__main__':

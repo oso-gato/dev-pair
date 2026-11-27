@@ -605,7 +605,66 @@ def observed_progress(path, payload, uid):
     return proof
 
 
+def verify_workload_access():
+    from bootstrap import Bootstrap, Blocked as BootstrapBlocked
+
+    try:
+        Bootstrap().verify_workload_access()
+    except BootstrapBlocked as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def access_probe(payload):
+    from bootstrap import Bootstrap
+
+    p.fields(payload, 'role source_sha')
+    role, source = payload['role'], payload['source_sha']
+    r.require(role in r.ROLES, 'unknown private access probe')
+    host = Bootstrap()
+    peer = host.observed_ssh_peer()
+    live, _ = host.tailscale_state()
+    host.named_tailnet_peer(live, peer)
+    guard = host.verify_final_guard()
+    r.require(guard['target']['source_sha'] == source, 'private access probe source differs from the verified guard')
+    host.verify_final_ssh()
+    identity = host.destination_identity()
+    with r.Renewal(ROOT, None).lock():
+        selection = host.access_workload_selection()
+        release, plan = admit_release(selection['release_sha256'])
+        bundle, _ = live_host(release['components']['host'])
+        if role == 'maintenance':
+            context = plan['maintenance_context_sha256']
+            imported = retained_maintenance(r.Renewal(ROOT, None), release['components']['maintenance-agent'], context)
+            r.require(imported is not None, 'private maintenance probe requires an exact installed platform image')
+            claim, _, _ = imported
+            command = [PYTHON, '-EBs', str(bundle / 'tools/gptbox.py'), 'verify-installed-maintenance', '--phase', 'verify',
+                       '--platform-sha256', claim['platform_sha256'], '--source-sha', claim['source_sha'],
+                       '--context-sha256', context, '--image', selection['maintenance_image'],
+                       '--oci-manifest-sha256', claim['oci_manifest_sha256']]
+            result = r.loads(run(command, timeout=310))
+            r.require(result == {**claim, 'boot_id': identity['boot_id']}, 'exact native maintenance probe failed')
+            cycles = result['boundary_and_version_cycles']
+        else:
+            manifest = selection['development_manifest']
+            command = [RUNUSER, '--user', 'dp-dev', '--', PYTHON, '-EBs', str(bundle / 'tools/devbox.py'), 'run',
+                       '--manifest', str(development_manifest(selection['job'], manifest)), '--sha256', manifest]
+            result = r.loads(run(command, timeout=210))
+            r.require(result['kind'] == 'dev-pair-devbox-probe-v1' and result['manifest_sha256'] == manifest and
+                      result['inner_image_id'] == selection['development_image'] and
+                      result['outer_image_id'] == selection['devbox_image'] and
+                      result['inner_removed'] is result['outer_removed'] is True,
+                      'exact nested DevBox and development probe failed')
+            cycles = len(result['cycles'])
+        r.require(type(cycles) is int and cycles == 2 and result['job_admission'] is False and
+                  host.destination_identity() == identity and host.observed_ssh_peer() == peer,
+                  'live named route or probe changed before observation completed')
+    return {'role': role, 'source_sha': source, **identity, 'address': peer['local'],
+            'role_artifacts': selection, 'probe_cycles': cycles, 'job_admission': False}
+
+
 def turn(action, payload):
+    if action != 'observe-progress':
+        verify_workload_access()
     role, job, operation = (payload[key] for key in ('role', 'job', 'operation'))
     reference = payload['release_sha256']
     r.require(r.read_json(CONTROL / 'site-current.json') == reference, 'role selected a stale release')
@@ -871,6 +930,8 @@ def main():
             result = verify_sessions(payload)
         elif action == 'verify-managed-probe':
             result = verify_managed_probe(payload)
+        elif action == 'access-probe':
+            result = access_probe(payload)
         else:
             r.require(action in ('validate', 'observe', 'activate', 'quiesce'), 'unsupported renewal action')
             result = release_action(action, payload)

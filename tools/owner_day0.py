@@ -3,7 +3,7 @@ import argparse
 from contextlib import ExitStack, contextmanager
 import fcntl
 import getpass
-from hashlib import file_digest
+from hashlib import file_digest, sha256
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -26,6 +26,9 @@ STATE = Path('/var/lib/dev-pair-day0')
 HANDOFF = Path('/etc/dev-pair/day0')
 ROOT = Path('/var/lib/dev-pair')
 GIT = Path('/usr/bin/git')
+OWNER_KITS = Path('/root')
+INITIAL_MAINTENANCE_SOURCE = 'a160b1c1724fb70d38d9992ad377ab791b2db0ee'
+INITIAL_MAINTENANCE_PRODUCTION_TREE = 'a0f038de4d44844a743d338998ca14deee4ac3cc08fea9ef53db85d7d466c595'
 MIB = 1024**2
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
        'PYTHONDONTWRITEBYTECODE': '1', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
@@ -181,7 +184,7 @@ class DayZero:
 
     def status(self, source=None):
         item = self.original()
-        protected = record(self.progress)
+        protected = record(STATE / 'continuation-progress.json') or record(self.progress)
         report = self.app.status()
         print(f"Host {item['host']} | Fedora 44 | SELinux { {'1': 'enforcing', '0': 'permissive'}.get(item['selinux'], item['selinux'])}")
         physical = os.statvfs('/var/lib')
@@ -196,7 +199,8 @@ class DayZero:
             maintenance = 'original setup reconciliation pending'
         print('Maintenance gptbox ' + maintenance)
         print('Tailnet enrollment ' + ('recorded' if report['enrollment_recorded'] else 'pending'))
-        print('SSH access ' + report['phase'])
+        access = report.get('access_scope')
+        print('SSH access ' + report['phase'] + (' | workload access pending' if access == 'core' else ''))
         print('Next ' + (protected['next'] if protected else 'Run ./day0.sh start in the selected hPanel root terminal.'))
 
     def stage(self, identity, revision, phase, next_step):
@@ -502,8 +506,119 @@ class DayZero:
             self.app.finalize(str(admitted))
             return True
         print('Independent access review still needs named tailnet and provider vantage points.')
-        print('This checkout has no automatic site handoff for those observations. Keep the initial and recovery routes.')
+        print('Use ./day0.sh access-request to export the live host selection to the independent verifier.')
         return False
+
+    @contextmanager
+    def owner_lock(self):
+        secure_directory(STATE)
+        descriptor = os.open(STATE / 'owner.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and
+                    stat.S_IMODE(info.st_mode) == 0o600, 'Unsafe day-zero ownership lock.')
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def compatible_predecessor(self, historical):
+        pin(historical, 40)
+        if historical == INITIAL_MAINTENANCE_SOURCE:
+            return True
+        for name in (historical, historical[:12]):
+            parent = OWNER_KITS / ('dev-pair-day0-' + name)
+            marker = parent / 'SOURCE'
+            if not os.path.lexists(marker):
+                continue
+            require(local_file(marker).read_text() == historical + '\n', 'Original owner checkout source pin differs.')
+            checkout = parent / 'dev-pair'
+            local_file(checkout / 'day0.sh')
+            local_file(checkout / '.git/HEAD')
+            git = ['/usr/bin/git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-C', str(checkout)]
+
+            def capture(*args):
+                return subprocess.check_output([*git, *args], env=ENV, timeout=10)
+
+            require(capture('rev-parse', '--verify', 'HEAD').strip() == historical.encode() and
+                    not capture('status', '--porcelain=v1', '--untracked-files=all'),
+                    'Original owner checkout differs from its recorded pin.')
+            entries = capture('ls-tree', '-r', '-z', historical)
+            require(len(entries) <= 256 * 1024, 'Original owner checkout tree exceeds its bound.')
+            production = [row for row in entries.split(b'\0') if row and not row.split(b'\t', 1)[1].startswith(b'tests/')]
+            return sha256(b'\0'.join(production)).hexdigest() == INITIAL_MAINTENANCE_PRODUCTION_TREE
+        return False
+
+    def select_source(self, identity, revision, previous):
+        if previous is None or previous['source_sha'] == revision:
+            require(record(STATE / 'continuation.json') is None,
+                    'Use the reviewed continuation checkout for this machine.')
+            return revision, None
+        historical = previous['source_sha']
+        require(self.compatible_predecessor(historical),
+                'This machine has day-zero progress under an unsupported pinned source.')
+        desired_path = Path(BOOTSTRAP) / 'desired.json'
+        journal_path = Path(BOOTSTRAP) / 'initialize.json'
+        desired, journal = record(desired_path), record(journal_path)
+        ready = record(Path(BOOTSTRAP) / 'host-ready.json')
+        require(type(desired) is dict and type(journal) is dict and type(ready) is dict and
+                ready.get('source_sha') == historical and
+                journal.get('phase') == journal.get('maintenance_gptbox') == 'complete',
+                'Finish maintenance initialization using the original reviewed checkout first.')
+        context = pin(desired['gptbox_context_sha256'])
+        image = self.maintenance_receipt(historical, context)
+        require(image and self.probes(journal['result'], historical, context) == image and
+                journal['target']['context_sha256'] == context and
+                journal['target']['source_sha'] == historical,
+                'The original sealed maintenance image does not match its completed initialization.')
+        checkpoint = {'schema': 1, 'machine_id': identity['machine_id'], 'controller_source_sha': revision,
+                      'maintenance_source_sha': historical, 'image_id': image,
+                      'context_sha256': context, 'initializer_sha256': checksum(journal_path),
+                      'desired_sha256': checksum(desired_path)}
+        path = STATE / 'continuation.json'
+        retained = record(path)
+        require(retained is None or retained == checkpoint, 'Protected Day 0 continuation differs from this exact source or host.')
+        if retained is None:
+            save(self.app, path, checkpoint)
+        self.progress = STATE / 'continuation-progress.json'
+        return historical, image
+
+    def access_exchange(self, source, response=None, *, workload=False, role=None):
+        from destination_observation import encoding, read_access_envelope
+
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        with self.owner_lock():
+            previous = record(STATE / 'progress.json')
+            require(previous and previous['machine_id'] == identity['machine_id'] and identity['selinux'] == '1' and
+                    not os.path.lexists('/.autorelabel'), 'Complete checked Day 0 maintenance setup and Tailscale enrollment first.')
+            self.ensure_git(revision, archive)
+            historical, image = self.select_source(identity, revision, previous)
+            expected = pin(record(Path(BOOTSTRAP) / 'desired.json')['gptbox_context_sha256'])
+            journal = record(Path(BOOTSTRAP) / 'initialize.json')
+            require(journal is None or journal['phase'] == journal['maintenance_gptbox'] == 'complete',
+                    'Resume the original maintenance initializer before requesting cutover.')
+            require(image or self.maintenance_receipt(historical, expected), 'Complete the confined maintenance gptbox and probes first.')
+            if role:
+                driver = local_file(Path('/usr/libexec/dev-pair/renewal/driver'))
+                connection = {key: os.environ[key] for key in ('SSH_CONNECTION', 'SSH_CLIENT') if key in os.environ}
+                subprocess.run(['/usr/bin/python3', '-IB', str(driver), 'access-probe'], env={**ENV, **connection},
+                               input=encoding({'role': role, 'source_sha': revision}), timeout=450, check=True)
+                return
+            if response is None:
+                sys.stdout.buffer.write(encoding(self.app.access_cutover_binding(revision, workload=workload)))
+                return
+            payload, signature = read_access_envelope(response)
+            # A verified signed pair is one bounded envelope in the transport.
+            # The bootstrap verifier checks the exact bytes again under its lock.
+            with tempfile.TemporaryDirectory(prefix='cutover-', dir=STATE) as temporary:
+                document = Path(temporary) / 'receipt.json'
+                document.write_bytes(payload)
+                document.with_name('receipt.json.sig').write_bytes(signature)
+                completed = self.app.finalize(str(document))
+            message = ('Named core access is tailnet-only. Independent workload access remains held.'
+                       if completed['access_scope'] == 'core' else 'The independent access review is accepted.')
+            self.stage(identity, revision, 'access-cutover-complete', message + ' Run ./day0.sh resume to continue.')
 
     def commission(self, identity, revision):
         self.stage(identity, revision, 'host-bootstrap-complete',
@@ -520,7 +635,10 @@ class DayZero:
                 self.stage(identity, revision, 'owner-terminal-ready',
                            'The named core tailnet terminal is available for approved jobs.')
             else:
+                core_only = self.app.status().get('access_scope') == 'core'
                 self.stage(identity, revision, 'managed-listener-ready',
+                           'The managed checklist listener is ready. Export ./day0.sh access-request --workloads for independent role checks.'
+                           if core_only else
                            'The managed checklist listener is ready. The owner terminal and workload activation remain held.')
         else:
             self.stage(identity, revision, 'commissioning-pending',
@@ -529,23 +647,17 @@ class DayZero:
     def start(self, source, tty):
         revision, archive = kit_source(self.repo, source)
         identity = self.original()
-        secure_directory(STATE)
-        lock = STATE / 'owner.lock'
-        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-        try:
-            info = os.fstat(descriptor)
-            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and
-                    stat.S_IMODE(info.st_mode) == 0o600, 'Unsafe day-zero ownership lock.')
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            prior = record(self.progress)
-            require(prior is None or (prior['source_sha'], prior['machine_id']) == (revision, identity['machine_id']),
-                    'This machine has day-zero progress under a different pinned source.')
+        with self.owner_lock():
+            prior = record(STATE / 'progress.json')
+            require(prior is None or prior['machine_id'] == identity['machine_id'],
+                    'The day-zero progress belongs to a different machine.')
             if prior is None:
                 message = f"Selected host {identity['host']} | machine {identity['machine_id']} | Fedora 44 x86_64. Continue here? Type yes."
                 if answer(tty, message).lower() != 'yes':
                     return
                 self.stage(identity, revision, 'host-identified', 'Checking the pinned source and signed Fedora prerequisites.')
             self.ensure_git(revision, archive)
+            historical, image = self.select_source(identity, revision, prior)
             report = self.app.status()
             if not report['prepared']:
                 geometry = self.storage_geometry()
@@ -567,7 +679,7 @@ class DayZero:
                         'An enrolled host requires checked enforcing SELinux before continuing. Keep recovery available.')
                 desired = record(Path(BOOTSTRAP) / 'desired.json')
                 expected = pin(desired['gptbox_context_sha256'])
-                if not self.resume_maintenance(identity, revision, expected, tty):
+                if not image and not self.resume_maintenance(identity, historical, expected, tty):
                     return
             self.stage(identity, revision, 'host-bootstrap-complete',
                        'The confined maintenance gptbox passed both offline probe cycles. Workloads remain held.')
@@ -580,15 +692,15 @@ class DayZero:
                            'Maintenance gptbox and tailnet enrollment are verified. Independent access handoff and workload activation remain pending.')
                 return
             self.commission(identity, revision)
-        finally:
-            os.close(descriptor)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('start', 'status', 'resume'))
+    parser.add_argument('stage', choices=('start', 'status', 'resume', 'access-request', 'access-response', 'access-probe'))
+    parser.add_argument('role', nargs='?', choices=('maintenance', 'development'))
     parser.add_argument('--source-sha')
     parser.add_argument('--confirm-recovery', action='store_true')
+    parser.add_argument('--workloads', action='store_true')
     args = parser.parse_args()
 
     def interrupted(_signal, _frame):
@@ -597,6 +709,8 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     try:
         require(os.getuid() == os.geteuid() == 0, 'Open the selected VPS root terminal in hPanel.')
+        require((args.role is not None) == (args.stage == 'access-probe') and
+                (not args.workloads or args.stage == 'access-request'), 'Select the exact access request or fixed role probe.')
         os.umask(0o077)
         day0 = DayZero()
         if args.confirm_recovery:
@@ -605,6 +719,9 @@ def main():
                 day0.confirm_recovery(tty, args.source_sha)
         elif args.stage == 'status':
             day0.status(args.source_sha)
+        elif args.stage in ('access-request', 'access-response', 'access-probe'):
+            day0.access_exchange(args.source_sha, sys.stdin.buffer if args.stage == 'access-response' else None,
+                                 workload=args.workloads, role=args.role)
         else:
             with tty_open() as tty:
                 day0.start(args.source_sha, tty)

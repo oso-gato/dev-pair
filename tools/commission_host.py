@@ -1057,6 +1057,8 @@ class Live:
         from bootstrap import checked_file
         from gptbox import Gptbox
 
+        if policy['timers']:
+            self.bootstrap.verify_workload_access()
         _, index, _ = self.installer.intake.retained_index(policy['platform_sha256'])
         for name in TLS_FILES:
             path = checked_file(Path(policy['checklist']['tls_profile']) / name, secret=True)

@@ -75,6 +75,75 @@ class DayZeroTests(unittest.TestCase):
         with self.assertRaisesRegex(bootstrap.Blocked, 'differs'):
             day.kit_source(self.entry.repo, 'c' * 40)
 
+    def test_continuation_retains_the_original_completed_maintenance_evidence(self):
+        state = self.directory / 'day0'
+        bootstrap_state = self.directory / 'bootstrap'
+        state.mkdir()
+        bootstrap_state.mkdir()
+        historical = day.INITIAL_MAINTENANCE_SOURCE
+        context, image = 'c' * 64, 'd' * 64
+
+        def save_record(path, value):
+            path.write_text(json.dumps(value, sort_keys=True) + '\n')
+            path.chmod(0o600)
+
+        original = {'source_sha': historical, 'machine_id': MACHINE}
+        result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': historical, 'context_sha256': context,
+                  'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False,
+                  'assembled_image_id': image}
+        journal = {'phase': 'complete', 'maintenance_gptbox': 'complete', 'result': result,
+                   'target': {'source_sha': historical, 'context_sha256': context}}
+        original_files = {state / 'progress.json': original, bootstrap_state / 'initialize.json': journal,
+                          bootstrap_state / 'host-ready.json': {'source_sha': historical},
+                          bootstrap_state / 'desired.json': {'gptbox_context_sha256': context}}
+        for path, value in original_files.items():
+            save_record(path, value)
+        before = {path: path.read_bytes() for path in original_files}
+        self.entry.maintenance_receipt = Mock(return_value=image)
+        with (patch.object(day, 'BOOTSTRAP', str(bootstrap_state)), patch.object(day, 'STATE', state),
+              patch.object(day, 'save', side_effect=lambda _app, path, value: save_record(path, value))):
+            self.assertEqual(self.entry.select_source(self.identity, SOURCE, original), (historical, image))
+            self.assertEqual(self.entry.select_source(self.identity, SOURCE, original), (historical, image))
+            self.assertEqual(self.entry.progress, state / 'continuation-progress.json')
+            with self.assertRaisesRegex(bootstrap.Blocked, 'continuation differs'):
+                self.entry.select_source(self.identity, 'e' * 40, original)
+            self.entry.maintenance_receipt.return_value = 'e' * 64
+            with self.assertRaisesRegex(bootstrap.Blocked, 'sealed maintenance image'):
+                self.entry.select_source(self.identity, SOURCE, original)
+        self.assertEqual({path: path.read_bytes() for path in original_files}, before)
+        self.assertEqual(json.loads((state / 'continuation.json').read_text())['maintenance_source_sha'], historical)
+
+    def test_historical_test_only_tree_uses_real_protected_git_objects(self):
+        checkout = self.directory / 'temporary'
+        checkout.mkdir()
+
+        def git(*args, path=checkout):
+            return subprocess.check_output(['/usr/bin/git', '-C', str(path), *args], env=day.ENV)
+
+        git('init', '-q')
+        git('config', 'user.name', 'Fixture')
+        git('config', 'user.email', 'fixture@example.invalid')
+        (checkout / 'day0.sh').write_text('production bytes')
+        git('add', '.')
+        git('commit', '-qm', 'original')
+        production = sha256(git('ls-tree', '-r', '-z', 'HEAD').rstrip(b'\0')).hexdigest()
+        (checkout / 'tests').mkdir()
+        (checkout / 'tests/test_earlier.py').write_text('fixture bytes')
+        git('add', '.')
+        git('commit', '-qm', 'test-only successor')
+        historical = git('rev-parse', 'HEAD').decode().strip()
+        parent = self.directory / ('dev-pair-day0-' + historical)
+        parent.mkdir()
+        repo = parent / 'dev-pair'
+        checkout.rename(repo)
+        (parent / 'SOURCE').write_text(historical + '\n')
+        with (patch.object(day, 'OWNER_KITS', self.directory),
+              patch.object(day, 'INITIAL_MAINTENANCE_PRODUCTION_TREE', production)):
+            self.assertTrue(self.entry.compatible_predecessor(historical))
+            (repo / 'day0.sh').write_text('unreviewed production bytes')
+            with self.assertRaisesRegex(bootstrap.Blocked, 'differs from its recorded pin'):
+                self.entry.compatible_predecessor(historical)
+
     def test_distinct_local_recovery_session_confirms_same_boot_and_source(self):
         path = self.directory / 'recovery.json'
         pending = path.with_name('challenge.json')
