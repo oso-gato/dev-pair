@@ -160,7 +160,7 @@ class GptboxTests(unittest.TestCase):
         path = self.app.path(g.STATE + '/prepared')
         path.parent.mkdir(parents=True)
         path.parent.chmod(0o700)
-        path.write_text('fixture prepared state, not host evidence')
+        self.app.atomic(g.STATE + '/prepared', 'fixture prepared state, not host evidence')
         # Completion is installed after the known synthetic Codex/proof inputs below.
         self.context = self.root / 'input'
         self.context.mkdir()
