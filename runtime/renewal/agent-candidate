@@ -1,0 +1,73 @@
+#!/usr/bin/python3 -I
+"""Intake of a digest-selected, independently approved agent release."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import urllib.request
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+import renewal as r
+from renewal import protocol as p
+
+ROOT = r.DEFAULT_ROOT
+CONTROL = ROOT / 'renewal'
+LATEST = 'https://api.github.com/repos/openai/codex/releases/latest'
+
+
+def stable_version(raw):
+    row = r.loads(raw)
+    match = re.fullmatch(r'rust-v([0-9]+\.[0-9]+\.[0-9]+)', row['tag_name'])
+    r.require(row['draft'] is False and row['prerelease'] is False and match is not None and
+              row['html_url'] == 'https://github.com/openai/codex/releases/tag/' + row['tag_name'],
+              'latest official stable Codex release could not be identified')
+    return match[1]
+
+
+def official_version():
+    request = urllib.request.Request(LATEST, headers={'Accept': 'application/vnd.github+json',
+                                                     'User-Agent': 'dev-pair-approved-agent-intake/1'})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        r.require(response.geturl() == LATEST and response.status == 200, 'official stable release lookup changed')
+        data = response.read(262145)
+    r.require(len(data) <= 262144, 'official stable release response exceeds bound')
+    return stable_version(data)
+
+
+def verify_attestation(subject, request, role, role_source, run_id):
+    p.number(run_id, 1, 2**63 - 1)
+    command = ['/usr/bin/python3', '-I', str(INSTALL / 'tools' / 'release_trust.py'), 'verify',
+               '--component', role, '--source-sha', role_source, '--subject', str(subject),
+               '--sha256', request['target_sha256'], '--run-id', str(run_id)]
+    p.require(r.sha(r.read_private(subject, r.MAX_CONTROL)) == request['target_sha256'], 'approved manifest bytes changed')
+    completed = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               timeout=120, check=False)
+    r.require(completed.returncode == 0, 'independent release attestation unavailable for ' + role)
+
+
+def controller_offer(controller, scope='agent'):
+    record = r.read_json(CONTROL / 'offers' / (scope + '.json'))
+    p.fields(record, 'schema request run_ids')
+    r.require(type(record['schema']) is int and record['schema'] == 1 and
+              type(record['run_ids']) is dict and set(record['run_ids']) == set(r.ROLES), 'invalid approved agent offer')
+    request = r.checked_request(record['request'], scope)
+    reference = request['target_sha256']
+    current = controller.live_release()
+    r.require(request['previous_sha256'] == current or reference == current, 'approved agent offer is stale')
+    target = controller.release(reference)
+    stable = official_version()
+    for role in r.ROLES:
+        component = target['components'][role + '-agent']
+        r.require(component['codex_version'] == stable, 'approved offer is not the current official stable CLI')
+        path = CONTROL / 'releases' / (reference + '.json')
+        verify_attestation(path, request, role, component['source_revision'], record['run_ids'][role])
+    if reference != current:
+        r.replace_json(CONTROL / 'requests' / (scope + '.json'), request)
+    return {'status': 'current' if reference == current else 'verified', 'version': stable, 'release_sha256': reference}
+
+
+if __name__ == '__main__':
+    r.require(os.getuid() == 0 and len(sys.argv) == 1, 'protected agent candidate intake required')
+    print(r.canonical(controller_offer(r.Renewal(ROOT, None))))

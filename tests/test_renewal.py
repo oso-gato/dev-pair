@@ -204,6 +204,24 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(self.renewal.live_release(), self.prior)
         self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
 
+    def test_missing_rollback_allowance_defers_before_replacement(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        (self.root / 'deny-recovery-grant').write_text(self.prior)
+        result = self.renewal.apply('agent')
+        self.assertEqual(result['phase'], 'deferred', result)
+        self.assertEqual(self.renewal.live_release(), self.prior)
+        self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+
+    def test_authoritative_provider_escrow_must_cover_every_resume_and_rollback(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        (self.root / 'insufficient-escrow').touch()
+        result = self.renewal.apply('agent')
+        self.assertEqual(result['phase'], 'deferred', result)
+        self.assertEqual(result['failure']['reason'], 'authoritative continuity budget cannot cover recovery')
+        self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+
     def test_prepared_unpublished_attempt_adopts_exact_request_without_duplicate_activation(self):
         target = self.release('b', self.prior)
         self.request(target)

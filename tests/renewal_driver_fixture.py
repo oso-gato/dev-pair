@@ -15,6 +15,14 @@ def sha(data):
 
 
 def invoke(root, action, payload):
+    if action == 'preflight-resume':
+        if (root / 'deny-recovery-grant').exists() and payload['release_sha256'] == (root / 'deny-recovery-grant').read_text():
+            raise SystemExit(4)
+        return {'operation': payload['operation'], 'request_sha256': sha(payload['operation'].encode()),
+                'job': payload['job'], 'allowance_sha256': sha(b'fixture allowance'), 'spend_microusd': 1}
+    if action == 'preflight-allowance':
+        return {'job': payload['job'], 'allowance_sha256': payload['allowance_sha256'],
+                'remaining_microusd': payload['needed_microusd'] - int((root / 'insufficient-escrow').exists())}
     if action == 'verify-sessions':
         state = root / payload['role'] / 'state' / payload['job']
         rows = [{'logical_session': path.stem, 'uuid': path.read_text().splitlines()[0]}
@@ -45,6 +53,7 @@ def invoke(root, action, payload):
         return {key: payload[key] for key in ('role', 'job', 'logical_session', 'operation')} | {
             'release_sha256': release, 'session_uuid': session,
             'request_sha256': payload.get('request_sha256', sha(operation.encode())),
+            'provider_receipt_sha256': sha(b'local fixture ' + operation.encode()),
             'events_sha256': sha(events), 'progress_sha256': sha(history.read_bytes()), 'child_reaped': True,
         }
     evidence = {key: payload[key] for key in ('release_sha256',)} | {'components': payload['release']['components']}

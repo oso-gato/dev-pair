@@ -711,7 +711,7 @@ class Renewal:
 
     def check_proof(self, proof, spec, release, *, require_progress=True):
         protocol.fields(proof, 'release_sha256 operation role job logical_session session_uuid request_sha256 '
-                        'events_sha256 progress_sha256 child_reaped')
+                        'events_sha256 progress_sha256 child_reaped provider_receipt_sha256')
         for field in ('operation', 'role', 'job', 'logical_session'):
             require(proof[field] == spec[field], 'role resume identity changed')
         session(proof['session_uuid'])
@@ -722,12 +722,11 @@ class Renewal:
         if 'request_sha256' in spec:
             require(proof['request_sha256'] == spec['request_sha256'], 'role request digest changed')
         digest(proof['events_sha256'])
+        digest(proof['provider_receipt_sha256'])
         if require_progress or proof['progress_sha256'] is not None:
             digest(proof['progress_sha256'])
 
-    def prove(self, attempt, state, reference, inventory, registries, recovery=False):
-        phase = 'rollback-verifying' if recovery else 'verifying'
-        self.phase(attempt, state, phase)
+    def resume_payloads(self, state, reference, inventory, registries):
         for saved in inventory['sessions']:
             key = saved['role'] + '/' + saved['job']
             registry = registries[key]
@@ -744,10 +743,49 @@ class Renewal:
                        'candidate_sha': checkpoint['candidate']['source_revision'],
                        'start_operation': origin['operation'], 'start_request_sha256': origin['provider_request_sha256'],
                        'pending_host': saved['pending_host']}
+            yield spec, payload
+
+    def readiness(self, attempt, state, inventory, registries):
+        prepared = {}
+        required_funds = {}
+        deadline = int(time.time()) + 360 * len(inventory['sessions']) + 240
+        keys = ('target_sha256', 'previous_sha256')
+        for key in keys:
+            reference = state['request'][key]
+            for spec, payload in self.resume_payloads(state, reference, inventory, registries):
+                approved = self.driver.invoke('preflight-resume', {**payload, 'minimum_grant_valid_until': deadline})
+                protocol.fields(approved, 'operation request_sha256 job allowance_sha256 spend_microusd')
+                require(approved['operation'] == spec['operation'] and approved['job'] == spec['job'],
+                        'continuity preflight identity changed')
+                digest(approved['request_sha256'])
+                digest(approved['allowance_sha256'])
+                protocol.number(approved['spend_microusd'], 1, 100000000)
+                account = (approved['job'], approved['allowance_sha256'])
+                required_funds[account] = required_funds.get(account, 0) + approved['spend_microusd']
+                prepared[spec['operation']] = approved['request_sha256']
+        require(len({job for job, _ in required_funds}) == len(required_funds), 'continuity allowances disagree within a job')
+        allowance_proofs = []
+        for (job, evidence), total in required_funds.items():
+            approval = self.driver.invoke('preflight-allowance', {'job': job, 'allowance_sha256': evidence,
+                                                                  'needed_microusd': total,
+                                                                  'minimum_grant_valid_until': deadline,
+                                                                  'release_sha256': state['request']['previous_sha256']})
+            protocol.fields(approval, 'job allowance_sha256 remaining_microusd')
+            require(approval['job'] == job and approval['allowance_sha256'] == evidence and
+                    type(approval['remaining_microusd']) is int and approval['remaining_microusd'] >= total,
+                    'authoritative continuity budget cannot cover recovery')
+            allowance_proofs.append({**approval, 'required_microusd': total})
+        self.phase(attempt, state, 'backed-up', continuity_requests=prepared, allowance_proofs=allowance_proofs)
+
+    def prove(self, attempt, state, reference, inventory, registries, recovery=False):
+        phase = 'rollback-verifying' if recovery else 'verifying'
+        self.phase(attempt, state, phase)
+        for spec, payload in self.resume_payloads(state, reference, inventory, registries):
+            operation = spec['operation']
             proof = state['proofs'].get(operation)
             if proof is None:
                 proof = self.driver.invoke('resume-without-effects', payload)
-            self.check_proof(proof, spec, reference)
+            self.check_proof(proof, {**spec, 'request_sha256': state['continuity_requests'][operation]}, reference)
             state['proofs'][operation] = proof
             self.phase(attempt, state, phase)
         self.confirm_tree(inventory)
@@ -787,6 +825,7 @@ class Renewal:
                 self.freeze(attempt, state, registries)
                 self.drain(registries)
                 inventory = self.capture(attempt, state, registries)
+                self.readiness(attempt, state, inventory, registries)
             self.verify_pending(inventory)
             self.phase(attempt, state, 'applying')
             self.verify_driver('activate', state, replacement)

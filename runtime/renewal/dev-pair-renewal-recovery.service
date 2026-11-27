@@ -1,7 +1,7 @@
 [Unit]
 Description=Recover an interrupted dev-pair renewal
-After=local-fs.target network-online.target
-Wants=network-online.target
+After=local-fs.target network-online.target dev-pair-renewal-host-observe.service
+Wants=network-online.target dev-pair-renewal-host-observe.service
 RequiresMountsFor=/var/lib/dev-pair
 
 [Service]
