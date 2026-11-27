@@ -68,6 +68,7 @@ class Engine:
             self.images[BASE]={'Id':BASE,'Labels':labels,'Architecture':'amd64','Os':'linux'}
             return BASE
         if command[0] == 'commit':
+            self.images['sha256:' + SEALED] = {**self.images[BASE], 'Id': SEALED}
             return SEALED
         if command[0] == 'create':
             runtime = '--read-only' in command
@@ -113,7 +114,8 @@ class Engine:
             if '--attach' in command:
                 self.containers[identity]['State'].update(Status='exited', Running=False)
                 record = {'kind': 'genuine-distrobox-assembled', 'source_sha': SOURCE, 'uid': 1000, 'gid': 1000,
-                          'inputs_sha256': hashlib.sha256((self.build / 'inputs.json').read_bytes()).hexdigest()}
+                          'inputs_sha256': hashlib.sha256((self.build / 'inputs.json').read_bytes()).hexdigest(),
+                          'packages_sha256': '1' * 64}
                 if self.bad_attestation:
                     record['inputs_sha256'] = '0' * 64
                 return 'Synthetic fixture upstream progress\n' + json.dumps(record)
@@ -245,6 +247,29 @@ class GptboxTests(unittest.TestCase):
         prior_builds = len([call for call in command_lists if 'build' in call])
         self.assertTrue(self.assemble()['reused_completed_evidence'])
         self.assertEqual(len([call for call, _ in self.engine.calls if 'build' in call]), prior_builds)
+
+    def test_pre_change_local_completion_binds_the_actual_sealed_output(self):
+        result = self.assemble()
+        resources = self.app.target + '/resources.json'
+        prepared = g.STATE + '/gptbox-image.json'
+        with patch.object(self.app, 'maintenance_gateway'):
+            # Standalone assemble retained the original minimal preparation.
+            self.assertEqual(self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED), '0.169.0')
+            # Normal initialize publishes this same full candidate as preparation.
+            self.app.atomic(prepared, self.app.text(self.app.target + '/candidate-image.json'),
+                            expected=self.app.text(prepared))
+            self.assertEqual(self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED), '0.169.0')
+            # A different image can carry the same labels and copy result fields.
+            # It cannot replace the sealed ID recorded by the actual attempt.
+            other = '0' * 64
+            self.engine.images['sha256:' + other] = {**self.engine.images['sha256:' + SEALED], 'Id': other}
+            self.app.record('result', {**result, 'assembled_image_id': other})
+            with self.assertRaisesRegex(g.Blocked, 'assembly resources differ'):
+                self.app.admitted_maintenance_image(EXPECTED, SOURCE, other)
+            self.app.record('result', result)
+            self.app.path(resources).unlink()
+            with self.assertRaisesRegex(g.Blocked, 'resources.json'):
+                self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED)
 
     def test_bad_finalizer_never_commits_or_records_success_and_explicit_retry_is_bounded(self):
         self.engine.bad_attestation = True

@@ -214,6 +214,11 @@ the protected completed-assembly identities.
   --source-sha "$MAINTENANCE_SOURCE_SHA"
 ```
 
+For a maintenance image installed from a portable release, also pass
+`--platform-sha256 "$PLATFORM_SHA"` from the selected protected platform release.
+The controller requires the receipt for that exact release, image and current
+boot. Both a prior release and its successor can select the same image bytes.
+
 On the approved development runner, execute the nested launch as `dp-dev`.
 Keep the independently selected manifest and its sealed archive together under
 `builds/<job>/inputs/<manifest_sha256>/`. The existing probe continues to use the

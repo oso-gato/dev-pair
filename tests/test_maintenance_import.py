@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from test_gptbox import Engine, EXPECTED, SOURCE, SEALED, RUNTIME, g
+from native_io_fixture import install, manager
 
 MANIFEST = '1' * 64
 PRODUCER = '2' * 64
@@ -178,7 +180,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.addCleanup(keys.stop)
         self.app.atomic(g.STATE + '/operator-password-set', 'already prepared\n')
 
-    def setup_release(self):
+    def setup_release(self, publisher_run=123, kind='dev-pair-platform-release'):
         part = {'schema': 1, 'image': {'role': 'maintenance', 'source_sha': SOURCE, 'context_sha256': EXPECTED,
                                        'image_id': SEALED, 'archive_sha256': ARCHIVE, 'archive_bytes': 123, 'diff_ids': [LAYER]},
                 'oci_manifest_sha256': MANIFEST, 'producer': {'result_sha256': PRODUCER}}
@@ -186,7 +188,7 @@ class MaintenanceImportTests(unittest.TestCase):
                'oci_manifest_sha256': MANIFEST, 'archive_sha256': ARCHIVE, 'archive_bytes': 123,
                'codex_version': '0.169.0', 'codex_source_sha': SOURCE, 'codex_sha256': g.CODEX_SHA}
         raw = canonical(part)
-        index = {'schema': 2, 'source_sha': SOURCE, 'publisher_run': 123, 'kind': 'dev-pair-platform-release',
+        index = {'schema': 2, 'source_sha': SOURCE, 'publisher_run': publisher_run, 'kind': kind,
                  'components': {'maintenance-agent': row}, 'transports': {'maintenance': {'files': {
                      'part.json': {'bytes': len(raw), 'sha256': g.sha(raw)},
                      'maintenance.oci.tar': {'bytes': 123, 'sha256': ARCHIVE}}}}}
@@ -194,7 +196,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.release = g.PLATFORM_RELEASES + '/' + self.platform
         self.app.atomic(self.release + '/platform.json', canonical(index).decode())
         self.app.atomic(self.release + '/intake.json', canonical({'schema': 2, 'source_sha': SOURCE,
-                        'publisher_run': 123, 'kind': index['kind'], 'platform_sha256': self.platform}).decode())
+                        'publisher_run': publisher_run, 'kind': index['kind'], 'platform_sha256': self.platform}).decode())
         self.app.atomic(self.release + '/maintenance/part.json', raw.decode())
 
         def fields(value, allowed):
@@ -226,6 +228,9 @@ class MaintenanceImportTests(unittest.TestCase):
             code = g.main()
         return code, json.loads(output.getvalue()) if code == 0 else None
 
+    def receipt_path(self, platform=None, boot=BOOT):
+        return self.app.import_receipt_path(EXPECTED, platform or self.platform, SEALED, boot)
+
     def import_witness(self, **changes):
         path = self.release + '/maintenance-import.json'
         record = {'schema': 1, 'kind': 'maintenance-native-oci-import', 'platform_sha256': self.platform,
@@ -251,6 +256,42 @@ class MaintenanceImportTests(unittest.TestCase):
         self.assertEqual(self.app.path(g.STATE + '/prepared').read_bytes(), self.app.path(g.STATE + '/desired.json').read_bytes())
         self.assertFalse(any('build' in args or 'load' in args for args, _ in self.app.run.calls))
 
+    def test_first_native_prepare_and_retry_after_rejected_old_prefix(self):
+        install(self, self.app.root)
+        runner, calls = g.Commands(), []
+        prereq = self.app.host_prerequisites
+
+        def prerequisite(*args, **kwargs):
+            self.assertEqual(runner(sys.executable, '-c', 'print("native host prerequisite fixture")',
+                                    timeout=10).strip(), 'native host prerequisite fixture')
+            return prereq(*args, **kwargs)
+
+        prep = SimpleNamespace(run=runner, _host_prerequisites=prerequisite, _host_desired=self.app.desired)
+        arguments = ('--bootstrap-source', '192.0.2.1/32', '--apply')
+        with patch.object(self.app, 'preparation', return_value=prep), \
+                patch.object(subprocess, 'Popen', side_effect=manager(subprocess.Popen, calls)):
+            self.assertEqual(self.prepare_cli(*arguments)[0], 0)
+            _, intent = self.app.read_config_record(g.MAINTENANCE_HOST_INTENT)
+            self.assertEqual(intent['phase'], 'complete')
+            self.assertEqual(len(intent['native_units']), 1)
+            self.assertRegex(intent['native_units'][0], r'^dev-pair-initialize-prepare-[0-9a-f]{8}-[0-9a-f]{8}$')
+            first = intent['native_units'][0]
+
+            # Simulate the protected intent left by the prior command, which
+            # rejected its prefix before the manager or registration ran.
+            prior = {**intent, 'phase': 'preparing', 'phase_prefixes': ['dev-pair-maint-host-12345678'],
+                     'native_units': []}
+            path = g.MAINTENANCE_HOST_INTENT
+            self.app.atomic(path, canonical(prior).decode(), expected=self.app.text(path))
+            self.assertEqual(self.prepare_cli(*arguments)[0], 2)
+            self.assertEqual(self.prepare_cli(*arguments, '--retry')[0], 0)
+            _, after = self.app.read_config_record(path)
+            self.assertEqual(after['phase_prefixes'][0], prior['phase_prefixes'][0])
+            self.assertEqual(len(after['phase_prefixes']), 2)
+            self.assertEqual(len(after['native_units']), 1)
+            self.assertNotEqual(first, after['native_units'][0])
+        self.assertEqual(sum(row[0] == '/usr/bin/systemd-run' for row in calls), 2)
+
     def test_preflight_uses_signed_scope_before_any_oci_effect(self):
         self.prepare()
         self.setup_release()
@@ -259,7 +300,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.assertEqual(result['boot_id'], BOOT)
         self.assertEqual(result['phase'], 'preflight')
         self.assertEqual(self.app.run.starts, 0)
-        self.assertFalse(self.app.path(self.app.import_receipt_path(EXPECTED, SEALED)).exists())
+        self.assertFalse(self.app.path(self.receipt_path()).exists())
         self.protocol.portable_index.assert_called_once()
         self.publisher.publication_evidence.assert_called_once()
 
@@ -288,28 +329,36 @@ class MaintenanceImportTests(unittest.TestCase):
         self.assertTrue(all('--no-tty' in command and '/credentials' not in command for command in commands))
         self.assertEqual(self.app.text(legacy), 'legacy unrelated local evidence\n')
         self.assertTrue(all(not path.exists() for path in self.app.import_probe_leaves))
-        self.assertEqual(self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED), '0.169.0')
+        self.assertEqual(self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED, self.platform), '0.169.0')
+        initial = self.app.path(self.receipt_path()).read_bytes()
         self.app.boot = REBOOT
         with self.assertRaisesRegex(g.Blocked, 'release or boot'):
-            self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED)
+            self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED, self.platform)
         self.import_witness()
         code, current = self.verify()
         self.assertEqual(code, 0)
         self.assertEqual(current['boot_id'], REBOOT)
         self.assertEqual(current['platform_sha256'], evidence['platform_sha256'])
+        self.assertEqual(self.app.path(self.receipt_path()).read_bytes(), initial)
+        self.assertNotEqual(self.app.path(self.receipt_path(boot=REBOOT)).read_bytes(), initial)
 
-    def test_guest_result_without_local_assembly_evidence_cannot_admit_job(self):
+    def test_two_platforms_can_reuse_exact_image_and_preserve_rollback(self):
         self.prepare()
-        result = {'kind': 'maintenance-gptbox-probe-candidate', 'assembled_image_id': SEALED,
-                  'source_sha': SOURCE, 'context_sha256': EXPECTED, 'distrobox_sha': g.DBX_SHA,
-                  'boundary_and_version_cycles': 2, 'runtime_container_removed': True}
-        self.app.atomic(self.app.target + '/result.json', g.image_inputs_bytes(result).decode())
-        with self.assertRaisesRegex(g.Blocked, 'gptbox-image.json'):
+        installs = []
+        for run, kind in ((123, 'dev-pair-platform-release'), (124, 'dev-pair-platform-agent-refresh')):
+            self.setup_release(run, kind)
+            self.import_witness()
+            self.assertEqual(self.verify()[0], 0)
+            path = self.app.path(self.receipt_path())
+            installs.append((self.platform, path, path.read_bytes()))
+        self.assertNotEqual(installs[0][1], installs[1][1])
+        for platform, path, exact in reversed(installs):
+            self.assertEqual(self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED, platform), '0.169.0')
+            self.assertEqual(path.read_bytes(), exact)
+        with self.assertRaisesRegex(g.Blocked, 'selected release or boot'):
+            self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED, '9' * 64)
+        with self.assertRaisesRegex(g.Blocked, 'result.json'):
             self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED)
-        self.app.atomic(g.STATE + '/gptbox-image.json', g.image_inputs_bytes({'source_sha': SOURCE,
-                        'context_sha256': EXPECTED}).decode())
-        self.app.atomic(self.app.target + '/assembly-attestation.json', self.app.seal_files['sealed.json'])
-        self.assertEqual(self.app.admitted_maintenance_image(EXPECTED, SOURCE, SEALED), '0.169.0')
 
     def test_wrong_import_and_rootless_store_are_rejected_before_runtime(self):
         self.prepare()
@@ -322,7 +371,7 @@ class MaintenanceImportTests(unittest.TestCase):
         with self.assertRaisesRegex(g.Blocked, 'rootless store'):
             self.app.verify_installed_maintenance('verify', self.platform, EXPECTED, SOURCE, SEALED, MANIFEST)
         self.assertFalse(self.app.run.containers)
-        self.assertFalse(self.app.path(self.app.import_receipt_path(EXPECTED, SEALED)).exists())
+        self.assertFalse(self.app.path(self.receipt_path()).exists())
 
     def test_tampered_transport_is_rejected_before_engine(self):
         self.prepare()
@@ -341,7 +390,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.import_witness()
         original = self.app.seal_files['sealed.json']
         self.app.seal_files['sealed.json'] = original.replace('"uid": 1000', '"uid": 0')
-        receipt = self.app.path(self.app.import_receipt_path(EXPECTED, SEALED))
+        receipt = self.app.path(self.receipt_path())
         with self.assertRaisesRegex(g.Blocked, 'Distrobox seal differs'):
             self.app.verify_installed_maintenance('verify', self.platform, EXPECTED, SOURCE, SEALED, MANIFEST)
         self.assertFalse(receipt.exists())
@@ -357,7 +406,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.prepare()
         self.setup_release()
         self.import_witness()
-        path = self.app.import_receipt_path(EXPECTED, SEALED)
+        path = self.receipt_path()
         conflicting = self.app.import_admission('a' * 64, EXPECTED, SOURCE, SEALED, MANIFEST, BOOT, PRODUCER)
         self.app.atomic(path, g.image_inputs_bytes(conflicting).decode())
         with self.assertRaisesRegex(g.Blocked, 'conflicting imported maintenance'):

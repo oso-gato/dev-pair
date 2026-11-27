@@ -593,18 +593,20 @@ class Gptbox(Bootstrap):
             raise Blocked('runtime changed during headless entry; inspect durable turn state')
         return output
 
-    def run_job(self, job, operation, request_sha, sealed, context, revision):
+    def run_job(self, job, operation, request_sha, sealed, context, revision, platform_sha=None):
         self.preflight()
         if (not JOB.fullmatch(job) or not OPERATION.fullmatch(operation) or not re.fullmatch(r'[0-9a-f]{64}', context)
                 or not re.fullmatch(r'[0-9a-f]{40}', revision) or not self.path(STATE + '/prepared').exists()):
             raise Blocked('maintenance job requires exact reviewed input, target and host readiness')
         sealed = image_id(sealed)
+        if platform_sha is not None:
+            raw_digest(platform_sha)
         self.target = ROOT + '/' + context
         with self.lock():
-            return self.run_job_locked(job, operation, request_sha, sealed, context, revision)
+            return self.run_job_locked(job, operation, request_sha, sealed, context, revision, platform_sha)
 
-    def run_job_locked(self, job, operation, request_sha, sealed, context, revision):
-        codex_version = self.admitted_maintenance_image(context, revision, sealed)
+    def run_job_locked(self, job, operation, request_sha, sealed, context, revision, platform_sha=None):
+        codex_version = self.admitted_maintenance_image(context, revision, sealed, platform_sha)
         uid, gid = self.uid, self.gid
         self.mounts, request = host_job_inputs('maintenance', job, operation, request_sha, int(gid))
         label = None
@@ -674,13 +676,17 @@ class Gptbox(Bootstrap):
         return raw, record
 
     def live_boot_id(self):
-        value = self.text('/proc/sys/kernel/random/boot_id').strip()
-        if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value):
+        return self.admission_boot_id(self.text('/proc/sys/kernel/random/boot_id').strip())
+
+    @staticmethod
+    def admission_boot_id(value):
+        if type(value) is not str or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value):
             raise Blocked('maintenance admission lacks the current host boot identity')
         return value
 
-    def import_receipt_path(self, context, sealed):
-        return ROOT + '/' + context + '/imported-releases/' + sealed + '.json'
+    def import_receipt_path(self, context, platform_sha, sealed, boot):
+        context, platform_sha, sealed = (raw_digest(value) for value in (context, platform_sha, sealed))
+        return f'{ROOT}/{context}/imported-releases/{platform_sha}/{sealed}/{self.admission_boot_id(boot)}.json'
 
     def import_authority(self, platform_sha, context, revision, sealed, manifest_sha):
         from platform_release import publication_evidence
@@ -739,34 +745,64 @@ class Gptbox(Bootstrap):
                 'boot_id': boot, 'distrobox_sha': DBX_SHA, 'boundary_and_version_cycles': 2,
                 'runtime_container_removed': True, 'job_admission': False, 'producer_result_sha256': producer}
 
-    def admitted_maintenance_image(self, context, revision, sealed):
-        path = self.import_receipt_path(context, sealed)
-        if os.path.lexists(self.path(path)):
+    def admitted_maintenance_image(self, context, revision, sealed, platform_sha=None):
+        if platform_sha is not None:
+            boot = self.live_boot_id()
+            path = self.import_receipt_path(context, platform_sha, sealed, boot)
+            if not os.path.lexists(self.path(path)):
+                raise Blocked('imported maintenance proof is unavailable for the selected release or boot')
             self.maintenance_host_readiness(context)
             raw, proof = self.read_config_record(path)
-            platform_sha = raw_digest(proof.get('platform_sha256'))
             manifest_sha = raw_digest(proof.get('oci_manifest_sha256'))
             _, row, diffs, producer = self.import_authority(platform_sha, context, revision, sealed, manifest_sha)
-            expected = self.import_admission(platform_sha, context, revision, sealed, manifest_sha,
-                                             self.live_boot_id(), producer)
+            expected = self.import_admission(platform_sha, context, revision, sealed, manifest_sha, boot, producer)
             if raw != image_inputs_bytes(expected):
                 raise Blocked('imported maintenance proof differs from the selected release or boot')
             return self.maintenance_labels(context, revision, sealed, row, diffs)['dev-pair.codex.version']
         self.maintenance_gateway(context)
+        return self.local_maintenance_completion(context, revision, sealed)
+
+    def local_maintenance_completion(self, context, revision, sealed):
         _, legacy = self.read_config_record(self.target + '/result.json')
-        if any(legacy.get(name) != expected for name, expected in (
-                ('kind', 'maintenance-gptbox-probe-candidate'), ('assembled_image_id', sealed),
-                ('source_sha', revision), ('context_sha256', context),
-                ('distrobox_sha', DBX_SHA), ('boundary_and_version_cycles', 2), ('runtime_container_removed', True))):
+        binding = {'source_sha': revision, 'context_sha256': context, 'distrobox_sha': DBX_SHA}
+        wanted = {**binding, 'kind': 'maintenance-gptbox-probe-candidate', 'assembled_image_id': sealed,
+                  'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False,
+                  'authentication': 'not verified', 'model_access': 'not verified', 'nested_placement': 'not verified',
+                  'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}
+        if (set(legacy) != set(wanted) | {'fedora_base', 'runtime_container_id'}
+                or any(legacy.get(key) != value for key, value in wanted.items())
+                or type(legacy.get('boundary_and_version_cycles')) is not int
+                or legacy.get('runtime_container_removed') is not True or legacy.get('job_admission') is not False):
             raise Blocked('maintenance image was not admitted by the exact completed assembly')
+        runtime = raw_digest(legacy['runtime_container_id'])
         _, prepared = self.read_config_record(STATE + '/gptbox-image.json')
+        _, built = self.read_config_record(self.target + '/candidate-image.json')
+        self.check_prepared_record(prepared, context, revision, built.get('codex_sha256'))
+        self.check_prepared_record(built, context, revision, prepared['codex_sha256'])
+        if (built['kind'] != 'full-adapter-candidate' or built['fedora_base'] != legacy['fedora_base']
+                or (prepared['kind'] == 'full-adapter-candidate' and prepared != built)):
+            raise Blocked('local maintenance candidate differs from protected preparation or completion')
+        self.prepared_build_files(context, built)
+        _, attempt = self.read_config_record(self.target + '/attempt.json')
+        count = attempt.get('count')
+        if type(count) is not int or not 1 <= count <= 2 or attempt != {**binding, 'count': count}:
+            raise Blocked('local maintenance completion lacks its exact bounded assembly attempt')
+        _, resources = self.read_config_record(self.target + '/resources.json')
+        base_name, runtime_name = (f'dp-gptbox-{kind}-{context[:16]}-{count}' for kind in ('a', 'r'))
+        if resources != {base_name: built['image_id'], runtime_name: sealed}:
+            raise Blocked('local maintenance assembly resources differ from the selected sealed image')
         _, assembly = self.read_config_record(self.target + '/assembly-attestation.json')
+        seal = {'kind': 'genuine-distrobox-assembled', 'source_sha': revision, 'uid': 1000, 'gid': 1000,
+                'inputs_sha256': built['inputs_sha256'], 'packages_sha256': raw_digest(assembly.get('packages_sha256'))}
         labels = self.maintenance_labels(context, revision, sealed)
-        if ((prepared.get('source_sha'), prepared.get('context_sha256')) != (revision, context)
-                or (assembly.get('kind'), assembly.get('source_sha'), assembly.get('uid'), assembly.get('gid')) !=
-                   ('genuine-distrobox-assembled', revision, 1000, 1000)
-                or raw_digest(assembly.get('inputs_sha256')) != labels.get('dev-pair.inputs')):
-            raise Blocked('complete local maintenance preparation and assembly evidence is required')
+        pinned = {'dev-pair.inputs': built['inputs_sha256'], 'dev-pair.runtime': built['runtime_sha256'],
+                  'dev-pair.init': built['init_sha256'], 'dev-pair.codex.sha256': built['codex_sha256'],
+                  'dev-pair.codex.version': '0.169.0'}
+        if (assembly != seal or type(assembly['uid']) is not int or type(assembly['gid']) is not int
+                or any(labels.get(key) != value for key, value in pinned.items())):
+            raise Blocked('local maintenance Distrobox seal differs from the prepared and sealed images')
+        for identity in (base_name, runtime_name, runtime):
+            self.engine('container', 'exists', identity, ok=(1,), timeout=8)
         return labels['dev-pair.codex.version']
 
     def create_maintenance_probe(self, name, context, sealed, *, imported=False):
@@ -884,12 +920,12 @@ class Gptbox(Bootstrap):
                            'image_id': sealed, 'oci_manifest_sha256': manifest_sha, 'boot_id': self.live_boot_id()}
                 if phase == 'preflight':
                     return {**binding, 'phase': 'preflight'}
-                proof, previous = self.prove_installed_maintenance(root, binding, part, diffs, producer)
-            destination = self.import_receipt_path(context, sealed)
-            self.atomic(destination, image_inputs_bytes(proof).decode(), expected=previous)
+                destination = self.import_receipt_path(context, platform_sha, sealed, binding['boot_id'])
+                proof = self.prove_installed_maintenance(root, binding, part, diffs, producer, destination)
+            self.atomic(destination, image_inputs_bytes(proof).decode())
             return proof
 
-    def prove_installed_maintenance(self, root, binding, part, diffs, producer):
+    def prove_installed_maintenance(self, root, binding, part, diffs, producer, destination):
         sealed, context, revision = (binding[key] for key in ('image_id', 'context_sha256', 'source_sha'))
         wanted = {**binding, 'kind': 'maintenance-native-oci-import', 'archive_sha256': part['archive_sha256'],
                   'graphroot': MAINTENANCE_STORE, 'runroot': f'/run/user/{self.uid}/dev-pair-gptbox'}
@@ -904,15 +940,10 @@ class Gptbox(Bootstrap):
         labels = self.maintenance_labels(context, revision, sealed, part, diffs)
         proof = self.import_admission(binding['platform_sha256'], context, revision, sealed,
                                       binding['oci_manifest_sha256'], binding['boot_id'], producer)
-        previous = None
-        destination = self.import_receipt_path(context, sealed)
         if os.path.lexists(self.path(destination)):
-            existing, data = self.read_config_record(destination)
-            previous_boot = data.get('boot_id')
-            if (type(previous_boot) is not str or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', previous_boot)
-                    or existing != image_inputs_bytes({**proof, 'boot_id': previous_boot})):
+            existing, _ = self.read_config_record(destination)
+            if existing != image_inputs_bytes(proof):
                 raise Blocked('conflicting imported maintenance admission preserved')
-            previous = existing.decode()
         self.directory(self.target, mode=0o755)
         self.target = self.target + '/import-probes/' + sealed
         self.directory(self.target, mode=0o700)
@@ -928,7 +959,7 @@ class Gptbox(Bootstrap):
             self.remove_import_probe_leaves()
         if self.live_boot_id() != binding['boot_id'] or self.run('/usr/sbin/getenforce').strip() != 'Enforcing':
             raise Blocked('host boot or SELinux enforcement changed during imported maintenance test')
-        return proof, previous
+        return proof
 
     def ready(self, identity, sealed, previous_start=None):
         deadline = time.monotonic() + 30
@@ -993,9 +1024,18 @@ class Gptbox(Bootstrap):
             if not stat.S_ISREG(node.st_mode) or node.st_nlink!=1 or stat.S_IMODE(node.st_mode)!=0o600 or node.st_size>16384:raise Blocked('unsafe prepared completion')
             try:record=json.loads(stream.read(16385),object_pairs_hook=fedora_oci.unique)
             except (ValueError,UnicodeError):raise Blocked('invalid prepared completion JSON') from None
+        self.check_prepared_record(record, expected, revision, manifest['codex']['sha256'])
+        if record['kind'] == 'full-adapter-candidate':
+            if (record['runtime_sha256'] != sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes())
+                    or record['init_sha256'] != sha(self.scripts['distrobox-init'])):
+                raise Blocked('full prepared completion differs from current runtime')
+            self.prepared_build_files(expected, record)
+        return record
+
+    def check_prepared_record(self, record, expected, revision, codex_sha):
         if type(record) is not dict:raise Blocked('invalid prepared completion')
         common=(record.get('source_sha')==revision and record.get('context_sha256')==expected and record.get('base_image')==FEDORA and
-            record.get('codex_sha256')==manifest['codex']['sha256'] and record.get('distrobox_assembled') is False and record.get('runtime_validated') is False and
+            record.get('codex_sha256')==raw_digest(codex_sha) and record.get('distrobox_assembled') is False and record.get('runtime_validated') is False and
             type(record.get('image_id')) is str and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}',record['image_id']))
         if not common:raise Blocked('prepared completion target/pins mismatch')
         if record.get('kind')=='host-maintenance-gptbox-oci-candidate':
@@ -1008,14 +1048,18 @@ class Gptbox(Bootstrap):
                 if not (size is None or type(size) is int and 0<=size<2**63) or not (layers is None and count is None or type(layers) is list and len(layers)<=128 and type(count) is int and count==len(layers) and all(type(v) is str and re.fullmatch('sha256:[0-9a-f]{64}',v) for v in layers)):raise Blocked('invalid legacy logical descriptors')
         elif record.get('kind')=='full-adapter-candidate':
             keys=set('schema kind source_sha context_sha256 standards_sha base_image codex_sha256 distrobox_sha init_sha256 runtime_sha256 inputs_sha256 recipe_sha256 platform distrobox_assembled runtime_validated image_id fedora_base'.split())
-            if set(record)!=keys or type(record['schema']) is not int or record['schema']!=1 or record['standards_sha']!=candidate.STANDARDS or record['distrobox_sha']!=DBX_SHA or record['platform']!={'os':'linux','architecture':'amd64'} or record['runtime_sha256']!=sha(Path(__file__).with_name('gptbox_runtime.py').read_bytes()) or record['init_sha256']!=sha(self.scripts['distrobox-init']):raise Blocked('invalid full prepared completion')
-            build=self.path('/var/lib/dev-pair/artifacts/gptbox-adapter/'+expected+'/build')
-            for name,key in (('inputs.json','inputs_sha256'),('Containerfile','recipe_sha256')):
-                if sha(self.protected(build/name).read_bytes())!=record[key]:raise Blocked('prepared recipe/input hash mismatch')
+            if set(record)!=keys or type(record['schema']) is not int or record['schema']!=1 or record['standards_sha']!=candidate.STANDARDS or record['distrobox_sha']!=DBX_SHA or record['platform']!={'os':'linux','architecture':'amd64'}:raise Blocked('invalid full prepared completion')
+            for name in ('image_id', 'runtime_sha256', 'init_sha256', 'inputs_sha256', 'recipe_sha256'):
+                raw_digest(record[name])
         else:raise Blocked('unknown prepared recipe kind')
         try:fedora_oci.validate_import_proof(record['fedora_base'])
         except (ValueError,KeyError,TypeError):raise Blocked('prepared signed import proof rejected') from None
-        return record
+
+    def prepared_build_files(self, context, record):
+        build = self.path(f'/var/lib/dev-pair/artifacts/gptbox-adapter/{context}/build')
+        for name, key in (('inputs.json', 'inputs_sha256'), ('Containerfile', 'recipe_sha256')):
+            if sha(self.protected_bytes(build / name, 65536, 0o444)) != record[key]:
+                raise Blocked('prepared recipe/input hash mismatch')
 
     def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
         self.preflight()
@@ -1426,13 +1470,16 @@ class Gptbox(Bootstrap):
         if os.path.lexists(self.path(MAINTENANCE_HOST_INTENT)):
             data, prior = self.read_config_record(MAINTENANCE_HOST_INTENT)
             phases, units = prior.get('phase_prefixes'), prior.get('native_units')
+            # The former prefix was rejected before Commands could register any
+            # native unit. Preserve its attempt, but grant no cleanup authority.
+            phase_name = rf'(?:{PREPARE_NATIVE}|dev-pair-maint-host)-[0-9a-f]{{8}}'
             if (set(prior) != set(record) or type(prior['schema']) is not int or prior['schema'] != 1
                     or prior['target'] != target or prior['phase'] not in ('preparing', 'complete')
                     or type(phases) is not list or not 1 <= len(phases) <= 2
-                    or any(type(prefix) is not str or not re.fullmatch(r'dev-pair-maint-host-[0-9a-f]{8}', prefix) for prefix in phases)
+                    or any(type(prefix) is not str or not re.fullmatch(phase_name, prefix) for prefix in phases)
                     or len(set(phases)) != len(phases) or type(units) is not list or len(units) > 512
                     or any(type(unit) is not str or unit.rsplit('-', 1)[0] not in phases
-                           or not re.fullmatch(r'dev-pair-maint-host-[0-9a-f]{8}-[0-9a-f]{8}', unit) for unit in units)
+                           or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}-[0-9a-f]{8}', unit) for unit in units)
                     or len(set(units)) != len(units)):
                 raise Blocked('protected maintenance host preparation target or native ownership differs')
             if prior['phase'] == 'complete':
@@ -1466,9 +1513,9 @@ class Gptbox(Bootstrap):
         def prove_source():
             _, self.scripts = self.inputs(context, expected, upstream, revision)
 
-        with preparation.run.phase(PREPARE_EXECUTION, 'dev-pair-maint-host'):
+        with preparation.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE):
             prefix = preparation.run.native_prefix
-            if not re.fullmatch(r'dev-pair-maint-host-[0-9a-f]{8}', prefix or '') or prefix in record['phase_prefixes']:
+            if not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}', prefix or '') or prefix in record['phase_prefixes']:
                 raise Blocked('maintenance host native phase identity collision')
             record['phase_prefixes'].append(prefix)
             save()
@@ -2257,10 +2304,11 @@ def run_job_cli(argv):
     parser = argparse.ArgumentParser(prog='gptbox.py run-job', description='Enter the exact sealed maintenance role.')
     for name in ('job', 'operation', 'request-sha256', 'image', 'context-sha256', 'source-sha'):
         parser.add_argument('--' + name, required=True)
+    parser.add_argument('--platform-sha256')
     args = parser.parse_args(argv)
     try:
         report = Gptbox().run_job(args.job, args.operation, args.request_sha256, args.image,
-                                  args.context_sha256, args.source_sha)
+                                  args.context_sha256, args.source_sha, args.platform_sha256)
         print(json.dumps(report, sort_keys=True))
         return 0 if report['turn']['status'] == 'completed-turn' else 2
     except (Blocked, RuntimeError, ImportError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):

@@ -239,13 +239,15 @@ and Distrobox seal. Probe cleanup verifies the exact owned container is gone
 and removes its empty temporary leaves.
 
 The protected local admission lives at
-`/var/lib/dev-pair/bootstrap/gptbox-adapter/<context>/imported-releases/<image>.json`.
-It binds the current boot, signed platform and producer record to the selected
-image. The original CI producer result stays in the portable artifact.
-Locally assembled candidates keep their original prepared image, assembly
-attestation and result. Each imported image has a separate receipt, so a
-previous image's evidence is available for recovery. Re-observe the installed
-image through the installer after reboot to refresh its boot-specific proof.
+`/var/lib/dev-pair/bootstrap/gptbox-adapter/<context>/imported-releases/<platform>/<image>/<boot>.json`.
+Each immutable receipt binds the current boot, signed platform and producer
+record to the selected image. Releases that reuse the same artifact each keep
+their own proof, so rollback retains the original release's evidence.
+Re-observe the installed image through the installer after reboot to publish
+the new boot-specific proof. The original CI producer result stays in the
+portable artifact. The locally assembled route checks the protected candidate,
+bounded assembly attempt and resource inventory, Distrobox attestation and
+completion that bind the selected sealed image.
 The normal [maintenance role entry](role-entry.md) accepts the exact local
 admission and still applies its separate job and provider gates.
 
