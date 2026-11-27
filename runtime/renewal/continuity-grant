@@ -81,8 +81,10 @@ def authorize(payload):
     activation = state['request']
     reference = turn['release_sha256']
     r.require(reference in (activation['target_sha256'], activation['previous_sha256']), 'continuity release is unapproved')
-    expected = 'renew-' + r.identity([activation['operation'], reference, turn['role'], turn['job'], turn['logical_session']])[:50]
+    attempt_id = state.get('attempt_id', activation['operation'])
+    expected = 'renew-' + r.identity([attempt_id, reference, turn['role'], turn['job'], turn['logical_session']])[:50]
     r.require(turn['operation'] == expected and turn['activation_operation'] == activation['operation'] and
+              turn['attempt_id'] == attempt_id and
               turn['scope'] == activation['scope'] and turn['release_sha256'] == reference,
               'continuity grant does not match the authorized renewal turn')
     r.session(turn['session_uuid'])
@@ -94,10 +96,13 @@ def authorize(payload):
     selected = controller.release(reference)['components']['host']['artifact_sha256']
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(INSTALL / 'host-releases' / selected / 'tools'))
-    from provider_broker import grant_document, job_selection, protected_file
+    from provider_broker import grant_document, job_selection, load_allowance, protected_file
+    from gptbox_runtime import host_repository_approval
     account = r.pwd.getpwnam({'maintenance': 'dp-maint', 'development': 'dp-dev'}[role])
     path = r.DEFAULT_ROOT / 'turn-inputs' / role / job / operation / 'turn' / 'request.json'
     selection = job_selection(protected_file(path, 4096), request_sha, role, job, operation)
+    r.require(protected_file(path.with_name('approval.json'), 4096) == host_repository_approval(selection),
+              'continuity slot repository approval changed')
     for key in ('logical_session', 'session_uuid'):
         r.require(selection[key] == turn[key], 'continuity selection changed')
     for key in ('provider', 'model', 'effort', 'standards_sha', 'agreement_sha256'):
@@ -113,7 +118,11 @@ def authorize(payload):
               node.st_uid == 0 and stat.S_IMODE(node.st_mode) == 0o600,
               'protected continuity provider credential unavailable')
     admitted = {**selection, **{key: turn[key] for key in ('scope', 'activation_operation', 'release_sha256')}}
-    path = claim(CONTROL, profile, request_sha, admitted, account, grant_document, time.time())
+    def coherent_grant(raw):
+        grant = grant_document(raw)
+        load_allowance(job, grant['allowance_sha256']).validate_grant(selection, grant)
+
+    path = claim(CONTROL, profile, request_sha, admitted, account, coherent_grant, time.time())
     grant = r.read_json(path)
     print(r.canonical({'operation': operation, 'request_sha256': request_sha, 'job': job,
                        'allowance_sha256': grant['allowance_sha256'], 'spend_microusd': grant['spend_microusd']}))

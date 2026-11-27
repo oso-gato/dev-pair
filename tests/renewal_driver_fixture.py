@@ -15,6 +15,13 @@ def sha(data):
 
 
 def invoke(root, action, payload):
+    if action == 'preflight-runtime':
+        if (root / 'missing-release-artifact').exists() and payload['release_sha256'] == (root / 'missing-release-artifact').read_text():
+            raise SystemExit(5)
+        return {'role': payload['role'], 'job': payload['job'],
+                'artifact_sha256': payload['release']['components'][payload['role'] + '-agent']['artifact_sha256']}
+    if action == 'capture-work':
+        return {'head': 'c' * 40, 'status_sha256': sha(b'dirty'), 'check_sha256': sha(b''), 'check_exit': 0}
     if action == 'preflight-resume':
         if (root / 'deny-recovery-grant').exists() and payload['release_sha256'] == (root / 'deny-recovery-grant').read_text():
             raise SystemExit(4)
@@ -27,7 +34,9 @@ def invoke(root, action, payload):
         state = root / payload['role'] / 'state' / payload['job']
         rows = [{'logical_session': path.stem, 'uuid': path.read_text().splitlines()[0]}
                 for path in sorted(state.glob('*.txt'))]
-        return {'sessions': rows}
+        native = {row['uuid']: {'path': row['logical_session'] + '.txt', 'bytes': 1,
+                                'sha256': sha(b'fixture')} for row in rows}
+        return {'sessions': rows, 'native': native, 'archived': {}}
     plan = root / 'site-live.json'
     trace = root / 'site-events.jsonl'
     current = json.loads(plan.read_text())
@@ -54,12 +63,16 @@ def invoke(root, action, payload):
             'release_sha256': release, 'session_uuid': session,
             'request_sha256': payload.get('request_sha256', sha(operation.encode())),
             'provider_receipt_sha256': sha(b'local fixture ' + operation.encode()),
+            'work_sha256': sha(json.dumps(payload['work'], sort_keys=True, separators=(',', ':')).encode())
+            if action == 'resume-without-effects' else None,
             'events_sha256': sha(events), 'progress_sha256': sha(history.read_bytes()), 'child_reaped': True,
         }
     evidence = {key: payload[key] for key in ('release_sha256',)} | {'components': payload['release']['components']}
     with trace.open('a') as log:
         log.write(json.dumps([action, payload['operation'], release]) + '\n')
     if action == 'observe':
+        if (root / 'failed-host-observation').exists():
+            raise SystemExit(6)
         assert evidence == current
     if action == 'activate':
         temporary = plan.with_suffix('.new')

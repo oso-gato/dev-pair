@@ -24,12 +24,14 @@ from session_controller import Observer, Registry, ROLES, STANDARDS, canonical, 
 SCOPE_COMPONENTS = {'agent': {'maintenance-agent', 'development-agent'},
                     'devbox': {'devbox'}, 'host': {'host'}}
 COMPONENTS = set.union(*SCOPE_COMPONENTS.values())
-TERMINAL = {'completed', 'rolled-back', 'deferred'}
+TERMINAL = {'completed', 'rolled-back', 'deferred', 'rejected'}
 MAX_CONTROL = 8 * 1024 * 1024
 MAX_JOBS = 64
 MAX_SESSIONS = 16
 MAX_ATTEMPTS = 32
 MIN_FREE_BYTES = 8 * 1024 ** 3
+MAX_TARGET_ATTEMPTS = 3
+RETRY_DELAY = 30
 DEFAULT_ROOT = Path('/var/lib/dev-pair')
 DEFAULT_DRIVER = Path('/usr/libexec/dev-pair/renewal/driver')
 LEDGER_USER = 'dp-checklist'
@@ -159,7 +161,10 @@ class LedgerAccess:
         completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    timeout=30, check=False, env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
         require(completed.returncode == 0 and len(completed.stdout) <= MAX_CONTROL, 'ledger helper rejected operation')
-        return loads(completed.stdout)
+        result = loads(completed.stdout)
+        if type(result) is dict and set(result) == {'blocked'}:
+            require(False, result['blocked'])
+        return result
 
     def checkpoint(self, job):
         token(job)
@@ -174,7 +179,7 @@ class LedgerAccess:
         finally:
             ledger.close()
 
-    def inventory(self, path=None):
+    def inventory(self, path=None, *, authority=None):
         if self.user is not None and path is None:
             return self.remote('inventory', '-')
         ledger = protocol.Ledger(path or self.path)
@@ -184,6 +189,9 @@ class LedgerAccess:
                 require(len(jobs) <= MAX_JOBS, 'job catalogue exceeds bound')
                 statuses = ledger.db.execute('SELECT id FROM requests ORDER BY id LIMIT 4097').fetchall()
                 require(len(statuses) <= 4096, 'host request catalogue exceeds bound')
+                if authority is not None:
+                    with contextlib.closing(authority(ledger.controller_id)) as history:
+                        check_host_history(ledger, history, {row['id'] for row in jobs}, statuses)
                 requests = {}
                 for row in statuses:
                     status = ledger.status(row['id'])
@@ -229,11 +237,46 @@ class LedgerAccess:
         return receipt
 
 
+def check_host_history(ledger, history, jobs, statuses):
+    """Read Q's exact authority while its mutation fence is held by renewal."""
+    history.db.execute('PRAGMA query_only=ON')
+    authority = history.db.execute('SELECT id,job FROM executions ORDER BY id LIMIT 4097').fetchall()
+    require(len(authority) <= 4096, 'authoritative host request catalogue exceeds bound')
+    known = {row['id'] for row in statuses}
+    for row in authority:
+        request = row['id']
+        token(request)
+        token(row['job'])
+        require(row['job'] in jobs, 'authoritative host job is missing from the restored mirror: ' + row['job'])
+        if request not in known:
+            require(False, 'authoritative host request is missing from the mirror; reconcile in Q: ' + request)
+    former = ledger.host_history
+    ledger.host_history = history
+    try:
+        for row in statuses:
+            mirror = ledger.status(row['id'])
+            request = mirror['request']
+            if not protocol.host_effect_journal(request):
+                continue
+            authoritative = ledger.host_status(request)
+            require(mirror == authoritative, 'restore the authoritative host outcome through Q: ' + row['id'])
+    finally:
+        ledger.host_history = former
+
+
 def ledger_helper(action, value):
     require(pwd.getpwuid(os.getuid()).pw_name == LEDGER_USER, 'invalid ledger helper account')
     access = LedgerAccess(DEFAULT_ROOT)
     if action == 'inventory':
-        return access.inventory()
+        from host_handoff import host_runtime
+        from ledger_recovery import HostHistory
+        runtime = host_runtime()
+        runtime.rootless_environment()
+
+        def authority(controller):
+            return HostHistory(runtime.HISTORY, controller, runtime.execution_identity())
+
+        return access.inventory(authority=authority)
     if action == 'checkpoint':
         return access.checkpoint(value)
     require(action == 'capture', 'unknown ledger helper action')
@@ -387,6 +430,26 @@ class Renewal:
         elif frozen:
             replace_json(marker, operation)
 
+    def boot_fence(self):
+        with self.lock(), self.host_fence():
+            attempt, _ = self.transition()
+            marker = self.root / 'renewal-fence' / 'frozen'
+            if os.path.lexists(marker):
+                require(read_json(marker) == (attempt.name if attempt else 'boot'), 'foreign host boot fence')
+            else:
+                self.mark_host_fence(attempt.name if attempt else 'boot', frozen=True)
+
+    def observe_then_clear_fence(self, attempt, state):
+        marker = self.root / 'renewal-fence' / 'frozen'
+        if not os.path.lexists(marker):
+            return
+        with self.host_fence():
+            operation = attempt.name if attempt else 'boot'
+            require(read_json(marker) == operation, 'foreign host boot fence')
+            context = state or {'request': {'operation': 'boot', 'scope': 'host'}}
+            self.verify_driver('observe', context, self.live_release())
+            self.mark_host_fence(operation, frozen=False)
+
     def release(self, reference):
         digest(reference)
         path = self.control / 'releases' / (reference + '.json')
@@ -405,6 +468,7 @@ class Renewal:
         with self.lock(shared=not for_enrollment):
             _, state = self.transition()
             require(state is None or state['phase'] in TERMINAL, 'role dispatch frozen by renewal')
+            require(not os.path.lexists(self.root / 'renewal-fence' / 'frozen'), 'role dispatch frozen pending host observation')
             yield self.live_release()
 
     def registry_path(self, role, job):
@@ -414,6 +478,33 @@ class Renewal:
 
     def trees(self, role, job):
         return {kind: self.root / role / kind / job for kind in ('workspaces', 'state')}
+
+    def check_durable_catalogue(self, registries):
+        retained = {}
+        attempts = self.control / 'attempts'
+        for path in attempts.iterdir():
+            journal = read_json(trusted_directory(path) / 'journal.json')
+            for key, entry in journal.get('displaced', {}).items():
+                require(key not in retained or retained[key] == entry, 'ambiguous retained tree')
+                retained[key] = entry
+        for role in ROLES:
+            expected = {key.split('/')[1] for key in registries if key.startswith(role + '/')}
+            for kind in ('workspaces', 'state'):
+                root = self.root / role / kind
+                require(root.resolve(strict=True) == root and root.is_dir(), 'unsafe durable job root')
+                names = set()
+                with os.scandir(root) as entries:
+                    for entry in entries:
+                        require(entry.is_dir(follow_symlinks=False), 'unexpected durable job entry')
+                        node = entry.stat(follow_symlinks=False)
+                        key = '/'.join((role, kind, entry.name))
+                        if key in retained:
+                            require(retained[key] == [node.st_dev, node.st_ino], 'displaced tree identity changed')
+                            continue
+                        token(entry.name)
+                        names.add(entry.name)
+                        require(len(names) <= MAX_JOBS, 'durable job catalogue exceeds bound')
+                require(names == expected, 'durable job catalogue differs from protected role registry')
 
     def register(self, binding):
         with self.dispatch_gate(for_enrollment=True):
@@ -495,7 +586,32 @@ class Renewal:
         request_path = self.control / 'requests' / (scope + '.json')
         if not request_path.exists() and not request_path.is_symlink():
             return None
-        return checked_request(read_json(request_path), scope)
+        value = read_json(request_path)
+        if scope == 'agent':
+            protocol.fields(value, 'schema offer_sha256 request')
+            require(type(value['schema']) is int and value['schema'] == 1, 'unsupported intake approval')
+            offer = self.control / 'offers' / 'agent.json'
+            if not os.path.lexists(offer):
+                return None
+            raw = read_private(offer, MAX_CONTROL)
+            require(sha(raw) == value['offer_sha256'] and loads(raw)['request'] == value['request'],
+                    'verified agent offer was changed or revoked')
+            value = value['request']
+        return checked_request(value, scope)
+
+    def attempts_for(self, request):
+        rows = []
+        count = 0
+        for path in (self.control / 'attempts').iterdir():
+            count += 1
+            require(count <= MAX_ATTEMPTS, 'renewal backup retention bound')
+            journal = read_json(trusted_directory(path) / 'journal.json')
+            previous = journal['request']
+            if previous['operation'] == request['operation']:
+                require(previous == request, 'renewal operation ID collision')
+            if all(previous[field] == request[field] for field in ('scope', 'target_sha256')):
+                rows.append((path, journal))
+        return sorted(rows, key=lambda row: row[1].get('target_attempt', 1))
 
     def apply(self, scope):
         require(scope in SCOPE_COMPONENTS, 'unknown renewal scope')
@@ -504,19 +620,28 @@ class Renewal:
             if state is not None:
                 if state['phase'] not in TERMINAL:
                     return self.resume(attempt, state)
-                self.mark_host_fence(state['request']['operation'], frozen=False)
+            self.observe_then_clear_fence(attempt, state)
             request = self.active_request(scope)
             if request is None:
                 return {'phase': 'no-approved-target', 'scope': scope}
-            target = self.control / 'attempts' / request['operation']
             state = None
-            if os.path.lexists(target):
-                state = read_json(trusted_directory(target) / 'journal.json')
-                require(state['request'] == request, 'renewal operation ID collision')
-                if state['phase'] in TERMINAL:
-                    return state
-                require(state['phase'] == 'prepared' and not state['freezes'] and not state['proofs'],
+            history = self.attempts_for(request)
+            attempt_number = len(history) + 1
+            attempt_id = request['operation']
+            if history:
+                last, prior = history[-1]
+                if prior['phase'] in ('completed', 'rolled-back', 'rejected'):
+                    return prior
+                if prior['phase'] == 'deferred':
+                    if attempt_number > MAX_TARGET_ATTEMPTS or time.time() < prior.get('retry_after', 0):
+                        return prior
+                    attempt_id = 'attempt-' + identity([request['operation'], request['target_sha256'], attempt_number])[:48]
+                else:
+                    require(prior['request'] == request and prior['phase'] == 'prepared' and
+                            not prior['freezes'] and not prior['proofs'],
                         'unpublished renewal attempt has consequential state')
+                    state, attempt_id = prior, last.name
+            target = self.control / 'attempts' / attempt_id
             previous = self.release(request['previous_sha256'])
             replacement = self.release(request['target_sha256'])
             require(request['previous_sha256'] == self.live_release(), 'stale renewal previous digest')
@@ -530,12 +655,13 @@ class Renewal:
                             'renewal backup retention bound')
                     with tempfile.TemporaryDirectory(dir=self.control / 'registry-staging') as temporary:
                         attempt = create_directory(Path(temporary) / 'attempt')
-                        state = {'schema': 1, 'request': request, 'freezes': {}, 'proofs': {}}
+                        state = {'schema': 1, 'request': request, 'freezes': {}, 'proofs': {},
+                                 'attempt_id': attempt_id, 'target_attempt': attempt_number}
                         self.phase(attempt, state, 'prepared')
                         attempt.rename(target)
                         sync_directory(target.parent)
-                replace_json(self.pointer, request['operation'])
-                self.mark_host_fence(request['operation'], frozen=True)
+                replace_json(self.pointer, attempt_id)
+                self.mark_host_fence(attempt_id, frozen=True)
                 return self.run(target, state)
 
     def refresh_agent_target(self):
@@ -557,7 +683,7 @@ class Renewal:
 
     def resume(self, attempt, state):
         with self.host_fence():
-            self.mark_host_fence(state['request']['operation'], frozen=True)
+            self.mark_host_fence(attempt.name, frozen=True)
             return self.recover(attempt, state)
 
     def payload(self, state, reference):
@@ -577,7 +703,7 @@ class Renewal:
         for key, registry in registries.items():
             binding = registry.meta['binding']
             current = registry.inventory()['dispatch']
-            attempt_id = state['request']['operation']
+            attempt_id = attempt.name
             generation = (current['identity']['requested_generation'] if current['state'] == 'frozen'
                           else current['generation'])
             receipt = registry.request_freeze(attempt_id, generation, binding)
@@ -605,6 +731,7 @@ class Renewal:
 
     def capture(self, attempt, state, registries):
         deadline = time.monotonic() + self.seconds
+        self.check_durable_catalogue(registries)
         capacity = os.statvfs(attempt)
         require(capacity.f_bavail * capacity.f_frsize >= MIN_FREE_BYTES + self.byte_limit,
                 'renewal requires free capacity for backup and protected reserve')
@@ -617,7 +744,7 @@ class Renewal:
         require(set(state['request']['affected_jobs']) <= set(host['jobs']), 'unknown affected product job')
         require(all(row['state'] != 'in-flight' for row in host['requests'].values()),
                 'host effects require reconciliation before renewal')
-        ledger_receipt = self.ledger.capture(state['request']['operation'], backup_root / 'ledger',
+        ledger_receipt = self.ledger.capture(attempt.name, backup_root / 'ledger',
                                             verification / 'ledger', min(deadline, time.monotonic() + 30))
         require(self.ledger.inventory(verification / 'ledger') == host, 'restored job ledger identity changed')
         entries = {}
@@ -630,7 +757,10 @@ class Renewal:
             require(len(sessions) + len(snapshot['sessions']) <= MAX_SESSIONS, 'active session count exceeds renewal allowance')
             proof = self.driver.invoke('verify-sessions', {'role': role, 'job': job, 'sessions': snapshot['sessions'],
                                                          'binding': registry.meta['binding']})
-            require(proof == {'sessions': snapshot['sessions']}, 'durable provider catalogue does not match registry')
+            protocol.fields(proof, 'sessions native archived')
+            require(proof['sessions'] == snapshot['sessions'] and type(proof['native']) is dict and
+                    set(proof['native']) == {row['uuid'] for row in snapshot['sessions']} and
+                    type(proof['archived']) is dict, 'durable provider catalogue does not match registry')
             registry_name = role + '--' + job
             group = create_directory(backup_root / registry_name)
             replace_json(group / 'registry.json', snapshot)
@@ -646,10 +776,12 @@ class Renewal:
                             if row['job'] == job and row['state'] == 'pending']
             deferred_turns = [row['operation'] for row in snapshot['operations'] if row['state'] == 'deferred']
             entries[key] = {'registry_sha256': identity(snapshot), 'checkpoint': checkpoint, 'trees': data,
+                            'archived_provider_sessions': proof['archived'],
                             'pending_host': pending_host, 'deferred_turns': deferred_turns}
             for active in snapshot['sessions']:
                 sessions.append({'role': role, 'job': job, 'logical_session': active['logical_session'],
                                  'provider_uuid': active['uuid'], 'checkpoint': checkpoint,
+                                 'native_rollout': proof['native'][active['uuid']],
                                  'uncommitted_source_sha256': data['workspaces'],
                                  'session_state_sha256': data['state'], 'pending_host': pending_host,
                                  'deferred_turns': deferred_turns, 'target_sha256': state['request']['target_sha256'],
@@ -711,7 +843,7 @@ class Renewal:
 
     def check_proof(self, proof, spec, release, *, require_progress=True):
         protocol.fields(proof, 'release_sha256 operation role job logical_session session_uuid request_sha256 '
-                        'events_sha256 progress_sha256 child_reaped provider_receipt_sha256')
+                        'events_sha256 progress_sha256 child_reaped provider_receipt_sha256 work_sha256')
         for field in ('operation', 'role', 'job', 'logical_session'):
             require(proof[field] == spec[field], 'role resume identity changed')
         session(proof['session_uuid'])
@@ -725,12 +857,14 @@ class Renewal:
         digest(proof['provider_receipt_sha256'])
         if require_progress or proof['progress_sha256'] is not None:
             digest(proof['progress_sha256'])
+        require(proof['work_sha256'] == spec.get('work_sha256'), 'resumed product check differs from checkpoint')
 
     def resume_payloads(self, state, reference, inventory, registries):
         for saved in inventory['sessions']:
             key = saved['role'] + '/' + saved['job']
             registry = registries[key]
-            operation = 'renew-' + identity([state['request']['operation'], reference,
+            attempt_id = state.get('attempt_id', state['request']['operation'])
+            operation = 'renew-' + identity([attempt_id, reference,
                                              saved['role'], saved['job'], saved['logical_session']])[:50]
             spec = {'operation': operation, 'role': saved['role'], 'job': saved['job'],
                     'logical_session': saved['logical_session'], 'session_uuid': saved['provider_uuid']}
@@ -738,11 +872,14 @@ class Renewal:
                           if row['mode'] == 'start' and row['logical_session'] == saved['logical_session'])
             _, _, checkpoint = self.ledger.checkpoint(saved['job'])
             require(protocol.identity(checkpoint) == saved['checkpoint']['checkpoint_sha256'], 'resume checkpoint changed')
+            work = state['work_checks'][key]
+            require(work['head'] == checkpoint['candidate']['source_revision'], 'saved workspace and checkpoint source differ')
             payload = {**self.payload(state, reference), **spec, 'activation_operation': state['request']['operation'],
+                       'attempt_id': attempt_id,
                        'checkpoint': saved['checkpoint'], 'binding': registry.meta['binding'],
                        'candidate_sha': checkpoint['candidate']['source_revision'],
                        'start_operation': origin['operation'], 'start_request_sha256': origin['provider_request_sha256'],
-                       'pending_host': saved['pending_host']}
+                       'pending_host': saved['pending_host'], 'native_rollout': saved['native_rollout'], 'work': work}
             yield spec, payload
 
     def readiness(self, attempt, state, inventory, registries):
@@ -750,6 +887,23 @@ class Renewal:
         required_funds = {}
         deadline = int(time.time()) + 360 * len(inventory['sessions']) + 240
         keys = ('target_sha256', 'previous_sha256')
+        work = {}
+        for key in registries:
+            role, job = key.split('/')
+            for selector in keys:
+                reference = state['request'][selector]
+                plan = self.driver.invoke('preflight-runtime', {**self.payload(state, reference), 'role': role, 'job': job})
+                require(plan == {'role': role, 'job': job, 'artifact_sha256':
+                                 self.release(reference)['components'][role + '-agent']['artifact_sha256']},
+                        'role artifact preflight identity changed')
+            proof = self.driver.invoke('capture-work', {'role': role, 'job': job})
+            protocol.fields(proof, 'head status_sha256 check_sha256 check_exit')
+            protocol.digest(proof['head'], 40)
+            for field in ('status_sha256', 'check_sha256'):
+                digest(proof[field])
+            protocol.number(proof['check_exit'], 0, 2)
+            work[key] = proof
+        self.phase(attempt, state, 'backed-up', work_checks=work)
         for key in keys:
             reference = state['request'][key]
             for spec, payload in self.resume_payloads(state, reference, inventory, registries):
@@ -785,7 +939,8 @@ class Renewal:
             proof = state['proofs'].get(operation)
             if proof is None:
                 proof = self.driver.invoke('resume-without-effects', payload)
-            self.check_proof(proof, {**spec, 'request_sha256': state['continuity_requests'][operation]}, reference)
+            self.check_proof(proof, {**spec, 'request_sha256': state['continuity_requests'][operation],
+                                   'work_sha256': identity(payload['work'])}, reference)
             state['proofs'][operation] = proof
             self.phase(attempt, state, phase)
         self.confirm_tree(inventory)
@@ -802,16 +957,17 @@ class Renewal:
                 if receipt is None and dispatch['state'] == 'frozen':
                     # The coordinator can die after SQLite commits but before its journal write.
                     candidate = dispatch['identity']
-                    if candidate['attempt'] == state['request']['operation']:
+                    if candidate['attempt'] == attempt.name:
                         receipt = candidate
                 if receipt is not None:
                     binding = registry.meta['binding']
-                    if terminal == 'deferred':
+                    if terminal in ('deferred', 'rejected'):
                         registry.cancel_unactivated(receipt, binding)
                     else:
                         registry.abort_freeze(receipt, binding)
-            self.phase(attempt, state, terminal)
-            self.mark_host_fence(state['request']['operation'], frozen=False)
+            extras = {'retry_after': int(time.time()) + RETRY_DELAY} if terminal == 'deferred' else {}
+            self.phase(attempt, state, terminal, **extras)
+            self.mark_host_fence(attempt.name, frozen=False)
         return state
 
     def run(self, attempt, state):
@@ -822,6 +978,7 @@ class Renewal:
                 registries = self.registries(stack)
                 self.verify_driver('observe', state, previous)
                 self.verify_driver('validate', state, replacement)
+                self.verify_driver('validate', state, previous)
                 self.freeze(attempt, state, registries)
                 self.drain(registries)
                 inventory = self.capture(attempt, state, registries)
@@ -843,7 +1000,7 @@ class Renewal:
 
     def restore_trees(self, attempt, state, inventory):
         tree_copy = TreeCopy(self.byte_limit, time.monotonic() + self.seconds)
-        operation = state['request']['operation']
+        operation = attempt.name
         for key, entry in inventory['registries'].items():
             role, job = key.split('/')
             group = attempt / 'backup' / (role + '--' + job)
@@ -862,6 +1019,9 @@ class Renewal:
                 require(TreeCopy(self.byte_limit, tree_copy.deadline).visit(stage) == saved, 'restore staging is incomplete')
                 if live.exists():
                     require(not failed.exists() and not failed.is_symlink(), 'restore already retained changed state')
+                    node = live.lstat()
+                    state.setdefault('displaced', {})['/'.join((role, kind, failed.name))] = [node.st_dev, node.st_ino]
+                    self.phase(attempt, state, 'rolling-back')
                     live.rename(failed)
                     sync_directory(live.parent)
                 stage.rename(live)
@@ -877,7 +1037,8 @@ class Renewal:
             return self.thaw(attempt, state, 'completed')
         if phase in ('prepared', 'freezing', 'backed-up'):
             self.verify_driver('observe', state, state['request']['previous_sha256'])
-            return self.thaw(attempt, state, 'deferred')
+            terminal = 'rejected' if phase == 'prepared' and state.get('failure') else 'deferred'
+            return self.thaw(attempt, state, terminal)
         if phase == 'rollback-accepted':
             self.verify_driver('observe', state, state['request']['previous_sha256'])
             self.verify_pending(self.checked_inventory(attempt, state))
@@ -923,7 +1084,11 @@ class Renewal:
 
 def main():
     if len(sys.argv) == 4 and sys.argv[1] == '__ledger-helper':
-        print(canonical(ledger_helper(*sys.argv[2:])))
+        try:
+            result = ledger_helper(*sys.argv[2:])
+        except ValueError as error:
+            result = {'blocked': str(error)[:256]}
+        print(canonical(result))
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -932,6 +1097,7 @@ def main():
     reconcile.add_argument('--check-candidate', action='store_true')
     sub.add_parser('status')
     sub.add_parser('recover')
+    sub.add_parser('boot-fence')
     for command in ('register', 'turn'):
         command_parser = sub.add_parser(command)
         command_parser.add_argument('input', type=Path)
@@ -941,7 +1107,7 @@ def main():
     try:
         controller = Renewal(DEFAULT_ROOT, SiteDriver(DEFAULT_DRIVER), ledger_user=LEDGER_USER)
         if args.command == 'reconcile':
-            if args.scope == 'agent' and args.check_candidate and not controller.refresh_agent_target():
+            if args.scope == 'agent' and not controller.refresh_agent_target():
                 result = {'phase': 'candidate-unavailable', 'scope': args.scope,
                           'retained_release_sha256': controller.live_release()}
             else:
@@ -953,15 +1119,22 @@ def main():
                 attempt, result = controller.transition()
                 if result and result['phase'] not in TERMINAL:
                     result = controller.resume(attempt, result)
-                elif result:
-                    controller.mark_host_fence(result['request']['operation'], frozen=False)
+                else:
+                    controller.observe_then_clear_fence(attempt, result)
+        elif args.command == 'boot-fence':
+            controller.boot_fence()
+            result = {'phase': 'boot-fenced'}
         elif args.command == 'register':
             result = controller.register(read_json(args.input))
         else:
             prompt = read_private(args.prompt, 262144).decode()
             result = controller.role_turn(read_json(args.input), prompt)
         print(canonical(result))
-        return 2 if result and result.get('phase') == 'blocked' else 0
+        if result and result.get('phase') == 'blocked':
+            return 2
+        if result and result.get('phase') == 'deferred' and result.get('target_attempt', 1) < MAX_TARGET_ATTEMPTS:
+            return 75
+        return 0
     except BlockingIOError:
         parser.exit(75, 'renewal deferred while a trusted owner holds the lease\n')
     except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:

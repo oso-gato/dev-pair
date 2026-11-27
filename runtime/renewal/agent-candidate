@@ -47,14 +47,37 @@ def verify_attestation(subject, request, role, role_source, run_id):
     r.require(completed.returncode == 0, 'independent release attestation unavailable for ' + role)
 
 
+def publish_request(controller, scope, request, base, offer_sha=None):
+    with controller.lock():
+        current = controller.live_release()
+        r.require(current == base, 'current release changed during agent intake')
+        path = controller.control / 'requests' / (scope + '.json')
+        offer = controller.control / 'offers' / (scope + '.json')
+        if request is None:
+            r.require(not os.path.lexists(offer), 'agent offer appeared during intake')
+        else:
+            r.require(r.sha(r.read_private(offer, r.MAX_CONTROL)) == offer_sha, 'agent offer changed during intake')
+        if request is None or request['target_sha256'] == current:
+            if os.path.lexists(path):
+                path.unlink()
+                r.sync_directory(path.parent)
+        else:
+            r.replace_json(path, {'schema': 1, 'offer_sha256': offer_sha, 'request': request})
+
+
 def controller_offer(controller, scope='agent'):
-    record = r.read_json(CONTROL / 'offers' / (scope + '.json'))
+    current = controller.live_release()
+    path = CONTROL / 'offers' / (scope + '.json')
+    if not os.path.lexists(path):
+        publish_request(controller, scope, None, current)
+        return {'status': 'no-approved-offer', 'release_sha256': current}
+    raw = r.read_private(path, r.MAX_CONTROL)
+    record = r.loads(raw)
     p.fields(record, 'schema request run_ids')
     r.require(type(record['schema']) is int and record['schema'] == 1 and
               type(record['run_ids']) is dict and set(record['run_ids']) == set(r.ROLES), 'invalid approved agent offer')
     request = r.checked_request(record['request'], scope)
     reference = request['target_sha256']
-    current = controller.live_release()
     r.require(request['previous_sha256'] == current or reference == current, 'approved agent offer is stale')
     target = controller.release(reference)
     stable = official_version()
@@ -63,8 +86,7 @@ def controller_offer(controller, scope='agent'):
         r.require(component['codex_version'] == stable, 'approved offer is not the current official stable CLI')
         path = CONTROL / 'releases' / (reference + '.json')
         verify_attestation(path, request, role, component['source_revision'], record['run_ids'][role])
-    if reference != current:
-        r.replace_json(CONTROL / 'requests' / (scope + '.json'), request)
+    publish_request(controller, scope, request, current, r.sha(raw))
     return {'status': 'current' if reference == current else 'verified', 'version': stable, 'release_sha256': reference}
 
 

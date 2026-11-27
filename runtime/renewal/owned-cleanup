@@ -26,7 +26,7 @@ def systemctl(*args, allowed=(0,), seconds=25):
 
 def stopped_unit(unit, *, user, description=None):
     fields = ('Id', 'LoadState', 'ActiveState', 'User', 'Description')
-    raw = systemctl('show', *('--property=' + field for field in fields), unit, allowed=(0, 1, 4))
+    raw = systemctl('show', '--all', *('--property=' + field for field in fields), unit, allowed=(0, 1, 4))
     facts = dict(line.split('=', 1) for line in raw.splitlines())
     r.require(set(facts) == set(fields) and facts['Id'] == unit, 'unverified manager unit identity')
     if facts['LoadState'] == 'not-found':
@@ -153,6 +153,12 @@ def cleanup(controller):
         broker = 'dev-pair-provider@' + record['request_sha256'] + '.service'
         stopped_unit(broker, user='root')
         stale_socket(record)
+        role_start = CONTROL / 'turn-launches' / key / 'role-started.json'
+        if not os.path.lexists(role_start):
+            stored = ROOT / role / 'state' / job / 'turns' / operation
+            r.require(not os.path.lexists(stored), 'role result exists without an authorized launch marker')
+            continue
+        r.require(r.read_json(role_start) == record, 'owned role launch identity changed')
         release = controller.release(record['release_sha256'])
         host = release['components']['host']
         r.require(record['release_sha256'] in (journal['request']['target_sha256'], journal['request']['previous_sha256']),

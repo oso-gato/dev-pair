@@ -56,15 +56,21 @@ def launch(sha):
               info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600, 'operator provider credential unavailable')
     root_directory(CHANNELS, 0o711)
     socket_dir = CHANNELS / sha[:32]
-    socket_dir.mkdir(mode=0o700)
-    os.chown(socket_dir, 0, account.pw_gid)
     source = ROOT / role / 'state' / job
     state = source.lstat()
     r.require(source.resolve(strict=True) == source and stat.S_ISDIR(state.st_mode) and state.st_uid == account.pw_uid,
               'broker requires the admitted role state leaf')
     label = os.getxattr(source, 'security.selinux')
-    os.setxattr(socket_dir, 'security.selinux', label)
-    socket_dir.chmod(0o750)
+    if os.path.lexists(socket_dir):
+        node = socket_dir.lstat()
+        r.require(stat.S_ISDIR(node.st_mode) and (node.st_uid, node.st_gid) == (0, account.pw_gid) and
+                  stat.S_IMODE(node.st_mode) == 0o750 and not any(socket_dir.iterdir()) and
+                  os.getxattr(socket_dir, 'security.selinux') == label, 'prior provider channel cannot be safely reused')
+    else:
+        socket_dir.mkdir(mode=0o700)
+        os.chown(socket_dir, 0, account.pw_gid)
+        os.setxattr(socket_dir, 'security.selinux', label)
+        socket_dir.chmod(0o750)
     evidence = ROOT / 'provider-evidence'
     for path in (evidence, evidence / role, evidence / role / job):
         root_directory(path)

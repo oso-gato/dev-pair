@@ -6,6 +6,8 @@ from pathlib import Path, PurePosixPath
 import stat
 import subprocess
 import sys
+import tempfile
+import time
 
 INSTALL = Path('/usr/libexec/dev-pair')
 sys.path.insert(0, str(INSTALL / 'tools'))
@@ -15,8 +17,11 @@ from renewal import protocol as p
 CONTROL = r.DEFAULT_ROOT / 'renewal'
 STORE = INSTALL / 'host-releases'
 CONFIGS = Path('/etc/dev-pair/host-releases')
+FENCE = r.DEFAULT_ROOT / 'renewal-fence'
+SYSTEMCTL = '/usr/bin/systemctl'
 REQUIRED = {'tools/gptbox.py', 'tools/devbox.py', 'tools/provider_broker.py', 'tools/host_handoff.py',
-            'runtime/devbox/controller.py', 'runtime/checklist/checklist_quadlet.py'}
+            'tools/job_protocol.py', 'tools/ledger_recovery.py', 'runtime/devbox/controller.py',
+            'runtime/checklist/checklist_quadlet.py', 'runtime/checklist/acceptance.container'}
 MAX_HOST_FILES = 256
 MAX_HOST_BYTES = 32 * 1024 * 1024
 
@@ -114,6 +119,76 @@ def measure_release(component, release_dir, config, observed):
             'hostname': observed['hostname'], 'platform': observed['platform'], 'selinux': observed['selinux']}
 
 
+def publish_selector(component):
+    fd, temporary = tempfile.mkstemp(prefix='.host-selector-', dir=FENCE)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(r.json_bytes({'schema': 1, 'artifact_sha256': component['artifact_sha256']}))
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.fsync(stream.fileno())
+        os.replace(temporary, FENCE / 'selected-host.json')
+        r.sync_directory(FENCE)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def listen_inode(proc, port=19425):
+    inodes = set()
+    for path in (proc / 'fd').iterdir():
+        try:
+            target = os.readlink(path)
+        except FileNotFoundError:
+            continue
+        if target.startswith('socket:[') and target.endswith(']'):
+            inodes.add(target[8:-1])
+    for line in (proc / 'net' / 'tcp').read_text().splitlines()[1:]:
+        row = line.split()
+        if len(row) >= 10 and row[1] == f'0100007F:{port:04X}' and row[3] == '0A' and row[9] in inodes:
+            return row[9]
+    raise ValueError('selected handoff executor does not own its loopback listener')
+
+
+def inspect_handoff(unit, command, account):
+    fields = 'Id,ActiveState,MainPID,ControlGroup,User,Group,ExecMainStartTimestampMonotonic'
+    data = subprocess.check_output([SYSTEMCTL, 'show', '--all', '--property=' + fields, unit], text=True, timeout=5)
+    facts = dict(line.split('=', 1) for line in data.splitlines())
+    r.require(set(facts) == set(fields.split(',')) and facts['Id'] == unit and facts['ActiveState'] == 'active' and
+              facts['User'] == facts['Group'] == account.pw_name and facts['ControlGroup'].endswith('/' + unit) and
+              facts['MainPID'].isdigit() and int(facts['MainPID']) > 1 and facts['ExecMainStartTimestampMonotonic'].isdigit(),
+              'managed handoff service is unavailable')
+    proc = Path('/proc') / facts['MainPID']
+    observed = (proc / 'cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+    status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines() if ':' in line)
+    r.require(observed == command and (proc / 'exe').resolve() == Path(command[0]).resolve() and
+              status['Uid'].split() == [str(account.pw_uid)] * 4 and status['Gid'].split() == [str(account.pw_gid)] * 4 and
+              '0::' + facts['ControlGroup'] in (proc / 'cgroup').read_text().splitlines(),
+              'handoff service does not use the selected immutable launch profile')
+    listener = listen_inode(proc)
+    r.require((proc / 'cmdline').read_bytes().rstrip(b'\0').decode().split('\0') == observed, 'handoff PID changed while observing')
+    return {'unit': unit, 'pid': int(facts['MainPID']), 'started': int(facts['ExecMainStartTimestampMonotonic']),
+            'command_sha256': r.identity(command), 'socket_inode': listener}
+
+
+def handoff_runtime(directory, *, restart):
+    account = r.pwd.getpwnam('dp-checklist')
+    unit = f'dev-pair-checklist-executor@{account.pw_uid}.service'
+    raw = subprocess.check_output([str(INSTALL / 'renewal' / 'checklist-entry'), '--describe'], timeout=5)
+    command = r.loads(raw)
+    r.require(command[2] == str(directory / 'tools' / 'host_handoff.py'), 'handoff selector names a different release')
+    if restart:
+        subprocess.run([SYSTEMCTL, 'restart', unit], check=True, timeout=85)
+    deadline = time.monotonic() + 12
+    while True:
+        try:
+            return inspect_handoff(unit, command, account)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+
+
 def selected_component(controller, control, action):
     path = control / 'host-selection.json'
     if action == 'observe':
@@ -142,10 +217,20 @@ def main():
         directory, config = release_dirs(STORE, component, CONFIGS)
         measure_release(component, directory, config, host_measurement())
         return
+    if sys.argv[1] == 'verify' and len(sys.argv) == 3:
+        component = controller.release(sys.argv[2])['components']['host']
+        r.require(component == r.read_json(CONTROL / 'host-selection.json'), 'observed host selector is stale')
+        directory, config = release_dirs(STORE, component, CONFIGS)
+        receipt = measure_release(component, directory, config, host_measurement())
+        receipt['handoff'] = handoff_runtime(directory, restart=False)
+        print(r.canonical(receipt))
+        return
     r.require(len(sys.argv) == 2 and sys.argv[1] in ('apply', 'observe'), 'unsupported host release entry')
     component = selected_component(controller, CONTROL, sys.argv[1])
     directory, config = release_dirs(STORE, component, CONFIGS)
     receipt = measure_release(component, directory, config, host_measurement())
+    publish_selector(component)
+    receipt['handoff'] = handoff_runtime(directory, restart=True)
     r.replace_json(CONTROL / 'host-selection.json', component)
     r.replace_json(CONTROL / 'host-observed.json', receipt)
     print(r.canonical({'boot_id': receipt['boot_id'], 'artifact_sha256': component['artifact_sha256']}))

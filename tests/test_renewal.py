@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -25,7 +26,7 @@ class RenewalTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.control = self.root / 'renewal'
-        for relative in ('renewal', 'renewal/attempts', 'renewal/registries', 'renewal/requests', 'renewal/releases',
+        for relative in ('renewal', 'renewal/attempts', 'renewal/registries', 'renewal/requests', 'renewal/releases', 'renewal/offers',
                          'renewal/registry-staging'):
             (self.root / relative).mkdir(mode=0o700)
         fence = self.root / 'renewal-fence'
@@ -119,6 +120,10 @@ class RenewalTests(unittest.TestCase):
         value = {'schema': 1, 'operation': operation, 'scope': scope,
                  'previous_sha256': previous or self.prior, 'target_sha256': until,
                  'affected_jobs': ['product'], 'reason': 'Platform repair found in product job'}
+        if scope == 'agent':
+            offer = {'schema': 1, 'request': value, 'run_ids': {'maintenance': 1, 'development': 2}}
+            r.replace_json(self.control / 'offers' / 'agent.json', offer)
+            value = {'schema': 1, 'request': value, 'offer_sha256': r.identity(offer)}
         r.replace_json(self.control / 'requests' / (scope + '.json'), value)
 
     def assert_sessions_preserved(self, state, active):
@@ -203,6 +208,82 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(result['phase'], 'deferred', result)
         self.assertEqual(self.renewal.live_release(), self.prior)
         self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+
+    def test_unregistered_durable_job_prevents_disruption_even_with_valid_registry_catalogue(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        missing = self.root / 'development' / 'state' / 'unregistered'
+        missing.mkdir()
+        (missing / 'pending-context').write_text('must survive')
+        result = self.renewal.apply('agent')
+        self.assertEqual(result['phase'], 'deferred', result)
+        self.assertIn('durable job catalogue', result['failure']['reason'])
+        self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+
+    def test_transient_deferral_retries_same_approval_and_rejected_target_cannot_be_renamed(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        unavailable = self.root / 'missing-release-artifact'
+        unavailable.write_text(self.prior)
+        first = self.renewal.apply('agent')
+        self.assertEqual(first['phase'], 'deferred', first)
+        self.assertEqual(self.renewal.apply('agent'), first)
+        attempt, _ = self.renewal.transition()
+        r.replace_json(attempt / 'journal.json', {**first, 'retry_after': 0})
+        unavailable.unlink()
+        (self.root / 'disrupt-release').write_text(target)
+        next_result = self.renewal.apply('agent')
+        self.assertEqual((next_result['phase'], next_result['target_attempt']), ('rolled-back', 2), next_result)
+        self.assertNotEqual(first['attempt_id'], next_result['attempt_id'])
+        self.request(target, operation='other-id')
+        self.assertEqual(self.renewal.apply('agent'), next_result)
+
+    def test_idle_startup_fence_survives_failed_observation(self):
+        lost = self.root / 'failed-host-observation'
+        lost.touch()
+        self.renewal.boot_fence()
+        with self.renewal.lock(), self.assertRaisesRegex(ValueError, 'observe'):
+            self.renewal.observe_then_clear_fence(None, None)
+        self.assertTrue((self.effect_lock.parent / 'frozen').is_file())
+        lost.unlink()
+        with self.renewal.lock():
+            self.renewal.observe_then_clear_fence(None, None)
+        self.assertFalse((self.effect_lock.parent / 'frozen').exists())
+
+    def test_terminal_recovery_cannot_clear_boot_fence_without_live_observation(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        self.assertEqual(self.renewal.apply('agent')['phase'], 'completed')
+        self.renewal.boot_fence()
+        lost = self.root / 'failed-host-observation'
+        lost.touch()
+        with self.assertRaisesRegex(ValueError, 'observe'):
+            self.renewal.apply('agent')
+        self.assertTrue((self.effect_lock.parent / 'frozen').exists())
+        lost.unlink()
+        self.assertEqual(self.renewal.apply('agent')['phase'], 'completed')
+        self.assertFalse((self.effect_lock.parent / 'frozen').exists())
+
+    def test_current_intake_clears_older_pending_request(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        candidate = runpy.run_path(str(TOOLS.parent / 'runtime' / 'renewal' / 'agent-candidate'))
+        offer = {'request': {'target_sha256': self.prior}}
+        r.replace_json(self.control / 'offers' / 'agent.json', offer)
+        candidate['publish_request'](self.renewal, 'agent', offer['request'], self.prior, r.identity(offer))
+        fresh = self.renewal.apply('agent')
+        self.assertEqual(fresh['phase'], 'no-approved-target')
+        self.assertEqual(self.renewal.live_release(), self.prior)
+
+    def test_withdrawn_and_changed_offers_invalidate_protected_pending_approval(self):
+        self.request(self.release('b', self.prior))
+        offer = self.control / 'offers' / 'agent.json'
+        raw = r.read_json(offer)
+        r.replace_json(offer, {**raw, 'run_ids': {'development': 3, 'maintenance': 4}})
+        with self.assertRaisesRegex(ValueError, 'changed or revoked'):
+            self.renewal.apply('agent')
+        offer.unlink()
+        self.assertEqual(self.renewal.apply('agent')['phase'], 'no-approved-target')
 
     def test_missing_rollback_allowance_defers_before_replacement(self):
         target = self.release('b', self.prior)
@@ -295,15 +376,26 @@ class RenewalTests(unittest.TestCase):
 
 class ProgressTests(unittest.TestCase):
     def test_fixed_driver_requires_a_fresh_checkpoint_progress_message(self):
-        check = runpy.run_path(str(TOOLS.parent / 'runtime' / 'renewal' / 'driver'))['verify_progress']
+        driver = runpy.run_path(str(TOOLS.parent / 'runtime' / 'renewal' / 'driver'))
+        check = driver['verify_progress']
         expected = {'operation': 'renew-next', 'checkpoint': 'saved-checkpoint',
                     'outstanding_work': 'Tracked edit remains incomplete', 'next_action': 'Run focused test'}
         event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(expected)}}
-        spec = {'operation': 'renew-next', 'checkpoint': {'checkpoint_id': 'saved-checkpoint'}}
-        self.assertEqual(check(r.json_bytes(event), spec), r.identity(expected))
+        work = {'head': 'a' * 40, 'status_sha256': r.sha(b' M file'), 'check_sha256': r.sha(b''), 'check_exit': 0}
+        spec = {'operation': 'renew-next', 'checkpoint': {'checkpoint_id': 'saved-checkpoint'}, 'work': work}
+        def tool(command, body):
+            return {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': shlex.join(command),
+                    'exit_code': 0, 'aggregated_output': body}}
+        observations = (tool(driver['STATUS'], ' M file\n'), tool(driver['CHECK'], ''))
+        events = b'\n'.join(r.json_bytes(row) for row in (*observations, event))
+        self.assertEqual(check(events, spec), r.identity({'progress': expected, 'work': work}))
+        with self.assertRaisesRegex(ValueError, 'product integrity'):
+            check(r.json_bytes(event), spec)
+        with self.assertRaisesRegex(ValueError, 'product integrity'):
+            check(b'\n'.join(r.json_bytes(row) for row in (tool(driver['STATUS'], 'wrong'), observations[1], event)), spec)
         stale = {**spec, 'operation': 'renew-later'}
         with self.assertRaisesRegex(ValueError, 'stale'):
-            check(r.json_bytes(event), stale)
+            check(events, stale)
 
 
 if __name__ == '__main__':

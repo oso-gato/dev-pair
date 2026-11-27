@@ -1,9 +1,12 @@
 #!/usr/bin/python3 -I
 """Fixed external Fedora adapter for reviewed dev-pair release plans."""
+import contextlib
 import fcntl
 import os
 from pathlib import Path
 import re
+import shlex
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -22,6 +25,9 @@ CONTROL = ROOT / 'renewal'
 SYSTEMCTL = '/usr/bin/systemctl'
 PYTHON = '/usr/bin/python3'
 RUNUSER = '/usr/sbin/runuser'
+GIT = ('/usr/bin/git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null')
+STATUS = (*GIT, 'status', '--porcelain=v1', '--untracked-files=all')
+CHECK = (*GIT, 'diff', '--check', '--no-ext-diff', '--no-textconv', 'HEAD')
 
 
 def owned_file(path, limit, expected_uid=0):
@@ -87,7 +93,7 @@ def development_manifest(job, sha):
 
 def live_host(component):
     row = r.read_json(CONTROL / 'host-observed.json')
-    p.fields(row, 'schema boot_id component launch_root role_launch_seconds hostname platform selinux')
+    p.fields(row, 'schema boot_id component launch_root role_launch_seconds hostname platform selinux handoff')
     boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
     release = INSTALL / 'host-releases' / component['artifact_sha256']
     r.require(row['schema'] == 2 and row['boot_id'] == boot_id and row['component'] == component and
@@ -96,6 +102,13 @@ def live_host(component):
               'live Fedora host release is unverified')
     p.number(row['role_launch_seconds'], 90, 169)
     return release, row['role_launch_seconds']
+
+
+def observe_host(reference, component):
+    live_host(component)
+    actual = r.loads(run([str(INSTALL / 'renewal' / 'host-release'), 'verify', reference], timeout=25))
+    r.require(actual['component'] == component and actual['handoff']['pid'] > 1,
+              'live handoff did not confirm the selected host release')
 
 
 def release_action(action, payload):
@@ -111,13 +124,13 @@ def release_action(action, payload):
     if action == 'activate':
         r.require(not any((CONTROL / 'owned-turns').iterdir()), 'role cleanup evidence required before activation')
         try:
-            live_host(release['components']['host'])
-        except (OSError, ValueError):
+            observe_host(reference, release['components']['host'])
+        except (OSError, ValueError, subprocess.SubprocessError):
             r.require(payload['scope'] == 'host', 'host change outside approved scope')
             r.replace_json(CONTROL / 'host-desired.json', {'operation': operation, 'release_sha256': reference,
                                                             'component': release['components']['host']})
-            unit('start', 'dev-pair-managed-host-release.service')
-        live_host(release['components']['host'])
+            unit('start', 'dev-pair-managed-host-release.service', timeout=105)
+        observe_host(reference, release['components']['host'])
         r.replace_json(selector, reference)
     if action == 'quiesce':
         owned = sorted((CONTROL / 'owned-turns').iterdir())
@@ -135,7 +148,7 @@ def release_action(action, payload):
             r.sync_directory(CONTROL / 'owned-turns')
     if action == 'observe':
         r.require(r.read_json(selector) == reference, 'selected release differs from live readback')
-        live_host(release['components']['host'])
+        observe_host(reference, release['components']['host'])
     return {'release_sha256': reference, 'components': release['components']}
 
 
@@ -148,6 +161,50 @@ def operation_leaf(role, job, operation):
     return path
 
 
+def preflight_runtime(payload):
+    release, plan = admit_release(payload['release_sha256'])
+    role, job = payload['role'], payload['job']
+    r.require(role in r.ROLES, 'unknown preflight role')
+    r.token(job)
+    script = str(INSTALL / 'renewal' / 'role-preflight')
+    spec = {'role': role, 'job': job, 'component': release['components'][role + '-agent'],
+            'host_artifact_sha256': release['components']['host']['artifact_sha256']}
+    if role == 'maintenance':
+        spec['context_sha256'] = plan['maintenance_context_sha256']
+        command = [script]
+    else:
+        r.require(job in plan['development_manifests'], 'approved development launch map omits a registered job')
+        spec['manifest_sha256'] = plan['development_manifests'][job]
+        command = [RUNUSER, '--user', 'dp-dev', '--', script]
+    return r.loads(run(command, timeout=160, input_data=r.json_bytes(spec)))
+
+
+def work_digest(data):
+    return r.sha(data.rstrip(b'\n'))
+
+
+def capture_work(payload):
+    role, job = payload['role'], payload['job']
+    r.token(job)
+    account = {'maintenance': 'dp-maint', 'development': 'dp-dev'}[role]
+    directory = ROOT / role / 'workspaces' / job
+    owned_dir(directory, r.pwd.getpwnam(account).pw_uid)
+
+    def git(command, accepted):
+        result = subprocess.run([RUNUSER, '--user', account, '--', *command], cwd=directory,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False,
+                                env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'GIT_CONFIG_NOSYSTEM': '1', 'HOME': '/nonexistent'})
+        r.require(result.returncode in accepted and len(result.stdout) <= 65536, 'checkpoint Git work observation failed')
+        result.stdout.decode('utf-8')
+        return result.returncode, result.stdout
+
+    _, head = git((*GIT, 'rev-parse', '--verify', 'HEAD'), (0,))
+    _, status = git(STATUS, (0,))
+    code, check = git(CHECK, (0, 2))
+    return {'head': head.decode().strip(), 'status_sha256': work_digest(status),
+            'check_sha256': work_digest(check), 'check_exit': code}
+
+
 def stage_verification(payload):
     role, job, operation = (payload[key] for key in ('role', 'job', 'operation'))
     origin = operation_leaf(role, job, payload['start_operation'])
@@ -157,10 +214,12 @@ def stage_verification(payload):
               'renewal request is not bound to its original durable session')
     leaf = operation_leaf(role, job, operation)
     checkpoint = payload['checkpoint']['checkpoint_id']
-    prompt = (f'Resume the saved work for checkpoint {checkpoint}. Read the retained job context and inspect the '
-              'current uncommitted work. Keep the workspace unchanged and take no external actions. Report '
-              'what remains and the next concrete implementation step in a JSON object with keys operation, '
-              f'checkpoint, outstanding_work and next_action. Set operation to {operation} and checkpoint to {checkpoint}.').encode()
+    r.require(payload['work']['head'] == payload['candidate_sha'], 'recorded checkpoint is not the saved workspace HEAD')
+    prompt = (f'Resume the saved job at checkpoint {checkpoint}. Run these two read-only commands individually '
+              f'in /work/job using the command tool. Keep the workspace unchanged and take no external actions.\n'
+              f'{shlex.join(STATUS)}\n{shlex.join(CHECK)}\n'
+              'Use the resulting Git status and diff integrity check to explain the current changes and what work '
+              f'remains. Reply in JSON with operation={operation}, checkpoint={checkpoint}, outstanding_work and next_action.').encode()
     request.update(operation=operation, action='resume', session_uuid=payload['session_uuid'],
                    candidate_sha=payload['candidate_sha'], prompt_sha256=r.sha(prompt),
                    turn_seconds=min(60, request['turn_seconds']))
@@ -214,11 +273,25 @@ def preflight_allowance(payload):
 
 def verify_progress(events, payload):
     messages = []
+    observations = {}
     for line in events.splitlines():
         row = r.loads(line)
         item = row.get('item', {})
-        if row.get('type') == 'item.completed' and item.get('type') == 'agent_message':
+        if row.get('type') == 'item.completed' and item.get('type') == 'agent_message' and len(observations) == 2:
             messages.append(item['text'])
+        if row.get('type') != 'item.completed' or item.get('type') != 'command_execution':
+            continue
+        command = shlex.split(item['command'])
+        if len(command) == 3 and command[0] in ('/bin/bash', '/usr/bin/bash', 'bash') and command[1] in ('-c', '-lc'):
+            command = shlex.split(command[2])
+        key = {STATUS: 'status', CHECK: 'check'}.get(tuple(command))
+        if key is not None:
+            r.require(key not in observations and type(item['exit_code']) is int and type(item['aggregated_output']) is str,
+                      'ambiguous resumed checkpoint tool evidence')
+            observations[key] = (item['exit_code'], work_digest(item['aggregated_output'].encode()))
+    work = payload['work']
+    r.require(observations == {'status': (0, work['status_sha256']), 'check': (work['check_exit'], work['check_sha256'])},
+              'fresh resumed product integrity checks do not match the saved checkpoint')
     r.require(messages, 'renewal produced no resumed progress')
     final = messages[-1].strip()
     fenced = re.fullmatch(r'```(?:json)?\s*([^`]+)\s*```', final, re.DOTALL)
@@ -228,7 +301,18 @@ def verify_progress(events, payload):
               progress['checkpoint'] == payload['checkpoint']['checkpoint_id'], 'resumed progress is stale')
     for key in ('outstanding_work', 'next_action'):
         p.text(progress[key], 2000)
-    return r.identity(progress)
+        r.require(len(progress[key].split()) >= 3, 'resumed product summary omits substantive work')
+    return r.identity({'progress': progress, 'work': work})
+
+
+def continued_rollout(payload, uid):
+    before = payload['native_rollout']
+    root = ROOT / payload['role'] / 'state' / payload['job']
+    current, _ = native_sessions(root, uid)
+    after = current[payload['session_uuid']]
+    r.require(after['path'] == before['path'] and after['bytes'] > before['bytes'], 'saved session did not advance its native rollout')
+    raw = owned_file(root / after['path'], 4 * 1024 * 1024, uid)
+    r.require(r.sha(raw[:before['bytes']]) == before['sha256'], 'resumed rollout replaced original session history')
 
 
 def require_provider_ready(request_sha, gid):
@@ -261,6 +345,62 @@ def provider_receipt(spec, request_sha):
     return r.sha(data)
 
 
+def install_exact(path, value):
+    if os.path.lexists(path):
+        r.require(r.read_json(path) == value, 'protected operation record changed')
+    else:
+        r.replace_json(path, value)
+
+
+def turn_root(control, key, owned, broker):
+    """Preparation is idempotent and cannot itself start any worker or broker."""
+    install_exact(control / 'broker-requests' / (owned['request_sha256'] + '.json'), broker)
+    install_exact(control / 'owned-turns' / key, owned)
+    path = control / 'turn-launches' / key
+    if not os.path.lexists(path):
+        r.create_directory(path)
+    return r.trusted_directory(path)
+
+
+def durable_launch(root, owned, launch, no_attempt):
+    """Never call launch again until protected evidence proves where it stopped."""
+    marker, output = root / 'dispatched.json', root / 'launcher.json'
+    if os.path.lexists(output):
+        try:
+            return r.read_json(output)
+        except ValueError:
+            r.require(no_attempt(), 'dispatched provider outcome is uncertain')
+            output.unlink()
+            r.sync_directory(root)
+    if os.path.lexists(marker):
+        r.require(r.read_json(marker) == owned and no_attempt(), 'dispatched provider outcome is uncertain')
+    else:
+        r.replace_json(marker, owned)
+    launch(output)
+    return r.read_json(output)
+
+
+def close_owned(pending):
+    if os.path.lexists(pending):
+        pending.unlink()
+        r.sync_directory(pending.parent)
+
+
+def no_provider_attempt(owned):
+    role, job, operation = (owned[key] for key in ('role', 'job', 'operation'))
+    request = owned['request_sha256']
+    socket = Path('/run/dev-pair/provider') / request[:32] / 'responses.sock'
+    result = ROOT / role / 'state' / job / 'turns' / operation
+    receipt = ROOT / 'provider-evidence' / role / job / (operation + '.json')
+    if any(os.path.lexists(path) for path in (socket, result, receipt)):
+        return False
+    broker = 'dev-pair-provider@' + request + '.service'
+    value = run([SYSTEMCTL, 'show', '--property=Id,ActiveState,LoadState,User', '--all', broker], timeout=8)
+    row = dict(line.split('=', 1) for line in value.decode().splitlines())
+    return row.get('Id') == broker and row.get('ActiveState') == 'inactive' and (
+        row.get('LoadState') == 'not-found' or row.get('LoadState') == 'loaded' and row.get('User') == 'root')
+
+
 def turn(action, payload):
     role, job, operation = (payload[key] for key in ('role', 'job', 'operation'))
     reference = payload['release_sha256']
@@ -271,11 +411,13 @@ def turn(action, payload):
     uid = r.pwd.getpwnam(role_account).pw_uid
     leaf = operation_leaf(role, job, operation)
     probe = action == 'resume-without-effects'
-    receipt_path = CONTROL / 'turn-receipts' / f'{role}--{job}--{operation}'
+    key = f'{role}--{job}--{operation}'
+    receipt_path = CONTROL / 'turn-receipts' / key
+    pending = CONTROL / 'owned-turns' / key
     if probe and os.path.lexists(receipt_path):
         recorded = r.read_json(receipt_path)
-        r.require(recorded['input_sha256'] == r.identity(payload) and not os.path.lexists(
-            CONTROL / 'owned-turns' / receipt_path.name), 'renewal progress replay is not settled')
+        r.require(recorded['input_sha256'] == r.identity(payload), 'renewal progress replay is not settled')
+        close_owned(pending)
         return recorded['proof']
     request_sha = stage_verification(payload) if probe else payload['request_sha256']
     request = gptbox.job_selection(owned_file(leaf / 'turn' / 'request.json', 4096), request_sha, role, job, operation)
@@ -295,25 +437,29 @@ def turn(action, payload):
         manifest_sha = plan['development_manifests'][job]
         command = [RUNUSER, '--user', role_account, '--', PYTHON, '-B', str(host_release / 'tools' / 'devbox.py'), 'run',
                    '--manifest', str(development_manifest(job, manifest_sha)), '--sha256', manifest_sha]
-    pending = CONTROL / 'owned-turns' / f'{role}--{job}--{operation}'
     r.require((CONTROL / 'provider-grants' / (request_sha + '.json')).is_file(),
               'exact provider operation authorization unavailable')
-    broker_request = CONTROL / 'broker-requests' / (request_sha + '.json')
-    r.write_private(broker_request, r.json_bytes({'role': role, 'job': job, 'operation': operation,
-                                                 'credential_ref': binding['credential_ref'],
-                                                 'host_artifact_sha256': release['components']['host']['artifact_sha256']}))
-    r.sync_directory(broker_request.parent)
-    r.write_private(pending, r.json_bytes({'role': role, 'job': job, 'operation': operation,
-                                          'request_sha256': request_sha, 'release_sha256': reference,
-                                          'maintenance_context_sha256': plan['maintenance_context_sha256'],
-                                          'development_manifest_sha256': plan['development_manifests'].get(job)}))
-    r.sync_directory(pending.parent)
+    broker = {'role': role, 'job': job, 'operation': operation, 'credential_ref': binding['credential_ref'],
+              'host_artifact_sha256': release['components']['host']['artifact_sha256']}
+    owned = {'role': role, 'job': job, 'operation': operation, 'request_sha256': request_sha, 'release_sha256': reference,
+             'maintenance_context_sha256': plan['maintenance_context_sha256'],
+             'development_manifest_sha256': plan['development_manifests'].get(job)}
+    journal = turn_root(CONTROL, key, owned, broker)
     channel = 'dev-pair-provider@' + request_sha + '.service'
-    unit('start', channel)
-    try:
+
+    def launch(output):
+        unit('start', channel)
         require_provider_ready(request_sha, r.pwd.getpwnam(role_account).pw_gid)
-        launch_time = min(host_limit, 175 - 20)
-        report = r.loads(run([*command, '--operation', operation, '--request-sha256', request_sha], timeout=launch_time))
+        install_exact(output.parent / 'role-started.json', owned)
+        with os.fdopen(os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), 'wb') as stream:
+            process = subprocess.run([*command, '--operation', operation, '--request-sha256', request_sha], stdout=stream,
+                                     env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}, timeout=min(host_limit, 155), check=False)
+            os.fsync(stream.fileno())
+        r.sync_directory(output.parent)
+        r.require(process.returncode == 0, 'fixed role launcher did not complete')
+
+    try:
+        report = durable_launch(journal, owned, launch, lambda: no_provider_attempt(owned))
     finally:
         unit('stop', channel)
     if role == 'maintenance':
@@ -336,20 +482,21 @@ def turn(action, payload):
               turn_result['runtime_admitted'] is True, 'bound real provider result missing')
     for key in ('role', 'job', 'operation', 'logical_session', 'model', 'effort', 'provider', 'standards_sha', 'candidate_sha'):
         r.require(turn_result[key] == request[key], 'observed turn request changed')
-    pending.unlink()
-    r.sync_directory(pending.parent)
     events = owned_file(stored / 'events.jsonl', 4 * 1024 * 1024, uid)
     r.require(r.sha(events) == turn_result['events_sha256'] and len(events) == turn_result['events_bytes'] and
               gptbox.completed_turn(events) == turn_result['session_uuid'], 'provider history evidence changed')
+    if probe:
+        continued_rollout(payload, uid)
     proof = {key: payload[key] for key in ('role', 'job', 'logical_session', 'operation')} | {
         'request_sha256': request_sha, 'release_sha256': reference, 'session_uuid': turn_result['session_uuid'],
         'events_sha256': turn_result['events_sha256'], 'child_reaped': True,
         'provider_receipt_sha256': provider_receipt(payload, request_sha),
+        'work_sha256': r.identity(payload['work']) if probe else None,
         'progress_sha256': verify_progress(events, payload) if probe else None,
     }
     if probe:
-        r.write_private(receipt_path, r.json_bytes({'input_sha256': r.identity(payload), 'proof': proof}))
-        r.sync_directory(receipt_path.parent)
+        install_exact(receipt_path, {'input_sha256': r.identity(payload), 'proof': proof})
+    close_owned(pending)
     return proof
 
 
@@ -376,7 +523,86 @@ def verify_sessions(payload):
                 r.require(row[key] == payload['binding'][key], 'durable provider session policy changed')
             actual.append({'logical_session': leaf.name, 'uuid': r.session(row['session_uuid'])})
     r.require(actual == payload['sessions'], 'incomplete durable provider session coverage')
-    return {'sessions': actual}
+    retained, archived = native_sessions(base, uid)
+    r.require(set(retained) == {item['uuid'] for item in actual}, 'native Codex and registry session catalogues differ')
+    return {'sessions': actual, 'native': retained, 'archived': archived}
+
+
+def owned_dir(path, uid):
+    node = path.lstat()
+    r.require(path.resolve(strict=True) == path and stat.S_ISDIR(node.st_mode) and node.st_uid == uid and
+              not node.st_mode & 0o022, 'unsafe native session directory')
+
+
+def rollout_inventory(base, uid):
+    records = {}
+    count = 0
+    for branch in ('sessions', 'archived_sessions'):
+        start = base / 'codex' / branch
+        if not os.path.lexists(start):
+            continue
+        stack = [start]
+        while stack:
+            directory = stack.pop()
+            owned_dir(directory, uid)
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    count += 1
+                    r.require(count <= 1024, 'native rollout catalogue exceeds bound')
+                    path = Path(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(path)
+                        continue
+                    r.require(path.suffix == '.jsonl' and path.name.startswith('rollout-'), 'unexpected native rollout entry')
+                    raw = owned_file(path, 4 * 1024 * 1024, uid)
+                    first, _, _ = raw.partition(b'\n')
+                    r.require(0 < len(first) <= 65536, 'invalid native rollout header')
+                    meta = r.loads(first)
+                    r.require(meta['type'] == 'session_meta' and meta['payload']['cwd'] == '/work/job',
+                              'native rollout workspace identity changed')
+                    ident = r.session(meta['payload']['id'])
+                    r.require(ident not in records and path.name.endswith(ident + '.jsonl'), 'ambiguous native rollout identity')
+                    records[ident] = ({'path': path.relative_to(base).as_posix(), 'bytes': len(raw),
+                                       'sha256': r.sha(raw)}, branch == 'archived_sessions')
+    return records
+
+
+def native_sessions(base, uid):
+    rollouts = rollout_inventory(base, uid)
+    directory = base / 'sqlite'
+    database = directory / 'state_5.sqlite'
+    if not os.path.lexists(database):
+        r.require(not rollouts and not any(os.path.lexists(database.with_name(database.name + suffix))
+                    for suffix in ('-wal', '-shm', '-journal')), 'native provider state database is missing')
+        return {}, {}
+    owned_dir(directory, uid)
+    with tempfile.TemporaryDirectory() as temporary:
+        image = Path(temporary) / database.name
+        for suffix in ('', '-wal', '-shm', '-journal'):
+            member = database.with_name(database.name + suffix)
+            if os.path.lexists(member):
+                data = owned_file(member, 64 * 1024 * 1024, uid)
+                if suffix != '-shm':
+                    r.write_private(image.with_name(image.name + suffix), data)
+        with contextlib.closing(sqlite3.connect(image.as_uri() + '?mode=ro', uri=True, timeout=.5)) as db:
+            db.execute('PRAGMA query_only=ON')
+            db.execute('PRAGMA trusted_schema=OFF')
+            end = time.monotonic() + 3
+            db.set_progress_handler(lambda: int(time.monotonic() > end), 1000)
+            columns = {row[1] for row in db.execute('PRAGMA table_info(threads)')}
+            r.require({'id', 'cwd', 'rollout_path', 'model_provider'} <= columns, 'unsupported native Codex sessions schema')
+            archive = 'archived' if 'archived' in columns else 'NULL'
+            rows = db.execute('SELECT id,cwd,rollout_path,model_provider,' + archive + ' FROM threads LIMIT 1025').fetchall()
+    r.require(len(rows) <= 1024 and {row[0] for row in rows} == set(rollouts) and len(rows) == len(rollouts),
+              'native Codex database and rollout catalogues differ')
+    retained, archived = {}, {}
+    for ident, cwd, path, provider, marked in rows:
+        record, passive = rollouts[ident]
+        r.require(cwd == '/work/job' and provider == 'openai' and path == '/state/' + record['path'] and
+                  (marked is None and 'archived' not in columns or type(marked) is int and marked == int(passive)),
+                  'native Codex thread is inconsistent with its rollout')
+        (archived if passive else retained)[ident] = record
+    return retained, archived
 
 
 def main():
@@ -397,6 +623,10 @@ def main():
             result = preflight_resume(payload)
         elif action == 'preflight-allowance':
             result = preflight_allowance(payload)
+        elif action == 'preflight-runtime':
+            result = preflight_runtime(payload)
+        elif action == 'capture-work':
+            result = capture_work(payload)
         elif action == 'verify-sessions':
             result = verify_sessions(payload)
         else:
