@@ -61,3 +61,14 @@ python3 -B examples/checklist/test_checklist.py -v
 
 The tests exercise loopback HTTP, a real process restart, backup restoration in
 an empty directory, and rejected inputs.
+
+## Private container deployment
+
+Build the [Containerfile](Containerfile) in an isolated worktree from a
+separately verified base image digest with system Python and SQLite. Pass
+the exact Git revision in `CHECKLIST_SOURCE`. The `--container` mode
+listens inside the container's private network. Quadlet publishes only to
+the host's IPv4 loopback. The controlled release config sets the exact
+`--tailnet-host` DNS name served by the host's Tailscale HTTPS proxy and
+uses a separate durable data mount. See the
+[Fedora Quadlet recipe and acceptance boundary](../../docs/host-handoff.md#fedora-checklist-quadlet).

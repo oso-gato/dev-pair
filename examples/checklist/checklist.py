@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A loopback checklist with a durable SQLite database."""
+"""A private checklist with a durable SQLite database."""
 
 import argparse
 from contextlib import ExitStack, closing
@@ -28,6 +28,7 @@ SCHEMA = f"""CREATE TABLE items (
     done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1))
 )"""
 COMPLETE = re.compile(r"/items/([1-9][0-9]{0,18})/complete")
+TAILNET_HOST = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){2,}ts\.net")
 
 PAGE = b"""<!doctype html>
 <html lang="en">
@@ -213,16 +214,18 @@ def item_object(row):
 
 
 class ChecklistServer(HTTPServer):
-    def __init__(self, port, db, listener):
-        super().__init__((HOST, port), ChecklistHandler, bind_and_activate=listener is None)
+    def __init__(self, port, db, listener, *, container=False, tailnet_host=None):
+        bind_host = "0.0.0.0" if container else HOST
+        super().__init__((bind_host, port), ChecklistHandler, bind_and_activate=listener is None)
         if listener is not None:
             self.socket.close()
             self.socket = listener
             self.server_address = listener.getsockname()
             self.server_name, self.server_port = self.server_address
         self.db = db
-        self.authority = f"{HOST}:{self.server_port}"
-        self.url = f"http://{self.authority}"
+        self.authority = tailnet_host or f"{HOST}:{self.server_port}"
+        scheme = "https" if tailnet_host else "http"
+        self.url = f"{scheme}://{self.authority}"
 
 
 class ChecklistHandler(BaseHTTPRequestHandler):
@@ -273,7 +276,7 @@ class ChecklistHandler(BaseHTTPRequestHandler):
 
     def route(self):
         if self.headers.get_all("Host") != [self.server.authority]:
-            raise RequestError(HTTPStatus.FORBIDDEN, "Use the loopback address printed at startup.")
+            raise RequestError(HTTPStatus.FORBIDDEN, "Use the checklist address printed at startup.")
         origins = self.headers.get_all("Origin", [])
         if origins and origins != [self.server.url]:
             raise RequestError(HTTPStatus.FORBIDDEN, "Request origin is outside the checklist.")
@@ -326,7 +329,7 @@ class ChecklistHandler(BaseHTTPRequestHandler):
     do_POST = dispatch
 
 
-def serve(database, port, listen_fd):
+def serve(database, port, listen_fd, *, container=False, tailnet_host=None):
     with ExitStack() as resources:
         listener = None
         if listen_fd is not None:
@@ -340,7 +343,8 @@ def serve(database, port, listen_fd):
                 raise ValueError("The inherited socket must already listen on 127.0.0.1.")
         db = resources.enter_context(closing(connect(database)))
         initialize(db)
-        server = resources.enter_context(ChecklistServer(port, db, listener))
+        server = resources.enter_context(ChecklistServer(port, db, listener, container=container,
+                                                          tailnet_host=tailnet_host))
         print(server.url, flush=True)
         try:
             server.serve_forever()
@@ -356,6 +360,8 @@ def main():
     endpoint = server.add_mutually_exclusive_group()
     endpoint.add_argument("--port", default=8000, type=int, help="use 0 for a free port")
     endpoint.add_argument("--listen-fd", type=int, help="inherit an already listening loopback socket")
+    server.add_argument("--container", action="store_true", help="listen on the private container network")
+    server.add_argument("--tailnet-host", help="exact DNS name served by the host HTTPS proxy")
     backup = commands.add_parser("backup", help="copy the database to a new snapshot file")
     backup.add_argument("--database", required=True, type=Path)
     backup.add_argument("--output", required=True, type=Path)
@@ -371,7 +377,13 @@ def main():
                 parser.error("--port must be between 0 and 65535")
             if args.listen_fd is not None and args.listen_fd < 3:
                 parser.error("--listen-fd must be at least 3")
-            serve(args.database, args.port, args.listen_fd)
+            if args.container and args.listen_fd is not None:
+                parser.error("--container and --listen-fd cannot be combined")
+            if args.tailnet_host is not None and (
+                not args.container or len(args.tailnet_host) > 253 or not TAILNET_HOST.fullmatch(args.tailnet_host)
+            ):
+                parser.error("--tailnet-host requires --container and an exact .ts.net name")
+            serve(args.database, args.port, args.listen_fd, container=args.container, tailnet_host=args.tailnet_host)
         elif args.command == "backup":
             copy_database(args.database, args.output)
         else:

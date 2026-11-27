@@ -21,6 +21,9 @@ VERSION = 1
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 RECIPE = 'local-json-message-v1'
 APP_PROCESS_BOUNDARY = 'local-app-process'
+APP_QUADLET_BOUNDARY = 'fedora-checklist-quadlet'
+AUTHENTICATED_BOUNDARIES = (APP_PROCESS_BOUNDARY, APP_QUADLET_BOUNDARY)
+QUADLET_ENVIRONMENT = 'Fedora 44 user systemd and rootless Podman Quadlet executor with SELinux enforcement gate.'
 MAX_MESSAGE = 65536
 # Requests reserve three quarters of the envelope for executor diagnostics,
 # per-check actual/verdict fields, identity and reconciliation evidence. These
@@ -105,7 +108,9 @@ def app_transport(request):
 
 def app_environment(request):
     app_transport(request)
-    return 'Local Linux namespace sandbox over mutually authenticated loopback TLS. ' + ' '.join(request['fixtures'][1:])
+    description = (QUADLET_ENVIRONMENT if request['boundary'] == APP_QUADLET_BOUNDARY else
+                   'Local Linux namespace sandbox over mutually authenticated loopback TLS.')
+    return description + ' ' + ' '.join(request['fixtures'][1:])
 
 
 def candidate(value):
@@ -186,7 +191,8 @@ def validate(obj, kind=None):
                 text(check['diagnostics'])
                 references(check['evidence'])
     if kind == 'request':
-        require(obj['boundary'] in ('local-protocol', 'fedora-host', APP_PROCESS_BOUNDARY), 'unsupported boundary')
+        require(obj['boundary'] in ('local-protocol', 'fedora-host', *AUTHENTICATED_BOUNDARIES),
+                'unsupported boundary')
         text(obj['reason'])
         for name in ('capabilities', 'permitted_effects'):
             require(type(obj[name]) is list and len(obj[name]) <= 16 and
@@ -195,7 +201,7 @@ def validate(obj, kind=None):
                 token(item)
         token(obj['workspace'])  # logical job-owned workspace ID, never a submitted host path
         references(obj['fixtures'])
-        if obj['boundary'] == APP_PROCESS_BOUNDARY:
+        if obj['boundary'] in AUTHENTICATED_BOUNDARIES:
             app_transport(obj)
         budgets(obj['budgets'])
         fields(obj['cleanup'], 'plan preserve')
@@ -208,7 +214,8 @@ def validate(obj, kind=None):
         fields(obj['executor'], 'controller_id environment boundary implementation_sha256')
         token(obj['executor']['controller_id'])
         text(obj['executor']['environment'])
-        require(obj['executor']['boundary'] in ('local-protocol', APP_PROCESS_BOUNDARY), 'unverified executor boundary')
+        require(obj['executor']['boundary'] in ('local-protocol', *AUTHENTICATED_BOUNDARIES),
+                'unverified executor boundary')
         digest(obj['executor']['implementation_sha256'])
         require(obj['status'] == verdict(obj['checks']), 'aggregate verdict mismatch')
         text(obj['diagnostics'])
@@ -230,8 +237,8 @@ def verdict(checks):
 
 def result_progress(result):
     if result['status'] == 'pass':
-        return ('process-checks-passed' if result['executor']['boundary'] == APP_PROCESS_BOUNDARY
-                else 'local-checks-passed')
+        return {APP_PROCESS_BOUNDARY: 'process-checks-passed', APP_QUADLET_BOUNDARY: 'host-checks-passed'}.get(
+            result['executor']['boundary'], 'local-checks-passed')
     return 'repair-required' if result['status'] == 'fail' else 'blocked'
 
 
@@ -242,10 +249,10 @@ def match_result(request, result, controller_id):
             'result identity mismatch')
     require([(c['id'], c['expected']) for c in result['checks']] ==
             [(c['id'], c['expected']) for c in request['checks']], 'result check mismatch')
-    app_process = request['boundary'] == APP_PROCESS_BOUNDARY
-    expected_boundary = APP_PROCESS_BOUNDARY if app_process else 'local-protocol'
+    authenticated = request['boundary'] in AUTHENTICATED_BOUNDARIES
+    expected_boundary = request['boundary'] if authenticated else 'local-protocol'
     require(result['executor']['boundary'] == expected_boundary, 'result boundary mismatch')
-    if app_process:
+    if authenticated:
         require(app_transport(request)[0] == controller_id and
                 result['executor']['implementation_sha256'] == request['test']['recipe_sha256'] and
                 result['executor']['environment'] == app_environment(request),
@@ -387,7 +394,7 @@ class Ledger:
 
     def submit(self, obj, *, authenticated=False):
         validate(obj, 'request')
-        require(obj['boundary'] != APP_PROCESS_BOUNDARY or authenticated,
+        require(obj['boundary'] not in AUTHENTICATED_BOUNDARIES or authenticated,
                 'application request requires authenticated transport')
         with self.transaction():
             old = self.db.execute('SELECT body FROM records WHERE kind=? AND id=?', ('request', obj['request_id'])).fetchone()
@@ -455,7 +462,7 @@ class Ledger:
         if authenticated_request is not None:
             require(status['request'] == authenticated_request, 'ID collision: request mismatch')
         else:
-            require(status['request']['boundary'] != APP_PROCESS_BOUNDARY,
+            require(status['request']['boundary'] not in AUTHENTICATED_BOUNDARIES,
                     'application request requires authenticated transport')
 
     def make_result(self, request, attempt, checks, diagnostics, evidence=None):
@@ -552,7 +559,7 @@ class Ledger:
         with self.transaction():
             status = self.status(request_id)
             require(status['state'] == 'in-flight', 'only in-flight attempts require reconciliation')
-            require(status['request']['boundary'] != APP_PROCESS_BOUNDARY,
+            require(status['request']['boundary'] not in AUTHENTICATED_BOUNDARIES,
                     'application attempt remains unresolved; inspect the owned scratch without replay')
             # This controller has never dispatched anything beyond its fixed,
             # read-only local recipe. External host effects cannot be reconciled here.

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Authenticated local-process handoff for one approved checklist artifact."""
+"""Authenticated checklist handoff for local and Fedora Quadlet checks."""
 import argparse
 import contextlib
 import ctypes
 import errno
 import fcntl
 import http.client
+import importlib.util
 import os
 import pathlib
 import resource
@@ -31,6 +32,7 @@ EFFECTS = ['create-item', 'complete-item', 'restart-owned-service', 'remove-disp
 CLEANUP = {'plan': 'Stop only the owned child processes and remove the attempt database',
            'preserve': ['source', 'checkpoints', 'evidence', 'deliverables']}
 OPERATIONS = ('submit', 'execute', 'consume')
+HOST_OPERATIONS = (*OPERATIONS, 'status')
 WIRE_SECONDS = 3
 MAX_APP_RESPONSE = 8192
 MAX_FILE_BYTES = 1024 * 1024
@@ -47,10 +49,28 @@ FULL_SEALS = 0x000F  # Seal the seal set, writes, growth and shrinking.
 
 RECIPE_SHA256 = p.sha256(SELF.read_bytes())
 RECIPE_REVISION = p.identity({'adapter': RECIPE_SHA256, 'protocol': p.sha256(JOB_PROTOCOL.read_bytes())})
+HOST_RUNTIME = SELF.parent.parent / 'runtime/checklist/checklist_quadlet.py'
+HOST_RECIPE = 'checklist-quadlet-persistence-v1'
+HOST_CAPABILITIES = ['rootless-quadlet', 'enforcing-selinux', 'loopback-http', 'owned-service-restart']
+HOST_EFFECTS = ['create-item', 'complete-item', 'restart-owned-service', 'remove-disposable-data']
+HOST_CLEANUP = dict(CLEANUP, plan='Stop the owned Quadlet and remove its disposable test data')
+HOST_REASON = 'Observe persistence across an approved rootless systemd service restart on Fedora'
 
 
-def recipe_identity():
+def recipe_identity(*, host=False):
+    if host:
+        implementation = p.identity({'adapter': RECIPE_SHA256, 'runtime': p.sha256(HOST_RUNTIME.read_bytes()),
+                                     'quadlet': p.sha256(HOST_RUNTIME.with_name('acceptance.container').read_bytes())})
+        return {'recipe': HOST_RECIPE, 'recipe_sha256': implementation,
+                'revision': p.identity({'implementation': implementation, 'protocol': p.sha256(JOB_PROTOCOL.read_bytes())})}
     return {'recipe': RECIPE, 'recipe_sha256': RECIPE_SHA256, 'revision': RECIPE_REVISION}
+
+
+def host_runtime():
+    spec = importlib.util.spec_from_file_location('checklist_quadlet', HOST_RUNTIME)
+    runtime = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runtime)
+    return runtime
 
 
 def tls_principal(directory, *, maintenance):
@@ -79,24 +99,36 @@ def bindings(controller, principals):
             'maintenance-cert-sha256:' + principals[1]]
 
 
-def produce_request(checkpoint, request_id, controller, principals, budget):
+def produce_request(checkpoint, request_id, controller, principals, budget, *, host=False):
     p.validate(checkpoint, 'checkpoint')
-    p.require(checkpoint['test'] == recipe_identity(), 'checkpoint uses a different recipe')
-    return p.envelope('request', **{key: checkpoint[key] for key in ('job_id', 'checkpoint_id', 'candidate', 'test')},
-                      request_id=request_id, boundary=p.APP_PROCESS_BOUNDARY, reason=REASON,
-                      capabilities=CAPABILITIES, permitted_effects=EFFECTS, workspace=checkpoint['job_id'],
-                      fixtures=bindings(controller, principals), budgets=budget,
-                      checks=[{'id': RECIPE, 'expected': EXPECTED}], cleanup=CLEANUP)
+    p.require(checkpoint['test'] == recipe_identity(host=host), 'checkpoint uses a different recipe')
+    boundary, reason, capabilities, effects, check, cleanup = (
+        (p.APP_QUADLET_BOUNDARY, HOST_REASON, HOST_CAPABILITIES, HOST_EFFECTS, HOST_RECIPE, HOST_CLEANUP)
+        if host else (p.APP_PROCESS_BOUNDARY, REASON, CAPABILITIES, EFFECTS, RECIPE, CLEANUP))
+    request = p.envelope('request', **{key: checkpoint[key] for key in ('job_id', 'checkpoint_id', 'candidate', 'test')},
+                         request_id=request_id, boundary=boundary, reason=reason,
+                         capabilities=capabilities, permitted_effects=effects, workspace=checkpoint['job_id'],
+                         fixtures=bindings(controller, principals), budgets=budget,
+                         checks=[{'id': check, 'expected': EXPECTED}], cleanup=cleanup)
+    if host:
+        p.require(request['budgets']['seconds'] >= host_runtime().CHECK_SECONDS,
+                  'checklist host budget must allow startup, restart and bounded cleanup')
+    return request
 
 
-def check_request(request, controller, principals):
+def check_request(request, controller, principals, *, host=False):
     p.validate(request, 'request')
-    p.require(request['boundary'] == p.APP_PROCESS_BOUNDARY and request['test'] == recipe_identity() and
-              request['workspace'] == request['job_id'] and request['reason'] == REASON and
-              request['capabilities'] == CAPABILITIES and
-              request['permitted_effects'] == EFFECTS and request['fixtures'] == bindings(controller, principals) and
-              request['checks'] == [{'id': RECIPE, 'expected': EXPECTED}] and request['cleanup'] == CLEANUP,
+    checkpoint = p.envelope('checkpoint', **{key: request[key] for key in
+                            ('job_id', 'checkpoint_id', 'candidate', 'test')}, summary='Check request', evidence=[])
+    p.require(request == produce_request(checkpoint, request['request_id'], controller, principals, request['budgets'],
+                                         host=host),
               'request differs from the fixed recipe or TLS principal bindings')
+
+
+def check_host_status_request(request, controller, principals):
+    p.validate(request, 'request')
+    p.require(request['boundary'] == p.APP_QUADLET_BOUNDARY and request['fixtures'] == bindings(controller, principals),
+              'stored host request requires the same controller and TLS principals')
 
 
 def time_left(deadline):
@@ -248,17 +280,25 @@ def expire(_signum, _frame):
     raise TimeoutError('application operation deadline expired')
 
 
-def app_http(port, deadline, method, path, expected, document=None):
+class UnexpectedHTTP(ValueError):
+    def __init__(self, status, expected):
+        super().__init__(f'application returned HTTP {status}, expected {expected}')
+
+
+def app_http(port, deadline, method, path, expected, document=None, *, authority=None):
     remaining = time_left(deadline)
     connection = http.client.HTTPConnection('127.0.0.1', port, timeout=remaining)
     previous = signal.signal(signal.SIGALRM, expire)
     signal.setitimer(signal.ITIMER_REAL, remaining)
     try:
         headers = {'Content-Type': 'application/json'} if document is not None else {}
+        if authority is not None:
+            headers['Host'] = authority
         body = p.canonical(document).encode() if document is not None else None
         connection.request(method, path, body=body, headers=headers)
         reply = connection.getresponse()
-        p.require(reply.status == expected, 'application returned an unexpected HTTP status')
+        if reply.status != expected:
+            raise UnexpectedHTTP(reply.status, expected)
         data = reply.read(MAX_APP_RESPONSE + 1)
         p.require(len(data) <= MAX_APP_RESPONSE, 'application response exceeds byte limit')
         return p.loads(data)
@@ -370,6 +410,190 @@ def dispatch(ledger, scratch, artifact, size, rules, job_id, candidate, principa
     return ledger.finish(run_attempt(ledger, request, attempt, scratch, artifact, rules))
 
 
+def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
+    end = time.monotonic() + request['budgets']['seconds']
+    deadline = end - runtime.CLEANUP_SECONDS
+    title = 'Checklist restart test ' + attempt
+    evidence = [*authorization, 'effect-id:' + attempt, 'kernel-release:' + os.uname().release]
+    effects = []
+    stage = 'checklist host prerequisites'
+    actual = 'The checklist restart observation could not complete'
+    status = 'blocked'
+
+    def http(port, method, path, expected, body=None):
+        return app_http(port, deadline, method, path, expected, body, authority=runtime.APP_AUTHORITY)
+
+    def ready_items(port):
+        while True:
+            try:
+                return http(port, 'GET', '/items', 200)
+            except (ConnectionRefusedError, ConnectionResetError, http.client.RemoteDisconnected):
+                time.sleep(min(0.05, time_left(deadline)))
+
+    try:
+        evidence.extend(unit.prepare(deadline, p.identity(request)))
+        stage = 'start the approved Quadlet'
+        port, first_invocation, first_container = unit.service('start', deadline)
+        evidence.extend(['first-invocation:' + first_invocation, 'first-container:' + first_container])
+        stage = 'create and complete the test item'
+        try:
+            p.require(ready_items(port) == [], 'disposable checklist data was not initially empty')
+            item = http(port, 'POST', '/items', 201, {'title': title})
+            valid_item(item)
+            p.require(item['title'] == title and item['done'] is False, 'unexpected item from create')
+            effects.append('Created a uniquely named test item')
+            expected = dict(item, done=True)
+            completed = http(port, 'POST', '/items/' + str(item['id']) + '/complete', 200)
+            valid_item(completed)
+            p.require(completed == expected, 'unexpected item from complete')
+            effects.append('Completed the test item')
+            evidence.append('completed-item-id:' + str(item['id']))
+        except ValueError as exc:
+            raise HostCheckFailure('Create or complete did not yield the expected item', exc) from exc
+        stage = 'restart the owned Quadlet'
+        port, second_invocation, second_container = unit.service('restart', deadline)
+        p.require(first_invocation != second_invocation and first_container != second_container,
+                  'restart did not replace both the systemd invocation and container')
+        evidence.extend(['second-invocation:' + second_invocation, 'second-container:' + second_container])
+        effects.append('Replaced the owned systemd invocation and container using the same data mount')
+        stage = 'verify the completed item after restart'
+        try:
+            observed = ready_items(port)
+            p.require(type(observed) is list, 'invalid checklist item list')
+            for entry in observed:
+                valid_item(entry)
+            p.require(observed == [expected], 'completed item was missing, changed or duplicated')
+        except ValueError as exc:
+            raise HostCheckFailure('The completed item did not survive restart with its ID and state', exc) from exc
+        actual = 'The same item ID and title returned with done=true after a new systemd invocation'
+        status = 'pass'
+        diagnostic = 'Checklist SQLite state persisted across one owned Quadlet restart'
+    except HostCheckFailure as exc:
+        status = 'fail'
+        actual = exc.actual
+        diagnostic = exc.diagnostic
+    except (OSError, ValueError, subprocess.SubprocessError, http.client.HTTPException) as exc:
+        error = str(exc) if type(exc) is ValueError else type(exc).__name__
+        diagnostic = bounded_diagnostic(stage + ': ' + error)
+    finally:
+        try:
+            unit.cleanup(end)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            raise ValueError('host effect remains in flight after unresolved Quadlet cleanup') from exc
+    logs = 'host-steps:' + ','.join(unit.logs)
+    p.text(logs, 1200)
+    check = dict(request['checks'][0], actual=actual, status=status, diagnostics=diagnostic, exit_status=None,
+                 evidence=evidence)
+    executor = {'controller_id': ledger.controller_id, 'environment': p.app_environment(request),
+                'boundary': p.APP_QUADLET_BOUNDARY, 'implementation_sha256': request['test']['recipe_sha256']}
+    cleanup = {'status': 'complete' if unit.path_created else 'not-needed',
+               'diagnostics': 'Owned unit and disposable data removed' if unit.path_created else
+               'No owned test service or data created'}
+    return p.envelope('result', **{name: request[name] for name in
+                      ('job_id', 'request_id', 'checkpoint_id', 'candidate', 'test')},
+                      request_sha256=p.identity(request), attempt_id=attempt, executor=executor, status=status,
+                      checks=[check], diagnostics=diagnostic, evidence=[*evidence, logs],
+                      effects=effects, cleanup=cleanup)
+
+
+def bounded_diagnostic(text):
+    return p.canonical(text)[1:-1][:400] or 'Host operation interrupted'
+
+
+class HostCheckFailure(Exception):
+    def __init__(self, actual, exc):
+        self.actual = actual
+        # Candidate-supplied JSON fragments and exception content need not leave the executor.
+        detail = str(exc) if isinstance(exc, UnexpectedHTTP) or type(exc) is ValueError else 'Invalid item response'
+        self.diagnostic = bounded_diagnostic(detail) + '. Check use of /data/checklist.sqlite3 for item IDs and completion state.'
+
+
+def dispatch_host(ledger, runtime, env, runtime_dir, approval, principals, packet):
+    p.fields(packet, 'operation request')
+    operation, request = packet['operation'], packet['request']
+    p.require(operation in HOST_OPERATIONS, 'unknown host handoff operation')
+    if operation == 'status':
+        check_host_status_request(request, ledger.controller_id, principals)
+        status = ledger.status(request['request_id'])
+        ledger.check_transport(status, request)
+        return status
+    check_request(request, ledger.controller_id, principals, host=True)
+    request_id = request['request_id']
+    with runtime.dispatch_gate():
+        if operation == 'submit':
+            runtime.approval(approval, request)
+            return ledger.submit(request, authenticated=True)
+        if operation == 'consume':
+            return ledger.consume(request_id, authenticated_request=request)
+        status = ledger.status(request_id)
+        ledger.check_transport(status, request)
+        if status['state'] == 'completed':
+            ledger.current(request)
+            return status['result']
+        p.require(status['state'] == 'pending', 'unresolved in-flight effects require reconciliation; execution refused')
+        image, authorization = runtime.approval(approval, request)
+        attempt, previous = ledger.begin(request_id, authenticated_request=request)
+        if previous is not None:
+            return previous
+        unit = runtime.Quadlet(runtime_dir, env, attempt, image, request['candidate'], request['budgets']['seconds'])
+        return ledger.finish(run_host_attempt(ledger, request, attempt, unit, authorization, runtime))
+
+
+def serve_connections(listener, lifetime, context, expected_peer, dispatch_packet):
+    deadline = time.monotonic() + lifetime
+    while time.monotonic() < deadline:
+        listener.settimeout(max(0.001, deadline - time.monotonic()))
+        try:
+            connection, _ = listener.accept()
+        except socket.timeout:
+            return
+        with connection:
+            connection.settimeout(WIRE_SECONDS)
+            try:
+                with context.wrap_socket(connection, server_side=True) as stream:
+                    check_peer(stream, expected_peer)
+                    packet = receive(stream, time.monotonic() + WIRE_SECONDS)
+                    try:
+                        data = dispatch_packet(packet)
+                        response = {'ok': True, 'data': data}
+                    except ValueError as exc:
+                        response = {'ok': False, 'data': bounded_diagnostic(str(exc))}
+                    send(stream, response, time.monotonic() + WIRE_SECONDS)
+            except (OSError, ValueError):
+                # Lost clients do not roll back effects or committed history.
+                continue
+
+
+def serve_host(args):
+    p.number(args.lifetime, 1, 600)
+    p.number(args.port, 0, 65535)
+    runtime = host_runtime()
+    for code in (SELF, JOB_PROTOCOL, HOST_RUNTIME, runtime.TEMPLATE, pathlib.Path(sys.modules['ledger_recovery'].__file__)):
+        runtime.protected(code, file=True)
+    directory, env = runtime.rootless_environment()
+    state = trusted_directory(args.state)
+    tls = trusted_directory(args.tls)
+    p.require(state == runtime.HOME / 'ledger' and tls == runtime.HOME / 'tls',
+              'durable ledger and TLS require their fixed protected home leaves')
+    approval = pathlib.Path(args.approval).absolute()
+    p.require(approval == runtime.APPROVAL, 'host approval requires its fixed protected leaf')
+    runtime.protected(approval.parent, file=False)
+    context, expected_peer, principals = tls_principal(tls, maintenance=True)
+    lock_path = directory / 'dev-pair-checklist.lock'
+    with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), 'rb+') as lock:
+        p.private_file(lock_path)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError('checklist host executor is already active') from exc
+        with contextlib.closing(p.Ledger(state)) as ledger, socket.socket(socket.AF_INET) as listener:
+            listener.bind(('127.0.0.1', args.port))
+            listener.listen(4)
+            print(p.canonical({'port': listener.getsockname()[1], 'controller_id': ledger.controller_id}), flush=True)
+            serve_connections(listener, args.lifetime, context, expected_peer,
+                              lambda packet: dispatch_host(ledger, runtime, env, directory, approval, principals, packet))
+
+
 def serve(args):
     p.token(args.job_id)
     p.number(args.lifetime, 1, 600)
@@ -389,29 +613,9 @@ def serve(args):
         listener.bind(('127.0.0.1', 0))
         listener.listen(4)
         print(p.canonical({'port': listener.getsockname()[1], 'controller_id': ledger.controller_id}), flush=True)
-        deadline = time.monotonic() + args.lifetime
-        while time.monotonic() < deadline:
-            listener.settimeout(max(0.001, deadline - time.monotonic()))
-            try:
-                connection, _ = listener.accept()
-            except socket.timeout:
-                return
-            with connection:
-                connection.settimeout(WIRE_SECONDS)
-                try:
-                    with context.wrap_socket(connection, server_side=True) as stream:
-                        check_peer(stream, expected_peer)
-                        packet = receive(stream, time.monotonic() + WIRE_SECONDS)
-                        try:
-                            data = dispatch(ledger, scratch, artifact, size, rules, args.job_id, candidate, principals, packet)
-                            response = {'ok': True, 'data': data}
-                        except ValueError as exc:
-                            response = {'ok': False, 'data': str(exc)}
-                        send(stream, response, time.monotonic() + WIRE_SECONDS)
-                except (OSError, ValueError):
-                    # Drop unauthenticated, malformed, partial and lost connections.
-                    # Any committed ledger state remains available to the same principal.
-                    continue
+        serve_connections(listener, args.lifetime, context, expected_peer,
+                          lambda packet: dispatch(ledger, scratch, artifact, size, rules, args.job_id,
+                                                  candidate, principals, packet))
 
 
 def exchange(port, context, expected_peer, operation, request):
@@ -430,9 +634,9 @@ def exchange(port, context, expected_peer, operation, request):
 
 
 def check_reply(operation, data, request, controller):
-    if operation == 'submit':
+    if operation in ('submit', 'status'):
         p.fields(data, 'request state attempt_id result reconciliation_required')
-        p.require(data['request'] == request, 'submitted request identity mismatch')
+        p.require(data['request'] == request, 'stored request identity mismatch')
         if data['result'] is None:
             p.require((data['state'] == 'pending' and data['attempt_id'] is None and
                        data['reconciliation_required'] is False) or
@@ -444,7 +648,7 @@ def check_reply(operation, data, request, controller):
     result = data if operation == 'execute' else data['result']
     p.validate(result, 'result')
     p.match_result(request, result, controller)
-    if operation == 'submit':
+    if operation in ('submit', 'status'):
         p.require(data['state'] == 'completed' and data['attempt_id'] == result['attempt_id'] and
                   data['reconciliation_required'] is False, 'invalid completed request state')
     if operation == 'consume':
@@ -454,37 +658,73 @@ def check_reply(operation, data, request, controller):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('recipe')
+    recipe = commands.add_parser('recipe')
     maintenance = commands.add_parser('serve', help='start the disposable loopback executor with an approved artifact')
     for name in ('state', 'scratch', 'candidate', 'tls', 'job-id', 'source-revision', 'artifact-sha256'):
         maintenance.add_argument('--' + name, required=True)
     maintenance.add_argument('--lifetime', type=int, default=120)
+    host = commands.add_parser('serve-host', help='start the protected Fedora checklist Quadlet executor')
+    for name in ('state', 'tls', 'approval'):
+        host.add_argument('--' + name, required=True)
+    host.add_argument('--lifetime', type=int, default=300)
+    host.add_argument('--port', type=int, default=0)
+    approve = commands.add_parser('approve-host', help='issue one bounded grant from a protected candidate receipt')
+    approve.add_argument('--candidate-receipt', required=True, type=pathlib.Path)
+    approve.add_argument('--lifetime', type=int, default=300)
+    approve.add_argument('--publish', action='store_true', help='activate the approval at its fixed root-owned leaf')
+    release = commands.add_parser('render-release', help='render a reviewed loopback-only deployment Quadlet to stdout')
+    for name in ('image', 'hostname'):
+        release.add_argument('--' + name, required=True)
+    for name in ('port', 'uid'):
+        release.add_argument('--' + name, type=int, required=True)
     request = commands.add_parser('request', help='produce the fixed request from a checkpoint JSON file')
     request.add_argument('checkpoint', type=pathlib.Path)
     request.add_argument('request_id')
     request.add_argument('--seconds', type=int, required=True)
     request.add_argument('--artifact-bytes', type=int, required=True)
     client = commands.add_parser('send', help='send a request from stdin using the development TLS principal')
-    client.add_argument('operation', choices=OPERATIONS)
+    client.add_argument('operation', choices=HOST_OPERATIONS)
     client.add_argument('--port', type=int, required=True)
     for command in (request, client):
         command.add_argument('--tls', required=True)
         command.add_argument('--controller-id', required=True)
+    for command in (recipe, request, client):
+        command.add_argument('--host', action='store_true', help='use the protected Fedora Quadlet recipe')
     args = parser.parse_args(argv)
     if args.command == 'recipe':
-        print(p.canonical(recipe_identity()))
+        print(p.canonical(recipe_identity(host=args.host)))
         return
     if args.command == 'serve':
         serve(args)
+        return
+    if args.command == 'serve-host':
+        serve_host(args)
+        return
+    if args.command == 'approve-host':
+        message = p.validate(p.loads(sys.stdin.buffer.read(p.MAX_MESSAGE + 1)), 'request')
+        controller, *principals = p.app_transport(message)
+        check_request(message, controller, principals, host=True)
+        runtime = host_runtime()
+        approval = runtime.issue_approval(args.candidate_receipt, message, args.lifetime)
+        if args.publish:
+            runtime.publish_approval(approval)
+        print(p.canonical(approval))
+        return
+    if args.command == 'render-release':
+        sys.stdout.buffer.write(host_runtime().deployment_unit(args.image, args.hostname, args.port, args.uid))
         return
     context, expected_peer, principals = tls_principal(args.tls, maintenance=False)
     if args.command == 'request':
         checkpoint = p.loads(p.read_data(args.checkpoint, p.MAX_MESSAGE))
         budget = {'seconds': args.seconds, 'artifact_bytes': args.artifact_bytes, 'spend_usd': 0}
-        result = produce_request(checkpoint, args.request_id, args.controller_id, principals, budget)
+        result = produce_request(checkpoint, args.request_id, args.controller_id, principals, budget, host=args.host)
     else:
+        p.require(args.host or args.operation in OPERATIONS, 'status requires the protected host recipe')
         message = p.loads(sys.stdin.buffer.read(p.MAX_MESSAGE + 1))
-        check_request(message, args.controller_id, principals)
+        if args.operation == 'status':
+            check_host_status_request(message, args.controller_id, principals)
+        else:
+            check_request(message, args.controller_id, principals, host=args.host)
         result = exchange(args.port, context, expected_peer, args.operation, message)
         check_reply(args.operation, result, message, args.controller_id)
     print(p.canonical(result))

@@ -1,0 +1,42 @@
+[Unit]
+Description=Dev-pair owned checklist persistence check
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Container]
+ContainerName=@NAME@
+GlobalArgs=--root @GRAPH@ --runroot @RUNROOT@
+Image=@IMAGE@
+Pull=never
+Entrypoint=/usr/bin/python3
+Exec=-IB /opt/dev-pair-checklist/checklist.py serve --container --port 8000 --database /data/checklist.sqlite3 @ORIGIN@
+Network=@NETWORK@
+PublishPort=127.0.0.1:@PORT@:8000
+ReadOnly=true
+ReadOnlyTmpfs=false
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=4m,nr_inodes=128
+Tmpfs=/run:rw,noexec,nosuid,nodev,size=1m,nr_inodes=128
+ShmSize=1m
+Volume=@DATA@:/data:Z,rw,nosuid,nodev,noexec
+UserNS=keep-id:uid=65532,gid=65532
+User=65532
+Group=65532
+DropCapability=all
+NoNewPrivileges=true
+Memory=128m
+PidsLimit=32
+StopTimeout=2
+LogDriver=none
+PodmanArgs=--image-volume=ignore --no-healthcheck
+
+[Service]
+Restart=@RESTART@
+RestartSec=2s
+RuntimeMaxSec=@SECONDS@
+TimeoutStartSec=15s
+TimeoutStopSec=5s
+MemoryMax=192M
+CPUQuota=75%
+TasksMax=64
+StandardOutput=null
+StandardError=null

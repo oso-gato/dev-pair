@@ -1,0 +1,19 @@
+[Unit]
+Description=Dev-pair checklist host acceptance executor
+Requires=user@%i.service
+After=user@%i.service
+RequiresMountsFor=/var/lib/dev-pair/checklist-validation
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+User=dp-checklist
+Group=dp-checklist
+UMask=0077
+ExecStart=/usr/bin/python3 -EBs /usr/libexec/dev-pair/checklist/tools/host_handoff.py serve-host --state /var/lib/dev-pair/checklist-executor/ledger --tls /var/lib/dev-pair/checklist-executor/tls --approval /etc/dev-pair/checklist/approval.json --port 19425 --lifetime 600
+Restart=always
+RestartSec=2s
+TimeoutStopSec=75s
+
+[Install]
+WantedBy=multi-user.target
