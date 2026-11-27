@@ -23,7 +23,7 @@ import platform_release as release
 from platform_release_protocol import ARCHIVE_LIMIT, GIB, ROLES, Blocked, canonical, file_hash, hex_id, require, seconds, receive_frame
 
 REPO = Path(__file__).resolve().parent.parent
-RUN_ENV = (*ci.RUNNER_ENV, 'GITHUB_SHA', 'GITHUB_REF', 'GITHUB_REF_PROTECTED')
+RUN_ENV = (*ci.RUNNER_ENV, 'GITHUB_SHA', 'GITHUB_REF', 'GITHUB_REF_PROTECTED', 'GITHUB_WORKFLOW_REF')
 EXPORT_VOLUME = 3 * GIB
 OUTER_SECONDS = 1200
 EVENT_LIMIT = 25 * 1024 ** 2
@@ -51,9 +51,46 @@ def admitted_push(source, env):
             value.get('repository', {}).get('full_name') == release.REPOSITORY, 'protected push event source mismatch')
 
 
+AGENT_WORKFLOW = '.github/workflows/agent-refresh.yml'
+AGENT_SCHEDULE = '0 19 * * *'
+
+
+def admitted_refresh(source, env):
+    hex_id(source, 40)
+    event_name = env.get('GITHUB_EVENT_NAME')
+    require(event_name in ('schedule', 'workflow_dispatch') and all(env.get(key) == value for key, value in {
+        'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': release.REPOSITORY, 'GITHUB_REF': 'refs/heads/main',
+        'GITHUB_REF_PROTECTED': 'true', 'GITHUB_SHA': source, 'GITHUB_RUN_ATTEMPT': '1',
+        'GITHUB_WORKFLOW_REF': release.REPOSITORY + '/' + AGENT_WORKFLOW + '@refs/heads/main',
+    }.items()) and re.fullmatch(r'[1-9][0-9]{0,19}', env.get('GITHUB_RUN_ID', '')),
+            'agent refresh requires the exact protected refresh workflow and main run')
+    path = Path(env.get('GITHUB_EVENT_PATH', ''))
+    require(path.is_absolute() and path.resolve(strict=True) == path, 'agent refresh event path differs')
+    from platform_release_protocol import regular
+    incoming, node = regular(path, EVENT_LIMIT)
+    with incoming:
+        require(node.st_uid in (0, os.getuid()), 'agent refresh event ownership differs')
+        event = json.loads(incoming.read(EVENT_LIMIT + 1), object_pairs_hook=guest.unique_object)
+    if event_name == 'schedule':
+        require(event.get('schedule') == AGENT_SCHEDULE, 'unapproved agent refresh schedule')
+    else:
+        require(event.get('ref') in ('main', 'refs/heads/main') and event.get('inputs') in (None, {}),
+                'on-demand refresh only accepts the fixed operation')
+
+
+def admitted_source(source, role, env):
+    if env.get('GITHUB_EVENT_NAME') == 'push':
+        admitted_push(source, env)
+        return False
+    admitted_refresh(source, env)
+    require(role in ci.SCENARIOS, 'agent refresh publishes only maintenance and development images')
+    return True
+
+
 class Export:
-    def __init__(self, scenario, final):
+    def __init__(self, scenario, final, tooling_cache=None):
         self.scenario = scenario
+        self.tooling_cache = tooling_cache
         self.final = final
         self.nonce = secrets.token_hex(16)
         self.volume = None
@@ -75,6 +112,11 @@ class Export:
         self.volume.configure()
         probe.report['release_storage'] = self.volume.observe(kernel.mount_table())
         probe.storage.parent_free(ARCHIVE_LIMIT if self.final.parent.stat().st_dev == probe.lease.stat().st_dev else 0)
+
+    def input_cache(self):
+        if self.tooling_cache is None:
+            return []
+        return ['--codex-cache', str(self.tooling_cache)]
 
     def request(self, probe):
         writer = REPO / 'tools/platform_release_guest.py'
@@ -227,7 +269,7 @@ def namespace(source, role):
 
 
 def entered(source, role, parent):
-    admitted_push(source, os.environ)
+    refresh = admitted_source(source, role, os.environ)
     require(parent is not None and os.getuid() != 0 and os.getpid() == 1 and
             re.fullmatch(r'mnt:\[\d+\]', parent) and os.readlink('/proc/self/ns/mnt') != parent,
             'private production mount and PID namespaces not established')
@@ -238,7 +280,7 @@ def entered(source, role, parent):
     require(runner.is_absolute(), 'standard runner temporary directory unavailable')
     final = runner / ('platform-' + role + '-' + source)
     root = ci.scratch_root(str(runner))
-    export = Export(role, final)
+    export = Export(role, final, runner / 'agent-tooling' if refresh else None)
     probe = ci.Probe(source, root, role if role in ci.SCENARIOS else 'maintenance', release=export)
     if role == 'devbox':
         probe.storage = OuterStorage(root, probe.privileged)
@@ -251,7 +293,7 @@ def main():
     parser.add_argument('role', choices=ROLES)
     parser.add_argument('--source', required=True)
     args = parser.parse_args()
-    admitted_push(args.source, os.environ)
+    admitted_source(args.source, args.role, os.environ)
     return namespace(args.source, args.role)
 
 

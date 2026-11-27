@@ -23,8 +23,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      host-config: ${{ steps.site.outputs.host-config }}
-      plan: ${{ steps.site.outputs.plan }}
       previous: ${{ steps.site.outputs.previous }}
       artifact-bytes: ${{ steps.site.outputs.artifact-bytes }}
     steps:
@@ -37,8 +35,6 @@ jobs:
       - name: Admit exact protected source and allocated transport
         id: site
         env:
-          HOST_CONFIG: ${{ vars.PLATFORM_HOST_CONFIG_SHA256 }}
-          LAUNCH_PLAN: ${{ vars.PLATFORM_LAUNCH_PLAN_SHA256 }}
           PREVIOUS: ${{ vars.PLATFORM_PREVIOUS_SHA256 }}
           ARTIFACT_BYTES: ${{ vars.PLATFORM_ARTIFACT_BYTES }}
         run: python3 -B tools/platform_release.py admit --source "$GITHUB_SHA"
@@ -118,10 +114,8 @@ jobs:
         with:
           pattern: platform-*-${{ github.sha }}
           path: ${{ runner.temp }}/platform-parts
-      - name: Verify all parts and assemble both release subjects
+      - name: Verify all parts and assemble the portable release index
         env:
-          HOST_CONFIG: ${{ needs.admit.outputs.host-config }}
-          LAUNCH_PLAN: ${{ needs.admit.outputs.plan }}
           PREVIOUS: ${{ needs.admit.outputs.previous }}
           ARTIFACT_BYTES: ${{ needs.admit.outputs.artifact-bytes }}
         run: |
@@ -129,9 +123,6 @@ jobs:
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ${{ runner.temp }}/platform-subjects-${{ github.sha }}/platform.json
-      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: ${{ runner.temp }}/platform-subjects-${{ github.sha }}/release.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: platform-subjects-${{ github.sha }}
@@ -142,4 +133,4 @@ jobs:
       - name: Record immutable release coordinates
         run: |
           printf 'Source `%s` · Actions run `%s`\n\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
-          (cd "$RUNNER_TEMP/platform-subjects-$GITHUB_SHA" && sha256sum platform.json release.json) >> "$GITHUB_STEP_SUMMARY"
+          (cd "$RUNNER_TEMP/platform-subjects-$GITHUB_SHA" && sha256sum platform.json) >> "$GITHUB_STEP_SUMMARY"

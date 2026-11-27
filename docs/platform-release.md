@@ -4,12 +4,10 @@ The protected platform workflow builds the maintenance gptbox, development gptbo
 
 ## Independent release authority
 
-Merge through the independent branch and required-check policy, then authorize the exact run through the `platform-release` GitHub environment. The environment supplies these protected site coordinates.
+Merge through the independent branch and required-check policy, then authorize the exact run through the `platform-release` GitHub environment. The environment supplies the portable recovery selection and allocation.
 
 | Setting | Value |
 | --- | --- |
-| `PLATFORM_HOST_CONFIG_SHA256` | Digest of the independently held Fedora host configuration |
-| `PLATFORM_LAUNCH_PLAN_SHA256` | Digest of the independently staged schema 1 launch plan |
 | `PLATFORM_PREVIOUS_SHA256` | Previously verified platform index digest, or `initial` for an empty staging store |
 | `PLATFORM_ARTIFACT_BYTES` | Independently available no-spend Actions artifact capacity covering three 2GiB OCI archives, host and subject files, and transport overhead |
 
@@ -19,13 +17,19 @@ Codex tag matching the repository's signed input pins. The publisher checks for 
 new official version before starting the build. A changed stable release requires a
 matching reviewed pin update or the separately approved refresh resolver.
 
-Only the publication job receives the GitHub attestation permissions. It attests
-the exact `platform.json` and `release.json` file subjects after verifying all four
-build outputs. The platform index binds the repository, source, run ID, archive
-digests/lengths and prior platform. The renewal manifest uses the control-plane
-schema and binds the deployed component configuration and immutable image IDs.
-The run summary supplies both subject digests. The Actions service retains the
-artifact parts for one day. Capture verified bytes on the host within that window.
+Only the publication job receives GitHub attestation permissions. It attests the
+exact `platform.json` schema 2 file after verifying the four build outputs. The
+portable index binds repository, source, run ID, adopted standards, state/policy
+contracts, raw host bundle manifest, exact OCI config and manifest digests,
+and archive hashes and lengths. The run summary supplies the subject digest.
+Actions retains the artifact parts for one day. Capture verified bytes on the
+host within that window.
+
+The protected destination controller uses its approved site configuration,
+actual local placement and exact previous/current portable digests to derive
+and durably bind the job manifests, launch plan and local renewal release.
+The CI producer has no site topology inputs. Exact source, role, image ID,
+archive or previous/base mismatch blocks admission.
 
 Provision the independently held `release-trust.json` file-subject publisher
 entry for each of `host`, `devbox`, `maintenance` and `development`. Pin
@@ -78,29 +82,55 @@ read-only GitHub CLI identity and site configuration before running intake.
 ```
 
 Use `--initial` for the approved first package with an empty staging store.
-Intake verifies the Actions transport identity, both attested subjects, the
-site configuration and plan hashes, and previously retained compatible
-components. It extracts only the declared files under explicit compressed,
-expanded and time limits. It verifies the actual OCI and host bundle content
-before publishing the new content-addressed staging directory and receipt.
-The store holds up to three staged versions under a single lock and preserves
-the 8GiB host reserve. Retiring a retained digest requires the separate
-authorized activation and recovery procedure.
+Intake verifies the Actions transport, portable attestation for each admitted
+component, and compatible retained prior components. It extracts only the
+declared files under explicit compressed, expanded and time limits. It verifies
+actual OCI and host bundle content before publishing the content-addressed
+staging directory and receipt. The store holds up to three staged versions
+under one lock and preserves the 8GiB host reserve. Retiring a retained digest
+requires the authorized activation and recovery procedure.
 
-The staged `release.json` is the exact renewal subject for the protected
-`renewal/releases/<sha256>.json` input. The destination activation work owns
-installation of the verified host bundle, rootless OCI imports, site launch
-plan, previous selection and the matching activation request. Credential
-custody, live selection, job admission and network cutover belong to the
+The subjects and physical bytes are under
+`/var/lib/dev-pair/platform-releases/<platform-sha256>/`. Each role has its own
+subdirectory with `<role>.oci.tar` and `part.json`. The host subdirectory contains
+`host.tar` and `host-manifest.json`. The site installer supplies the actual
+rootless image, digest-addressed host bundle and per-job G manifest readback.
+That installer and G's prebuilt release path are the remaining native source
+connections. The release transport has its own protected receipt
+`intake.json`; local installed readback and selection follow under the
 authorized destination controller.
+
+## Nightly and on-demand agent refresh
+
+The protected `agent-refresh.yml` workflow declares 04:00 Asia/Tokyo and a fixed
+on-demand entry on protected main. Provision the separate `agent-refresh`
+environment and enable `PLATFORM_AGENT_REFRESH_ENABLED` only under authorized
+release custody. The environment supplies the exact current
+`PLATFORM_PREVIOUS_SHA256`, stable full `PLATFORM_BASE_SHA256`, and allocated
+`PLATFORM_AGENT_ARTIFACT_BYTES`, including bounded temporary public input
+retention. D's independent file-subject policy pins the separate agent workflow
+under the maintenance and development `agent_refresh` fields.
+
+The resolver uses the official latest stable release, its exact Git tag
+commit and role-appropriate x86_64 archive and Sigstore asset. It bootstraps
+Cosign from the reviewed pinned digest and verifies the binary against the
+official workflow, tag, repo, issuer and source. Both role jobs share the
+eligible exact verified assets inside the run and reverify them through the
+existing authenticated producer. A new version or altered signed bytes yield
+a `tooling.json` pin proposal for independent review. The live release keeps its
+previous verified artifact pending approval of the new exact build inputs.
+
+The resulting `dev-pair-agent-release` index contains two agents and refers
+to the exact previous selection and full stable platform base. The host uses
+the same intake with `--agent-only --previous <digest>`. Intake validates that
+the base matches the retained previous selection, so an agent-only operation
+retains the prior host bundle and DevBox. U derives the local activation plan
+after the actual artifacts and per-job manifests are verified.
 
 ## Evidence still required
 
-Run `PYTHONPATH=tests python3 -B -m unittest -q test_platform_release` for the
-local source/transport checks. Native checks must establish that the current
-standard runner supports the added release volume and virtio endpoint, that
-the role builders fit the clipped time/space envelope and that the approved
-Actions quota and the read-only host identity work. The full protected push
-publishes a complete platform set. Separate nightly and on-demand agent-only
-refresh needs the approved agent event policy and an intake that retains the
-current host and DevBox components.
+Run `PYTHONPATH=tests python3 -B -m unittest -q test_platform_release` for local
+source/transport checks. Hosted tests still need to establish the standard
+runner's extra ext4 volume, virtio endpoint, clipped native role time and exact
+OCI transport. The destination needs the approved read-only identity,
+artifact retention allocation and actual installed recovery pair.

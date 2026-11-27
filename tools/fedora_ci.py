@@ -1088,7 +1088,10 @@ class Probe:
         helper = self.repo / 'tools/public_inputs.py'
         cache = self.root / 'public-cache'
         handoff = self.root / 'public-handoff'
-        self.bounded([sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)], PUBLIC_SECONDS, 'fixed public input download')
+        fetch_args = [sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)]
+        if self.release is not None:
+            fetch_args.extend(self.release.input_cache())
+        self.bounded(fetch_args, PUBLIC_SECONDS, 'fixed public input download')
         try:
             output = self.bounded([sys.executable, str(helper), 'build', '--role', self.scenario, '--cache', str(cache),
                                   '--distrobox-source', str(cache / 'distrobox'), '--output', str(handoff)], PUBLIC_SECONDS, 'strict public input verification/build')

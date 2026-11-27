@@ -20,6 +20,7 @@ import platform_release as publisher
 import platform_release_ci as builder
 import platform_release_intake as intake
 import platform_release_protocol as protocol
+import platform_tooling_refresh as refresh
 
 
 class PlatformReleaseTests(unittest.TestCase):
@@ -169,7 +170,7 @@ class PlatformReleaseTests(unittest.TestCase):
             publisher.build_host(source, revision, self.root / 'reject')
         self.assertFalse((self.root / 'reject').exists())
 
-    def test_assembly_binds_three_verified_oci_parts_and_exact_host_to_both_subjects(self):
+    def test_portable_index_binds_three_verified_oci_parts_and_exact_host(self):
         revision_path, self.source = self.git_repo()
         parts = self.root / 'parts'
         parts.mkdir()
@@ -213,21 +214,27 @@ class PlatformReleaseTests(unittest.TestCase):
                 publisher.write_image_part(directory, image, proof, self.end)
         output = self.root / 'subjects'
         with mock.patch.object(fedora_oci, 'DIFF', base):
-            platform_sha, runtime_sha = publisher.assemble(parts, output, self.source, 1234, '1' * 64,
-                                                            '2' * 64, 'initial', publisher.TRANSPORT_BUDGET)
+            platform_sha = publisher.assemble(parts, output, self.source, 1234, 'initial', publisher.TRANSPORT_BUDGET)
+            agent_sha = publisher.assemble(parts, self.root / 'agent', self.source, 5678, platform_sha,
+                                           publisher.AGENT_BUDGET, agent=True, base=platform_sha)
         platform_raw, platform = publisher.readonly_json(output / 'platform.json')
         self.assertEqual(publisher.digest(platform_raw), platform_sha)
-        intake.validate_subject(platform, self.source, 1234)
-        _, runtime = publisher.readonly_json(output / 'release.json')
-        self.assertEqual(platform['release_sha256'], runtime_sha)
-        self.assertEqual(runtime['components']['host']['artifact_sha256'], host_sha)
+        protocol.portable_index(platform, self.source, 1234)
+        self.assertEqual(platform['components']['host']['bundle_manifest_sha256'], host_sha)
         for role, image in images.items():
             name = protocol.COMPONENT[role]
-            self.assertEqual(runtime['components'][name]['artifact_sha256'], image['image_id'])
+            self.assertEqual(platform['components'][name]['oci_config_sha256'], image['image_id'])
             self.assertEqual(platform['transports'][role]['files'][publisher.archive_name(role)]['sha256'], image['archive_sha256'])
+        agent_raw, agent = publisher.readonly_json(self.root / 'agent/platform.json')
+        self.assertEqual(publisher.digest(agent_raw), agent_sha)
+        protocol.portable_index(agent, self.source, 5678)
+        self.assertEqual(set(agent['components']), {'maintenance-agent', 'development-agent'})
+        self.assertEqual(agent['base_platform_sha256'], platform_sha)
+        agent['components']['development-agent']['codex_sha256'] = '0' * 64
+        with self.assertRaisesRegex(protocol.Blocked, 'different verified tooling'):
+            protocol.portable_index(agent, self.source, 5678)
         with self.assertRaisesRegex(protocol.Blocked, 'quota approval'):
-            publisher.assemble(parts, self.root / 'other', self.source, 1234, '1' * 64, '2' * 64, 'initial',
-                               publisher.TRANSPORT_BUDGET - 1)
+            publisher.assemble(parts, self.root / 'other', self.source, 1234, 'initial', publisher.TRANSPORT_BUDGET - 1)
 
     def test_exact_action_zip_extraction_rejects_paths_modes_and_bombs(self):
         path = self.root / 'artifact.zip'
@@ -267,3 +274,47 @@ class PlatformReleaseTests(unittest.TestCase):
         for field, value in (('draft', 0), ('prerelease', True), ('tag_name', 'rust-v1.0.0-beta.1'), ('html_url', 'https://example.invalid')):
             with self.assertRaises(protocol.Blocked):
                 publisher.stable_version(protocol.canonical({**raw, field: value}))
+
+    def test_refresh_admits_only_exact_fixed_schedule_or_dispatch_for_both_agents(self):
+        env = self.for_push(GITHUB_EVENT_NAME='schedule',
+                            GITHUB_WORKFLOW_REF=publisher.REPOSITORY + '/' + builder.AGENT_WORKFLOW + '@refs/heads/main')
+        path = Path(env['GITHUB_EVENT_PATH'])
+        path.write_bytes(protocol.canonical({'schedule': builder.AGENT_SCHEDULE}))
+        self.assertTrue(builder.admitted_source(self.source, 'maintenance', env))
+        self.assertTrue(builder.admitted_source(self.source, 'development', env))
+        with self.assertRaisesRegex(protocol.Blocked, 'only maintenance and development'):
+            builder.admitted_source(self.source, 'devbox', env)
+        path.write_bytes(protocol.canonical({'ref': 'refs/heads/main', 'inputs': {}}))
+        env['GITHUB_EVENT_NAME'] = 'workflow_dispatch'
+        self.assertTrue(builder.admitted_source(self.source, 'development', env))
+        path.write_bytes(protocol.canonical({'ref': 'refs/heads/main', 'inputs': {'alternate': 'command'}}))
+        with self.assertRaisesRegex(protocol.Blocked, 'fixed operation'):
+            builder.admitted_source(self.source, 'development', env)
+
+    def test_refresh_reuses_only_pinned_bytes_and_rejects_unverified_binary_members(self):
+        cache = self.root / 'cache'
+        cache.mkdir()
+        data = b'checked public artifact bytes'
+        digest = publisher.digest(data)
+        blob = cache / (digest + '.blob')
+        blob.write_bytes(data)
+        path = self.root / 'copied'
+        opener = mock.Mock()
+        record = refresh.acquire(opener, path, ('https://github.com/unused', len(data), digest), self.end, cache)
+        self.assertEqual(record, {'sha256': digest, 'bytes': len(data), 'reused': True})
+        opener.open.assert_not_called()
+        blob.write_bytes(b'x' * len(data))
+        with self.assertRaisesRegex(protocol.Blocked, 'cache entry changed'):
+            refresh.acquire(opener, self.root / 'bad-copy', ('https://github.com/unused', len(data), digest), self.end, cache)
+        archive = self.root / 'tooling.tgz'
+        with tarfile.open(archive, 'w:gz') as stream:
+            member = tarfile.TarInfo('codex-x86_64-unknown-linux-musl')
+            member.size = len(data)
+            stream.addfile(member, io.BytesIO(data))
+        self.assertEqual(refresh.extract_binary(archive, self.root / 'codex', self.end), (digest, len(data)))
+        with tarfile.open(archive, 'w:gz') as stream:
+            member = tarfile.TarInfo('../unexpected-file')
+            member.size = len(data)
+            stream.addfile(member, io.BytesIO(data))
+        with self.assertRaisesRegex(protocol.Blocked, 'unsupported archive member'):
+            refresh.extract_binary(archive, self.root / 'no-code', self.end)

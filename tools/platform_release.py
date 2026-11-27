@@ -23,7 +23,7 @@ from devbox import db
 from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, EXPANSION_LIMIT, HOST_LIMIT, ROLES, STANDARDS,
     COMPONENT, Blocked, canonical, fields, file_hash, hex_id, image_record, json_bytes,
-    regular, require, seconds, stream_exact,
+    regular, require, seconds, stream_exact, portable_index, portable_roles,
 )
 
 REPOSITORY = 'oso-gato/dev-pair'
@@ -33,9 +33,10 @@ HOST_FILES = 256
 ASSEMBLY_SECONDS = 720
 HOST_PAYLOADS = ('host.tar', 'host-manifest.json')
 PART_FILE = 'part.json'
-SUBJECTS = ('platform.json', 'release.json')
+SUBJECTS = ('platform.json',)
 FILE_BUDGET = len(ROLES) * (ARCHIVE_LIMIT + CONTROL_LIMIT) + HOST_LIMIT + 3 * CONTROL_LIMIT
 TRANSPORT_BUDGET = FILE_BUDGET + 5 * 1024 ** 2
+AGENT_BUDGET = 2 * (ARCHIVE_LIMIT + CONTROL_LIMIT) + 4 * 1024 ** 2
 LATEST = 'https://api.github.com/repos/openai/codex/releases/latest'
 
 
@@ -136,7 +137,6 @@ def admit(source):
     for requirement in ('tools/native_placements.py', 'tools/release_trust.py', 'tools/renewal.py',
                         'runtime/renewal/driver', 'runtime/renewal/host-release'):
         require((SOURCE / requirement).is_file(), 'protected platform integration lacks ' + requirement)
-    config, plan = (hex_id(os.environ.get(key)) for key in ('HOST_CONFIG', 'LAUNCH_PLAN'))
     previous = os.environ.get('PREVIOUS')
     if previous != 'initial':
         hex_id(previous)
@@ -150,7 +150,7 @@ def admit(source):
     output = Path(os.environ['GITHUB_OUTPUT'])
     require(output.is_absolute() and output.resolve(strict=True) == output, 'Actions approval output unavailable')
     with output.open('a') as stream:
-        stream.write(f'host-config={config}\nplan={plan}\nprevious={previous}\nartifact-bytes={quota}\n')
+        stream.write(f'previous={previous}\nartifact-bytes={quota}\n')
 
 
 def host_member(name):
@@ -271,7 +271,7 @@ def publication_evidence(image, proof):
                 'DevBox layers do not extend its verified tooling')
 
 
-def image_archive(path, image, end):
+def image_archive(path, image, end, tooling=None):
     image_record(image)
     require(file_hash(path, ARCHIVE_LIMIT, end) == (image['archive_sha256'], image['archive_bytes']),
             'exact OCI archive digest or size mismatch')
@@ -289,8 +289,10 @@ def image_archive(path, image, end):
     expected = {'org.opencontainers.image.revision': image['source_sha'], 'dev-pair.role': image['role'],
                 'dev-pair.standards': STANDARDS, 'dev-pair.distrobox': public_inputs.DBX_SOURCE}
     if image['role'] != 'devbox':
-        expected.update({'dev-pair.context': image['context_sha256'], 'dev-pair.codex.version': CODEX_VERSION,
-                         'dev-pair.codex.sha256': public_inputs.CODEX_SHA})
+        version, binary = ((CODEX_VERSION, public_inputs.CODEX_SHA) if tooling is None
+                           else (tooling['codex_version'], tooling['codex_sha256']))
+        expected.update({'dev-pair.context': image['context_sha256'], 'dev-pair.codex.version': version,
+                         'dev-pair.codex.sha256': binary})
     require(type(labels) is dict and all(labels.get(key) == value for key, value in expected.items()),
             'archived image labels differ from the fixed Fedora/platform/source target')
     return hex_id(manifest.removeprefix('sha256:'))
@@ -305,14 +307,14 @@ def write_image_part(directory, image, proof, end):
     return data
 
 
-def validate_image_part(directory, role, source, end):
+def validate_image_part(directory, role, source, end, tooling=None):
     raw, part = readonly_json(directory / PART_FILE)
     fields(part, 'schema image oci_manifest_sha256 producer')
     image = image_record(part['image'])
     require(type(part['schema']) is int and part['schema'] == 1 and image['role'] == role and image['source_sha'] == source,
             'platform image part source or role differs')
     publication_evidence(image, part['producer'])
-    require(image_archive(directory / archive_name(role), image, end) == part['oci_manifest_sha256'],
+    require(image_archive(directory / archive_name(role), image, end, tooling) == part['oci_manifest_sha256'],
             'platform image manifest digest changed')
     return part, digest(raw)
 
@@ -326,42 +328,50 @@ def transport_record(directory, names, maximum, end):
     return result
 
 
-def assemble(inputs, output, source, run_id, config, plan, previous, quota):
+def portable_image(part, tooling=None):
+    image = part['image']
+    item = {key: image[key] for key in ('source_sha', 'context_sha256', 'archive_sha256', 'archive_bytes')}
+    item.update(oci_config_sha256=image['image_id'], oci_manifest_sha256=part['oci_manifest_sha256'])
+    if image['role'] != 'devbox':
+        values = tooling or {'codex_version': CODEX_VERSION, 'codex_source_sha': public_inputs.CODEX_SOURCE,
+                             'codex_sha256': public_inputs.CODEX_SHA}
+        item.update({key: values[key] for key in ('codex_version', 'codex_source_sha', 'codex_sha256')})
+    return item
+
+
+def assemble(inputs, output, source, run_id, previous, quota, *, agent=False, base=None):
     hex_id(source, 40)
-    require(type(run_id) is int and run_id > 0 and type(quota) is int and TRANSPORT_BUDGET <= quota,
+    limit = AGENT_BUDGET if agent else TRANSPORT_BUDGET
+    require(type(run_id) is int and run_id > 0 and type(quota) is int and limit <= quota,
             'protected Actions artifact quota approval is missing')
-    for value in (config, plan):
-        hex_id(value)
     if previous != 'initial':
         hex_id(previous)
+    if agent:
+        hex_id(previous)
+        hex_id(base)
     end = time.monotonic() + ASSEMBLY_SECONDS
+    kind = 'dev-pair-agent-release' if agent else 'dev-pair-platform-release'
     transports = {}
     components = {}
-    for role in ROLES:
+    for role in portable_roles(kind):
         name = artifact_name(role, source)
         directory = inputs / name
         part, _ = validate_image_part(directory, role, source, end)
+        components[COMPONENT[role]] = portable_image(part)
         transports[role] = {'name': name, 'files': transport_record(directory, (archive_name(role), PART_FILE), ARCHIVE_LIMIT, end)}
-        image = part['image']
-        item = {'source_revision': source, 'config_sha256': image['context_sha256'], 'artifact_sha256': image['image_id']}
-        if role != 'devbox':
-            item['codex_version'] = CODEX_VERSION
-        components[COMPONENT[role]] = item
-    name = artifact_name('host', source)
-    directory = inputs / name
-    host = validate_host(directory, source, end)
-    transports['host'] = {'name': name, 'files': transport_record(directory, HOST_PAYLOADS, HOST_LIMIT, end)}
-    components['host'] = {'source_revision': source, 'config_sha256': config, 'artifact_sha256': host}
-    runtime = {'schema': 1, 'source_revision': source, 'config_sha256': config, 'plan_sha256': plan,
-               'ledger_contract': 1, 'state_contract': 1, 'components': components}
+    if not agent:
+        name = artifact_name('host', source)
+        directory = inputs / name
+        host = validate_host(directory, source, end)
+        transports['host'] = {'name': name, 'files': transport_record(directory, HOST_PAYLOADS, HOST_LIMIT, end)}
+        components['host'] = {'source_sha': source, 'bundle_manifest_sha256': host}
+    combined = {'schema': 2, 'kind': kind, 'repository': REPOSITORY, 'source_sha': source, 'publisher_run': run_id,
+                'standards_sha': STANDARDS, 'contracts': {'ledger': 1, 'state': 1, 'release_policy': 1},
+                'previous_platform_sha256': None if previous == 'initial' else previous, 'base_platform_sha256': base,
+                'components': components, 'transports': transports}
+    portable_index(combined, source, run_id)
     with output_directory(output) as stage:
-        release_sha = write_json(stage / 'release.json', runtime)
-        combined = {'schema': 1, 'kind': 'dev-pair-platform-release', 'repository': REPOSITORY,
-                    'source_sha': source, 'publisher_run': run_id, 'standards_sha': STANDARDS,
-                    'previous_platform_sha256': None if previous == 'initial' else previous,
-                    'release_sha256': release_sha, 'transports': transports}
-        combined_sha = write_json(stage / 'platform.json', combined)
-    return combined_sha, release_sha
+        return write_json(stage / 'platform.json', combined)
 
 
 def main():
@@ -377,8 +387,8 @@ def main():
     build.add_argument('--input', required=True, type=Path)
     build.add_argument('--output', required=True, type=Path)
     build.add_argument('--run-id', required=True, type=int)
-    build.add_argument('--host-config-sha256', required=True)
-    build.add_argument('--plan-sha256', required=True)
+    build.add_argument('--agent-only', action='store_true')
+    build.add_argument('--base-platform')
     build.add_argument('--previous', required=True)
     build.add_argument('--approved-artifact-bytes', required=True, type=int)
     args = parser.parse_args()
@@ -387,9 +397,9 @@ def main():
     elif args.operation == 'host':
         print(build_host(SOURCE, args.source, args.output))
     else:
-        combined, runtime = assemble(args.input, args.output, args.source, args.run_id, args.host_config_sha256,
-                                     args.plan_sha256, args.previous, args.approved_artifact_bytes)
-        print(canonical({'platform_sha256': combined, 'release_sha256': runtime}).decode(), end='')
+        identity = assemble(args.input, args.output, args.source, args.run_id, args.previous, args.approved_artifact_bytes,
+                            agent=args.agent_only, base=args.base_platform)
+        print(identity)
     return 0
 
 

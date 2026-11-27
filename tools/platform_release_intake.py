@@ -20,14 +20,12 @@ import zipfile
 import platform_release as release
 from storage import GUEST_RESERVE
 from platform_release_protocol import (
-    ARCHIVE_LIMIT, CONTROL_LIMIT, HOST_LIMIT, ROLES, STANDARDS, COMPONENT,
-    Blocked, fields, file_hash, hex_id, json_bytes, require, seconds, stream_exact,
+    ARCHIVE_LIMIT, CONTROL_LIMIT, ROLES, COMPONENT,
+    Blocked, file_hash, hex_id, json_bytes, require, seconds, stream_exact, portable_index, portable_roles,
 )
 
 GITHUB = '/usr/bin/gh'
 ROOT = Path('/var/lib/dev-pair/platform-releases')
-U_ROOT = Path('/var/lib/dev-pair/renewal')
-HOST_CONFIG = Path('/etc/dev-pair/host-releases')
 TRUST = Path('/usr/libexec/dev-pair/tools/release_trust.py')
 API = 'repos/' + release.REPOSITORY + '/'
 CONTROL_SECONDS = 900
@@ -83,17 +81,22 @@ def intake_limit(directory, files, headroom=0):
     require(shutil.disk_usage(directory).free >= demand, 'release intake capacity and recovery reserve are insufficient')
 
 
-def checked_run(value, source, run):
-    require(value.get('id') == run and value.get('run_attempt') == 1 and value.get('event') == 'push' and
+def checked_run(value, source, run, agent):
+    event = ('schedule', 'workflow_dispatch') if agent else ('push',)
+    path = '.github/workflows/agent-refresh.yml' if agent else '.github/workflows/platform-release.yml'
+    require(value.get('id') == run and value.get('run_attempt') == 1 and value.get('event') in event and
             value.get('status') == 'completed' and value.get('conclusion') == 'success' and
-            value.get('path') == '.github/workflows/platform-release.yml' and value.get('head_sha') == source and
+            value.get('path') == path and value.get('head_sha') == source and
             value.get('head_branch') == 'main' and value.get('repository', {}).get('full_name') == release.REPOSITORY and
             value.get('head_repository', {}).get('full_name') == release.REPOSITORY, 'protected platform publisher run unavailable')
 
 
-def artifacts(raw, source):
+def artifacts(raw, source, agent):
     values = raw.get('artifacts')
-    names = {release.artifact_name(part, source) for part in (*ROLES, 'host', 'subjects')}
+    roles = (*ROLES, 'host') if not agent else ROLES[:2]
+    names = {release.artifact_name(part, source) for part in (*roles, 'subjects')}
+    if agent:
+        names.add(f'agent-tooling-{source}')
     require(raw.get('total_count') == len(names) and type(values) is list and len(values) == len(names),
             'publisher artifact inventory differs from the closed release package')
     result = {}
@@ -151,30 +154,6 @@ def fetch_artifact(rows, name, destination, wanted, end):
         extract_zip(path, destination, wanted, end)
 
 
-def validate_subject(value, source, run):
-    fields(value, 'schema kind repository source_sha publisher_run standards_sha previous_platform_sha256 release_sha256 transports')
-    require(type(value['schema']) is int and value['schema'] == 1 and value['kind'] == 'dev-pair-platform-release' and
-            value['repository'] == release.REPOSITORY and value['source_sha'] == source and
-            type(value['publisher_run']) is int and value['publisher_run'] == run and value['standards_sha'] == STANDARDS,
-            'attested platform subject does not identify the exact candidate and publisher')
-    hex_id(value['release_sha256'])
-    if value['previous_platform_sha256'] is not None:
-        hex_id(value['previous_platform_sha256'])
-    transports = value['transports']
-    require(type(transports) is dict and set(transports) == set((*ROLES, 'host')), 'platform transport inventory is incomplete')
-    for part, transport in transports.items():
-        fields(transport, 'name files')
-        require(transport['name'] == release.artifact_name(part, source), 'attested Actions artifact name differs')
-        names = release.HOST_PAYLOADS if part == 'host' else (release.archive_name(part), release.PART_FILE)
-        require(type(transport['files']) is dict and set(transport['files']) == set(names), 'platform artifact file inventory changed')
-        for name, row in transport['files'].items():
-            fields(row, 'sha256 bytes')
-            hex_id(row['sha256'])
-            cap = (HOST_LIMIT if part == 'host' else ARCHIVE_LIMIT) if name.endswith('.tar') else CONTROL_LIMIT
-            require(type(row['bytes']) is int and 0 < row['bytes'] <= cap, 'attested component file bound invalid')
-    return value
-
-
 def verify_subject(path, identity, source, run, role, end):
     verify = protected(TRUST)
     subprocess.run(['/usr/bin/python3', '-B', str(verify), 'verify', '--component', role, '--source-sha', source,
@@ -182,38 +161,7 @@ def verify_subject(path, identity, source, run, role, end):
                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, env=native_env(), timeout=seconds(end, 120), check=True)
 
 
-def runtime_manifest(path, expected):
-    digest, value = release.readonly_json(path, 0)
-    require(hashlib.sha256(digest).hexdigest() == expected, 'renewal subject digest differs from attested platform record')
-    fields(value, 'schema source_revision config_sha256 plan_sha256 ledger_contract state_contract components')
-    require(all(type(value[key]) is int and value[key] == 1 for key in ('schema', 'ledger_contract', 'state_contract')),
-            'platform and prior release state contracts differ')
-    hex_id(value['source_revision'], 40)
-    for value_sha in (value['config_sha256'], value['plan_sha256']):
-        hex_id(value_sha)
-    components = value['components']
-    require(type(components) is dict and set(components) == {'host', *COMPONENT.values()}, 'platform runtime components are incomplete')
-    for name, item in components.items():
-        agent = name.endswith('-agent')
-        fields(item, 'source_revision config_sha256 artifact_sha256' + (' codex_version' if agent else ''))
-        hex_id(item['source_revision'], 40)
-        hex_id(item['config_sha256'])
-        hex_id(item['artifact_sha256'])
-        if agent:
-            require(type(item['codex_version']) is str and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', item['codex_version']),
-                    'release agent lacks a stable tooling version')
-    require(components['host']['config_sha256'] == value['config_sha256'], 'platform host configuration changed')
-    return value
-
-
-def check_site(runtime, end):
-    config = protected(HOST_CONFIG / (runtime['config_sha256'] + '.json'))
-    plan = protected(U_ROOT / 'plans' / (runtime['plan_sha256'] + '.json'))
-    for path, identity, limit in ((config, runtime['config_sha256'], 4096), (plan, runtime['plan_sha256'], CONTROL_LIMIT)):
-        require(file_hash(path, limit, end, owner=0)[0] == identity, 'independently selected site configuration or launch plan changed')
-
-
-def verify_local_parts(directory, value, runtime, end):
+def verify_local_parts(directory, value, end):
     for part, transfer in value['transports'].items():
         local = protected(directory / part, directory=True)
         require({item.name for item in local.iterdir()} == set(transfer['files']), 'local release component inventory changed')
@@ -222,32 +170,25 @@ def verify_local_parts(directory, value, runtime, end):
                     'local release component no longer matches its digest')
         source = value['source_sha']
         if part == 'host':
-            require(release.validate_host(local, source, end) == runtime['components']['host']['artifact_sha256'],
-                    'platform host bundle identity differs from renewal subject')
+            require(release.validate_host(local, source, end) == value['components']['host']['bundle_manifest_sha256'],
+                    'portable host bundle identity differs')
         else:
-            checked, _ = release.validate_image_part(local, part, source, end)
-            runtime_row = runtime['components'][COMPONENT[part]]
-            fixed = {'source_revision': source, 'artifact_sha256': checked['image']['image_id'],
-                     'config_sha256': checked['image']['context_sha256']}
-            if part != 'devbox':
-                fixed['codex_version'] = release.CODEX_VERSION
-            require(runtime_row == fixed, 'platform runtime image differs from exact archive')
+            component = value['components'][COMPONENT[part]]
+            checked, _ = release.validate_image_part(local, part, source, end, component if part != 'devbox' else None)
+            require(release.portable_image(checked, component) == component, 'portable image identity differs from exact archive')
 
 
 def previous_release(identity, end):
-    if identity is None:
-        return
     previous = protected(ROOT / identity, directory=True)
     raw, value = release.readonly_json(protected(previous / 'platform.json'), 0)
     require(hashlib.sha256(raw).hexdigest() == identity, 'retained previous platform manifest changed')
-    validate_subject(value, value['source_sha'], value['publisher_run'])
-    raw, receipt = release.readonly_json(protected(previous / 'intake.json'), 0)
-    require(receipt == {'schema': 1, 'platform_sha256': identity, 'source_sha': value['source_sha'],
-                        'publisher_run': value['publisher_run'], 'release_sha256': value['release_sha256']},
+    portable_index(value, value['source_sha'], value['publisher_run'])
+    _, receipt = release.readonly_json(protected(previous / 'intake.json'), 0)
+    require(receipt == {'schema': 2, 'platform_sha256': identity, 'source_sha': value['source_sha'],
+                        'publisher_run': value['publisher_run'], 'kind': value['kind']},
             'retained previous platform lacks exact prior trust receipt')
-    runtime = runtime_manifest(protected(previous / 'release.json'), value['release_sha256'])
-    check_site(runtime, end)
-    verify_local_parts(previous, value, runtime, end)
+    verify_local_parts(previous, value, end)
+    return value
 
 
 @contextmanager
@@ -265,7 +206,7 @@ def intake_lock():
         os.close(fd)
 
 
-def acquire(source, run, expected, previous, end):
+def acquire(source, run, expected, previous, end, *, agent=False):
     hex_id(source, 40)
     hex_id(expected)
     require(type(run) is int and 0 < run < 2 ** 63 and os.getuid() == os.geteuid() == 0,
@@ -283,34 +224,42 @@ def acquire(source, run, expected, previous, end):
         require(previous != expected, 'platform release cannot reference itself for recovery')
     # Capacity is established before contacting the transport. One additional
     # ZIP may coexist with the complete set of retained release files.
-    intake_limit(ROOT, [release.FILE_BUDGET], ARCHIVE_LIMIT + ZIP_OVERHEAD)
-    checked_run(read_api(f'actions/runs/{run}', end), source, run)
-    rows = artifacts(read_api(f'actions/runs/{run}/artifacts?per_page=100', end), source)
+    intake_limit(ROOT, [release.AGENT_BUDGET if agent else release.FILE_BUDGET], ARCHIVE_LIMIT + ZIP_OVERHEAD)
+    checked_run(read_api(f'actions/runs/{run}', end), source, run, agent)
+    rows = artifacts(read_api(f'actions/runs/{run}/artifacts?per_page=100', end), source, agent)
     with release.output_directory(ROOT / expected) as stage:
         names = {name: (None, CONTROL_LIMIT) for name in release.SUBJECTS}
         fetch_artifact(rows, release.artifact_name('subjects', source), stage, names, end)
         raw, value = release.readonly_json(stage / 'platform.json', 0)
         require(hashlib.sha256(raw).hexdigest() == expected, 'platform subject differs from independently selected digest')
-        value = validate_subject(value, source, run)
-        require(value['previous_platform_sha256'] == previous, 'protected recovery version differs from the release request')
-        verify_subject(stage / 'platform.json', expected, source, run, 'host', end)
-        runtime = runtime_manifest(stage / 'release.json', value['release_sha256'])
-        require(runtime['source_revision'] == source, 'renewal subject source differs')
-        for role in ROLES:
-            verify_subject(stage / 'release.json', value['release_sha256'], source, run, role, end)
-        check_site(runtime, end)
-        previous_release(previous, end)
+        value = portable_index(value, source, run)
+        kind = 'dev-pair-agent-release' if agent else 'dev-pair-platform-release'
+        require(value['kind'] == kind and value['previous_platform_sha256'] == previous,
+                'protected recovery version or release kind differs')
+        roles = portable_roles(kind)
+        for role in roles if agent else (*roles, 'host'):
+            verify_subject(stage / 'platform.json', expected, source, run, role, end)
+        if previous is not None:
+            prior = previous_release(previous, end)
+            if agent:
+                base = prior['base_platform_sha256'] or previous
+                require(value['base_platform_sha256'] == base, 'agent refresh changes the retained host and DevBox base')
+                if base != previous:
+                    retained = previous_release(base, end)
+                    require(retained['kind'] == 'dev-pair-platform-release', 'retained stable base is incomplete')
+        else:
+            require(not agent, 'agent refresh requires the previous verified platform')
         for part, transport in value['transports'].items():
             target = stage / part
             target.mkdir(mode=0o700)
             wanted = {name: (item['sha256'], item['bytes']) for name, item in transport['files'].items()}
             fetch_artifact(rows, transport['name'], target, wanted, end)
-        verify_local_parts(stage, value, runtime, end)
+        verify_local_parts(stage, value, end)
         branch = read_api('branches/main', end)
         require(branch.get('protected') is True and branch.get('commit', {}).get('sha') == source,
                 'protected main changed before release staging')
-        receipt = {'schema': 1, 'platform_sha256': expected, 'source_sha': source,
-                   'publisher_run': run, 'release_sha256': value['release_sha256']}
+        receipt = {'schema': 2, 'platform_sha256': expected, 'source_sha': source,
+                   'publisher_run': run, 'kind': value['kind']}
         release.write_json(stage / 'intake.json', receipt)
     return receipt
 
@@ -320,6 +269,7 @@ def main():
     parser.add_argument('--source', required=True)
     parser.add_argument('--run-id', required=True, type=int)
     parser.add_argument('--platform-sha256', required=True)
+    parser.add_argument('--agent-only', action='store_true')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--previous')
     mode.add_argument('--initial', action='store_true')
@@ -327,7 +277,8 @@ def main():
     os.umask(0o077)
     require(os.getuid() == os.geteuid() == 0, 'protected release operator required')
     with intake_lock():
-        result = acquire(args.source, args.run_id, args.platform_sha256, args.previous, time.monotonic() + CONTROL_SECONDS)
+        result = acquire(args.source, args.run_id, args.platform_sha256, args.previous,
+                         time.monotonic() + CONTROL_SECONDS, agent=args.agent_only)
     print(release.canonical(result).decode(), end='')
     return 0
 

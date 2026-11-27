@@ -161,3 +161,70 @@ def receive_frame(path, output, target, end):
         require((current.st_size, current.st_mtime_ns, current.st_ctime_ns) ==
                 (node.st_size, node.st_mtime_ns, node.st_ctime_ns), 'release spool changed during transfer')
     return frame
+
+
+def portable_roles(kind):
+    require(kind in ('dev-pair-platform-release', 'dev-pair-agent-release'), 'unsupported portable release kind')
+    return ROLES if kind == 'dev-pair-platform-release' else ROLES[:2]
+
+
+def portable_index(value, source, run):
+    fields(value, 'schema kind repository source_sha publisher_run standards_sha contracts '
+           'previous_platform_sha256 base_platform_sha256 components transports')
+    require(type(value['schema']) is int and value['schema'] == 2 and value['repository'] == 'oso-gato/dev-pair' and
+            value['source_sha'] == hex_id(source, 40) and type(value['publisher_run']) is int and
+            value['publisher_run'] == run and run > 0 and value['standards_sha'] == STANDARDS,
+            'portable index does not bind the exact reviewed source and run')
+    contracts = fields(value['contracts'], 'ledger state release_policy')
+    require(all(type(flag) is int and flag == 1 for flag in contracts.values()), 'portable release contracts differ')
+    roles = portable_roles(value['kind'])
+    agent_only = roles == ROLES[:2]
+    previous, base = value['previous_platform_sha256'], value['base_platform_sha256']
+    if agent_only:
+        hex_id(previous)
+        hex_id(base)
+    else:
+        require(base is None, 'full platform release carries its own host and DevBox')
+        if previous is not None:
+            hex_id(previous)
+    components = fields(value['components'], ' '.join(COMPONENT[role] for role in roles) + ('' if agent_only else ' host'))
+    transfers = fields(value['transports'], ' '.join(roles) + ('' if agent_only else ' host'))
+    if not agent_only:
+        host = fields(components['host'], 'source_sha bundle_manifest_sha256')
+        require(host['source_sha'] == source, 'portable host artifact source differs')
+        hex_id(host['bundle_manifest_sha256'])
+    for role in roles:
+        names = 'source_sha context_sha256 oci_config_sha256 oci_manifest_sha256 archive_sha256 archive_bytes'
+        agent = role != 'devbox'
+        item = fields(components[COMPONENT[role]], names + (' codex_version codex_source_sha codex_sha256' if agent else ''))
+        require(item['source_sha'] == source and type(item['archive_bytes']) is int and
+                0 < item['archive_bytes'] <= ARCHIVE_LIMIT, 'portable image source or archive bound differs')
+        for key in ('context_sha256', 'oci_config_sha256', 'oci_manifest_sha256', 'archive_sha256'):
+            hex_id(item[key])
+        if agent:
+            require(type(item['codex_version']) is str and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', item['codex_version']),
+                    'portable image stable version missing')
+            hex_id(item['codex_source_sha'], 40)
+            hex_id(item['codex_sha256'])
+    maintenance, development = (components[COMPONENT[role]] for role in ROLES[:2])
+    require(all(maintenance[key] == development[key] for key in ('codex_version', 'codex_source_sha', 'codex_sha256')),
+            'portable agent pair uses different verified tooling inputs')
+    for name, row in transfers.items():
+        fields(row, 'name files')
+        require(row['name'] == f'platform-{name}-{source}', 'portable release transport name differs')
+        archive = 'host.tar' if name == 'host' else f'{name}.oci.tar'
+        evidence = 'host-manifest.json' if name == 'host' else 'part.json'
+        files = fields(row['files'], f'{archive} {evidence}')
+        for leaf, info in files.items():
+            fields(info, 'sha256 bytes')
+            hex_id(info['sha256'])
+            cap = ((HOST_LIMIT if name == 'host' else ARCHIVE_LIMIT) if leaf == archive else CONTROL_LIMIT)
+            require(type(info['bytes']) is int and 0 < info['bytes'] <= cap, 'portable release transfer exceeds its bound')
+        if name == 'host':
+            require(files[evidence]['sha256'] == components['host']['bundle_manifest_sha256'],
+                    'portable host bundle manifest digest differs')
+        else:
+            image = components[COMPONENT[name]]
+            require(files[archive] == {'sha256': image['archive_sha256'], 'bytes': image['archive_bytes']},
+                    'portable archive transport differs from its image identity')
+    return value

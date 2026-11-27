@@ -229,18 +229,21 @@ class HTTPSOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch(output, fedora_cache=None):
+def fetch(output, fedora_cache=None, *, codex_cache=None):
     with wall_limit(600):
-        return fetch_within_limit(output, fedora_cache)
+        return fetch_within_limit(output, fedora_cache, codex_cache=codex_cache)
 
 
-def fetch_within_limit(output, fedora_cache=None):
+def fetch_within_limit(output, fedora_cache=None, *, codex_cache=None):
     output = private_directory(output)
     try:
         opener = urllib.request.build_opener(HTTPSOnly())
         for name, (url, size, expected) in ARTIFACTS.items():
             if fedora_cache is not None and name in fedora_oci.ARTIFACTS:
                 snapshot(pathlib.Path(fedora_cache)/name,output/name,size,expected)
+                continue
+            if codex_cache is not None and name in ('codex.tar.gz', 'codex.sigstore', 'cosign'):
+                snapshot(pathlib.Path(codex_cache) / name, output / name, size, expected)
                 continue
             started = time.monotonic()
             copied = 0
@@ -578,6 +581,7 @@ def main():
     sub = parser.add_subparsers(dest='command', required=True)
     fetch_parser = sub.add_parser('fetch')
     fetch_parser.add_argument('--fedora-cache', type=pathlib.Path)
+    fetch_parser.add_argument('--codex-cache', type=pathlib.Path)
     fetch_parser.add_argument('--output', required=True, type=pathlib.Path)
     build_parser = sub.add_parser('build')
     build_parser.add_argument('--cache', required=True, type=pathlib.Path)
@@ -592,7 +596,7 @@ def main():
     consumer.add_argument('--role', choices=ROLES, default='maintenance')
     args = parser.parse_args()
     if args.command == 'fetch':
-        result = fetch(args.output, args.fedora_cache)
+        result = fetch(args.output, args.fedora_cache, codex_cache=args.codex_cache)
     elif args.command == 'build':
         result = build(args.cache, args.distrobox_source, args.output, role=args.role)
     else:
