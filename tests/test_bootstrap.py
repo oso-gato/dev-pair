@@ -441,6 +441,51 @@ class BootstrapTests(unittest.TestCase):
             if f.is_file():
                 self.assertNotIn('tskey-secret', f.read_text())
 
+    def test_browser_enrollment_keeps_verified_scope_and_needs_no_key_file(self):
+        self.prepare()
+        calls = []
+
+        def browser(command):
+            calls.append(command)
+            self.fake(*command)
+
+        self.app.enroll(None, 'example.ts.net', browser=browser)
+        self.app.enroll(None, 'example.ts.net', browser=browser)
+        self.assertEqual(len(calls), 1)
+        command = calls[0]
+        self.assertIn('--ssh=false', command)
+        self.assertIn('--netfilter-mode=off', command)
+        self.assertIn('--timeout=10m', command)
+        self.assertFalse(any('--auth-key' in option for option in command))
+        self.assertTrue(self.app.status()['enrollment_recorded'])
+
+    @unittest.skipUnless(Path('/usr/sbin/sshd').exists(), 'sshd parser unavailable')
+    def test_real_sshd_attended_core_only_negotiates_tailnet_scope(self):
+        host = self.root / 'attended-test-host-key'
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(host)], check=True)
+        config = self.root / 'attended-sshd.conf'
+        include = self.app.path('/etc/ssh/sshd_config.d/00-dev-pair-operator.conf')
+        config.write_text(f'HostKey {host}\nInclude {include}\n')
+
+        def run(*args, **kwargs):
+            if args[:2] == ('/usr/sbin/sshd', '-T'):
+                return subprocess.run([*args[:2], '-f', str(config), *args[2:]], text=True,
+                                      capture_output=True, check=True).stdout
+            return self.fake(*args, **kwargs)
+
+        self.app.run = run
+        self.app.attended_access = True
+        self.app.ssh_operator('core', KEY)
+        for address, local, expected in (('100.64.0.1', '100.64.0.2', False),
+                                         ('192.0.2.1', '192.0.2.2', True),
+                                         ('fd7a:115c:a1e0::1', 'fd7a:115c:a1e0::2', False),
+                                         ('2001:db8::1', 'fd7a:115c:a1e0::2', True)):
+            status = run('/usr/sbin/sshd', '-T', '-C', f'user=core,host=bootstrap,addr={address},laddr={local}')
+            self.assertEqual(any(line.startswith('denyusers ') and 'core' in line.split()[1:]
+                                 for line in status.splitlines()), expected)
+        root = run('/usr/sbin/sshd', '-T', '-C', 'user=root,host=bootstrap,addr=192.0.2.1,laddr=192.0.2.2')
+        self.assertFalse(any(line.startswith('denyusers ') and 'root' in line.split()[1:] for line in root.splitlines()))
+
     def test_enrollment_failure_keeps_bootstrap_route_and_reports_no_secret(self):
         self.prepare()
         before = self.app.text('/etc/dev-pair/bootstrap.nft')
