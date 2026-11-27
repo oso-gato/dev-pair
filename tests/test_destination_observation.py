@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import uuid
@@ -161,6 +162,52 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(o.prepare_plan(binding, site, NOW + 1, prepared), prepared)
         with self.assertRaisesRegex(o.Blocked, 'differs'):
             o.prepare_plan({**binding, 'dns_name': 'other.site.ts.net'}, site, NOW, None)
+
+    def test_ordinary_export_refuses_wrong_or_missing_publisher_attempt(self):
+        from product_release import product
+
+        plan = self.plan
+        release = {'source_sha': plan['release_source'], 'subject': plan['image'],
+                   'run_id': plan['publisher_run_id'], 'run_attempt': plan['publisher_run_attempt'],
+                   'source_tree': '5' * 40, 'artifact_sha256': plan['image'].rsplit(':', 1)[1],
+                   'pull_request': 7, 'review_head': '6' * 40}
+        live = dict(release, dns_name=DNS)
+        promotion = {'job_id': plan['job_id'], 'phase': 'awaiting-independent-destination',
+                     'release': release, 'binding': {'dns_name': DNS}}
+
+        @contextmanager
+        def release_gate():
+            yield {'platform_sha': plan['source_sha']}, None, DNS
+
+        destination = SimpleNamespace(
+            release_gate=release_gate,
+            initial_activation=lambda: {'active': live, 'pending': None, 'route_pending': False, 'previous': None},
+            serve_config=lambda dns: dns == DNS,
+            destination_identity=lambda: {'machine_id': MACHINE, 'boot_id': BOOT},
+            verify_final_guard=lambda: {name: plan[name] for name in ('provider_recovery', 'public_addresses', 'guard_sha256')},
+        )
+        job = plan['job_id']
+        with tempfile.TemporaryDirectory() as tmp, patch.object(product, 'JOBS', Path(tmp)), \
+                patch.object(o.os, 'geteuid', return_value=0), patch('destination_release.Destination', return_value=destination):
+            root = product.job_path(job)
+            root.mkdir(mode=0o700)
+            product.durable_json(root / 'promotion.json', promotion)
+            for value in (1, None, True):
+                with self.subTest(activation_attempt=value):
+                    if value is None:
+                        live.pop('run_attempt')
+                    else:
+                        live['run_attempt'] = value
+                    with self.assertRaisesRegex(o.Blocked, 'selected exact release'):
+                        o.export_release(job)
+            live['run_attempt'] = release['run_attempt']
+            exported = o.export_release(job)
+            self.assertEqual((exported['publisher_run_id'], exported['publisher_run_attempt']), (371, 2))
+            self.assertEqual(exported['image'], plan['image'])
+            release.pop('run_attempt')
+            product.durable_json(root / 'promotion.json', promotion)
+            with self.assertRaisesRegex(o.Blocked, 'selected exact release'):
+                o.export_release(job)
 
     def test_receipt_verifies_distinct_keys_and_recovery_order_without_inventing_missing_observations(self):
         with tempfile.TemporaryDirectory() as tmp:
