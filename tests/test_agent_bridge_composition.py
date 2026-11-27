@@ -110,7 +110,7 @@ class NightlyComposition(TestCase):
         def query(endpoint, end, *, limit=intake.META_LIMIT, output=None):
             run = native['run']
             if endpoint == 'branches/main':
-                return {'protected': True, 'commit': {'sha': run['head_sha']}}
+                return {'name': 'main', 'protected': True, 'commit': {'sha': run['head_sha']}}
             if endpoint.startswith('actions/workflows/'):
                 self.assertIn('event=' + run['event'], endpoint)
                 return {'workflow_runs': [run] if native['occupied'] else []}
