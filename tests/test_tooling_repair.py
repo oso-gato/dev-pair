@@ -19,6 +19,7 @@ class ToolingRepair(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
         self.probe=ci.Probe('a'*40,self.root)
+        self.root=self.probe.root;self.root.mkdir()
 
     @contextlib.contextmanager
     def fixture(self,bounded,import_calls=False):
@@ -68,7 +69,8 @@ class ToolingRepair(unittest.TestCase):
         self.assertTrue(self.probe.engine_activity);self.assertFalse(self.probe.image_copy_active)
         self.assertIsNone(self.probe.primary_image_failure)
         with patch.object(ci.subprocess,'run',side_effect=[subprocess.CompletedProcess([],0,b'',b''),subprocess.CompletedProcess([],0,b'',b'')]) as run, \
-             patch.object(ci,'mounts_below',return_value=False),contextlib.redirect_stdout(io.StringIO()):
+             patch.object(self.probe.storage,'verify_engine_mount'), \
+             patch.object(self.probe.storage,'release',side_effect=lambda:shutil.rmtree(self.root)),contextlib.redirect_stdout(io.StringIO()):
             self.probe.cleanup()
         self.assertEqual(run.call_count,2)
         self.assertEqual(run.call_args_list[0].args[0][-3:],['rm','--force','--all'])
@@ -144,7 +146,8 @@ class ToolingRepair(unittest.TestCase):
             self.fail('unexpected preflight command')
         with patch.dict(os.environ,{'GITHUB_ACTIONS':'true','GITHUB_REPOSITORY':'oso-gato/dev-pair'}), \
              patch.object(Path,'read_text',read),patch.object(Path,'is_file',return_value=True), \
-             patch.object(ci.os,'cpu_count',return_value=4),patch.object(ci,'check_capacity',return_value=30*ci.GIB), \
+             patch.object(ci.os,'cpu_count',return_value=4),patch.object(self.probe.storage,'configure',return_value={}), \
+             patch.object(self.probe,'initialize_directories',side_effect=self.probe.initialize_directories), \
              patch.object(ci,'run_small',side_effect=small),contextlib.redirect_stdout(io.StringIO()):
             yield calls
 

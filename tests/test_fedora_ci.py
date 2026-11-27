@@ -205,13 +205,7 @@ class FedoraCITests(unittest.TestCase):
             guest.stage_source(bad, self.root / 'bad-staging', ci.file_hash(bad / 'source.tar'), ci.file_hash(bad / 'source.bundle'))
         self.assertEqual(victim.read_text(), 'preserve')
 
-    def test_capacity_requires_full_overlay_reservation_and_controls_are_escaped(self):
-        disk = type('Disk', (), {})()
-        disk.free = ci.HOST_RESERVE + ci.OVERLAY_LIMIT - 1
-        with mock.patch.object(ci.shutil, 'disk_usage', return_value=disk):
-            with self.assertRaisesRegex(ci.Blocked, 'capacity blocked'):
-                ci.check_capacity(self.root, before_boot=True)
-            self.assertEqual(ci.check_capacity(self.root), disk.free)
+    def test_controls_are_escaped(self):
         self.assertNotIn('::error', ci.sanitize(b'::error::untrusted\x1b[31m\x00'))
         self.assertNotIn('\x1b', ci.sanitize(b'bad\x1b[31m'))
         with self.assertRaisesRegex(ci.Blocked, 'invalid payload identity'):
@@ -229,13 +223,12 @@ class FedoraCITests(unittest.TestCase):
         self.assertEqual(short.stat().st_uid, os.getuid())
         self.assertEqual(short.stat().st_mode & 0o022, 0)
         for name in ('graph', 'runroot', 'tmp'):
-            self.assertLessEqual(len(os.fsencode(short / name)), 50)
-            self.assertIn(str(short / name), ' '.join(probe.podman))
+            self.assertLessEqual(len(os.fsencode(probe.root / name)), 50)
+            self.assertIn(str(probe.root / name), ' '.join(probe.podman))
 
     def test_preflight_failure_removes_owned_scratch_without_engine_or_sudo(self):
         short = ci.scratch_root(str(self.root))
         self.addCleanup(lambda: shutil.rmtree(short, ignore_errors=True))
-        (short / 'partial-public-input').write_text('preserve diagnostics in report, not scratch')
         probe = ci.Probe('a' * 40, short)
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}), \
@@ -248,17 +241,12 @@ class FedoraCITests(unittest.TestCase):
                       if line.startswith('DP_REPORT '))
         self.assertEqual(report['blocker'], 'engine initialization rejected')
 
-    def test_engine_version_directory_creation_does_not_break_next_phase(self):
+    def test_bound_preflight_reaches_input_phase(self):
         short = ci.scratch_root(str(self.root))
         self.addCleanup(lambda: shutil.rmtree(short, ignore_errors=True))
         probe = ci.Probe('a' * 40, short)
-        def version_probe():
-            # Actual filesystem behavior of Podman version with explicit paths,
-            # without installing/running Podman on the development machine.
-            for name in ('graph', 'runroot', 'tmp'):
-                (short / name).mkdir(parents=True, exist_ok=True)
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': ''}), \
-             mock.patch.object(probe, 'preflight', side_effect=version_probe), \
+             mock.patch.object(probe, 'preflight'), \
              mock.patch.object(probe, 'inputs', side_effect=ci.Blocked('reached input phase')) as inputs:
             self.assertEqual(probe.execute(), 2)
         inputs.assert_called_once_with()
@@ -268,21 +256,26 @@ class FedoraCITests(unittest.TestCase):
 
     def test_directory_initialization_rejects_symlink_or_foreign_write_mode(self):
         probe = ci.Probe('a' * 40, self.root)
+        probe.root.mkdir()
         target = self.root / 'preserved'
         target.mkdir()
-        (self.root / 'graph').symlink_to(target, target_is_directory=True)
+        graph = probe.root / 'graph'
+        graph.symlink_to(target, target_is_directory=True)
         with self.assertRaisesRegex(ci.Blocked, 'unsafe'):
             probe.initialize_directories()
         self.assertTrue(target.is_dir())
-        (self.root / 'graph').unlink()
-        (self.root / 'graph').mkdir()
-        (self.root / 'graph').chmod(0o777)
+        graph.unlink()
+        graph.mkdir()
+        graph.chmod(0o777)
         with self.assertRaisesRegex(ci.Blocked, 'unsafe'):
             probe.initialize_directories()
 
     def test_active_engine_failure_or_mount_preserves_owned_scratch(self):
         probe = ci.Probe('a' * 40, self.root)
         probe.engine_activity = True
+        mount_patch = mock.patch.object(probe.storage, 'verify_engine_mount')
+        mount_proof = mount_patch.start()
+        self.addCleanup(mount_patch.stop)
         evidence = self.root / 'evidence'
         evidence.write_text('retain')
         with mock.patch.object(ci.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, b'', b'engine failed')) as run:
@@ -290,8 +283,8 @@ class FedoraCITests(unittest.TestCase):
                 probe.cleanup()
             self.assertEqual(run.call_count, 1)
         with mock.patch.object(ci.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'', b'')), \
-             mock.patch.object(ci, 'mounts_below', return_value=True):
-            with self.assertRaisesRegex(ci.Blocked, 'active scratch mounts'):
+             mock.patch.object(probe.storage, 'release', side_effect=ci.kernel_storage.StorageBlocked('active owned mount')):
+            with self.assertRaisesRegex(ci.kernel_storage.StorageBlocked, 'active owned mount'):
                 probe.cleanup()
         with mock.patch.object(ci.subprocess, 'run', side_effect=[
                 subprocess.CompletedProcess([], 0, b'', b''),
@@ -299,6 +292,7 @@ class FedoraCITests(unittest.TestCase):
             with self.assertRaisesRegex(ci.Blocked, 'inventory unresolved'):
                 probe.cleanup()
         self.assertEqual(evidence.read_text(), 'retain')
+        self.assertEqual(mount_proof.call_count, 3)
 
     def test_cleanup_refuses_replaced_owned_directory(self):
         original = self.root / 'original'
@@ -395,11 +389,6 @@ class FedoraCITests(unittest.TestCase):
         self.assertRegex(detail['stderr_sha256'],r'^[0-9a-f]{64}$')
         self.assertNotIn('stderr_tail',detail)
         self.assertLess(len(ci.safe_json(detail)), 5000)
-        probe = ci.Probe('a' * 40, self.root)
-        with mock.patch.object(ci, 'capture_du', side_effect=caught.exception):
-            with self.assertRaises(ci.StorageMeasurementBlocked):
-                probe.storage_measurement(live=True)
-        self.assertEqual(probe.report['storage_measurement_failure'], detail)
 
     def test_storage_failure_retains_other_error_and_still_rejects_it(self):
         output = ('0\t' + str(self.root) + '\n').encode()

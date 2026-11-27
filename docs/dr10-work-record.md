@@ -2,6 +2,25 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026 — Fedora CI kernel storage candidate
+
+- W1 uses the reviewed guest source at `657eec5d0d16a56fb34360af9883777ea3e51f31`
+  and adopted standards at `b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`.
+  The implementation session used API-selected GPT-6.2 Sol High. Backend
+  attestation is unavailable.
+- Standard-runner maintenance and development-producer attempts require a
+  fresh same-repository label event for the exact role and candidate.
+  Routine PR edits run the hosted suite. The native controller uses fixed,
+  physically allocated ext4 volumes for overhead and the qcow2 overlay,
+  and reads kernel capacity counters. It checks and preserves the existing
+  outside-backing and guest reserves.
+- Local evidence covers allocated-versus-sparse backing, separate kernel
+  byte and inode limits, charging an open unlinked file, private process
+  cleanup and the scoped native launch contract. Native ext4/loop geometry,
+  Podman in the private namespaces and Fedora role outcomes await a separate
+  authorized standard-runner attempt. Nested placement and artifact delivery
+  remain outside this slice. See [the Fedora execution route](fedora-ci.md).
+
 ### November 27, 2026, 10:16 UTC — development guest preservation
 
 - The development guest at `7dfd42a10c9732eb172d4979f9a858a6fc2c331a`

@@ -48,6 +48,8 @@ GUEST_ADMISSION_SECONDS = 60
 INITIALIZE_SECONDS = 2280
 INITIALIZE_CLEANUP_SECONDS = 45
 GUEST_FINAL_SECONDS = 60
+PLATFORM_EXPORT_SECONDS = 240
+PLATFORM_VERIFY_SECONDS = 240
 PAYLOAD_PATH = pathlib.Path('/run/dev-pair-payload')
 INPUT_DESTINATION = pathlib.Path('/root/dev-pair-ci-inputs')
 SECRET_DIRECTORY = pathlib.Path('/run/dev-pair-ci-secrets')
@@ -641,10 +643,18 @@ def safe_text(value, limit=4000):
 
 def validate_inputs(value):
     fields = set(INPUT_LENGTHS) | {'payload_bytes'}
-    require(type(value) is dict and (set(value) == fields or
-            set(value) == fields | {'scenario', 'run_nonce'} and value['scenario'] == 'development' and
-            type(value['run_nonce']) is str and re.fullmatch('[0-9a-f]{32}', value['run_nonce'])),
+    require(type(value) is dict, 'invalid public input identity fields')
+    keys = set(value) - {'platform_export'}
+    require(keys == fields or
+            keys == fields | {'scenario', 'run_nonce'} and value['scenario'] == 'development' and
+            type(value['run_nonce']) is str and re.fullmatch('[0-9a-f]{32}', value['run_nonce']),
             'invalid public input identity fields')
+    if 'platform_export' in value:
+        export = value['platform_export']
+        require(type(export) is dict and set(export) == {'nonce', 'writer_sha256'} and
+                all(type(export[key]) is str and re.fullmatch('[0-9a-f]{%d}' % length, export[key])
+                    for key, length in (('nonce', 32), ('writer_sha256', 64))),
+                'invalid protected platform export identity')
     for key, length in INPUT_LENGTHS.items():
         require(type(value[key]) is str and re.fullmatch('[0-9a-f]{%d}' % length, value[key]), 'invalid public input identity')
     require(type(value['payload_bytes']) is int and 0 < value['payload_bytes'] <= 192 * 1024 ** 2, 'invalid public payload size')
@@ -1685,6 +1695,8 @@ def development_service(expected, guest_sha):
     active, receipt, identity = DEVELOPMENT_PHASES[0], None, {}
     work_end = None
     password = DevelopmentPassword(SECRET_DIRECTORY)
+    export_seconds = PLATFORM_EXPORT_SECONDS if 'platform_export' in expected else 0
+    work_seconds = INITIALIZE_SECONDS - (export_seconds + PLATFORM_VERIFY_SECONDS if export_seconds else 0)
     try:
         require(digest(pathlib.Path(__file__)) == guest_sha, 'Executing development guest identity mismatch')
         executor = native_executor_identity(expected, guest_sha)
@@ -1697,7 +1709,7 @@ def development_service(expected, guest_sha):
         source = admit_inputs(PAYLOAD_PATH, expected, INPUT_DESTINATION,
                               timeout=remaining(admission_end, GUEST_ADMISSION_SECONDS))
         remaining(admission_end, GUEST_ADMISSION_SECONDS)
-        work_end = time.monotonic() + INITIALIZE_SECONDS
+        work_end = time.monotonic() + work_seconds
         target_args = ['--source-sha', expected['source_sha'], '--distrobox-source', str(INPUT_DESTINATION / 'distrobox'),
                        '--context', str(INPUT_DESTINATION / 'context'), '--expected-context-sha256', expected['context_sha256']]
         active = 'development-host-prepare'
@@ -1741,15 +1753,37 @@ def development_service(expected, guest_sha):
                          for index, name in enumerate(DEVELOPMENT_PHASES)},
               'development': {'stage': active, 'receipt': receipt, 'nested_placement_exercised': False, 'job_admission': False},
               'cleanup': {'password_absent': password_absent, 'remaining_resources': 'controller-teardown-required'}}
-    final_end = time.monotonic() + GUEST_FINAL_SECONDS
+    final_end = time.monotonic() + GUEST_FINAL_SECONDS + export_seconds
     if work_end is not None:
-        final_end = min(final_end, work_end + INITIALIZE_CLEANUP_SECONDS + GUEST_FINAL_SECONDS)
+        final_end = min(final_end, work_end + INITIALIZE_CLEANUP_SECONDS + GUEST_FINAL_SECONDS + export_seconds)
     try:
         validate_development_report(report, expected['source_sha'], guest_sha, expected)
+        if export_seconds and active == 'complete':
+            try:
+                write_platform_export(source, report, final_end - REPORT_WRITE_SECONDS - 5)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                stage = DEVELOPMENT_PHASES[-1]
+                report['development'].update(stage=stage, receipt=None)
+                report['phases'][stage] = development_phase('blocked')
+                report['identity'].pop('final_root_free_bytes')
         write_report(report, timeout=remaining(final_end - 5, REPORT_WRITE_SECONDS))
     finally:
         result = subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=remaining(final_end, 5))
         require(result.returncode == 0, 'Guest poweroff request failed; controller/native deadline remains the final bound')
+
+
+def write_platform_export(source, report, end):
+    writer = source / 'tools/platform_release_guest.py'
+    expected = report['inputs']['platform_export']
+    require(digest(writer) == expected['writer_sha256'], 'Protected export writer identity mismatch')
+    timeout = remaining(end, PLATFORM_EXPORT_SECONDS)
+    keys = ('inputs', 'phases', 'development' if report['inputs'].get('scenario') == 'development' else 'initialization')
+    raw = json.dumps({key: report[key] for key in keys}, sort_keys=True).encode()
+    require(len(raw) <= REPORT_LIMIT, 'Protected export report exceeds byte limit')
+    result = subprocess.run(['/usr/bin/python3', '-I', '-B', str(writer), str(time.monotonic() + timeout)],
+                            input=raw, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env=SAFE_ENV, timeout=timeout)
+    require(result.returncode == 0, 'Protected export did not complete')
 
 
 def main():
@@ -1784,6 +1818,8 @@ def main():
     secret = None
     state_root = STATE_ROOT
     active = 'fedora-preflight'
+    export_seconds = PLATFORM_EXPORT_SECONDS if 'platform_export' in expected else 0
+    work_seconds = INITIALIZE_SECONDS - (export_seconds + PLATFORM_VERIFY_SECONDS if export_seconds else 0)
     try:
         payload = PAYLOAD_PATH
         require(digest(pathlib.Path(__file__)) == args.guest_sha256, 'Executing guest script identity mismatch')
@@ -1817,7 +1853,7 @@ def main():
                 remove_password_after_prepare(secret, state_root, expected)
             started = time.monotonic()
             try:
-                code, output = capture(argv, timeout=INITIALIZE_SECONDS + INITIALIZE_CLEANUP_SECONDS, tick=remove_after_prepare)
+                code, output = capture(argv, timeout=work_seconds + INITIALIZE_CLEANUP_SECONDS, tick=remove_after_prepare)
                 report['diagnostics']['initialize_cli'] = {'exit_status': code, 'tail': safe_text(output, 1500)}
                 report['initialization'] = initialize_projection(read_json(state_root / 'initialize.json'), expected, code)
                 phases['bootstrap-prepare'] = {'status': 'blocked', 'detail': 'Initialize exit' + str(code) + '; awaiting actual protected prerequisite/image verification'}
@@ -1833,8 +1869,8 @@ def main():
                 secret.unlink(missing_ok=True)
             except OSError:
                 phases['bootstrap-prepare'] = {'status': 'blocked', 'detail': 'Disposable password cleanup failed; owned VM teardown required'}
-        final_end = time.monotonic() + GUEST_FINAL_SECONDS
-        evidence_end = final_end - REPORT_WRITE_SECONDS - 5
+        final_end = time.monotonic() + GUEST_FINAL_SECONDS + export_seconds
+        evidence_end = final_end - export_seconds - REPORT_WRITE_SECONDS - 5
         if source is not None:
             try:
                 if not report['initialization'] and (state_root / 'initialize.json').exists():
@@ -1877,6 +1913,11 @@ def main():
                                                    'vm_teardown': 'Remaining guest resources end at shutdown/outer teardown'}
         if not password_absent:
             phases['bootstrap-prepare'] = {'status': 'blocked', 'detail': 'Disposable password absence not verified; owned VM teardown required'}
+        if export_seconds and all(phase['status'] == 'pass' for phase in phases.values()):
+            try:
+                write_platform_export(source, report, final_end - REPORT_WRITE_SECONDS - 5)
+            except (ValueError, OSError, subprocess.SubprocessError):
+                phases['maintenance-gptbox'] = {'status': 'blocked', 'detail': 'Protected platform export did not complete'}
         write_report(report, timeout=remaining(final_end - 5, REPORT_WRITE_SECONDS))
         result = subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=remaining(final_end, 5))
         require(result.returncode == 0, 'Guest poweroff request failed; controller/native deadline remains the final bound')

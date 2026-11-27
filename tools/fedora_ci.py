@@ -30,6 +30,7 @@ from fedora_ci_guest import (DEVELOPMENT_PHASES, validate_development_report, se
                              validate_startup_witness, signed_load_projection)
 import public_inputs as public
 import fedora_oci
+import fedora_ci_storage as kernel_storage
 
 GIB = 1024 ** 3
 MIB = 1024 ** 2
@@ -41,9 +42,9 @@ IMAGE_BYTES = 583729152
 IMAGE_ROOT = 'https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/'
 CHECKSUM_NAME = 'Fedora-Cloud-44-1.7-x86_64-CHECKSUM'
 CHECKSUM_SHA256 = 'a436186ff0e930d77637d03e6f357206b686c4ef3fcde234b6f1da63041d4b32'
-HOST_RESERVE = 3 * GIB
-OVERLAY_LIMIT = 16 * GIB
-OVERHEAD_LIMIT = 4 * GIB
+HOST_RESERVE = kernel_storage.HOST_RESERVE
+OVERLAY_LIMIT = kernel_storage.OVERLAY_LIMIT
+OVERHEAD_LIMIT = kernel_storage.OVERHEAD_LIMIT
 LOG_LIMIT = 8 * MIB
 DU_CAPTURE_LIMIT = 65536  # unchanged until actual diagnostic volume/type is known
 SOURCE_LIMIT = 32 * MIB
@@ -59,7 +60,10 @@ PHASES = ('runner-preflight', 'signed-cloud-image', 'tooling', 'source-payload',
           'fedora-boot', 'fedora-preflight', 'bootstrap-inspect', 'bootstrap-status',
           'guest-inputs', 'bootstrap-prepare', 'maintenance-gptbox', 'bootstrap-post-inspect', 'bootstrap-post-status', 'cleanup')
 SCENARIOS = ('maintenance', 'development')
-DEVELOPMENT_LABEL = 'fedora-development-producer'
+NATIVE_LABEL_PREFIX = {'maintenance': 'fedora-m-', 'development': 'fedora-d-'}
+NAMESPACE_TOOLS = ('/usr/bin/unshare', '/usr/bin/setpriv', '/usr/bin/sudo', '/usr/bin/timeout')
+RUNNER_ENV = ('GITHUB_ACTIONS', 'GITHUB_REPOSITORY', 'GITHUB_EVENT_NAME', 'GITHUB_EVENT_PATH', 'GITHUB_RUN_ID',
+              'GITHUB_RUN_ATTEMPT', 'GITHUB_ACTOR', 'RUNNER_TEMP', 'GITHUB_STEP_SUMMARY', 'ImageVersion', 'DP_MERGE_SOURCE')
 
 
 def select_pull_request(event, source):
@@ -71,28 +75,25 @@ def select_pull_request(event, source):
     head = pull.get('head')
     if type(head) is not dict or type(head.get('repo')) is not dict or head['repo'].get('full_name') != repository['full_name']:
         return None
-    if action == 'labeled':
-        label = event.get('label')
-        if type(label) is not dict or label.get('name') != DEVELOPMENT_LABEL:
-            return None
-        scenario = 'development'
-    elif action in ('opened', 'synchronize', 'reopened'):
-        scenario = 'maintenance'
-    else:
+    label = event.get('label')
+    if action != 'labeled' or type(label) is not dict:
         return None
     require(type(source) is str and re.fullmatch('[0-9a-f]{40}', source) and head.get('sha') == source,
             'Exact pull request event head differs from the selected source')
-    return scenario
+    return next((scenario for scenario, prefix in NATIVE_LABEL_PREFIX.items() if label.get('name') == prefix + source), None)
 
 
-def actions_development_event(supplied):
+def actions_native_event(supplied):
     # GitHub's job environment, read-only token and exact checkout are the
     # trust boundary. A caller cannot substitute another event file via argv.
     require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('GITHUB_EVENT_NAME') == 'pull_request'
-            and os.environ.get('GITHUB_REPOSITORY') == 'oso-gato/dev-pair', 'Development requires the Actions pull request event')
+            and os.environ.get('GITHUB_REPOSITORY') == 'oso-gato/dev-pair', 'Native Fedora requires the Actions pull request event')
+    require(os.environ.get('GITHUB_RUN_ATTEMPT') == '1' and
+            re.fullmatch('[1-9][0-9]{0,19}', os.environ.get('GITHUB_RUN_ID', '')),
+            'Native Fedora requires the first attempt of an exact Actions run')
     path = pathlib.Path(os.environ.get('GITHUB_EVENT_PATH', ''))
     require(path.is_absolute() and (supplied is None or supplied == path) and path.resolve(strict=True) == path,
-            'Development event path differs from the Actions event')
+            'Native Fedora event path differs from the Actions event')
     return path
 
 
@@ -106,7 +107,14 @@ def read_pull_request(path, source, *, actions_event=False):
         data = stream.read(25 * MIB + 1)
     require(len(data) <= 25 * MIB, 'GitHub event exceeds byte limit')
     try:
-        return select_pull_request(json.loads(data, object_pairs_hook=unique_object), source)
+        event = json.loads(data, object_pairs_hook=unique_object)
+        selected = select_pull_request(event, source)
+        if selected and actions_event:
+            actor = os.environ.get('GITHUB_ACTOR', '')
+            sender = event.get('sender')
+            require(type(sender) is dict and re.fullmatch(r'[A-Za-z0-9-]{1,39}', actor) and
+                    sender.get('login') == actor, 'Native Fedora label actor differs from the Actions actor')
+        return selected
     except (ValueError, UnicodeError, RecursionError):
         raise Blocked('Invalid pull request event') from None
 
@@ -115,25 +123,30 @@ def scratch_root(runner_temp):
     require(runner_temp and pathlib.Path(runner_temp).is_dir(), 'RUNNER_TEMP unavailable')
     # Podman 4.9 rejects runroot paths longer than 50 characters. The normal
     # /home/runner/work/_temp prefix plus our leaf already exceeds that limit.
-    # All storage/disks/accounting stay together in one private, short leaf.
+    # Both fixed volumes and their backing files use a unique short lease.
     parent = pathlib.Path('/tmp')
     info = parent.lstat()
     require(stat.S_ISDIR(info.st_mode) and not parent.is_symlink() and info.st_uid == 0 and
             (not info.st_mode & 0o022 or info.st_mode & stat.S_ISVTX), 'short scratch parent is not trusted')
-    root = pathlib.Path(tempfile.mkdtemp(prefix='dpvm-', dir=parent))
-    root.chmod(0o755)  # public payload only; engine storage retains private modes
-    return root
+    return pathlib.Path(tempfile.mkdtemp(prefix='dpvm-', dir=parent))
 
 
-def mounts_below(root):
-    for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines():
-        fields = line.split()
-        require(len(fields) >= 6, 'cannot validate scratch mount inventory')
-        decoded = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), fields[4])
-        mounted = pathlib.Path(decoded)
-        if mounted == root or root in mounted.parents:
-            return True
-    return False
+def run_in_private_mount_namespace(source, scenario):
+    for tool in NAMESPACE_TOOLS:
+        require(pathlib.Path(tool).is_file(), 'required preinstalled namespace tool unavailable: ' + tool)
+    ancestor = os.readlink('/proc/self/ns/mnt')
+    env = {**SAFE_ENV, **{key: os.environ[key] for key in RUNNER_ENV if key in os.environ}}
+    args = ['/usr/bin/sudo', '-n', '/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', f'{CONTROLLER_SECONDS}s',
+            '/usr/bin/unshare', '--mount', '--propagation', 'private',
+            '--pid', '--mount-proc', '--kill-child=SIGKILL',
+            '/usr/bin/setpriv', '--reuid', str(os.getuid()), '--regid', str(os.getgid()), '--init-groups', '--pdeathsig=keep',
+            '/usr/bin/env', '-i', *(f'{key}={value}' for key, value in env.items()),
+            '/usr/bin/python3', '-B', str(pathlib.Path(__file__).resolve()), '--expected-source', source,
+            '--scenario', scenario, '--namespace-parent', ancestor]
+    try:
+        return subprocess.run(args, env=SAFE_ENV, timeout=CONTROLLER_SECONDS + 5, check=False).returncode
+    except subprocess.TimeoutExpired:
+        raise Blocked('native namespace controller exceeded its wall-time budget') from None
 
 
 class Blocked(Exception):
@@ -267,7 +280,7 @@ def run_small(argv, timeout=30, cwd=None, input_data=None):
 
 def verify_checksum(key_bundle, signed_checksum, home):
     home.mkdir(mode=0o700)
-    gpg = ['/usr/bin/gpg', '--batch', '--no-auto-key-retrieve', '--homedir', str(home)]
+    gpg = ['/usr/bin/gpg', '--batch', '--no-options', '--no-autostart', '--no-auto-key-retrieve', '--homedir', str(home)]
     run_small(gpg + ['--import', str(key_bundle)])
     key = run_small(gpg + ['--export', FINGERPRINT])
     require(key, 'Fedora 44 signing key absent')
@@ -283,13 +296,6 @@ def verify_checksum(key_bundle, signed_checksum, home):
     # immutable file digest also rules out ambiguous extra clear-signed content.
     require(file_hash(signed_checksum) == CHECKSUM_SHA256, 'signed checksum file identity mismatch')
     return checksum_identity(signed_checksum.read_bytes())
-
-
-def check_capacity(root, before_boot=False):
-    free = shutil.disk_usage(root).free
-    require(free >= HOST_RESERVE + (OVERLAY_LIMIT if before_boot else 0),
-            'capacity blocked: insufficient free disk for declared overlay and host reserve')
-    return free
 
 
 def du_disappearance(root, line):
@@ -752,46 +758,73 @@ class ReportPipe:
 
 
 class Probe:
-    def __init__(self, source, root, scenario='maintenance'):
+    def __init__(self, source, root, scenario='maintenance', *, release=None):
         require(scenario in SCENARIOS, 'invalid requested Fedora scenario')
         self.source = source
         self.scenario = scenario
+        self.release = release
         self.repo = pathlib.Path(__file__).resolve().parents[1]
-        self.root = root
+        self.lease = root
         info = root.lstat()
         require(stat.S_ISDIR(info.st_mode) and not root.is_symlink() and info.st_uid == os.getuid(),
                 'scratch must be an owned nonsymlink directory')
-        require(all(len(os.fsencode(root / name)) <= 50 for name in ('graph', 'runroot', 'tmp')),
+        self.storage = kernel_storage.KernelStorage(root, self.privileged)
+        self.root = self.storage.overhead.path
+        self.overlay = self.storage.overlay.path
+        require(all(len(os.fsencode(self.root / name)) <= 50 for name in ('graph', 'runroot', 'tmp')),
                 'scratch engine paths exceed Podman 50-byte runroot compatibility limit')
         self.scratch_identity = (info.st_dev, info.st_ino)
-        self.scratch_owner=info.st_uid
-        self.storage_worker_sha=file_hash(self.repo/'tools/storage_measure.py')
         self.image_copy_active = False
         self.engine_activity = False
         self.primary_image_failure = None
+        if release is None:
+            workflow = '.github/workflows/fedora-vm.yml'
+            trigger = {'run_id': os.environ.get('GITHUB_RUN_ID'), 'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+                       'label_actor': os.environ.get('GITHUB_ACTOR'), 'label': NATIVE_LABEL_PREFIX[scenario] + source}
+        else:
+            workflow, trigger = release.report_identity()
         self.report = {'version': REPORT_VERSION, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
                        'controller_sha256': file_hash(pathlib.Path(__file__)),
-                       'workflow_sha256': file_hash(self.repo / '.github/workflows/fedora-vm.yml'),
+                       'workflow': workflow, 'workflow_sha256': file_hash(self.repo / workflow),
+                       'storage_controller_sha256': file_hash(pathlib.Path(kernel_storage.__file__)),
+                       'trigger': trigger,
                        'phases': {name: {'status': 'blocked', 'detail': 'Not reached'}
                                   for name in (PHASES if scenario == 'maintenance' else (*PHASES[:5], *DEVELOPMENT_PHASES, 'cleanup'))},
                        'limits': {'overlay_bytes': OVERLAY_LIMIT, 'host_reserve_bytes': HOST_RESERVE,
                                   'overhead_bytes': OVERHEAD_LIMIT, 'log_bytes': LOG_LIMIT,
-                                  'storage_diagnostic_bytes': DU_CAPTURE_LIMIT,
+                                  'parent_headroom_bytes': kernel_storage.PARENT_HEADROOM,
+                                  'overhead_inodes': self.storage.overhead.inodes, 'overlay_inodes': self.storage.overlay.inodes,
                                   'report_json_bytes': REPORT_LIMIT, 'report_frame_bytes': REPORT_FRAME_LIMIT,
                                   'report_write_seconds': REPORT_WRITE_SECONDS,
                                   'container_seconds': CONTAINER_SECONDS, 'vm_container_seconds': VM_CONTAINER_SECONDS, 'guest_virtual_bytes': VIRTUAL_BYTES,
                                   'controller_seconds': CONTROLLER_SECONDS, 'public_seconds': PUBLIC_SECONDS, 'vm_seconds': VM_SECONDS, 'cleanup_seconds': CLEANUP_SECONDS,
                                   'cpus': 3, 'memory_bytes': 8 * GIB, 'guest_cpus': 2, 'guest_memory_bytes': 6 * GIB},
                        'hostinger_acceptance': False, 'job_admission': False}
-        if scenario == 'development':
-            self.report['scenario'] = scenario
-        self.podman = ['sudo', '-n', '/usr/bin/podman', '--root=' + str(root / 'graph'),
-                       '--runroot=' + str(root / 'runroot'), '--tmpdir=' + str(root / 'tmp'),
-                       '--hooks-dir=' + str(root / 'empty-hooks'),
-                       '--storage-driver=overlay']
+        self.report['scenario'] = scenario
+        if release is not None:
+            release.report_profile(self)
+        self.engine_env = {**SAFE_ENV, 'TMPDIR': str(self.root / 'tmp'), 'HOME': str(self.root / 'home'),
+                           'XDG_RUNTIME_DIR': str(self.root / 'runtime'), 'REGISTRY_AUTH_FILE': str(self.root / 'empty-auth.json'),
+                           'CONTAINERS_CONF_OVERRIDE': str(self.root / 'containers.conf')}
+        self.podman = self.engine_command()
         self.container = 'dp-fedora-probe-' + root.name.rsplit('-', 1)[-1]
         self.log_used = 0
         self.phase_end = None
+        self.engine_paths = {}
+
+    def engine_command(self, *, copy_tmp=None, limits=()):
+        env = self.engine_env if copy_tmp is None else {**self.engine_env, 'TMPDIR': str(copy_tmp)}
+        return ['sudo', '-n', '/usr/bin/env', '-i', *(f'{key}={value}' for key, value in env.items()), *limits,
+                '/usr/bin/podman', '--root=' + str(self.root / 'graph'), '--runroot=' + str(self.root / 'runroot'),
+                '--tmpdir=' + str(self.root / 'tmp'), '--hooks-dir=' + str(self.root / 'empty-hooks'),
+                '--storage-driver=overlay', '--events-backend=file', '--cgroup-manager=cgroupfs']
+
+    def privileged(self, *args, seconds=10):
+        if self.phase_end is not None:
+            seconds = min(seconds, self.phase_end - time.monotonic())
+        require(seconds > 0, 'kernel storage operation deadline exhausted')
+        return run_small(['/usr/bin/sudo', '-n', '/usr/bin/timeout', '--signal=TERM', '--kill-after=1s',
+                          f'{seconds:.6f}s', *args], timeout=seconds + 2)
 
     def phase(self, name, status, detail):
         self.report['phases'][name] = {'status': status, 'detail': evidence_tail(detail, 4000)}
@@ -801,24 +834,33 @@ class Probe:
         # Podman version can create graph/runroot/tmp while validating config.
         # Establish every declared leaf first; no post-probe mkdir may assume
         # the engine left those paths absent.
-        for name in ('graph', 'runroot', 'tmp', 'payload', 'disks', 'empty-hooks'):
+        device = self.root.lstat().st_dev
+        private = ('graph', 'runroot', 'tmp', 'home', 'runtime')
+        for name in (*private, 'payload', 'disks', 'empty-hooks', 'network'):
             path = self.root / name
-            path.mkdir(mode=0o700 if name in ('graph', 'runroot', 'tmp') else 0o755, exist_ok=True)
+            path.mkdir(mode=0o700 if name in private else 0o755, exist_ok=True)
             info = path.lstat()
             require(stat.S_ISDIR(info.st_mode) and not path.is_symlink() and info.st_uid == os.getuid() and
-                    not info.st_mode & 0o022 and info.st_dev == self.scratch_identity[0],
+                    not info.st_mode & 0o022 and info.st_dev == device,
                     'declared scratch directory is unsafe or on another filesystem: ' + name)
+            if name in ('graph', 'runroot', 'tmp'):
+                self.engine_paths[path] = kernel_storage.identity(info)
+        with (self.root / 'empty-auth.json').open('x') as auth:
+            auth.write('{"auths":{}}\n')
+        with (self.root / 'containers.conf').open('x') as config:
+            config.write('[engine]\nlock_type = "file"\n')
+            for name, relative in (('static_dir', 'graph/libpod'), ('volume_path', 'graph/volumes'),
+                                   ('events_logfile_path', 'tmp/events.log')):
+                config.write(f'{name} = {json.dumps(str(self.root / relative))}\n')
+            config.write(f'[network]\nnetwork_config_dir = {json.dumps(str(self.root / "network"))}\n')
 
     def storage_measurement(self, live=False):
-        try:
-            measurement = measure_storage(self.root,live=live,expected_root={'device':self.scratch_identity[0],'inode':self.scratch_identity[1],'owner':self.scratch_owner},worker_sha=self.storage_worker_sha)
-            reserve = fedora_oci.UNLINKED_RESERVE if self.image_copy_active else 0
-            require(measurement['bytes'] + reserve <= OVERHEAD_LIMIT, 'capacity blocked: image-copy unlinked spool reserve exceeds overhead')
-            measurement['unlinked_spool_reserve_bytes'] = reserve
-            return measurement
-        except StorageMeasurementBlocked as exc:
-            self.report['storage_measurement_failure'] = exc.diagnostics
-            raise
+        measurement = self.storage.observe()
+        if self.image_copy_active and not live:
+            require(measurement['overhead']['available_bytes'] >= fedora_oci.UNLINKED_RESERVE,
+                    'capacity blocked: image-copy unlinked spool reserve exceeds overhead')
+        self.report['kernel_storage_last_sample'] = measurement
+        return measurement
 
     def bounded(self, argv, timeout, name, disk_check=True, file_limit=None, report_pipe=None, observe_network=False, tooling_stages=False):
         """Bound logs/time and watch storage while a native child runs."""
@@ -831,8 +873,9 @@ class Probe:
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             if file_limit is not None:
                 resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+        child_env = {**SAFE_ENV, 'TMPDIR': str(self.root / 'tmp'), 'HOME': str(self.root / 'home'), 'PYTHONDONTWRITEBYTECODE': '1'}
         process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   stdin=subprocess.DEVNULL, env=SAFE_ENV, start_new_session=True,
+                                   stdin=subprocess.DEVNULL, env=child_env, start_new_session=True,
                                    preexec_fn=child_limits)
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ, 'console')
@@ -853,13 +896,7 @@ class Probe:
                     if report_pipe is not None:
                         report_pipe.release_keeper()
                 if disk_check and exited is None and now >= next_storage:
-                    check_capacity(self.root)
-                    # Rootful Podman owns private storage directories. Measure
-                    # via a fixed read-only privileged tool, never silently skip
-                    # inaccessible files in an unprivileged os.walk.
-                    measurement = self.storage_measurement(live=True)
-                    if measurement['provisional']:
-                        self.report['provisional_storage_samples'] = self.report.get('provisional_storage_samples', 0) + 1
+                    self.storage_measurement(live=True)
                     next_storage = time.monotonic() + 1
                 events = selector.select(timeout=.1 if report_pipe is not None else 1)
                 for key, _ in events:
@@ -890,8 +927,7 @@ class Probe:
             require(network_observed, 'VM exited before its actual network isolation could be inspected')
             require(process.returncode == 0, name + ' failed with exit ' + str(process.returncode))
             if disk_check:
-                check_capacity(self.root)
-                self.report['last_stable_overhead_bytes'] = self.storage_measurement()['bytes']
+                self.storage_measurement(live=True)
             return (bytes(log), bytes(report_pipe.data)) if report_pipe is not None else bytes(log)
         except BaseException:
             # Podman/conmon scopes may outlive the CLI; cleanup also force-removes
@@ -929,15 +965,17 @@ class Probe:
         self.engine_activity = True  # version-only preflight never starts resources
         return self.bounded(self.podman + args, timeout, 'tooling command', **kwargs)
 
-    def run_args(self, entrypoint, mounts=True, vm=False):
+    def run_args(self, entrypoint, mounts=True, vm=False, *, overlay=False):
         args = ['run', '--rm', '--name=' + self.container, '--timeout=' + str(VM_CONTAINER_SECONDS if vm else CONTAINER_SECONDS),
                 '--restart=no', '--network=' + ('slirp4netns:allow_host_loopback=false' if vm else 'none'), '--read-only', '--read-only-tmpfs=false',
                 '--user=' + str(os.getuid()) + ':' + str(os.getgid()), '--cap-drop=ALL',
-                '--security-opt=no-new-privileges', '--pids-limit=1024', '--memory=8g', '--cpus=3',
+                '--security-opt=no-new-privileges', '--pids-limit=1024', '--memory=8g', '--cpus=3', '--log-driver=none',
                 '--tmpfs=/tmp:rw,nosuid,nodev,size=64m', '--entrypoint=' + entrypoint]
         if mounts:
             args += ['--volume=' + str(self.root / 'payload') + ':/payload:ro',
                      '--volume=' + str(self.root / 'disks') + ':/disks:rw']
+        if vm or overlay:
+            args += ['--volume=' + str(self.overlay) + ':/overlay:rw']
         return args
 
     def preflight(self):
@@ -946,30 +984,34 @@ class Probe:
         release = pathlib.Path('/etc/os-release').read_text()
         require('ID=ubuntu' in release and 'VERSION_ID="24.04"' in release, 'only ubuntu-24.04 standard runner supported')
         require(re.fullmatch('[0-9a-f]{40}', self.source), 'invalid exact source SHA')
-        require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source, 'checkout differs from exact PR head')
+        require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source,
+                'checkout differs from the exact admitted source')
         require(not run_small(['/usr/bin/git', '-C', str(self.repo), 'status', '--porcelain']), 'source checkout must be clean')
-        require(file_hash(self.repo/'tools/storage_measure.py')==self.storage_worker_sha,'storage worker changed before source admission')
-        self.report['storage_worker_sha256']=self.storage_worker_sha
         for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo',
-                        '/usr/bin/timeout', '/usr/bin/prlimit', '/usr/bin/python3', '/usr/bin/slirp4netns'):
+                        '/usr/bin/timeout', '/usr/bin/prlimit', '/usr/bin/python3', '/usr/bin/slirp4netns',
+                        *kernel_storage.TOOLS):
             require(pathlib.Path(command).is_file(), 'required preinstalled runner tool unavailable: ' + command)
         require(os.cpu_count() >= 2, 'at least two CPUs required')
         mem = int(re.search(r'^MemTotal:\s+(\d+) kB$', pathlib.Path('/proc/meminfo').read_text(), re.M)[1]) * 1024
         require(mem >= 10 * GIB, 'insufficient runner memory')
-        free = check_capacity(self.root, before_boot=True)
-        require(free >= HOST_RESERVE + OVERLAY_LIMIT + OVERHEAD_LIMIT, 'capacity blocked:23GiB initial disk budget required')
         slirp_version = run_small(['/usr/bin/slirp4netns', '--version'], timeout=5).decode()
         require('slirp4netns' in slirp_version, 'preinstalled slirp implementation unavailable')
         slirp_help = run_small(['/usr/bin/slirp4netns', '--help'], timeout=5)
         slirp_features = ('--disable-host-loopback', '--netns-type')
         require(all(re.search(rb'(?<![\w-])'+feature.encode()+rb'(?=[=\s,]|$)', slirp_help)
                     for feature in slirp_features), 'preinstalled slirp lacks required loopback-denial/path-namespace features')
+        if self.release is not None:
+            self.release.preflight(self)
+        self.report['kernel_storage_initial'] = self.storage.configure()
+        if self.release is not None:
+            self.release.allocate(self)
+        self.initialize_directories()
         version = run_small(self.podman + ['version', '--format=json']).decode()
         self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
-                                 'podman': json.loads(version), 'slirp_version': evidence_tail(slirp_version, 1000), 'free_bytes': free, 'memory_bytes': mem,
-                                 'slirp_required_features': list(slirp_features), 'slirp_help_sha256': sha256(slirp_help),
-                                 'merge_sha': os.environ.get('DP_MERGE_SOURCE', 'unreported'),
-                                 'scratch_device': self.scratch_identity[0], 'scratch_root': str(self.root)}
+                                 'podman': json.loads(version), 'slirp_version': evidence_tail(slirp_version, 1000), 'memory_bytes': mem,
+                                 'slirp_required_features': list(slirp_features), 'slirp_help_sha256': sha256(slirp_help)}
+        if self.release is None:
+            self.report['runner']['merge_sha'] = os.environ.get('DP_MERGE_SOURCE', 'unreported')
         self.phase('runner-preflight', 'pass', 'Actual standard-runner OS/source/tools/capacity checked; no host packages installed')
 
     def inputs(self):
@@ -997,23 +1039,20 @@ class Probe:
             require(not self.image_copy_active, 'image copy worker termination unresolved; owned scratch preserved')
         def remove_copy(path):
             run_small(['sudo','-n','/bin/rm','-rf','--',str(path)],timeout=20)
-        with fedora_oci.image_workspaces(self.root, reconcile=reconcile_copy, remove=remove_copy, reserve=HOST_RESERVE) as (copy_tmp, verification_root):
+        with fedora_oci.image_workspaces(self.root, reconcile=reconcile_copy, remove=remove_copy) as (copy_tmp, verification_root):
             with fedora_oci.verified(signed, temporary_parent=verification_root, leased=True) as (plain, proof):
                 def local_image(*args, **kwargs):
                     operation = 'inspect' if args[:2]==('image','inspect') else args[0] if args and args[0] in ('load','save','build') else None
                     require(operation is not None, 'unsupported local image operation')
                     try:
-                        prefix = list(self.podman)
-                        index = prefix.index('/usr/bin/podman')
                         seconds = min(kwargs.get('timeout',120),self.phase_end-time.monotonic() if self.phase_end else 120)
                         require(seconds > 0,'image copy deadline exhausted')
-                        extra = ['/usr/bin/env','-i','PATH=/usr/bin:/bin','TMPDIR='+str(copy_tmp),
-                                 '/usr/bin/timeout','--signal=TERM','--kill-after=1s',str(seconds)+'s']
+                        extra = ['/usr/bin/timeout','--signal=TERM','--kill-after=1s',str(seconds)+'s']
                         if args[0]=='save': extra += ['/usr/bin/prlimit','--fsize='+str(fedora_oci.SAVE_FILE_LIMIT)+':'+str(fedora_oci.SAVE_FILE_LIMIT)]
-                        prefix[index:index]=extra
+                        prefix = self.engine_command(copy_tmp=copy_tmp, limits=extra)
                         self.image_copy_active=True
-                        # The unlinked source spool cannot appear in du; charge it
-                        # independently before launch and throughout observation.
+                        # Preflight one copy's headroom. The overhead filesystem
+                        # also charges open, unlinked files during the copy.
                         try:
                             self.storage_measurement()
                         except BaseException:
@@ -1038,7 +1077,6 @@ class Probe:
             build.mkdir()
             (build / 'Containerfile').write_text(tooling_recipe())
             shutil.copyfile(self.repo / 'tools/fedora_ci_qemu.py', build / 'qemu_entry.py')
-            (self.root / 'empty-auth.json').write_text('{"auths":{}}\n')
             self.image = local_image('build', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--http-proxy=false', '--authfile=' + str(self.root / 'empty-auth.json'),
                                       '--memory=2g', '--cpu-quota=200000', '--force-rm',
                                       '--ulimit=fsize=2147483648:2147483648', '--iidfile=' + str(self.root / 'tool-image'),
@@ -1059,7 +1097,10 @@ class Probe:
         helper = self.repo / 'tools/public_inputs.py'
         cache = self.root / 'public-cache'
         handoff = self.root / 'public-handoff'
-        self.bounded([sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)], PUBLIC_SECONDS, 'fixed public input download')
+        fetch_args = [sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)]
+        if self.release is not None:
+            fetch_args.extend(self.release.input_cache())
+        self.bounded(fetch_args, PUBLIC_SECONDS, 'fixed public input download')
         try:
             output = self.bounded([sys.executable, str(helper), 'build', '--role', self.scenario, '--cache', str(cache),
                                   '--distrobox-source', str(cache / 'distrobox'), '--output', str(handoff)], PUBLIC_SECONDS, 'strict public input verification/build')
@@ -1082,6 +1123,8 @@ class Probe:
                         'standards_sha': record['standards_sha'], 'codex_sha256': public.CODEX_SHA, 'codex_source_sha': public.CODEX_SOURCE}
         if self.scenario == 'development':
             self.handoff.update(scenario='development', run_nonce=secrets.token_hex(16))
+        if self.release is not None:
+            self.handoff['platform_export'] = self.release.request(self)
         validate_inputs(self.handoff)
         for name in ('manifest.json', bundle_name):
             shutil.copyfile(handoff / name, payload / name)
@@ -1123,14 +1166,14 @@ class Probe:
         require(base_info.get('format') == 'qcow2' and not base_info.get('backing-filename') and
                 0 < base_info.get('virtual-size', 0) <= VIRTUAL_BYTES, 'signed base disk layout exceeds declared scope')
         self.report['cloud_image']['virtual_bytes'] = base_info['virtual-size']
-        self.helper(self.run_args('/usr/bin/qemu-img') + [self.image, 'create', '-f', 'qcow2', '-F', 'qcow2',
-                    '-b', '/payload/base.qcow2', '/disks/guest.qcow2', '32G'])
+        self.helper(self.run_args('/usr/bin/qemu-img', overlay=True) + [self.image, 'create', '-f', 'qcow2', '-F', 'qcow2',
+                    '-b', '/payload/base.qcow2', '/overlay/guest.qcow2', '32G'])
         self.report['payload'] = {'source_sha': self.source, 'guest_sha256': self.guest_sha,
                                   'inputs': self.handoff}
         self.phase('source-payload', 'pass', json.dumps(self.report['payload']))
 
     def boot(self):
-        check_capacity(self.root, before_boot=True)
+        self.storage_measurement()
         accel = 'tcg'
         # Merely finding /dev/kvm is insufficient. Prove VM initialization with
         # QEMU's native paused-start + QMP quit, bounded separately.
@@ -1152,11 +1195,14 @@ class Probe:
         args += [self.image, '/usr/local/bin/dp-qemu-entry.py', '-machine', 'q35,accel=' + accel,
                  '-cpu', 'host' if accel == 'kvm' else 'max', '-smp', '2', '-m', '6144',
                  '-display', 'none', '-serial', 'stdio', '-serial', 'pipe:/disks/result', '-monitor', 'none', '-no-reboot',
-                 '-nic', 'user,model=virtio-net-pci,ipv6=off', '-drive', 'file=/disks/guest.qcow2,if=virtio,format=qcow2,cache=none',
+                 '-nic', 'user,model=virtio-net-pci,ipv6=off', '-drive', 'file=/overlay/guest.qcow2,if=virtio,format=qcow2,cache=none',
                  '-drive', 'file=/disks/seed.iso,media=cdrom,readonly=on,format=raw',
                  '-drive', 'file=/disks/payload.iso,media=cdrom,readonly=on,format=raw']
+        vm_seconds = VM_SECONDS
+        if self.release is not None:
+            args, vm_seconds = self.release.vm_arguments(args, self.image)
         with ReportPipe(self.root / 'disks') as report_pipe:
-            console, report_data = self.helper(args, timeout=VM_SECONDS, report_pipe=report_pipe, observe_network=True)
+            console, report_data = self.helper(args, timeout=vm_seconds, report_pipe=report_pipe, observe_network=True)
         if self.scenario == 'maintenance':
             emit_text('DP_SERIAL_TAIL\n', console, 24000)
         guest = parse_serial(report_data, self.source, self.guest_sha, self.handoff)
@@ -1182,14 +1228,38 @@ class Probe:
                                   'runner_namespace': os.readlink('/proc/self/ns/net'),
                                   'qemu': 'IPv4 usernet; no forwarding', 'destination_acl': False}
 
+    def reconcile_processes(self):
+        require(os.getpid() == 1, 'private process namespace unavailable; owned storage preserved')
+        namespace = os.readlink('/proc/self/ns/pid')
+        for _ in range(3):
+            self.privileged('/usr/bin/python3', '-B', str(pathlib.Path(kernel_storage.__file__).resolve()),
+                            'stop-children', namespace, seconds=10)
+            until = time.monotonic() + 1
+            while time.monotonic() < until:
+                try:
+                    pid, _ = os.waitpid(-1, os.WNOHANG)
+                except ChildProcessError:
+                    return
+                if not pid:
+                    time.sleep(.02)
+        raise Blocked('native process cleanup unresolved; owned storage preserved')
+
     def cleanup(self):
         # No system reset, prune, shared storage deletion or runner cleanup.
         # Rootful storage exists solely below the controller's mkdtemp leaf.
-        info = self.root.lstat()
-        require(stat.S_ISDIR(info.st_mode) and not self.root.is_symlink() and info.st_uid == os.getuid() and
+        info = self.lease.lstat()
+        require(stat.S_ISDIR(info.st_mode) and not self.lease.is_symlink() and info.st_uid == os.getuid() and
                 (info.st_dev, info.st_ino) == self.scratch_identity, 'scratch identity changed; cleanup refused')
-        require(not self.image_copy_active, 'image copy worker unresolved; owned scratch preserved')
+        if self.image_copy_active:
+            require(self.storage.started, 'image copy worker unresolved; owned scratch preserved')
+            self.reconcile_processes()
+            self.image_copy_active = False
         if self.engine_activity:
+            self.storage.verify_engine_mount()
+            for path, expected in self.engine_paths.items():
+                node = path.lstat()
+                require(stat.S_ISDIR(node.st_mode) and kernel_storage.identity(node) == expected,
+                        'engine path changed; owned scratch preserved')
             result = subprocess.run(self.podman + ['rm', '--force', '--all'], capture_output=True, env=SAFE_ENV, timeout=20)
             require(result.returncode == 0, 'engine cleanup failed; owned scratch preserved for reconciliation: ' +
                     evidence_tail(result.stderr, 1500))
@@ -1198,17 +1268,13 @@ class Probe:
             require(remaining.returncode == 0 and not remaining.stdout.strip(),
                     'engine resource inventory unresolved; owned scratch preserved: ' +
                     evidence_tail(remaining.stderr, 1500))
-        require(not mounts_below(self.root), 'active scratch mounts remain; owned scratch preserved')
-        # Preflight-only failures need no working engine or sudo. After actual
-        # engine use, root-owned storage can require narrowly scoped removal.
-        try:
-            shutil.rmtree(self.root)
-        except PermissionError:
-            cleanup = subprocess.run(['sudo', '-n', '/bin/rm', '-rf', '--', str(self.root)],
-                                     capture_output=True, env=SAFE_ENV, timeout=60)
-            require(cleanup.returncode == 0, 'own scratch cleanup incomplete')
-        require(not self.root.exists(), 'own scratch cleanup incomplete')
-        self.phase('cleanup', 'pass', 'Only this run\'s isolated Podman containers and unique scratch/storage/disks were removed')
+        if self.storage.started:
+            self.reconcile_processes()
+        if self.release is not None:
+            self.release.close()
+        self.storage.release()
+        self.lease.rmdir()
+        self.phase('cleanup', 'pass', 'Verified owned process, mount, loop and backing removal')
 
     def execute(self):
         active = 'runner-preflight'
@@ -1216,7 +1282,6 @@ class Probe:
         try:
             self.phase_end = execution_started + PUBLIC_SECONDS
             with deadline(PUBLIC_SECONDS):
-                self.initialize_directories()
                 self.preflight()
                 for active, action in (('signed-cloud-image', self.inputs), ('tooling', self.tooling), ('source-payload', self.payload)):
                     action()
@@ -1224,6 +1289,8 @@ class Probe:
             self.phase_end = min(execution_started + CONTROLLER_SECONDS - CLEANUP_SECONDS, time.monotonic() + VM_SECONDS)
             with deadline(self.phase_end - time.monotonic()):
                 self.boot()
+                if self.release is not None:
+                    self.release.capture(self)
         except (Blocked, OSError, ValueError, RecursionError, subprocess.SubprocessError) as exc:
             primary = self.primary_image_failure if active == 'tooling' else None
             self.report['blocker'] = ('Development VM execution or authenticated report blocked'
@@ -1236,20 +1303,29 @@ class Probe:
                 self.phase_end = None
                 with deadline(min(CLEANUP_SECONDS, max(.001, execution_started + CONTROLLER_SECONDS - time.monotonic()))):
                     self.cleanup()
-            except (Blocked, OSError, subprocess.SubprocessError) as exc:
+            except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
                 self.phase('cleanup', 'fail', 'Owned development VM cleanup could not be verified'
                            if self.scenario == 'development' else str(exc))
-            emit_json('DP_REPORT', self.report)
-            summary = os.environ.get('GITHUB_STEP_SUMMARY')
-            if summary:
-                with open(summary, 'a') as output:
-                    output.write('### Fedora 44 VM component probe\n\n')
-                    output.write('Source: `' + self.source + '`; Hostinger/pair acceptance: **unverified**.\n\n')
-                    for name, phase in self.report['phases'].items():
-                        output.write('- ' + name + ': **' + phase['status'] + '** — ' + sanitize(phase['detail'], 500).replace('\n', ' ') + '\n')
-                    output.write('\nNo artifact/cache uploads, secrets, enrollment or model calls.\n')
+            self.finish_report()
         # Passing is exact-candidate disposable VM component evidence only.
         return 0 if all(p['status'] == 'pass' for p in self.report['phases'].values()) else 2
+
+    def finish_report(self):
+        emit_json('DP_REPORT', self.report)
+        summary = os.environ.get('GITHUB_STEP_SUMMARY')
+        if not summary:
+            return
+        with open(summary, 'a') as output:
+            heading = 'Fedora 44 VM component probe' if self.release is None else 'Protected Fedora platform build'
+            output.write(f'### {heading}\n\n')
+            output.write(f'Source `{self.source}`. Hostinger and pair acceptance are **unverified**.\n\n')
+            for name, phase in self.report['phases'].items():
+                output.write('- ' + name + ': **' + phase['status'] + '** — ' + sanitize(phase['detail'], 500).replace('\n', ' ') + '\n')
+            if self.release is None:
+                output.write('\nNo artifact/cache uploads, secrets, enrollment or model calls.\n')
+            else:
+                output.write('\nThe workflow uploads a successful role export after verified teardown. '
+                             'A separate publication job attests the portable index.\n')
 
 
 def main():
@@ -1257,16 +1333,24 @@ def main():
     parser.add_argument('--expected-source', required=True)
     parser.add_argument('--scenario', choices=SCENARIOS, default='maintenance')
     parser.add_argument('--github-event', type=pathlib.Path)
+    parser.add_argument('--namespace-parent', help=argparse.SUPPRESS)
+    parser.add_argument('--platform-release-role', choices=(*SCENARIOS, 'devbox'), help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.scenario == 'development':
-        event = actions_development_event(args.github_event)
-        require(read_pull_request(event, args.expected_source, actions_event=True) == 'development',
-                'Development is outside the exact pull request label event')
-    elif args.github_event is not None:
-        selected = read_pull_request(args.github_event, args.expected_source)
-        if selected is None:
-            return 0
-        require(args.scenario == selected, 'Fedora scenario differs from the pull request event')
+    if args.platform_release_role is not None:
+        from platform_release_ci import entered, ci as platform_ci
+        try:
+            return entered(args.expected_source, args.platform_release_role, args.namespace_parent)
+        except (platform_ci.Blocked, OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError) as exc:
+            emit_text('PLATFORM_RELEASE_BLOCKED ', str(exc), 1500)
+            return 2
+    event = actions_native_event(args.github_event)
+    require(read_pull_request(event, args.expected_source, actions_event=True) == args.scenario,
+            'Fedora scenario is outside the exact pull request label event')
+    if args.namespace_parent is None:
+        return run_in_private_mount_namespace(args.expected_source, args.scenario)
+    require(os.getuid() != 0 and os.getpid() == 1 and re.fullmatch(r'mnt:\[\d+\]', args.namespace_parent) and
+            os.readlink('/proc/self/ns/mnt') != args.namespace_parent, 'private native mount/PID namespace not established')
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     root = scratch_root(os.environ.get('RUNNER_TEMP'))
     return Probe(args.expected_source, root, args.scenario).execute()
 

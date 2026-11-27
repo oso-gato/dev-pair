@@ -7,8 +7,8 @@ The reviewed baseline reached a real TCG Fedora44 boot, Enforcing SELinux,
 systemd PID1, cgroupv2 and a complete dedicated serial report. Run7 identified
 stock systemd-resolved LLMNR as the inspection blocker. The shared bootstrap now
 contains the separately reviewed service-bound discovery mitigation.
-**The preparation/maintenance integration described here has not run on Fedora.**
-Local process/crypto/parser tests do not establish installation or confinement.
+**The split-storage route awaits its first native Fedora run.**
+Local tests verify the controller and its kernel fixtures.
 
 A successful new run must perform actual preparation and genuine maintenance
 Distrobox initialization, seal an image, complete two frozen boundary/version
@@ -17,37 +17,40 @@ VM and exact source; it does not establish designated Hostinger or pair acceptan
 
 ## Workflow and authority
 
-Only same-repository PRs in `oso-gato/dev-pair` run on free standard
-`ubuntu-24.04`. Opened, synchronize and reopened events select maintenance.
-Adding the fixed `fedora-development-producer` label selects development for
-that event's exact PR head. Other label events are ignored. The workflow checks
-out the exact event head and uses official actions/checkout v4.3.1 commit
-`34e114876b0b11c390a56381ad16ebd13914f8d5`, with persisted credentials disabled.
-The controller requires exact clean HEAD. Token permissions are contents read;
-there are no secrets, OIDC, private repository/standards retrieval, registry push,
-cache/artifact uploads or purchased resources. Only sanitized bounded public logs
-and the job summary are retained. No runner OS packages or firewall rules change.
+Same-repository PRs in `oso-gato/dev-pair` use standard free
+`ubuntu-24.04` runners. Opening, synchronizing and reopening a PR runs the
+hosted suite. A reviewer first checks the exact candidate and its workflow.
+After separate authorization for one native attempt, an authorized operator
+adds the exact role and head label to the PR:
 
-The controller's owned filesystem, exact checkout and read-only VM payload are
-the trust boundary. JSON source/role/executor claims are identities, not remote
-authentication. No external transport/admission, agent job, account/model request,
-Tailscale enrollment, SSH cutover or nested placement is enabled. Public source
-contains adopted standards identities, never private standards text.
+| Scenario | Label |
+| --- | --- |
+| Maintenance initialization | `fedora-m-<40-character head SHA>` |
+| Development host preparation and image producer | `fedora-d-<40-character head SHA>` |
+
+The label-add event supplies the immutable checkout and selects one role.
+The workflow runs the hosted suite before entering the controller. The
+controller verifies the same-repository head, exact label, event file and
+label actor from Actions, requires run attempt 1, and records the run ID.
+Each new native attempt requires fresh authorization and a new label event.
+The PR's hosted and native runs use separate concurrency groups, and the
+native group retains an active attempt. GitHub can supersede a pending
+attempt with a newer one. An operator tracks the exact run through its
+terminal result before another label event or head change.
+
+The workflow checks out the event head with official actions/checkout v4.3.1
+commit `34e114876b0b11c390a56381ad16ebd13914f8d5` and disables persisted
+credentials. The controller requires a clean checkout at that head. The job
+uses a contents-read token and fixed public upstream inputs. The controller
+inherits only its declared event metadata, and GitHub retains bounded
+sanitized logs and the job summary. The operation is disposable component
+validation, with production promotion and job admission disabled.
+The reviewed workflow and the standard ephemeral runner provide the execution
+boundary.
 
 ## Development image producer
 
-Both scenarios use the same per-PR concurrency group and preserve its active
-run. GitHub can supersede an older pending run with a newer pending run. Treat
-a superseded run as blocked and keep the next dispatch under the existing
-reviewed authority. Apply the development label only when the applicable
-maintenance work is terminal and the exact head has been authorized. Keep one
-active scope per PR and avoid label or head changes while a run is active.
-
-The controller's `--scenario` accepts `maintenance` (the default) or
-`development`. Development admission requires the Actions pull request event
-from the runner's `GITHUB_EVENT_PATH` in `oso-gato/dev-pair`. A supplied event
-path must match that path. The controller checks the fixed label and exact
-event head before creating scratch or entering the probe. Development builds and ships one
+Development builds and ships one
 authenticated development bundle. The manifest kind must match at build and
 extraction. The scenario and a per-run nonce bind the NoCloud request, the
 effective native service and the dedicated serial report. The development
@@ -83,9 +86,12 @@ protocol retains its existing preparation, assembly and report evidence.
 
 ## Authenticated public inputs and actual guest path
 
-1. Require preinstalled Podman, Git, GPG, sudo, coreutils and working
-   slirp4netns; record the actual versions/kernel/runner image. Require >=10GiB
-   runner RAM, two CPUs and >=23GiB free on the actual owned scratch filesystem.
+1. Require preinstalled Podman, Git, GPG, sudo, coreutils, util-linux,
+   e2fsprogs and working slirp4netns. Enter private mount and PID namespaces
+   and record the kernel, runner image and actual tool versions. Require
+   >=10GiB runner RAM, two CPUs and >=23GiB plus 16MiB local headroom on
+   the native backing filesystem. Verify and mount both fixed volumes before
+   signed downloads or engine work.
 2. Verify the official final Fedora44 Cloud checksum signature using fingerprint
    `36F612DCF27F7D1A48A835E4DBFCF71C6D9F90A6`. Require exact checksum-file SHA256
    `a436186ff0e930d77637d03e6f357206b686c4ef3fcde234b6f1da63041d4b32`,
@@ -213,9 +219,11 @@ Final maintenance probe runtimes retain network-none.
 | --- | --- |
 | Guest virtual disk |32GiB |
 | Writable qcow2 hard file ceiling |16GiB |
-| Measured non-overlay overhead |4GiB |
-| Host free reserve |3GiB |
-| Initial required free storage |23GiB |
+| Native overhead backing |4GiB including ext4 metadata, 65,536 inodes |
+| Native overlay backing |16GiB including ext4 metadata, 4,096 inodes |
+| Host free reserve outside both backings |3GiB |
+| Initial required free storage on the backing mount |23GiB + 16MiB |
+| Guest free reserve |8GiB |
 | Guest / outer resources |6GiB2CPU /8GiB3CPU1024PIDs |
 | Captured console and report aggregate |8MiB |
 | Dedicated JSON / write deadline |64KiB /30s |
@@ -235,43 +243,22 @@ RUN has its own native540s timeout and10s forced termination. This bounds that
 work when a build helper escapes its client unit; it does not prove every engine
 helper stopped, or extend an already shorter remaining image/VM budget.
 
-Virtual capacity is not physical allocation. QEMU RLIMIT_FSIZE enforces16GiB;
-capacity/overhead monitoring preserves host reserve. Guest free space is measured
-before preparation, before assembly in shared code, and finally. No reserve is
-lowered. Repository/cache/temporary expansion/ISO duplication count toward4GiB.
-Measured insufficiency, ENOSPC, timeout and capability failures remain blockers.
+The controller requires a private native ext4 mount on a direct runner
+block device. The two loop backings are allocated at their complete fixed
+sizes. FIEMAP verifies physical extents before and after formatting with
+discard disabled. Absolute block limits include filesystem metadata. The
+controller checks loop and mount identity, bytes and inode geometry, and
+keeps 3GiB free on the parent filesystem outside the backings.
 
-The source-bound storage worker measures allocated blocks with descriptor-relative
-traversal, hardlink deduplication and the existing `guest.qcow2` basename
-exclusion. It skips other devices without enumerating them. Same-device bind
-mounts are traversed only after the worker verifies their source inside owned
-scratch, with GNU `du --one-file-system` accounting for aliases and cycles.
-If a strict source lookup crosses a mount at the final directory component on
-ext4 or tmpfs, the worker checks that the visible mount is a canonical self-bind
-and that the entry beneath it has the expected inode. It repeats the proof
-after traversal, keeps the scanned and canonical source mounts pinned, and
-charges the extra directory entries to the same scan limits.
-If the source's strict parent lookup also returns EXDEV, a bounded child in a
-private mount namespace can pass a read-only nonrecursive bind of the owned
-scratch root back as a metadata descriptor. The worker checks each live source
-component against that backing view and verifies the canonical mount source of
-every crossed prefix. It holds live mount identities through the post-scan
-check. All block accounting and enumeration still use the live filesystem.
-Unavailable proof or a changed identity blocks the sample.
-When the strict canonical source lookup returns EXDEV, fixed reason codes
-identify a regular file, another nondirectory, or an empty canonical name.
-Directory fallback codes identify the parent open, parent identity, unsupported
-filesystem, visible leaf open, or a leaf still on the scratch mount. Overlay
-has its own filesystem code. Other EXDEV errors within the fallback use
-`bind-source-before-exdev`.
-Unverified same-device mounts block. A descendant disappearance can yield a
-provisional sample or trigger another attempt without contributing a total.
-Across at most three attempts, the largest usable sample counts against the
-same overhead and active-copy reserve. Final measurements require a complete
-scan. Identity, permission, I/O, traversal-limit and timeout failures block.
-The 64 KiB capture limit and root-side 5-second timeout with a 1-second kill
-grace remain in effect. Worker evidence reports typed results and output counts
-and hashes. An unresolved image-copy worker still prevents scratch cleanup.
+The overhead filesystem contains the Podman graph/runroot, logs, OCI copies,
+temporary files, signed bytes, source payloads, ISOs and report FIFO. The
+qcow2 lives on the separate overlay filesystem and keeps its 16GiB file
+limit. Each filesystem enforces its own capacity even for open, unlinked
+files. The controller uses kernel filesystem counters for live outer checks.
+The public input verifier retains its separate signed-format and bounded
+workspace checks. The guest still checks its 8GiB reserve before preparation,
+before assembly in shared code and at final readback. Unsupported backing,
+ENOSPC, timeout or unverifiable cleanup blocks the run.
 
 ## Reports, secrecy and cleanup
 
@@ -303,17 +290,18 @@ preserves decoded evidence. The bounded raw-report hash/hex/base64 witness remai
 The password's absence and initialization cleanup state are reported explicitly.
 Only exact owned guest units/recorded resources are reconciled by shared code;
 uncertain cleanup stays unverified. Whole-VM shutdown/forced native teardown is
-the final guest boundary. Outer cleanup uses only its unique Podman root and
-short `/tmp/dpvm-*` scratch. It requires successful removal, empty inventory
-including external build containers and no mounts before deletion. Unknown
-active state preserves scratch and reports failure. No shared prune/reset or
-runner-wide deletion occurs. Cancellation/SIGKILL supplies no completed cleanup
-claim; native/job limits and the disposable runner remain the outer bound.
+the final guest boundary. Outer cleanup validates its unique Podman store
+and requires an empty inventory including external build containers. The
+private PID namespace controller stops and reaps remaining owned processes.
+It verifies its exact mounts and backing associations, performs normal
+unmount and verifies loop detachment before removing the backing files.
+Unknown active state preserves scratch and reports failure. On cancellation,
+the native/job limits and disposable runner bound the attempt.
 
-Run `python3 -m unittest discover -s tests -q`. Local checks cover actual process
-limits/descendants, authenticated cached payload extraction, public GPG metadata,
-FIFO/PTY framing, secret-sentinel failure paths, phase/identity rejection and fixed
-profile/network construction. Engine/service responses injected in tests remain
+Run `python3 -B -m unittest discover -s tests -q`. Local checks cover actual process
+limits/descendants, split kernel byte and inode limits in isolated tmpfs fixtures,
+physical extent checks, authenticated cached input, public GPG, FIFO/PTY framing,
+phase/identity rejection and fixed profile/network construction. Engine/service responses injected in tests remain
 explicit synthetic contracts, not Fedora execution. Actual Fedora owned-mask selection/effective kill profile/native context admission, current-source public
 fetch/Cosign, package timing/capacity, rootless SELinux confinement and genuine
 Distrobox initialization require a separately reviewed hosted run. No local

@@ -114,6 +114,7 @@ class ToolingDiagnostics(unittest.TestCase):
         for mode in ('exit125','exit17','timeout','capture-overflow'):
             with tempfile.TemporaryDirectory() as directory:
                 self.root=Path(directory);self.probe=ci.Probe('a'*40,self.root)
+                self.root=self.probe.root;self.root.mkdir()
                 payload='FIXED_PUBLIC_BUILD_FAILURE\n'
                 code='import os,sys,time;assert "'+canary+'" not in os.environ;os.write(1,sys.argv[1].encode());'
                 if mode.startswith('exit'):code+='sys.exit('+mode[4:]+')'
@@ -150,7 +151,7 @@ class ToolingDiagnostics(unittest.TestCase):
                 self.assertTrue((self.root/'image-copy-owner.json').exists());self.assertTrue((self.root/'verification-work-owner.json').exists())
                 self.assertNotIn(canary,json.dumps(self.probe.report))
 
-    def test_exact_baseline_engine_sequence_minus_optional_info_only(self):
+    def test_signed_engine_operations_and_tooling_recipe_match_historical_baseline(self):
         import types
         baseline=types.ModuleType('optional_info_baseline');baseline.__file__=ci.__file__
         text=subprocess.check_output(['git','-C',str(Path(ci.__file__).resolve().parents[1]),'show',
@@ -160,12 +161,17 @@ class ToolingDiagnostics(unittest.TestCase):
         for module in (baseline,ci):
             with tempfile.TemporaryDirectory() as directory:
                 self.root=Path(directory);self.probe=module.Probe('a'*40,self.root);self.probe.container='fixed-owned-fixture'
+                self.root = self.probe.root
+                self.root.mkdir(exist_ok=True)
                 self.probe.report['oci_runtime']={'status':'observed','name':'STALE_RUNTIME_MUST_NOT_BE_COPIED'}
                 calls=[]
                 def bounded(argv,seconds,name,**kwargs):
                     operation=next(value for value in argv if value in ('load','image','save','info','build','run'))
                     kwargs.pop('suppress_failure_output',None)  # Exclusively dead old query switch.
-                    calls.append((operation,[value.replace(str(self.root),'/OWNED') for value in argv],seconds,name,kwargs))
+                    operation_index = argv.index(operation)
+                    operation_args = [value.replace(str(self.root), '/OWNED') for value in argv[operation_index:]
+                                      if value != '--log-driver=none']
+                    calls.append((operation, operation_args, seconds, name, kwargs))
                     return b'null' if operation=='info' else b'fixed-rpm-fixture'
                 with self.fixture(bounded,import_calls=True),patch.object(module,'download',ci.download), \
                         patch.object(module,'run_small',ci.run_small),contextlib.redirect_stdout(io.StringIO()):
