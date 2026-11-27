@@ -120,8 +120,15 @@ separate archive filesystem counts its actual block device size. The native
 maintenance import checks the rootless VFS graph, runroot, bounded copy
 space, OCI expansion and live config/manifest identities. P then runs the
 normal confined offline entry twice and records local cleanup under
-`bootstrap/gptbox-adapter/<context>/imported-releases/<image>.json`.
+`bootstrap/gptbox-adapter/<context>/imported-releases/<platform>/<image>/<boot>.json`.
 The guest producer record remains in the signed artifact package.
+
+Maintenance staging records its platform, image, physical allocation, copy
+directory and exact transient systemd unit in a protected lease before native
+execution. Before another staging attempt, the installer reconciles that lease
+and removes its copy only after the owned unit has stopped and its cgroup is
+empty. Uncertain launch or cleanup retains the lease and the copy. The retry
+first observes whether the exact image already exists in the role store.
 
 G preflights and stages each job through its bounded role store. A
 root-protected `development-placement.json` selects the exact site, inner
@@ -149,6 +156,13 @@ placement paths and the immutable installed host bundle read back. It binds
 U independently derives the local launch plan and release from the portable
 index, protected site configuration and actual native scopes. Activation
 uses its separately authorized staging and rollback path.
+
+After a reboot, renewal can call the same installer with `--reobserve-maintenance`
+and the already selected platform and site digests. The installer reads the
+retained signed index, exact local launch plan and historical P admission,
+then checks the existing rootless image and runs the ordinary P verification.
+Only the maintenance boot observation is refreshed. The historical admission
+and installer receipt remain available for recovery.
 
 ## Nightly and on-demand agent refresh
 

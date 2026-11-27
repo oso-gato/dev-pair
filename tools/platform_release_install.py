@@ -43,8 +43,13 @@ CGROUP_ROOT = Path('/sys/fs/cgroup/system.slice')
 SYSTEMCTL = '/usr/bin/systemctl'
 PODMAN = '/usr/bin/podman'
 TIME_LIMIT = 900
+REOBSERVE_LIMIT = 390
 MAX_JOBS = 32
 HOST_RELEASE_HEADROOM = 3 * (HOST_LIMIT + CONTROL_LIMIT)
+LEASE_NAME = '.platform-maintenance-lease.json'
+SPOOL_PREFIX = '.platform-import-'
+UNIT_PREFIX = 'dev-pair-platform-install-'
+BOOT_PATTERN = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 ENV = {'PATH': '/usr/bin:/usr/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
        'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
 
@@ -112,7 +117,7 @@ def bounded(argv, end, limit=CONTROL_LIMIT, allowed=(0,), *, data=None):
 
 def current_boot():
     value = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-    require(re.fullmatch('[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value), 'live boot identity is unavailable')
+    require(re.fullmatch(BOOT_PATTERN, value), 'live boot identity is unavailable')
     return value
 
 
@@ -219,27 +224,184 @@ def empty_cgroup(unit):
             'release installer native process cleanup is unresolved')
 
 
+class ImportLease:
+    """Durable exclusive ownership under the protected release-intake lock."""
+
+    def __init__(self, account, capacity):
+        self.root = intake.protected(ROOT, directory=True)
+        self.path = self.root / LEASE_NAME
+        self.account = account
+        self.boot = current_boot()
+        self.parent = self.root.lstat()
+        self.backing = [capacity['backing_inode'], capacity['backing_bytes']]
+        require(self.parent.st_dev == MAINTENANCE.lstat().st_dev and
+                f'{os.major(self.parent.st_dev)}:{os.minor(self.parent.st_dev)}' == capacity['device'],
+                'maintenance copy and engine must use the same bounded filesystem')
+        self.record = None
+
+    @property
+    def spool(self):
+        return self.root / (SPOOL_PREFIX + self.record['nonce'])
+
+    def read(self):
+        value, raw = protected_json(self.path)
+        require(self.path.lstat().st_mode & 0o777 == 0o600 and raw == canonical(value),
+                'maintenance import lease is not a protected canonical record')
+        fields(value, 'schema platform_sha256 image_id boot_id nonce owner backing parent inode unit')
+        require(type(value['schema']) is int and value['schema'] == 1 and
+                re.fullmatch(BOOT_PATTERN, value['boot_id']) and re.fullmatch('[0-9a-f]{24}', value['nonce']) and
+                value['owner'] == [self.account.pw_uid, self.account.pw_gid] and value['backing'] == self.backing and
+                type(value['parent']) is list and len(value['parent']) == 2 and
+                value['parent'][1] == self.parent.st_ino and
+                (value['boot_id'] != self.boot or value['parent'][0] == self.parent.st_dev) and
+                (value['inode'] is None or type(value['inode']) is int and value['inode'] > 0),
+                'maintenance import lease differs from the measured filesystem or role')
+        for key in ('platform_sha256', 'image_id'):
+            hex_id(value[key])
+        if value['unit'] is not None:
+            unit = fields(value['unit'], 'name operation quiesced')
+            require(value['inode'] is not None and re.fullmatch(UNIT_PREFIX + '[0-9a-f]{24}\\.service', unit['name']) and
+                    unit['operation'] in ('info', 'exists', 'load', 'inspect') and type(unit['quiesced']) is bool,
+                    'invalid maintenance import unit lease')
+        return value
+
+    def update(self, **changes):
+        require(self.read() == self.record, 'maintenance import lease changed during the operation')
+        value = {**self.record, **changes}
+        replace_observation(self.path, canonical(value))
+        self.record = value
+
+    def prepare(self, stage, image):
+        self.record = {'schema': 1, 'platform_sha256': hex_id(stage.name), 'image_id': hex_id(image),
+                       'boot_id': self.boot, 'nonce': secrets.token_hex(12),
+                       'owner': [self.account.pw_uid, self.account.pw_gid], 'backing': self.backing,
+                       'parent': [self.parent.st_dev, self.parent.st_ino], 'inode': None, 'unit': None}
+        require(not os.path.lexists(self.path) and not os.path.lexists(self.spool),
+                'previous maintenance import requires reconciliation')
+        replace_observation(self.path, canonical(self.record))
+        self.spool.mkdir(mode=0o700)
+        release.sync_directory(self.root)
+        self.update(inode=self.spool.lstat().st_ino)
+        os.chown(self.spool, self.account.pw_uid, self.account.pw_gid)
+
+    def begin(self, operation):
+        require(self.record['unit'] is None, 'previous native import unit is unresolved')
+        name = UNIT_PREFIX + secrets.token_hex(12) + '.service'
+        self.update(unit={'name': name, 'operation': operation, 'quiesced': False})
+        return name, self.description()
+
+    def description(self):
+        record = self.record
+        return (f"dev-pair-owned-{record['unit']['name']} {record['nonce']} "
+                f"{record['platform_sha256']} {record['unit']['operation']}")
+
+    def properties(self, end):
+        name = self.record['unit']['name']
+        keys = ('Id', 'Description', 'User', 'Transient', 'LoadState', 'ActiveState', 'ControlGroup',
+                'Result', 'ExecMainCode', 'ExecMainStatus')
+        command = [SYSTEMCTL, 'show', '--all', '--property=' + ','.join(keys), '--', name]
+        status, raw = bounded(command, min(end, time.monotonic() + 10), allowed=(0, 1, 4))
+        rows = [line.split('=', 1) for line in raw.decode().splitlines()]
+        props = dict(rows)
+        require(set(props) >= {'Id', 'LoadState', 'ActiveState'} and len(rows) == len(props) and
+                props['Id'] == name, 'maintenance import manager readback is unresolved')
+        if props['LoadState'] == 'not-found':
+            require(props['ActiveState'] == 'inactive' and not props.get('ControlGroup'),
+                    'maintenance import manager absence is unresolved')
+            return None
+        require(status == 0 and set(props) == set(keys) and props['LoadState'] == 'loaded' and props['User'] == 'dp-maint' and
+                props['Transient'] == 'yes' and props['Description'] == self.description() and
+                props['ControlGroup'] in ('', f'/system.slice/{name}'), 'maintenance import unit ownership differs')
+        return props
+
+    def retire(self, end, *, completed=False, image_missing=False):
+        unit = self.record['unit']
+        name = unit['name']
+        props = self.properties(end)
+        if image_missing:
+            require(props is not None and props['ActiveState'] == 'failed' and
+                    props['Result'] == 'exit-code' and props['ExecMainCode'] == '1' and props['ExecMainStatus'] == '1',
+                    'maintenance image absence lacks an exact local Podman exit')
+        if self.record['boot_id'] != self.boot:
+            require(props is None and not os.path.lexists(CGROUP_ROOT / name),
+                    'earlier-boot maintenance unit still has a current host identity')
+        elif unit['quiesced']:
+            require(props is None or props['ActiveState'] == 'inactive', 'retired maintenance unit became active')
+        elif props is None:
+            require(completed, 'maintenance native launch is uncertain on this boot')
+        else:
+            bounded([SYSTEMCTL, 'stop', '--', name], min(end, time.monotonic() + 12), allowed=(0, 5))
+            props = self.properties(end)
+            require(props is None or props['ActiveState'] == 'inactive',
+                    'maintenance owned unit has not stopped')
+        _, jobs = bounded([SYSTEMCTL, 'list-jobs', '--no-legend', '--no-pager', '--plain', '--', name],
+                          min(end, time.monotonic() + 10))
+        require(not jobs.strip(), 'maintenance owned unit still has a queued manager operation')
+        if not unit['quiesced']:
+            self.update(unit={**unit, 'quiesced': True})
+        empty_cgroup(name)
+        self.update(unit=None)
+
+    def finish(self):
+        require(self.read() == self.record and self.record['unit'] is None,
+                'maintenance import lease or native cleanup is unresolved')
+        if os.path.lexists(self.spool):
+            node = self.spool.lstat()
+            inode = self.record['inode']
+            require(self.spool.resolve(strict=True) == self.spool and stat.S_ISDIR(node.st_mode) and
+                    node.st_dev == self.parent.st_dev and stat.S_IMODE(node.st_mode) == 0o700 and
+                    (node.st_uid, node.st_gid) in ((0, 0), (self.account.pw_uid, self.account.pw_gid)),
+                    'maintenance import copy directory ownership changed')
+            # Before the inode is recorded the root-created directory has never been handed to the role.
+            if inode is None:
+                require((node.st_uid, node.st_gid) == (0, 0), 'unpublished maintenance copy directory changed')
+                self.spool.rmdir()
+            else:
+                require(node.st_ino == inode and shutil.rmtree.avoids_symlink_attacks,
+                        'maintenance import copy directory identity changed')
+                with Path('/proc/self/mountinfo').open('rb') as stream:
+                    mounts = stream.read(1024**2 + 1)
+                require(0 < len(mounts) <= 1024**2 and all(
+                    row[4] != os.fsencode(self.spool) and not row[4].startswith(os.fsencode(self.spool) + b'/')
+                    for row in (line.split() for line in mounts.splitlines())), 'maintenance copy directory contains a mount')
+                shutil.rmtree(self.spool)
+            release.sync_directory(self.root)
+        require(not os.path.lexists(self.spool), 'maintenance import copy directory remains after cleanup')
+        self.path.unlink()
+        release.sync_directory(self.root)
+        self.record = None
+
+    def recover(self, end):
+        if os.path.lexists(self.path):
+            self.record = self.read()
+            if self.record['unit'] is not None:
+                self.retire(end)
+            self.finish()
+
+
 class Maintenance:
-    def __init__(self, account, runtime, copy):
-        self.account, self.runtime, self.copy = account, runtime, copy
+    def __init__(self, runtime, lease):
+        self.lease = lease
+        self.copy = lease.spool
         self.runroot = runtime / 'dev-pair-gptbox'
         self.command = ['/usr/bin/env', '-i', 'PATH=/usr/bin:/usr/sbin', 'LANG=C.UTF-8',
                         f'HOME={ENGINE_CONTROL}/home', f'CONTAINERS_CONF={ENGINE_CONTROL}/containers.conf',
-                        f'XDG_RUNTIME_DIR={runtime}', f'TMPDIR={copy}', PODMAN,
+                        f'XDG_RUNTIME_DIR={runtime}', f'TMPDIR={self.copy}', PODMAN,
                         f'--root={MAINTENANCE}', f'--runroot={self.runroot}', '--storage-driver=vfs',
                         '--events-backend=file', '--remote=false']
 
     def call(self, args, end, *, data=None, allowed=(0,)):
         timeout = min(240, int(seconds(end, 240)))
         require(timeout >= 5, 'maintenance import has insufficient bounded native time')
-        unit = 'dev-pair-platform-install-' + secrets.token_hex(12) + '.service'
-        command = ['/usr/bin/systemd-run', '--unit=' + unit, '--description=dev-pair-owned-' + unit,
-                   '--uid=dp-maint', '--quiet', '--wait', '--collect', '--pipe', '--service-type=exec',
+        operation = args[1] if args[0] == 'image' else args[0]
+        unit, description = self.lease.begin(operation)
+        command = ['/usr/bin/systemd-run', '--unit=' + unit, '--description=' + description,
+                   '--uid=dp-maint', '--quiet', '--wait', '--pipe', '--service-type=exec', '--slice=system.slice',
                    '--property=RuntimeMaxSec=' + str(timeout - 3), '--property=TimeoutStopSec=2',
                    '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
                    '--property=CPUQuota=100%', *self.command, *args]
         answer = bounded(command, min(end, time.monotonic() + timeout), allowed=allowed, data=data)
-        empty_cgroup(unit)
+        self.lease.retire(end, completed=answer[0] == 0, image_missing=operation == 'exists' and answer[0] == 1)
         return answer
 
     def observe_store(self, end):
@@ -278,6 +440,19 @@ def fixed_file(path, raw):
         os.unlink(staged)
 
 
+def replace_observation(path, raw):
+    descriptor, staged = tempfile.mkstemp(dir=path.parent, prefix='.platform-observation-')
+    try:
+        with os.fdopen(descriptor, 'wb') as output:
+            output.write(raw)
+            os.fsync(output.fileno())
+        os.replace(staged, path)
+        release.sync_directory(path.parent)
+    finally:
+        if os.path.lexists(staged):
+            os.unlink(staged)
+
+
 def publish_observation(path, value, *, installed=False):
     raw = canonical(value)
     if not os.path.lexists(path):
@@ -293,23 +468,18 @@ def publish_observation(path, value, *, installed=False):
         del expected['components']['maintenance']['result_sha256']
         del observed['components']['maintenance']['result_sha256']
     require(expected == observed, 'reboot readback changes an immutable installation binding')
-    descriptor, staged = tempfile.mkstemp(dir=path.parent, prefix='.platform-observation-')
-    try:
-        with os.fdopen(descriptor, 'wb') as output:
-            output.write(raw)
-            os.fsync(output.fileno())
-        require(protected_json(path)[1] == prior_raw, 'native observation changed before replacement')
-        os.replace(staged, path)
-        release.sync_directory(path.parent)
-    finally:
-        if os.path.lexists(staged):
-            os.unlink(staged)
+    require(protected_json(path)[1] == prior_raw, 'native observation changed before replacement')
+    replace_observation(path, raw)
+
+
+def maintenance_bindings(stage, index):
+    row = index['components']['maintenance-agent']
+    return {'platform_sha256': stage.name, 'source_sha': index['source_sha'], 'context_sha256': row['context_sha256'],
+            'image_id': row['oci_config_sha256'], 'oci_manifest_sha256': row['oci_manifest_sha256']}
 
 
 def maintenance_probe(stage, index, phase, end):
-    row = index['components']['maintenance-agent']
-    bindings = {'platform_sha256': stage.name, 'source_sha': index['source_sha'], 'context_sha256': row['context_sha256'],
-                'image_id': row['oci_config_sha256'], 'oci_manifest_sha256': row['oci_manifest_sha256']}
+    bindings = maintenance_bindings(stage, index)
     executable = intake.protected(P_ENTRY)
     argv = ['/usr/bin/python3', '-B', str(executable), 'verify-installed-maintenance', '--phase', phase,
             '--platform-sha256', bindings['platform_sha256'], '--source-sha', bindings['source_sha'],
@@ -322,59 +492,76 @@ def maintenance_probe(stage, index, phase, end):
                 'local maintenance gateway did not prove the exact import scope')
         return None
 
+    expected = maintenance_admission(stage, index, current_boot())
+    _, raw = maintenance_admission_readback(expected)
+    return maintenance_result(bindings, raw)
+
+
+def maintenance_admission(stage, index, boot):
+    bindings = maintenance_bindings(stage, index)
     _, part = release.readonly_json(stage / 'maintenance/part.json', 0)
-    path = ADAPTER / row['context_sha256'] / 'imported-releases' / (bindings['image_id'] + '.json')
+    return {'schema': 1, 'kind': 'maintenance-imported-release-admission', **bindings,
+            'boot_id': boot, 'distrobox_sha': release.public_inputs.DBX_SOURCE,
+            'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False,
+            'producer_result_sha256': part['producer']['result_sha256']}
+
+
+def maintenance_admission_readback(expected):
+    path = (ADAPTER / expected['context_sha256'] / 'imported-releases' / expected['platform_sha256'] /
+            expected['image_id'] / (expected['boot_id'] + '.json'))
     value, raw = protected_json(path)
-    expected = {'schema': 1, 'kind': 'maintenance-imported-release-admission', **bindings,
-                'boot_id': current_boot(), 'distrobox_sha': release.public_inputs.DBX_SOURCE,
-                'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False,
-                'producer_result_sha256': part['producer']['result_sha256']}
     require(path.lstat().st_mode & 0o777 == 0o600 and value == expected and type(value['schema']) is int and
             type(value['boundary_and_version_cycles']) is int and value['runtime_container_removed'] is True and
-            value['job_admission'] is False, 'actual restricted native maintenance probe evidence differs')
-    return {'context_sha256': row['context_sha256'], 'oci_config_sha256': bindings['image_id'],
+            value['job_admission'] is False and raw == gptbox.image_inputs_bytes(expected),
+            'actual restricted native maintenance probe evidence differs')
+    return value, raw
+
+
+def maintenance_result(bindings, raw):
+    return {'context_sha256': bindings['context_sha256'], 'oci_config_sha256': bindings['image_id'],
             'oci_manifest_sha256': bindings['oci_manifest_sha256'], 'result_sha256': release.digest(raw)}
 
 
-def install_maintenance(stage, index, account, runtime, end):
+def maintenance_import_record(stage, index, runtime, boot):
+    return {'schema': 1, 'kind': 'maintenance-native-oci-import', **maintenance_bindings(stage, index), 'boot_id': boot,
+            'archive_sha256': index['components']['maintenance-agent']['archive_sha256'],
+            'graphroot': str(MAINTENANCE), 'runroot': str(runtime / 'dev-pair-gptbox')}
+
+
+def observe_maintenance_engine(stage, index, account, runtime, end, *, allow_load):
     row = index['components']['maintenance-agent']
-    source = intake.protected(stage / 'maintenance/maintenance.oci.tar')
-    bounded_volume(MAINTENANCE, 1024**2)
-    copy = Path(tempfile.mkdtemp(prefix='.platform-import-', dir=MAINTENANCE))
-    owned = copy.lstat()
-    os.chown(copy, account.pw_uid, account.pw_gid)
-    finished = False
+    capacity = bounded_volume(MAINTENANCE, 1024**2)
+    lease = ImportLease(account, capacity)
+    lease.recover(end)
+    image, manifest = (row[name] for name in ('oci_config_sha256', 'oci_manifest_sha256'))
     try:
-        bounded(['/usr/sbin/restorecon', '-F', str(copy)], min(end, time.monotonic() + 10))
-        engine = Maintenance(account, runtime, copy)
+        lease.prepare(stage, image)
+        bounded(['/usr/sbin/restorecon', '-F', str(lease.spool)], min(end, time.monotonic() + 10))
+        engine = Maintenance(runtime, lease)
         engine.observe_store(end)
-        image, manifest = (row[name] for name in ('oci_config_sha256', 'oci_manifest_sha256'))
-        status, _ = engine.call(('image', 'exists', 'sha256:' + image), min(end, time.monotonic() + 20), allowed=(0, 1))
-        if status:
-            bounded_volume(MAINTENANCE, rootless_import_peak(source, row, end))
-            stream, node = regular(source, ARCHIVE_LIMIT, 0)
-            with stream:
-                require(node.st_size == row['archive_bytes'], 'maintenance source length differs at native import')
-                engine.call(('load',), end, data=stream)
-                after = os.fstat(stream.fileno())
-                require((after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_size) ==
-                        (node.st_dev, node.st_ino, node.st_mtime_ns, node.st_ctime_ns, node.st_size),
-                        'maintenance source changed during native import')
+        if allow_load:
+            status, _ = engine.call(('image', 'exists', 'sha256:' + image), min(end, time.monotonic() + 20), allowed=(0, 1))
+            if status:
+                source = intake.protected(stage / 'maintenance/maintenance.oci.tar')
+                bounded_volume(MAINTENANCE, rootless_import_peak(source, row, end))
+                stream, node = regular(source, ARCHIVE_LIMIT, 0)
+                with stream:
+                    require(node.st_size == row['archive_bytes'], 'maintenance source length differs at native import')
+                    engine.call(('load',), end, data=stream)
+                    after = os.fstat(stream.fileno())
+                    require((after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns, after.st_size) ==
+                            (node.st_dev, node.st_ino, node.st_mtime_ns, node.st_ctime_ns, node.st_size),
+                            'maintenance source changed during native import')
         engine.inspect(image, manifest, end)
         bounded_volume(MAINTENANCE, need_import=False)
-        finished = True
     finally:
-        if finished:
-            observed = copy.lstat()
-            require(shutil.rmtree.avoids_symlink_attacks and stat.S_ISDIR(observed.st_mode) and
-                    (observed.st_dev, observed.st_ino) == (owned.st_dev, owned.st_ino),
-                    'owned import spool identity changed before cleanup')
-            shutil.rmtree(copy)
-    evidence = {'schema': 1, 'kind': 'maintenance-native-oci-import', 'platform_sha256': stage.name,
-                'source_sha': index['source_sha'], 'context_sha256': row['context_sha256'],
-                'image_id': image, 'oci_manifest_sha256': manifest, 'boot_id': current_boot(),
-                'archive_sha256': row['archive_sha256'], 'graphroot': str(MAINTENANCE),
-                'runroot': str(runtime / 'dev-pair-gptbox')}
+        if lease.record is not None and lease.record['unit'] is None and os.path.lexists(lease.path):
+            lease.finish()
+
+
+def install_maintenance(stage, index, account, runtime, end):
+    observe_maintenance_engine(stage, index, account, runtime, end, allow_load=True)
+    evidence = maintenance_import_record(stage, index, runtime, current_boot())
     publish_observation(stage / 'maintenance-import.json', evidence)
     return maintenance_probe(stage, index, 'verify', end)
 
@@ -468,9 +655,10 @@ def install_host(stage, row, end, *, reuse_only=False):
     return check_host_bundle(destination, row, end)
 
 
-def exact_local_programs(base_stage, end):
-    manifest, _ = protected_json(base_stage / 'host/host-manifest.json')
-    for program in (G_ENTRY, P_ENTRY):
+def exact_local_programs(base_stage, end, *, expected=None, programs=None):
+    manifest, _ = protected_json(base_stage / 'host/host-manifest.json', expected)
+    programs = (G_ENTRY, P_ENTRY) if programs is None else programs
+    for program in programs:
         expected = hex_id(manifest['files']['tools/' + program.name])
         require(file_hash(intake.protected(program), 4 * 1024**2, end, owner=0)[0] == expected,
                 f'installed {program.name} differs from the approved stable host release')
@@ -529,6 +717,121 @@ def check_development(stage, index, base_index, site, reported, end):
     return observed, result
 
 
+def approved_maintenance_selection(stage, index, base, intake_sha, site_sha, site):
+    # The invoking renewal path already holds its owner/effect fence. Read its
+    # protected selection and journal without recursively taking those locks.
+    import renewal
+
+    control = renewal.Renewal(ROOT, None)
+    current = control.live_release()
+    selected = hex_id(renewal.read_json(control.control / 'site-current.json'))
+    marker = ROOT / 'renewal-fence/frozen'
+    fence = renewal.read_json(marker) if os.path.lexists(marker) else None
+    if fence in (None, 'boot'):
+        require(current == selected, 'renewal current and live site selection differ')
+        references = {current}
+    else:
+        attempt, journal = control.transition()
+        require(attempt is not None and attempt.name == fence and journal['attempt_id'] == fence and
+                type(journal['schema']) is int and journal['schema'] == 1,
+                'maintenance reobservation lacks a matching protected renewal fence')
+        request = renewal.checked_request(journal['request'], journal['request']['scope'])
+        previous, target = request['previous_sha256'], request['target_sha256']
+        phase = journal['phase']
+        require(previous != target and {current, selected} <= {previous, target},
+                'renewal live selectors escaped the protected transition')
+        if phase in ('prepared', 'freezing', 'backed-up', 'applying', 'verifying'):
+            references = {previous, target}
+        elif phase == 'accepted':
+            references = {target}
+        else:
+            require(phase in ('rolling-back', 'rollback-verifying', 'rollback-accepted'),
+                    'maintenance reobservation is outside an approved transition phase')
+            references = {previous}
+    matching = []
+    for reference in sorted(references):
+        selection = control.release(reference)
+        component = selection['components']['maintenance-agent']
+        platform = component.get('platform_sha256')
+        path = control.control / 'platform-bindings' / (reference + '.json')
+        plan_sha = selection['plan_sha256']
+        if os.path.lexists(path):
+            binding = renewal.read_json(path)
+            if binding['platform_sha256'] != stage.name:
+                require(platform != stage.name, 'maintenance component conflicts with the protected portable binding')
+                continue
+            require(platform in (None, stage.name) and type(binding['schema']) is int and binding == {
+                'schema': 1, 'release_sha256': reference, 'platform_sha256': stage.name, 'base_platform_sha256': base,
+                'site_config_sha256': site_sha, 'intake_sha256': intake_sha, 'plan_sha256': plan_sha} and
+                selection['config_sha256'] == site['host_config_sha256'],
+                'local release binding differs from approved portable maintenance evidence')
+        elif platform != stage.name:
+            continue
+        # A deliberately mixed host/DevBox release retains the exact signed
+        # maintenance component but derives a new local plan and host profile.
+        plan, _ = protected_json(control.control / 'plans' / (hex_id(plan_sha) + '.json'), plan_sha)
+        row = index['components']['maintenance-agent']
+        require(plan['maintenance_context_sha256'] == row['context_sha256'] and
+                component['artifact_sha256'] == row['oci_config_sha256'] and
+                component['source_revision'] == index['source_sha'] and component['codex_version'] == row['codex_version'],
+                'local release plan differs from approved portable maintenance evidence')
+        matching.append(reference)
+    require(matching, 'maintenance image is not selected by an exact approved local release')
+    return tuple(matching)
+
+
+def reobserve_maintenance(identity, site_sha, end):
+    identity, site_sha = hex_id(identity), hex_id(site_sha)
+    site = site_configuration(SITE_CONFIGS / (site_sha + '.json'), site_sha)
+    boot = machine(site, end)
+    stage, index, intake_sha = intake.retained_index(identity)
+    if index['kind'] == 'dev-pair-agent-release':
+        base = index['base_platform_sha256']
+        base_stage, base_index, _ = intake.retained_index(base)
+        require(base_index['kind'] == 'dev-pair-platform-release', 'retained maintenance release has no stable host base')
+    else:
+        base, base_stage, base_index = identity, stage, index
+    reference = approved_maintenance_selection(stage, index, base, intake_sha, site_sha, site)
+    exact_local_programs(base_stage, end, expected=base_index['components']['host']['bundle_manifest_sha256'],
+                         programs=(P_ENTRY,))
+    part_path = intake.protected(stage / 'maintenance/part.json')
+    part = index['transports']['maintenance']['files']['part.json']
+    require(file_hash(part_path, CONTROL_LIMIT, end, owner=0) == (part['sha256'], part['bytes']),
+            'retained maintenance producer proof differs from its signed transport')
+    installed_path = stage / 'installed.json'
+    installed, raw = protected_json(installed_path)
+    fields(installed, 'schema platform_sha256 base_platform_sha256 site_config_sha256 boot_id source_sha components')
+    old_boot = installed['boot_id']
+    require(installed_path.lstat().st_mode & 0o777 == 0o600 and raw == canonical(installed) and
+            type(installed['schema']) is int and installed['schema'] == 1 and type(old_boot) is str and
+            re.fullmatch(BOOT_PATTERN, old_boot) and installed['platform_sha256'] == identity and
+            installed['base_platform_sha256'] == base and installed['site_config_sha256'] == site_sha and
+            installed['source_sha'] == index['source_sha'], 'retained native installation differs from approved selection')
+    _, historical = maintenance_admission_readback(maintenance_admission(stage, index, old_boot))
+    bindings = maintenance_bindings(stage, index)
+    retained = fields(installed['components'], 'maintenance development devbox host')['maintenance']
+    require(retained == maintenance_result(bindings, historical),
+            'retained native installation lacks the exact completed maintenance admission')
+
+    account, runtime = maintenance_identity()
+    import_path = stage / 'maintenance-import.json'
+    prior, raw = protected_json(import_path)
+    prior_boot = prior['boot_id']
+    require(import_path.lstat().st_mode & 0o777 == 0o600 and raw == canonical(prior) and
+            type(prior['schema']) is int and type(prior_boot) is str and re.fullmatch(BOOT_PATTERN, prior_boot) and
+            prior == maintenance_import_record(stage, index, runtime, prior_boot),
+            'retained native import does not identify the selected immutable image or store')
+    volume = bounded_volume(MAINTENANCE, need_import=False)
+    stage_budget(stage, volume)
+    ImportLease(account, volume).recover(end)
+    maintenance_probe(stage, index, 'preflight', end)
+    observe_maintenance_engine(stage, index, account, runtime, end, allow_load=False)
+    require(current_boot() == boot and approved_maintenance_selection(stage, index, base, intake_sha, site_sha, site) == reference,
+            'boot or local release selection changed across maintenance readback')
+    publish_observation(import_path, maintenance_import_record(stage, index, runtime, boot))
+    return maintenance_probe(stage, index, 'verify', end)
+
+
 def install(identity, site_sha, end):
     identity, site_sha = hex_id(identity), hex_id(site_sha)
     config = site_configuration(SITE_CONFIGS / (site_sha + '.json'), site_sha)
@@ -545,6 +848,7 @@ def install(identity, site_sha, end):
     account, runtime = maintenance_identity()
     volume = bounded_volume(MAINTENANCE, need_import=False)
     stage_budget(stage, volume)
+    ImportLease(account, volume).recover(end)
     if agent:
         stage_budget(base_stage, volume)
         # Agent update may only keep the actual installed host bundle.
@@ -579,11 +883,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--platform-sha256', required=True)
     parser.add_argument('--site-config-sha256', required=True)
+    parser.add_argument('--reobserve-maintenance', action='store_true')
     args = parser.parse_args()
     require(os.getuid() == os.geteuid() == 0, 'protected native installer operator required')
     os.umask(0o077)
     with intake.intake_lock():
-        result = install(args.platform_sha256, args.site_config_sha256, time.monotonic() + TIME_LIMIT)
+        if args.reobserve_maintenance:
+            result = reobserve_maintenance(args.platform_sha256, args.site_config_sha256, time.monotonic() + REOBSERVE_LIMIT)
+        else:
+            result = install(args.platform_sha256, args.site_config_sha256, time.monotonic() + TIME_LIMIT)
     print(canonical(result).decode(), end='')
     return 0
 

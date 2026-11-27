@@ -178,15 +178,23 @@ def verify_local_parts(directory, value, end):
             require(release.portable_image(checked, component) == component, 'portable image identity differs from exact archive')
 
 
-def previous_release(identity, end):
+def retained_index(identity):
     previous = protected(ROOT / identity, directory=True)
     raw, value = release.readonly_json(protected(previous / 'platform.json'), 0)
-    require(hashlib.sha256(raw).hexdigest() == identity, 'retained previous platform manifest changed')
+    require(raw == canonical(value) and hashlib.sha256(raw).hexdigest() == identity,
+            'retained previous platform manifest changed')
     portable_index(value, value['source_sha'], value['publisher_run'])
-    _, receipt = release.readonly_json(protected(previous / 'intake.json'), 0)
-    require(receipt == {'schema': 2, 'platform_sha256': identity, 'source_sha': value['source_sha'],
-                        'publisher_run': value['publisher_run'], 'kind': value['kind']},
+    path = protected(previous / 'intake.json')
+    receipt_raw, receipt = release.readonly_json(path, 0)
+    require(stat.S_IMODE(path.lstat().st_mode) == 0o600 and receipt_raw == canonical(receipt) and
+            type(receipt['schema']) is int and receipt == {'schema': 2, 'platform_sha256': identity,
+            'source_sha': value['source_sha'], 'publisher_run': value['publisher_run'], 'kind': value['kind']},
             'retained previous platform lacks exact prior trust receipt')
+    return previous, value, hashlib.sha256(receipt_raw).hexdigest()
+
+
+def previous_release(identity, end):
+    previous, value, _ = retained_index(identity)
     verify_local_parts(previous, value, end)
     return value
 
