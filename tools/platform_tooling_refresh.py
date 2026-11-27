@@ -193,16 +193,16 @@ def resolve(output, approved_source, cache=None):
                  'source_sha': source, 'tag': tag, 'version': version, 'release_id': row['id'],
                  'assets': {name: {key: info[key] for key in ('sha256', 'bytes')} for name, info in assets.items()},
                  'binary': {'sha256': digest, 'bytes': size}, 'verification_sha256': evidence}
-        eligible = matches_pins(value)
-        release.write_json(stage / 'tooling.json', {**value, 'approved_pins_match': eligible,
-                                                    'cached_assets': sorted(name for name, row in assets.items() if row['reused'])})
-        # Carry verified public inputs inside this run only. Each role reruns
-        # signature and byte verification against its protected source pins.
-        if eligible:
-            for key, name in (('archive', 'codex.tar.gz'), ('bundle', 'codex.sigstore'), ('cosign', 'cosign')):
-                (work / key).rename(stage / name)
+        exact = matches_pins(value)
+        numeric = tuple(int(part) for part in version.split('.'))
+        shipped = tuple(int(part) for part in release.CODEX_VERSION.split('.'))
+        require(numeric > shipped or exact, 'official tooling is older than the pinned baseline or changed at its pinned version')
+        record = {**value, 'approved_pins_match': exact, 'cached_assets': sorted(name for name, row in assets.items() if row['reused'])}
+        release.write_json(stage / 'tooling.json', public.tooling_record(record, approved_source))
+        for key, name in (('archive', 'codex.tar.gz'), ('bundle', 'codex.sigstore'), ('cosign', 'cosign')):
+            (work / key).rename(stage / name)
         shutil.rmtree(work)
-    return eligible
+    return record
 
 
 def main():
@@ -216,20 +216,20 @@ def main():
     if args.actions:
         from platform_release_ci import admitted_refresh
         admitted_refresh(args.source, os.environ)
-        previous, base = (hex_id(os.environ.get(key)) for key in ('PREVIOUS_PLATFORM', 'BASE_PLATFORM'))
+        base = hex_id(os.environ.get('BASE_PLATFORM'))
         try:
             quota = int(os.environ.get('ARTIFACT_BYTES', ''))
         except ValueError:
             raise Blocked('agent artifact quota approval is missing') from None
         require(quota >= release.AGENT_BUDGET + TOOLING_CACHE_BUDGET, 'agent artifact quota cannot cover bounded release and cache')
-        metadata = {'previous': previous, 'base': base, 'artifact-bytes': quota}
-    eligible = resolve(args.output, args.source, args.cache)
+        metadata = {'base': base, 'artifact-bytes': quota}
+    record = resolve(args.output, args.source, args.cache)
     if filepath := os.environ.get('GITHUB_OUTPUT'):
         with Path(filepath).open('a') as stream:
             for name, value in metadata.items():
                 stream.write(f'{name}={value}\n')
-            stream.write(f'approved-pins-match={str(eligible).lower()}\n')
-    print('Verified official tooling matches approved pins' if eligible else 'Verified tooling pin proposal awaits independent review')
+            stream.write('tooling-verified=true\n')
+    print('Verified official stable Codex ' + record['version'])
 
 
 if __name__ == '__main__':

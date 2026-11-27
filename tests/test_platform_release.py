@@ -67,6 +67,10 @@ class PlatformReleaseTests(unittest.TestCase):
         export = {'nonce': self.nonce, 'writer_sha256': 'a' * 64}
         protected = {**inputs, 'platform_export': export}
         self.assertEqual(guest.validate_inputs(protected), protected)
+        refresh_inputs = {'codex_version': '0.170.0', 'refresh_tooling_sha256': 'f' * 64}
+        self.assertEqual(guest.validate_inputs({**protected, **refresh_inputs}), {**protected, **refresh_inputs})
+        with self.assertRaisesRegex(ValueError, 'protected|signed'):
+            guest.validate_inputs({**inputs, **refresh_inputs})
         with self.assertRaises(ValueError):
             guest.validate_inputs({**inputs, 'platform_export': {**export, 'credentials': 'secret'}})
         budget = guest.INITIALIZE_SECONDS - guest.PLATFORM_EXPORT_SECONDS - guest.PLATFORM_VERIFY_SECONDS
@@ -248,6 +252,11 @@ class PlatformReleaseTests(unittest.TestCase):
         with mock.patch.object(fedora_oci, 'DIFF', base):
             agent_sha = publisher.assemble(parts, self.root / 'agent', self.source, 5678, platform_sha,
                                            publisher.AGENT_BUDGET, agent=True, base=platform_sha)
+            next_sha = publisher.assemble(parts, self.root / 'site-chained', self.source, 6790, None,
+                                          publisher.AGENT_BUDGET, agent=True, base=platform_sha, site_chain=True,
+                                          tooling={'codex_version': publisher.CODEX_VERSION,
+                                                   'codex_source_sha': publisher.public_inputs.CODEX_SOURCE,
+                                                   'codex_sha256': publisher.public_inputs.CODEX_SHA})
         platform_raw, platform = publisher.readonly_json(output / 'platform.json')
         self.assertEqual(publisher.digest(platform_raw), platform_sha)
         protocol.portable_index(platform, self.source, 1234)
@@ -261,6 +270,18 @@ class PlatformReleaseTests(unittest.TestCase):
         protocol.portable_index(agent, self.source, 5678)
         self.assertEqual(set(agent['components']), {'maintenance-agent', 'development-agent'})
         self.assertEqual(agent['base_platform_sha256'], platform_sha)
+        next_raw, next_package = publisher.readonly_json(self.root / 'site-chained/platform.json')
+        self.assertEqual(publisher.digest(next_raw), next_sha)
+        self.assertEqual((next_package['schema'], next_package['previous_platform_sha256'], next_package['base_platform_sha256']),
+                         (3, None, platform_sha))
+        protocol.portable_index(next_package, self.source, 6790)
+        with self.assertRaisesRegex(protocol.Blocked, 'site-chained schema'):
+            protocol.portable_index({**next_package, 'previous_platform_sha256': agent_sha}, self.source, 6790)
+        local = {'schema': 1, 'platform_sha256': next_sha, 'base_platform_sha256': platform_sha,
+                 'previous_platform_sha256': agent_sha}
+        self.assertEqual(protocol.site_predecessor(local, next_sha, platform_sha), agent_sha)
+        with self.assertRaisesRegex(protocol.Blocked, 'reference itself'):
+            protocol.site_predecessor({**local, 'previous_platform_sha256': next_sha}, next_sha, platform_sha)
 
         staged = self.root / 'staged'
         staged.mkdir()
@@ -271,7 +292,8 @@ class PlatformReleaseTests(unittest.TestCase):
                                 protocol.file_hash(path, maximum, end, owner=os.getuid())),
               mock.patch.object(publisher, 'readonly_json', side_effect=lambda path, _owner=None: ordinary_json(path)),
               mock.patch.object(fedora_oci, 'DIFF', base)):
-            for identity, raw, value in ((platform_sha, platform_raw, platform), (agent_sha, agent_raw, agent)):
+            for identity, raw, value in ((platform_sha, platform_raw, platform), (agent_sha, agent_raw, agent),
+                                         (next_sha, next_raw, next_package)):
                 destination = staged / identity
                 destination.mkdir()
                 (destination / 'platform.json').write_bytes(raw)
@@ -282,8 +304,15 @@ class PlatformReleaseTests(unittest.TestCase):
                 receipt_path.chmod(0o600)
                 for role, transfer in value['transports'].items():
                     shutil.copytree(parts / transfer['name'], destination / role)
+                proof = b''
+                if value['schema'] == 3:
+                    local_path = destination / 'site-predecessor.json'
+                    proof = protocol.canonical(local)
+                    local_path.write_bytes(proof)
+                    local_path.chmod(0o600)
                 self.assertEqual(intake.previous_release(identity, self.end), value)
-                self.assertEqual(intake.retained_index(identity), (destination, value, publisher.digest(receipt_path.read_bytes())))
+                expected = publisher.digest(receipt_path.read_bytes() + proof)
+                self.assertEqual(intake.retained_index(identity), (destination, value, expected))
                 receipt_path.write_bytes(protocol.canonical(receipt) + b'\n')
                 with self.assertRaisesRegex(protocol.Blocked, 'exact prior trust receipt'):
                     intake.retained_index(identity)
@@ -411,27 +440,45 @@ class PlatformReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(protocol.Blocked, 'official release metadata exceeds'):
                 publisher.official_version()
 
-    def test_newer_large_stable_reply_proposes_pins_and_preserves_prior_selection(self):
+    def test_newer_signed_stable_carries_exact_public_inputs_for_both_role_builds(self):
         raw = self.upstream_metadata().replace(b'rust-v0.169.0', b'rust-v0.170.0')
         resolver = mock.Mock()
         resolver.open.side_effect = lambda *_args, **_kwargs: self.response(raw)
         prior = self.root / 'current-selection'
         prior.write_text('retained exact previous release')
-        output = self.root / 'pin-proposal'
+        output = self.root / 'verified-tooling'
+
+        def acquire(_opener, destination, _identity, _end, _cache):
+            destination.write_bytes(b'x' * 41)
+            return {'sha256': publisher.digest(b'x' * 41), 'bytes': 41, 'reused': False}
+
         with (
             mock.patch.object(refresh.urllib.request, 'build_opener', return_value=resolver),
             mock.patch.object(refresh.release, 'source_checkout'),
             mock.patch.object(refresh, 'commit_for_tag', return_value='a' * 40),
-            mock.patch.object(refresh, 'acquire', return_value={'sha256': '3' * 64, 'bytes': 41, 'reused': False}),
+            mock.patch.object(refresh, 'acquire', side_effect=acquire),
             mock.patch.object(refresh, 'extract_binary', return_value=('4' * 64, 19)),
             mock.patch.object(Path, 'chmod'),
-            mock.patch.object(refresh, 'verify_signature', return_value='5' * 64),
+            mock.patch.object(refresh, 'verify_signature', return_value='5' * 64) as signature,
         ):
-            self.assertFalse(refresh.resolve(output, self.source))
+            verified = refresh.resolve(output, self.source)
+            self.assertEqual(signature.call_args.args[-3:-1], ('rust-v0.170.0', 'a' * 40))
         _, proposal = publisher.readonly_json(output / 'tooling.json')
         self.assertEqual((proposal['tag'], proposal['version'], proposal['approved_pins_match']),
                          ('rust-v0.170.0', '0.170.0', False))
-        self.assertEqual(set(item.name for item in output.iterdir()), {'tooling.json'})
+        self.assertEqual(verified, proposal)
+        self.assertEqual(set(item.name for item in output.iterdir()),
+                         {'tooling.json', 'codex.tar.gz', 'codex.sigstore', 'cosign'})
+        selected = builder.Export('maintenance', self.root / 'unused', output)
+        self.assertEqual(selected.tooling, verified)
+        self.assertEqual(selected.input_cache(), ['--codex-cache', str(output), '--refresh-tooling', str(output / 'tooling.json')])
+        artifacts, version, source, binary, size = publisher.public_inputs.selected_tooling(proposal)
+        self.assertEqual((version, source, binary, size), ('0.170.0', 'a' * 40, '4' * 64, 19))
+        self.assertEqual(artifacts['codex.tar.gz'][1:], (41, publisher.digest(b'x' * 41)))
+        args = publisher.public_inputs.signature_args('/cosign', '/bundle', '/codex', proposal)
+        self.assertIn('https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.170.0', args)
+        self.assertEqual(args[args.index('--certificate-github-workflow-sha') + 1], source)
+        self.assertEqual(publisher.tooling_row(proposal), {'codex_version': version, 'codex_source_sha': source, 'codex_sha256': binary})
         self.assertEqual(prior.read_text(), 'retained exact previous release')
 
     def test_reports_identify_actual_workflow_trigger_role_limits_and_transfer_policy(self):

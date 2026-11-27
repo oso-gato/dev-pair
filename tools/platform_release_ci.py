@@ -90,6 +90,8 @@ class Export:
     def __init__(self, scenario, final, tooling_cache=None):
         self.scenario = scenario
         self.tooling_cache = tooling_cache
+        self.tooling_path = None if tooling_cache is None else tooling_cache / 'tooling.json'
+        self.tooling = None if self.tooling_path is None else ci.public.read_tooling(self.tooling_path)
         self.final = final
         self.nonce = secrets.token_hex(16)
         self.volume = None
@@ -147,7 +149,10 @@ class Export:
     def input_cache(self):
         if self.tooling_cache is None:
             return []
-        return ['--codex-cache', str(self.tooling_cache)]
+        return ['--codex-cache', str(self.tooling_cache), *self.build_tooling()]
+
+    def build_tooling(self):
+        return ['--refresh-tooling', str(self.tooling_path)] if self.tooling_path is not None else []
 
     def request(self, probe):
         writer = REPO / 'tools/platform_release_guest.py'
@@ -182,7 +187,7 @@ class Export:
                         'transferred maintenance result differs from verified serial evidence')
             else:
                 require(frame['receipt'] == proof, 'transferred inner record differs from verified serial evidence')
-            release.write_image_part(stage, frame['image'], frame['receipt'], end)
+            release.write_image_part(stage, frame['image'], frame['receipt'], end, release.tooling_row(self.tooling))
         probe.storage.parent_free()
         probe.report['platform_export'] = frame['image']
 
@@ -322,6 +327,8 @@ def entered(source, role, parent):
     final = runner / ('platform-' + role + '-' + source)
     root = ci.scratch_root(str(runner))
     export = Export(role, final, runner / 'agent-tooling' if refresh else None)
+    if refresh:
+        ci.public.tooling_record(export.tooling, source)
     probe = ci.Probe(source, root, role if role in ci.SCENARIOS else 'maintenance', release=export)
     if role == 'devbox':
         probe.storage = OuterStorage(root, probe.privileged)

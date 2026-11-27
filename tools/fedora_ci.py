@@ -557,21 +557,22 @@ def tooling_stage_evidence(data, truncated=False):
             'all_stages_observed':observed==list(TOOL_STAGES) and not (truncated or invalid or order_invalid or partial)}
 
 
-def verification_evidence(directory, source):
+def verification_evidence(directory, source, tooling=None):
     # Preserve bounded original public crypto evidence before downstream
     # packaging failures or isolated scratch cleanup can remove it.
     receipt_data, _ = public.capture_regular(directory / 'receipt.json', 65536)
     receipt = json.loads(receipt_data, object_pairs_hook=unique_object)
-    expected_artifacts = {name: {'bytes': size, 'sha256': sha} for name, (_, size, sha) in public.ARTIFACTS.items()}
+    artifacts, _, codex_source, codex_sha, codex_bytes = public.selected_tooling(tooling)
+    expected_artifacts = public.artifact_receipt(artifacts)
     require(type(receipt) is dict and set(receipt) == set(('version kind helper_source_sha exit_status result codex_source_sha codex_binary_sha256 codex_binary_bytes artifacts verification_output_sha256 note').split()),
             'Original verification receipt schema mismatch')
     require(type(receipt.get('version')) is int and receipt.get('version') == 1 and receipt.get('kind') == 'public-codex-verification-receipt' and
             receipt.get('helper_source_sha') == source and type(receipt.get('exit_status')) is int and receipt.get('exit_status') == 0 and receipt.get('result') == 'Verified OK' and
-            receipt.get('codex_source_sha') == public.CODEX_SOURCE and receipt.get('codex_binary_sha256') == public.CODEX_SHA and
-            receipt.get('artifacts') == expected_artifacts and receipt.get('codex_binary_bytes') == public.CODEX_BYTES and receipt.get('note') == public.VERIFICATION, 'Original public verification receipt identity mismatch')
-    bundle, bundle_sha = public.capture_regular(directory / 'codex.sigstore', public.ARTIFACTS['codex.sigstore'][1],
-                                               exact_size=public.ARTIFACTS['codex.sigstore'][1])
-    require(bundle_sha == public.ARTIFACTS['codex.sigstore'][2], 'Original signature bundle mismatch')
+            receipt.get('codex_source_sha') == codex_source and receipt.get('codex_binary_sha256') == codex_sha and
+            receipt.get('artifacts') == expected_artifacts and receipt.get('codex_binary_bytes') == codex_bytes and receipt.get('note') == public.VERIFICATION, 'Original public verification receipt identity mismatch')
+    bundle, bundle_sha = public.capture_regular(directory / 'codex.sigstore', artifacts['codex.sigstore'][1],
+                                               exact_size=artifacts['codex.sigstore'][1])
+    require(bundle_sha == artifacts['codex.sigstore'][2], 'Original signature bundle mismatch')
     proof, proof_sha = public.capture_regular(directory / 'cosign-verification.txt', MIB)
     require(proof_sha == receipt['verification_output_sha256'] and b'Verified OK' in proof, 'Original verification output mismatch')
     return {'receipt': receipt, 'bundle_base64': base64.b64encode(bundle).decode(), 'bundle_sha256': bundle_sha,
@@ -1098,15 +1099,18 @@ class Probe:
         cache = self.root / 'public-cache'
         handoff = self.root / 'public-handoff'
         fetch_args = [sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)]
+        tooling = None
+        tooling_args = []
         if self.release is not None:
             fetch_args.extend(self.release.input_cache())
+            tooling, tooling_args = self.release.tooling, self.release.build_tooling()
         self.bounded(fetch_args, PUBLIC_SECONDS, 'fixed public input download')
         try:
             output = self.bounded([sys.executable, str(helper), 'build', '--role', self.scenario, '--cache', str(cache),
-                                  '--distrobox-source', str(cache / 'distrobox'), '--output', str(handoff)], PUBLIC_SECONDS, 'strict public input verification/build')
+                                  '--distrobox-source', str(cache / 'distrobox'), '--output', str(handoff), *tooling_args], PUBLIC_SECONDS, 'strict public input verification/build')
         finally:
             if (handoff / 'verification/receipt.json').exists():
-                verification = verification_evidence(handoff / 'verification', self.source)
+                verification = verification_evidence(handoff / 'verification', self.source, tooling)
                 if self.scenario == 'development':
                     verification = {k: v for k, v in verification.items() if not k.endswith('_base64')}
                 self.report['input_verification'] = verification
@@ -1114,13 +1118,16 @@ class Probe:
         manifest_data, manifest_sha = public.capture_regular(handoff / 'manifest.json', public.MANIFEST_LIMIT)
         record = public.parse_manifest(manifest_data, manifest_sha, produced['manifest_sha256'])
         require(record['kind'] == f'verified-public-{self.scenario}-inputs' and
-                record['source_sha'] == self.source and produced['source_sha'] == self.source and
+                record['source_sha'] == self.source and record.get('tooling') == tooling and produced['source_sha'] == self.source and
                 produced['context_sha256'] == record['context_sha256'] and produced['payload_sha256'] == record['payload']['sha256'],
                 'Public producer target differs from exact checked out candidate')
+        _, version, codex_source, codex_sha, _ = public.selected_tooling(tooling)
         self.handoff = {'controller_sha256': self.report['controller_sha256'], 'source_sha': self.source, 'helper_sha256': file_hash(helper), 'fedora_helper_sha256': file_hash(self.repo / 'tools/fedora_oci.py'), 'manifest_sha256': manifest_sha,
                         'payload_sha256': record['payload']['sha256'], 'payload_bytes': record['payload']['bytes'],
                         'context_sha256': record['context_sha256'], 'distrobox_sha': record['distrobox_sha'],
-                        'standards_sha': record['standards_sha'], 'codex_sha256': public.CODEX_SHA, 'codex_source_sha': public.CODEX_SOURCE}
+                        'standards_sha': record['standards_sha'], 'codex_sha256': codex_sha, 'codex_source_sha': codex_source}
+        if tooling is not None:
+            self.handoff.update(codex_version=version, refresh_tooling_sha256=hashlib.sha256(public.canonical(tooling)).hexdigest())
         if self.scenario == 'development':
             self.handoff.update(scenario='development', run_nonce=secrets.token_hex(16))
         if self.release is not None:

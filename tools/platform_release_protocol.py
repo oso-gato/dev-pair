@@ -182,7 +182,7 @@ def portable_roles(kind):
 def portable_index(value, source, run):
     fields(value, 'schema kind repository source_sha publisher_run standards_sha contracts '
            'previous_platform_sha256 base_platform_sha256 components transports')
-    require(type(value['schema']) is int and value['schema'] == 2 and value['repository'] == 'oso-gato/dev-pair' and
+    require(type(value['schema']) is int and value['schema'] in (2, 3) and value['repository'] == 'oso-gato/dev-pair' and
             value['source_sha'] == hex_id(source, 40) and type(value['publisher_run']) is int and
             value['publisher_run'] == run and run > 0 and value['standards_sha'] == STANDARDS,
             'portable index does not bind the exact reviewed source and run')
@@ -191,7 +191,10 @@ def portable_index(value, source, run):
     roles = portable_roles(value['kind'])
     agent_only = roles == ROLES[:2]
     previous, base = value['previous_platform_sha256'], value['base_platform_sha256']
-    if agent_only:
+    if value['schema'] == 3:
+        require(agent_only and previous is None, 'site-chained schema is restricted to portable agent pairs')
+        hex_id(base)
+    elif agent_only:
         hex_id(previous)
         hex_id(base)
     else:
@@ -239,3 +242,12 @@ def portable_index(value, source, run):
             require(files[archive] == {'sha256': image['archive_sha256'], 'bytes': image['archive_bytes']},
                     'portable archive transport differs from its image identity')
     return value
+
+
+def site_predecessor(value, platform, base):
+    fields(value, 'schema platform_sha256 base_platform_sha256 previous_platform_sha256')
+    require(type(value['schema']) is int and value['schema'] == 1 and value['platform_sha256'] == hex_id(platform)
+            and value['base_platform_sha256'] == hex_id(base), 'local predecessor proof selects a different platform or base')
+    previous = hex_id(value['previous_platform_sha256'])
+    require(previous != platform, 'local predecessor may not reference itself')
+    return previous

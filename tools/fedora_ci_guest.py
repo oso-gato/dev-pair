@@ -645,6 +645,12 @@ def validate_inputs(value):
     fields = set(INPUT_LENGTHS) | {'payload_bytes'}
     require(type(value) is dict, 'invalid public input identity fields')
     keys = set(value) - {'platform_export'}
+    if 'refresh_tooling_sha256' in keys or 'codex_version' in keys:
+        require('platform_export' in value and type(value.get('refresh_tooling_sha256')) is str and
+                re.fullmatch('[0-9a-f]{64}', value['refresh_tooling_sha256']) and type(value.get('codex_version')) is str and
+                re.fullmatch(r'(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})', value['codex_version']),
+                'invalid signed platform refresh selection')
+        keys -= {'refresh_tooling_sha256', 'codex_version'}
     require(keys == fields or
             keys == fields | {'scenario', 'run_nonce'} and value['scenario'] == 'development' and
             type(value['run_nonce']) is str and re.fullmatch('[0-9a-f]{32}', value['run_nonce']),
@@ -957,12 +963,23 @@ def admit_inputs(payload, expected, destination, timeout=GUEST_ADMISSION_SECONDS
             manifest['source_sha'] == expected['source_sha'] and manifest['context_sha256'] == expected['context_sha256'] and
             manifest['distrobox_sha'] == expected['distrobox_sha'] and manifest['standards_sha'] == expected['standards_sha'],
             'Authenticated input identities do not match controller handoff')
+    tooling = manifest.get('tooling')
+    if 'refresh_tooling_sha256' in expected:
+        require(type(tooling) is dict and tooling['version'] == expected['codex_version'] and
+                tooling['source_sha'] == expected['codex_source_sha'] and tooling['binary']['sha256'] == expected['codex_sha256'],
+                'signed refresh selection differs from authenticated controller handoff')
+    else:
+        require(tooling is None, 'refresh proof requires protected platform export')
     result = json.loads(command(['/usr/bin/python3', str(payload / 'public_inputs.py'), 'extract',
                          '--role', role, '--manifest', str(payload / 'manifest.json'), '--payload', str(payload / f'{role}-inputs.tar.gz'),
                          '--expected-manifest-sha256', expected['manifest_sha256'], '--output', str(destination)],
                          timeout=timeout), object_pairs_hook=unique_object)
     require(result['source_sha'] == expected['source_sha'] and result['context_sha256'] == expected['context_sha256'],
             'Extracted source/context differs from controller target')
+    if tooling is not None:
+        path = destination / 'evidence/tooling.json'
+        require(digest(path) == expected['refresh_tooling_sha256'] and read_json(path) == tooling,
+                'extracted original tooling selection differs')
     receipt = read_json(destination / 'evidence/verification-receipt.json')
     require(receipt['helper_source_sha'] == expected['source_sha'] and receipt['exit_status'] == 0 and receipt['result'] == 'Verified OK' and
             receipt['codex_binary_sha256'] == expected['codex_sha256'] and receipt['codex_source_sha'] == expected['codex_source_sha'],
@@ -1219,7 +1236,7 @@ def image_evidence(expected, projection, state_root, source, end, logical_observ
                 'Actual engine image identity/source mismatch')
         if index == 0:
             require(labels.get('dev-pair.role') == 'maintenance' and labels.get('dev-pair.standards') == expected['standards_sha'] and
-                    labels.get('dev-pair.codex.version') == '0.169.0', 'Actual prerequisite image labels mismatch')
+                    labels.get('dev-pair.codex.version') == expected.get('codex_version', '0.169.0'), 'Actual prerequisite image labels mismatch')
             if projection.get('state_schema')==2:
                 require(all(labels.get(k)==record[v] for k,v in (('dev-pair.inputs','inputs_sha256'),('dev-pair.runtime','runtime_sha256'),('dev-pair.init','init_sha256'),('dev-pair.codex.sha256','codex_sha256'))),'Actual full image input labels mismatch')
             projection['prepared_image_verified'] = True
@@ -1651,7 +1668,10 @@ def development_readback(source, expected, built, end):
     finally:
         sys.path.pop(0)
         sys.dont_write_bytecode = old_cache
-    return development_release_evidence(module, module.DevelopmentGptbox(), expected, built, end)
+    app = module.DevelopmentGptbox()
+    if 'refresh_tooling_sha256' in expected:
+        app.use_ci_tooling(expected['refresh_tooling_sha256'])
+    return development_release_evidence(module, app, expected, built, end)
 
 
 def development_release_evidence(module, app, expected, built, end):
@@ -1712,6 +1732,8 @@ def development_service(expected, guest_sha):
         work_end = time.monotonic() + work_seconds
         target_args = ['--source-sha', expected['source_sha'], '--distrobox-source', str(INPUT_DESTINATION / 'distrobox'),
                        '--context', str(INPUT_DESTINATION / 'context'), '--expected-context-sha256', expected['context_sha256']]
+        if 'refresh_tooling_sha256' in expected:
+            target_args.extend(('--ci-tooling-sha256', expected['refresh_tooling_sha256']))
         active = 'development-host-prepare'
         prepare_end = min(work_end, time.monotonic() + DEVELOPMENT_PREPARE_SECONDS)
         with password.create() as password_path:
@@ -1849,6 +1871,10 @@ def main():
                     '--source-sha', args.source, '--distrobox-source', str(destination / 'distrobox'),
                     '--gptbox-context', str(destination / 'context'), '--expected-context-sha256', expected['context_sha256'],
                     '--bootstrap-source', '192.0.2.9/32', '--password-file', str(secret)]
+            if 'refresh_tooling_sha256' in expected:
+                argv[1:3] = [str(source / 'tools/gptbox.py'), 'initialize']
+                argv[argv.index('--gptbox-context')] = '--context'
+                argv.extend(('--ci-tooling-sha256', expected['refresh_tooling_sha256']))
             def remove_after_prepare():
                 remove_password_after_prepare(secret, state_root, expected)
             started = time.monotonic()

@@ -24,8 +24,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      approved-pins-match: ${{ steps.tooling.outputs.approved-pins-match }}
-      previous: ${{ steps.tooling.outputs.previous }}
+      tooling-verified: ${{ steps.tooling.outputs.tooling-verified }}
       base: ${{ steps.tooling.outputs.base }}
       artifact-bytes: ${{ steps.tooling.outputs.artifact-bytes }}
     steps:
@@ -38,7 +37,6 @@ jobs:
       - name: Verify exact current tooling and refresh custody
         id: tooling
         env:
-          PREVIOUS_PLATFORM: ${{ vars.PLATFORM_PREVIOUS_SHA256 }}
           BASE_PLATFORM: ${{ vars.PLATFORM_BASE_SHA256 }}
           ARTIFACT_BYTES: ${{ vars.PLATFORM_AGENT_ARTIFACT_BYTES }}
         run: |
@@ -54,7 +52,7 @@ jobs:
 
   agent:
     needs: resolve
-    if: needs.resolve.outputs.approved-pins-match == 'true'
+    if: needs.resolve.outputs.tooling-verified == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -105,13 +103,20 @@ jobs:
         with:
           pattern: platform-*-${{ github.sha }}
           path: ${{ runner.temp }}/platform-parts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-tooling-${{ github.sha }}
+          path: ${{ runner.temp }}/agent-tooling
       - name: Assemble the portable agent-only release
         env:
-          PREVIOUS_PLATFORM: ${{ needs.resolve.outputs.previous }}
           BASE_PLATFORM: ${{ needs.resolve.outputs.base }}
           ARTIFACT_BYTES: ${{ needs.resolve.outputs.artifact-bytes }}
         run: |
-          python3 -B tools/platform_release.py assemble --agent-only --source "$GITHUB_SHA"             --input "$RUNNER_TEMP/platform-parts" --output "$RUNNER_TEMP/platform-subjects-$GITHUB_SHA"             --run-id "$GITHUB_RUN_ID" --previous "$PREVIOUS_PLATFORM" --base-platform "$BASE_PLATFORM"             --approved-artifact-bytes "$ARTIFACT_BYTES"
+          python3 -B tools/platform_release.py assemble --agent-only --site-chain --source "$GITHUB_SHA" \
+            --input "$RUNNER_TEMP/platform-parts" --output "$RUNNER_TEMP/platform-subjects-$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --base-platform "$BASE_PLATFORM" \
+            --refresh-tooling "$RUNNER_TEMP/agent-tooling/tooling.json" \
+            --approved-artifact-bytes "$ARTIFACT_BYTES"
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
           subject-path: ${{ runner.temp }}/platform-subjects-${{ github.sha }}/platform.json

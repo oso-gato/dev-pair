@@ -77,6 +77,57 @@ def digest(path):
     return value.hexdigest()
 
 
+def tooling_record(value, revision=None):
+    names = ('schema kind reviewed_source_sha source_sha tag version release_id assets binary verification_sha256 '
+             'approved_pins_match cached_assets')
+    require(type(value) is dict and set(value) == set(names.split()) and type(value['schema']) is int and
+            value['schema'] == 1 and value['kind'] == 'dev-pair-verified-codex-pin-proposal',
+            'verified refresh tooling record shape differs')
+    require(all(type(value[key]) is str and re.fullmatch('[0-9a-f]{40}', value[key])
+                for key in ('reviewed_source_sha', 'source_sha')) and
+            (revision is None or revision == value['reviewed_source_sha']), 'refresh tooling source differs')
+    require(type(value['version']) is str and re.fullmatch(r'(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})', value['version'])
+            and value['tag'] == 'rust-v' + value['version'] and type(value['release_id']) is int and value['release_id'] > 0,
+            'invalid official stable tooling release identity')
+    require(type(value['verification_sha256']) is str and re.fullmatch('[0-9a-f]{64}', value['verification_sha256']) and
+            type(value['approved_pins_match']) is bool and type(value['cached_assets']) is list and
+            value['cached_assets'] == sorted(set(value['cached_assets'])) and set(value['cached_assets']) <= {'archive', 'bundle'},
+            'invalid tooling signature or cache evidence')
+    assets = value['assets']
+    require(type(assets) is dict and set(assets) == {'archive', 'bundle'}, 'refresh asset evidence differs')
+    limits = (PAYLOAD_LIMIT - fedora_oci.ARCHIVE_BYTES - 2 * MIB, 256 * 1024,
+              EXPANSION_LIMIT - fedora_oci.ARCHIVE_BYTES - 4 * MIB)
+    for item, limit in zip((assets['archive'], assets['bundle'], value['binary']), limits):
+        require(type(item) is dict and set(item) == {'sha256', 'bytes'} and type(item['bytes']) is int and
+                0 < item['bytes'] <= limit and type(item['sha256']) is str and re.fullmatch('[0-9a-f]{64}', item['sha256']),
+                'verified refresh tooling bytes exceed the approved bound')
+    return value
+
+
+def read_tooling(path, revision=None):
+    raw, _ = capture_regular(path, 64 * 1024)
+    value = tooling_record(json.loads(raw), revision)
+    require(raw == canonical(value), 'refresh tooling evidence must be canonical')
+    return value
+
+
+def selected_tooling(tooling=None):
+    if tooling is None:
+        return ARTIFACTS, '0.169.0', CODEX_SOURCE, CODEX_SHA, CODEX_BYTES
+    tag = tooling['tag']
+    assets = dict(ARTIFACTS)
+    for part, local, suffix in (('archive', 'codex.tar.gz', 'tar.gz'), ('bundle', 'codex.sigstore', 'sigstore')):
+        item = tooling['assets'][part]
+        url = f'https://github.com/openai/codex/releases/download/{tag}/codex-x86_64-unknown-linux-musl.{suffix}'
+        assets[local] = url, item['bytes'], item['sha256']
+    binary = tooling['binary']
+    return assets, tooling['version'], tooling['source_sha'], binary['sha256'], binary['bytes']
+
+
+def artifact_receipt(artifacts):
+    return {name: {'bytes': size, 'sha256': sha} for name, (_, size, sha) in artifacts.items()}
+
+
 def safe_path(name):
     require(type(name) is str and 0 < len(name.encode()) <= 240 and
             all(32 <= ord(c) < 127 for c in name), 'invalid archive path')
@@ -229,16 +280,18 @@ class HTTPSOnly(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def fetch(output, fedora_cache=None, *, codex_cache=None):
+def fetch(output, fedora_cache=None, *, codex_cache=None, tooling=None):
     with wall_limit(600):
-        return fetch_within_limit(output, fedora_cache, codex_cache=codex_cache)
+        return fetch_within_limit(output, fedora_cache, codex_cache=codex_cache, tooling=tooling)
 
 
-def fetch_within_limit(output, fedora_cache=None, *, codex_cache=None):
+def fetch_within_limit(output, fedora_cache=None, *, codex_cache=None, tooling=None):
+    require(tooling is None or codex_cache is not None, 'refresh requires the exact signed in-run public cache')
+    artifacts, _, _, _, _ = selected_tooling(tooling)
     output = private_directory(output)
     try:
         opener = urllib.request.build_opener(HTTPSOnly())
-        for name, (url, size, expected) in ARTIFACTS.items():
+        for name, (url, size, expected) in artifacts.items():
             if fedora_cache is not None and name in fedora_oci.ARTIFACTS:
                 snapshot(pathlib.Path(fedora_cache)/name,output/name,size,expected)
                 continue
@@ -264,39 +317,43 @@ def fetch_within_limit(output, fedora_cache=None, *, codex_cache=None):
         command(git(repo, 'fetch', '--depth=1', '--no-tags', 'https://github.com/89luca89/distrobox.git', DBX_SOURCE), output, network=True)
         command(git(repo, 'update-ref', 'refs/heads/public-input', DBX_SOURCE), output)
         command(git(repo, 'symbolic-ref', 'HEAD', 'refs/heads/public-input'), output)
-        return {'cache': str(output), 'downloaded_artifacts': list(ARTIFACTS), 'distrobox_sha': DBX_SOURCE,
+        return {'cache': str(output), 'downloaded_artifacts': list(artifacts), 'distrobox_sha': DBX_SOURCE,
                 'signature_verification': 'not yet performed; build must verify'}
     except BaseException:
         shutil.rmtree(output)
         raise
 
 
-def extract_codex(archive, destination):
-    require(archive.stat().st_size == ARTIFACTS['codex.tar.gz'][1] and digest(archive) == ARTIFACTS['codex.tar.gz'][2],
+def extract_codex(archive, destination, tooling=None):
+    artifacts, _, _, binary, size = selected_tooling(tooling)
+    _, archive_bytes, archive_sha = artifacts['codex.tar.gz']
+    require(archive.stat().st_size == archive_bytes and digest(archive) == archive_sha,
             'official Codex archive identity mismatch before expansion')
-    return _parse_codex_archive(archive, destination, CODEX_BYTES, CODEX_SHA)
+    return _parse_codex_archive(archive, destination, size, binary)
 
 
 def _parse_codex_archive(archive, destination, expected_bytes, expected_sha):
     """Internal parser; production calls only with the fixed verified identities."""
-    with tarfile.open(archive, 'r:gz') as source:
-        members = source.getmembers()
-        require(len(members) == 1, 'Codex archive must contain exactly its official binary')
-        item = members[0]
-        require(item.name == 'codex-x86_64-unknown-linux-musl' and item.isfile() and item.size == expected_bytes,
+    with tarfile.open(archive, 'r|gz') as source:
+        item = source.next()
+        require(item is not None and item.name == 'codex-x86_64-unknown-linux-musl' and
+                item.type == tarfile.REGTYPE and not item.pax_headers and not item.issparse() and item.size == expected_bytes,
                 'unexpected Codex archive member/type/expansion')
         with source.extractfile(item) as src, open(destination, 'xb') as dst:
             shutil.copyfileobj(src, dst, length=MIB)
+        require(source.next() is None, 'Codex archive must contain exactly its official binary')
     require(destination.stat().st_size == expected_bytes and digest(destination) == expected_sha, 'extracted Codex digest mismatch')
 
 
-def signature_args(verifier, bundle, binary):
+def signature_args(verifier, bundle, binary, tooling=None):
+    _, version, source, _, _ = selected_tooling(tooling)
+    tag = 'refs/tags/rust-v' + version
     return [str(verifier), 'verify-blob', '--bundle', str(bundle),
-            '--certificate-identity', 'https://github.com/openai/codex/.github/workflows/rust-release.yml@refs/tags/rust-v0.169.0',
+            '--certificate-identity', 'https://github.com/openai/codex/.github/workflows/rust-release.yml@' + tag,
             '--certificate-oidc-issuer', 'https://token.actions.githubusercontent.com',
             '--certificate-github-workflow-repository', 'openai/codex',
-            '--certificate-github-workflow-ref', 'refs/tags/rust-v0.169.0',
-            '--certificate-github-workflow-sha', CODEX_SOURCE, str(binary)]
+            '--certificate-github-workflow-ref', tag,
+            '--certificate-github-workflow-sha', source, str(binary)]
 
 
 def clean_checkout(source, revision, destination, work):
@@ -334,7 +391,7 @@ def clean_checkout(source, revision, destination, work):
     return destination
 
 
-def inventory(root):
+def inventory(root, binary_limit=CODEX_BYTES):
     result = []
     for path in sorted(root.rglob('*')):
         info = path.lstat()
@@ -342,7 +399,7 @@ def inventory(root):
         if path.is_file():
             name = path.relative_to(root).as_posix()
             safe_path(name)
-            require(info.st_size <= CODEX_BYTES, 'payload file exceeds individual byte limit')
+            require(info.st_size <= binary_limit, 'payload file exceeds individual byte limit')
             result.append({'path': name, 'bytes': info.st_size, 'sha256': digest(path)})
     require(len(result) <= FILE_LIMIT and sum(item['bytes'] for item in result) <= EXPANSION_LIMIT, 'payload expansion/file budget exceeded')
     return result
@@ -360,12 +417,12 @@ def write_payload(root, files, destination):
     require(destination.stat().st_size <= PAYLOAD_LIMIT, 'compressed payload byte limit exceeded')
 
 
-def build(cache, distrobox, output, *, role='maintenance'):
+def build(cache, distrobox, output, *, role='maintenance', tooling=None):
     with wall_limit(600):
-        return build_within_limit(cache, distrobox, output, role=role)
+        return build_within_limit(cache, distrobox, output, role=role, tooling=tooling)
 
 
-def build_within_limit(cache, distrobox, output, *, role='maintenance'):
+def build_within_limit(cache, distrobox, output, *, role='maintenance', tooling=None):
     require(role in ROLES, 'unsupported public-input role')
     repo = pathlib.Path(__file__).resolve().parents[1]
     output = private_directory(output)
@@ -377,21 +434,24 @@ def build_within_limit(cache, distrobox, output, *, role='maintenance'):
             require(not command(git(repo, 'status', '--porcelain'), work)[0], 'public source must be committed and clean')
             require(command(git(repo, 'show', revision + ':tools/public_inputs.py'), work)[0] == pathlib.Path(__file__).read_bytes(),
                     'executing input helper differs from exact public HEAD')
-            for name, (_, size, expected) in ARTIFACTS.items():
+            if tooling is not None:
+                tooling_record(tooling, revision)
+            artifacts, version, codex_source, codex_sha, codex_bytes = selected_tooling(tooling)
+            for name, (_, size, expected) in artifacts.items():
                 snapshot(pathlib.Path(cache) / name, work / name, size, expected)
             binary = work / 'codex'
-            extract_codex(work / 'codex.tar.gz', binary)
+            extract_codex(work / 'codex.tar.gz', binary, tooling)
             (work / 'cosign').chmod(0o500)
-            proof = command(signature_args(work / 'cosign', work / 'codex.sigstore', binary), work, network=True)
+            proof = command(signature_args(work / 'cosign', work / 'codex.sigstore', binary, tooling), work, network=True)
             require(b'Verified OK' in proof[0] + proof[1], 'strict Cosign success evidence missing')
             retained = output / 'verification'
             retained.mkdir(mode=0o700)
             shutil.copyfile(work / 'codex.sigstore', retained / 'codex.sigstore')
             (retained / 'cosign-verification.txt').write_bytes(proof[0] + proof[1])
             receipt = {'version': 1, 'kind': 'public-codex-verification-receipt', 'helper_source_sha': revision,
-                       'exit_status': 0, 'result': 'Verified OK', 'codex_source_sha': CODEX_SOURCE,
-                       'codex_binary_sha256': CODEX_SHA, 'codex_binary_bytes': CODEX_BYTES,
-                       'artifacts': {name: {'bytes': size, 'sha256': sha} for name, (_, size, sha) in ARTIFACTS.items()},
+                       'exit_status': 0, 'result': 'Verified OK', 'codex_source_sha': codex_source,
+                       'codex_binary_sha256': codex_sha, 'codex_binary_bytes': codex_bytes,
+                       'artifacts': artifact_receipt(artifacts),
                        'verification_output_sha256': hashlib.sha256(proof[0] + proof[1]).hexdigest(),
                        'note': VERIFICATION}
             (retained / 'receipt.json').write_bytes(canonical(receipt))
@@ -408,7 +468,7 @@ def build_within_limit(cache, distrobox, output, *, role='maintenance'):
             role_root = f'/var/lib/dev-pair/{role}'
             manifest = {'kind': 'operator-verified-inputs', 'source_sha': revision, 'standards_sha': STANDARDS,
                         'fedora': dict(fedora_oci.PROVENANCE),
-                        'codex': {'version': '0.169.0', 'source': ARTIFACTS['codex.tar.gz'][0], 'sha256': CODEX_SHA,
+                        'codex': {'version': version, 'source': artifacts['codex.tar.gz'][0], 'sha256': codex_sha,
                                   'verification': 'Strict Cosign3.1.4 identity/issuer/workflow/repository/ref/source verification passed; evidence in payload'},
                         'role': role, 'provider': 'gptbox', 'model': 'gpt-6.2-sol', 'effort': 'high',
                         'mounts': {'workspace': f'{role_root}/workspaces/{leaf}',
@@ -419,7 +479,7 @@ def build_within_limit(cache, distrobox, output, *, role='maintenance'):
             inputs.write_text(json.dumps(manifest))
             preparation = command([sys.executable, '-I', str(tree / 'dev-pair/tools/candidate.py'), 'prepare',
                                    '--manifest', str(inputs), '--binary', str(binary), '--fedora-inputs', str(work), '--output', str(tree / 'context')],
-                                  work, file_limit=CODEX_BYTES + MIB, workspace_reserve=160*MIB)[0]
+                                  work, file_limit=codex_bytes + MIB, workspace_reserve=160*MIB)[0]
             context = json.loads(preparation)
             evidence = tree / 'evidence'
             evidence.mkdir()
@@ -427,14 +487,18 @@ def build_within_limit(cache, distrobox, output, *, role='maintenance'):
             shutil.copyfile(retained / 'cosign-verification.txt', evidence / 'cosign-verification.txt')
             shutil.copyfile(retained / 'receipt.json', evidence / 'verification-receipt.json')
             shutil.copyfile(retained / 'fedora-verification.json', evidence / 'fedora-verification.json')
-            files = inventory(tree)
+            if tooling is not None:
+                (evidence / 'tooling.json').write_bytes(canonical(tooling))
+            files = inventory(tree, codex_bytes)
             payload = output / f'{role}-inputs.tar.gz'
             write_payload(tree, files, payload)
             record = {'version': 2, 'kind': f'verified-public-{role}-inputs', 'fedora': dict(fedora_oci.PROVENANCE), 'source_sha': revision,
                       'standards_sha': STANDARDS, 'distrobox_sha': DBX_SOURCE, 'context_sha256': context['context_sha256'],
-                      'artifacts': {name: {'url': url, 'bytes': size, 'sha256': sha} for name, (url, size, sha) in ARTIFACTS.items()},
+                      'artifacts': {name: {'url': url, 'bytes': size, 'sha256': sha} for name, (url, size, sha) in artifacts.items()},
                       'payload': {'sha256': digest(payload), 'bytes': payload.stat().st_size}, 'files': files,
                       'verification': VERIFICATION}
+            if tooling is not None:
+                record.update(version=3, tooling=tooling)
             validate_manifest(record)
             (output / 'manifest.json').write_bytes(canonical(record))
             return {'manifest_sha256': digest(output / 'manifest.json'), 'payload_sha256': digest(payload),
@@ -460,14 +524,18 @@ def cleanup_failed_build(output):
 def validate_manifest(obj):
     def keys(value, names):
         require(type(value) is dict and set(value) == set(names.split()), 'missing or unknown manifest fields')
-    keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification fedora')
-    require(type(obj['version']) is int and obj['version'] == 2 and obj['kind'] in PUBLIC_INPUT_KINDS,
+    refreshed = type(obj) is dict and obj.get('version') == 3
+    keys(obj, 'version kind source_sha standards_sha distrobox_sha context_sha256 artifacts payload files verification fedora'
+         + (' tooling' if refreshed else ''))
+    require(type(obj['version']) is int and obj['version'] in (2, 3) and obj['kind'] in PUBLIC_INPUT_KINDS,
             'unsupported public-input manifest version/kind')
     require(obj['fedora'] == fedora_oci.PROVENANCE, 'signed Fedora provenance mismatch')
     require(re.fullmatch('[0-9a-f]{40}', obj['source_sha']) and obj['standards_sha'] == STANDARDS and
             obj['distrobox_sha'] == DBX_SOURCE and re.fullmatch('[0-9a-f]{64}', obj['context_sha256']), 'manifest identity mismatch')
+    tooling = tooling_record(obj['tooling'], obj['source_sha']) if refreshed else None
+    artifacts, _, _, _, binary_limit = selected_tooling(tooling)
     require(canonical(obj['artifacts']) == canonical({name: {'url': url, 'bytes': size, 'sha256': sha}
-                                for name, (url, size, sha) in ARTIFACTS.items()}) and obj['verification'] == VERIFICATION,
+                                for name, (url, size, sha) in artifacts.items()}) and obj['verification'] == VERIFICATION,
             'public artifact verification contract mismatch')
     keys(obj['payload'], 'sha256 bytes')
     require(re.fullmatch('[0-9a-f]{64}', obj['payload']['sha256']) and type(obj['payload']['bytes']) is int and
@@ -482,13 +550,15 @@ def validate_manifest(obj):
         if '.git' in (part.lower() for part in path.parts):
             require(re.fullmatch(r'(dev-pair|distrobox)/\.git/(HEAD|config|shallow|refs/heads/public-input|objects/pack/pack-[0-9a-f]{40}\.(pack|idx|rev))', item['path']),
                     'undeclared Git metadata denied')
-        require(type(item['bytes']) is int and 0 <= item['bytes'] <= CODEX_BYTES and
+        require(type(item['bytes']) is int and 0 <= item['bytes'] <= binary_limit and
                 re.fullmatch('[0-9a-f]{64}', item['sha256']), 'invalid file identity/size')
         names.append(item['path'])
         total += item['bytes']
     require(names == sorted(set(names)) and total <= EXPANSION_LIMIT, 'duplicate/unsorted/oversized payload inventory')
     required = {'context/' + name for name in ('inputs.json', 'codex', 'candidate.json', 'Containerfile', *fedora_oci.FILES)}
     required |= {'evidence/codex.sigstore', 'evidence/cosign-verification.txt', 'evidence/verification-receipt.json', 'evidence/fedora-verification.json'}
+    if refreshed:
+        required.add('evidence/tooling.json')
     for repo in ('dev-pair', 'distrobox'):
         required |= {repo + '/.git/' + name for name in ('HEAD', 'config', 'shallow', 'refs/heads/public-input')}
     require(required <= set(names), 'incomplete public-input payload')
@@ -582,9 +652,11 @@ def main():
     fetch_parser = sub.add_parser('fetch')
     fetch_parser.add_argument('--fedora-cache', type=pathlib.Path)
     fetch_parser.add_argument('--codex-cache', type=pathlib.Path)
+    fetch_parser.add_argument('--refresh-tooling', type=pathlib.Path)
     fetch_parser.add_argument('--output', required=True, type=pathlib.Path)
     build_parser = sub.add_parser('build')
     build_parser.add_argument('--cache', required=True, type=pathlib.Path)
+    build_parser.add_argument('--refresh-tooling', type=pathlib.Path)
     build_parser.add_argument('--distrobox-source', required=True, type=pathlib.Path)
     build_parser.add_argument('--output', required=True, type=pathlib.Path)
     build_parser.add_argument('--role', choices=ROLES, default='maintenance')
@@ -595,10 +667,11 @@ def main():
     consumer.add_argument('--output', required=True, type=pathlib.Path)
     consumer.add_argument('--role', choices=ROLES, default='maintenance')
     args = parser.parse_args()
+    tooling = read_tooling(args.refresh_tooling) if getattr(args, 'refresh_tooling', None) else None
     if args.command == 'fetch':
-        result = fetch(args.output, args.fedora_cache, codex_cache=args.codex_cache)
+        result = fetch(args.output, args.fedora_cache, codex_cache=args.codex_cache, tooling=tooling)
     elif args.command == 'build':
-        result = build(args.cache, args.distrobox_source, args.output, role=args.role)
+        result = build(args.cache, args.distrobox_source, args.output, role=args.role, tooling=tooling)
     else:
         result = extract(args.payload, args.manifest, args.expected_manifest_sha256, args.output, role=args.role)
     print(json.dumps(result, sort_keys=True))

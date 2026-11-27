@@ -22,6 +22,7 @@ from storage import GUEST_RESERVE
 from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, ROLES, COMPONENT,
     Blocked, canonical, file_hash, hex_id, json_bytes, require, seconds, stream_exact, portable_index, portable_roles,
+    site_predecessor,
 )
 
 GITHUB = '/usr/bin/gh'
@@ -190,6 +191,13 @@ def retained_index(identity):
             type(receipt['schema']) is int and receipt == {'schema': 2, 'platform_sha256': identity,
             'source_sha': value['source_sha'], 'publisher_run': value['publisher_run'], 'kind': value['kind']},
             'retained previous platform lacks exact prior trust receipt')
+    if value['schema'] == 3:
+        binding_path = protected(previous / 'site-predecessor.json')
+        binding_raw, binding = release.readonly_json(binding_path, 0)
+        require(stat.S_IMODE(binding_path.lstat().st_mode) == 0o600 and binding_raw == canonical(binding),
+                'retained local predecessor evidence is not protected canonical data')
+        site_predecessor(binding, identity, value['base_platform_sha256'])
+        receipt_raw += binding_raw
     return previous, value, hashlib.sha256(receipt_raw).hexdigest()
 
 
@@ -242,7 +250,7 @@ def acquire(source, run, expected, previous, end, *, agent=False):
         require(hashlib.sha256(raw).hexdigest() == expected, 'platform subject differs from independently selected digest')
         value = portable_index(value, source, run)
         kind = 'dev-pair-agent-release' if agent else 'dev-pair-platform-release'
-        require(value['kind'] == kind and value['previous_platform_sha256'] == previous,
+        require(value['kind'] == kind and (value['schema'] == 3 or value['previous_platform_sha256'] == previous),
                 'protected recovery version or release kind differs')
         roles = portable_roles(kind)
         for role in roles if agent else (*roles, 'host'):
@@ -269,6 +277,11 @@ def acquire(source, run, expected, previous, end, *, agent=False):
         receipt = {'schema': 2, 'platform_sha256': expected, 'source_sha': source,
                    'publisher_run': run, 'kind': value['kind']}
         release.write_json(stage / 'intake.json', receipt)
+        if value['schema'] == 3:
+            binding = {'schema': 1, 'platform_sha256': expected, 'base_platform_sha256': value['base_platform_sha256'],
+                       'previous_platform_sha256': previous}
+            site_predecessor(binding, expected, value['base_platform_sha256'])
+            release.write_json(stage / 'site-predecessor.json', binding)
     return receipt
 
 

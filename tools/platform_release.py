@@ -300,10 +300,17 @@ def image_archive(path, image, end, tooling=None):
     return hex_id(manifest.removeprefix('sha256:'))
 
 
-def write_image_part(directory, image, proof, end):
+def tooling_row(tooling):
+    if tooling is None:
+        return None
+    return {'codex_version': tooling['version'], 'codex_source_sha': tooling['source_sha'],
+            'codex_sha256': tooling['binary']['sha256']}
+
+
+def write_image_part(directory, image, proof, end, tooling=None):
     image_record(image)
     publication_evidence(image, proof)
-    manifest = image_archive(directory / archive_name(image['role']), image, end)
+    manifest = image_archive(directory / archive_name(image['role']), image, end, tooling)
     data = {'schema': 1, 'image': image, 'oci_manifest_sha256': manifest, 'producer': proof}
     write_json(directory / PART_FILE, data)
     return data
@@ -341,15 +348,18 @@ def portable_image(part, tooling=None):
     return item
 
 
-def assemble(inputs, output, source, run_id, previous, quota, *, agent=False, base=None):
+def assemble(inputs, output, source, run_id, previous, quota, *, agent=False, base=None, site_chain=False, tooling=None):
     hex_id(source, 40)
     limit = AGENT_BUDGET if agent else TRANSPORT_BUDGET
     require(type(run_id) is int and run_id > 0 and type(quota) is int and limit <= quota,
             'protected Actions artifact quota approval is missing')
-    if previous != 'initial':
-        hex_id(previous)
+    require(site_chain == (tooling is not None), 'site-chained assembly requires selected release tooling')
+    if site_chain:
+        require(agent and previous is None, 'site-chained assembly only accepts an agent pair without a CI predecessor')
+    else:
+        if previous != 'initial' or agent:
+            hex_id(previous)
     if agent:
-        hex_id(previous)
         hex_id(base)
     end = time.monotonic() + ASSEMBLY_SECONDS
     kind = 'dev-pair-agent-release' if agent else 'dev-pair-platform-release'
@@ -358,8 +368,8 @@ def assemble(inputs, output, source, run_id, previous, quota, *, agent=False, ba
     for role in portable_roles(kind):
         name = artifact_name(role, source)
         directory = inputs / name
-        part, _ = validate_image_part(directory, role, source, end)
-        components[COMPONENT[role]] = portable_image(part)
+        part, _ = validate_image_part(directory, role, source, end, tooling)
+        components[COMPONENT[role]] = portable_image(part, tooling)
         transports[role] = {'name': name, 'files': transport_record(directory, (archive_name(role), PART_FILE), ARCHIVE_LIMIT, end)}
     if not agent:
         name = artifact_name('host', source)
@@ -367,7 +377,7 @@ def assemble(inputs, output, source, run_id, previous, quota, *, agent=False, ba
         host = validate_host(directory, source, end)
         transports['host'] = {'name': name, 'files': transport_record(directory, HOST_PAYLOADS, HOST_LIMIT, end)}
         components['host'] = {'source_sha': source, 'bundle_manifest_sha256': host}
-    combined = {'schema': 2, 'kind': kind, 'repository': REPOSITORY, 'source_sha': source, 'publisher_run': run_id,
+    combined = {'schema': 3 if site_chain else 2, 'kind': kind, 'repository': REPOSITORY, 'source_sha': source, 'publisher_run': run_id,
                 'standards_sha': STANDARDS, 'contracts': {'ledger': 1, 'state': 1, 'release_policy': 1},
                 'previous_platform_sha256': None if previous == 'initial' else previous, 'base_platform_sha256': base,
                 'components': components, 'transports': transports}
@@ -391,7 +401,9 @@ def main():
     build.add_argument('--run-id', required=True, type=int)
     build.add_argument('--agent-only', action='store_true')
     build.add_argument('--base-platform')
-    build.add_argument('--previous', required=True)
+    build.add_argument('--previous')
+    build.add_argument('--site-chain', action='store_true')
+    build.add_argument('--refresh-tooling', type=Path)
     build.add_argument('--approved-artifact-bytes', required=True, type=int)
     args = parser.parse_args()
     if args.operation == 'admit':
@@ -399,8 +411,15 @@ def main():
     elif args.operation == 'host':
         print(build_host(SOURCE, args.source, args.output))
     else:
+        require(args.site_chain == (args.refresh_tooling is not None), 'site-chained assembly requires verified refresh tooling')
+        tooling = None
+        if args.site_chain:
+            from platform_release_ci import admitted_refresh
+            admitted_refresh(args.source, os.environ)
+            source_checkout(SOURCE, args.source)
+            tooling = tooling_row(public_inputs.read_tooling(args.refresh_tooling, args.source))
         identity = assemble(args.input, args.output, args.source, args.run_id, args.previous, args.approved_artifact_bytes,
-                            agent=args.agent_only, base=args.base_platform)
+                            agent=args.agent_only, base=args.base_platform, site_chain=args.site_chain, tooling=tooling)
         print(identity)
     return 0
 
