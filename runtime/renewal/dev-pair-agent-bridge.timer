@@ -1,0 +1,11 @@
+[Unit]
+Description=Discover and reconcile the protected nightly dev-pair agent release
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00 Asia/Tokyo
+AccuracySec=1s
+Persistent=true
+Unit=dev-pair-agent-bridge@poll.service
+
+[Install]
+WantedBy=timers.target

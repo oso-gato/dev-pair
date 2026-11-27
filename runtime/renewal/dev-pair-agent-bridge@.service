@@ -1,0 +1,15 @@
+[Unit]
+Description=Discover protected dev-pair agent release (%i)
+After=network-online.target dev-pair-renewal-recovery.service
+Wants=network-online.target
+RequiresMountsFor=/var/lib/dev-pair
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/libexec/dev-pair/tools/agent_release_bridge.py --%i
+TimeoutStartSec=40min
+TimeoutStopSec=30s
+KillMode=control-group
