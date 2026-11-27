@@ -2,6 +2,53 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026 — owner bootstrap integration baseline
+
+The owner-run delivery branch starts at
+`657eec5d0d16a56fb34360af9883777ea3e51f31` and adopts standards
+`b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`. Its first integrated source is
+`38e1791d97c4e9fb10136532a0ed045112445e2a` with tree
+`97e58081697f64d8f5c7b59b761558d5779dccad`. Integration used API-selected
+GPT-6.2 Sol High. Independent backend attestation is unavailable.
+
+| Component | Preserved source commit |
+| --- | --- |
+| Fedora platform builder and intake | `51e24d4f00b94e3549b50ce009f978b00ce9a1f4` |
+| Native placement and managed volume recovery | `21be42d4ad073928b9869d9941615536a1b47f1a` |
+| Maintenance and development role entry | `84bf1040409dc80d614cf2150d8276526fe37720` |
+| Destination provisioning and access cutover | `cabde7037e9a44468234e7f757c6b56e08e67068` |
+| Durable renewal and role continuity | `c7ac12edd5776b1dc1ead4ba729e1acae1e11d59` |
+| Authenticated checklist host test | `8f316c4b7df71adf700640e86acc276112a5a62f` |
+| Product loop and tested Git custody | `63f48e3fcd66bef1257a8d2fddfed7140b7097ef` |
+| Owner terminal intake and confirmed-job recovery | `ad5d74e4ead76f5630122757de0ce9fd923f7e85` |
+| Bounded checklist build transfer and recovery | `348961129a54dfc73f55a6b1b13493e79beb313e` |
+
+The maintenance merge retains the protected preparation and admission paths
+alongside the destination's verified console receipt in `Gptbox.initialize`
+and its CLI. The DevBox merge preserves ordinary nested job entry and the
+separate recovery-only storage observation for an already-owned finite mount.
+The product job guide includes tested Git custody and the checklist transfer
+lifecycle. See [destination setup](destination-release.md),
+[role entry](role-entry.md), [owner terminal intake](owner-intake.md), and
+[product jobs](product-job.md).
+
+The detached local suite observed 1,029 passes, six skips and one error in
+206.323 seconds, with the same clean commit and tree before and after. The
+error in `test_observer_process_disconnect_child_progress_and_reattach` occurred
+when SQLite removed its rollback journal between directory enumeration and the
+validation read. The registry file check predates the integration. One focused
+run of that test passed in 0.212 seconds. The full log SHA-256 is
+`b33869f5b2e8b91018fd25de079986229d496505149992f52c93fd9c07a6c593`.
+The six skipped tests require mapped root custody. They cover compatible base
+reuse and clean output, interrupted-transfer recovery, idle cleanup with
+foreign objects, byte and inode pressure, malformed lease preservation, and
+surviving export and import helpers. All six passed separately in the detached
+mapped-root commissioning projection.
+
+These checks are local source and fixture evidence. Owner portal execution,
+native Fedora role validation, protected CI publication and deployment remain
+pending. This checkpoint used no destination credentials or provider calls.
+
 ### November 27, 2026 — Fedora CI kernel storage candidate
 
 - W1 uses the reviewed guest source at `657eec5d0d16a56fb34360af9883777ea3e51f31`
