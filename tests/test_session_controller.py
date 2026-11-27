@@ -190,6 +190,48 @@ class ControllerTests(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 os.killpg(owner.pid,signal.SIGKILL);owner.communicate(timeout=2)
 
+    def test_observer_allows_sqlite_to_remove_journal_during_file_check(self):
+        journal=self.registry.root/'registry.sqlite3-journal'
+        writer=sqlite3.connect(self.registry.path,isolation_level=None)
+        self.addCleanup(writer.close)
+        writer.execute('BEGIN IMMEDIATE')
+        writer.execute("UPDATE metadata SET value='1' WHERE key='generation'")
+        self.assertTrue(journal.is_file())
+        actual_stat=os.stat
+        committed=False
+
+        def commit_before_journal_stat(path,*args,**kwargs):
+            nonlocal committed
+            if not committed and isinstance(path,(str,Path)) and Path(path).name==journal.name:
+                committed=True
+                self.assertFalse(kwargs.get('follow_symlinks',True))
+                writer.commit()
+                self.assertFalse(journal.exists())
+            return actual_stat(path,*args,**kwargs)
+
+        with patch.object(os,'stat',side_effect=commit_before_journal_stat):
+            observer=c.Observer(self.registry.root)
+        self.addCleanup(observer.close)
+        self.assertTrue(committed)
+        self.assertEqual(observer.inventory()['generation'],1)
+
+    def test_present_sqlite_journal_keeps_private_file_and_size_checks(self):
+        journal=self.registry.root/'registry.sqlite3-journal'
+        outside=self.root/'outside-journal'
+        outside.touch(mode=0o600)
+        for kind in ('symlink','hardlink','mode','oversize'):
+            with self.subTest(kind=kind):
+                if kind=='symlink':journal.symlink_to(outside)
+                elif kind=='hardlink':os.link(outside,journal)
+                else:
+                    journal.touch(mode=0o600)
+                    if kind=='mode':journal.chmod(0o644)
+                    if kind=='oversize':os.truncate(journal,c.BYTES+1)
+                try:
+                    reason='byte bound' if kind=='oversize' else 'unsafe controller file'
+                    with self.assertRaisesRegex(ValueError,reason):self.registry.check_files()
+                finally:journal.unlink()
+
     def test_transaction_dedupe_competing_processes_and_active_session_exclusion(self):
         script='import sys,time;sys.path[:0]='+repr([str(Path(__file__).parent),str(Path(c.__file__).parent)])+';import test_session_controller as f;r=f.make_registry(sys.argv[1]);row,created=r.reserve("competing","alpha","fixed",time.monotonic()+3);print(created);r.close()'
         children=[subprocess.Popen([sys.executable,'-c',script,str(self.root)],stdout=subprocess.PIPE,stderr=subprocess.PIPE) for _ in range(2)]

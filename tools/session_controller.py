@@ -43,8 +43,11 @@ def digest(value):require(type(value) is str and re.fullmatch('[0-9a-f]{64}',val
 def session(value):
     require(type(value) is str and str(uuid.UUID(value))==value,'invalid controller session UUID');return value
 
-def private_file(path):
-    node=path.lstat();require(stat.S_ISREG(node.st_mode) and node.st_uid==os.getuid() and node.st_nlink==1 and stat.S_IMODE(node.st_mode)==0o600,'unsafe controller file')
+def private_file(name,dir_fd):
+    node=os.stat(name,dir_fd=dir_fd,follow_symlinks=False)
+    require(stat.S_ISREG(node.st_mode) and node.st_uid==os.getuid() and node.st_nlink==1 and
+            stat.S_IMODE(node.st_mode)==0o600,'unsafe controller file')
+    return node
 
 class DispatchFrozen(ValueError):
     pass
@@ -183,16 +186,25 @@ class Registry:
     def check_files(self):
         node=self.root.lstat();held=os.fstat(self.fd)
         require(stat.S_ISDIR(node.st_mode) and node.st_uid==os.getuid() and stat.S_IMODE(node.st_mode)==0o700 and (node.st_dev,node.st_ino)==self.identity and (held.st_dev,held.st_ino)==self.identity,'controller directory changed')
-        allowed={'registry.sqlite3','owner.lock','registry.sqlite3-journal'}
-        names=set(p.name for p in self.root.iterdir());require({'registry.sqlite3','owner.lock'}<=names<=allowed,'unknown or missing controller state file')
+        required={'registry.sqlite3','owner.lock'}
+        journal='registry.sqlite3-journal'
+        names=set(os.listdir(self.fd))
+        require(required<=names<=required|{journal},'unknown or missing controller state file')
         total=0
-        for path in self.root.iterdir():
-            private_file(path);total+=path.stat().st_size
+        for name in required:
+            current=private_file(name,self.fd)
+            total+=current.st_size
+            if name in self.control_fds:
+                held=os.fstat(self.control_fds[name])
+                expected=self.control_nodes[name] if self.control_nodes is not None else {'device':held.st_dev,'inode':held.st_ino}
+                require((current.st_dev,current.st_ino)==(held.st_dev,held.st_ino)==(expected['device'],expected['inode']) and
+                        held.st_nlink==1,'controller control-file identity changed')
+        # A concurrent SQLite commit can unlink the optional rollback journal.
+        try:
+            total+=private_file(journal,self.fd).st_size
+        except FileNotFoundError:
+            pass
         require(total<=BYTES,'controller state byte bound')
-        for name,fd in self.control_fds.items():
-            held=os.fstat(fd);current=os.stat(name,dir_fd=self.fd,follow_symlinks=False)
-            expected=self.control_nodes[name] if self.control_nodes is not None else {'device':held.st_dev,'inode':held.st_ino}
-            require(stat.S_ISREG(current.st_mode) and (current.st_dev,current.st_ino)==(held.st_dev,held.st_ino)==(expected['device'],expected['inode']) and held.st_nlink==1,'controller control-file identity changed')
     def close(self):
         require(not self.owner_active,'cannot close an active controller owner')
         if self.db is not None:self.db.close();self.db=None
