@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for approved dev-pair agent releases nightly
+
+[Timer]
+OnCalendar=*-*-* 04:00:00 Asia/Tokyo
+AccuracySec=1s
+Persistent=true
+Unit=dev-pair-renewal@agent.service
+
+[Install]
+WantedBy=timers.target
