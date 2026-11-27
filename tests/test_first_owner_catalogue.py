@@ -46,7 +46,8 @@ class FirstCatalogueTests(unittest.TestCase):
         self.root = self.path / 'runtime'
         self.credential = self.path / 'credentials' / 'approved-api'
         self.billing = self.path / 'billing' / self.credential.name
-        for folder in (self.site / 'standards', self.root / 'renewal', self.root / 'product-jobs/intake',
+        for folder in (self.site / 'standards', self.root / 'renewal', self.root / 'product-jobs',
+                       self.root / 'product-jobs/intake',
                        self.root / 'product-jobs/jobs', self.root / 'product-jobs/profiles',
                        self.root / 'repository-approvals', self.root / 'provider-allowances',
                        self.credential.parent, self.billing):

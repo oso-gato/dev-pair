@@ -169,11 +169,25 @@ class RuntimeListeners(unittest.TestCase):
         self.listeners.append(line('127.0.0.1:19425', Q_PROC, 'python3'))
 
     def select_site(self, component, role_generation=1):
-        release = json.dumps({'schema': 1, 'components': {'host': component}, 'role_generation': role_generation},
+        control = '/var/lib/dev-pair/renewal'
+        self.app.directory(control, mode=0o700)
+        manifest = hashlib.sha256(str(role_generation).encode()).hexdigest()
+        plan = json.dumps({'schema': 1, 'maintenance_context_sha256': component['config_sha256'],
+                           'development_manifests': {'checklist': manifest}}, sort_keys=True, separators=(',', ':'))
+        plan_sha = hashlib.sha256(plan.encode()).hexdigest()
+        self.put(control + '/plans/' + plan_sha + '.json', plan)
+        components = {'host': component, 'devbox': {**component, 'artifact_sha256': '4' * 64},
+                      'maintenance-agent': {**component, 'artifact_sha256': '7' * 64, 'codex_version': '0.170.0'},
+                      'development-agent': {**component, 'artifact_sha256': '8' * 64, 'codex_version': '0.170.0'}}
+        release = json.dumps({'schema': 1, 'source_revision': component['source_revision'],
+                              'config_sha256': component['config_sha256'], 'plan_sha256': plan_sha,
+                              'ledger_contract': 1, 'state_contract': 1, 'components': components},
                              sort_keys=True, separators=(',', ':'))
         site = hashlib.sha256(release.encode()).hexdigest()
-        self.put('/var/lib/dev-pair/renewal/releases/' + site + '.json', release)
-        self.put('/var/lib/dev-pair/renewal/site-current.json', json.dumps(site))
+        self.put(control + '/releases/' + site + '.json', release)
+        self.put(control + '/site-current.json', json.dumps(site))
+        self.put(control + '/current.json', json.dumps(site))
+        self.app.directory('/var/lib/dev-pair/renewal-fence', mode=0o755)
         self.site = site
         return site
 
@@ -195,10 +209,15 @@ class RuntimeListeners(unittest.TestCase):
         self.process(APP_PROC, UID, APP_MANAGER + '/app.slice/libpod-' + CONTAINER + '.scope', '/usr/libexec/podman/rootlessport')
         self.process(TS_PROC, 0, TS_GROUP, '/usr/sbin/tailscaled')
         self.put(b.STATE + '/node.json', {'tailnet': 'trusted', 'node_id': 'node-id'})
-        self.put(b.CUTOVER, {'phase': 'complete', 'guard_sha256': self.app.guard_hash(), 'target': {'dns_name': DNS}})
+        roles = self.app.selected_workload_placement()
+        self.assertEqual(roles['release_sha256'], self.site)
+        self.put(b.CUTOVER, {'phase': 'complete', 'guard_sha256': self.app.guard_hash(), 'target': {'dns_name': DNS},
+                             'role_artifacts': roles})
         self.put(b.GUARD_PATH, self.app.guard_rules([], tailnet_only=True))
         self.put(b.SSH_CUTOVER, b.SSH_CUTOVER_CONFIG)
+        self.app.publish_workload_gate('admitted', roles)
         self.listeners.append(line('127.0.0.1:18279', APP_PROC, 'rootlessport'))
+        return roles
 
     def runtime(self):
         return self.app.preflight(managed_runtime=True)
@@ -295,9 +314,13 @@ class RuntimeListeners(unittest.TestCase):
 
     def test_published_loopback_and_exact_tailnet_serve_from_live_supervisors(self):
         self.handoff(managed=True)
-        self.publish()
+        roles = self.publish()
         self.runtime()
         self.listeners.extend((line('100.64.8.9:443', TS_PROC), line('[fd7a:115c:a1e0::9]:443', TS_PROC)))
+        self.runtime()
+        self.app.publish_workload_gate('held')
+        self.assert_blocks()
+        self.app.publish_workload_gate('admitted', roles)
         self.runtime()
         with self.assertRaisesRegex(b.Blocked, 'not vanilla'):
             self.app.preflight()
@@ -307,6 +330,7 @@ class RuntimeListeners(unittest.TestCase):
     def test_managed_app_rejects_foreign_cgroup_image_route_and_staging_state(self):
         self.handoff(managed=True)
         self.publish()
+        self.runtime()
         self.app_row['Image'] = 'sha256:' + '0' * 64
         self.assert_blocks()
         self.app_row['Image'] = 'sha256:' + APP_ID
