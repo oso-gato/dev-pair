@@ -140,17 +140,33 @@ class CapsuleTests(unittest.TestCase):
         ):
             probe.payload()
 
-        [argv] = [call.args[0] for call in helper.call_args_list if 'DPPAYLOAD' in call.args[0]]
-        self.assertEqual(argv[argv.index('-uid') + 1], '0')
-        self.assertEqual(argv[argv.index('-gid') + 1], '0')
+        payload_calls = [
+            call.args[0] for call in helper.call_args_list
+            if 'DPPAYLOAD' in call.args[0] or '/disks/payload.iso' in call.args[0]
+        ]
+        self.assertEqual(len(payload_calls), 1)
+        argv = payload_calls[0]
+        self.assertEqual(argv[0], 'run')
+        entrypoints = [arg for arg in argv if arg == '--entrypoint' or arg.startswith('--entrypoint=')]
+        self.assertEqual(entrypoints, ['--entrypoint=/usr/bin/genisoimage'])
+        for option, value in (
+            ('-output', '/disks/payload.iso'), ('-volid', 'DPPAYLOAD'), ('-uid', '0'), ('-gid', '0'),
+        ):
+            with self.subTest(option=option):
+                self.assertEqual(argv.count(option), 1)
+                index = argv.index(option)
+                self.assertEqual(argv[index:index + 2], [option, value])
+        self.assertEqual(argv.count('-graft-points'), 1)
         grafts = argv[argv.index('-graft-points') + 1:]
-        for graft in (
+        self.assertCountEqual(grafts, [
             'native35-recipient.asc=/payload/native35-recipient.asc',
             'native35-gpg-home=/payload/native35-gpg-home',
+            'guest.py=/payload/guest.py',
+            'public_inputs.py=/payload/public_inputs.py',
+            'fedora_oci.py=/payload/fedora_oci.py',
             'manifest.json=/payload/manifest.json',
             'maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz',
-        ):
-            self.assertIn(graft, grafts)
+        ])
     def test_bounded_header_variants_and_incomplete_streams(self):
         buffers,payload=operands(b'x'*5100)
         for uid in (1000,2**32-1):
