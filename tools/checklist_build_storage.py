@@ -23,6 +23,16 @@ class StoragePressure(BlockingIOError):
         super().__init__('checklist build paused for bounded filesystem bytes or inodes')
 
 
+@contextmanager
+def transfer_reader(path):
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        # The engine inherits this open file description as stdin. Closing the
+        # conductor's copy cannot drop a surviving helper's shared lock.
+        fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        yield stream
+
+
 def free_space(fd):
     info = os.fstatvfs(fd)
     p.require(info.f_frsize > 0 and info.f_files > 0, 'checklist storage has no finite inode evidence')
@@ -109,7 +119,10 @@ class Spool:
         except FileNotFoundError:
             return None
         p.fields(value, 'schema directory job revision reserved_at')
-        p.require(value['schema'] == 1 and value['directory'] == self.identity(fd),
+        identity = value['directory']
+        p.require(type(value['schema']) is int and value['schema'] == 1
+                  and type(identity) is list and len(identity) == 2 and all(type(part) is int for part in identity)
+                  and identity == self.identity(fd),
                   'checklist transfer lease directory identity changed')
         p.token(value['job'])
         p.digest(value['revision'], 40)
@@ -138,21 +151,40 @@ class Spool:
         pressure = not enough(before, self.limit)
         if not (before_build or expired or pressure):
             return {'event': 'retained', 'before': before, 'after': before}
-        if occupied:
-            node = os.stat(ARCHIVE, dir_fd=fd, follow_symlinks=False)
-            p.require(stat.S_ISREG(node.st_mode) and node.st_uid == node.st_gid == 0 and node.st_nlink == 1
-                      and stat.S_IMODE(node.st_mode) == 0o600 and node.st_size <= self.limit,
-                      'foreign or ambiguous checklist transfer object preserved')
-            os.unlink(ARCHIVE, dir_fd=fd)
-            os.fsync(fd)
+        if occupied and not self.remove_inactive_transfer(fd):
+            return {'event': 'active-transfer-retained', 'job': record['job'], 'revision': record['revision'],
+                    'before': before, 'after': free_space(fd)}
         self.lease.unlink()
         sync_directory(self.control)
-        return {'event': 'reclaimed', 'job': record['job'], 'revision': record['revision'],
-                'before': before, 'after': free_space(fd)}
+        after = free_space(fd)
+        event = 'lease-cleared'
+        if occupied:
+            event = ('reclaimed' if any(after[key] > before[key] for key in before)
+                     else 'transfer-removed-capacity-unobserved')
+        return {'event': event, 'job': record['job'], 'revision': record['revision'],
+                'before': before, 'after': after}
+
+    def remove_inactive_transfer(self, fd):
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        node = os.stat(ARCHIVE, dir_fd=fd, follow_symlinks=False)
+        p.require(stat.S_ISREG(node.st_mode) and node.st_uid == node.st_gid == 0 and node.st_nlink == 1
+                  and stat.S_IMODE(node.st_mode) == 0o600 and node.st_size <= self.limit,
+                  'foreign or ambiguous checklist transfer object preserved')
+        with os.fdopen(os.open(ARCHIVE, flags, dir_fd=fd), 'rb') as stream:
+            try:
+                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            p.require(os.fstat(stream.fileno()) == node, 'checklist transfer changed while establishing cleanup')
+            os.unlink(ARCHIVE, dir_fd=fd)
+            os.fsync(fd)
+        return True
 
     @contextmanager
     def transfer(self, fd, job, revision):
         recovered = self.reclaim(fd, before_build=True)
+        if recovered['event'] == 'active-transfer-retained':
+            raise BlockingIOError('checklist transfer engine still holds the owned archive')
         if not enough(recovered['after'], self.limit):
             print(p.canonical({'event': 'checklist-build-pressure', 'job': job, 'revision': revision,
                                'reconciliation': recovered, 'required': reserve(self.limit)}),

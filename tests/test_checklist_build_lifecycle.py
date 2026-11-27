@@ -5,6 +5,7 @@ import fcntl
 import io
 import os
 from pathlib import Path
+import signal
 import sys
 import tarfile
 import tempfile
@@ -82,7 +83,8 @@ class SpoolTests(unittest.TestCase):
                 recovery = observed['before_build']
                 self.assertEqual(recovery['job'], 'job-a')
                 self.assertGreaterEqual(recovery['after']['bytes'] - before['bytes'], 512 * 1024)
-                self.assertEqual(recovery['after']['inodes'], before['inodes'] + 1)
+                shared_filesystem = self.control.stat().st_dev == self.volume.stat().st_dev
+                self.assertEqual(recovery['after']['inodes'], before['inodes'] + 1 + shared_filesystem)
                 stream.write(b'new verified transfer')
                 stream.flush()
                 self.assertEqual(archive.read_bytes(), b'new verified transfer')
@@ -118,6 +120,106 @@ class SpoolTests(unittest.TestCase):
                     self.fail('transfer started with insufficient available bytes')
         self.assertFalse(self.archive.exists())
         self.assertFalse(self.spool.lease.exists())
+
+    def test_mistyped_lease_preserves_bytes_and_ownership_record(self):
+        self.leave_interrupted()
+        with self.spool.locked(create=False) as fd:
+            authorized = self.spool.record(fd)
+            before = storage.free_space(fd)
+            malformed = (dict(authorized, schema=True),
+                         dict(authorized, directory=[authorized['directory'][0], float(authorized['directory'][1])]))
+            for shape in malformed:
+                with self.subTest(shape=shape):
+                    raw = p.canonical(shape).encode()
+                    self.spool.lease.write_bytes(raw)
+                    with self.assertRaisesRegex(ValueError, 'lease directory identity changed'):
+                        self.spool.reclaim(fd, before_build=True)
+                    self.assertEqual(self.spool.lease.read_bytes(), raw)
+                    self.assertEqual(self.archive.stat().st_size, 512 * 1024)
+                    self.assertEqual(storage.free_space(fd), before)
+            self.spool.lease.write_text(p.canonical(authorized))
+            self.assertEqual(self.spool.reclaim(fd, before_build=True)['event'], 'reclaimed')
+
+    def test_surviving_export_and_import_prevent_sweep_and_new_transfer(self):
+        helper_code = (
+            'import os,pathlib,sys,time\n'
+            'operation, ready = sys.argv[1:]\n'
+            'if operation == "save":\n'
+            '    sys.stdout.buffer.write(b"x" * (512 * 1024))\n'
+            '    sys.stdout.buffer.flush()\n'
+            'else:\n'
+            '    assert sys.stdin.buffer.read(1) == b"x"\n'
+            'path = pathlib.Path(ready)\n'
+            'tmp = path.with_suffix(".tmp")\n'
+            'tmp.write_text(str(os.getpid()))\n'
+            'tmp.replace(path)\n'
+            'time.sleep(8)\n'
+        )
+        for operation in ('save', 'load'):
+            with self.subTest(operation=operation):
+                ready = self.root / operation
+                conductor = os.fork()
+                if conductor == 0:
+                    try:
+                        with self.spool.locked(create=True) as directory, \
+                                self.spool.transfer(directory, 'job-a', REVISION) as (archive, export, _):
+                            if operation == 'load':
+                                export.write(b'x' * (512 * 1024))
+                                export.flush()
+                                os.fsync(export.fileno())
+                            with storage.transfer_reader(archive) as incoming:
+                                candidate.invoke([sys.executable, '-c', helper_code, operation, str(ready)],
+                                                 time.monotonic() + 7, stdin=incoming,
+                                                 stdout=export if operation == 'save' else None, cap=MIB)
+                    finally:
+                        os._exit(1)
+                try:
+                    cutoff = time.monotonic() + 3
+                    while not ready.exists() and time.monotonic() < cutoff:
+                        time.sleep(.01)
+                    helper = os.pidfd_open(int(ready.read_text()))
+                    try:
+                        os.kill(conductor, signal.SIGKILL)
+                        self.assertEqual(os.waitpid(conductor, 0)[1], signal.SIGKILL)
+                        conductor = None
+                        with self.spool.locked(create=False) as directory:
+                            before = storage.free_space(directory)
+                            old_record = self.spool.lease.read_bytes()
+                            old_inode = self.archive.stat().st_ino
+                            self.assertGreaterEqual(self.archive.stat().st_size, 512 * 1024 - 8192)
+                            with self.assertRaises(BlockingIOError), self.spool.locked(create=False):
+                                self.fail('other conductor obtained the held filesystem lock')
+                            report = self.spool.reclaim(directory, now=int(time.time()) + storage.IDLE_SECONDS)
+                            self.assertEqual(report['event'], 'active-transfer-retained')
+                            self.assertEqual(report['after'], before)
+                            with self.assertRaisesRegex(BlockingIOError, 'still holds the owned archive'):
+                                with self.spool.transfer(directory, 'job-b', 'b' * 40):
+                                    self.fail('new transfer overlapped the surviving helper')
+                            self.assertEqual(self.archive.stat().st_ino, old_inode)
+                            self.assertEqual(self.spool.lease.read_bytes(), old_record)
+                            signal.pidfd_send_signal(helper, signal.SIGTERM)
+                            cutoff = time.monotonic() + 3
+                            while time.monotonic() < cutoff:
+                                report = self.spool.reclaim(directory, before_build=True)
+                                if report['event'] != 'active-transfer-retained':
+                                    break
+                                time.sleep(.01)
+                            self.assertEqual(report['event'], 'reclaimed')
+                            self.assertGreaterEqual(report['after']['bytes'] - before['bytes'], 512 * 1024 - 8192)
+                            with self.spool.transfer(directory, 'job-b', 'b' * 40):
+                                self.assertNotEqual(self.spool.lease.read_bytes(), old_record)
+                    finally:
+                        try:
+                            signal.pidfd_send_signal(helper, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        os.close(helper)
+                finally:
+                    if conductor is not None:
+                        os.kill(conductor, signal.SIGKILL)
+                        os.waitpid(conductor, 0)
+                self.assertEqual(self.source.read_bytes(), b'user edit')
+                self.assertEqual(self.rollback.read_bytes(), b'prior artifact')
 
 
 @unittest.skipUnless(UNIX_ROOT, 'root custody fixture requires a mapped root namespace')
@@ -159,6 +261,10 @@ class NormalBuildTests(unittest.TestCase):
                 graph, runroot = argv[2], argv[4]
                 action, *args = argv[5:]
                 calls.append(action)
+                self.assertEqual(fcntl.fcntl(stdin, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDONLY)
+                with (volume / '.build-transfer' / storage.ARCHIVE).open('rb') as contender:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 if action == 'info':
                     return f'true true {graph} {runroot} {volume / "image-copy"}'.encode()
                 if action == 'build':
@@ -195,7 +301,6 @@ class NormalBuildTests(unittest.TestCase):
                     stdout.write(active['archive'])
                     return b''
                 self.assertEqual(action, 'load')
-                self.assertEqual(fcntl.fcntl(stdin, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDONLY)
                 self.assertEqual(stdin.read(), active['archive'])
                 imported.append(p.sha256(active['archive']))
                 return b''

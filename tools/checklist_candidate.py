@@ -437,26 +437,29 @@ def retained_candidate(path, job, revision, end):
 
 def build_and_load(runtime, podman, store, validation, image_copy, account, base, recipe,
                    source, job, revision, tag, staged, end):
+    archive, transfer, _ = staged
+
+    def engine(*args, **options):
+        with build_storage.transfer_reader(archive) as lease:
+            return podman(*args, stdin=lease, **options)
+
     for graph, runroot in (store, validation):
-        info = podman(graph, runroot, 'info', '--format', '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} '
+        info = engine(graph, runroot, 'info', '--format', '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} '
                       '{{.Store.GraphRoot}} {{.Store.RunRoot}} {{.Store.ImageCopyTmpDir}}').decode().strip()
         p.require(info == f'true true {graph} {runroot} {image_copy}', 'Podman build or import storage identity changed')
     base_id, base_digest, checked_base = candidate_image(
-        p.loads(podman(*store, 'image', 'inspect', base['image'])), base['image'])
-    archive, transfer, _ = staged
+        p.loads(engine(*store, 'image', 'inspect', base['image'])), base['image'])
     with build_context(runtime, account.pw_gid, recipe, source, end) as context:
-        podman(*store, 'build', '--quiet', '--platform', 'linux/amd64', '--format', 'oci', '--pull=never', '--no-cache',
+        engine(*store, 'build', '--quiet', '--platform', 'linux/amd64', '--format', 'oci', '--pull=never', '--no-cache',
                '--network=none', '--timestamp=0', '--tag', tag, '--build-arg', 'CHECKLIST_BASE=' + checked_base,
                '--build-arg', 'CHECKLIST_SOURCE=' + revision, '--file', context / 'Containerfile', context)
-        ident, digest, image = candidate_image(p.loads(podman(*store, 'image', 'inspect', tag)), tag, revision)
-        podman(*store, 'save', '--format=oci-archive', tag, cap=MAX_ARCHIVE, stdout=transfer)
+        ident, digest, image = candidate_image(p.loads(engine(*store, 'image', 'inspect', tag)), tag, revision)
+        engine(*store, 'save', '--format=oci-archive', tag, cap=MAX_ARCHIVE, stdout=transfer)
         transfer.flush()
         os.fsync(transfer.fileno())
         archive_manifest(archive, ident, digest, end, protected=True)
-        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-        with os.fdopen(os.open(archive, flags), 'rb') as incoming:
-            podman(*validation, 'load', stdin=incoming)
-        observed = candidate_image(p.loads(podman(*validation, 'image', 'inspect', image)), image, revision)
+        engine(*validation, 'load')
+        observed = candidate_image(p.loads(engine(*validation, 'image', 'inspect', image)), image, revision)
         p.require(observed == (ident, digest, image), 'validation store importer changed the exact candidate')
     print(p.canonical({'event': 'checklist-build-inputs', 'job': job, 'revision': revision,
                        'base_config_sha256': base_id, 'base_manifest_sha256': base_digest,

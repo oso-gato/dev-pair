@@ -121,8 +121,11 @@ bytes and inodes before and after. A new build reconciles an interrupted owned
 transfer before measuring its budget. The hourly timer also reclaims an owned
 transfer after seven inactive days, or earlier under byte or inode pressure.
 The timer takes the same exclusive transfer lock and the renewal dispatch gate.
-It preserves active transfers and leaves foreign objects in place. The same
-check is available through `checklist_candidate.py sweep-spool`.
+The engine also inherits a lock on its read-only archive descriptor. If the
+conductor exits while an engine helper still holds that descriptor, cleanup and
+the next build wait for the helper. Unlink alone is insufficient evidence of
+newly available capacity. Foreign objects are preserved. The same check is
+available through `checklist_candidate.py sweep-spool`.
 
 This cleanup is limited to the checklist OCI transfer. The verified base,
 validation and rollback images, job agreements, durable test results and both
