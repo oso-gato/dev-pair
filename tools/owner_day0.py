@@ -190,7 +190,11 @@ class DayZero:
         print('Day 0 phase ' + (protected['phase'] if protected else 'ready for inspection'))
         desired = record(Path(BOOTSTRAP) / 'desired.json') if report['prepared'] else None
         probe = Path(BOOTSTRAP) / 'gptbox-adapter' / pin(desired['gptbox_context_sha256']) / 'result.json' if desired else None
-        print('Maintenance gptbox ' + ('probe completion recorded' if probe and record(probe) else 'build and probes pending'))
+        maintenance = 'probe completion recorded' if probe and record(probe) else 'build and probes pending'
+        initializer = record(Path(BOOTSTRAP) / 'initialize.json')
+        if initializer is not None and (type(initializer) is not dict or initializer.get('phase') != 'complete'):
+            maintenance = 'original setup reconciliation pending'
+        print('Maintenance gptbox ' + maintenance)
         print('Tailnet enrollment ' + ('recorded' if report['enrollment_recorded'] else 'pending'))
         print('SSH access ' + report['phase'])
         print('Next ' + (protected['next'] if protected else 'Run ./day0.sh start in the selected hPanel root terminal.'))
@@ -432,6 +436,35 @@ class DayZero:
                 'The combined host preparation and maintenance gptbox are incomplete.')
         return self.probes(result['result'], revision, expected)
 
+    def resume_maintenance(self, identity, revision, expected, tty):
+        journal = record(Path(BOOTSTRAP) / 'initialize.json')
+        incomplete = False
+        if journal is not None:
+            target = journal.get('target') if type(journal) is dict else None
+            require(type(target) is dict and journal.get('phase') in ('prepare', 'maintenance-gptbox', 'complete') and
+                    target.get('source_sha') == revision and target.get('context_sha256') == expected,
+                    'The combined initializer journal does not match this prepared host.')
+            incomplete = journal['phase'] != 'complete'
+        if not incomplete:
+            if self.maintenance_receipt(revision, expected) is not None:
+                return True
+            require(journal is None, 'The completed initializer is missing its exact sealed maintenance proof.')
+        access = ()
+        if incomplete:
+            access = self.transport(tty, identity, revision)
+            if access is None:
+                self.stage(identity, revision, 'recovery-confirmation-pending',
+                           'Confirm the original recovery route to resume the interrupted combined initializer.')
+                return False
+        self.stage(identity, revision, 'maintenance-gptbox',
+                   'Resuming the original initializer and its owned resources.' if incomplete else
+                   'Resuming the prepared host without resetting core or ingress.')
+        paths = self.inputs(revision)
+        require(paths[2] == expected, 'The prepared host uses different verified maintenance inputs.')
+        image = self.prepare(revision, access, paths, tty, already_prepared=not incomplete)
+        require(self.maintenance_receipt(revision, expected) == image, 'The maintenance probe evidence did not read back.')
+        return True
+
     def enroll(self, tty):
         current = self.app.status()
         if current['enrollment_recorded']:
@@ -534,12 +567,8 @@ class DayZero:
                         'An enrolled host requires checked enforcing SELinux before continuing. Keep recovery available.')
                 desired = record(Path(BOOTSTRAP) / 'desired.json')
                 expected = pin(desired['gptbox_context_sha256'])
-                if self.maintenance_receipt(revision, expected) is None:
-                    self.stage(identity, revision, 'maintenance-gptbox', 'Resuming the prepared host without resetting core or ingress.')
-                    paths = self.inputs(revision)
-                    require(paths[2] == expected, 'The prepared host uses different verified maintenance inputs.')
-                    image = self.prepare(revision, (), paths, tty, already_prepared=True)
-                    require(self.maintenance_receipt(revision, expected) == image, 'The maintenance probe evidence did not read back.')
+                if not self.resume_maintenance(identity, revision, expected, tty):
+                    return
             self.stage(identity, revision, 'host-bootstrap-complete',
                        'The confined maintenance gptbox passed both offline probe cycles. Workloads remain held.')
             if not self.enroll(tty):

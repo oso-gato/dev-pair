@@ -1,5 +1,5 @@
 """Exercise the interactive owner control flow with local physical boundaries projected."""
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from hashlib import sha256
 import io
 import json
@@ -368,6 +368,16 @@ class DayZeroTests(unittest.TestCase):
             self.assertEqual(reply['preview'], 'initialize')
             self.assertTrue(app.attended_access)
             self.assertFalse((sanitized / '.git/index').exists())
+            runner = Mock(side_effect=self.native_call)
+            runner.phase.return_value = nullcontext()
+            argv = ['gptbox.py', 'initialize', '--apply', '--context', str(work), '--expected-context-sha256', context,
+                    '--distrobox-source', str(work), '--source-sha', revision, '--console-receipt', str(receipt)]
+            with (patch.object(gptbox, 'Gptbox', return_value=app), patch.object(sys, 'argv', argv),
+                  patch.object(app, 'run', runner),
+                  patch.object(app, 'lock', side_effect=RuntimeError('physical state boundary')) as lock):
+                with self.assertRaisesRegex(RuntimeError, 'physical state boundary'):
+                    gptbox.main()
+                lock.assert_called_once_with('initialize.lock')
             receipt.write_text(json.dumps({**proof, 'source_sha': 'a' * 40}))
             with self.assertRaisesRegex(bootstrap.Blocked, 'source checkout differs'):
                 app._initialize(str(work), context, str(work), revision, None, console_receipt=str(receipt))
@@ -385,3 +395,37 @@ class DayZeroTests(unittest.TestCase):
         self.entry.call.return_value = {'phase': 'ready', 'owner_terminal': '/usr/local/bin/dev-pair', 'held_features': []}
         self.entry.commission(self.identity, SOURCE)
         self.assertEqual(self.entry.stage.call_args.args[2], 'owner-terminal-ready')
+
+    def test_prepared_marker_cannot_bypass_an_interrupted_initializer_journal(self):
+        state = self.directory / 'bootstrap'
+        state.mkdir()
+        expected = 'a' * 64
+        journal = state / 'initialize.json'
+        body = {'schema': 2, 'phase': 'maintenance-gptbox', 'maintenance_gptbox': 'blocked',
+                'target': {'source_sha': SOURCE, 'context_sha256': expected},
+                'native_units': ['dev-pair-initialize-adapter-1234abcd-5678efab']}
+        journal.write_text(json.dumps(body))
+        journal.chmod(0o600)
+        self.entry.stage = Mock()
+        access = ['--bootstrap-source', '192.0.2.44/32']
+        self.entry.transport = Mock(return_value=access)
+        paths = (self.directory / 'context', self.directory / 'upstream', expected)
+        self.entry.inputs = Mock(return_value=paths)
+        self.entry.maintenance_receipt = Mock(return_value='b' * 64)
+
+        def initialize(*args, **kwargs):
+            self.assertFalse(kwargs['already_prepared'])
+            journal.write_text(json.dumps({**body, 'phase': 'complete', 'maintenance_gptbox': 'complete'}))
+            return 'b' * 64
+
+        self.entry.prepare = Mock(side_effect=initialize)
+        with patch.object(day, 'BOOTSTRAP', str(state)):
+            self.assertTrue(self.entry.resume_maintenance(self.identity, SOURCE, expected, None))
+            self.entry.prepare.assert_called_once_with(SOURCE, access, paths, None, already_prepared=False)
+            self.assertTrue(self.entry.resume_maintenance(self.identity, SOURCE, expected, None))
+            self.entry.prepare.assert_called_once()
+            self.entry.transport.assert_called_once()
+            self.entry.inputs.assert_called_once()
+            self.entry.maintenance_receipt.return_value = None
+            with self.assertRaisesRegex(bootstrap.Blocked, 'completed initializer is missing'):
+                self.entry.resume_maintenance(self.identity, SOURCE, expected, None)
