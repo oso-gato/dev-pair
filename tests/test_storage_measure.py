@@ -495,7 +495,10 @@ class MeasurementTests(unittest.TestCase):
         try:
             try:
                 observed=ci.measure_storage(self.root,live=True,sudo=False);self.assertGreater(observed['bytes'],0)
-            except ci.StorageMeasurementBlocked as error:self.assertIn(error.diagnostics.get('worker',{}).get('reason'),('identity-changed','enumeration-disappeared'))
+            except ci.StorageMeasurementBlocked as error:
+                if 'worker' in error.diagnostics:
+                    self.assertIn(error.diagnostics['worker']['reason'],('identity-changed','enumeration-disappeared','ordinary-entry-changed'))
+                else:self.assertIn('did not stabilize after an ordinary entry change',str(error))
         finally:stop.set();thread.join(timeout=3);self.assertFalse(thread.is_alive())
         self.assertEqual(ci.measure_storage(self.root,sudo=False)['bytes'],self.oracle())
     def test_root_replacement_and_every_guard_produce_no_accepted_total(self):
@@ -510,7 +513,9 @@ class MeasurementTests(unittest.TestCase):
             nonlocal changed
             if name=='directory' and kwargs.get('dir_fd') is not None and not changed:changed=True;child.rename(self.root/'moved');child.mkdir()
             return original(name,*args,**kwargs)
-        with patch.object(worker.os,'stat',side_effect=replaced),self.assertRaisesRegex(worker.ScanError,'identity-changed'):worker.scan(self.root,expected)
+        with patch.object(worker.os,'stat',side_effect=replaced),self.assertRaisesRegex(worker.ScanError,'ordinary-entry-changed'):
+            worker.scan(self.root,expected)
+        self.assertEqual(worker.scan(self.root,expected)['allocated_bytes'],self.oracle())
         child_ino=child.stat().st_ino
         scandir=os.scandir
         def replaced_after_open(fd):
@@ -518,8 +523,183 @@ class MeasurementTests(unittest.TestCase):
                 child.rename(self.root/'moved-again')
                 child.mkdir()
             return scandir(fd)
-        with patch.object(worker.os,'scandir',side_effect=replaced_after_open),self.assertRaisesRegex(worker.ScanError,'identity-changed'):
+        with patch.object(worker.os,'scandir',side_effect=replaced_after_open),self.assertRaisesRegex(worker.ScanError,'ordinary-entry-changed'):
             worker.scan(self.root,expected)
+        self.assertEqual(worker.scan(self.root,expected)['allocated_bytes'],self.oracle())
+
+    def test_actual_atomic_file_replacement_discards_one_scan_and_recovers_via_controller(self):
+        target=self.root/'entry';target.write_bytes(b'x'*8192)
+        pending=self.root/'pending';pending.write_bytes(b'y'*12288)
+        original_stat=os.stat
+        original_capture=ci.capture_du
+        discarded=[]
+
+        def replace(name,*args,**kwargs):
+            if name=='entry' and kwargs.get('dir_fd') is not None and pending.exists():pending.replace(target)
+            return original_stat(name,*args,**kwargs)
+
+        def capture(root,argv,*,end=None):
+            if discarded:return original_capture(root,argv,end=end)
+            output=StringIO()
+            worker_argv=argv[argv.index(str(Path(worker.__file__))):]
+            with patch.object(worker.os,'stat',side_effect=replace),patch.object(sys,'argv',worker_argv),redirect_stdout(output):
+                code=worker.main()
+            value=json.loads(output.getvalue())
+            self.assertEqual((code,value['status'],value['allocated_bytes'],value['reason']),
+                             (2,'failed',None,'ordinary-entry-changed'))
+            discarded.append(code)
+            return subprocess.CompletedProcess(argv,code,output.getvalue().encode(),b'')
+
+        with patch.object(ci,'capture_du',side_effect=capture) as observed:
+            recovered=ci.measure_storage(self.root,live=True,sudo=False,end=time.monotonic()+5)
+        self.assertEqual(observed.call_count,2)
+        self.assertEqual((recovered['bytes'],recovered['usable_samples'],recovered['provisional']),(self.oracle(),1,False))
+
+    def test_actual_single_link_move_between_siblings_discards_the_double_observation(self):
+        (self.root/'left').mkdir();(self.root/'right').mkdir()
+        with os.scandir(self.root) as entries:first,second=(Path(entry.path) for entry in entries)
+        before=first/'moved';before.write_bytes(b'x'*8192)
+        second_inode=second.stat().st_ino
+        scandir=os.scandir
+
+        def move(fd):
+            if os.fstat(fd).st_ino==second_inode:before.rename(second/'moved')
+            return scandir(fd)
+
+        with patch.object(worker.os,'scandir',side_effect=move),self.assertRaisesRegex(worker.ScanError,'ordinary-entry-changed'):
+            worker.scan(self.root,self.expected())
+        self.assertEqual(worker.scan(self.root,self.expected())['allocated_bytes'],self.oracle())
+
+    def test_actual_link_count_contradiction_is_not_ordinary_move(self):
+        (self.root/'left').mkdir();(self.root/'right').mkdir()
+        with os.scandir(self.root) as entries:first,second=(Path(entry.path) for entry in entries)
+        file=first/'file';file.write_bytes(b'x'*8192)
+        second_inode=second.stat().st_ino
+        scandir=os.scandir
+
+        def link(fd):
+            if os.fstat(fd).st_ino==second_inode:os.link(file,second/'link')
+            return scandir(fd)
+
+        with patch.object(worker.os,'scandir',side_effect=link),self.assertRaisesRegex(worker.ScanError,'^identity-changed$'):
+            worker.scan(self.root,self.expected())
+
+    def test_replacement_type_disagreement_and_loss_on_strict_confirmation_are_terminal(self):
+        for replacement in ('directory','vanished','again'):
+            with self.subTest(replacement=replacement),tempfile.TemporaryDirectory(dir=self.root) as path:
+                root=Path(path);entry=root/'entry';entry.touch();pending=root/'pending';pending.touch()
+                second=root/'again';second.touch()
+                original_stat=os.stat;open_node=worker._node
+                seen=False
+
+                def replace(name,*args,**kwargs):
+                    nonlocal seen
+                    if name=='entry' and kwargs.get('dir_fd') is not None and not seen:
+                        seen=True
+                        if replacement=='directory':entry.unlink();entry.mkdir()
+                        else:pending.replace(entry)
+                    return original_stat(name,*args,**kwargs)
+
+                def confirm(fd,name,*,same_mount=True):
+                    if name=='entry' and seen:
+                        if replacement=='again':second.replace(entry)
+                        if replacement=='vanished':entry.unlink()
+                    return open_node(fd,name,same_mount=same_mount)
+
+                expected=worker.identity(root.stat())
+                with (patch.object(worker.os,'stat',side_effect=replace),patch.object(worker,'_node',side_effect=confirm),
+                      self.assertRaisesRegex(worker.ScanError,'^identity-changed$')):
+                    worker.scan(root,expected)
+
+    def test_actual_ordinary_replacement_rechecks_root_mount_identity(self):
+        target=self.root/'entry';target.touch();(self.root/'next').touch()
+        self.isolated_mount_scan(self.root,[],'''
+            import ctypes
+
+            libc=ctypes.CDLL(None,use_errno=True)
+            original_stat=os.stat
+            def replace(name,*args,**kwargs):
+                if name=='entry' and kwargs.get('dir_fd') is not None and (root/'next').exists():
+                    (root/'next').replace(root/'entry')
+                    path=os.fsencode(root)
+                    assert libc.mount(path,path,None,4096,None)==0, ctypes.get_errno()
+                return original_stat(name,*args,**kwargs)
+            with patch.object(worker.os,'stat',side_effect=replace):
+                check_failure('root-identity')
+            ''',remount=True)
+
+    def test_actual_ordinary_change_beneath_bind_requires_every_ancestor_check(self):
+        for event,reason in (('stable','ordinary-entry-changed'),('source','bind-source-after-identity'),
+                             ('mount','identity-changed'),('missing','entry-reopen-missing')):
+            with self.subTest(event=event),tempfile.TemporaryDirectory(dir=self.root) as path:
+                fixture=Path(path)
+                source=fixture/'source';(source/'subdir').mkdir(parents=True)
+                (source/'subdir'/'entry').write_bytes(b'x'*8192);(source/'subdir'/'next').write_bytes(b'y'*12288)
+                alias=fixture/'alias';alias.mkdir()
+                original_root=self.root
+                self.root=fixture
+                try:self.isolated_mount_scan(fixture,['--bind',source,alias],'''
+                    import ctypes
+
+                    event=EVENT
+                    libc=ctypes.CDLL(None,use_errno=True)
+                    original_stat=os.stat
+                    replaced=False
+                    alias=root/'alias'
+                    subdir=alias/'subdir'
+                    def replace(name,*args,**kwargs):
+                        global replaced
+                        fd=kwargs.get('dir_fd')
+                        if name=='entry' and fd is not None and Path(os.readlink(f'/proc/self/fd/{fd}'))==subdir and not replaced:
+                            (subdir/'next').replace(subdir/'entry')
+                            replaced=True
+                            if event=='source':
+                                (root/'source').rename(root/'renamed')
+                                (root/'source').mkdir()
+                            if event=='mount':
+                                path=os.fsencode(alias)
+                                assert libc.umount2(path,2)==0, ctypes.get_errno()
+                                assert libc.mount(os.fsencode(root/'source'),path,None,4096,None)==0, ctypes.get_errno()
+                            if event=='missing':subdir.rename(alias/'renamed-subdir')
+                        return original_stat(name,*args,**kwargs)
+                    with patch.object(worker.os,'stat',side_effect=replace):
+                        check_failure(REASON)
+                    assert replaced
+                    if event=='stable':
+                        sample=ci.measure_storage(root,sudo=False)
+                        native=int(subprocess.check_output(['/usr/bin/du','-sxB1',root],timeout=3).split()[0])
+                        assert sample['bytes']==native and not sample['provisional'], sample
+                    '''.replace('EVENT',repr(event)).replace('REASON',repr(reason)),remount=event=='mount')
+                finally:self.root=original_root
+
+    def test_actual_change_beneath_backing_verified_bind_rechecks_canonical_mounts(self):
+        for remount in (False,True):
+            with self.subTest(remount=remount):
+                backing,mounts=self.crossed_parent_fixture()
+                (backing/'parent'/'child'/'next').write_bytes(b'y'*12288)
+                self.isolated_mount_scan(self.root,mounts,'''
+                    import ctypes
+
+                    remount=REMOUNT
+                    libc=ctypes.CDLL(None,use_errno=True)
+                    original_stat=os.stat
+                    alias=root/'alias'
+                    replaced=False
+                    def replace(name,*args,**kwargs):
+                        global replaced
+                        fd=kwargs.get('dir_fd')
+                        if name=='data' and fd is not None and Path(os.readlink(f'/proc/self/fd/{fd}'))==alias and not replaced:
+                            (alias/'next').replace(alias/'data')
+                            replaced=True
+                            if remount:
+                                path=os.fsencode(root/'parent')
+                                assert libc.umount2(path,2)==0, ctypes.get_errno()
+                                assert libc.mount(path,path,None,4096,None)==0, ctypes.get_errno()
+                        return original_stat(name,*args,**kwargs)
+                    with patch.object(worker.os,'stat',side_effect=replace):
+                        check_failure('bind-source-after-identity' if remount else 'ordinary-entry-changed')
+                    assert replaced
+                    '''.replace('REMOUNT',repr(remount)),backing=backing,proof=True)
     def test_only_descendant_enoent_allows_a_provisional_sample(self):
         (self.root/'file').touch()
         for number in (errno.EACCES,errno.EPERM,errno.EIO,errno.ELOOP):

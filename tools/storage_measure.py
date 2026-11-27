@@ -25,7 +25,7 @@ FDS=256
 INODE_FILESYSTEMS={0xEF53:b'ext4',0x01021994:b'tmpfs'}
 BACKING_FLAGS=os.ST_RDONLY|os.ST_NOSUID|os.ST_NODEV|os.ST_NOEXEC
 REASONS=(
-    'none','root-identity','identity-changed','permission','io','unsupported','mount-boundary',
+    'none','root-identity','identity-changed','ordinary-entry-changed','permission','io','unsupported','mount-boundary',
     'mount-id-missing','mount-id-equal','mountinfo-unavailable','mountinfo-row-shape','mountinfo-device',
     'mountinfo-root-missing','mountinfo-entry-missing','held-root-path-missing','held-entry-path-missing',
     'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
@@ -41,6 +41,7 @@ REASONS=(
 class ScanError(ValueError):pass
 class NoTotal(ScanError):pass
 class SourceParentEXDEV(ScanError):pass
+class OrdinaryChange(ScanError):pass
 
 def require(ok,reason):
     if not ok:raise ScanError(reason)
@@ -365,6 +366,10 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                 require(identity(os.fstat(current_fd))==expected and _mount_id(current_fd)==root_mount,'root-identity')
             finally:os.close(current_fd)
     def bound():require(time.monotonic()<end,'deadline')
+    def require_ordinary_replacement(previous,current,crossed):
+        require(not crossed and previous[0]==current[0]==expected['device'] and
+                previous[1]>0 and current[1]>0 and previous[1]!=current[1] and
+                previous[2]==current[2] and previous[2] in (stat.S_IFREG,stat.S_IFDIR),'identity-changed')
     def charge_entry():
         counters['entries']+=1
         require(counters['entries']<=entry_limit,'entry-limit')
@@ -396,14 +401,17 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         key=(node.st_dev,node.st_ino)
         kind=stat.S_IFMT(node.st_mode)
         if key in seen:
-            prior_kind,prior_links,ordinary_seen=seen[key]
+            prior_kind,prior_links,ordinary_seen,bind_seen=seen[key]
             require(kind==prior_kind,'identity-changed')
             if kind!=stat.S_IFDIR and prior_links>1 and node.st_nlink>1:return key
+            if (kind==stat.S_IFREG and node.st_dev==expected['device'] and prior_links==node.st_nlink==1 and
+                    ordinary_seen and not (through_bind or bind_seen)):
+                raise OrdinaryChange('ordinary-entry-changed')
             require((through_bind or not ordinary_seen) and (prior_links>1)==(node.st_nlink>1),'identity-changed')
-            seen[key]=(kind,prior_links,ordinary_seen or not through_bind)
+            seen[key]=(kind,prior_links,ordinary_seen or not through_bind,bind_seen or through_bind)
         else:
             require(len(seen)<inode_limit,'inode-limit')
-            seen[key]=(kind,node.st_nlink,not through_bind)
+            seen[key]=(kind,node.st_nlink,not through_bind,through_bind)
             counters['unique_inodes']+=1
         require(type(node.st_blocks) is int and 0<=node.st_blocks<2**54,'unsupported')
         total+=node.st_blocks*512;require(total<2**63,'unsupported')
@@ -412,11 +420,26 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         nonlocal root_mount
         node_fd,crossed=_open_entry(directory,name)
         source_pin=None
+        change=None
         try:
             opened=os.fstat(node_fd)
             node_identity=_node_identity(opened)
             current=os.stat(name,dir_fd=directory,follow_symlinks=False)
-            require(_node_identity(current)==node_identity,'identity-changed')
+            current_identity=_node_identity(current)
+            if current_identity!=node_identity:
+                require_ordinary_replacement(node_identity,current_identity,crossed)
+                # The name must still resolve to the replacement under the
+                # ordinary lookup restrictions. Loss during this proof is fatal.
+                bound()
+                try:
+                    confirmed=_node(directory,name)
+                    try:
+                        confirmed_node=os.fstat(confirmed)
+                        require(_node_identity(confirmed_node)==current_identity and confirmed_node.st_nlink==current.st_nlink,
+                                'identity-changed')
+                    finally:os.close(confirmed)
+                except FileNotFoundError:raise ScanError('identity-changed') from None
+                raise OrdinaryChange('ordinary-entry-changed')
             # GNU du -x excludes both files and directories on other devices,
             # including their mount roots. It never enumerates those trees.
             same_device=opened.st_dev==expected['device']
@@ -437,29 +460,38 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                         try:
                             child_node=os.fstat(child)
                             require(_node_identity(child_node)==node_identity,'identity-changed')
-                            walk(child,child_node,depth+1,through_bind or crossed)
+                            try:walk(child,child_node,depth+1,through_bind or crossed)
+                            except OrdinaryChange as error:change=error
                         finally:os.close(child)
                 else:account(opened,through_bind or crossed)
             if directory_node or crossed:
                 # Reopen via the original parent and check the mounted identity
-                # again, including a replacement that reused the same inode.
+                # again, even if a descendant already invalidated the total.
                 try:
                     after=_node(directory,name,same_mount=not crossed)
                 except FileNotFoundError:
                     # A missing mountpoint prevents the final mount and source
                     # checks after its blocks may already have been counted.
-                    if crossed:raise ScanError('entry-reopen-missing') from None
+                    if crossed or change is not None:raise ScanError('entry-reopen-missing') from None
                     raise
                 except OSError as error:
                     if error.errno==errno.EXDEV:raise ScanError('entry-reopen-exdev') from None
                     raise
                 try:
-                    require(_node_identity(os.fstat(after))==node_identity,'identity-changed')
+                    after_identity=_node_identity(os.fstat(after))
+                    if after_identity!=node_identity:
+                        require(change is None,'identity-changed')
+                        require_ordinary_replacement(node_identity,after_identity,crossed)
+                        raise OrdinaryChange('ordinary-entry-changed')
                     if crossed:require(_mount_id(after)==mount_id,'identity-changed')
                     if source is not None:
                         _verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry,
                                             after=True,source_pin=source_pin,backing_source=backing_source)
+                except FileNotFoundError:
+                    if change is not None:raise ScanError('entry-reopen-missing') from None
+                    raise
                 finally:os.close(after)
+            if change is not None:raise change
         finally:
             if isinstance(source_pin,_BackingSource):source_pin.close()
             elif source_pin is not None:os.close(source_pin)
@@ -482,7 +514,17 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         except FileNotFoundError:raise NoTotal('enumeration-disappeared') from None
         finally:active.remove(key)
     try:
-        root_check();walk(fd,os.fstat(fd),0,False);root_check()
+        root_check()
+        try:walk(fd,os.fstat(fd),0,False)
+        except OrdinaryChange:
+            # The original root descriptor still pins its mount, even when
+            # no entry crossed a mount during this scan.
+            if root_mount is None:root_mount=_mount_id(fd)
+            try:root_check()
+            except FileNotFoundError:raise ScanError('root-identity') from None
+            bound()
+            raise
+        root_check()
         return {'status':'provisional' if counters['vanished'] else 'complete','allocated_bytes':total,'reason':'none','counters':counters}
     except NoTotal:
         root_check();return {'status':'no-total','allocated_bytes':None,'reason':'enumeration-disappeared','counters':counters}

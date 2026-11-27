@@ -23,9 +23,12 @@ def fixture_inputs():
     return {**{key: 'c' * length for key, length in guest.INPUT_LENGTHS.items()}, 'source_sha': 'a' * 40, 'payload_bytes': 123}
 
 
-def worker_result(root,size=4096,provisional=False,no_total=False,code=None):
+def worker_result(root,size=4096,provisional=False,no_total=False,code=None,*,failure=None):
     node=root.stat();status='no-total' if no_total else 'provisional' if provisional else 'complete'
     value={'schema':1,'worker_sha256':ci.file_hash(pathlib.Path(ci.__file__).with_name('storage_measure.py')),'root':{'device':node.st_dev,'inode':node.st_ino,'owner':node.st_uid},'status':status,'allocated_bytes':None if no_total else size,'reason':'enumeration-disappeared' if no_total else 'none','counters':{'entries':1,'unique_inodes':1,'vanished':1 if provisional else 0}}
+    if failure is not None:
+        value.update(status='failed',allocated_bytes=None,reason=failure)
+        code=2
     return subprocess.CompletedProcess([],1 if no_total else 0 if code is None else code,json.dumps(value).encode(),b'')
 
 
@@ -334,7 +337,9 @@ class FedoraCITests(unittest.TestCase):
                     measurement = ci.measure_storage(self.root, live=True, sudo=False)
                     self.assertLessEqual(measurement['bytes'], ci.OVERHEAD_LIMIT)
                 except ci.StorageMeasurementBlocked as failure:
-                    self.assertIn(failure.diagnostics.get('worker',{}).get('reason'),('identity-changed','permission','enumeration-disappeared'))
+                    if 'worker' in failure.diagnostics:
+                        self.assertIn(failure.diagnostics['worker']['reason'],('identity-changed','permission','enumeration-disappeared','ordinary-entry-changed'))
+                    else:self.assertIn('did not stabilize after an ordinary entry change',str(failure))
                 if observed:
                     break
             self.assertTrue(observed, 'real removed/recreated-file race was not exercised')
@@ -371,6 +376,87 @@ class FedoraCITests(unittest.TestCase):
         with mock.patch.object(ci, 'capture_du', return_value=huge):
             with self.assertRaisesRegex(ci.Blocked, 'overhead limit'):
                 ci.measure_storage(self.root, live=True, sudo=False)
+
+    def test_ordinary_change_recovery_requires_fresh_complete_and_keeps_maximum(self):
+        change=worker_result(self.root,failure='ordinary-entry-changed')
+        earlier=worker_result(self.root,16384,provisional=True)
+        complete=worker_result(self.root,4096)
+        missing=worker_result(self.root,no_total=True)
+        with mock.patch.object(ci,'check_capacity'),mock.patch.object(ci,'capture_du',side_effect=[earlier,change,complete]) as run:
+            report=ci.measure_storage(self.root,live=True,sudo=False)
+        self.assertEqual(run.call_count,3)
+        self.assertEqual((report['bytes'],report['max_observed_bytes'],report['usable_samples'],report['provisional']),
+                         (4096,16384,2,False))
+        with mock.patch.object(ci,'check_capacity'),mock.patch.object(ci,'capture_du',side_effect=[change,change,complete]):
+            report=ci.measure_storage(self.root,live=True,sudo=False)
+        self.assertEqual((report['attempts'],report['usable_samples'],report['bytes']),(3,1,4096))
+        for results in ([earlier,change,missing],[change,missing,earlier],[change,change,change]):
+            with (self.subTest(results=results),mock.patch.object(ci,'check_capacity'),
+                  mock.patch.object(ci,'capture_du',side_effect=results) as run,self.assertRaises(ci.StorageMeasurementBlocked) as stopped):
+                ci.measure_storage(self.root,live=True,sudo=False)
+            self.assertEqual(run.call_count,3)
+            self.assertEqual(stopped.exception.diagnostics['attempts'],3)
+        for live,result in ((False,change),(True,worker_result(self.root,failure='identity-changed'))):
+            with mock.patch.object(ci,'capture_du',side_effect=[result,complete]) as run,self.assertRaises(ci.StorageMeasurementBlocked):
+                ci.measure_storage(self.root,live=live,sudo=False)
+            self.assertEqual(run.call_count,1)
+        wrong_status=subprocess.CompletedProcess([],1,change.stdout,b'')
+        with mock.patch.object(ci,'capture_du',side_effect=[wrong_status,complete]) as run,self.assertRaises(ci.StorageMeasurementBlocked):
+            ci.measure_storage(self.root,live=True,sudo=False)
+        self.assertEqual(run.call_count,1)
+
+    def test_ordinary_change_recovery_rechecks_physical_capacity_and_prior_maximum_reserve(self):
+        change=worker_result(self.root,failure='ordinary-entry-changed')
+        limit=ci.OVERHEAD_LIMIT-ci.fedora_oci.UNLINKED_RESERVE
+        probe=ci.Probe('a'*40,self.root);probe.image_copy_active=True
+        earlier=worker_result(self.root,limit,provisional=True)
+        complete=worker_result(self.root,4096)
+        with mock.patch.object(ci,'check_capacity'),mock.patch.object(ci,'capture_du',side_effect=[earlier,change,complete]):
+            report=probe.storage_measurement(live=True)
+        self.assertEqual((report['bytes'],report['max_observed_bytes']),(4096,limit))
+        self.assertTrue(probe.image_copy_active)
+        above=worker_result(self.root,limit+512,provisional=True)
+        with mock.patch.object(ci,'capture_du',side_effect=[above,change,complete]) as run,self.assertRaisesRegex(ci.Blocked,'unlinked'):
+            probe.storage_measurement(live=True)
+        self.assertEqual(run.call_count,1)
+        self.assertEqual(probe.report['storage_measurement_failure']['max_observed_bytes'],limit+512)
+        with (mock.patch.object(ci,'check_capacity',side_effect=ci.Blocked('capacity blocked: fixture reserve')),
+              mock.patch.object(ci,'capture_du',side_effect=[change,complete]) as run,self.assertRaisesRegex(ci.Blocked,'fixture reserve')):
+            probe.storage_measurement(live=True)
+        self.assertEqual(run.call_count,1)
+        self.assertTrue(probe.image_copy_active)
+
+    def test_ordinary_change_recovery_uses_only_remaining_shared_budget(self):
+        probe=ci.Probe('a'*40,self.root);probe.phase_end=21
+        change=worker_result(self.root,failure='ordinary-entry-changed')
+        complete=worker_result(self.root,4096)
+        ticks=[20]
+        calls=[]
+
+        def capture(root,argv,*,end=None):
+            seconds=float(argv[5][:-1])
+            calls.append((end,seconds))
+            ticks[0]+=.4
+            return change if len(calls)==1 else complete
+
+        with (mock.patch.object(ci,'check_capacity'),mock.patch.object(ci,'capture_du',side_effect=capture),
+              mock.patch.object(ci.time,'monotonic',side_effect=lambda:ticks[0])):
+            self.assertEqual(probe.storage_measurement(live=True,end=22)['bytes'],4096)
+        self.assertEqual(calls,[(21,1.0),(21,.6)])
+
+        ticks[:]=[20];calls.clear()
+        with (mock.patch.object(ci,'check_capacity',side_effect=lambda root: ticks.__setitem__(0,21)),
+              mock.patch.object(ci,'capture_du',side_effect=capture),mock.patch.object(ci.time,'monotonic',side_effect=lambda:ticks[0]),
+              self.assertRaisesRegex(ci.StorageMeasurementBlocked,'deadline exceeded')):
+            probe.storage_measurement(live=True,end=22)
+        self.assertEqual(calls,[(21,1.0)])
+
+    def test_storage_capture_honors_short_absolute_end(self):
+        argv=[sys.executable,'-I','-c','import time;time.sleep(30)']
+        started=time.monotonic()
+        with self.assertRaisesRegex(ci.StorageMeasurementBlocked,'deadline exceeded'):
+            ci.capture_du(self.root,argv,end=started+.1)
+        self.assertLess(time.monotonic()-started,2)
 
     def test_real_gnu_du_deleted_path_volume_keeps_bounded_failure_diagnostics(self):
         # Deterministic queued-path disappearance, not claimed proof of the

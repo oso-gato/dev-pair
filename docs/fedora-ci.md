@@ -217,6 +217,12 @@ has its own filesystem code. Other EXDEV errors within the fallback use
 `bind-source-before-exdev`.
 Unverified same-device mounts block. A descendant disappearance can yield a
 provisional sample or trigger another attempt without contributing a total.
+If a live scan verifies an ordinary same-device file or directory replacement,
+or observes an ordinary single-link regular file twice, it discards that scan.
+Active ancestors and the pinned scratch root must still pass their identity and
+mount checks. Recovery requires a fresh complete scan within the existing
+attempt count and remaining operation and phase time. Earlier usable sizes
+still count toward capacity and the active-copy reserve.
 Across at most three attempts, the largest usable sample counts against the
 same overhead and active-copy reserve. Final measurements require a complete
 scan. Identity, permission, I/O, traversal-limit and timeout failures block.

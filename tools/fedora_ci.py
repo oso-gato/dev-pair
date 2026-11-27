@@ -279,7 +279,7 @@ def parse_storage(root,result,expected,worker_sha):
         status=value['status'];size=value['allocated_bytes']
         if status=='failed':
             require(result.returncode==2 and size is None and value['reason'] in (
-                'root-identity','identity-changed','permission','io','unsupported','mount-boundary',
+                'root-identity','identity-changed','ordinary-entry-changed','permission','io','unsupported','mount-boundary',
                 'mount-id-missing','mount-id-equal','mountinfo-unavailable','mountinfo-row-shape','mountinfo-device',
                 'mountinfo-root-missing','mountinfo-entry-missing','held-root-path-missing','held-entry-path-missing',
                 'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
@@ -302,7 +302,7 @@ def parse_storage(root,result,expected,worker_sha):
     except (Blocked,ValueError,KeyError,TypeError,RecursionError) as error:
         raise StorageMeasurementBlocked('storage worker result rejected',storage_diagnostics(root,result)) from None
 
-def capture_du(root, argv):
+def capture_du(root, argv, *, end=None):
     buffers = {'stdout': bytearray(), 'stderr': bytearray()}
     seen = {'stdout': 0, 'stderr': 0}
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -311,11 +311,13 @@ def capture_du(root, argv):
     selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
     selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
     started = time.monotonic()
+    capture_end = min(started + 5, end) if end is not None else started + 5
     failure = None
     try:
         while selector.get_map():
-            require(time.monotonic() - started < 5, 'storage measurement deadline exceeded')
-            for key, _ in selector.select(timeout=.1):
+            left = capture_end - time.monotonic()
+            require(left > 0, 'storage measurement deadline exceeded')
+            for key, _ in selector.select(timeout=min(.1, left)):
                 data = os.read(key.fileobj.fileno(), 4096)
                 if not data:
                     selector.unregister(key.fileobj)
@@ -324,7 +326,9 @@ def capture_du(root, argv):
                 remaining = DU_CAPTURE_LIMIT - sum(map(len, buffers.values()))
                 buffers[key.data].extend(data[:remaining])
                 require(sum(seen.values()) <= DU_CAPTURE_LIMIT, 'storage measurement diagnostic limit exceeded')
-        return subprocess.CompletedProcess(argv, process.wait(timeout=1), bytes(buffers['stdout']), bytes(buffers['stderr']))
+        left = min(1, end - time.monotonic()) if end is not None else 1
+        require(left > 0, 'storage measurement deadline exceeded')
+        return subprocess.CompletedProcess(argv, process.wait(timeout=left), bytes(buffers['stdout']), bytes(buffers['stderr']))
     except (Blocked, subprocess.SubprocessError) as exc:
         result = subprocess.CompletedProcess(argv, process.poll(), bytes(buffers['stdout']), bytes(buffers['stderr']))
         failure = StorageMeasurementBlocked(str(exc), storage_diagnostics(root, result, seen, truncated=True))
@@ -387,7 +391,7 @@ def validate_du(root, result):
     return int(summary[1]), True
 
 
-def measure_storage(root, live=False, sudo=True, attempts=3, expected_root=None, worker_sha=None):
+def measure_storage(root, live=False, sudo=True, attempts=3, expected_root=None, worker_sha=None, *, end=None, unlinked_reserve=0):
     require(type(attempts) is int and 1 <= attempts <= 3, 'invalid storage retry bound')
     worker=pathlib.Path(__file__).with_name('storage_measure.py')
     require(not worker.is_symlink() and worker.is_file(),'storage worker source rejected')
@@ -398,31 +402,56 @@ def measure_storage(root, live=False, sudo=True, attempts=3, expected_root=None,
         except OSError:raise StorageMeasurementBlocked('storage root unavailable',{'schema':1,'worker_sha256':worker_sha,'availability':'not-launched','reason':'root-identity'}) from None
         expected={'device':node.st_dev,'inode':node.st_ino,'owner':node.st_uid}
     else:expected=expected_root
-    argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/timeout', '--signal=TERM', '--kill-after=1s', '5s',
-        '/usr/bin/prlimit','--core=0:0','--as=268435456:268435456','--nofile=256:256','--','/usr/bin/python3','-I',str(worker),
+    timeout_argv = (['sudo', '-n'] if sudo else []) + ['/usr/bin/timeout', '--signal=TERM', '--kill-after=1s']
+    worker_argv = ['/usr/bin/prlimit','--core=0:0','--as=268435456:268435456','--nofile=256:256','--','/usr/bin/python3','-I',str(worker),
         '--root',str(root),'--device',str(expected['device']),'--inode',str(expected['inode']),'--owner',str(expected['owner']),'--sha256',worker_sha]
     maximum = None
     usable = missing = 0
+    needs_complete = False
+    def sample_context(count):
+        return {'attempts':count,'usable_samples':usable,'missing_total_samples':missing,'max_observed_bytes':maximum}
     for attempt in range(attempts):
+        if end is not None and time.monotonic() >= end:
+            raise StorageMeasurementBlocked('storage measurement deadline exceeded', sample_context(attempt))
+        if needs_complete:
+            try:check_capacity(root)
+            except Blocked as exc:raise StorageMeasurementBlocked(str(exc), sample_context(attempt)) from exc
+        left = min(5, end - time.monotonic()) if end is not None else 5
+        # GNU timeout interprets a zero duration as disabled. Keep a positive
+        # duration rounded down to the displayed resolution.
+        microseconds = int(left * 1_000_000)
+        if microseconds <= 0:
+            raise StorageMeasurementBlocked('storage measurement deadline exceeded', sample_context(attempt))
+        duration = '5s' if left == 5 else f'{microseconds // 1_000_000}.{microseconds % 1_000_000:06d}s'
         try:
-            result = capture_du(root, argv)
+            result = capture_du(root, [*timeout_argv, duration, *worker_argv], end=end)
             size, vanished = parse_storage(root,result,expected,worker_sha)
+            if end is not None and time.monotonic() >= end:
+                raise StorageMeasurementBlocked('storage measurement deadline exceeded', storage_diagnostics(root, result))
         except StorageMeasurementBlocked as exc:
-            exc.diagnostics.update(worker_sha256=worker_sha,root_identity=expected,attempts=attempt + 1, usable_samples=usable,
-                                   missing_total_samples=missing, max_observed_bytes=maximum)
+            exc.diagnostics.update(worker_sha256=worker_sha,root_identity=expected,**sample_context(attempt+1))
+            reason = exc.diagnostics.get('worker', {}).get('reason')
+            if live and reason == 'ordinary-entry-changed' and attempt + 1 < attempts:
+                needs_complete = True
+                continue
             raise
         if size is None:
             missing += 1
         else:
             usable += 1
             maximum = size if maximum is None else max(maximum, size)
-        context = {'attempts': attempt + 1, 'usable_samples': usable,
-                   'missing_total_samples': missing, 'max_observed_bytes': maximum}
+        context = sample_context(attempt+1)
         if maximum is not None and maximum > OVERHEAD_LIMIT:
             raise StorageMeasurementBlocked('capacity blocked: tooling/source overhead limit exceeded',
                                             {**storage_diagnostics(root, result), **context})
+        if maximum is not None and maximum + unlinked_reserve > OVERHEAD_LIMIT:
+            raise StorageMeasurementBlocked('capacity blocked: image-copy unlinked spool reserve exceeds overhead',
+                                            {**storage_diagnostics(root, result), **context})
         if not vanished:
-            return {'bytes':maximum,'provisional':False,'worker_sha256':worker_sha,'root_identity':expected,**context}
+            return {'bytes':size if needs_complete else maximum,'provisional':False,'worker_sha256':worker_sha,'root_identity':expected,**context}
+    if needs_complete:
+        raise StorageMeasurementBlocked('storage measurement did not stabilize after an ordinary entry change within bounded retries',
+                                        {**storage_diagnostics(root, result), **context})
     # Live churn can produce valid but incomplete traversals. Keep the largest
     # observed count; it is provisional, never a completed-phase validation.
     if maximum is None:
@@ -745,11 +774,14 @@ class Probe:
                     not info.st_mode & 0o022 and info.st_dev == self.scratch_identity[0],
                     'declared scratch directory is unsafe or on another filesystem: ' + name)
 
-    def storage_measurement(self, live=False):
+    def storage_measurement(self, live=False, *, end=None):
         try:
-            measurement = measure_storage(self.root,live=live,expected_root={'device':self.scratch_identity[0],'inode':self.scratch_identity[1],'owner':self.scratch_owner},worker_sha=self.storage_worker_sha)
             reserve = fedora_oci.UNLINKED_RESERVE if self.image_copy_active else 0
-            require(measurement['bytes'] + reserve <= OVERHEAD_LIMIT, 'capacity blocked: image-copy unlinked spool reserve exceeds overhead')
+            if self.phase_end is not None:
+                end = min(end,self.phase_end) if end is not None else self.phase_end
+            measurement = measure_storage(self.root,live=live,expected_root={'device':self.scratch_identity[0],'inode':self.scratch_identity[1],'owner':self.scratch_owner},worker_sha=self.storage_worker_sha,end=end,unlinked_reserve=reserve)
+            require(measurement.get('max_observed_bytes',measurement['bytes']) + reserve <= OVERHEAD_LIMIT,
+                    'capacity blocked: image-copy unlinked spool reserve exceeds overhead')
             measurement['unlinked_spool_reserve_bytes'] = reserve
             return measurement
         except StorageMeasurementBlocked as exc:
@@ -793,7 +825,7 @@ class Probe:
                     # Rootful Podman owns private storage directories. Measure
                     # via a fixed read-only privileged tool, never silently skip
                     # inaccessible files in an unprivileged os.walk.
-                    measurement = self.storage_measurement(live=True)
+                    measurement = self.storage_measurement(live=True, end=started+timeout)
                     if measurement['provisional']:
                         self.report['provisional_storage_samples'] = self.report.get('provisional_storage_samples', 0) + 1
                     next_storage = time.monotonic() + 1
