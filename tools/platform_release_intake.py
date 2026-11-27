@@ -24,7 +24,7 @@ import platform_release as release
 from storage import GUEST_RESERVE, MANAGED_CEILING
 from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, ROLES, COMPONENT,
-    Blocked, canonical, file_hash, hex_id, json_bytes, require, seconds, stream_exact, portable_index, portable_roles,
+    Blocked, bounded_json, canonical, file_hash, hex_id, require, seconds, stream_exact, portable_index, portable_roles,
     site_predecessor,
 )
 
@@ -72,6 +72,8 @@ def protected(path, *, directory=False):
 
 def read_api(endpoint, end, *, limit=META_LIMIT, output=None):
     parent = os.getpid()
+    if output is None:
+        limit = min(limit, META_LIMIT)
 
     def limits():
         # A terminated intake must not leave a worker growing the anonymous ZIP.
@@ -94,7 +96,9 @@ def read_api(endpoint, end, *, limit=META_LIMIT, output=None):
         with tempfile.TemporaryFile(dir=ROOT) as target:
             transfer(target)
             target.seek(0)
-            return json_bytes(target.read(limit + 1))
+            value = bounded_json(target.read(limit + 1), limit, 'GitHub REST metadata exceeds its bound')
+            require(type(value) is dict, 'GitHub REST metadata must be an object')
+            return value
     transfer(output)
 
 

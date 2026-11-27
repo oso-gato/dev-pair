@@ -9,10 +9,12 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import platform_release_intake as intake
-from platform_release_protocol import ARCHIVE_LIMIT, Blocked, COMPONENT, ROLES, STANDARDS, canonical
+from platform_release_protocol import ARCHIVE_LIMIT, Blocked, COMPONENT, CONTROL_LIMIT, ROLES, STANDARDS, canonical, json_bytes
 
 
 class InitialIntakeTests(unittest.TestCase):
+    read_api = staticmethod(intake.read_api)
+
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.portable = self.root / 'platform-releases'
@@ -89,6 +91,21 @@ class InitialIntakeTests(unittest.TestCase):
         run = rows[name]['id'] // 10
         (stage / 'platform.json').write_bytes(canonical(self.indexes[run]))
 
+    def serve_locally(self, responses):
+        files = {}
+        for number, (endpoint, raw) in enumerate(responses.items()):
+            path = self.root / f'response-{number}'
+            path.write_bytes(raw)
+            files[intake.API + endpoint] = str(path)
+        binary = self.root / 'local-gh'
+        binary.write_text('#!/usr/bin/python3\nfrom pathlib import Path\nimport sys\n'
+                          f'files = {files!r}\n'
+                          'sys.stdout.buffer.write(Path(files[sys.argv[-1]]).read_bytes())\n')
+        binary.chmod(0o700)
+        self.enterContext(mock.patch.object(intake, 'GITHUB', str(binary)))
+        self.enterContext(mock.patch.object(intake, 'native_env', return_value=intake.ENV))
+        self.enterContext(mock.patch.object(intake, 'read_api', self.read_api))
+
     @staticmethod
     def selected(source, run, identity, previous, end):
         return {'schema': 2, 'platform_sha256': identity, 'source_sha': source, 'publisher_run': run,
@@ -107,6 +124,52 @@ class InitialIntakeTests(unittest.TestCase):
         self.assertEqual([call.args[4] for call in self.verify.call_args_list], [*ROLES, 'host'] * 2)
         self.assertEqual(list(self.portable.iterdir()), [])
         self.acquire.assert_called_once_with(self.source, 102, result['platform_sha256'], None, self.end)
+
+    def test_initial_selection_accepts_a_complete_71484_byte_run_inventory(self):
+        self.add(101, head_commit={'message': 'a' * (34 * 1024)})
+        self.add(102, head_commit={'message': ''})
+        listing = {'total_count': 2, 'workflow_runs': self.runs}
+        self.runs[1]['head_commit']['message'] = 'b' * (71484 - len(canonical(listing)))
+        raw = canonical(listing)
+        self.assertEqual(len(raw), 71484)
+        endpoint = (f'actions/workflows/{intake.PLATFORM_WORKFLOW}/runs?branch=main&event=push&status=success'
+                    f'&head_sha={self.source}&per_page={intake.INITIAL_RUN_LIMIT}')
+        responses = {'branches/main': canonical(self.branch), endpoint: raw}
+        for row in self.runs:
+            run = row['id']
+            responses[f'actions/runs/{run}'] = canonical(row)
+            rows = self.asset_rows[run]
+            responses[f'actions/runs/{run}/artifacts?per_page=100'] = canonical({'total_count': len(rows), 'artifacts': rows})
+        self.serve_locally(responses)
+        self.assertEqual(intake.acquire_initial(self.source, self.end)['publisher_run'], 102)
+        self.assertEqual(self.verify.call_count, 8)
+        self.assertEqual(list(self.portable.iterdir()), [])
+
+    def test_rest_and_zip_bounds_are_separate_from_signed_subjects(self):
+        def metadata(size):
+            return b'{"data":"' + b'x' * (size - len(b'{"data":""}\n')) + b'"}\n'
+
+        near = metadata(CONTROL_LIMIT + 1)
+        maximum = metadata(intake.META_LIMIT)
+        oversized = metadata(intake.META_LIMIT + 1)
+        self.serve_locally({'near': near, 'maximum': maximum, 'overflow': oversized,
+                            'duplicate': b'{"data":{"id":1,"id":2}}', 'array': b'[]'})
+        self.assertEqual(canonical(intake.read_api('near', self.end)), near)
+        self.assertEqual(canonical(intake.read_api('maximum', self.end)), maximum)
+        with self.assertRaises(subprocess.CalledProcessError):
+            intake.read_api('overflow', self.end, limit=len(oversized))
+        with self.assertRaises(subprocess.CalledProcessError):
+            intake.read_api('near', self.end, limit=CONTROL_LIMIT)
+        with self.assertRaisesRegex(Blocked, 'duplicate release field'):
+            intake.read_api('duplicate', self.end)
+        with self.assertRaisesRegex(Blocked, 'REST metadata must be an object'):
+            intake.read_api('array', self.end)
+        with self.assertRaisesRegex(Blocked, 'release metadata exceeds its bound'):
+            json_bytes(near)
+        with tempfile.TemporaryFile(dir=self.portable) as spool:
+            intake.read_api('overflow', self.end, limit=len(oversized), output=spool)
+            spool.seek(0)
+            self.assertEqual(spool.read(), oversized)
 
     def test_conflicting_verified_images_and_unavailable_attestation_do_not_stage(self):
         self.add(101)
