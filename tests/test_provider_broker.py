@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -133,28 +134,81 @@ class JobSelectionTests(unittest.TestCase):
         self.assertNotIn(db.JOB_BUILD, runtime.ENV['PATH'])
 
     def test_probe_and_live_options_reach_host_with_public_argv(self):
+        from bootstrap import Bootstrap
         import devbox
+        import job_protocol as protocol
         from test_devbox import manifest
 
         with tempfile.TemporaryDirectory(prefix='dp-role-argv-') as path:
-            candidate = Path(path) / 'manifest.json'
-            candidate.write_text('{}')
+            fixture = Path(path).resolve()
+            host = Bootstrap(fixture)
+            root = host.path('/var/lib/dev-pair')
+            candidate = root / 'manifest.json'
+            host.atomic('/var/lib/dev-pair/manifest.json', '{}')
+            marker = root / protocol.WORKLOAD_ACCESS
+            lease = root / protocol.WORKLOAD_LEASE
+            selected = manifest()
+            roles = {'release_sha256': 'a' * 64, 'maintenance_image': 'f' * 64,
+                     'development_image': selected['inner']['image_id'], 'devbox_image': selected['outer']['image_id']}
             setup = ['--manifest', str(candidate), '--sha256', 'b' * 64]
             live = ['--operation', 'resume-turn', '--request-sha256', 'c' * 64]
             operation = ('b' * 64, 'resume-turn', 'c' * 64)
-            cases = [(['run', *setup], None), (['run', *setup, *live], operation), ([*live, 'run', *setup], operation)]
-            for argv, expected in cases:
+
+            # Map only the temporary tree's controller ownership and its host ancestors.
+            # Keep the fixture file modes, identities, contents, and kernel locks real.
+            ancestors = set(marker.parents) | set(lease.parents)
+            real_lstat, real_fstat = Path.lstat, os.fstat
+            protected_inodes = set()
+
+            def controller_lstat(node_path):
+                node = real_lstat(node_path)
+                if node_path in ancestors:
+                    mode = node.st_mode if node_path.is_relative_to(fixture) else node.st_mode & ~0o022
+                    return SimpleNamespace(st_uid=0, st_mode=mode)
+                return node
+
+            def controller_fstat(fd):
+                node = real_fstat(fd)
+                if (node.st_dev, node.st_ino) in protected_inodes:
+                    return SimpleNamespace(st_uid=0, st_mode=node.st_mode, st_nlink=node.st_nlink,
+                                           st_size=node.st_size, st_dev=node.st_dev, st_ino=node.st_ino)
+                return node
+
+            def launch_turn(*args):
+                if args[-1] is not None:
+                    with self.assertRaises(BlockingIOError), protocol.workload_access_lease(root, exclusive=True):
+                        self.fail('activation acquired the lease during the admitted turn')
+                return {'turn': {'status': 'completed-turn'}}
+
+            def execute(argv, expected, blocked=None):
                 with self.subTest(argv=argv), patch.object(sys, 'argv', ['devbox.py', *argv]), \
                         patch.object(sys, 'stdout', new_callable=io.StringIO), patch.object(devbox.signal, 'signal'), \
+                        patch.object(sys, 'stderr', new_callable=io.StringIO) as diagnostics, \
+                        patch.object(devbox, 'ROOT', root / 'development'), \
+                        patch.object(Path, 'lstat', controller_lstat), patch.object(os, 'fstat', controller_fstat), \
                         patch.object(devbox, 'host_account'), patch.object(devbox, 'host_env'), patch.object(devbox, 'enforcing'), \
-                        patch.object(devbox.db, 'read_manifest', return_value=manifest()), \
+                        patch.object(devbox.db, 'read_manifest', return_value=selected), \
                         patch.object(devbox.db, 'immutable_image'), patch.object(devbox.db, 'remove_owned'), \
                         patch.object(devbox, 'ownership', return_value=nullcontext(('owner', 'hooks'))), \
                         patch.object(devbox, 'placement', return_value=({}, {})) as placement, \
-                        patch.object(devbox, 'launch', return_value={'turn': {'status': 'completed-turn'}}) as launch:
-                    self.assertEqual(devbox.main(), 0)
+                        patch.object(devbox, 'launch', side_effect=launch_turn) as launch:
+                    self.assertEqual(devbox.main(), 2 if blocked else 0, diagnostics.getvalue())
+                    if blocked:
+                        self.assertIn(blocked, diagnostics.getvalue())
+                        placement.assert_not_called()
+                        launch.assert_not_called()
+                        return
                     self.assertEqual(placement.call_args.args[-1], expected)
                     self.assertEqual(launch.call_args.args[-1], expected)
+
+            execute(['run', *setup], None)
+            execute(['run', *setup, *live], operation, 'workload access observation is unavailable')
+            host.publish_workload_gate('admitted', roles)
+            for protected in (marker, lease):
+                node = protected.stat()
+                protected_inodes.add((node.st_dev, node.st_ino))
+            execute(['run', *setup, *live], operation)
+            execute([*live, 'run', *setup], operation)
 
 
 class ProviderGatewayTests(unittest.TestCase):
