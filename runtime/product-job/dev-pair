@@ -1,0 +1,143 @@
+#!/usr/bin/python3 -IB
+"""The named operator's terminal commands for the dev-pair product conductor."""
+import argparse
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+ENTRY = '/usr/libexec/dev-pair/tools/owner_intake.py'
+COMMAND = ('/usr/bin/sudo', '-n', '--', ENTRY)
+BRIEF_MAX = 2500
+
+
+def query(request):
+    payload = json.dumps(request, ensure_ascii=False, separators=(',', ':')).encode()
+    if len(payload) > 8192:
+        raise ValueError('Owner input is too long.')
+    return subprocess.run(COMMAND, input=payload, stdout=subprocess.PIPE, check=True).stdout
+
+
+def show(record):
+    phase = 'checklist validation passed' if record['phase'] == 'passed' else record['phase'].replace('-', ' ')
+    print(f"Job {record['job_id']} · {phase}", flush=True)
+    if record.get('failed_stage'):
+        print('Stopped during ' + record['failed_stage'].replace('-', ' '), flush=True)
+    if record.get('diagnostics'):
+        print(record['diagnostics'], flush=True)
+    for role in ('maintenance', 'development'):
+        if record.get(role) and record[role].get('session_uuid'):
+            print(f"{role.title()} session {record[role]['session_uuid']}", flush=True)
+    for key, label in (('first', 'Host check'), ('final', 'Final host check')):
+        result = (record.get(key) or {}).get('result')
+        if result:
+            print(f"{label} {result['status']} · attempt {result['attempt_id']}", flush=True)
+            if result['status'] != 'pass':
+                print(result['diagnostics'], flush=True)
+
+
+def review(record):
+    show(record)
+    preview = record['preview']
+    plan = preview['plan']
+    agreement = plan['agreement']
+    expires = datetime.fromtimestamp(preview['expires_unix'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    print(f"Repository {agreement['repository']} at {agreement['initial_commit']}")
+    print(f"Startup revision {preview['startup_revision']} · standards {preview['standards_sha']}")
+    print(f"Verified startup SHA-256 {plan['startup_sha256']}")
+    print()
+    print(agreement['brief'])
+    print()
+    print('The checklist adapter verifies persistence after one controlled restart per candidate.')
+    print('The job allows one changed retest. Other product criteria require their agreed evidence.')
+    print(f"{agreement['build_seconds']}s per build · {agreement['host_seconds']}s per host check · "
+          f"{agreement['turn_seconds']}s per role turn")
+    print(f"Approved provider ceiling USD {preview['provider_microusd'] / 1_000_000:.6f} · expires {expires}")
+    for role, limits in preview['provider_limits'].items():
+        print(f"{role.title()} · up to {limits['max_requests']} provider requests · "
+              f"{limits['max_context_tokens']} input tokens per request · "
+              f"{limits['max_output_tokens']} output tokens per response · "
+              f"USD {limits['spend_microusd'] / 1_000_000:.6f} maximum · up to {limits['seconds']}s")
+    print(f"Agreement SHA-256 {record['agreement_token']}", flush=True)
+
+
+def brief(args, interactive):
+    if args.brief_file:
+        if args.brief_file == '-':
+            raw = sys.stdin.buffer.read(BRIEF_MAX + 1)
+        else:
+            with Path(args.brief_file).open('rb') as stream:
+                raw = stream.read(BRIEF_MAX + 1)
+        if len(raw) > BRIEF_MAX:
+            raise ValueError('The product brief exceeds 2500 UTF-8 bytes.')
+        return raw.decode('utf-8')
+    if args.brief is not None:
+        return args.brief
+    if not interactive:
+        raise ValueError('Give the product brief with --brief or --brief-file.')
+    return input('What should the pair build or fix? ')
+
+
+def follow(action, job):
+    payload = json.dumps({'action': action, 'job': job}).encode()
+    with subprocess.Popen(COMMAND, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False) as process:
+        with process.stdin:
+            process.stdin.write(payload)
+        for line in process.stdout:
+            show(json.loads(line))
+        return process.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='dev-pair', description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    for action in ('start', 'draft'):
+        new = sub.add_parser(action, help='review an agreement for an approved repository')
+        new.add_argument('repository')
+        source = new.add_mutually_exclusive_group()
+        source.add_argument('--brief')
+        source.add_argument('--brief-file', metavar='FILE')
+        new.add_argument('--acceptance', help='additional observable acceptance criterion from your agreement')
+        new.add_argument('--constraints', default='', help='additional scope or data limits')
+    submit = sub.add_parser('submit', help='confirm and start the exact saved agreement')
+    submit.add_argument('job')
+    submit.add_argument('agreement_sha256')
+    for action in ('status', 'reattach'):
+        sub.add_parser(action, help='read the latest job progress').add_argument('job')
+    sub.add_parser('agreement', help='read the saved product agreement').add_argument('job')
+    args = parser.parse_args()
+    try:
+        if args.action in ('status', 'reattach'):
+            return follow(args.action, args.job)
+        if args.action == 'agreement':
+            review(json.loads(query({'action': 'agreement', 'job': args.job})))
+            return 0
+        if args.action == 'submit':
+            show(json.loads(query({'action': 'submit', 'job': args.job,
+                                   'agreement_token': args.agreement_sha256})))
+            return 0
+        interactive = sys.stdin.isatty() and args.brief_file != '-'
+        text = brief(args, interactive)
+        acceptance = args.acceptance
+        if acceptance is None and interactive:
+            acceptance = input('Any acceptance criterion beyond your brief and checklist persistence? [Enter to keep both] ')
+        record = json.loads(query({'action': 'draft', 'repository': args.repository, 'brief': text,
+                                   'acceptance': acceptance or '', 'constraints': args.constraints}))
+        review(record)
+        job, token = record['job_id'], record['agreement_token']
+        if args.action == 'start' and interactive and input('Start this exact agreement? [y/N] ').strip().lower() in ('y', 'yes'):
+            show(json.loads(query({'action': 'submit', 'job': job, 'agreement_token': token})))
+        else:
+            print(f"Confirm when ready with dev-pair submit {job} {token}")
+        print(f"Follow with dev-pair reattach {job}")
+        return 0
+    except subprocess.CalledProcessError as error:
+        return error.returncode
+    except (EOFError, OSError, ValueError) as error:
+        print('Dev-pair request stopped. ' + str(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

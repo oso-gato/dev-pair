@@ -1,0 +1,143 @@
+# Start a job from the owner terminal
+
+Connect as the named operator `core` over the authorized tailnet route. Give
+the command an approved repository and a short product brief.
+
+```sh
+dev-pair start owner/approved-repository
+```
+
+For a multiline brief, give the command a local file. Include a known
+acceptance criterion and data limits when they matter.
+
+```sh
+dev-pair start owner/approved-repository --brief-file brief.txt --acceptance 'The same completed item appears once after restart.' --constraints 'Keep existing data and item IDs.'
+```
+
+The entry asks for the brief when one is missing. If an additional acceptance
+criterion is missing in an interactive session, it offers the fixed checklist
+persistence criterion alongside the brief. The preview shows the exact
+repository and starting commit, destination, scope, criteria, data constraints,
+startup policy, time and provider limits. Answer yes once to confirm the
+displayed agreement. Use `dev-pair draft` to save the preview for later
+confirmation. The preview prints the exact confirmation command with the job
+ID and digest.
+
+```sh
+dev-pair submit JOB AGREEMENT_SHA256
+dev-pair status JOB
+dev-pair reattach JOB
+dev-pair agreement JOB
+```
+
+Save the job ID before disconnecting. Preparation and product work run in
+detached services and publish durable state. Reattach reads the same job,
+reports progress while preparation runs and follows the normal product
+conductor after submission. It shows recorded role session IDs and native
+attempt IDs when available. If a host reboot interrupted scheduling, the same
+confirmation can request a restart of the same job. Repeat confirmations keep
+the original agreement. Use a new draft for a materially different brief.
+
+The current adapter exercises checklist restart persistence. Additional
+product criteria need their own evidence before delivery. The job uses the
+controlled private release process. The [product loop](product-job.md) owns
+the workspace changes, fixed host tests, candidate repair and role registrations.
+
+## Install the intake once
+
+Install these files from the combined independently reviewed release, with
+root ownership and protected ancestors.
+
+| Source | Installed path and mode |
+| --- | --- |
+| [Terminal command](../runtime/product-job/dev-pair) | `/usr/local/bin/dev-pair` mode 0755 |
+| [Protected entry](../tools/owner_intake.py) | `/usr/libexec/dev-pair/tools/owner_intake.py` mode 0755, alongside the existing trusted Python components |
+| [Scoped sudoers rule](../runtime/product-job/dev-pair-owner.sudoers) | `/etc/sudoers.d/60-dev-pair-owner` mode 0440, admitted by `visudo` |
+| [Preparation service](../runtime/product-job/dev-pair-intake@.service) | `/etc/systemd/system/dev-pair-intake@.service` mode 0644 |
+| [Private directories](../runtime/product-job/dev-pair-intake.conf) | `/etc/tmpfiles.d/dev-pair-intake.conf` mode 0644 |
+
+The named operator rule invokes the fixed entry with zero command-line
+arguments. The entry accepts a bounded stdin request containing the
+repository, brief, or job ID and agreement digest. Site paths, startup source,
+execution scope, role profiles and budgets come from root-owned configuration.
+The terminal command reads a brief file as the operator and passes only its
+text. The preparation unit uses a separate internal mode.
+
+Provision the ordinary [product](product-job.md), [role](role-entry.md),
+renewal and [Fedora executor](host-handoff.md) paths first. Trusted role image
+selection, provider credentials and allowance, independent release and named
+operator access are part of controlled setup. Keep
+`/var/lib/dev-pair/{maintenance,development}/conductor-inputs` as fixed
+mode-0700 directories owned by their role accounts for bounded Git transfer.
+
+The intake reads the selected renewal launch plan's admitted
+`development_manifests` map. A slot has a released DevBox manifest, bounded
+build filesystem and root-owned templates. Its role workspaces, state and cache
+leaves are created after the owner confirms. Approve the provider and product
+limits for each available slot in advance. The pool serves different
+authorized repositories. A used slot retains its original logical job ID and
+durable history. Automatic replenishment needs verified terminal jobs,
+preserved backups and results, settled pending operations and sessions, and
+a freshly approved logical ID and manifest.
+
+### Repository and slot inputs
+
+Keep the following under `/etc/dev-pair/product-intake` in root custody. The
+catalogue `repositories.json` has schema 1 and the fields `schema`,
+`repositories` and `slots`. The repository map binds each allowed
+`owner/repository` to its exact Git `commit`, `startup_revision` and
+human-readable private `destination`. The slots list gives the allocation
+order for unused job IDs in the approved renewal plan.
+
+For each repository, place protected Git checkouts at
+`repositories/OWNER/REPOSITORY/acquired` and
+`repositories/OWNER/REPOSITORY/startup`. The acquired checkout comes from the
+approved GitHub origin at the configured commit and contains the source used
+by the checklist adapter. The startup checkout supplies the repository's
+reviewed project documents at the configured revision. Place the verified
+private standards cache at `standards`. The existing startup loader verifies
+each repository's exact adoption and complete documents. At confirmation the
+normal `gptbox.py approve-job` entry binds the acquisition, startup corpus and
+agreed brief.
+
+Each `slots/JOB/profile.json` contains these fields.
+
+| Field | Value |
+| --- | --- |
+| `schema` | 1 |
+| `host_seconds`, `build_seconds`, `turn_seconds` | Approved limits within the existing conductor maxima |
+| `allowance_ref`, `spend_microusd`, `expires_unix` | Approved provider account reference, total job spend ceiling and actual expiration |
+| `pricing` | Existing broker model fields `max_context_tokens`, `input_microusd_per_million`, `output_microusd_per_million`, `observed_models`, `context_evidence_sha256`, `tariff_evidence_sha256` |
+
+Store the reviewed evidence as `slots/JOB/gpt-6.2-sol.context` and
+`slots/JOB/gpt-6.2-sol.tariff`. Those files carry the existing broker's verified
+billing ceiling and tariff for the actual account. The site's approved
+allowance must cover all available grants. An unavailable or expired provider
+authorization blocks preparation.
+
+Each `slots/JOB/ROLE/profile.json` has the conductor's `runtime_sha256`,
+`binary_sha256`, `layout_sha256`, named `credential_ref` and a `grant`
+containing exactly `spend_microusd`, `seconds`, `max_requests`,
+`max_request_bytes` and `max_output_tokens`. Store the credential in the
+protected role provider path. Intake materializes the job-bound allowance and
+role limits so the existing broker can validate them before role execution.
+
+Each `slots/JOB/ROLE/seed` uses the reviewed role configuration and exclusive
+SELinux categories. Include readonly placeholders for `turn/request.json`,
+`turn/prompt.txt`, `turn/approval.json`, `turn/startup/manifest.json` and all seven
+named startup documents. Intake preserves the seed's assigned role group
+access and readonly metadata while binding the approved acquisition and
+verified private startup files. The conductor replaces its request and prompt
+placeholders during normal turn entry. Keep unallocated job inputs outside
+the role workspace and state inventories.
+
+## Validation
+
+```sh
+/usr/bin/python3 -B -m unittest discover -s tests -p test_owner_intake.py -v
+```
+
+The local checks use real Git objects, private durable files and the regular
+product submission path with fixture approval, placement and systemd seams.
+The installed sudo rule, enforcing Fedora labels, actual provider allowance,
+role placement and owner reconnect journey require native acceptance.
