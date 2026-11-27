@@ -162,3 +162,55 @@ class PlatformReleaseInstallerTests(unittest.TestCase):
             receipt['kind'] = 'maintenance-gptbox-probe-candidate'
             with self.assertRaisesRegex(protocol.Blocked, 'actual restricted native maintenance probe'):
                 install.maintenance_probe(stage, self.index(), 'verify', self.end)
+
+    def test_actual_versioned_manifest_retains_stable_outer_and_original_inner_encoding(self):
+        stage = self.root / self.platform
+        (stage / 'development').mkdir(parents=True)
+        disk = b'role-scoped archive bytes'
+        inner = {'image_id': self.image, 'source_sha': self.source, 'context_sha256': self.context,
+                 'inputs_sha256': '8' * 64, 'sealed_sha256': '9' * 64, 'archive_bytes': len(disk),
+                 'archive_sha256': release.digest(disk), 'diff_ids': ['sha256:' + 'a' * 64]}
+        (stage / 'development/part.json').write_bytes(protocol.canonical({'producer': inner}))
+        stable_outer = {'source_sha': 'b' * 40, 'oci_config_sha256': 'c' * 64, 'oci_manifest_sha256': 'd' * 64}
+        base = {'components': {'devbox': stable_outer}}
+        index = {'source_sha': self.source, 'standards_sha': protocol.STANDARDS, 'components': {
+            'development-agent': {'context_sha256': self.context, 'oci_config_sha256': self.image,
+                                  'oci_manifest_sha256': self.manifest, 'archive_bytes': len(disk),
+                                  'archive_sha256': release.digest(disk)}}}
+        manifest = {'kind': 'dev-pair-development-nested-v1', 'standards_sha': protocol.STANDARDS,
+                    'job': 'checklist', 'storage_bytes': 8 * protocol.GIB, 'inner': inner,
+                    'outer': {'source_sha': stable_outer['source_sha'], 'image_id': stable_outer['oci_config_sha256']},
+                    'categories': self.config['jobs']['checklist']['categories']}
+
+        def place(value):
+            raw = protocol.canonical(value)
+            identity = release.digest(raw)
+            leaf = self.root / 'development/builds/checklist/inputs' / identity
+            leaf.mkdir(parents=True)
+            for name, data in (('manifest.json', raw), ('development.oci.tar', disk)):
+                path = leaf / name
+                path.write_bytes(data)
+                path.chmod(0o444)
+            return {'outer': {key: stable_outer[key] for key in ('oci_config_sha256', 'oci_manifest_sha256')},
+                    'jobs': {'checklist': {'manifest_sha256': identity}}}
+
+        ordinary_json = release.readonly_json
+        ordinary_hash = install.file_hash
+        with (
+            mock.patch.object(install, 'ROOT', self.root),
+            mock.patch.object(release, 'readonly_json', side_effect=lambda path, _owner=None: ordinary_json(path)),
+            mock.patch.object(install, 'file_hash', side_effect=lambda path, maximum, end, **_kwargs:
+                              ordinary_hash(path, maximum, end)),
+            mock.patch.object(install.devbox, 'check_label', create=True) as label,
+            mock.patch.object(install.devbox, 'storage_mount'),
+        ):
+            reported = place(manifest)
+            _, proof = install.check_development(stage, index, base, self.config, reported, self.end)
+            encoded = install.gptbox.image_inputs_bytes(inner)
+            self.assertNotEqual(encoded, protocol.canonical(inner))
+            self.assertEqual(proof['inner_sha256'], release.digest(encoded))
+            self.assertEqual(proof['jobs'], reported['jobs'])
+            self.assertEqual(label.call_count, 2)
+            wrong = {**manifest, 'outer': {**manifest['outer'], 'source_sha': self.source}}
+            with self.assertRaisesRegex(protocol.Blocked, 'stable outer'):
+                install.check_development(stage, index, base, self.config, place(wrong), self.end)

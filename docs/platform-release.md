@@ -144,7 +144,7 @@ placement paths and the immutable installed host bundle read back. It binds
 | `host` | `manifest_sha256` |
 | `maintenance` | `context_sha256`, `oci_config_sha256`, `oci_manifest_sha256`, `result_sha256` of P's local admission record |
 | `devbox` | `oci_config_sha256`, `oci_manifest_sha256` |
-| `development` | `context_sha256`, `oci_config_sha256`, `oci_manifest_sha256`, `inner_sha256` of the canonical producer record, and `jobs` mapping each job to `manifest_sha256` |
+| `development` | `context_sha256`, `oci_config_sha256`, `oci_manifest_sha256`, `inner_sha256` of the exact producer `inner.json` encoding, and `jobs` mapping each job to `manifest_sha256` |
 
 U independently derives the local launch plan and release from the portable
 index, protected site configuration and actual native scopes. Activation

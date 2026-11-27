@@ -525,7 +525,7 @@ def check_development(stage, index, base_index, site, reported, end):
         devbox.storage_mount(build, expected['storage_bytes'], mountinfo)
         records[job] = {'manifest_sha256': manifest_sha}
     result = {key: current[key] for key in ('context_sha256', 'oci_config_sha256', 'oci_manifest_sha256')}
-    result.update(inner_sha256=release.digest(canonical(inner)), jobs=records)
+    result.update(inner_sha256=release.digest(gptbox.image_inputs_bytes(inner)), jobs=records)
     return observed, result
 
 
