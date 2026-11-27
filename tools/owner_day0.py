@@ -70,7 +70,7 @@ def kit_source(repo, supplied=None):
     require(manifest.stat().st_size <= 2 * MIB, 'owner kit manifest exceeds its bound')
     seen = set()
     for line in manifest.read_text().splitlines():
-        match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9._/+-]+)', line)
+        match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9._/+@-]+)', line)
         require(match, 'owner kit manifest contains an invalid path')
         digest, name = match.groups()
         leaf = PurePosixPath(name)
@@ -410,6 +410,10 @@ class DayZero:
             result = self.call('gptbox.py', 'assemble-prepared-maintenance', *common, '--context', context,
                                *retry, timeout=1850, checkout=checkout)
             return self.probes(result, revision, expected)
+        if access[0] == '--console-receipt' and access[1] != ATTENDED_RECEIPT:
+            # Signed provider evidence uses the ordinary clean-checkout source
+            # verifier. Its closed receipt does not carry an alternate checkout.
+            checkout = self.repo
         options = [*common, '--gptbox-context', context, *access]
         if access[0] == '--bootstrap-source':
             options.append('--provider-ssh')

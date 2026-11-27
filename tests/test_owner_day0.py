@@ -41,7 +41,7 @@ class DayZeroTests(unittest.TestCase):
 
     def test_gitless_kit_verification_and_signed_prerequisite(self):
         repo = self.entry.repo
-        for name in ('day0.sh', 'tools/owner_day0.py', '.git/HEAD', '.git/index'):
+        for name in ('day0.sh', 'tools/owner_day0.py', 'runtime/dev-pair-test@.service', '.git/HEAD', '.git/index'):
             leaf = repo / name
             leaf.parent.mkdir(parents=True, exist_ok=True)
             leaf.write_bytes(name.encode())
@@ -59,6 +59,11 @@ class DayZeroTests(unittest.TestCase):
             self.assertEqual(command.call_args.args[0][-3:], ['--enablerepo=updates', 'install', 'git-core'])
             self.assertIn('--setopt=gpgcheck=1', command.call_args.args[0])
             self.entry.app.destination_source.assert_called_once_with(SOURCE)
+            safe_manifest = manifest.read_text()
+            manifest.write_text(safe_manifest + '1' * 64 + '  dev-pair/../outside\n')
+            with self.assertRaisesRegex(bootstrap.Blocked, 'outside its approved source'):
+                day.kit_source(repo)
+            manifest.write_text(safe_manifest)
             (repo / 'day0.sh').write_bytes(b'changed')
             with self.assertRaisesRegex(bootstrap.Blocked, 'bytes differ'):
                 day.kit_source(repo)
@@ -275,3 +280,94 @@ class DayZeroTests(unittest.TestCase):
             with self.assertRaisesRegex(bootstrap.Blocked, 'foreign relabel'):
                 self.entry.selinux(self.identity, SOURCE, None)
         self.assertEqual(self.entry.call.call_args.args[1], 'converge')
+
+    def authority_source(self):
+        upstream = self.entry.repo
+        (upstream / 'tools').mkdir(parents=True)
+        original = Path(bootstrap.__file__).read_bytes()
+        (upstream / 'tools/bootstrap.py').write_bytes(original)
+        for args in (('init', '-q'), ('add', '.'), ('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                                                    'commit', '-qm', 'authority source fixture')):
+            subprocess.run(['/usr/bin/git', '-C', str(upstream), *args], check=True)
+        revision = subprocess.check_output(['/usr/bin/git', '-C', str(upstream), 'rev-parse', 'HEAD'], text=True).strip()
+        return upstream, revision
+
+    @staticmethod
+    def native_call(*args, **kwargs):
+        return subprocess.run(args, text=True, input=kwargs.get('input_text'), capture_output=True, timeout=10, check=True).stdout
+
+    @contextmanager
+    def projected_root_ancestry(self):
+        original = Path.lstat
+
+        def projected(path):
+            node = original(path)
+            return SimpleNamespace(st_mode=node.st_mode & ~0o022, st_uid=0, st_nlink=node.st_nlink, st_size=node.st_size)
+
+        with patch.object(Path, 'lstat', projected):
+            yield
+
+    def test_signed_provider_receipt_retains_its_closed_schema_and_git_authority(self):
+        source, revision = self.authority_source()
+        key = self.directory / 'issuer'
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True)
+        allowed = self.directory / 'allowed-signers'
+        principal = 'dev-pair-provider-console'
+        allowed.write_text(principal + ' ' + key.with_suffix('.pub').read_text())
+        receipt = self.directory / 'provider.json'
+        app = bootstrap.Bootstrap(self.directory, self.native_call)
+        app.destination_identity = Mock(return_value={'machine_id': MACHINE, 'boot_id': BOOT})
+        fields = {'provider', 'provider_vps_id', 'transport', 'reopened_root', 'public_ssh_denied'}
+        data = {'version': 1, 'source_sha': revision, 'machine_id': MACHINE, 'boot_id': BOOT, 'issued_at': int(time.time()),
+                'expires_at': int(time.time()) + 300, 'provider': 'hostinger', 'provider_vps_id': 'fixture-vps',
+                'transport': 'out-of-band', 'reopened_root': True, 'public_ssh_denied': True}
+
+        def sign(value):
+            receipt.write_text(json.dumps(value) + '\n')
+            receipt.with_suffix('.json.sig').unlink(missing_ok=True)
+            subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-q', '-n', 'dev-pair-destination', '-f', str(key),
+                            str(receipt)], capture_output=True, check=True)
+
+        with (self.projected_root_ancestry(), patch.object(bootstrap, '__file__', str(source / 'tools/bootstrap.py')),
+              patch.object(bootstrap, 'TRUST_SIGNERS', '/allowed-signers')):
+            sign(data)
+            self.assertEqual(app.recent_destination_evidence(str(receipt), principal, fields, lifetime=7200), data)
+            sign({**data, 'source_sha': 'a' * 40})
+            with self.assertRaisesRegex(bootstrap.Blocked, 'source checkout differs'):
+                app.recent_destination_evidence(str(receipt), principal, fields, lifetime=7200)
+            sign({**data, 'owner_checkout': str(source)})
+            with self.assertRaisesRegex(bootstrap.Blocked, 'evidence is stale'):
+                app.recent_destination_evidence(str(receipt), principal, fields, lifetime=7200)
+
+    def test_real_attended_authority_in_initialize_from_sanitized_no_index_source(self):
+        source, revision = self.authority_source()
+        work = self.directory / 'context'
+        (work / 'home').mkdir(parents=True)
+        sanitized = work / 'dev-pair'
+        public_inputs.clean_checkout(source, revision, sanitized, work)
+        self.assertFalse((sanitized / '.git/index').exists())
+        receipt = self.directory / 'recovery.json'
+        proof = {'schema': 1, 'kind': bootstrap.ATTENDED_ACCESS, 'source_sha': revision, 'machine_id': MACHINE,
+                 'boot_id': BOOT, 'created_at': int(time.time()), 'origin_session': 1001, 'confirmed_session': 1002,
+                 'owner_checkout': str(source)}
+        receipt.write_text(json.dumps(proof))
+        receipt.chmod(0o600)
+        app = gptbox.Gptbox(self.directory, self.native_call)
+        app.destination_identity = Mock(return_value={'machine_id': MACHINE, 'boot_id': BOOT})
+        app.ssh_ancestor = Mock(return_value=False)
+        app.preflight = Mock()
+        app.check_gptbox_inputs = Mock(return_value=(None, None, {'source_sha': revision}))
+        app.protected = lambda path: Path(path)
+        mark = app.path(bootstrap.STATE + '/operator-password-set')
+        mark.parent.mkdir(parents=True)
+        mark.touch()
+        context = 'b' * 64
+        with (self.projected_root_ancestry(), patch.object(bootstrap, '__file__', str(sanitized / 'tools/bootstrap.py')),
+              patch.object(bootstrap, 'ATTENDED_RECEIPT', str(receipt)), patch.dict(os.environ, {}, clear=True)):
+            reply = app._initialize(str(work), context, str(work), revision, None, console_receipt=str(receipt))
+            self.assertEqual(reply['preview'], 'initialize')
+            self.assertTrue(app.attended_access)
+            self.assertFalse((sanitized / '.git/index').exists())
+            receipt.write_text(json.dumps({**proof, 'source_sha': 'a' * 40}))
+            with self.assertRaisesRegex(bootstrap.Blocked, 'source checkout differs'):
+                app._initialize(str(work), context, str(work), revision, None, console_receipt=str(receipt))

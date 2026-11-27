@@ -1338,7 +1338,7 @@ class Bootstrap:
                 or not data['issued_at'] < data['expires_at'] <= data['issued_at'] + lifetime
                 or data['expires_at'] <= time.time()):
             raise Blocked('destination evidence is stale or belongs to another machine/boot')
-        self.destination_source(data['source_sha'], checkout=data['owner_checkout'])
+        self.destination_source(data['source_sha'])
         return data
 
     def validate_bootstrap_access(self, sources, console_receipt=None):
@@ -1377,7 +1377,7 @@ class Bootstrap:
                 or any(type(data[key]) is not int or data[key] < 2 for key in ('origin_session', 'confirmed_session'))
                 or data['origin_session'] == data['confirmed_session']):
             raise Blocked('separate current-boot attended recovery confirmation is required')
-        self.destination_source(data['source_sha'])
+        self.destination_source(data['source_sha'], checkout=data['owner_checkout'])
         return data
 
     def ssh_ancestors(self):
