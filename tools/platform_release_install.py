@@ -24,7 +24,6 @@ import devbox
 import gptbox
 import platform_release as release
 import platform_release_intake as intake
-from storage import MANAGED_CEILING
 from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, EXPANSION_LIMIT, GIB, HOST_LIMIT, Blocked, canonical, fields,
     file_hash, hex_id, json_bytes, regular, require, seconds,
@@ -600,14 +599,7 @@ def stage_budget(stage, capacity):
     node = stage.lstat()
     if f'{os.major(node.st_dev)}:{os.minor(node.st_dev)}' == capacity['device']:
         return  # Kernel available space already charges these input bytes.
-    remaining = MANAGED_CEILING - capacity['backing_bytes']
-    require(remaining > 0, 'release archive backing does not fit the aggregate managed budget')
-    mountinfo = Path('/proc/self/mountinfo').read_text()
-    separate = devbox.storage_mount(intake.ROOT, remaining, mountinfo)
-    device = Path('/sys/dev/block') / separate['device']
-    sectors = int((device / 'size').read_text().strip())
-    require(separate['bytes'] <= sectors * 512 and capacity['backing_bytes'] + sectors * 512 <= MANAGED_CEILING,
-            'role and archive filesystems exceed the shared managed ceiling')
+    intake.archive_geometry(intake.ROOT, capacity, intake.read_mountinfo())
 
 
 def rootless_import_peak(archive, row, end):

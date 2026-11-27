@@ -86,9 +86,24 @@ Intake verifies the Actions transport, portable attestation for each admitted
 component, and compatible retained prior components. It extracts only the
 declared files under explicit compressed, expanded and time limits. It verifies
 actual OCI and host bundle content before publishing the content-addressed
-staging directory and receipt. The store holds up to three staged versions
-under one lock and preserves the 8GiB host reserve. Retiring a retained digest
-requires the authorized activation and recovery procedure.
+staging directory and receipt. Agent intake measures the signed extracted
+bytes plus the largest bounded ZIP, staging metadata and the existing 8GiB
+recovery reserve. The archive and native role volumes count against the shared
+20GiB managed capacity. The transfer also preserves the installer's inode
+reserve. The stable base, active release, compatible rollback input and an
+incoming transfer can overlap, so a site must have room for all four when
+their archive bytes differ.
+
+Under measured pressure, the intake lock and renewal selection protect the
+base, active and compatible previous packages, pending offers and requests,
+and in-progress renewal or native staging. Only positively superseded agent
+transfer archives on the measured filesystem are eligible for reclamation.
+Before removing each eligible package's verified OCI archive leaves, the
+installer durably records the retirement at that digest. The signed index,
+producer metadata, local predecessor, intake and installation evidence stay
+in place. A retired archive cannot serve as a future intake or installation
+input. Mixed selections without enough protected evidence to prove retirement
+authority and sites that still lack capacity stop before the large transfer.
 
 The subjects and physical bytes are under
 `/var/lib/dev-pair/platform-releases/<platform-sha256>/`. Each role has a

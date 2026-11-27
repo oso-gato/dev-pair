@@ -18,7 +18,7 @@ import time
 import zipfile
 
 import platform_release as release
-from storage import GUEST_RESERVE
+from storage import GUEST_RESERVE, MANAGED_CEILING
 from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, ROLES, COMPONENT,
     Blocked, canonical, file_hash, hex_id, json_bytes, require, seconds, stream_exact, portable_index, portable_roles,
@@ -30,9 +30,10 @@ ROOT = Path('/var/lib/dev-pair/platform-releases')
 TRUST = Path('/usr/libexec/dev-pair/tools/release_trust.py')
 API = 'repos/' + release.REPOSITORY + '/'
 CONTROL_SECONDS = 900
-MAX_LOCAL_RELEASES = 3
 ZIP_OVERHEAD = 1024 * 1024
 META_LIMIT = 256 * 1024
+TRANSFER_INODES = 512 + 24  # Installer reserve plus a complete transfer's control and payload leaves.
+RETIREMENT = 'archives-retired.json'
 ENV = {'PATH': '/usr/bin:/usr/sbin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8',
        'GH_PROMPT_DISABLED': '1', 'GH_NO_UPDATE_NOTIFIER': '1', 'GH_HOST': 'github.com'}
 
@@ -80,6 +81,44 @@ def read_api(endpoint, end, *, limit=META_LIMIT, output=None):
 def intake_limit(directory, files, headroom=0):
     demand = sum(files) + headroom + GUEST_RESERVE
     require(shutil.disk_usage(directory).free >= demand, 'release intake capacity and recovery reserve are insufficient')
+
+
+def read_mountinfo():
+    with Path('/proc/self/mountinfo').open('rb') as source:
+        raw = source.read(1024**2 + 1)
+    require(0 < len(raw) <= 1024**2, 'release mount inventory exceeds its byte bound')
+    return raw.decode()
+
+
+def archive_geometry(directory, managed, mountinfo):
+    """Independently charge a separate archive backing once to the managed cap."""
+    import devbox
+
+    node = directory.lstat()
+    if f'{os.major(node.st_dev)}:{os.minor(node.st_dev)}' != managed['device']:
+        remaining = MANAGED_CEILING - managed['backing_bytes']
+        require(remaining > 0, 'release archive backing does not fit the aggregate managed budget')
+        separate = devbox.storage_mount(directory, remaining, mountinfo)
+        device = Path('/sys/dev/block') / separate['device']
+        sectors = int((device / 'size').read_text().strip())
+        require(separate['bytes'] <= sectors * 512 and managed['backing_bytes'] + sectors * 512 <= MANAGED_CEILING,
+                'role and archive filesystems exceed the shared managed ceiling')
+    return node.st_dev
+
+
+def retirement_device():
+    import devbox
+
+    mountinfo = read_mountinfo()
+    prefix = os.fsencode(ROOT) + b'/'
+    require(not any(os.fsencode(row.split()[4]).startswith(prefix) for row in mountinfo.splitlines()),
+            'portable inputs have nested mounts; retirement is unresolved')
+    managed = devbox.managed_storage(mountinfo)
+    device = archive_geometry(ROOT, managed, mountinfo)
+    mounts = [row.split() for row in mountinfo.splitlines()]
+    archive_device = f'{os.major(device)}:{os.minor(device)}'
+    mount_ids = tuple(row[0] for row in mounts if row[2] in {archive_device, managed['device']})
+    return device, managed['backing_inode'], managed['backing_bytes'], mount_ids
 
 
 def checked_run(value, source, run, agent):
@@ -203,8 +242,206 @@ def retained_index(identity):
 
 def previous_release(identity, end):
     previous, value, _ = retained_index(identity)
+    require(not os.path.lexists(previous / RETIREMENT), 'portable release has retired its archive transfer; choose an available predecessor')
     verify_local_parts(previous, value, end)
     return value
+
+
+def staged_paths(end):
+    paths = []
+    with os.scandir(ROOT) as entries:
+        for entry in entries:
+            seconds(end, CONTROL_SECONDS)
+            if entry.name != '.intake.lock':
+                require(re.fullmatch('[0-9a-f]{64}', entry.name),
+                        'portable staging contains an unresolved or foreign entry')
+                paths.append(protected(Path(entry.path), directory=True))
+    return paths
+
+
+def portable_predecessor(directory, index):
+    if index['schema'] == 3:
+        _, binding = release.readonly_json(protected(directory / 'site-predecessor.json'), 0)
+        return site_predecessor(binding, directory.name, index['base_platform_sha256'])
+    return index['previous_platform_sha256']
+
+
+def bound_local_platform(controller, reference, catalog, *, required=True):
+    import renewal
+
+    reference = hex_id(reference)
+    local = controller.release(reference)
+    path = controller.control / 'platform-bindings' / (reference + '.json')
+    if not os.path.lexists(path):
+        require(not required, 'retirement requires an exact portable binding for the selected or pending local release')
+        return None
+    binding = renewal.read_json(path)
+    identity = hex_id(binding['platform_sha256'])
+    _, index, receipt = catalog[identity]
+    component = local['components']['maintenance-agent']
+    require(set(binding) == {'schema', 'release_sha256', 'platform_sha256', 'base_platform_sha256',
+                             'site_config_sha256', 'plan_sha256', 'intake_sha256'} and type(binding['schema']) is int and
+            binding['schema'] == 1 and binding['release_sha256'] == reference and binding['intake_sha256'] == receipt and
+            binding['plan_sha256'] == local['plan_sha256'] and
+            binding['base_platform_sha256'] == (index['base_platform_sha256'] or identity) and
+            component.get('platform_sha256', identity) == identity and
+            component['artifact_sha256'] == index['components']['maintenance-agent']['oci_config_sha256'] and
+            component['source_revision'] == index['source_sha'], 'local and portable retirement authority differ')
+    return identity
+
+
+def retirement_scope(controller, catalog, expected_previous, base, end):
+    import renewal
+    from renewal_site import offer_record
+
+    current = controller.live_release()
+    _, journal = controller.transition()
+    require(renewal.read_json(controller.control / 'site-current.json') == current and
+            (journal is None or journal['phase'] in renewal.TERMINAL) and
+            not os.path.lexists(controller.root / 'renewal-fence/frozen') and
+            not os.path.lexists(controller.root / '.platform-maintenance-lease.json'),
+            'pending renewal, boot observation or native ownership prevents portable archive retirement')
+    active = bound_local_platform(controller, current, catalog)
+    require(active == expected_previous and (catalog[active][1]['base_platform_sha256'] or active) == base and
+            catalog[base][1]['kind'] == 'dev-pair-platform-release',
+            'active site selection or stable portable base changed before retirement')
+    lineage = set()
+    reference = active
+    while reference != base:
+        seconds(end, CONTROL_SECONDS)
+        require(reference in catalog and reference not in lineage, 'active portable predecessor chain is incomplete or cyclic')
+        lineage.add(reference)
+        directory, index, _ = catalog[reference]
+        require(index['base_platform_sha256'] == base, 'active portable predecessor changes the stable base')
+        reference = portable_predecessor(directory, index)
+    lineage.add(base)
+    keep = {base, active}
+    if active != base:
+        keep.add(portable_predecessor(*catalog[active][:2]))
+    require(all(not os.path.lexists(catalog[identity][0] / RETIREMENT) for identity in keep),
+            'active or recoverable portable release has missing retained archive authority')
+
+    for scope in ('initial', 'agent'):
+        path = controller.control / 'offers' / (scope + '.json')
+        if os.path.lexists(path):
+            offer = offer_record(renewal.read_json(path), scope)
+            keep.add(offer['platform_sha256'])
+            if offer['previous_release_sha256'] is not None:
+                keep.add(bound_local_platform(controller, offer['previous_release_sha256'], catalog))
+    for scope in renewal.SCOPE_COMPONENTS:
+        path = controller.control / 'requests' / (scope + '.json')
+        if os.path.lexists(path):
+            raw = renewal.read_json(path)
+            request = renewal.checked_request(raw['request'] if scope == 'agent' else raw, scope)
+            keep.update(bound_local_platform(controller, request[key], catalog) for key in ('previous_sha256', 'target_sha256'))
+
+    rejected = set()
+    attempts = renewal.trusted_directory(controller.control / 'attempts')
+    with os.scandir(attempts) as entries:
+        for count, entry in enumerate(entries, 1):
+            seconds(end, CONTROL_SECONDS)
+            require(count <= renewal.MAX_ATTEMPTS, 'renewal journal exceeds its retained-attempt bound')
+            attempt = renewal.trusted_directory(Path(entry.path))
+            record = renewal.read_json(attempt / 'journal.json')
+            require(type(record['schema']) is int and record['schema'] == 1 and record['attempt_id'] == attempt.name,
+                    'retained renewal attempt identity differs')
+            request = renewal.checked_request(record['request'], record['request']['scope'])
+            if record['phase'] not in renewal.TERMINAL or (record['phase'] == 'deferred' and request['previous_sha256'] == current):
+                keep.update(bound_local_platform(controller, request[key], catalog)
+                            for key in ('previous_sha256', 'target_sha256'))
+            if record['phase'] in ('rolled-back', 'rejected') and request['scope'] == 'agent':
+                rejected.add(bound_local_platform(controller, request['target_sha256'], catalog, required=False))
+    return current, keep, lineage - {active}, rejected
+
+
+def retired_record(directory, receipt):
+    path = directory / RETIREMENT
+    if not os.path.lexists(path):
+        return None
+    raw, value = release.readonly_json(protected(path), 0)
+    require(set(value) == {'schema', 'platform_sha256', 'intake_sha256', 'superseding_release_sha256'} and
+            stat.S_IMODE(path.lstat().st_mode) == 0o600 and type(value['schema']) is int and value['schema'] == 1 and
+            value['platform_sha256'] == directory.name and value['intake_sha256'] == receipt and raw == canonical(value),
+            'portable archive retirement journal differs from its exact intake evidence')
+    hex_id(value['superseding_release_sha256'])
+    return value
+
+
+def retireable_archives(directory, index, receipt, device, end):
+    retired = retired_record(directory, receipt)
+    owned = []
+    for role, transfer in index['transports'].items():
+        parent = protected(directory / role, directory=True)
+        require(parent.lstat().st_dev == device, 'portable archive directory changed its measured filesystem')
+        require({item.name for item in parent.iterdir()} <= set(transfer['files']),
+                'foreign portable role file prevents archive retirement')
+        for name, item in transfer['files'].items():
+            path = parent / name
+            archive = name == f'{role}.oci.tar'
+            if archive and retired and not os.path.lexists(path):
+                continue  # A prior invocation durably authorized this exact leaf.
+            node = protected(path).lstat()
+            require(node.st_dev == device and file_hash(path, item['bytes'], end, owner=0) == (item['sha256'], item['bytes']),
+                    'portable transport changed before retirement')
+            if archive:
+                owned.append((path, archive_inode(node)))
+    return retired, owned
+
+
+def archive_inode(node):
+    return (node.st_dev, node.st_ino, node.st_mode, node.st_uid, node.st_gid, node.st_nlink,
+            node.st_size, node.st_mtime_ns, node.st_ctime_ns)
+
+
+def retain_for_transfer(paths, previous, base, demand, end):
+    """Recover only verified surplus transfer files under actual package pressure."""
+    def enough():
+        state = os.statvfs(ROOT)
+        return state.f_bavail * state.f_frsize >= demand + GUEST_RESERVE and state.f_favail >= TRANSFER_INODES
+
+    volume = retirement_device()
+    if enough():
+        return
+    import renewal
+
+    catalog = {}
+    for path in paths:
+        seconds(end, CONTROL_SECONDS)
+        catalog[path.name] = retained_index(path.name)
+    controller = renewal.Renewal(ROOT.parent, None)
+    with controller.lock():
+        scope = retirement_scope(controller, catalog, previous, base, end)
+    rollback = portable_predecessor(*catalog[previous][:2])
+    if previous != base and rollback != base:
+        previous_release(rollback, end)
+    _, keep, historical, rejected = scope
+    ordered = sorted(catalog.values(), key=lambda record: record[1]['publisher_run'])
+    for directory, index, receipt in ordered:
+        if index['kind'] != 'dev-pair-agent-release' or index['base_platform_sha256'] != base or directory.name in keep:
+            continue
+        if directory.name not in historical | rejected and portable_predecessor(directory, index) not in historical:
+            continue
+        retired, owned = retireable_archives(directory, index, receipt, volume[0], end)
+        if not owned:
+            continue
+        with controller.lock():
+            require(retirement_scope(controller, catalog, previous, base, end) == scope and retirement_device() == volume,
+                    'portable retirement authority or physical backing changed')
+            if retired is None:
+                state = os.statvfs(directory)
+                require(state.f_favail > 0 and state.f_bavail * state.f_frsize >= CONTROL_LIMIT,
+                        'portable archive retirement needs space for its protected journal')
+                release.write_json(directory / RETIREMENT, {'schema': 1, 'platform_sha256': directory.name,
+                                   'intake_sha256': receipt, 'superseding_release_sha256': scope[0]})
+                release.sync_directory(directory)
+            for path, node in owned:
+                require(archive_inode(protected(path).lstat()) == node, 'owned portable archive changed after verification')
+                path.unlink()
+                release.sync_directory(path.parent)
+        if enough():
+            return
+    raise Blocked('portable archive capacity and recovery reserve are insufficient after scoped retirement; '
+                  'active, compatible previous and pending inputs remain reserved')
 
 
 @contextmanager
@@ -230,17 +467,18 @@ def acquire(source, run, expected, previous, end, *, agent=False):
     protected(ROOT, directory=True)
     require(Path(GITHUB).is_file(), 'protected read-only GitHub CLI unavailable')
     require(not os.path.lexists(ROOT / expected), 'platform package already staged at its exact digest')
-    entries = [item for item in ROOT.iterdir() if item.name != '.intake.lock']
-    require(len(entries) < MAX_LOCAL_RELEASES and all(re.fullmatch('[0-9a-f]{64}', item.name) and
-                                                   protected(item, directory=True) for item in entries),
-            'retained platform store is full or requires scoped reconciliation')
+    entries = staged_paths(end)
     require(previous is not None or not entries, 'initial release intake requires an empty platform store')
     if previous is not None:
         hex_id(previous)
         require(previous != expected, 'platform release cannot reference itself for recovery')
-    # Capacity is established before contacting the transport. One additional
-    # ZIP may coexist with the complete set of retained release files.
-    intake_limit(ROOT, [release.AGENT_BUDGET if agent else release.FILE_BUDGET], ARCHIVE_LIMIT + ZIP_OVERHEAD)
+    # Fetch the agent subject within its small metadata runway. The signed
+    # manifest then supplies exact expansion bounds before any role download.
+    if agent:
+        require(previous is not None, 'agent refresh requires the previous verified platform')
+        intake_limit(ROOT, [META_LIMIT, 2 * CONTROL_LIMIT], ZIP_OVERHEAD)
+    else:
+        intake_limit(ROOT, [release.FILE_BUDGET], ARCHIVE_LIMIT + ZIP_OVERHEAD)
     checked_run(read_api(f'actions/runs/{run}', end), source, run, agent)
     rows = artifacts(read_api(f'actions/runs/{run}/artifacts?per_page=100', end), source, agent)
     with release.output_directory(ROOT / expected) as stage:
@@ -263,8 +501,16 @@ def acquire(source, run, expected, previous, end, *, agent=False):
                 if base != previous:
                     retained = previous_release(base, end)
                     require(retained['kind'] == 'dev-pair-platform-release', 'retained stable base is incomplete')
-        else:
-            require(not agent, 'agent refresh requires the previous verified platform')
+                expanded = []
+                compressed = []
+                for transport in value['transports'].values():
+                    size = sum(item['bytes'] for item in transport['files'].values())
+                    zipped = rows[transport['name']]['size_in_bytes']
+                    require(zipped <= size + ZIP_OVERHEAD, 'Actions ZIP transport exceeds the approved byte bound')
+                    expanded.append(size)
+                    compressed.append(zipped)
+                demand = sum(expanded) + max(compressed) + ZIP_OVERHEAD + 3 * CONTROL_LIMIT
+                retain_for_transfer(entries, previous, base, demand, end)
         for part, transport in value['transports'].items():
             target = stage / part
             target.mkdir(mode=0o700)
