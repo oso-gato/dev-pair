@@ -980,11 +980,12 @@ def make_password(directory):
 
 
 class DevelopmentPassword:
-    """Own only the newly created leaf, and retain its parent for readback."""
+    """Hold the original leaf and its private parent through cleanup proof."""
     def __init__(self, directory):
         self.directory = directory
         self.path = directory / 'core-password'
         self.fd = None
+        self.file_fd = None
         self.removed = False
 
     def verify_parent(self):
@@ -999,31 +1000,37 @@ class DevelopmentPassword:
     def leaf(self):
         return os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
 
+    def verify_file(self, links):
+        require(self.file_fd is not None, 'Disposable password file not held')
+        held = os.fstat(self.file_fd)
+        require(stat.S_ISREG(held.st_mode) and held.st_uid == os.geteuid() and held.st_nlink == links
+                and stat.S_IMODE(held.st_mode) == 0o600, 'Disposable password file identity or links changed')
+        return held
+
     @contextlib.contextmanager
     def create(self):
         self.directory.mkdir(mode=0o700)
         self.fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self.verify_parent()
-        fd = os.open(self.path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
-        owned = None
+        self.file_fd = os.open(self.path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
         try:
-            with os.fdopen(fd, 'w') as stream:
-                owned = os.fstat(stream.fileno())
+            self.verify_file(1)
+            with os.fdopen(self.file_fd, 'w', closefd=False) as stream:
                 stream.write(secrets.token_urlsafe(48) + '\n')
                 stream.flush()
                 os.fsync(stream.fileno())
             yield self.path
         finally:
-            if owned is not None:
-                self.remove(owned)
+            self.remove()
 
-    def remove(self, owned):
+    def remove(self):
         self.verify_parent()
         current = self.leaf()
-        require(stat.S_ISREG(current.st_mode) and current.st_uid == os.geteuid() and current.st_nlink == 1
-                and stat.S_IMODE(current.st_mode) == 0o600 and
-                (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino), 'Disposable password file changed')
+        held = self.verify_file(1)
+        require((current.st_dev, current.st_ino, current.st_mode, current.st_uid, current.st_nlink) ==
+                (held.st_dev, held.st_ino, held.st_mode, held.st_uid, held.st_nlink), 'Disposable password path changed')
         os.unlink(self.path.name, dir_fd=self.fd)
+        self.verify_file(0)
         self.removed = True
 
     def absent(self):
@@ -1031,19 +1038,26 @@ class DevelopmentPassword:
             return False
         try:
             self.verify_parent()
+            self.verify_file(0)
             try:
                 self.leaf()
             except FileNotFoundError:
                 self.verify_parent()
+                self.verify_file(0)
                 return True
         except (OSError, ValueError, RuntimeError):
             pass
         return False
 
     def close(self):
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+        file_fd, parent_fd = self.file_fd, self.fd
+        self.file_fd = self.fd = None
+        try:
+            if file_fd is not None:
+                os.close(file_fd)
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
 
 def remove_password_after_prepare(secret, state_root, expected):
@@ -1713,7 +1727,10 @@ def development_service(expected, guest_sha):
     try:
         password_absent = password.absent()
     finally:
-        password.close()
+        try:
+            password.close()
+        except OSError:
+            password_absent = False
     if active == 'complete' and not password_absent:
         active, receipt = 'development-readback', None
         identity.pop('final_root_free_bytes')

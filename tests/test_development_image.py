@@ -1,4 +1,5 @@
 """Development producer component checks with a synthetic engine and real OCI bytes."""
+import ctypes
 import gzip
 import io
 import json
@@ -220,7 +221,7 @@ class DevelopmentImageTests(unittest.TestCase):
         lifetime = int(next(arg[10:] for arg in create_stage if arg.startswith('--timeout=')))
         self.assertTrue(0 < lifetime < g.ASSEMBLY_LIFETIME)
         self.assertLessEqual(started + 2 * lifetime + g.CLEANUP_EXECUTION, runner.deadline)
-        self.assertIn(g.DEVELOPMENT_TIMED_EXEC, create_stage)
+        self.assertIn(g.DEVELOPMENT_TIMED_EXEC.replace('$', '$$'), create_stage)
         self.assertEqual(self.engine.saved_stage['Config']['Timeout'], lifetime)
         snapshot = next(args for args, _ in self.engine.calls if 'create' in args and '--entrypoint=/usr/bin/false' in args)
         snapshot_lifetime = int(next(arg[10:] for arg in snapshot if arg.startswith('--timeout=')))
@@ -265,6 +266,77 @@ class DevelopmentImageTests(unittest.TestCase):
         result = subprocess.run([*command, str(uptime + 30), '15', '/bin/sh', '-c', 'printf allowed'],
                                 capture_output=True, check=True, timeout=3)
         self.assertEqual(result.stdout, b'allowed')
+
+    def test_assembly_guard_survives_the_installed_systemd_argv_expander(self):
+        try:
+            version = subprocess.check_output(['/usr/bin/systemd-run', '--version'], text=True).split()[1]
+        except (OSError, subprocess.SubprocessError, IndexError):
+            self.skipTest('systemd argument parser unavailable')
+        name = 'libsystemd-shared-' + version + '.so'
+        paths = [*Path('/usr/lib').glob('*/systemd/' + name), Path('/usr/lib/systemd') / name,
+                 Path('/usr/lib64/systemd') / name]
+        try:
+            library = ctypes.CDLL(str(next(path for path in paths if path.is_file())))
+            expand, free = library.replace_env_argv, library.strv_free
+        except (StopIteration, OSError, AttributeError):
+            self.skipTest('systemd shared argument parser unavailable')
+        ptr = ctypes.POINTER(ctypes.c_char_p)
+        expand.argtypes = (ptr, ptr, ctypes.POINTER(ptr), ctypes.POINTER(ptr), ctypes.POINTER(ptr))
+        expand.restype = ctypes.c_int
+        free.argtypes = (ptr,)
+        free.restype = ptr
+
+        self.bounded_engine(160)
+        self.assemble()
+        create = next(args for args, _ in self.engine.calls if 'create' in args and '--entrypoint=/bin/sh' in args)
+        idx = create.index('-ec')
+        for expired in (False, True):
+            command = list(create)
+            if expired:
+                command[idx + 3] = '1'
+            original = (ctypes.c_char_p * (len(command) + 1))(*[value.encode() for value in command], None)
+            environment = (ctypes.c_char_p * 3)(b'left=poison', b'uptime=poison', None)
+            expanded, unset, bad = ptr(), ptr(), ptr()
+            try:
+                self.assertEqual(expand(original, environment, ctypes.byref(expanded), ctypes.byref(unset), ctypes.byref(bad)), 0)
+                delivered = [expanded[i].decode() for i in range(len(command))]
+                self.assertFalse(expanded[len(command)])
+            finally:
+                for field in (expanded, unset, bad):
+                    free(field)
+            command[idx + 1] = g.DEVELOPMENT_TIMED_EXEC
+            self.assertEqual(delivered, command)  # Only the fixed script differed in transit.
+            result = subprocess.run(['/bin/sh', *delivered[idx:idx + 5],
+                                     '/bin/sh', '-c', 'printf fixture-payload'],
+                                    capture_output=True, check=False, timeout=3)
+            self.assertEqual(result.returncode, 124 if expired else 0)
+            self.assertEqual(result.stdout, b'' if expired else b'fixture-payload')
+
+    def reject_float_timeout(self, identity, expected_error):
+        original = self.app.engine
+
+        def engine(*args, **kwargs):
+            output = original(*args, **kwargs)
+            if args == ('inspect', '--type=container', identity):
+                rows = json.loads(output)
+                if rows:
+                    rows[0]['Config']['Timeout'] = float(rows[0]['Config']['Timeout'])
+                return json.dumps(rows)
+            return output
+
+        self.bounded_engine(160)
+        with patch.object(self.app, 'engine', side_effect=engine), self.assertRaisesRegex(g.Blocked, expected_error):
+            self.assemble()
+        self.assertFalse(self.release.exists())
+        self.assertFalse(self.engine.containers)
+
+    def test_assembly_rejects_numerically_equal_noninteger_timeout(self):
+        from test_gptbox import STAGE
+        self.reject_float_timeout(STAGE, 'native container lifetime')
+
+    def test_snapshot_rejects_numerically_equal_noninteger_timeout(self):
+        self.reject_float_timeout(RUNTIME, 'never-started image snapshot')
+        self.assertFalse(g.exact_oci_timeout(True, 1, g.RUNTIME_LIFETIME))
 
     def test_committed_development_graph_exports_a_bound_inner_record_atomically(self):
         self.assertFalse(self.assemble(apply=False)['changes'])

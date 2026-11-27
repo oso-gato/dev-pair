@@ -77,6 +77,10 @@ def image_inputs_bytes(inputs):
     return json.dumps(inputs, sort_keys=True).encode() + b'\n'
 
 
+def exact_oci_timeout(observed, expected, ceiling):
+    return type(observed) is type(expected) is int and 0 < observed == expected <= ceiling
+
+
 def image_id(value):
     if type(value) is not str:
         raise Blocked('engine returned no immutable image/container identity')
@@ -385,7 +389,7 @@ class Gptbox(Bootstrap):
                 raise Blocked('isolated assembly budget/confinement mismatch')
         ceiling = RUNTIME_LIFETIME if runtime else ASSEMBLY_LIFETIME
         lifetime = ceiling if lifetime is None else lifetime
-        if type(lifetime) is not int or not 0 < lifetime <= ceiling or config.get('Timeout') != lifetime:
+        if not exact_oci_timeout(config.get('Timeout'), lifetime, ceiling):
             raise Blocked('independent native container lifetime is missing or mismatched')
         policy = host.get('RestartPolicy', {})
         if policy.get('Name') not in ('no', '') or policy.get('MaximumRetryCount', 0) != 0:
@@ -676,7 +680,11 @@ class Gptbox(Bootstrap):
             if lifetime <= OCI_KILL_GRACE:
                 raise Blocked('insufficient time for finite development assembly')
             entrypoint = '/bin/sh'
-            assembly_args = ['-ec', DEVELOPMENT_TIMED_EXEC, 'development-assembly', str(end), str(lifetime), *INIT]
+            # The service manager expands argv before the native relay sees
+            # it. systemd.exec treats $$ as a literal dollar; only transport
+            # this shell-program argument escaped. The shell gets its raw bytes.
+            guard = DEVELOPMENT_TIMED_EXEC.replace('$', '$$')
+            assembly_args = ['-ec', guard, 'development-assembly', str(end), str(lifetime), *INIT]
         identity = image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + expected,
             '--timeout=' + str(lifetime), '--restart=no',
             '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private',
@@ -1635,7 +1643,7 @@ class DevelopmentGptbox(Gptbox):
         rows = json.loads(self.engine('inspect', '--type=container', snapshot), object_pairs_hook=fedora_oci.unique)
         if (type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != snapshot
                 or image_id(rows[0]['Image']) != sealed or rows[0]['State']['Status'] not in ('configured', 'created')
-                or rows[0]['Config'].get('Timeout') != snapshot_lifetime
+                or not exact_oci_timeout(rows[0]['Config'].get('Timeout'), snapshot_lifetime, RUNTIME_LIFETIME)
                 or rows[0]['State'].get('Running') is not False):
             raise Blocked('development raw file read requires the exact never-started image snapshot')
         policy = rows[0]['HostConfig'].get('RestartPolicy', {})

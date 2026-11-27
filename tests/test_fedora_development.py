@@ -430,6 +430,72 @@ class DevelopmentGuestTests(unittest.TestCase):
         self.secret_dir.mkdir(mode=0o700)
         self.assertFalse(password.absent())
 
+    def test_exact_password_leaf_is_held_through_removal_and_closed(self):
+        password = guest.DevelopmentPassword(self.secret_dir)
+        self.addCleanup(password.close)
+        with password.create() as path:
+            file_fd, parent_fd = password.file_fd, password.fd
+            opened, named = os.fstat(file_fd), path.lstat()
+            self.assertEqual((opened.st_dev, opened.st_ino, opened.st_nlink),
+                             (named.st_dev, named.st_ino, 1))
+            self.assertFalse(os.get_inheritable(file_fd))
+        self.assertEqual(os.fstat(file_fd).st_nlink, 0)
+        self.assertTrue(password.absent())
+        password.close()
+        for descriptor in (file_fd, parent_fd):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_replaced_or_multiply_linked_password_is_preserved(self):
+        for replacement in (False, True):
+            directory = self.root / str(replacement)
+            password = guest.DevelopmentPassword(directory)
+            self.addCleanup(password.close)
+            saved = directory / 'still-linked'
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(ValueError, 'password (file|path)'):
+                with password.create() as path:
+                    if replacement:
+                        path.rename(saved)
+                        path.write_text('unrelated fixture\n')
+                        path.chmod(0o600)
+                    else:
+                        os.link(path, saved)
+            self.assertFalse(password.absent())
+            self.assertTrue(saved.is_file())
+            if replacement:
+                self.assertEqual(password.path.read_text(), 'unrelated fixture\n')
+            else:
+                self.assertEqual(password.path.lstat().st_nlink, 2)
+
+    def test_named_enoent_without_original_unlink_withholds_build(self):
+        unlink = os.unlink
+
+        def move_away(name, *, dir_fd=None):
+            if dir_fd is not None and name == 'core-password':
+                os.rename(name, 'still-linked', src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                return
+            return unlink(name, dir_fd=dir_fd)
+
+        with mock.patch.object(guest.os, 'unlink', side_effect=move_away):
+            report = self.run_guest()
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(report['cleanup']['password_absent'])
+        self.assertEqual(report['development']['stage'], 'development-host-prepare')
+        self.assertTrue((self.secret_dir / 'still-linked').is_file())
+
+    def test_descriptor_close_error_withholds_final_receipt(self):
+        close = guest.DevelopmentPassword.close
+
+        def fail_after_close(owner):
+            close(owner)
+            raise OSError('fixture password descriptor close failure')
+
+        with mock.patch.object(guest.DevelopmentPassword, 'close', new=fail_after_close):
+            result = self.run_guest()
+        self.assertFalse(result['cleanup']['password_absent'])
+        self.assertEqual(result['development']['stage'], 'development-readback')
+        self.assertIsNone(result['development']['receipt'])
+
     def test_development_cli_deadline_clips_both_existing_native_ceilings(self):
         options = ['gptbox.py', 'prepare-development-host', '--apply', '--context', '/fixture-context',
                    '--source-sha', SOURCE, '--expected-context-sha256', EXPECTED, '--distrobox-source', '/fixture-upstream',
