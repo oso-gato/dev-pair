@@ -276,6 +276,26 @@ class GptboxTests(unittest.TestCase):
         self.assertEqual([args[-1] for args in self.app.entry_calls], ['probe', 'version', 'probe', 'version'])
         self.assertFalse(any('chpasswd' in args[0] for args, _ in self.engine.calls))
 
+    def test_prepared_host_cli_rejects_permissive_preparation_marker(self):
+        from contextlib import nullcontext, redirect_stderr
+        from io import StringIO
+
+        self.app.atomic(g.STATE + '/desired.json', '{}\n')
+        marker = self.app.path(g.STATE + '/prepared')
+        original = marker.read_bytes()
+        marker.chmod(0o644)
+        with self.assertRaisesRegex(g.Blocked, 'permissions conflict'):
+            self.app.maintenance_host_readiness(EXPECTED)
+        argv = ['gptbox.py', 'assemble-prepared-maintenance', '--apply', '--context', str(self.context),
+                '--expected-context-sha256', EXPECTED, '--distrobox-source', '/unused', '--source-sha', SOURCE]
+        with (patch.object(g, 'Gptbox', return_value=self.app),
+              patch.object(self.app.run, 'phase', return_value=nullcontext(), create=True),
+              patch.object(sys, 'argv', argv), redirect_stderr(StringIO())):
+            self.assertEqual(g.main(), 2)
+        self.assertEqual(marker.read_bytes(), original)
+        self.assertFalse(self.engine.calls)
+        self.assertFalse(self.app.entry_calls)
+
     def test_combined_initialize_retry_reconciles_native_inventory_and_completes_receipt(self):
         from contextlib import nullcontext
 
