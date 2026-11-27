@@ -19,6 +19,9 @@ sys.path.insert(0, str(RUNTIME))
 import controller as db
 
 ROOT = Path('/var/lib/dev-pair/development')
+MANAGED_BACKING = Path('/var/lib/dev-pair-managed.ext4')
+MANAGED_INODE_LIMIT = 1310720
+HOST_INODE_RESERVE = 4096
 DP_DEV_SUBORDINATES = [(1065536, 65536)]
 
 
@@ -47,6 +50,55 @@ def private_dir(path, account):
     return info
 
 
+def managed_storage(mountinfo, *, for_recovery=False):
+    """Prove the enclosing ext4 and require fresh-write reserves by default."""
+    root = ROOT.parent
+    entries = [line.split() for line in mountinfo.splitlines()]
+    rows = [row for row in entries if row[4] == str(root)]
+    db.require(len(rows) == 1, 'dedicated managed ext4 mount required')
+    row = rows[0]
+    separator = row.index('-')
+    fs_type, source, options = row[separator + 1:separator + 4]
+    db.require(row[3] == '/' and fs_type == 'ext4' and re.fullmatch(r'/dev/loop[0-9]+', source)
+               and {'rw', 'nosuid', 'nodev'} <= set(row[5].split(','))
+               and 'discard' not in options.split(',')
+               and sum(entry[2] == row[2] for entry in entries) == 1,
+               'managed ext4 mount geometry or safety flags differ')
+    node = root.lstat()
+    db.require(root.resolve(strict=True) == root and stat.S_ISDIR(node.st_mode)
+               and (node.st_uid, node.st_gid, stat.S_IMODE(node.st_mode)) == (0, 0, 0o755)
+               and row[2] == f'{os.major(node.st_dev)}:{os.minor(node.st_dev)}',
+               'managed ext4 mountpoint ownership or device differs')
+    loop = Path('/sys/dev/block') / row[2] / 'loop'
+    db.require(Path((loop / 'backing_file').read_text().strip()) == MANAGED_BACKING
+               and (loop / 'offset').read_text().strip() == '0'
+               and (loop / 'sizelimit').read_text().strip() == '0',
+               'managed ext4 requires its fixed full backing file')
+    backing = MANAGED_BACKING.lstat()
+    host_node = MANAGED_BACKING.parent.stat()
+    db.require(MANAGED_BACKING.parent == root.parent and MANAGED_BACKING.resolve(strict=True) == MANAGED_BACKING
+               and stat.S_ISREG(backing.st_mode) and backing.st_nlink == 1
+               and (backing.st_uid, backing.st_gid, stat.S_IMODE(backing.st_mode)) == (0, 0, 0o600)
+               and backing.st_dev == host_node.st_dev != node.st_dev
+               and 0 < backing.st_size <= 20 * db.GIB and backing.st_blocks * 512 >= backing.st_size,
+               'managed ext4 backing is foreign, sparse or exceeds twenty GiB')
+    guest = os.statvfs(root)
+    host = os.statvfs(MANAGED_BACKING.parent)
+    db.require(0 < guest.f_blocks * guest.f_frsize <= backing.st_size
+               and 0 < guest.f_files <= MANAGED_INODE_LIMIT and 0 <= guest.f_favail <= guest.f_files,
+               'managed ext4 byte or inode ceiling is unavailable')
+    if not for_recovery:
+        db.require(guest.f_favail > 0, 'managed ext4 byte or inode ceiling is unavailable')
+        db.require(host.f_bavail * host.f_frsize >= 8 * db.GIB
+                   and host.f_files >= host.f_favail >= HOST_INODE_RESERVE,
+                   'physical host byte and finite inode reserve required')
+    return {'device': row[2], 'source': source, 'bytes': guest.f_blocks * guest.f_frsize,
+            'backing_bytes': backing.st_size, 'backing_inode': backing.st_ino,
+            'available_bytes': guest.f_bavail * guest.f_frsize, 'inodes': guest.f_files,
+            'available_inodes': guest.f_favail, 'host_available_bytes': host.f_bavail * host.f_frsize,
+            'host_available_inodes': host.f_favail}
+
+
 def storage_mount(path, ceiling, mountinfo):
     entries = [line.split() for line in mountinfo.splitlines()]
     rows = [entry for entry in entries if entry[4] == str(path)]
@@ -62,18 +114,29 @@ def storage_mount(path, ceiling, mountinfo):
     db.require(info[2] == f'{os.major(dev)}:{os.minor(dev)}' and dev != path.parent.stat().st_dev,
                'development storage must be separate from the role filesystem')
     backing = Path('/sys/dev/block') / info[2] / 'loop/backing_file'
+    managed = None
     if backing.exists():
         image = Path(backing.read_text().strip())
         info_backing = image.lstat()
         db.require(image.is_absolute() and image.resolve(strict=True) == image
                    and stat.S_ISREG(info_backing.st_mode) and info_backing.st_blocks * 512 >= info_backing.st_size,
                    'loop-backed development storage must be fully allocated')
+        if image == ROOT.parent / 'native-placements' / 'backings' / path.name / 'build.ext4':
+            db.require(info_backing.st_dev == path.parent.stat().st_dev
+                       and info_backing.st_nlink == 1
+                       and (info_backing.st_uid, info_backing.st_gid, stat.S_IMODE(info_backing.st_mode)) == (0, 0, 0o600),
+                       'nested backing differs from the managed filesystem lease')
+            managed = managed_storage(mountinfo)
     limits = os.statvfs(path)
     total = limits.f_blocks * limits.f_frsize
     db.require(0 < total <= ceiling, 'actual filesystem capacity exceeds the declared storage ceiling')
-    host = os.statvfs(path.parent)
-    db.require(host.f_bavail * host.f_frsize >= 8 * db.GIB, 'eight GiB host reserve required')
-    return {'device': info[2], 'type': fs_type, 'bytes': total}
+    result = {'device': info[2], 'type': fs_type, 'bytes': total}
+    if managed is None:
+        host = os.statvfs(path.parent)
+        db.require(host.f_bavail * host.f_frsize >= 8 * db.GIB, 'eight GiB host reserve required')
+    else:
+        result['managed_storage'] = managed
+    return result
 
 
 def check_label(path, expected):
