@@ -21,7 +21,8 @@ FENCE = r.DEFAULT_ROOT / 'renewal-fence'
 SYSTEMCTL = '/usr/bin/systemctl'
 REQUIRED = {'tools/gptbox.py', 'tools/devbox.py', 'tools/provider_broker.py', 'tools/host_handoff.py',
             'tools/job_protocol.py', 'tools/ledger_recovery.py', 'runtime/devbox/controller.py',
-            'runtime/checklist/checklist_quadlet.py', 'runtime/checklist/acceptance.container'}
+            'runtime/checklist/checklist_quadlet.py', 'runtime/checklist/acceptance.container',
+            'tools/product_job.py', 'tools/checklist_candidate.py'}
 MAX_HOST_FILES = 256
 MAX_HOST_BYTES = 32 * 1024 * 1024
 

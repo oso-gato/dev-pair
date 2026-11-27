@@ -38,7 +38,7 @@ def official_version():
 
 def verify_attestation(subject, request, role, role_source, run_id):
     p.number(run_id, 1, 2**63 - 1)
-    command = ['/usr/bin/python3', '-I', str(INSTALL / 'tools' / 'release_trust.py'), 'verify',
+    command = ['/usr/bin/python3', '-EBs', str(INSTALL / 'tools' / 'release_trust.py'), 'verify',
                '--component', role, '--source-sha', role_source, '--subject', str(subject),
                '--sha256', request['target_sha256'], '--run-id', str(run_id)]
     p.require(r.sha(r.read_private(subject, r.MAX_CONTROL)) == request['target_sha256'], 'approved manifest bytes changed')

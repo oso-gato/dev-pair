@@ -70,6 +70,12 @@ def claim(control, profile, claim_id, turn, account, validate, now):
         return grant_path
 
 
+def check_request_capacity(grant, reserve, minimum_requests):
+    r.require(type(reserve) is int and reserve > 0 and grant['max_requests'] >= minimum_requests and
+              grant['spend_microusd'] >= grant['max_requests'] * reserve,
+              'continuity ceiling cannot fund the authorized model and tool-result requests')
+
+
 def authorize(payload):
     p.fields(payload, 'request_sha256 turn')
     request_sha = payload['request_sha256']
@@ -96,7 +102,7 @@ def authorize(payload):
     selected = controller.release(reference)['components']['host']['artifact_sha256']
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(INSTALL / 'host-releases' / selected / 'tools'))
-    from provider_broker import grant_document, job_selection, load_allowance, protected_file
+    from provider_broker import grant_document, job_selection, load_allowance, protected_file, reserved_cost
     from gptbox_runtime import host_repository_approval
     account = r.pwd.getpwnam({'maintenance': 'dp-maint', 'development': 'dp-dev'}[role])
     path = r.DEFAULT_ROOT / 'turn-inputs' / role / job / operation / 'turn' / 'request.json'
@@ -121,6 +127,7 @@ def authorize(payload):
     def coherent_grant(raw):
         grant = grant_document(raw)
         load_allowance(job, grant['allowance_sha256']).validate_grant(selection, grant)
+        check_request_capacity(grant, reserved_cost(grant), r.CONTINUITY_REQUESTS)
 
     path = claim(CONTROL, profile, request_sha, admitted, account, coherent_grant, time.time())
     grant = r.read_json(path)

@@ -28,6 +28,44 @@ RUNUSER = '/usr/sbin/runuser'
 GIT = ('/usr/bin/git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null')
 STATUS = (*GIT, 'status', '--porcelain=v1', '--untracked-files=all')
 CHECK = (*GIT, 'diff', '--check', '--no-ext-diff', '--no-textconv', 'HEAD')
+APP = 'examples/checklist/checklist.py'
+SOURCE = '''import hashlib, json
+from pathlib import Path
+source = Path("examples/checklist/checklist.py")
+with source.open("rb") as stream:
+    data = stream.read(65537)
+assert 0 < len(data) <= 65536
+source_sha256 = hashlib.sha256(data).hexdigest()
+'''
+MAINTENANCE_TASK = SOURCE + '''import ast
+tree = ast.parse(data)
+functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+assert {"initialize", "copy_database", "serve"} <= functions.keys()
+assert any(isinstance(node, ast.Attribute) and node.attr == "backup"
+           for node in ast.walk(functions["copy_database"]))
+print(json.dumps({"recipe": "checklist-persistence-readiness", "source_sha256": source_sha256,
+                  "checks": ["schema-entry", "sqlite-backup", "serve-entry"]}, sort_keys=True))
+'''
+DEVELOPMENT_TASK = SOURCE + '''from contextlib import closing
+import tempfile
+app = {"__name__": "checklist_continuity", "__file__": str(source)}
+exec(compile(data, str(source), "exec"), app)
+with tempfile.TemporaryDirectory(prefix="checklist-continuity-", dir="/tmp") as tmp:
+    live, backup, restored = (Path(tmp) / name for name in ("live", "backup", "restored"))
+    with closing(app["connect"](live)) as db:
+        app["initialize"](db)
+        with db:
+            rowid = db.execute("INSERT INTO items(title,done) VALUES (?,1)",
+                               ("renewal continuity",)).lastrowid
+    app["copy_database"](live, backup)
+    app["copy_database"](backup, restored)
+    with closing(app["connect"](restored, readonly=True)) as db:
+        app["verify_database"](db)
+        row = db.execute("SELECT id,title,done FROM items").fetchone()
+    assert row == (rowid, "renewal continuity", 1)
+print(json.dumps({"recipe": "checklist-backup-restore", "source_sha256": source_sha256,
+                  "restored": app["item_object"](row)}, sort_keys=True))
+'''
 
 
 def owned_file(path, limit, expected_uid=0):
@@ -179,8 +217,48 @@ def preflight_runtime(payload):
     return r.loads(run(command, timeout=160, input_data=r.json_bytes(spec)))
 
 
+def reserve_development_owner(job, manifest_sha, host_artifact):
+    command = [RUNUSER, '--user', 'dp-dev', '--', str(INSTALL / 'renewal' / 'role-preflight')]
+    intent = {'mode': 'reserve-owner', 'role': 'development', 'job': job,
+              'manifest_sha256': manifest_sha, 'host_artifact_sha256': host_artifact}
+    proof = r.loads(run(command, timeout=25, input_data=r.json_bytes(intent)))
+    p.fields(proof, 'job manifest_sha256 owner')
+    r.require(proof['job'] == job and proof['manifest_sha256'] == manifest_sha, 'DevBox reservation changed')
+    r.digest(proof['owner'])
+    return proof['owner']
+
+
 def work_digest(data):
     return r.sha(data.rstrip(b'\n'))
+
+
+def product_command(role, recipe):
+    choices = {'maintenance': ('checklist-persistence-readiness', MAINTENANCE_TASK),
+               'development': ('checklist-backup-restore', DEVELOPMENT_TASK)}
+    r.require(role in choices and choices[role][0] == recipe, 'unapproved continuation recipe')
+    return ('/usr/bin/timeout', '--signal=TERM', '--kill-after=2s', '15s', '/usr/bin/python3', '-IB', '-c', choices[role][1])
+
+
+def product_result(role, source_sha):
+    r.digest(source_sha)
+    if role == 'maintenance':
+        return {'recipe': 'checklist-persistence-readiness', 'source_sha256': source_sha,
+                'checks': ['schema-entry', 'sqlite-backup', 'serve-entry']}
+    r.require(role == 'development', 'unapproved continuation role')
+    return {'recipe': 'checklist-backup-restore', 'source_sha256': source_sha,
+            'restored': {'id': 1, 'title': 'renewal continuity', 'done': True}}
+
+
+def product_plan(payload):
+    from product_job import plan, agreement_sha
+    job = payload['job']
+    r.token(job)
+    raw = owned_file(ROOT / 'product-jobs' / 'jobs' / job / 'plan.json', r.MAX_CONTROL)
+    approved = plan(raw)
+    r.require(approved['adapter'] == 'checklist-quadlet' and approved['job_id'] == job and
+              agreement_sha(approved) == payload['binding']['agreement_sha256'],
+              'active product plan has no approved continuation adapter')
+    return r.sha(raw)
 
 
 def capture_work(payload):
@@ -188,7 +266,10 @@ def capture_work(payload):
     r.token(job)
     account = {'maintenance': 'dp-maint', 'development': 'dp-dev'}[role]
     directory = ROOT / role / 'workspaces' / job
-    owned_dir(directory, r.pwd.getpwnam(account).pw_uid)
+    uid = r.pwd.getpwnam(account).pw_uid
+    owned_dir(directory, uid)
+    approval = product_plan(payload)
+    source_sha = r.sha(owned_file(directory / APP, 65536, uid))
 
     def git(command, accepted):
         result = subprocess.run([RUNUSER, '--user', account, '--', *command], cwd=directory,
@@ -202,7 +283,8 @@ def capture_work(payload):
     _, status = git(STATUS, (0,))
     code, check = git(CHECK, (0, 2))
     return {'head': head.decode().strip(), 'status_sha256': work_digest(status),
-            'check_sha256': work_digest(check), 'check_exit': code}
+            'check_sha256': work_digest(check), 'check_exit': code, 'product_plan_sha256': approval,
+            'product_result': product_result(role, source_sha)}
 
 
 def stage_verification(payload):
@@ -215,11 +297,14 @@ def stage_verification(payload):
     leaf = operation_leaf(role, job, operation)
     checkpoint = payload['checkpoint']['checkpoint_id']
     r.require(payload['work']['head'] == payload['candidate_sha'], 'recorded checkpoint is not the saved workspace HEAD')
-    prompt = (f'Resume the saved job at checkpoint {checkpoint}. Run these two read-only commands individually '
-              f'in /work/job using the command tool. Keep the workspace unchanged and take no external actions.\n'
-              f'{shlex.join(STATUS)}\n{shlex.join(CHECK)}\n'
-              'Use the resulting Git status and diff integrity check to explain the current changes and what work '
-              f'remains. Reply in JSON with operation={operation}, checkpoint={checkpoint}, outstanding_work and next_action.').encode()
+    recipe = payload['work']['product_result']['recipe']
+    command = product_command(role, recipe)
+    next_state = 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job'
+    prompt = (f'Resume this product job at checkpoint {checkpoint}. Run exactly this one bounded local test in /work/job '
+              'using the command tool. Keep the checkout unchanged. The test uses no network, host actions, or live app data.\n'
+              f'{shlex.join(command)}\n'
+              'After the actual test, reply with a single JSON object with these fields: '
+              f'operation={operation}, checkpoint={checkpoint}, recipe={recipe}, next_state={next_state}.').encode()
     request.update(operation=operation, action='resume', session_uuid=payload['session_uuid'],
                    candidate_sha=payload['candidate_sha'], prompt_sha256=r.sha(prompt),
                    turn_seconds=min(60, request['turn_seconds']))
@@ -273,36 +358,36 @@ def preflight_allowance(payload):
 
 def verify_progress(events, payload):
     messages = []
-    observations = {}
+    observed = None
+    work = payload['work']
+    expected = work['product_result']
+    planned = product_command(payload['role'], expected['recipe'])
     for line in events.splitlines():
         row = r.loads(line)
         item = row.get('item', {})
-        if row.get('type') == 'item.completed' and item.get('type') == 'agent_message' and len(observations) == 2:
+        if row.get('type') == 'item.completed' and item.get('type') == 'agent_message' and observed is not None:
             messages.append(item['text'])
         if row.get('type') != 'item.completed' or item.get('type') != 'command_execution':
             continue
         command = shlex.split(item['command'])
-        if len(command) == 3 and command[0] in ('/bin/bash', '/usr/bin/bash', 'bash') and command[1] in ('-c', '-lc'):
+        if len(command) == 3 and command[0] in ('/bin/bash', '/usr/bin/bash', 'bash', '/bin/sh', '/usr/bin/sh', 'sh') and command[1] in ('-c', '-lc'):
             command = shlex.split(command[2])
-        key = {STATUS: 'status', CHECK: 'check'}.get(tuple(command))
-        if key is not None:
-            r.require(key not in observations and type(item['exit_code']) is int and type(item['aggregated_output']) is str,
-                      'ambiguous resumed checkpoint tool evidence')
-            observations[key] = (item['exit_code'], work_digest(item['aggregated_output'].encode()))
-    work = payload['work']
-    r.require(observations == {'status': (0, work['status_sha256']), 'check': (work['check_exit'], work['check_sha256'])},
-              'fresh resumed product integrity checks do not match the saved checkpoint')
+        r.require(tuple(command) == planned, 'resumed turn ran a command outside the approved product action')
+        r.require(observed is None and type(item['exit_code']) is int and item['exit_code'] == 0 and
+                  type(item['aggregated_output']) is str and len(item['aggregated_output']) <= 4096,
+                  'ambiguous or failed checkpoint product result')
+        observed = r.loads(item['aggregated_output'])
+    r.require(observed == expected, 'fresh task-specific product result differs from the saved job')
     r.require(messages, 'renewal produced no resumed progress')
     final = messages[-1].strip()
     fenced = re.fullmatch(r'```(?:json)?\s*([^`]+)\s*```', final, re.DOTALL)
     progress = r.loads(fenced[1].strip() if fenced else final)
-    p.fields(progress, 'operation checkpoint outstanding_work next_action')
-    r.require(progress['operation'] == payload['operation'] and
-              progress['checkpoint'] == payload['checkpoint']['checkpoint_id'], 'resumed progress is stale')
-    for key in ('outstanding_work', 'next_action'):
-        p.text(progress[key], 2000)
-        r.require(len(progress[key].split()) >= 3, 'resumed product summary omits substantive work')
-    return r.identity({'progress': progress, 'work': work})
+    required = {'operation': payload['operation'], 'checkpoint': payload['checkpoint']['checkpoint_id'],
+                'recipe': expected['recipe'], 'next_state': 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job'}
+    r.require(progress == required, 'resumed product progress is stale or changes the approved next step')
+    return {'schema': 1, 'operation': required['operation'], 'checkpoint': payload['checkpoint'],
+            'plan_sha256': work['product_plan_sha256'], 'result': observed, 'next_state': required['next_state'],
+            'pending_host': payload['pending_host']}
 
 
 def continued_rollout(payload, uid):
@@ -411,7 +496,7 @@ def turn(action, payload):
     uid = r.pwd.getpwnam(role_account).pw_uid
     leaf = operation_leaf(role, job, operation)
     probe = action == 'resume-without-effects'
-    key = f'{role}--{job}--{operation}'
+    key = r.role_operation_key(role, job, operation)
     receipt_path = CONTROL / 'turn-receipts' / key
     pending = CONTROL / 'owned-turns' / key
     if probe and os.path.lexists(receipt_path):
@@ -422,8 +507,8 @@ def turn(action, payload):
     request_sha = stage_verification(payload) if probe else payload['request_sha256']
     request = gptbox.job_selection(owned_file(leaf / 'turn' / 'request.json', 4096), request_sha, role, job, operation)
     binding = payload['binding']
-    for key in ('role', 'provider', 'model', 'effort', 'standards_sha', 'agreement_sha256', 'startup_sha256'):
-        r.require(request[key] == binding[key], 'provider turn changed registered role policy')
+    for field in ('role', 'provider', 'model', 'effort', 'standards_sha', 'agreement_sha256', 'startup_sha256'):
+        r.require(request[field] == binding[field], 'provider turn changed registered role policy')
     r.require(request['config_sha256'] == binding['policy_sha256'] and request['job'] == binding['job_id'] and
               request['logical_session'] == payload['logical_session'] and request['session_uuid'] == payload['session_uuid'] and
               request['candidate_sha'] == payload['candidate_sha'] and
@@ -443,7 +528,9 @@ def turn(action, payload):
               'host_artifact_sha256': release['components']['host']['artifact_sha256']}
     owned = {'role': role, 'job': job, 'operation': operation, 'request_sha256': request_sha, 'release_sha256': reference,
              'maintenance_context_sha256': plan['maintenance_context_sha256'],
-             'development_manifest_sha256': plan['development_manifests'].get(job)}
+             'development_manifest_sha256': plan['development_manifests'].get(job), 'development_owner': None}
+    if role == 'development':
+        owned['development_owner'] = reserve_development_owner(job, manifest_sha, broker['host_artifact_sha256'])
     journal = turn_root(CONTROL, key, owned, broker)
     channel = 'dev-pair-provider@' + request_sha + '.service'
 
@@ -487,12 +574,14 @@ def turn(action, payload):
               gptbox.completed_turn(events) == turn_result['session_uuid'], 'provider history evidence changed')
     if probe:
         continued_rollout(payload, uid)
+    action_result = verify_progress(events, payload) if probe else None
     proof = {key: payload[key] for key in ('role', 'job', 'logical_session', 'operation')} | {
         'request_sha256': request_sha, 'release_sha256': reference, 'session_uuid': turn_result['session_uuid'],
         'events_sha256': turn_result['events_sha256'], 'child_reaped': True,
         'provider_receipt_sha256': provider_receipt(payload, request_sha),
         'work_sha256': r.identity(payload['work']) if probe else None,
-        'progress_sha256': verify_progress(events, payload) if probe else None,
+        'product': action_result,
+        'progress_sha256': r.identity(action_result) if probe else None,
     }
     if probe:
         install_exact(receipt_path, {'input_sha256': r.identity(payload), 'proof': proof})
@@ -526,6 +615,29 @@ def verify_sessions(payload):
     retained, archived = native_sessions(base, uid)
     r.require(set(retained) == {item['uuid'] for item in actual}, 'native Codex and registry session catalogues differ')
     return {'sessions': actual, 'native': retained, 'archived': archived}
+
+
+def check_probe_trees(root, account):
+    for kind in ('workspaces', 'state', 'cache'):
+        path = root / 'maintenance' / kind / 'gptbox-probe'
+        owned_dir(path, account.pw_uid)
+        node = path.lstat()
+        r.require(node.st_gid == account.pw_gid and stat.S_IMODE(node.st_mode) == 0o700 and
+                  next(path.iterdir(), None) is None, 'managed probe tree contains durable work or changed ownership')
+
+
+def verify_managed_probe(payload):
+    release, plan = admit_release(payload['release_sha256'])
+    r.require(r.read_json(CONTROL / 'site-current.json') == payload['release_sha256'],
+              'managed probe must belong to the observed prior platform')
+    context = plan['maintenance_context_sha256']
+    receipt = r.loads(owned_file(ROOT / 'bootstrap' / 'gptbox-adapter' / context / 'result.json', 1 << 20))
+    r.require(receipt.get('kind') == 'maintenance-gptbox-probe-candidate' and receipt.get('job_admission') is False and
+              receipt.get('runtime_container_removed') is True and receipt.get('boundary_and_version_cycles') == 2 and
+              receipt.get('assembled_image_id') == release['components']['maintenance-agent']['artifact_sha256'],
+              'maintenance probe assembly receipt is not an exact completed probe')
+    check_probe_trees(ROOT, r.pwd.getpwnam('dp-maint'))
+    return {'scope': 'maintenance-assembly-probe', 'empty': True}
 
 
 def owned_dir(path, uid):
@@ -629,6 +741,8 @@ def main():
             result = capture_work(payload)
         elif action == 'verify-sessions':
             result = verify_sessions(payload)
+        elif action == 'verify-managed-probe':
+            result = verify_managed_probe(payload)
         else:
             r.require(action in ('validate', 'observe', 'activate', 'quiesce'), 'unsupported renewal action')
             result = release_action(action, payload)

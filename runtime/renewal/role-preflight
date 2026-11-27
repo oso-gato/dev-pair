@@ -54,6 +54,20 @@ def development_inputs(inputs, device, archive_bytes, owner=0):
     return paths
 
 
+def reserve_owner(spec):
+    import devbox
+    from devbox import db
+    end = time.monotonic() + 15
+    account = devbox.host_account()
+    devbox.enforcing(end)
+    job, reference = spec['job'], spec['manifest_sha256']
+    path = devbox.ROOT / 'builds' / job / 'inputs' / reference / 'manifest.json'
+    manifest = db.read_manifest(path, reference, end)
+    r.require(manifest['job'] == job, 'DevBox reservation selects a foreign job')
+    with devbox.ownership(account, job, reference, job_turn=True) as (owner, _):
+        return {'job': job, 'manifest_sha256': reference, 'owner': owner}
+
+
 def development(spec):
     import devbox
     from devbox import db
@@ -111,6 +125,9 @@ def main():
         r.require(spec['role'] == 'development' and r.pwd.getpwuid(os.getuid()).pw_name == 'dp-dev',
                   'rootless development artifact preflight required')
         r.digest(spec['manifest_sha256'])
+        if spec.get('mode') == 'reserve-owner':
+            print(r.canonical(reserve_owner(spec)))
+            return
         development(spec)
     print(r.canonical({'role': spec['role'], 'job': spec['job'], 'artifact_sha256': spec['component']['artifact_sha256']}))
 

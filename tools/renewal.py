@@ -30,6 +30,7 @@ MAX_JOBS = 64
 MAX_SESSIONS = 16
 MAX_ATTEMPTS = 32
 MIN_FREE_BYTES = 8 * 1024 ** 3
+CONTINUITY_REQUESTS = 2  # Model requests the one test tool and then consumes its result.
 MAX_TARGET_ATTEMPTS = 3
 RETRY_DELAY = 30
 DEFAULT_ROOT = Path('/var/lib/dev-pair')
@@ -43,6 +44,13 @@ def json_bytes(value):
 
 def identity(value):
     return sha(json_bytes(value))
+
+
+def role_operation_key(role, job, operation):
+    require(role in ROLES, 'unknown role operation')
+    token(job)
+    token(operation)
+    return 'turn-' + identity([role, job, operation])
 
 
 def diagnostic(error):
@@ -479,7 +487,7 @@ class Renewal:
     def trees(self, role, job):
         return {kind: self.root / role / kind / job for kind in ('workspaces', 'state')}
 
-    def check_durable_catalogue(self, registries):
+    def check_durable_catalogue(self, registries, state):
         retained = {}
         attempts = self.control / 'attempts'
         for path in attempts.iterdir():
@@ -489,6 +497,7 @@ class Renewal:
                 retained[key] = entry
         for role in ROLES:
             expected = {key.split('/')[1] for key in registries if key.startswith(role + '/')}
+            probe_verified = False
             for kind in ('workspaces', 'state'):
                 root = self.root / role / kind
                 require(root.resolve(strict=True) == root and root.is_dir(), 'unsafe durable job root')
@@ -501,6 +510,14 @@ class Renewal:
                         if key in retained:
                             require(retained[key] == [node.st_dev, node.st_ino], 'displaced tree identity changed')
                             continue
+                        if role == 'maintenance' and entry.name == 'gptbox-probe' and entry.name not in expected:
+                            if not probe_verified:
+                                previous = state['request']['previous_sha256']
+                                proof = self.driver.invoke('verify-managed-probe', self.payload(state, previous))
+                                require(proof == {'scope': 'maintenance-assembly-probe', 'empty': True},
+                                        'managed assembly probe provenance was not established')
+                                probe_verified = True
+                            continue
                         token(entry.name)
                         names.add(entry.name)
                         require(len(names) <= MAX_JOBS, 'durable job catalogue exceeds bound')
@@ -508,6 +525,8 @@ class Renewal:
 
     def register(self, binding):
         with self.dispatch_gate(for_enrollment=True):
+            require(binding['role'] != 'maintenance' or binding['job_id'] != 'gptbox-probe',
+                    'maintenance assembly probe name is reserved')
             path = self.registry_path(binding['role'], binding['job_id'])
             staging = trusted_directory(self.control / 'registry-staging')
             with tempfile.TemporaryDirectory(dir=staging) as temporary:
@@ -611,7 +630,7 @@ class Renewal:
                 require(previous == request, 'renewal operation ID collision')
             if all(previous[field] == request[field] for field in ('scope', 'target_sha256')):
                 rows.append((path, journal))
-        return sorted(rows, key=lambda row: row[1].get('target_attempt', 1))
+        return sorted(rows, key=lambda row: row[1].get('activation_generation', 0))
 
     def apply(self, scope):
         require(scope in SCOPE_COMPONENTS, 'unknown renewal scope')
@@ -626,25 +645,34 @@ class Renewal:
                 return {'phase': 'no-approved-target', 'scope': scope}
             state = None
             history = self.attempts_for(request)
-            attempt_number = len(history) + 1
+            exact = [(path, row) for path, row in history if row['request'] == request]
+            current = self.live_release()
+            if exact and exact[-1][1]['phase'] == 'completed':
+                prior = exact[-1][1]
+                require(current == request['target_sha256'], 'completed approval no longer names the live release')
+                self.verify_driver('observe', prior, current)
+                return prior
+            require(request['previous_sha256'] == current, 'stale renewal previous digest')
+            generation = max((row.get('activation_generation', 0) for _, row in history), default=0) + 1
+            rejected = [(path, row) for path, row in history if row['phase'] in ('rolled-back', 'rejected')]
+            if rejected:
+                return rejected[-1][1]
+            deferred = [(path, row) for path, row in history if row['phase'] == 'deferred']
+            attempt_number = len(deferred) + 1
             attempt_id = request['operation']
-            if history:
-                last, prior = history[-1]
-                if prior['phase'] in ('completed', 'rolled-back', 'rejected'):
-                    return prior
-                if prior['phase'] == 'deferred':
-                    if attempt_number > MAX_TARGET_ATTEMPTS or time.time() < prior.get('retry_after', 0):
-                        return prior
-                    attempt_id = 'attempt-' + identity([request['operation'], request['target_sha256'], attempt_number])[:48]
-                else:
-                    require(prior['request'] == request and prior['phase'] == 'prepared' and
-                            not prior['freezes'] and not prior['proofs'],
+            if exact and exact[-1][1]['phase'] != 'deferred':
+                last, prior = exact[-1]
+                require(prior['phase'] == 'prepared' and not prior['freezes'] and not prior['proofs'],
                         'unpublished renewal attempt has consequential state')
-                    state, attempt_id = prior, last.name
+                state, attempt_id = prior, last.name
+            elif deferred:
+                prior = deferred[-1][1]
+                if attempt_number > MAX_TARGET_ATTEMPTS or time.time() < prior.get('retry_after', 0):
+                    return prior
+                attempt_id = 'attempt-' + identity([request['operation'], request['target_sha256'], generation])[:48]
             target = self.control / 'attempts' / attempt_id
             previous = self.release(request['previous_sha256'])
             replacement = self.release(request['target_sha256'])
-            require(request['previous_sha256'] == self.live_release(), 'stale renewal previous digest')
             changed = {name for name in COMPONENTS if previous['components'][name] != replacement['components'][name]}
             require(changed and changed <= SCOPE_COMPONENTS[scope], 'renewal changes outside approved scope')
             if scope != 'host':
@@ -656,7 +684,8 @@ class Renewal:
                     with tempfile.TemporaryDirectory(dir=self.control / 'registry-staging') as temporary:
                         attempt = create_directory(Path(temporary) / 'attempt')
                         state = {'schema': 1, 'request': request, 'freezes': {}, 'proofs': {},
-                                 'attempt_id': attempt_id, 'target_attempt': attempt_number}
+                                 'attempt_id': attempt_id, 'target_attempt': attempt_number,
+                                 'activation_generation': generation}
                         self.phase(attempt, state, 'prepared')
                         attempt.rename(target)
                         sync_directory(target.parent)
@@ -731,7 +760,7 @@ class Renewal:
 
     def capture(self, attempt, state, registries):
         deadline = time.monotonic() + self.seconds
-        self.check_durable_catalogue(registries)
+        self.check_durable_catalogue(registries, state)
         capacity = os.statvfs(attempt)
         require(capacity.f_bavail * capacity.f_frsize >= MIN_FREE_BYTES + self.byte_limit,
                 'renewal requires free capacity for backup and protected reserve')
@@ -843,7 +872,7 @@ class Renewal:
 
     def check_proof(self, proof, spec, release, *, require_progress=True):
         protocol.fields(proof, 'release_sha256 operation role job logical_session session_uuid request_sha256 '
-                        'events_sha256 progress_sha256 child_reaped provider_receipt_sha256 work_sha256')
+                        'events_sha256 progress_sha256 child_reaped provider_receipt_sha256 work_sha256 product')
         for field in ('operation', 'role', 'job', 'logical_session'):
             require(proof[field] == spec[field], 'role resume identity changed')
         session(proof['session_uuid'])
@@ -855,8 +884,13 @@ class Renewal:
             require(proof['request_sha256'] == spec['request_sha256'], 'role request digest changed')
         digest(proof['events_sha256'])
         digest(proof['provider_receipt_sha256'])
-        if require_progress or proof['progress_sha256'] is not None:
+        if require_progress:
             digest(proof['progress_sha256'])
+            require(proof['product'] == spec['product'] and identity(proof['product']) == proof['progress_sha256'],
+                    'durable product continuation identity changed')
+        else:
+            require(proof['product'] is None and proof['progress_sha256'] is None,
+                    'ordinary role turn returned unrelated renewal evidence')
         require(proof['work_sha256'] == spec.get('work_sha256'), 'resumed product check differs from checkpoint')
 
     def resume_payloads(self, state, reference, inventory, registries):
@@ -896,12 +930,15 @@ class Renewal:
                 require(plan == {'role': role, 'job': job, 'artifact_sha256':
                                  self.release(reference)['components'][role + '-agent']['artifact_sha256']},
                         'role artifact preflight identity changed')
-            proof = self.driver.invoke('capture-work', {'role': role, 'job': job})
-            protocol.fields(proof, 'head status_sha256 check_sha256 check_exit')
+            binding = registries[key].meta['binding']
+            proof = self.driver.invoke('capture-work', {'role': role, 'job': job, 'binding': binding})
+            protocol.fields(proof, 'head status_sha256 check_sha256 check_exit product_plan_sha256 product_result')
             protocol.digest(proof['head'], 40)
-            for field in ('status_sha256', 'check_sha256'):
+            for field in ('status_sha256', 'check_sha256', 'product_plan_sha256'):
                 digest(proof[field])
             protocol.number(proof['check_exit'], 0, 2)
+            require(type(proof['product_result']) is dict and len(json_bytes(proof['product_result'])) <= 4096,
+                    'invalid bounded product workspace evidence')
             work[key] = proof
         self.phase(attempt, state, 'backed-up', work_checks=work)
         for key in keys:
@@ -939,8 +976,13 @@ class Renewal:
             proof = state['proofs'].get(operation)
             if proof is None:
                 proof = self.driver.invoke('resume-without-effects', payload)
+            work = payload['work']
+            action = {'schema': 1, 'operation': operation, 'checkpoint': payload['checkpoint'],
+                      'plan_sha256': work['product_plan_sha256'], 'result': work['product_result'],
+                      'next_state': 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job',
+                      'pending_host': payload['pending_host']}
             self.check_proof(proof, {**spec, 'request_sha256': state['continuity_requests'][operation],
-                                   'work_sha256': identity(payload['work'])}, reference)
+                                   'work_sha256': identity(work), 'product': action}, reference)
             state['proofs'][operation] = proof
             self.phase(attempt, state, phase)
         self.confirm_tree(inventory)

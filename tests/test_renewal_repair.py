@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import shlex
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -21,6 +22,124 @@ import renewal as r
 
 
 class NativeRecoveryTests(unittest.TestCase):
+    def test_only_exact_empty_probe_leaves_are_eligible_for_infrastructure_exclusion(self):
+        check = runpy.run_path(str(SCRIPT))['check_probe_trees']
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for kind in ('workspaces', 'state', 'cache'):
+                (root / 'maintenance' / kind / 'gptbox-probe').mkdir(parents=True, mode=0o700)
+            account = SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid())
+            check(root, account)
+            (root / 'maintenance' / 'state' / 'gptbox-probe' / 'state.sqlite3').touch()
+            with self.assertRaisesRegex(ValueError, 'contains durable work'):
+                check(root, account)
+
+    def test_grant_requires_enough_full_cost_requests_for_the_product_tool_and_result(self):
+        verify = runpy.run_path(str(REPO / 'runtime' / 'renewal' / 'continuity-grant'))['check_request_capacity']
+        verify({'max_requests': 3, 'spend_microusd': 3264}, 1088, r.CONTINUITY_REQUESTS)
+        for bad in ({'max_requests': 3, 'spend_microusd': 1}, {'max_requests': 3, 'spend_microusd': 2176},
+                    {'max_requests': 1, 'spend_microusd': 1088}):
+            with self.assertRaisesRegex(ValueError, 'cannot fund'):
+                verify(bad, 1088, r.CONTINUITY_REQUESTS)
+
+    def test_normal_driver_and_same_uuid_resume_keep_disjoint_operation_records(self):
+        driver = runpy.run_path(str(SCRIPT))
+        turn = driver['turn']
+        g = turn.__globals__
+        uid, gid = os.getuid(), os.getgid()
+        real_run = subprocess.run
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            control = root / 'renewal'
+            control.mkdir(mode=0o700)
+            for folder in ('broker-requests', 'owned-turns', 'turn-launches', 'turn-receipts', 'provider-grants'):
+                (control / folder).mkdir(mode=0o700)
+            current = 'a' * 64
+            r.replace_json(control / 'site-current.json', current)
+            source = 'b' * 40
+            parts = {'maintenance-agent': {'artifact_sha256': 'c'*64, 'source_revision': source, 'codex_version': '1.2.3'},
+                     'development-agent': {'artifact_sha256': 'd'*64, 'source_revision': source, 'codex_version': '1.2.3'},
+                     'devbox': {'artifact_sha256': 'e'*64}, 'host': {'artifact_sha256': 'f'*64}}
+            plan = {'maintenance_context_sha256': '5'*64, 'development_manifests': {'product': '6'*64}}
+            started = []
+
+            def broker(action, channel):
+                if action == 'start':
+                    owned = list((control / 'owned-turns').iterdir())
+                    self.assertEqual(len(owned), 1)
+                    record = r.read_json(owned[0])
+                    if record['role'] == 'development':
+                        self.assertEqual(record['development_owner'], '7'*64)
+                    self.assertEqual(owned[0].name, r.role_operation_key(record['role'], record['job'], record['operation']))
+                    started.append(channel)
+
+            changes = {'ROOT': root, 'CONTROL': control,
+                       'admit_release': lambda _: ({'components': parts}, plan),
+                       'live_host': lambda _: (root, 100), 'unit': broker,
+                       'owned_file': lambda path, limit, expected_uid=0: r.read_private(path, limit),
+                       'require_provider_ready': lambda *_: None, 'reserve_development_owner': lambda *_: '7'*64,
+                       'provider_receipt': lambda _, sha: r.sha(sha.encode()),
+                       'stage_verification': lambda payload: payload['request_sha256'], 'continued_rollout': lambda *_: None,
+                       'gptbox': SimpleNamespace(job_selection=lambda raw, *_: r.loads(raw),
+                                                  completed_turn=lambda events: r.loads(events.splitlines()[0])['thread_id'])}
+            for role in r.ROLES:
+                self.assertNotEqual(r.role_operation_key(role, 'job--part', 'turn'),
+                                    r.role_operation_key(role, 'job', 'part--turn'))
+            session = {role: str(uuid.uuid4()) for role in r.ROLES}
+            with patch.dict(g, changes), patch.object(r.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=uid, pw_gid=gid)):
+                for role, action, operation in (('maintenance', 'turn', 'normal-m'), ('development', 'turn', 'normal-d'),
+                                                ('development', 'resume-without-effects', 'rollback-d')):
+                    active = session[role]
+                    compound = role == 'development'
+                    request = {'role': role, 'job': 'product', 'logical_session': role, 'operation': operation,
+                               'session_uuid': active if action != 'turn' else None, 'provider': 'gptbox',
+                               'model': 'gpt-6.2-sol', 'effort': 'high', 'standards_sha': r.STANDARDS,
+                               'agreement_sha256': 'a'*64, 'startup_sha256': 'b'*64, 'config_sha256': 'c'*64,
+                               'prompt_sha256': 'd'*64, 'candidate_sha': source}
+                    request_sha = r.identity(request)
+                    leaf = root / 'turn-inputs' / role / 'product' / operation / 'turn'
+                    leaf.mkdir(mode=0o700, parents=True)
+                    r.replace_json(leaf / 'request.json', request)
+                    r.replace_json(control / 'provider-grants' / (request_sha + '.json'), {})
+                    events = r.json_bytes({'thread_id': active})
+                    proof = None
+                    if action != 'turn':
+                        expectation = driver['product_result'](role, 'f'*64)
+                        command = shlex.join(driver['product_command'](role, expectation['recipe']))
+                        reply = {'operation': operation, 'checkpoint': 'cp', 'recipe': expectation['recipe'],
+                                 'next_state': 'retain-pending-host-check'}
+                        proof = {'checkpoint': {'checkpoint_id': 'cp', 'checkpoint_sha256': '3'*64},
+                                 'work': {'product_plan_sha256': 'a'*64, 'product_result': expectation},
+                                 'pending_host': ['still-pending']}
+                        events += b'\n' + r.json_bytes({'type': 'item.completed', 'item': {'type': 'command_execution',
+                                                'command': command, 'exit_code': 0, 'aggregated_output': r.canonical(expectation)}})
+                        events += b'\n' + r.json_bytes({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': r.canonical(reply)}})
+                    event_hash = r.sha(events)
+                    observed = {**request, 'session_uuid': active, 'request_sha256': request_sha, 'schema': 2,
+                                'status': 'completed-turn', 'runtime_admitted': True, 'owned_cleanup': 'reaped',
+                                'events_sha256': event_hash, 'events_bytes': len(events)}
+                    stored = root / role / 'state' / 'product' / 'turns' / operation
+                    stored.mkdir(mode=0o700, parents=True)
+                    r.replace_json(stored / 'result.json', observed)
+                    r.write_private(stored / 'events.jsonl', events)
+                    common = {'turn': observed, 'codex_version': '1.2.3'}
+                    report = common | ({'outer_removed': True, 'inner_removed': True, 'manifest_sha256': '6'*64,
+                                        'outer_image_id': 'e'*64, 'inner_image_id': 'd'*64} if compound else
+                                       {'runtime_container_removed': True, 'context_sha256': '5'*64, 'image_id': 'c'*64,
+                                        'source_sha': source})
+                    binding = {**request, 'policy_sha256': request['config_sha256'], 'job_id': 'product', 'credential_ref': 'mock'}
+                    spec = {**request, 'release_sha256': current, 'binding': binding, 'request_sha256': request_sha, **(proof or {})}
+                    with patch.object(subprocess, 'run', side_effect=lambda command, **kwargs:
+                                      real_run([sys.executable, '-c', 'import sys; print(sys.argv[1])', r.canonical(report)], **kwargs)):
+                        result = turn(action, spec)
+                    self.assertEqual(result['session_uuid'], active)
+                    self.assertFalse(list((control / 'owned-turns').iterdir()))
+                    if proof:
+                        self.assertEqual(turn(action, spec), result)
+                        self.assertEqual(result['product']['pending_host'], ['still-pending'])
+            self.assertEqual(len(started), 3)
+            self.assertEqual(len(list((control / 'turn-launches').iterdir())), 3)
+
     def test_rollback_archive_must_exist_as_exact_protected_file(self):
         verify = runpy.run_path(str(REPO / 'runtime' / 'renewal' / 'role-preflight'))['development_inputs']
         with tempfile.TemporaryDirectory() as temp:

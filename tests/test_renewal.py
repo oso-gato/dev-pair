@@ -186,6 +186,7 @@ class RenewalTests(unittest.TestCase):
                 before[role] = registry.meta['registry_id'], registry.inventory()['operations']
             finally:
                 registry.close()
+
         target = self.release('b', self.prior)
         self.request(target)
         (self.root / 'remove-registries').write_text(target)
@@ -198,6 +199,24 @@ class RenewalTests(unittest.TestCase):
                 self.assertEqual((registry.meta['registry_id'], registry.inventory()['operations']), before[role])
             finally:
                 registry.close()
+
+    def test_previous_completed_release_gets_a_fresh_verified_return_generation(self):
+        first = self.release('b', self.prior, scope='devbox')
+        second = self.release('c', first, scope='devbox')
+        for previous, target, name in ((self.prior, first, 'into-b'), (first, second, 'into-c')):
+            self.request(target, previous=previous, scope='devbox', operation=name)
+            result = self.renewal.apply('devbox')
+            self.assertEqual((result['phase'], result['request']['operation']), ('completed', name), result)
+            self.assertEqual(self.renewal.live_release(), target)
+        self.request(first, previous=self.prior, scope='devbox', operation='into-b')
+        with self.assertRaisesRegex(ValueError, 'no longer names the live release'):
+            self.renewal.apply('devbox')
+        self.request(first, previous=second, scope='devbox', operation='return-b')
+        result = self.renewal.apply('devbox')
+        self.assertEqual((result['phase'], result['request']['operation']), ('completed', 'return-b'), result)
+        self.assertEqual(result['activation_generation'], 2)
+        self.assertEqual(self.renewal.live_release(), first)
+        self.assertEqual(self.renewal.apply('devbox'), result)
 
     def test_unregistered_durable_session_prevents_any_activation(self):
         target = self.release('b', self.prior)
@@ -219,6 +238,15 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(result['phase'], 'deferred', result)
         self.assertIn('durable job catalogue', result['failure']['reason'])
         self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+
+    def test_managed_assembly_probe_empty_artifacts_can_coexist_with_real_jobs(self):
+        target = self.release('b', self.prior)
+        self.request(target)
+        for name in ('workspaces', 'state', 'cache'):
+            (self.root / 'maintenance' / name / 'gptbox-probe').mkdir(mode=0o700, parents=True)
+        result = self.renewal.apply('agent')
+        self.assertEqual(result['phase'], 'completed', result)
+        self.assert_sessions_preserved(result, target)
 
     def test_transient_deferral_retries_same_approval_and_rejected_target_cannot_be_renamed(self):
         target = self.release('b', self.prior)
@@ -315,12 +343,12 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(self.renewal.apply('agent'), result)
         self.assertEqual((self.root / 'site-events.jsonl').read_text().count('activate'), 1)
 
-    def test_real_interruption_leaves_durable_fences_and_restores_prior(self):
-        target = self.release('b', self.prior)
-        self.request(target)
+    def test_real_interruption_and_failed_target_host_observation_recover_prior(self):
+        target = self.release('b', self.prior, scope='host')
+        self.request(target, scope='host')
         (self.root / 'interrupt-release').write_text(target)
         program = ('import pathlib, sys;sys.path.insert(0,sys.argv[1]);import renewal as r;'
-                   'root=pathlib.Path(sys.argv[2]);r.Renewal(root,r.SiteDriver(root/"driver",8)).apply("agent")')
+                   'root=pathlib.Path(sys.argv[2]);r.Renewal(root,r.SiteDriver(root/"driver",8)).apply("host")')
         child = subprocess.Popen([sys.executable, '-c', program, str(TOOLS), str(self.root)], stdout=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 8
@@ -341,7 +369,12 @@ class RenewalTests(unittest.TestCase):
         while not (self.root / 'activation-child-finished').exists():
             self.assertLess(time.monotonic(), deadline)
             time.sleep(.01)
-        result = self.renewal.apply('agent')
+        (self.root / 'failed-host-observation').write_text(target)
+        self.renewal.boot_fence()
+        unit = (TOOLS.parent / 'runtime/renewal/dev-pair-renewal-recovery.service').read_text()
+        self.assertIn('Requires=dev-pair-renewal-boot-fence.service', unit)
+        self.assertIn('Wants=network-online.target dev-pair-renewal-host-observe.service', unit)
+        result = self.renewal.apply('host')
         self.assertEqual(result['phase'], 'rolled-back', result)
         self.assert_sessions_preserved(result, self.prior)
 
@@ -375,27 +408,33 @@ class RenewalTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
-    def test_fixed_driver_requires_a_fresh_checkpoint_progress_message(self):
+    def test_fixed_driver_requires_real_task_specific_work_and_original_next_effect(self):
         driver = runpy.run_path(str(TOOLS.parent / 'runtime' / 'renewal' / 'driver'))
         check = driver['verify_progress']
-        expected = {'operation': 'renew-next', 'checkpoint': 'saved-checkpoint',
-                    'outstanding_work': 'Tracked edit remains incomplete', 'next_action': 'Run focused test'}
-        event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(expected)}}
-        work = {'head': 'a' * 40, 'status_sha256': r.sha(b' M file'), 'check_sha256': r.sha(b''), 'check_exit': 0}
-        spec = {'operation': 'renew-next', 'checkpoint': {'checkpoint_id': 'saved-checkpoint'}, 'work': work}
         def tool(command, body):
             return {'type': 'item.completed', 'item': {'type': 'command_execution', 'command': shlex.join(command),
                     'exit_code': 0, 'aggregated_output': body}}
-        observations = (tool(driver['STATUS'], ' M file\n'), tool(driver['CHECK'], ''))
-        events = b'\n'.join(r.json_bytes(row) for row in (*observations, event))
-        self.assertEqual(check(events, spec), r.identity({'progress': expected, 'work': work}))
-        with self.assertRaisesRegex(ValueError, 'product integrity'):
-            check(r.json_bytes(event), spec)
-        with self.assertRaisesRegex(ValueError, 'product integrity'):
-            check(b'\n'.join(r.json_bytes(row) for row in (tool(driver['STATUS'], 'wrong'), observations[1], event)), spec)
-        stale = {**spec, 'operation': 'renew-later'}
-        with self.assertRaisesRegex(ValueError, 'stale'):
-            check(events, stale)
+        file = TOOLS.parent / 'examples' / 'checklist' / 'checklist.py'
+        for role in r.ROLES:
+            expectation = driver['product_result'](role, r.sha(file.read_bytes()))
+            recipe = expectation['recipe']
+            planned = driver['product_command'](role, recipe)
+            actual = subprocess.check_output(planned, cwd=TOOLS.parent, timeout=18, text=True)
+            self.assertEqual(json.loads(actual), expectation)
+            reply = {'operation': 'renew-next', 'checkpoint': 'saved-checkpoint', 'recipe': recipe,
+                     'next_state': 'retain-pending-host-check'}
+            event = {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(reply)}}
+            work = {'head': 'a' * 40, 'product_plan_sha256': r.sha(b'approved plan'), 'product_result': expectation}
+            spec = {'role': role, 'operation': 'renew-next', 'checkpoint': {'checkpoint_id': 'saved-checkpoint'},
+                    'work': work, 'pending_host': ['pending-check']}
+            events = b'\n'.join(r.json_bytes(row) for row in (tool(planned, actual), event))
+            self.assertEqual(check(events, spec)['result'], expectation)
+            with self.assertRaisesRegex(ValueError, 'task-specific product result'):
+                check(r.json_bytes(event), spec)
+            with self.assertRaisesRegex(ValueError, 'outside the approved product action'):
+                check(b'\n'.join(r.json_bytes(row) for row in (tool(driver['STATUS'], ' M file'), event)), spec)
+            with self.assertRaisesRegex(ValueError, 'stale'):
+                check(events, {**spec, 'operation': 'renew-later'})
 
 
 if __name__ == '__main__':

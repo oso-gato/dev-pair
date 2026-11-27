@@ -101,16 +101,18 @@ def maintenance(record, directory, image):
 
 def development(record, directory, manifest_sha):
     command = ['/usr/sbin/runuser', '--user', 'dp-dev', '--', '/usr/bin/python3', '-I', '-B',
-               str(INSTALL / 'renewal' / 'owned-cleanup'), '__development', str(directory), record['job'], manifest_sha]
+               str(INSTALL / 'renewal' / 'owned-cleanup'), '__development', str(directory), record['job'], manifest_sha,
+               record['development_owner']]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=50, check=False,
                             env={'PATH': '/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'})
     r.require(result.returncode == 0 and result.stdout == b'owned runtime absent\n', 'owned DevBox reconciliation failed')
 
 
-def development_child(directory, job, manifest_sha):
+def development_child(directory, job, manifest_sha, expected_owner):
     r.require(r.pwd.getpwuid(os.getuid()).pw_name == 'dp-dev', 'rootless development cleanup required')
     r.token(job)
     r.digest(manifest_sha)
+    r.digest(expected_owner)
     absolute = Path(directory)
     r.require(absolute == in_release({'artifact_sha256': absolute.name}), 'invalid development control plane')
     sys.path.insert(0, str(absolute / 'tools'))
@@ -126,6 +128,7 @@ def development_child(directory, job, manifest_sha):
     engine = db.Engine([db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd'],
                        devbox.host_env(account), end)
     with devbox.ownership(account, job, manifest_sha, job_turn=True) as (owner, _):
+        r.require(owner == expected_owner, 'DevBox pre-reserved owner changed')
         db.remove_owned(engine, 'dp-devbox-' + owner[:24], owner, manifest['outer']['image_id'])
     print('owned runtime absent')
 
@@ -142,11 +145,11 @@ def cleanup(controller):
     active_records = CONTROL / 'owned-turns'
     r.require(set(owned) == {item.name for item in active_records.iterdir()}, 'owned cleanup inventory changed')
     for key, record in owned.items():
-        p.fields(record, 'role job operation request_sha256 release_sha256 maintenance_context_sha256 development_manifest_sha256')
+        p.fields(record, 'role job operation request_sha256 release_sha256 maintenance_context_sha256 development_manifest_sha256 development_owner')
         role, job, operation = (record[field] for field in ('role', 'job', 'operation'))
         r.token(job)
         r.token(operation)
-        r.require(role in r.ROLES and key == f'{role}--{job}--{operation}' and
+        r.require(role in r.ROLES and key == r.role_operation_key(role, job, operation) and
                   record == r.read_json(active_records / key), 'owned cleanup record changed')
         r.digest(record['request_sha256'])
         # Stop the exact broker before considering container removal. Its durable receipt survives.
@@ -174,7 +177,7 @@ def cleanup(controller):
 
 def main():
     if sys.argv[1:2] == ['__development']:
-        r.require(len(sys.argv) == 5, 'invalid development cleanup arguments')
+        r.require(len(sys.argv) == 6, 'invalid development cleanup arguments')
         development_child(*sys.argv[2:])
         return
     r.require(os.getuid() == 0 and len(sys.argv) == 1, 'protected owned cleanup required')

@@ -21,7 +21,12 @@ def invoke(root, action, payload):
         return {'role': payload['role'], 'job': payload['job'],
                 'artifact_sha256': payload['release']['components'][payload['role'] + '-agent']['artifact_sha256']}
     if action == 'capture-work':
-        return {'head': 'c' * 40, 'status_sha256': sha(b'dirty'), 'check_sha256': sha(b''), 'check_exit': 0}
+        return {'head': 'c' * 40, 'status_sha256': sha(b'dirty'), 'check_sha256': sha(b''), 'check_exit': 0,
+                'product_plan_sha256': sha(b'local only'), 'product_result': {'check': 'fixture-only'}}
+    if action == 'verify-managed-probe':
+        for name in ('workspaces', 'state', 'cache'):
+            assert not any((root / 'maintenance' / name / 'gptbox-probe').iterdir())
+        return {'scope': 'maintenance-assembly-probe', 'empty': True}
     if action == 'preflight-resume':
         if (root / 'deny-recovery-grant').exists() and payload['release_sha256'] == (root / 'deny-recovery-grant').read_text():
             raise SystemExit(4)
@@ -59,19 +64,29 @@ def invoke(root, action, payload):
             stream.write(operation + '\n')
         if (root / 'duplicate-effect').exists() and action == 'resume-without-effects':
             raise AssertionError('verification has no host effect path')
+        evidence = None
+        if action == 'resume-without-effects':
+            work = payload['work']
+            evidence = {'schema': 1, 'operation': operation, 'checkpoint': payload['checkpoint'],
+                        'plan_sha256': work['product_plan_sha256'], 'result': work['product_result'],
+                        'next_state': 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job',
+                        'pending_host': payload['pending_host']}
         return {key: payload[key] for key in ('role', 'job', 'logical_session', 'operation')} | {
             'release_sha256': release, 'session_uuid': session,
             'request_sha256': payload.get('request_sha256', sha(operation.encode())),
             'provider_receipt_sha256': sha(b'local fixture ' + operation.encode()),
             'work_sha256': sha(json.dumps(payload['work'], sort_keys=True, separators=(',', ':')).encode())
             if action == 'resume-without-effects' else None,
-            'events_sha256': sha(events), 'progress_sha256': sha(history.read_bytes()), 'child_reaped': True,
+            'events_sha256': sha(events), 'child_reaped': True,
+            'product': evidence,
+            'progress_sha256': sha(json.dumps(evidence, sort_keys=True, separators=(',', ':')).encode()) if evidence else None,
         }
     evidence = {key: payload[key] for key in ('release_sha256',)} | {'components': payload['release']['components']}
     with trace.open('a') as log:
         log.write(json.dumps([action, payload['operation'], release]) + '\n')
     if action == 'observe':
-        if (root / 'failed-host-observation').exists():
+        unavailable = root / 'failed-host-observation'
+        if unavailable.exists() and unavailable.read_text() in ('', release):
             raise SystemExit(6)
         assert evidence == current
     if action == 'activate':
