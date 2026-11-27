@@ -36,6 +36,7 @@ class Systemd:
         self.vendor_key = b'public Fedora test key'
         self.vendor_payload = b'# Fedora test payload\n[Service]\nTimeoutStopFailureMode=abort\n'
         self.vendor_facts = {}
+        self.missing_properties = set()
 
     def __call__(self, binary, command, *args, **unused):
         if binary == '/usr/bin/rpm':
@@ -90,7 +91,8 @@ class Systemd:
                    SendSIGKILL='yes', FinalKillSignal='9', TimeoutStartFailureMode='terminate',
                    TimeoutStopFailureMode='abort' if vendor.exists() else 'terminate')
         row.update(self.vendor_facts)
-        return ''.join(f'{key}={row[key]}\n' for key in fields)
+        return ''.join(f'{key}={row[key]}\n' for key in fields if key not in self.missing_properties
+                       and (key not in profile.COMMAND_HOOKS or row[key]))
 
 
 class ExistingPaths:
@@ -261,6 +263,17 @@ class HostCommissioning(unittest.TestCase):
             self.apply()
         self.assertNotIn('dev-pair-checklist-spool.timer', self.manager.enabled)
         self.assertFalse(self.app.path('/etc/sudoers.d/60-dev-pair-owner').exists())
+
+    def test_stock_empty_hooks_are_omitted_but_forbidden_hooks_and_missing_execstart_block(self):
+        self.assertEqual(self.apply()['phase'], 'host-observation-queued')
+        self.manager.vendor_facts['ExecStopPost'] = '{ path=/usr/bin/false ; argv[]=/usr/bin/false ; }'
+        with self.assertRaisesRegex(c.Blocked, 'effective process profile differs'):
+            self.apply()
+        self.manager.vendor_facts.clear()
+        self.manager.missing_properties.add('ExecStart')
+        with self.assertRaisesRegex(c.Blocked, 'unit property readback differs'):
+            self.apply()
+        self.assertNotIn('enable:dev-pair-intake-recovery.timer', self.steps)
 
     def test_fedora_vendor_dropin_is_measured_and_effective_properties_are_checked(self):
         with patch.object(profile, 'KEY_SHA', c.digest(self.manager.vendor_key)):

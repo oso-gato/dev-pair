@@ -20,6 +20,22 @@ PROPERTIES = ('NeedDaemonReload', 'RootDirectory', 'RootImage', 'SELinuxContext'
 TIMEOUT_FIELDS = ('TimeoutStartFailureMode', 'TimeoutStopFailureMode')
 
 
+def manager_properties(output, expected):
+    """Read systemctl show output, including omitted empty command arrays."""
+    rows = [line.split('=', 1) for line in output.splitlines()]
+    values = dict(rows)
+    expected = set(expected)
+    missing = expected - values.keys()
+    # The stock formatter emits no record for an empty Exec command array,
+    # even with --all. Only these known optional arrays may be absent on a
+    # positively loaded unit. Every requested scalar and ExecStart is required.
+    if (len(rows) != len(values) or values.keys() - expected or missing - set(COMMAND_HOOKS)
+            or missing and values.get('LoadState') != 'loaded'):
+        raise ValueError('systemd manager property readback is incomplete or ambiguous')
+    values.update(dict.fromkeys(missing, ''))
+    return values
+
+
 def protected(path, owner, limit, *, mode=None):
     path = Path(path)
     for parent in path.parents:

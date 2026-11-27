@@ -324,10 +324,11 @@ class Commission:
             'Unit,NextElapseUSecRealtime,NextElapseUSecMonotonic' if timer else
             ','.join(('ExecStart', 'User', 'Group', *profile.PROPERTIES)))
         output = self.run(SYSTEMCTL, 'show', '--all', '--property=' + properties, unit, timeout=15)
-        pairs = [line.split('=', 1) for line in output.splitlines()]
-        row = dict(pairs)
-        require(len(pairs) == len(row) and set(row) == set(properties.split(',')) and
-                row['LoadState'] == 'loaded' and row['FragmentPath'] == fragment,
+        try:
+            row = profile.manager_properties(output, properties.split(','))
+        except ValueError:
+            raise Blocked('systemd unit property readback differs for ' + unit) from None
+        require(row['LoadState'] == 'loaded' and row['FragmentPath'] == fragment,
                 'systemd loaded a different fragment for ' + unit)
         if timer:
             require(row['DropInPaths'].split() == drops, 'systemd loaded a different timer override for ' + unit)
