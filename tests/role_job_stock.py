@@ -35,10 +35,18 @@ class MockProvider:
         self.calls.append({'model': body['model'], 'effort': body['reasoning']['effort']})
         response = {'id': 'resp_fixture_' + self.operation, 'model': MODEL,
                     'usage': {'input_tokens': 100, 'output_tokens': 12, 'total_tokens': 112}}
+        item = {'id': 'msg_fixture_' + self.operation, 'type': 'message', 'role': 'assistant',
+                'content': [{'type': 'output_text', 'text': ANSWERS[self.operation]}]}
+        if self.operation == 'first':
+            if len(self.calls) == 1:
+                item = {'type': 'function_call', 'id': 'fc_fixture_pwd', 'call_id': 'call_fixture_pwd',
+                        'name': 'exec_command', 'arguments': json.dumps({'cmd': 'pwd', 'workdir': '/work/job'})}
+            else:
+                assert any(row.get('type') == 'function_call_output' and
+                           row.get('call_id') == 'call_fixture_pwd' and '/work/job' in str(row.get('output'))
+                           for row in body['input'])
         items = [{'type': 'response.created', 'response': response},
-                 {'type': 'response.output_item.done', 'item': {
-                     'id': 'msg_fixture_' + self.operation, 'type': 'message', 'role': 'assistant',
-                     'content': [{'type': 'output_text', 'text': ANSWERS[self.operation]}]}},
+                 {'type': 'response.output_item.done', 'item': item},
                  {'type': 'response.completed', 'response': response}]
         raw = b''.join(f'event: {item["type"]}\ndata: {json.dumps(item)}\n\n'.encode() for item in items)
         result = FakeResponse(raw)
@@ -60,6 +68,7 @@ def fixtures(root, runner):
     (f / 'work/resource.txt').write_text('stays across runtime launches\n')
     command = ['/usr/bin/git', '-C', str(f / 'work')]
     subprocess.run([*command, 'init', '-q'], check=True)
+    subprocess.run([*command, 'remote', 'add', 'origin', 'https://github.com/owner/product.git'], check=True)
     subprocess.run([*command, 'add', 'resource.txt'], check=True)
     subprocess.run([*command, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
                     'commit', '-q', '-m', 'fixture'], check=True)
@@ -82,7 +91,10 @@ def fixtures(root, runner):
     details = {**selection(), 'role': 'maintenance', 'logical_session': CLAIM, 'candidate_sha': head}
     for key, value in (('config', profile), ('requirements', policy), ('startup', manifest)):
         details[key + '_sha256'] = hashlib.sha256(value).hexdigest()
-    return f, details
+    approval = {key: details[key] for key in ('job', 'repository', 'agreement_sha256', 'standards_sha', 'startup_sha256')}
+    approval.update(schema=1, acquired_commit=head, startup_project_revision=head,
+                    acquired_tree=subprocess.check_output([*command, 'rev-parse', 'HEAD^{tree}'], text=True).strip())
+    return f, details, approval
 
 
 def inner_mode(operation, request_sha):
@@ -144,7 +156,7 @@ def run(binary):
     with tempfile.TemporaryDirectory(prefix='dp-live-fixture-') as tmp:
         root = Path(tmp)
         runner = state.Harness(root, binary)
-        f, details = fixtures(root / 'role', runner)
+        f, details, approval = fixtures(root / 'role', runner)
         for operation in ('first', 'next'):
             identity = {**details, 'operation': operation, 'turn_seconds': 8,
                         'prompt_sha256': hashlib.sha256(PROMPTS[operation]).hexdigest()}
@@ -154,11 +166,12 @@ def run(binary):
             request_sha = hashlib.sha256(raw).hexdigest()
             write(f / operation / 'request.json', raw)
             write(f / operation / 'prompt.txt', PROMPTS[operation])
+            write(f / operation / 'approval.json', broker.canonical(approval))
             shutil.copytree(f / 'startup', f / operation / 'startup')
             channel = root / ('broker-' + operation)
             channel.mkdir()
             channel.chmod(0o750)
-            permission = {**grant(request_sha), 'max_request_bytes': 262144}
+            permission = {**grant(request_sha), 'max_request_bytes': 262144, 'spend_microusd': 3200}
             evidence = broker.Journal(root / f'{operation}.json', identity, permission)
             provider = MockProvider(operation)
             end = time.monotonic() + 12
@@ -169,6 +182,29 @@ def run(binary):
                 while evidence.value['status'] != 'listening':
                     assert worker.is_alive() and end - time.monotonic() > 10
                     time.sleep(.01)
+                if operation == 'first':
+                    approval_file = f / operation / 'approval.json'
+                    approval_file.unlink()
+                    write(approval_file, broker.canonical({**approval, 'startup_project_revision': '0' * 40}))
+                    try:
+                        execute(f, runner.binary, operation, request_sha, channel, end)
+                    except RuntimeError as error:
+                        assert 'invalid private startup manifest' in str(error)
+                    else:
+                        raise AssertionError('unapproved startup revision launched stock work')
+                    assert not provider.calls
+                    approval_file.unlink()
+                    write(approval_file, broker.canonical(approval))
+                    command = ['/usr/bin/git', '-C', str(f / 'work'), 'remote', 'set-url', 'origin']
+                    subprocess.run([*command, 'https://github.com/unrelated/checkout.git'], check=True)
+                    try:
+                        execute(f, runner.binary, operation, request_sha, channel, end)
+                    except RuntimeError as error:
+                        assert 'workspace checkout does not identify the approved repository' in str(error)
+                    else:
+                        raise AssertionError('unrelated checkout launched stock work')
+                    assert not provider.calls
+                    subprocess.run([*command, 'https://github.com/owner/product.git'], check=True)
                 result = execute(f, runner.binary, operation, request_sha, channel, end)
                 if result['status'] != 'completed-turn':
                     diagnostic = f / 'state/turns' / operation
@@ -176,14 +212,24 @@ def run(binary):
                                        str([json.loads(row).get('type') for row in
                                             (diagnostic / 'events.jsonl').read_text().splitlines()]))
                 assert ANSWERS[operation].encode() in (f / 'state/turns' / operation / 'events.jsonl').read_bytes()
-                assert provider.calls == [{'model': MODEL, 'effort': 'high'}]
+                expected_calls = 2 if operation == 'first' else 1
+                assert provider.calls == [{'model': MODEL, 'effort': 'high'}] * expected_calls
+                try:
+                    execute(f, runner.binary, operation, request_sha, channel, end)
+                except RuntimeError as error:
+                    assert 'operation already dispatched' in str(error)
+                else:
+                    raise AssertionError('duplicate operation launched stock work')
+                assert len(provider.calls) == expected_calls
                 results.append(result)
             finally:
                 worker.join(12)
                 assert not worker.is_alive()
         assert results[0]['session_uuid'] == results[1]['session_uuid']
     print(json.dumps({'binary_sha256': state.CODEX_SHA, 'results': results, 'owned_cleanup': True,
-                      'provider': 'synthetic-stream', 'native_selinux_tested': False}))
+                      'provider': 'synthetic-stream', 'native_selinux_tested': False, 'tool_result_observed': True,
+                      'wrong_origin_provider_attempts': 0, 'wrong_startup_revision_provider_attempts': 0,
+                      'duplicate_additional_provider_attempts': 0}))
 
 
 if __name__ == '__main__':

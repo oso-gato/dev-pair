@@ -14,8 +14,6 @@ import stat
 import sys
 import time
 
-from gptbox_runtime import host_job_inputs
-
 RUNTIME = Path(__file__).resolve().parent.parent / 'runtime/devbox'
 sys.path.insert(0, str(RUNTIME))
 import controller as db
@@ -91,6 +89,9 @@ def placement(account, manifest, actual_manifest, job_turn=None):
     storage = storage_mount(build, manifest['storage_bytes'], mountinfo)
     inputs = build / 'inputs'
     if job_turn:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from gptbox_runtime import host_job_inputs
+
         inputs /= job_turn[0]
     graph = build / 'graph'
     image_copy = build / 'image-copy'
@@ -295,7 +296,7 @@ def validate_job_result(receipt, admission, owner, manifest, job_turn):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('run',))
+    parser.add_argument('command', choices=('run',))
     parser.add_argument('--manifest', type=Path, required=True)
     parser.add_argument('--sha256', required=True, help='independently recorded manifest SHA-256')
     parser.add_argument('--operation', help='run one protected live job turn in the exact placement')

@@ -39,6 +39,7 @@ TURN_READONLY_MOUNTS = (REQUIREMENTS.parent, TURN_INPUTS, CREDENTIAL.parent,
                         *(CODEX_HOME / name for name in (*LOADER_FILES, *LOADER_DIRS)))
 PROVIDER_DIR = Path('/run/dev-pair-provider')
 PROVIDER_SOCKET = PROVIDER_DIR / 'responses.sock'
+REPOSITORY_APPROVALS = Path('/var/lib/dev-pair/repository-approvals')
 JOB_READONLY_MOUNTS = (REQUIREMENTS.parent, TURN_INPUTS, PROVIDER_DIR,
                        *(CODEX_HOME / name for name in (*LOADER_FILES, *LOADER_DIRS)))
 JOB_INPUTS = {'/etc/codex': 'requirements', str(TURN_INPUTS): 'turn',
@@ -65,6 +66,8 @@ ENV = {'HOME': '/home/gpt', 'CODEX_HOME': str(CODEX_HOME),
        'PATH': '/opt/dev-pair/bin:/usr/bin:/bin', 'LANG': 'C.UTF-8', 'TMPDIR': '/tmp',
        'XDG_RUNTIME_DIR': '/run/user/1000', 'XDG_CACHE_HOME': '/cache/job',
        'XDG_STATE_HOME': '/state', 'XDG_CONFIG_HOME': '/home/gpt/.config'}
+GIT_ENV = {**ENV, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_NO_REPLACE_OBJECTS': '1',
+           'GIT_NO_LAZY_FETCH': '1', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0', 'GIT_ALLOW_PROTOCOL': ''}
 
 def digest(path):
     with Path(path).open('rb') as stream:
@@ -521,6 +524,58 @@ def provider_host_path(request_sha):
     return Path('/run/dev-pair/provider') / request_sha[:32]
 
 
+def repository_origin(repository, remote):
+    return type(remote) is str and remote in (f'https://github.com/{repository}', f'https://github.com/{repository}.git',
+                                               f'git@github.com:{repository}.git')
+
+
+def git_output(directory, *arguments):
+    result = subprocess.run(['/usr/bin/git', '-C', str(directory), *arguments], check=True, capture_output=True,
+                            env=GIT_ENV, timeout=4)
+    require(0 < len(result.stdout) <= 1024, 'unexpected Git repository identity output')
+    return result.stdout.decode('utf-8').removesuffix('\n')
+
+
+def read_repository_approval(raw, selection):
+    approval = json.loads(raw, object_pairs_hook=unique_object)
+    bound = ('job', 'repository', 'agreement_sha256', 'standards_sha', 'startup_sha256')
+    fields = {*bound, 'schema', 'acquired_commit', 'acquired_tree', 'startup_project_revision'}
+    require(type(approval) is dict and approval.keys() == fields and type(approval['schema']) is int
+            and approval['schema'] == 1 and all(approval[key] == selection[key] for key in bound)
+            and all(type(approval[key]) is str and re.fullmatch(r'[0-9a-f]{40}', approval[key])
+                    for key in ('acquired_commit', 'acquired_tree', 'startup_project_revision')),
+            'trusted job repository or startup approval mismatch')
+    return approval
+
+
+def host_repository_approval(selection):
+    require(JOB.fullmatch(selection['job']), 'invalid protected repository leaf')
+    path = REPOSITORY_APPROVALS / (selection['job'] + '.json')
+    for parent in (path, *path.parents):
+        node = parent.lstat()
+        require(node.st_uid == 0 and not node.st_mode & 0o022 and not stat.S_ISLNK(node.st_mode),
+                'job repository approval lacks protected custody')
+    raw = fixed_read(path, 4096)
+    read_repository_approval(raw, selection)
+    return raw
+
+
+def verify_workspace(selection, approval):
+    require(git_output(WORK, 'rev-parse', '--show-toplevel') == str(WORK) and
+            repository_origin(selection['repository'],
+                              git_output(WORK, 'config', '--local', '--no-includes', '--get-all', 'remote.origin.url')),
+            'workspace checkout does not identify the approved repository')
+    head = git_output(WORK, 'rev-parse', '--verify', 'HEAD')
+    baseline = approval['acquired_commit']
+    require(head == selection['candidate_sha'] and
+            git_output(WORK, 'rev-parse', '--verify', baseline + '^{tree}') == approval['acquired_tree'],
+            'workspace candidate or acquired source differs from its protected identity')
+    ancestry = subprocess.run(['/usr/bin/git', '-C', str(WORK), 'merge-base', '--is-ancestor', baseline, head],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              env=GIT_ENV, timeout=4)
+    require(ancestry.returncode == 0, 'workspace candidate is outside approved acquisition history')
+
+
 def host_job_inputs(role, job, operation, request_sha, gid):
     require(role in ('maintenance', 'development') and JOB.fullmatch(job) and OPERATION.fullmatch(operation),
             'invalid role job or operation leaf')
@@ -545,15 +600,20 @@ def host_job_inputs(role, job, operation, request_sha, gid):
     request_path = leaf / 'turn' / 'request.json'
     node = request_path.lstat()
     require(node.st_uid == 0 and not node.st_mode & 0o222, 'job request file is writable')
-    return mounts, job_selection(fixed_read(request_path, 4096), request_sha, role, job, operation)
+    request = job_selection(fixed_read(request_path, 4096), request_sha, role, job, operation)
+    mirror = leaf / 'turn' / 'approval.json'
+    node = mirror.lstat()
+    require(node.st_uid == 0 and not node.st_mode & 0o222 and fixed_read(mirror, 4096) == host_repository_approval(request),
+            'staged approval differs from trusted job authorization')
+    return mounts, request
 
 
-def startup_documents(raw, selection):
+def startup_documents(raw, selection, approval):
     manifest = json.loads(raw, object_pairs_hook=unique_object)
     require(type(manifest) is dict and set(manifest) == {'version', 'mode', 'project_revision', 'standards_sha', 'documents'}
             and type(manifest['version']) is int and manifest['version'] == 1 and manifest['mode'] == 'private-runtime'
             and manifest['standards_sha'] == selection['standards_sha'] and
-            type(manifest['project_revision']) is str and re.fullmatch(r'[0-9a-f]{40}', manifest['project_revision']) and
+            manifest['project_revision'] == approval['startup_project_revision'] and
             type(manifest['documents']) is list and len(manifest['documents']) == len(STARTUP_IDS),
             'invalid private startup manifest')
     documents = []
@@ -577,11 +637,12 @@ def job_turn_inputs(role, job, operation, request_sha):
                 os.statvfs(path).f_flag & os.ST_RDONLY, 'job configuration mount is not read-only')
     require(stat.S_ISSOCK(PROVIDER_SOCKET.lstat().st_mode) and not os.path.lexists(CODEX_HOME / 'auth.json'),
             'job requires the dedicated provider channel and clean saved authentication')
-    require({path.name for path in TURN_INPUTS.iterdir()} == {'request.json', 'prompt.txt', 'startup'}
+    require({path.name for path in TURN_INPUTS.iterdir()} == {'request.json', 'approval.json', 'prompt.txt', 'startup'}
             and {path.name for path in REQUIREMENTS.parent.iterdir()} == {REQUIREMENTS.name},
             'unknown job configuration file')
     raw = fixed_read(TURN_INPUTS / 'request.json', 4096, readonly=True)
     request = job_selection(raw, request_sha, role, job, operation)
+    approval = read_repository_approval(fixed_read(TURN_INPUTS / 'approval.json', 4096, readonly=True), request)
     prompt = fixed_read(TURN_INPUTS / 'prompt.txt', 16384, readonly=True)
     requirements = fixed_read(REQUIREMENTS, 65536, readonly=True)
     config = fixed_read(CODEX_HOME / 'config.toml', 8192, readonly=True)
@@ -596,10 +657,8 @@ def job_turn_inputs(role, job, operation, request_sha):
     require(json.dumps(policy, sort_keys=True) == json.dumps(expected_requirements, sort_keys=True) and
             json.dumps(tomllib.loads(config.decode('utf-8')), sort_keys=True) == json.dumps(expected_config, sort_keys=True),
             'managed job permission policy changed')
-    documents = startup_documents(startup, request)
-    head = subprocess.run(['/usr/bin/git', '-C', str(WORK), 'rev-parse', '--verify', 'HEAD'],
-                          capture_output=True, check=True, env=ENV, timeout=4).stdout.strip()
-    require(head == request['candidate_sha'].encode('ascii'), 'workspace HEAD differs from the admitted candidate')
+    documents = startup_documents(startup, request, approval)
+    verify_workspace(request, approval)
     if request['action'] == 'start':
         inputs = b'\n\n'.join(name.encode() + b'\n' + data for name, data in zip(STARTUP_IDS, documents))
         prompt = (b'Read the complete startup documents below before starting the authorized job.\n\n' + inputs +

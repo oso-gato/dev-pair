@@ -23,7 +23,8 @@ from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Comma
                        SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
-from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, TURN_READONLY_MOUNTS, host_job_inputs)
+from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPROVALS, TURN_READONLY_MOUNTS,
+                           git_output, host_job_inputs, repository_origin)
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
@@ -1855,9 +1856,57 @@ def run_job_cli(argv):
         return 2
 
 
+def approve_job(argv):
+    parser = argparse.ArgumentParser(prog='gptbox.py approve-job', description='Record the approved Git acquisition and pinned startup input.')
+    for field in ('job', 'repository', 'agreement-sha256', 'acquired-checkout', 'acquired-sha',
+                  'startup-project', 'startup-project-sha', 'standards-cache'):
+        parser.add_argument('--' + field, required=True)
+    args = parser.parse_args(argv)
+    try:
+        from startup_delivery import IDS, load_private
+
+        if (os.geteuid() != 0 or not JOB.fullmatch(args.job)
+                or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}', args.repository)
+                or not re.fullmatch(r'[0-9a-f]{64}', args.agreement_sha256)
+                or not re.fullmatch(r'[0-9a-f]{40}', args.acquired_sha)
+                or not re.fullmatch(r'[0-9a-f]{40}', args.startup_project_sha)):
+            raise Blocked('approved acquisition identity required')
+        app = Gptbox()
+        acquired = app.protected(Path(args.acquired_checkout))
+        app.protected(acquired / '.git' / 'config')
+        if (git_output(acquired, 'rev-parse', '--show-toplevel') != str(acquired)
+                or git_output(acquired, 'rev-parse', '--verify', 'HEAD') != args.acquired_sha
+                or not repository_origin(args.repository,
+                                         git_output(acquired, 'config', '--local', '--no-includes', '--get-all', 'remote.origin.url'))):
+            raise Blocked('protected Git acquisition did not match the approved source')
+        tree = git_output(acquired, 'rev-parse', '--verify', 'HEAD^{tree}')
+        project = app.protected(Path(args.startup_project))
+        standards = app.protected(Path(args.standards_cache))
+        corpus = load_private(project, standards, args.startup_project_sha, time.monotonic() + 20)
+        manifest = image_inputs_bytes(corpus.manifest)
+        approval = {'schema': 1, 'job': args.job, 'repository': args.repository,
+                    'agreement_sha256': args.agreement_sha256, 'acquired_commit': args.acquired_sha, 'acquired_tree': tree,
+                    'standards_sha': candidate.STANDARDS, 'startup_project_revision': args.startup_project_sha,
+                    'startup_sha256': sha(manifest)}
+        root = REPOSITORY_APPROVALS / args.job
+        with app.lock('job-acquisition.lock'):
+            app.directory(str(root), mode=0o700)
+            app.atomic(str(root / 'manifest.json'), manifest.decode(), mode=0o400)
+            for ident in IDS:
+                app.atomic(str(root / (ident + '.txt')), corpus.private_document(ident).decode(), mode=0o400)
+            app.atomic(str(REPOSITORY_APPROVALS / (args.job + '.json')), image_inputs_bytes(approval).decode(), mode=0o444)
+        print(json.dumps(approval, sort_keys=True))
+        return 0
+    except (RuntimeError, OSError, TypeError, ValueError, KeyError, subprocess.SubprocessError):
+        print('Job acquisition blocked; inspect protected source and standards identity locally', file=sys.stderr)
+        return 2
+
+
 def main():
     if sys.argv[1:2] == ['run-job']:
         return run_job_cli(sys.argv[2:])
+    if sys.argv[1:2] == ['approve-job']:
+        return approve_job(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', choices=('assemble', 'initialize', 'prepare-development-host', 'build-development'))
     parser.add_argument('--apply', action='store_true')

@@ -1,6 +1,6 @@
 """Offline checks for the scoped role-to-provider transport."""
 
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 import hashlib
 import http.client
 import io
@@ -36,7 +36,7 @@ def selection():
 
 def grant(request_sha):
     return {'schema': 1, 'auth_profile': 'openai-api-key', 'request_sha256': request_sha,
-            'allowance_ref': 'offline-fixture', 'peer_uid': os.getuid(), 'peer_gid': os.getgid(),
+            'allowance_ref': 'offline-fixture', 'allowance_sha256': 'a' * 64, 'peer_uid': os.getuid(), 'peer_gid': os.getgid(),
             'spend_microusd': 1600, 'seconds': 30, 'expires_unix': 1800000000, 'max_requests': 2,
             'max_request_bytes': 4096, 'max_context_tokens': 1024, 'max_output_tokens': 32,
             'input_microusd_per_million': 1000000, 'output_microusd_per_million': 2000000,
@@ -53,12 +53,16 @@ def request(**changes):
 def events(model=MODEL):
     response = {'id': 'resp_fixture', 'model': model}
     completed = {**response, 'usage': {'input_tokens': 12, 'output_tokens': 3, 'total_tokens': 15}}
-    return b''.join(b'data: ' + broker.canonical({'type': kind, 'response': value}) + b'\n\n'
+    return b''.join(broker.sse(kind, {'type': kind, 'response': value})
                     for kind, value in (('response.created', response), ('response.completed', completed)))
 
 
 class FakeResponse(io.BytesIO):
     status = 200
+
+    def read1(self, length):
+        # Make complete provider frames cross multiple reads.
+        return super().read1(min(length, 19))
 
     @staticmethod
     def getheader(name, default=None):
@@ -128,6 +132,30 @@ class JobSelectionTests(unittest.TestCase):
         self.assertEqual(policy['permissions']['product-child']['filesystem'][db.JOB_BUILD], 'write')
         self.assertNotIn(db.JOB_BUILD, runtime.ENV['PATH'])
 
+    def test_probe_and_live_options_reach_host_with_public_argv(self):
+        import devbox
+        from test_devbox import manifest
+
+        with tempfile.TemporaryDirectory(prefix='dp-role-argv-') as path:
+            candidate = Path(path) / 'manifest.json'
+            candidate.write_text('{}')
+            setup = ['--manifest', str(candidate), '--sha256', 'b' * 64]
+            live = ['--operation', 'resume-turn', '--request-sha256', 'c' * 64]
+            operation = ('b' * 64, 'resume-turn', 'c' * 64)
+            cases = [(['run', *setup], None), (['run', *setup, *live], operation), ([*live, 'run', *setup], operation)]
+            for argv, expected in cases:
+                with self.subTest(argv=argv), patch.object(sys, 'argv', ['devbox.py', *argv]), \
+                        patch.object(sys, 'stdout', new_callable=io.StringIO), patch.object(devbox.signal, 'signal'), \
+                        patch.object(devbox, 'host_account'), patch.object(devbox, 'host_env'), patch.object(devbox, 'enforcing'), \
+                        patch.object(devbox.db, 'read_manifest', return_value=manifest()), \
+                        patch.object(devbox.db, 'immutable_image'), patch.object(devbox.db, 'remove_owned'), \
+                        patch.object(devbox, 'ownership', return_value=nullcontext(('owner', 'hooks'))), \
+                        patch.object(devbox, 'placement', return_value=({}, {})) as placement, \
+                        patch.object(devbox, 'launch', return_value={'turn': {'status': 'completed-turn'}}) as launch:
+                    self.assertEqual(devbox.main(), 0)
+                    self.assertEqual(placement.call_args.args[-1], expected)
+                    self.assertEqual(launch.call_args.args[-1], expected)
+
 
 class ProviderGatewayTests(unittest.TestCase):
     def setUp(self):
@@ -142,7 +170,7 @@ class ProviderGatewayTests(unittest.TestCase):
         self.grant = grant(self.request_sha)
 
     @contextmanager
-    def provider(self, reply):
+    def provider(self, reply, allowance=None):
         api = FakeProvider(reply)
         journal = broker.Journal(self.receipt, selection(), self.grant)
         path = self.path / 'responses.sock'
@@ -150,7 +178,7 @@ class ProviderGatewayTests(unittest.TestCase):
 
         def listen():
             try:
-                broker.listen(path, api, selection(), self.grant, journal, time.monotonic() + 1.5)
+                broker.listen(path, api, selection(), self.grant, journal, time.monotonic() + 1.5, allowance=allowance)
             except Exception as error:
                 errors.append(error)
 
@@ -206,6 +234,43 @@ class ProviderGatewayTests(unittest.TestCase):
         self.assertEqual(entry['status'], 'effect-uncertain')
         self.assertNotIn('observed_model', entry)
 
+    def test_sanitizes_a_late_provider_error_after_stream_started(self):
+        created, _ = events().split(b'\n\n', 1)
+        raw = created + b'\n\n' + broker.sse('response.failed', {
+            'type': 'response.failed', 'response': {'model': MODEL, 'error': {
+                'code': 'private-upstream-code', 'message': 'private diagnostic across frames'}}})
+        with self.provider(raw) as (api, path), local_runtime(path, self.request_sha) as port:
+            status, body = self.post(port)
+            self.assertEqual(status, 200)
+            self.assertIn(b'event: response.created', body)
+            self.assertIn(broker.FAILED_FRAME, body)
+            self.assertNotIn(b'private', body)
+            self.assertEqual(len(api.bodies), 1)
+        entry, = json.loads(self.receipt.read_bytes())['attempts']
+        self.assertEqual(entry['status'], 'provider-stream-failed')
+
+    def test_excessive_provider_usage_is_recorded_quarantined_and_withheld(self):
+        created, _ = events().split(b'\n\n', 1)
+        raw = created + b'\n\n' + broker.sse('response.completed', {
+            'type': 'response.completed', 'response': {'id': 'resp_overrun', 'model': MODEL, 'usage': {
+                'input_tokens': 1600, 'output_tokens': 16, 'total_tokens': 1616}}})
+        allowance = Mock()
+        allowance.network_lease.side_effect = lambda: nullcontext(True)
+        allowance.reserve.side_effect = [True, False]
+        self.grant['spend_microusd'] = 3200
+        with self.provider(raw, allowance) as (api, path), local_runtime(path, self.request_sha) as port:
+            status, body = self.post(port)
+            self.assertEqual(status, 200)
+            self.assertIn(broker.FAILED_FRAME, body)
+            self.assertNotIn(b'response.completed', body)
+            self.assertEqual(self.post(port)[0], 429)
+            allowance.quarantine.assert_called_once()
+            self.assertEqual(len(api.bodies), 1)
+        entry, = json.loads(self.receipt.read_bytes())['attempts']
+        self.assertEqual(entry['status'], 'billing-bound-violated')
+        self.assertEqual(entry['reserved_microusd'], 1088)
+        self.assertEqual(entry['observed_cost_upper_microusd'], 1632)
+
     def test_foreign_raw_channel_digest_is_rejected_before_provider(self):
         with self.provider(events()) as (api, path), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
             channel.settimeout(1)
@@ -243,6 +308,126 @@ class ProviderGatewayTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 broker.labeled_listener(label)
             self.assertEqual(library.setsockcreatecon_raw.call_args_list, [call(label), call(None)])
+
+
+class SharedAllowanceTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='dp-budget-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.job = self.root / 'sample'
+        self.job.mkdir()
+        self.selection = selection()
+        self.grant = grant('a' * 64)
+        proof = {key: self.grant[key] for key in broker.TARIFF_FIELDS}
+        for suffix in ('context', 'tariff'):
+            data = ('offline-fixture-' + suffix).encode()
+            (self.job / (MODEL + '.' + suffix)).write_bytes(data)
+            proof[suffix + '_evidence_sha256'] = hashlib.sha256(data).hexdigest()
+        self.policy = {'schema': 1, 'kind': 'verified-full-billable-context', 'job': 'sample',
+                       'auth_profile': broker.PROFILE, 'allowance_ref': self.grant['allowance_ref'],
+                       'spend_microusd': 1900, 'expires_unix': self.grant['expires_unix'],
+                       'repository': self.selection['repository'], 'agreement_sha256': self.selection['agreement_sha256'],
+                       'models': {MODEL: proof}}
+        raw = broker.canonical(self.policy)
+        (self.job / 'allowance.json').write_bytes(raw)
+        self.digest = hashlib.sha256(raw).hexdigest()
+        self.grant['allowance_sha256'] = self.digest
+        location = patch.object(broker, 'ALLOWANCES', self.root)
+        location.start()
+        self.addCleanup(location.stop)
+        # The fixture substitutes protected ancestry only. It retains actual
+        # bounded file reads, verified digests and SQLite reservation commits.
+        custody = patch.object(broker, 'protected_file', side_effect=runtime.fixed_read)
+        custody.start()
+        self.addCleanup(custody.stop)
+
+    def test_held_cost_is_shared_across_role_and_grant_and_survives_reopen(self):
+        allowance = broker.load_allowance('sample', self.digest)
+        allowance.validate_grant(self.selection, self.grant)
+        self.assertEqual(broker.remaining_allowance('sample', self.digest)['remaining_microusd'], 1900)
+        self.assertFalse((self.job / 'usage.sqlite').exists())
+        self.assertTrue(allowance.reserve(self.selection, self.grant, 1, 1088))
+        other = {**self.selection, 'role': 'maintenance', 'operation': 'second'}
+        next_grant = {**self.grant, 'request_sha256': 'b' * 64}
+        reopened = broker.load_allowance('sample', self.digest)
+        self.assertFalse(reopened.reserve(other, next_grant, 1, 1088))
+        self.assertEqual(reopened.remaining()['remaining_microusd'], 812)
+        reopened.quarantine()
+        self.assertEqual(broker.remaining_allowance('sample', self.digest)['status'], 'quarantined')
+        self.assertEqual(reopened.remaining()['remaining_microusd'], 0)
+
+    def test_job_effect_lease_blocks_overlap_while_quarantining(self):
+        first = broker.load_allowance('sample', self.digest)
+        second = broker.load_allowance('sample', self.digest)
+        with first.network_lease() as claimed, second.network_lease() as overlapping:
+            self.assertTrue(claimed)
+            self.assertFalse(overlapping)
+        with second.network_lease() as recovered:
+            self.assertTrue(recovered)
+
+    def test_job_rejects_unproven_context_and_missing_or_changed_pricing(self):
+        allowance = broker.load_allowance('sample', self.digest)
+        with self.assertRaises(RuntimeError):
+            allowance.validate_grant(self.selection, {**self.grant, 'max_context_tokens': 1023})
+        (self.job / (MODEL + '.tariff')).write_text('unapproved changed price')
+        with self.assertRaises(RuntimeError):
+            allowance.validate_grant(self.selection, self.grant)
+        with self.assertRaises(RuntimeError):
+            broker.remaining_allowance('sample', 'f' * 64)
+
+
+class BrokerLifecycleTests(unittest.TestCase):
+    def invoke(self, available):
+        with tempfile.TemporaryDirectory(prefix='dp-idle-') as temp:
+            root = Path(temp)
+            inputs = selection()
+            raw = broker.canonical(inputs)
+            request_sha = hashlib.sha256(raw).hexdigest()
+            template = {**grant(request_sha), 'expires_unix': int(time.time()) + 1}
+            directory = root / 'channel'
+            directory.mkdir()
+            directory.chmod(0o750)
+            path = directory / 'responses.sock'
+            destination = root / 'development' / inputs['job']
+            destination.mkdir(parents=True)
+            destination.chmod(0o700)
+            receipt = destination / (inputs['operation'] + '.json')
+            approved = Mock()
+            approved.remaining.return_value = {'remaining_microusd': 3000}
+            api = Mock()
+            api.discover.return_value = 'available'
+            args = ['provider_broker.py', '--grant', str(root / 'grant'), '--request', str(root / 'request'),
+                    '--credential-file', str(root / 'key'), '--socket', str(path), '--receipt', str(receipt)]
+            with patch.object(sys, 'argv', args), patch.object(broker, 'EVIDENCE', root), \
+                    patch.object(broker, 'provider_host_path', return_value=directory), \
+                    patch.object(broker, 'protected_file', side_effect=[broker.canonical(template), raw, b'fixture-key']), \
+                    patch.object(broker, 'host_repository_approval'), \
+                    patch.object(broker.os, 'geteuid', side_effect=[0] + [os.getuid()] * 8), \
+                    patch.object(broker, 'broker_channel_label', return_value=b'fixture-label'), \
+                    patch.object(broker, 'labeled_listener', side_effect=lambda _label: socket.socket(socket.AF_UNIX)), \
+                    patch.object(broker, 'load_allowance', return_value=approved,
+                                 side_effect=None if available else FileNotFoundError('allowance unproven')), \
+                    patch.object(broker, 'Provider', return_value=api) as acquire, \
+                    patch.object(sys, 'stderr', new_callable=io.StringIO):
+                result = broker.main()
+            self.assertFalse(path.exists())
+            if not available:
+                acquire.assert_not_called()
+                self.assertFalse(receipt.exists())
+                return result, None
+            api.discover.assert_called_once()
+            api.responses.assert_not_called()
+            return result, json.loads(receipt.read_bytes())
+
+    def test_idle_clock_expiry_closes_normally_without_interruption(self):
+        result, receipt = self.invoke(True)
+        self.assertEqual(result, 0)
+        self.assertEqual(receipt['status'], 'closed')
+        self.assertEqual(receipt['attempts'], [])
+
+    def test_missing_allowance_blocks_before_any_provider_initialization(self):
+        self.assertEqual(self.invoke(False), (2, None))
 
 
 if __name__ == '__main__':
