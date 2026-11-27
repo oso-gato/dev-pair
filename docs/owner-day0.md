@@ -64,8 +64,11 @@ selection. Optional owner and provider activation needs its own supported
 policy transition and approved grants.
 
 On a previously reviewed legacy host, resume verifies the stored full cutover
-and can retain its unchanged managed release. A changed or unavailable release
-requires a fresh workload review. The installer reports which review is pending.
+and can retain the managed release recorded when that review was accepted. A
+standalone review keeps its original scope when commissioning adds the first
+managed release. That release gets a fresh signed workload review. If you moved
+from an approved earlier checkout, the installer retains its completed cutover
+record and binds the new workload review to the verified continuation source.
 
 If you ran a reviewed offline-only bootstrap, retain its checkout, journals and
 local gptbox. Stage the separately reviewed continuation checkout in its own

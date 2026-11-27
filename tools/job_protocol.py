@@ -5,6 +5,7 @@ principal that owns this module and ledger is the controller.
 """
 import contextlib
 import base64
+import fcntl
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import uuid
 VERSION = 1
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 WORKLOAD_ACCESS = 'workload-access.json'
+WORKLOAD_LEASE = 'renewal-fence/driver.lock'
 RECIPE = 'local-json-message-v1'
 APP_PROCESS_BOUNDARY = 'local-app-process'
 APP_QUADLET_BOUNDARY = 'fedora-checklist-quadlet'
@@ -41,6 +43,32 @@ MAX_RECONCILIATION_BYTES = 8192
 def require(ok, message):
     if not ok:
         raise ValueError(message)
+
+
+@contextlib.contextmanager
+def workload_access_lease(root, *, exclusive=False):
+    path = root / WORKLOAD_LEASE
+    for parent in path.parents:
+        node = parent.lstat()
+        require(stat.S_ISDIR(node.st_mode) and node.st_uid == 0 and not node.st_mode & 0o022,
+                'unprotected workload dispatch lease ancestry')
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as stream:
+        node = os.fstat(fd)
+        require(stat.S_ISREG(node.st_mode) and node.st_uid == 0 and node.st_nlink in (1, 2) and
+                stat.S_IMODE(node.st_mode) == 0o644, 'unprotected workload dispatch lease')
+        if os.geteuid() == 0:
+            try:
+                earlier = (root / 'renewal' / 'driver.lock').lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                require((earlier.st_dev, earlier.st_ino) == (node.st_dev, node.st_ino),
+                        'historical renewal uses a different workload dispatch lease')
+        fcntl.flock(stream, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+        live = path.lstat()
+        require((live.st_dev, live.st_ino) == (node.st_dev, node.st_ino), 'workload dispatch lease changed')
+        yield
 
 
 def require_workload_access(root=pathlib.Path('/var/lib/dev-pair'), *, release=None, images=None):
@@ -78,11 +106,11 @@ def require_workload_access(root=pathlib.Path('/var/lib/dev-pair'), *, release=N
         require(gate['phase'] == 'legacy' and gate['release_sha256'] is None and gate['images'] is None,
                 'independent workload access review is pending')
         require(release is None, 'standalone access review has no verified managed workload selection')
-        try:
-            (root / 'renewal-fence' / 'selected-host.json').lstat()
-        except FileNotFoundError:
-            pass
-        else:
+        for marker in (root / 'renewal', root / 'renewal-fence' / 'selected-host.json'):
+            try:
+                marker.lstat()
+            except FileNotFoundError:
+                continue
             raise ValueError('standalone access review has no verified managed workload selection')
 
 

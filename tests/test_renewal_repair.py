@@ -1,5 +1,6 @@
 """Production parser and durable launch regressions on private local data."""
 from contextlib import nullcontext
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,9 +22,80 @@ SCRIPT = REPO / 'runtime' / 'renewal' / 'driver'
 sys.path.insert(0, str(TOOLS))
 import renewal as r
 import bootstrap as b
+import gptbox
 
 
 class NativeRecoveryTests(unittest.TestCase):
+    def test_direct_job_uses_the_existing_driver_inode_and_rechecks_after_revocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            scratch = Path(temporary)
+            host = gptbox.Gptbox(scratch)
+            root = host.path('/var/lib/dev-pair')
+            old = root / 'renewal' / 'driver.lock'
+            current = root / r.protocol.WORKLOAD_LEASE
+            flag = root / r.protocol.WORKLOAD_ACCESS
+            host.directory('/var/lib/dev-pair/renewal', mode=0o700)
+            host.atomic('/var/lib/dev-pair/renewal/driver.lock', '')
+            host.atomic(b.STATE + '/prepared', 'fixture')
+            roles = {'release_sha256': '1' * 64, 'maintenance_image': '2' * 64,
+                     'development_image': '3' * 64, 'devbox_image': '4' * 64}
+            with patch.object(b, 'checked_file', side_effect=Path):
+                with old.open('rb') as legacy:
+                    fcntl.flock(legacy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    host.publish_workload_gate('admitted', roles)
+                    self.assertEqual((old.stat().st_dev, old.stat().st_ino), (current.stat().st_dev, current.stat().st_ino))
+                    with current.open('rb') as reader, self.assertRaises(BlockingIOError):
+                        fcntl.flock(reader, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            original_check = r.protocol.require_workload_access
+            real_lstat, real_fstat = Path.lstat, os.fstat
+            ancestry = {current.parent, *current.parents}
+
+            def mapped_lstat(path):
+                node = real_lstat(path)
+                return SimpleNamespace(st_uid=0, st_mode=node.st_mode & ~0o022) if path in ancestry else node
+
+            def mapped_fstat(fd):
+                node = real_fstat(fd)
+                if any((node.st_dev, node.st_ino) == (path.stat().st_dev, path.stat().st_ino) for path in (flag, current)):
+                    return SimpleNamespace(st_uid=0, st_mode=node.st_mode, st_nlink=node.st_nlink,
+                                           st_size=node.st_size, st_ino=node.st_ino, st_dev=node.st_dev)
+                return node
+
+            approved = flag.read_bytes()
+            replacement = flag.with_suffix('.held')
+            replacement.write_text(json.dumps({'schema': 1, 'phase': 'held', 'release_sha256': None, 'images': None}))
+            replacement.chmod(0o644)
+
+            def revoke_after_initial_check(*args, **kwargs):
+                original_check(*args, **kwargs)
+                if replacement.exists():
+                    with r.protocol.workload_access_lease(root, exclusive=True):
+                        os.replace(replacement, flag)
+
+            options = ['--job', 'demo', '--operation', 'approved-turn', '--request-sha256', '5' * 64,
+                       '--image', roles['maintenance_image'], '--context-sha256', '6' * 64, '--source-sha', '7' * 40]
+
+            def during_preflight(*, managed_runtime):
+                self.assertTrue(managed_runtime)
+                with self.assertRaises(BlockingIOError), r.protocol.workload_access_lease(root, exclusive=True):
+                    self.fail('activation entered before the admitted job released its lease')
+
+            with (patch.object(gptbox, 'Gptbox', return_value=host), patch.object(Path, 'lstat', mapped_lstat),
+                  patch.object(os, 'fstat', mapped_fstat), patch.object(host, 'lock', return_value=nullcontext()),
+                  patch.object(host, 'preflight', side_effect=during_preflight) as prepare,
+                  patch.object(host, 'run_job_locked', return_value={'turn': {'status': 'completed-turn'}}) as run):
+                with patch.object(r.protocol, 'require_workload_access', side_effect=revoke_after_initial_check):
+                    self.assertEqual(gptbox.run_job_cli(options), 2)
+                    prepare.assert_not_called()
+                    run.assert_not_called()
+                flag.write_bytes(approved)
+                with r.protocol.workload_access_lease(root):
+                    self.assertEqual(gptbox.run_job_cli(options), 0)
+                prepare.assert_called_once()
+                run.assert_called_once()
+                with r.protocol.workload_access_lease(root, exclusive=True):
+                    pass
+
     def test_activation_holds_prior_public_grant_before_host_selector_or_service(self):
         activate = runpy.run_path(str(SCRIPT))['release_action']
         with tempfile.TemporaryDirectory() as temporary:
@@ -73,6 +145,8 @@ class NativeRecoveryTests(unittest.TestCase):
         host.verify_final_guard.return_value = {'target': {'source_sha': source}, 'scope': 'core'}
         host.destination_identity.return_value = identity
         host.access_workload_selection.return_value = selection
+        host.access_control_source.side_effect = lambda revision, guard: (
+            self.assertEqual(revision, guard['target']['source_sha']))
         release = {'components': {'host': {}, 'maintenance-agent': {}, 'development-agent': {'codex_version': '0.170.0'}}}
         plan = {'maintenance_context_sha256': '7' * 64}
         development = {'kind': 'dev-pair-devbox-probe-v1', 'manifest_sha256': selection['development_manifest'],

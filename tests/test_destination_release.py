@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -18,9 +19,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bootstrap as b
+import commission_host as commission
 import destination_release as d
 import job_protocol as jobs
 import release_trust as t
+import renewal
 
 SOURCE = 'a' * 40
 HEAD = 'b' * 40
@@ -43,7 +46,7 @@ def workflow_content(path, data):
 
 class BootstrapAccessTests(unittest.TestCase):
     def test_signed_core_cutover_preserves_workload_hold_then_admits_exact_full_proof(self):
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[2]) as temporary:
             root = Path(temporary)
             key, signers, receipt = (root / name for name in ('key', 'allowed_signers', 'receipt.json'))
             subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True)
@@ -97,7 +100,8 @@ class BootstrapAccessTests(unittest.TestCase):
             temporary_guard = app.guard_rules(access)
             app.atomic(b.GUARD_PATH, temporary_guard)
             read_selection = app.access_workload_selection
-            with (patch.object(b, 'checked_file', side_effect=Path), patch.object(b, 'TRUST_SIGNERS', '/' + signers.name),
+            with (patch.object(b, 'checked_file', side_effect=lambda path, **_: Path(path)),
+                  patch.object(b, 'TRUST_SIGNERS', '/' + signers.name),
                   patch.object(b.os, 'geteuid', return_value=0),
                   patch.object(app, 'destination_source'),
                   patch.object(app, 'destination_identity', return_value={key: data[key] for key in ('machine_id', 'boot_id')}) as identity,
@@ -199,13 +203,56 @@ class BootstrapAccessTests(unittest.TestCase):
                 app.atomic(b.GUARD_PATH, temporary_guard, expected=app.text(b.GUARD_PATH))
                 current.return_value = role_selection
                 sign(False, legacy=True)
-                self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
+                with (patch.object(app, 'selected_workload_placement', return_value=role_selection),
+                      patch.object(app, 'runtime_selected_host', return_value=(role_selection['release_sha256'], {}, {}))):
+                    self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
                 self.assertEqual(json.loads(pending.read_bytes())['legacy_role_artifacts'], role_selection)
                 self.assertEqual(json.loads(marker.read_text())['phase'], 'legacy')
                 app.hold_changed_workload_access(updated['release_sha256'])
                 current.return_value = updated
                 app.refresh_workload_gate()
                 self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+
+                app.path(b.CUTOVER).unlink()
+                app.path(b.SSH_CUTOVER).unlink()
+                app.atomic(b.GUARD_PATH, temporary_guard, expected=app.text(b.GUARD_PATH))
+                shutil.rmtree(app.path('/var/lib/dev-pair/renewal'))
+                historical = '11fbe9e0e0ff911fce13e33527c55020958a50a7'
+                data['source_sha'] = historical
+                sign(False, legacy=True)
+                self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
+                original_standalone = pending.read_bytes()
+                self.assertEqual(json.loads(original_standalone)['legacy_origin'], 'standalone')
+                self.assertIsNone(json.loads(marker.read_text())['release_sha256'])
+
+                app.directory(commission.CONTROL, mode=0o700)
+                controller = renewal.Renewal(app.path('/var/lib/dev-pair'), None)
+                first = commission.Commission(root, root, None, os.getuid(), SimpleNamespace(
+                    renewal=lambda: controller, resolve_initial=lambda *_: role_selection['release_sha256'],
+                    verify_selection=lambda *_: None))
+                self.assertEqual(first.selectors({}, data['boot_id'], {}, None), role_selection['release_sha256'])
+                self.assertEqual(controller.transition(), (None, None))
+                app.refresh_workload_gate()
+                self.assertEqual(pending.read_bytes(), original_standalone)
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+
+                continuation = {'schema': 1, 'machine_id': data['machine_id'], 'controller_source_sha': SOURCE,
+                                'maintenance_source_sha': historical, 'image_id': 'a' * 64, 'context_sha256': 'b' * 64,
+                                'initializer_sha256': 'c' * 64, 'desired_sha256': 'd' * 64}
+                app.atomic('/var/lib/dev-pair-day0/continuation.json', json.dumps(continuation))
+                current.return_value = role_selection
+                data['source_sha'] = SOURCE
+                sign(False)
+                with self.assertRaisesRegex(b.Blocked, 'target conflict'):
+                    app.finalize(str(receipt), previous_source='4' * 40)
+                self.assertEqual(pending.read_bytes(), original_standalone)
+                app.access_control_source(SOURCE, json.loads(original_standalone))
+                self.assertEqual(app.finalize(str(receipt), previous_source=historical)['access_scope'], 'full')
+                accepted = json.loads(pending.read_bytes())
+                self.assertEqual(accepted['target']['source_sha'], SOURCE)
+                self.assertEqual(accepted['legacy_origin'], 'standalone')
+                archived = b.STATE + '/cutover-history/' + accepted['predecessor_cutover_sha256'] + '.json'
+                self.assertEqual(app.path(archived).read_bytes(), original_standalone)
 
     def test_stripped_ssh_binding_denies_existing_scoped_path(self):
         app = b.Bootstrap()

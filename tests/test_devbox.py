@@ -1,7 +1,7 @@
 """Local DevBox contract tests. Fedora confinement needs the native runner."""
 
 from copy import deepcopy
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 import gzip
 import hashlib
 import io
@@ -184,6 +184,11 @@ class TestManifest(unittest.TestCase):
                 with patch.object(job_protocol, 'require_workload_access', side_effect=ValueError('workload review is pending')):
                     self.assertEqual(devbox.main(), 2)
                 self.assertIn('workload review is pending', error.getvalue())
+                with (patch.object(job_protocol, 'require_workload_access', side_effect=[None, ValueError('access withdrawn')]),
+                      patch.object(job_protocol, 'workload_access_lease', return_value=nullcontext()) as lease):
+                    self.assertEqual(devbox.main(), 2)
+                lease.assert_called_once_with(root.parent)
+                self.assertIn('access withdrawn', error.getvalue())
                 remove.assert_called_once()
             self.assertEqual((live / 'prior.json').read_text(), 'retained live data')
 

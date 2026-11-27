@@ -240,7 +240,7 @@ def main():
         desired = r.read_json(CONTROL / 'host-desired.json')
         r.require(desired['component'] == component and selected_component(controller, CONTROL, 'apply') == component,
                   'host desired release changed before activation')
-        Bootstrap().hold_changed_workload_access(desired['release_sha256'])
+        Bootstrap().hold_changed_workload_access(desired['release_sha256'], acquire_lease=True)
         r.require(r.read_json(CONTROL / 'host-desired.json') == desired, 'host desired release changed after workload hold')
     publish_selector(component)
     receipt['handoff'] = handoff_runtime(directory, restart=True)

@@ -2,7 +2,7 @@
 """Run an exact DevBox and its nested development gptbox."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 from hashlib import sha256
 import json
@@ -408,10 +408,13 @@ def main():
     end = time.monotonic() + db.OUTER_SECONDS
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, db.interrupt)
+    leases = ExitStack()
     try:
         if job_turn:
-            from job_protocol import require_workload_access
+            from job_protocol import require_workload_access, workload_access_lease
 
+            require_workload_access(ROOT.parent)
+            leases.enter_context(workload_access_lease(ROOT.parent))
             require_workload_access(ROOT.parent)
         account = host_account()
         enforcing(end)
@@ -449,6 +452,8 @@ def main():
     except (RuntimeError, OSError, KeyError, ValueError, TypeError, IndexError) as error:
         print(f'DevBox blocked: {error}', file=sys.stderr)
         return 2
+    finally:
+        leases.close()
 
 
 if __name__ == '__main__':

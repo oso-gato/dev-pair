@@ -655,19 +655,23 @@ class Gptbox(Bootstrap):
         return output
 
     def run_job(self, job, operation, request_sha, sealed, context, revision, platform_sha=None):
-        from job_protocol import require_workload_access
+        from job_protocol import require_workload_access, workload_access_lease
 
         sealed = image_id(sealed)
-        require_workload_access(self.path('/var/lib/dev-pair'), images={'maintenance': sealed})
-        self.preflight(managed_runtime=True)
-        if (not JOB.fullmatch(job) or not OPERATION.fullmatch(operation) or not re.fullmatch(r'[0-9a-f]{64}', context)
-                or not re.fullmatch(r'[0-9a-f]{40}', revision) or not self.path(STATE + '/prepared').exists()):
-            raise Blocked('maintenance job requires exact reviewed input, target and host readiness')
-        if platform_sha is not None:
-            raw_digest(platform_sha)
-        self.target = ROOT + '/' + context
-        with self.lock():
-            return self.run_job_locked(job, operation, request_sha, sealed, context, revision, platform_sha)
+        root = self.path('/var/lib/dev-pair')
+        images = {'maintenance': sealed}
+        require_workload_access(root, images=images)
+        with workload_access_lease(root):
+            require_workload_access(root, images=images)
+            self.preflight(managed_runtime=True)
+            if (not JOB.fullmatch(job) or not OPERATION.fullmatch(operation) or not re.fullmatch(r'[0-9a-f]{64}', context)
+                    or not re.fullmatch(r'[0-9a-f]{40}', revision) or not self.path(STATE + '/prepared').exists()):
+                raise Blocked('maintenance job requires exact reviewed input, target and host readiness')
+            if platform_sha is not None:
+                raw_digest(platform_sha)
+            self.target = ROOT + '/' + context
+            with self.lock():
+                return self.run_job_locked(job, operation, request_sha, sealed, context, revision, platform_sha)
 
     def run_job_locked(self, job, operation, request_sha, sealed, context, revision, platform_sha=None):
         codex_version = self.admitted_maintenance_image(context, revision, sealed, platform_sha)

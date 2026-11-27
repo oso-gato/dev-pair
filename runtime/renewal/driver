@@ -1,7 +1,6 @@
 #!/usr/bin/python3 -I
 """Fixed external Fedora adapter for reviewed dev-pair release plans."""
 import contextlib
-import fcntl
 import os
 from pathlib import Path
 import re
@@ -666,7 +665,7 @@ def access_probe(payload):
     live, _ = host.tailscale_state()
     host.named_tailnet_peer(live, peer)
     guard = host.verify_final_guard()
-    r.require(guard['target']['source_sha'] == source, 'private access probe source differs from the verified guard')
+    host.access_control_source(source, guard)
     host.verify_final_ssh()
     identity = host.destination_identity()
     with r.Renewal(ROOT, None).lock():
@@ -951,12 +950,7 @@ def main():
     incoming = sys.stdin.buffer.read(r.MAX_CONTROL + 1)
     r.require(len(incoming) <= r.MAX_CONTROL, 'renewal driver request exceeds byte limit')
     payload = r.loads(incoming)
-    lock = CONTROL / 'driver.lock'
-    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
-    with os.fdopen(os.open(lock, flags, 0o600), 'rb+') as stream:
-        r.require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), 'unsafe external driver lock')
-        exclusive = action in ('activate', 'quiesce')
-        fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+    with p.workload_access_lease(ROOT, exclusive=action in ('activate', 'quiesce')):
         if action in ('turn', 'resume-without-effects', 'observe-progress'):
             result = turn(action, payload)
         elif action == 'preflight-resume':
