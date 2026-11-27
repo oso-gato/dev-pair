@@ -322,6 +322,17 @@ class DevelopmentImageTests(unittest.TestCase):
                 self.assemble()
         self.assertFalse(self.release.parent.exists())
 
+    def test_legacy_maintenance_readiness_and_prepared_marker_allow_different_development_target(self):
+        record = json.loads(self.host_ready.read_bytes())
+        self.assertNotEqual((record['source_sha'], record['context_sha256']), (SOURCE, EXPECTED))
+        with patch.object(self.app, 'setup_executor', side_effect=AssertionError('reached image executor')):
+            with self.assertRaisesRegex(AssertionError, 'reached image executor'):
+                self.assemble()
+            self.host_ready.unlink()
+            self.app.atomic(g.STATE + '/prepared', self.app.text(g.STATE + '/desired.json'))
+            with self.assertRaisesRegex(AssertionError, 'reached image executor'):
+                self.assemble()
+
     def test_producer_rejects_index_media_type_rejected_by_nested_consumer(self):
         self.engine.bad_index_media = True
         with self.assertRaisesRegex(g.Blocked, 'must select one image'):

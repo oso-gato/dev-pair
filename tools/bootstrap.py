@@ -2235,14 +2235,17 @@ class Bootstrap:
         self.observe_storage('prepared-image',manifest['source_sha'],expected,image_id)
         return record
 
+    def _reject_unowned_bootstrap_table(self):
+        tables = self.run('/usr/sbin/nft', 'list', 'tables')
+        if 'dev_pair_bootstrap' in tables:
+            raise Blocked('existing bootstrap nft table has no managed configuration')
+
     def guard(self, sources):
         rules = '\n'.join(f'add rule inet dev_pair_bootstrap input {"ip6" if ":" in cidr else "ip"} saddr {cidr} tcp dport 22 accept' for cidr in sources)
         guard = GUARD.replace('{bootstrap_rules}', rules)
         config = '/etc/dev-pair/bootstrap.nft'
         if not self.path(config).exists():
-            tables = self.run('/usr/sbin/nft', 'list', 'tables')
-            if 'dev_pair_bootstrap' in tables:
-                raise Blocked('existing bootstrap nft table has no managed configuration')
+            self._reject_unowned_bootstrap_table()
         self.atomic(config, guard, mode=0o600)
         self.atomic('/etc/systemd/system/dev-pair-bootstrap-guard.service', UNIT, mode=0o644)
         self.run('/usr/sbin/nft', '--check', '-f', str(self.path(config)))

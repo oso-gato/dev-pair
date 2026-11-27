@@ -31,6 +31,14 @@ class HostCommands(b.Commands):
         if args[0] == '/usr/bin/git':
             fixture.events.append(('proof', args[-1]))
             return super().__call__(*args, **kwargs)
+        if args == ('/usr/sbin/nft', 'list', 'tables'):
+            fixture.events.append(('nft-read', fixture.live_bootstrap_table))
+            return 'table inet dev_pair_bootstrap\n' if fixture.live_bootstrap_table else ''
+        if args[:2] == ('/usr/sbin/nft', '-f'):
+            fixture.events.append(('nft-write', 'fixture bootstrap table'))
+            fixture.live_bootstrap_table = True
+        if args == ('/usr/bin/rpm', '-q', *b.PACKAGES, 'tailscale') and fixture.fail_inventory:
+            raise b.Blocked('interrupted fixture host package inventory')
         if args[0] == '/usr/bin/dnf':
             self.assert_native_scope()
             self.native_register(self.native_prefix + f'-{len(fixture.events):08x}')
@@ -59,9 +67,12 @@ class DevelopmentHostTests(unittest.TestCase):
         self.addCleanup(self.host.doCleanups)
         self.root = self.host.root
         self.git = self.host.app.path('/usr/bin/git')
+        self.nft = self.host.app.path('/usr/sbin/nft')
         self.events = []
         self.fail_packages = False
         self.fail_reconcile = False
+        self.fail_inventory = False
+        self.live_bootstrap_table = False
         self.password = self.root / 'disposable-password'
         self.password.write_text('synthetic-disposable-password\n')
         self.password.chmod(0o600)
@@ -118,16 +129,16 @@ class DevelopmentHostTests(unittest.TestCase):
                 target.chmod(0o444)
         return staged, revision
 
-    def make_context(self, role):
-        output = self.root / (role + '-context')
+    def make_context(self, role, leaf='offline-fixture'):
+        output = self.root / (role + '-' + leaf + '-context')
         manifest = {'kind': 'operator-verified-inputs', 'source_sha': self.revision,
             'standards_sha': g.candidate.STANDARDS, 'fedora': dict(g.fedora_oci.PROVENANCE),
             'codex': {'version': '0.169.0', 'source': 'https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-x86_64-unknown-linux-musl.tar.gz',
                       'sha256': g.CODEX_SHA, 'verification': 'SYNTHETIC fixture only'},
             'role': role, 'provider': 'gptbox', 'model': 'gpt-6.2-sol', 'effort': 'high',
-            'mounts': {name: f'/var/lib/dev-pair/{role}/{directory}/offline-fixture'
+            'mounts': {name: f'/var/lib/dev-pair/{role}/{directory}/{leaf}'
                        for name, directory in (('workspace', 'workspaces'), ('state', 'state'), ('cache', 'cache'))}}
-        manifest['mounts']['credentials'] = f'/var/lib/dev-pair/credentials/{role}/offline-fixture'
+        manifest['mounts']['credentials'] = f'/var/lib/dev-pair/credentials/{role}/{leaf}'
         record = g.candidate.prepare(manifest, self.binary, output, fedora_inputs=self.root / 'fake-fedora')
         return output, record['context_sha256']
 
@@ -247,3 +258,140 @@ class DevelopmentHostTests(unittest.TestCase):
         maintenance, digest = self.make_context('maintenance')
         with self.assertRaisesRegex(b.Blocked, 'belongs to the development host preparation'):
             self.preparation.prepare('core', host.KEY, ['192.0.2.9/32'], maintenance, digest, password='fixture')
+
+    def test_development_readiness_requires_exact_protected_intent_and_completion(self):
+        other, other_digest = self.make_context('development', 'other-valid-job')
+        self.assertNotEqual(self.digest, other_digest)
+        self.assertEqual(self.cli(stage='build-development', context=other, digest=other_digest)[0], 0)
+        self.assertEqual(self.cli('--apply')[0], 0)
+        intent = self.entry.path(b.DEVELOPMENT_HOST_INTENT)
+        original = intent.read_bytes()
+        parsed = json.loads(original)
+        ready_path = self.entry.state / 'host-ready.json'
+        ready_bytes = ready_path.read_bytes()
+        ready = json.loads(ready_bytes)
+        self.assertEqual(ready['kind'], 'development-host-prerequisites')
+        self.assertEqual(ready['intent_sha256'], g.sha(original))
+
+        with patch.object(self.entry, 'verify_builder') as builder:
+            with self.assertRaisesRegex(AssertionError, 'image executor invoked'):
+                self.cli('--apply', stage='build-development')
+            builder.reset_mock()
+
+            def denied(*, original_target=True):
+                if original_target:
+                    self.assertEqual(self.cli('--apply', stage='build-development')[0], 2)
+                self.assertEqual(self.cli('--apply', stage='build-development', context=other, digest=other_digest)[0], 2)
+                builder.assert_not_called()
+
+            denied(original_target=False)
+            intent.unlink()
+            denied()
+            intent.symlink_to(self.root / 'missing-intent')
+            denied()
+            intent.unlink()
+            self.entry.atomic(b.DEVELOPMENT_HOST_INTENT, original.decode())
+            intent.chmod(0o644)
+            denied()
+            intent.chmod(0o600)
+            variants = {
+                'malformed': b'{invalid',
+                'different target': g.image_inputs_bytes({**parsed, 'target': {**parsed['target'], 'context_sha256': other_digest}}),
+                'changed ownership record': g.image_inputs_bytes({**parsed, 'native_units': parsed['native_units'][:-1]}),
+            }
+            for label, changed in variants.items():
+                with self.subTest(intent=label):
+                    intent.write_bytes(changed)
+                    denied()
+            intent.write_bytes(original)
+            ready_path.unlink()
+            denied()
+            intent.unlink()
+            denied()
+            self.entry.atomic(b.DEVELOPMENT_HOST_INTENT, original.decode())
+            # An intact development intent also denies legacy fallback.
+            desired = (self.entry.state / 'desired.json').read_text()
+            self.entry.atomic(b.STATE + '/prepared', desired)
+            denied()
+            legacy = {key: value for key, value in ready.items() if key != 'intent_sha256'}
+            legacy['kind'] = 'host-prerequisites'
+            self.entry.atomic(b.STATE + '/host-ready.json', g.image_inputs_bytes(legacy).decode())
+            denied()
+            ready_path.write_bytes(ready_bytes)
+            with self.assertRaisesRegex(AssertionError, 'image executor invoked'):
+                self.cli('--apply', stage='build-development')
+
+    def test_unowned_bootstrap_table_blocks_fresh_and_pre_desired_retry(self):
+        self.nft.parent.mkdir(parents=True)
+        self.nft.touch()
+        self.live_bootstrap_table = True
+        intent = self.entry.path(b.DEVELOPMENT_HOST_INTENT)
+        with patch.object(g, 'operator_password', side_effect=AssertionError('foreign table must block credential reads')):
+            self.assertEqual(self.cli('--apply')[0], 2)
+        self.assertFalse(intent.exists())
+        self.assertEqual(self.events, [('nft-read', True), ('nft-read', True)])
+        self.assertFalse(self.host.fake.accounts)
+        self.assertTrue(self.live_bootstrap_table)
+
+        self.live_bootstrap_table = False
+        script = self.upstream / 'distrobox-init'
+        original_script = script.read_bytes()
+        script.chmod(0o644)
+        script.write_bytes(b'synthetic dirty upstream\n')
+        self.assertEqual(self.cli('--apply')[0], 2)
+        self.assertTrue(intent.exists())
+        self.assertFalse((self.entry.state / 'desired.json').exists())
+        script.write_bytes(original_script)
+        script.chmod(0o444)
+        original_intent = intent.read_bytes()
+
+        self.events.clear()
+        self.live_bootstrap_table = True
+        with patch.object(g, 'operator_password', side_effect=AssertionError('foreign table must block credential reads')):
+            self.assertEqual(self.cli('--apply', '--retry')[0], 2)
+        self.assertEqual(self.events, [('nft-read', True), ('nft-read', True)])
+        self.assertEqual(intent.read_bytes(), original_intent)
+        self.assertFalse(self.host.fake.accounts)
+        self.assertFalse(self.host.fake.password_inputs)
+        self.assertFalse(self.entry.path('/etc/dev-pair/bootstrap.nft').exists())
+        self.assertTrue(self.live_bootstrap_table)
+
+    def test_late_exact_retry_reconverges_owned_bootstrap_table(self):
+        self.nft.parent.mkdir(parents=True)
+        self.nft.touch()
+        self.fail_inventory = True
+        self.assertEqual(self.cli('--apply')[0], 2)
+        self.assertTrue(self.live_bootstrap_table)
+        configuration = self.entry.path('/etc/dev-pair/bootstrap.nft')
+        owned = configuration.read_bytes()
+        self.assertFalse((self.entry.state / 'host-ready.json').exists())
+        self.fail_inventory = False
+        self.events.clear()
+        self.assertEqual(self.cli('--apply', '--retry')[0], 0)
+        self.assertEqual(configuration.read_bytes(), owned)
+        self.assertTrue(self.live_bootstrap_table)
+        self.assertEqual(self.host.fake.password_inputs, ['core:synthetic-disposable-password\n'])
+        self.assertEqual(sum(event[0] == 'nft-write' for event in self.events), 1)
+        self.entry.verify_host_readiness(self.revision, self.digest)
+
+    def test_publication_interruption_requires_exact_retry_and_final_intent_binding(self):
+        atomic = self.entry.atomic
+        ready_path = b.STATE + '/host-ready.json'
+
+        def stop_before_publication(path, *args, **kwargs):
+            if path == ready_path:
+                raise OSError('synthetic interruption before publishing readiness')
+            return atomic(path, *args, **kwargs)
+
+        with patch.object(self.entry, 'atomic', side_effect=stop_before_publication):
+            self.assertEqual(self.cli('--apply')[0], 2)
+        intent = self.entry.path(b.DEVELOPMENT_HOST_INTENT)
+        interrupted = intent.read_bytes()
+        self.assertFalse(self.entry.path(ready_path).exists())
+        self.assertEqual(self.cli('--apply', stage='build-development')[0], 2)
+        self.assertEqual(self.cli('--apply')[0], 2)
+        self.assertEqual(self.cli('--apply', '--retry')[0], 0)
+        complete = intent.read_bytes()
+        self.assertNotEqual(interrupted, complete)
+        self.assertEqual(json.loads(self.entry.path(ready_path).read_bytes())['intent_sha256'], g.sha(complete))
+        self.assertEqual(self.host.fake.password_inputs, ['core:synthetic-disposable-password\n'])

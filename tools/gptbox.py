@@ -48,6 +48,7 @@ RUNTIME_LIFETIME = 180
 INITIALIZE_EXECUTION = 2280
 PREPARE_EXECUTION = 600
 PREPARE_NATIVE = 'dev-pair-initialize-prepare'
+DEVELOPMENT_HOST_READY_KIND = 'development-host-prerequisites'
 ADAPTER_EXECUTION = 1620
 IMAGE_EXECUTION = 600
 CLEANUP_EXECUTION = 45
@@ -1095,7 +1096,7 @@ class DevelopmentGptbox(Gptbox):
     def prepare_development_host(self, context, expected, upstream, revision, sources, password_file=None,
                                  apply=False, retry=False):
         sources = validate_sources(sources)
-        result = {'kind': 'development-host-prerequisites', 'source_sha': revision,
+        result = {'kind': DEVELOPMENT_HOST_READY_KIND, 'source_sha': revision,
                   'context_sha256': expected, 'job_admission': False}
         with contextlib.ExitStack() as locked:
             with self.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE, native=False):
@@ -1118,6 +1119,22 @@ class DevelopmentGptbox(Gptbox):
                 self.atomic(STATE + '/host-ready.json', image_inputs_bytes(ready).decode())
         return {**result, 'host_prerequisites': 'complete', 'reused': ready is None}
 
+    def _read_development_host_intent(self, target):
+        raw = self.protected_bytes(self.path(DEVELOPMENT_HOST_INTENT), 65536, 0o600)
+        record = json.loads(raw, object_pairs_hook=fedora_oci.unique)
+        if (type(record) is not dict or set(record) != {'schema', 'target', 'phase_prefixes', 'native_units'}
+                or type(record['schema']) is not int or record['schema'] != 1 or record['target'] != target):
+            raise Blocked('development host target differs from protected prior intent')
+        phases, units = record['phase_prefixes'], record['native_units']
+        if (type(phases) is not list or not 1 <= len(phases) <= 2
+                or any(type(prefix) is not str or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}', prefix) for prefix in phases)
+                or len(set(phases)) != len(phases) or type(units) is not list or len(units) > 512
+                or any(type(unit) is not str or unit.rsplit('-', 1)[0] not in phases
+                       or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}-[0-9a-f]{8}', unit) for unit in units)
+                or len(set(units)) != len(units)):
+            raise Blocked('invalid protected development host native ownership record')
+        return raw, record
+
     def _prepare_development_host(self, preparation, context, expected, upstream, revision, sources,
                                   password_file, retry):
         target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
@@ -1128,19 +1145,8 @@ class DevelopmentGptbox(Gptbox):
         record = {'schema': 1, 'target': target, 'phase_prefixes': [], 'native_units': []}
         desired = preparation._host_desired('core', sources, expected).encode()
         if intent.name in members:
-            raw = self.protected_bytes(intent, 65536, 0o600).decode()
-            record = json.loads(raw, object_pairs_hook=fedora_oci.unique)
-            if (type(record) is not dict or set(record) != {'schema', 'target', 'phase_prefixes', 'native_units'}
-                    or type(record['schema']) is not int or record['schema'] != 1 or record['target'] != target):
-                raise Blocked('development host target differs from protected prior intent')
-            phases, units = record['phase_prefixes'], record['native_units']
-            if (type(phases) is not list or not 1 <= len(phases) <= 2
-                    or any(type(prefix) is not str or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}', prefix) for prefix in phases)
-                    or len(set(phases)) != len(phases) or type(units) is not list or len(units) > 512
-                    or any(type(unit) is not str or unit.rsplit('-', 1)[0] not in phases
-                           or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}-[0-9a-f]{8}', unit) for unit in units)
-                    or len(set(units)) != len(units)):
-                raise Blocked('invalid protected development host native ownership record')
+            content, record = self._read_development_host_intent(target)
+            raw = content.decode()
             if members & {'initialize.json', 'prepared', 'gptbox-image.json', 'gptbox-adapter', 'node.json', 'enrollment-intent.json'}:
                 raise Blocked('prior maintenance bootstrap state conflicts with development host intent')
             if 'desired.json' in members and self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600) != desired:
@@ -1159,6 +1165,8 @@ class DevelopmentGptbox(Gptbox):
 
         # Before the desired record, this operation could only have installed signed Git.
         if 'desired.json' not in members:
+            if self.path('/usr/sbin/nft').exists():
+                self._reject_unowned_bootstrap_table()
             if members & {'operator-password-set', 'packages.txt', 'identity-core.json', 'identity-dp-maint.json', 'identity-dp-dev.json'}:
                 raise Blocked('unbound bootstrap state preserved')
             for name in ('/etc/dev-pair', '/etc/ssh/dev-pair-keys', '/etc/ssh/sshd_config.d/00-dev-pair-operator.conf',
@@ -1213,8 +1221,9 @@ class DevelopmentGptbox(Gptbox):
 
         preparation.run.native_register = register
         try:
-            return preparation._host_prerequisites('core', github_keys, sources, context, expected,
+            ready = preparation._host_prerequisites('core', github_keys, sources, context, expected,
                                                     password=password, source_check=prove_source, development_host=True)
+            return {**ready, 'kind': DEVELOPMENT_HOST_READY_KIND, 'intent_sha256': sha(raw.encode())}
         finally:
             preparation.run.native_register = None
 
@@ -1256,19 +1265,28 @@ class DevelopmentGptbox(Gptbox):
         packages = self.protected_bytes(self.path(STATE + '/packages.txt'), 16384, 0o600)
         ready = self.path(STATE + '/host-ready.json')
         intent = self.path(DEVELOPMENT_HOST_INTENT)
-        development_host = intent.exists() or intent.is_symlink()
+        has_intent = intent.exists() or intent.is_symlink()
         if ready.exists() or ready.is_symlink():
             record = json.loads(self.protected_bytes(ready, 16384, 0o600), object_pairs_hook=fedora_oci.unique)
-            pins = {'schema': 1, 'kind': 'host-prerequisites', 'context_sha256': desired['gptbox_context_sha256'],
-                    'standards_sha': candidate.STANDARDS, 'bootstrap_sha256': desired['bootstrap_sha256'],
-                    'desired_sha256': sha(desired_raw), 'packages_sha256': sha(packages)}
             if (type(record) is not dict or type(record.get('schema')) is not int
-                    or type(record.get('source_sha')) is not str or not re.fullmatch('[0-9a-f]{40}', record['source_sha'])
-                    or record != {**pins, 'source_sha': record['source_sha']}):
+                    or type(record.get('source_sha')) is not str or not re.fullmatch('[0-9a-f]{40}', record['source_sha'])):
                 raise Blocked('protected host prerequisite record does not match existing host evidence')
-            if development_host and (record['source_sha'], record['context_sha256']) != (revision, expected):
-                raise Blocked('build target differs from the prepared development host')
-        elif development_host:
+            pins = {'schema': 1, 'kind': 'host-prerequisites', 'source_sha': record['source_sha'],
+                    'context_sha256': desired['gptbox_context_sha256'], 'standards_sha': candidate.STANDARDS,
+                    'bootstrap_sha256': desired['bootstrap_sha256'], 'desired_sha256': sha(desired_raw),
+                    'packages_sha256': sha(packages)}
+            if record.get('kind') == DEVELOPMENT_HOST_READY_KIND:
+                if (pins['source_sha'], pins['context_sha256']) != (revision, expected):
+                    raise Blocked('build target differs from the prepared development host')
+                target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
+                          'bootstrap_sources': desired['bootstrap_sources']}
+                intent_raw, _ = self._read_development_host_intent(target)
+                pins.update(kind=DEVELOPMENT_HOST_READY_KIND, intent_sha256=sha(intent_raw))
+            elif has_intent:
+                raise Blocked('development host intent requires its own readiness record')
+            if record != pins:
+                raise Blocked('protected host prerequisite record does not match existing host evidence')
+        elif has_intent:
             raise Blocked('development host preparation has not published readiness')
         elif self.protected_bytes(self.path(STATE + '/prepared'), 16384, 0o600) != desired_raw:
             raise Blocked('protected prepared marker does not match authorized host desired state')
