@@ -23,7 +23,7 @@ from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Comma
                        SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
-from gptbox_runtime import TURN_READONLY_MOUNTS
+from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, TURN_READONLY_MOUNTS, host_job_inputs)
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
@@ -44,6 +44,8 @@ RELEASE_INNER = 'inner.json'
 INIT = ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt', '--init', '0']
 FINAL_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' finalize'
 FROZEN_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' frozen'
+JOB_ENTER_WRAPPER = ('#!/bin/sh\ncase "$1" in inspect|exec) ;; *) exit 64 ;; esac\n'
+                     'exec ' + CONTROL + '/bin/podman "$@"\n')
 ASSEMBLY_LIFETIME = 900
 RUNTIME_LIFETIME = 180
 INITIALIZE_EXECUTION = 2280
@@ -320,6 +322,9 @@ class Gptbox(Bootstrap):
                    f'exec {engine} "$@"\n')
         self.wrapper = str(self.path(control + '/bin/podman'))
         self.atomic(control + '/bin/podman', script, mode=0o555)
+        if self.role == 'maintenance':
+            self.directory(control + '/job-bin', mode=0o755)
+            self.atomic(control + '/job-bin/podman', JOB_ENTER_WRAPPER, mode=0o555)
         self.atomic(control + '/distrobox-enter', self.scripts['distrobox-enter'].decode(), mode=0o555)
         self.run('/usr/sbin/restorecon', '-RF', str(self.path(control)))
         self.run('/usr/bin/systemctl', 'start', f'user@{uid}.service')
@@ -335,6 +340,9 @@ class Gptbox(Bootstrap):
                 raise Blocked('prior context executor has not stopped; no cleanup or duplicate operation')
         if retry and isinstance(self.run, Commands):
             self.run.reconcile_native(('--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--uid=dp-maint'), {})
+        self.configure_executor(uid, control)
+
+    def configure_executor(self, uid, control):
         self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--quiet', '--wait', '--collect', '--service-type=exec',
                          '--uid=dp-maint', '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=10',
                          '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
@@ -428,28 +436,135 @@ class Gptbox(Bootstrap):
             raise Blocked('unexpected/missing host bind mount')
         return item
 
-    def enter(self, identity, sealed, operation):
-        if operation not in ('probe', 'version', 'turn'):
+    def enter(self, identity, sealed, operation, job=None):
+        if operation not in ('probe', 'version', 'turn', 'job-turn') or (operation == 'job-turn') != (job is not None):
             raise Blocked('unsupported fixed role entry')
         before = self.inspect_container(identity, sealed)
         if before['State']['Status'] != 'running':
             raise Blocked('entry requires an already running exact target; no auto-create/start fallback')
-        if operation == 'turn':
+        if operation in ('turn', 'job-turn'):
+            readonly = JOB_READONLY_MOUNTS if job else TURN_READONLY_MOUNTS
             expected = {'/work/job': True, '/state': True, '/cache/job': True,
-                        **dict.fromkeys(map(str, TURN_READONLY_MOUNTS), False)}
+                        **dict.fromkeys(map(str, readonly), False)}
             actual = [mount for mount in before['Mounts'] if mount.get('Type') == 'bind']
             if (len(actual) != len(expected)
                     or {mount['Destination']: mount.get('RW') for mount in actual} != expected
                     or not before['State'].get('StartedAt')):
                 raise Blocked('headless role entry requires the exact running job mounts')
-        output = self.execute(str(self.path(CONTROL + '/distrobox-enter')),
+        protected_entry = job or getattr(self, 'protected_job_entry', False)
+        environment = ('/usr/bin/env', 'PATH=' + CONTROL + '/job-bin:/usr/bin:/usr/sbin:/bin') if protected_entry else ()
+        output = self.execute(*environment, str(self.path(CONTROL + '/distrobox-enter')),
                           '--name', identity, '--no-tty', '--no-workdir', '--clean-path', '--',
-                          '/usr/bin/python3', '-I', RUNTIME, 'entry', operation, timeout=30)
+                          '/usr/bin/python3', '-I', RUNTIME, 'entry', operation, *(job or ()), timeout=150 if job else 30)
         after = self.inspect_container(identity, sealed)
-        if operation == 'turn' and (after['State']['Status'] != 'running' or
+        if operation in ('turn', 'job-turn') and (after['State']['Status'] != 'running' or
                                    before['State']['StartedAt'] != after['State'].get('StartedAt')):
             raise Blocked('runtime changed during headless entry; inspect durable turn state')
         return output
+
+    def run_job(self, job, operation, request_sha, sealed, context, revision):
+        self.preflight()
+        if (not JOB.fullmatch(job) or not OPERATION.fullmatch(operation) or not re.fullmatch(r'[0-9a-f]{64}', context)
+                or not re.fullmatch(r'[0-9a-f]{40}', revision) or not self.path(STATE + '/prepared').exists()):
+            raise Blocked('maintenance job requires exact reviewed input, target and host readiness')
+        sealed = image_id(sealed)
+        self.target = ROOT + '/' + context
+        with self.lock():
+            return self.run_job_locked(job, operation, request_sha, sealed, context, revision)
+
+    def run_job_locked(self, job, operation, request_sha, sealed, context, revision):
+        uid = self.run('/usr/bin/id', '-u', 'dp-maint').strip()
+        gid = self.run('/usr/bin/id', '-g', 'dp-maint').strip()
+        if not all(value.isdigit() and int(value) >= 1000 for value in (uid, gid)):
+            raise Blocked('managed maintenance account required')
+        self.uid, self.gid = uid, gid
+        # Use the established protected controlling artifacts from the assembly.
+        self.wrapper = str(self.protected(self.path(CONTROL + '/bin/podman')))
+        enter = self.protected(self.path(CONTROL + '/distrobox-enter'))
+        if sha(enter.read_bytes()) != '75359e1965dcb9897a221db7818be098138154ee11c2eb2de34989a37c4b8bb8':
+            raise Blocked('pinned maintenance Distrobox entry bytes changed')
+        if self.protected(self.path(CONTROL + '/job-bin/podman')).read_text() != JOB_ENTER_WRAPPER:
+            raise Blocked('maintenance Distrobox job gateway changed')
+        self.protected(self.path(CONTROL + '/containers.conf'))
+        for directory in ('home', 'xdg-config', 'empty-hooks'):
+            if next(self.protected(self.path(CONTROL + '/' + directory)).iterdir(), None) is not None:
+                raise Blocked('maintenance control directory is not empty')
+        self.unit = 'dev-pair-gptbox-' + context + '.service'
+        self.configure_executor(uid, CONTROL)
+        self.protected_job_entry = True
+        outcome = json.loads(self.protected(self.path(self.target + '/result.json')).read_bytes())
+        if any(outcome.get(name) != expected for name, expected in (
+                ('assembled_image_id', sealed), ('source_sha', revision), ('context_sha256', context),
+                ('distrobox_sha', DBX_SHA), ('boundary_and_version_cycles', 2), ('runtime_container_removed', True))):
+            raise Blocked('maintenance image was not admitted by the exact completed assembly')
+        rows = json.loads(self.engine('image', 'inspect', sealed))
+        row, = rows
+        labels = row.get('Labels') or row['Config']['Labels']
+        codex_version = labels.get('dev-pair.codex.version')
+        if image_id(row['Id']) != sealed or any(labels.get(name) != expected for name, expected in (
+                ('dev-pair.role', 'maintenance'), ('dev-pair.context', context), ('dev-pair.distrobox', DBX_SHA),
+                ('org.opencontainers.image.revision', revision), ('dev-pair.standards', candidate.STANDARDS))) or (
+                type(codex_version) is not str or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', codex_version)):
+            raise Blocked('maintenance image identity mismatch')
+        self.mounts, request = host_job_inputs('maintenance', job, operation, request_sha, int(gid))
+        label = None
+        for branch, destination in (('workspaces', '/work/job'), ('state', '/state'), ('cache', '/cache/job')):
+            path = self.path(f'/var/lib/dev-pair/maintenance/{branch}/{job}')
+            node = path.lstat()
+            if (path.resolve(strict=True) != path or not stat.S_ISDIR(node.st_mode) or
+                    (node.st_uid, node.st_gid) != (int(uid), int(gid)) or stat.S_IMODE(node.st_mode) != 0o700):
+                raise Blocked('unsafe persistent maintenance job leaf')
+            label = label or os.getxattr(path, 'security.selinux').decode('ascii').rstrip('\0')
+            self.mounts[destination] = (str(path), True)
+        match = re.fullmatch(r'system_u:object_r:container_file_t:(s0:c[0-9]+,c[0-9]+)', label or '')
+        if not match:
+            raise Blocked('maintenance job leaf has no explicit SELinux category allocation')
+        mount_args = []
+        for destination, (source, writable) in self.mounts.items():
+            if os.getxattr(source, 'security.selinux').decode('ascii').rstrip('\0') != label:
+                raise Blocked('maintenance job mount label mismatch')
+            mount_args.append(f'--volume={source}:{destination}:{"rw" if writable else "ro"},nosuid,nodev,noexec,rprivate')
+        name = 'dp-gptbox-job-' + sha((job + '\n' + request_sha).encode())[:24]
+        timeout = str(RUNTIME_LIFETIME)
+        identity = None
+        marker = 'dev-pair.job-request=' + request_sha
+        try:
+            # A collision may hold previous evidence. Require operator reconciliation.
+            self.engine('container', 'exists', name, ok=(1,))
+            identity = image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + context,
+                '--label=' + marker, '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
+                '--pull=never', '--restart=no', '--timeout=' + timeout, '--read-only', '--read-only-tmpfs=false',
+                '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL',
+                '--security-opt=no-new-privileges', '--security-opt=label=level:' + match[1], '--network=none',
+                '--pid=private', '--ipc=private', '--uts=private', '--cgroupns=private', '--memory=2g',
+                '--memory-swap=2g', '--pids-limit=256', '--cpus=1', '--http-proxy=false', '--image-volume=ignore',
+                '--no-hosts', '--no-hostname', '--dns=none', '--systemd=false', '--log-driver=k8s-file', '--log-opt=max-size=1mb',
+                '--tmpfs=/run:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size=16m',
+                '--tmpfs=/tmp:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size=16m',
+                '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), *mount_args,
+                '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
+            self.inspect_container(identity, sealed)
+            self.engine('start', identity, timeout=20)
+            self.ready(identity, sealed)
+            if self.enter(identity, sealed, 'version').strip() != f'codex-cli {codex_version}':
+                raise Blocked('actual role binary version differs from exact image')
+            report = json.loads(self.enter(identity, sealed, 'job-turn', (job, operation, request_sha)))
+            if (report['schema'] != 2 or report['request_sha256'] != request_sha or any(report.get(field) != request[field]
+                    for field in ('job', 'operation', 'action', 'role', 'model', 'effort', 'logical_session')) or
+                    self.run('/usr/sbin/getenforce').strip() != 'Enforcing'):
+                raise Blocked('maintenance turn or host confinement evidence mismatch')
+        finally:
+            if identity is not None:
+                cleanup = json.loads(self.engine('inspect', '--type=container', identity, timeout=10))
+                row, = cleanup
+                if image_id(row['Id']) != identity or image_id(row['Image']) != sealed or row['Config']['Labels'].get('dev-pair.job-request') != request_sha:
+                    raise Blocked('maintenance cleanup ownership changed')
+                self.engine('rm', '--force', '--time=5', identity, timeout=20)
+                self.engine('container', 'exists', identity, ok=(1,), timeout=10)
+        return {'kind': 'dev-pair-maintenance-job-v1', 'image_id': sealed, 'context_sha256': context,
+                'source_sha': revision, 'codex_version': codex_version,
+                'runtime_container_id': identity, 'runtime_container_removed': True,
+                'turn': report}
 
     def ready(self, identity, sealed, previous_start=None):
         deadline = time.monotonic() + 30
@@ -1725,7 +1840,24 @@ class DevelopmentGptbox(Gptbox):
             raise Blocked(f'development archive verification failed: {error}') from None
 
 
+def run_job_cli(argv):
+    parser = argparse.ArgumentParser(prog='gptbox.py run-job', description='Enter the exact sealed maintenance role.')
+    for name in ('job', 'operation', 'request-sha256', 'image', 'context-sha256', 'source-sha'):
+        parser.add_argument('--' + name, required=True)
+    args = parser.parse_args(argv)
+    try:
+        report = Gptbox().run_job(args.job, args.operation, args.request_sha256, args.image,
+                                  args.context_sha256, args.source_sha)
+        print(json.dumps(report, sort_keys=True))
+        return 0 if report['turn']['status'] == 'completed-turn' else 2
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+        print('Maintenance role blocked; inspect protected evidence locally', file=sys.stderr)
+        return 2
+
+
 def main():
+    if sys.argv[1:2] == ['run-job']:
+        return run_job_cli(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', choices=('assemble', 'initialize', 'prepare-development-host', 'build-development'))
     parser.add_argument('--apply', action='store_true')
