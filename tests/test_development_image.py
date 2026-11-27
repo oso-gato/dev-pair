@@ -6,10 +6,12 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import subprocess
 import tarfile
 import tempfile
 from types import SimpleNamespace
 import unittest
+import time
 from unittest.mock import patch
 
 from test_gptbox import BASE, EXPECTED, RUNTIME, SOURCE, Engine, g
@@ -69,7 +71,9 @@ class ProducerEngine(Engine):
             self.calls.append((args, kwargs))
             assert command[-1] == 'sha256:' + self.sealed_id
             self.containers[RUNTIME] = {'Id': RUNTIME, 'Image': self.sealed_id,
-                'Config': {'Labels': {'dev-pair.context': EXPECTED}},
+                'Config': {'Labels': {'dev-pair.context': EXPECTED},
+                           'Timeout': int(next(value[10:] for value in command if value.startswith('--timeout=')))},
+                'HostConfig': {'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0}},
                 'Name': next(part[7:] for part in command if part.startswith('--name=')),
                 'State': {'Status': 'configured', 'Running': False}}
             return RUNTIME
@@ -186,6 +190,81 @@ class DevelopmentImageTests(unittest.TestCase):
 
     def assemble(self, retry=False, apply=True):
         return self.app.assemble(self.context, EXPECTED, '/', SOURCE, apply=apply, retry=retry)
+
+    def bounded_engine(self, seconds):
+        engine = self.engine
+
+        class BoundedEngine(g.Commands):
+            def __call__(self, *args, **kwargs):
+                return engine(*args, **kwargs)
+
+            def reconcile_native(self, args, env):
+                engine.calls.append((args, {}))
+
+        runner = BoundedEngine()
+        runner.deadline = time.monotonic() + seconds
+        self.enterContext(patch.object(self.app, 'run', runner))
+        return runner
+
+    def test_development_oci_effects_use_reduced_independent_lifetimes(self):
+        runner = self.bounded_engine(160)
+        started = time.monotonic()
+        self.assertEqual(self.assemble()['inner']['image_id'], self.engine.sealed_id)
+        build = next(args for args, _ in self.engine.calls if 'build' in args)
+        end = int(next(arg.split('=', 2)[2] for arg in build if arg.startswith('--build-arg=DP_OCI_END=')))
+        self.assertLessEqual(end, runner.deadline - g.CLEANUP_EXECUTION)
+        self.assertIn('--pid=private', build)
+        recipe = (self.engine.build / 'Containerfile').read_text()
+        self.assertIn('ARG DP_OCI_END', recipe)
+        create_stage = next(args for args, _ in self.engine.calls if 'create' in args and '--entrypoint=/bin/sh' in args)
+        lifetime = int(next(arg[10:] for arg in create_stage if arg.startswith('--timeout=')))
+        self.assertTrue(0 < lifetime < g.ASSEMBLY_LIFETIME)
+        self.assertLessEqual(started + 2 * lifetime + g.CLEANUP_EXECUTION, runner.deadline)
+        self.assertIn(g.DEVELOPMENT_TIMED_EXEC, create_stage)
+        self.assertEqual(self.engine.saved_stage['Config']['Timeout'], lifetime)
+        snapshot = next(args for args, _ in self.engine.calls if 'create' in args and '--entrypoint=/usr/bin/false' in args)
+        snapshot_lifetime = int(next(arg[10:] for arg in snapshot if arg.startswith('--timeout=')))
+        self.assertTrue(0 < snapshot_lifetime < g.RUNTIME_LIFETIME)
+        self.assertNotIn(RUNTIME, next(args for args, _ in self.engine.calls if 'start' in args and '--attach' in args))
+        self.assertFalse(self.engine.containers)
+
+    def test_delayed_create_to_start_does_not_launch_past_oci_budget(self):
+        runner = self.bounded_engine(160)
+        original = self.app.inspect_container
+
+        def delayed(*args, **kwargs):
+            container = original(*args, **kwargs)
+            runner.deadline = time.monotonic() + (g.CLEANUP_EXECUTION + g.OCI_KILL_GRACE + 5)
+            return container
+
+        with patch.object(self.app, 'inspect_container', side_effect=delayed), \
+                self.assertRaisesRegex(g.Blocked, 'start no longer fits'):
+            self.assemble()
+        self.assertFalse(any('start' in args and '--attach' in args for args, _ in self.engine.calls))
+        self.assertFalse(self.engine.containers)
+        self.assertFalse(self.release.exists())
+
+    def test_unobservable_development_container_removal_withholds_ready_release(self):
+        self.bounded_engine(160)
+        self.engine.fail = lambda argv: 'exists' in argv
+        with self.assertRaisesRegex(g.Blocked, 'cleanup unresolved'):
+            self.assemble()
+        self.assertFalse(self.release.exists())
+        self.assertEqual(json.loads(self.publication.read_bytes())['phase'], 'verified')
+        state = json.loads(self.app.text(self.app.target + '/resource-cleanup.json'))
+        self.assertEqual(state, {'context_sha256': EXPECTED, 'source_sha': SOURCE, 'status': 'unresolved; exact resources retained'})
+
+    def test_oci_entry_guard_rejects_expired_or_zero_payload_before_dispatch(self):
+        uptime = int(Path('/proc/uptime').read_text().split()[0].split('.')[0])
+        command = ['/bin/sh', '-ec', g.DEVELOPMENT_TIMED_EXEC, 'fixture']
+        for end, ceiling in ((uptime, 550), (uptime + 30, 0), (uptime + 30, 10)):
+            result = subprocess.run([*command, str(end), str(ceiling), '/bin/sh', '-c', 'printf forbidden'],
+                                    capture_output=True, check=False, timeout=3)
+            self.assertEqual(result.returncode, 124)
+            self.assertEqual(result.stdout, b'')
+        result = subprocess.run([*command, str(uptime + 30), '15', '/bin/sh', '-c', 'printf allowed'],
+                                capture_output=True, check=True, timeout=3)
+        self.assertEqual(result.stdout, b'allowed')
 
     def test_committed_development_graph_exports_a_bound_inner_record_atomically(self):
         self.assertFalse(self.assemble(apply=False)['changes'])

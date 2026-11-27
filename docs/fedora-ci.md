@@ -44,8 +44,10 @@ maintenance work is terminal and the exact head has been authorized. Keep one
 active scope per PR and avoid label or head changes while a run is active.
 
 The controller's `--scenario` accepts `maintenance` (the default) or
-`development`. The workflow independently checks the selected scenario against
-the original event and exact checked-out head. Development builds and ships one
+`development`. Development admission requires the Actions pull request event
+from the runner's `GITHUB_EVENT_PATH` in `oso-gato/dev-pair`. A supplied event
+path must match that path. The controller checks the fixed label and exact
+event head before creating scratch or entering the probe. Development builds and ships one
 authenticated development bundle. The manifest kind must match at build and
 extraction. The scenario and a per-run nonce bind the NoCloud request, the
 effective native service and the dedicated serial report. The development
@@ -53,11 +55,19 @@ report omits raw console/command output, paths and diagnostic ciphertext.
 
 After admission on enforcing Fedora 44, the guest runs
 `prepare-development-host --apply` once and deletes the disposable operator
-password file before it can run `build-development --apply`. Both commands
+password file before it can run `build-development --apply`. The guest checks
+the original held parent and observes the file absent after the owned unlink.
+It repeats the check before reporting completion. Both commands
 share one absolute 2280-second work deadline. Preparation's 600 seconds and
 the producer's 120-second preflight plus 2040-second build are upper bounds
-clipped to the same deadline. Native launch startup/runtime and in-unit relay
-execution inherit the remaining budget. A failed command blocks its stage and
+clipped to the same deadline. The guest accepts each result before its stage
+cutoff. The cleanup allowance cannot extend that cutoff. Native launch
+startup/runtime and in-unit relay execution inherit the remaining budget.
+The development Buildah package command and Distrobox assembly also check an
+absolute cutoff at workload entry. Assembly and the never-started readback
+snapshot retain inspected positive Podman lifetimes within their 900-second
+and 180-second ceilings. Assembly checks that the created container still fits
+the remaining time before starting. A failed command blocks its stage and
 does not automatically retry. The 45-second cleanup allowance, 60-second final
 report allowance, 2640-second VM cap and existing storage reserves remain.
 

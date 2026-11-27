@@ -32,14 +32,23 @@ class DevelopmentSelectionTests(unittest.TestCase):
         return {'action': action, 'label': {'name': label}, 'repository': {'full_name': 'oso-gato/dev-pair'},
                 'pull_request': {'head': {'sha': self.source, 'repo': {'full_name': repo}}}}
 
-    def run_cli(self, event, *options):
+    def run_cli(self, event, *options, trusted=True, supplied=True, event_name='pull_request'):
         event_file = self.root / 'event.json'
         event_file.write_text(json.dumps(event))
-        with mock.patch.object(sys, 'argv', ['fedora_ci.py', '--expected-source', self.source,
-                 '--github-event', str(event_file), *options]), mock.patch.object(ci, 'scratch_root', return_value=self.root), \
+        env = {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': event_name, 'GITHUB_REPOSITORY': 'oso-gato/dev-pair',
+               'GITHUB_EVENT_PATH': str(event_file)} if trusted else {}
+        event_args = ['--github-event', str(event_file if supplied is True else supplied)] if supplied else []
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(sys, 'argv', ['fedora_ci.py', '--expected-source', self.source, *event_args, *options]), \
+                mock.patch.object(ci, 'scratch_root', return_value=self.root) as scratch, \
                 mock.patch.object(ci, 'Probe') as probe:
             probe.return_value.execute.return_value = 0
-            self.assertEqual(ci.main(), 0)
+            try:
+                self.assertEqual(ci.main(), 0)
+            except (OSError, ci.Blocked):
+                scratch.assert_not_called()
+                probe.assert_not_called()
+                raise
             return probe.call_args
 
     def test_workflow_and_controller_require_exact_event_head_and_fixed_label(self):
@@ -48,9 +57,23 @@ class DevelopmentSelectionTests(unittest.TestCase):
                              (self.source, self.root, 'maintenance'))
         self.assertEqual(self.run_cli(self.event('labeled', ci.DEVELOPMENT_LABEL), '--scenario', 'development').args,
                          (self.source, self.root, 'development'))
+        self.assertEqual(self.run_cli(self.event('opened'), trusted=False, supplied=False).args, (self.source, self.root, 'maintenance'))
         for event in (self.event('labeled', 'other'), self.event('labeled', ci.DEVELOPMENT_LABEL.upper()),
-                      self.event('unlabeled', ci.DEVELOPMENT_LABEL), self.event('labeled', ci.DEVELOPMENT_LABEL, 'fork/project')):
-            self.assertIsNone(self.run_cli(event, '--scenario', 'development'))
+                      self.event('unlabeled', ci.DEVELOPMENT_LABEL), self.event('opened', ci.DEVELOPMENT_LABEL),
+                      self.event('labeled', ci.DEVELOPMENT_LABEL, 'fork/project')):
+            with self.assertRaisesRegex(ci.Blocked, 'outside the exact pull request label event'):
+                self.run_cli(event, '--scenario', 'development')
+        wanted = self.event('labeled', ci.DEVELOPMENT_LABEL)
+        with self.assertRaisesRegex(ci.Blocked, 'requires the Actions'):
+            self.run_cli(wanted, '--scenario', 'development', trusted=False, supplied=False)
+        with self.assertRaisesRegex(ci.Blocked, 'requires the Actions'):
+            self.run_cli(wanted, '--scenario', 'development', trusted=False)
+        with self.assertRaisesRegex(ci.Blocked, 'requires the Actions'):
+            self.run_cli(wanted, '--scenario', 'development', event_name='workflow_dispatch')
+        decoy = self.root / 'other.json'
+        decoy.write_text(json.dumps(wanted))
+        with self.assertRaisesRegex(ci.Blocked, 'differs from the Actions event'):
+            self.run_cli(wanted, '--scenario', 'development', supplied=decoy)
         with self.assertRaisesRegex(ci.Blocked, 'differs from the pull request event'):
             self.run_cli(self.event('labeled', ci.DEVELOPMENT_LABEL))
         stale = self.event('labeled', ci.DEVELOPMENT_LABEL)
@@ -216,7 +239,7 @@ class DevelopmentGuestTests(unittest.TestCase):
         path = g.STATE + '/host-ready.json'
         self.app.atomic(path, g.image_inputs_bytes(ready).decode(), expected=self.app.text(path))
 
-    def capture(self, args, *, fail_prepare=False, **kwargs):
+    def capture(self, args, *, fail_prepare=False, prepare_effect=None, **kwargs):
         self.calls.append((args, kwargs))
         self.assertIn('--apply', args)
         self.assertNotIn('--retry', args)
@@ -224,6 +247,8 @@ class DevelopmentGuestTests(unittest.TestCase):
             password = Path(args[args.index('--password-file') + 1])
             self.assertEqual(password.stat().st_mode & 0o777, 0o600)
             self.assertEqual(password.read_text(), 'disposable-fixture-sentinel\n')
+            if prepare_effect is not None:
+                prepare_effect()
             if fail_prepare:
                 return 2, b'private command log /root/not-public disposable-fixture-sentinel'
             self.seed_development_ready()
@@ -245,7 +270,7 @@ class DevelopmentGuestTests(unittest.TestCase):
         with mock.patch.object(self.app, 'run', ReceiptCommands()):
             return guest.development_release_evidence(g, self.app, expected, built, end)
 
-    def run_guest(self, fail_prepare=False):
+    def run_guest(self, fail_prepare=False, prepare_effect=None, expect_removed=True):
         reports = []
         executor = executor_fixture(self.expected, self.guest_sha)
         executor['admission_deadline'] = time.monotonic() + 60
@@ -255,14 +280,16 @@ class DevelopmentGuestTests(unittest.TestCase):
                 mock.patch.object(guest, 'native_executor_identity', return_value=executor), \
                 mock.patch.object(guest, 'baseline', return_value=baseline), \
                 mock.patch.object(guest, 'admit_inputs', return_value=self.root), \
-                mock.patch.object(guest, 'capture', side_effect=lambda *a, **kw: self.capture(*a, fail_prepare=fail_prepare, **kw)), \
+                mock.patch.object(guest, 'capture', side_effect=lambda *a, **kw: self.capture(
+                    *a, fail_prepare=fail_prepare, prepare_effect=prepare_effect, **kw)), \
                 mock.patch.object(guest, 'development_readback', side_effect=self.readback), \
                 mock.patch.object(guest.secrets, 'token_urlsafe', return_value='disposable-fixture-sentinel'), \
                 mock.patch.object(guest, 'write_report', side_effect=lambda report, **kw: reports.append(copy.deepcopy(report))), \
                 mock.patch.object(guest.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as system:
             guest.main()
         self.assertEqual(system.call_args.args[0], ['/usr/bin/systemctl', 'poweroff', '--no-block'])
-        self.assertFalse(os.path.lexists(self.secret_dir / 'core-password'))
+        if expect_removed:
+            self.assertFalse(os.path.lexists(self.secret_dir / 'core-password'))
         self.assertEqual(len(reports), 1)
         frame = guest.encode_report(reports[0])
         for sensitive in (b'disposable-fixture-sentinel', b'/root/not-public', os.fsencode(self.root), os.fsencode(guest.SERVICE_MASK)):
@@ -276,9 +303,10 @@ class DevelopmentGuestTests(unittest.TestCase):
         self.assertFalse(report['development']['job_admission'])
         args = [argv for argv, _ in self.calls]
         times = [float(argv[argv.index('--work-deadline-monotonic') + 1]) for argv in args]
-        self.assertEqual(times[0], times[1])
+        self.assertLess(times[0], times[1])
         self.assertGreater(times[0], time.monotonic())
         self.assertLessEqual(times[0] - time.monotonic(), guest.INITIALIZE_SECONDS)
+        self.assertLessEqual(times[1] - time.monotonic(), guest.INITIALIZE_SECONDS)
         self.assertLessEqual(self.calls[0][1]['timeout'], 600 + guest.INITIALIZE_CLEANUP_SECONDS)
         self.assertLessEqual(self.calls[1][1]['timeout'], 2160 + guest.INITIALIZE_CLEANUP_SECONDS)
         receipt = report['development']['receipt']
@@ -333,6 +361,74 @@ class DevelopmentGuestTests(unittest.TestCase):
         witness = ci.report_witness(guest.encode_report(report), include_bytes=False)
         self.assertNotIn('retained_base64', witness)
         self.assertTrue(witness['framing_complete'])
+
+    def test_late_success_during_cleanup_grace_never_starts_build(self):
+        with mock.patch.object(guest, 'DEVELOPMENT_PREPARE_SECONDS', .04):
+            report = self.run_guest(prepare_effect=lambda: time.sleep(.06))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(report['development']['stage'], 'development-host-prepare')
+        self.assertIsNone(report['development']['receipt'])
+        self.assertTrue(report['cleanup']['password_absent'])
+        capture = guest.capture
+
+        def delayed_child(*args, **kwargs):
+            return capture([sys.executable, '-c', 'import time; time.sleep(.08); print("{}")'], **kwargs)
+
+        with mock.patch.object(guest, 'capture', side_effect=delayed_child), self.assertRaisesRegex(ValueError, 'budget exhausted'):
+            guest.development_command(self.root, 'prepare-development-host', [], time.monotonic() + 2, .04)
+
+    def test_inaccessible_password_parent_is_unresolved_after_failed_prepare(self):
+        report = self.run_guest(fail_prepare=True, prepare_effect=lambda: self.secret_dir.chmod(0), expect_removed=False)
+        self.secret_dir.chmod(0o700)
+        self.assertTrue((self.secret_dir / 'core-password').is_file())
+        self.assertFalse(report['cleanup']['password_absent'])
+        self.assertEqual(report['development']['stage'], 'development-host-prepare')
+        self.assertEqual(len(self.calls), 1)
+
+    def test_failed_unlink_or_final_metadata_observation_never_blesses_cleanup(self):
+        unlink = os.unlink
+
+        def denied_unlink(name, *, dir_fd=None):
+            if dir_fd is not None and name == 'core-password':
+                raise PermissionError('fixture denied exact unlink')
+            return unlink(name, dir_fd=dir_fd)
+
+        with mock.patch.object(guest.os, 'unlink', side_effect=denied_unlink):
+            report = self.run_guest(fail_prepare=True, expect_removed=False)
+        self.assertFalse(report['cleanup']['password_absent'])
+        self.assertTrue((self.secret_dir / 'core-password').is_file())
+        shutil.rmtree(self.secret_dir)
+        self.calls.clear()
+        leaf = guest.DevelopmentPassword.leaf
+        observations = []
+
+        def deny_final_observation(owner):
+            if owner.removed:
+                observations.append(owner.removed)
+                if len(observations) == 2:
+                    raise OSError('fixture final lstat failure')
+            return leaf(owner)
+
+        with mock.patch.object(guest.DevelopmentPassword, 'leaf', new=deny_final_observation):
+            report = self.run_guest()
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(observations), 2)
+        self.assertFalse(report['cleanup']['password_absent'])
+        self.assertEqual(report['development']['stage'], 'development-readback')
+        self.assertIsNone(report['development']['receipt'])
+
+    def test_password_parent_replacement_and_dangling_leaf_withhold_absence(self):
+        password = guest.DevelopmentPassword(self.secret_dir)
+        self.addCleanup(password.close)
+        with password.create():
+            pass
+        self.assertTrue(password.absent())
+        password.path.symlink_to(self.root / 'missing')
+        self.assertFalse(password.absent())
+        password.path.unlink()
+        self.secret_dir.rename(self.root / 'original-secret')
+        self.secret_dir.mkdir(mode=0o700)
+        self.assertFalse(password.absent())
 
     def test_development_cli_deadline_clips_both_existing_native_ceilings(self):
         options = ['gptbox.py', 'prepare-development-host', '--apply', '--context', '/fixture-context',

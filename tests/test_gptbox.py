@@ -74,7 +74,7 @@ class Engine:
             identity = RUNTIME if runtime else STAGE
             name = next(value.split('=', 1)[1] for value in command if value.startswith('--name='))
             config = {'User': '1000:1000' if runtime else '',
-                      'Timeout': g.RUNTIME_LIFETIME if runtime else g.ASSEMBLY_LIFETIME,
+                      'Timeout': int(next(value[10:] for value in command if value.startswith('--timeout='))),
                       'Labels': {'manager': 'distrobox', 'distrobox.unshare_groups': '0', 'dev-pair.context': EXPECTED}}
             host = {'Privileged': False, 'ReadonlyRootfs': runtime, 'CapAdd': [] if runtime else ['CAP_SYS_ADMIN'],
                     'CapDrop': ['ALL'] if runtime else [], 'SecurityOpt': ['no-new-privileges'],
@@ -102,6 +102,12 @@ class Engine:
             if found is None:
                 found = next((value for value in self.containers.values() if value['Name'] == identity), None)
             return json.dumps([found] if found else [])
+        if command[:2] == ('container', 'exists'):
+            identity = command[-1]
+            present = identity in self.containers or any(item['Name'] == identity for item in self.containers.values())
+            if (0 if present else 1) not in kwargs.get('ok', (0,)):
+                raise g.Blocked('synthetic container existence status rejected')
+            return ''
         if command[0] == 'start':
             identity = command[-1]
             if '--attach' in command:

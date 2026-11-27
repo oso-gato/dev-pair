@@ -85,6 +85,32 @@ def select_pull_request(event, source):
     return scenario
 
 
+def actions_development_event(supplied):
+    # GitHub's job environment, read-only token and exact checkout are the
+    # trust boundary. A caller cannot substitute another event file via argv.
+    require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('GITHUB_EVENT_NAME') == 'pull_request'
+            and os.environ.get('GITHUB_REPOSITORY') == 'oso-gato/dev-pair', 'Development requires the Actions pull request event')
+    path = pathlib.Path(os.environ.get('GITHUB_EVENT_PATH', ''))
+    require(path.is_absolute() and (supplied is None or supplied == path) and path.resolve(strict=True) == path,
+            'Development event path differs from the Actions event')
+    return path
+
+
+def read_pull_request(path, source, *, actions_event=False):
+    fd = os.open(path, os.O_RDONLY | (os.O_NOFOLLOW | os.O_NONBLOCK if actions_event else 0))
+    with os.fdopen(fd, 'rb') as stream:
+        if actions_event:
+            node = os.fstat(stream.fileno())
+            require(stat.S_ISREG(node.st_mode) and node.st_uid in (0, os.geteuid()) and node.st_nlink == 1
+                    and not node.st_mode & 0o022, 'Invalid Actions event file ownership or mode')
+        data = stream.read(25 * MIB + 1)
+    require(len(data) <= 25 * MIB, 'GitHub event exceeds byte limit')
+    try:
+        return select_pull_request(json.loads(data, object_pairs_hook=unique_object), source)
+    except (ValueError, UnicodeError, RecursionError):
+        raise Blocked('Invalid pull request event') from None
+
+
 def scratch_root(runner_temp):
     require(runner_temp and pathlib.Path(runner_temp).is_dir(), 'RUNNER_TEMP unavailable')
     # Podman 4.9 rejects runroot paths longer than 50 characters. The normal
@@ -1232,14 +1258,12 @@ def main():
     parser.add_argument('--scenario', choices=SCENARIOS, default='maintenance')
     parser.add_argument('--github-event', type=pathlib.Path)
     args = parser.parse_args()
-    if args.github_event is not None:
-        with args.github_event.open('rb') as stream:
-            data = stream.read(25 * MIB + 1)
-        require(len(data) <= 25 * MIB, 'GitHub event exceeds byte limit')
-        try:
-            selected = select_pull_request(json.loads(data, object_pairs_hook=unique_object), args.expected_source)
-        except (ValueError, UnicodeError, RecursionError):
-            raise Blocked('Invalid pull request event') from None
+    if args.scenario == 'development':
+        event = actions_development_event(args.github_event)
+        require(read_pull_request(event, args.expected_source, actions_event=True) == 'development',
+                'Development is outside the exact pull request label event')
+    elif args.github_event is not None:
+        selected = read_pull_request(args.github_event, args.expected_source)
         if selected is None:
             return 0
         require(args.scenario == selected, 'Fedora scenario differs from the pull request event')

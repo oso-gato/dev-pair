@@ -54,6 +54,16 @@ ADAPTER_EXECUTION = 1620
 IMAGE_EXECUTION = 600
 CLEANUP_EXECUTION = 45
 COMMAND_CLEANUP_GRACE = 45
+OCI_KILL_GRACE = 10
+# Fedora's /proc/uptime is boot time in the shared time namespace. It is
+# never earlier than CLOCK_MONOTONIC, including after suspend. Round elapsed
+# time up and the supplied absolute cutoff down before starting any payload.
+DEVELOPMENT_TIMED_EXEC = (
+    'end=$1; max=$2; shift 2; read -r uptime idle </proc/uptime; now=${uptime%%.*}; '
+    'case $end:$max:$now in *[!0-9:]*|:*|*::*|*:) exit 124;; esac; '
+    'left=$((end - now - 1 - 10)); limit=$((max - 10)); '
+    '[ "$left" -le "$limit" ] || left=$limit; [ "$left" -gt 0 ] || exit 124; '
+    'exec /usr/bin/timeout --signal=TERM --kill-after=10s "${left}s" "$@"')
 ADAPTER_SOURCE_FILES = ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py',
                         'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py',
                         'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py')
@@ -334,7 +344,7 @@ class Gptbox(Bootstrap):
         path = self.target + '/' + name + '.json'
         self.atomic(path, json.dumps(value, sort_keys=True) + '\n', expected=self.text(path) or None)
 
-    def inspect_container(self, identity, sealed, runtime=True, timeout=30):
+    def inspect_container(self, identity, sealed, runtime=True, timeout=30, *, lifetime=None):
         rows = json.loads(self.engine('inspect', '--type=container', identity, timeout=timeout))
         if not isinstance(rows, list) or len(rows) != 1:
             raise Blocked('ambiguous engine inspection')
@@ -373,7 +383,9 @@ class Gptbox(Bootstrap):
             if (host.get('Memory') != 2147483648 or host.get('PidsLimit') != 512 or host.get('NanoCpus') != 1000000000
                     or ':container_engine_t:s0:' not in item.get('ProcessLabel', '')):
                 raise Blocked('isolated assembly budget/confinement mismatch')
-        if config.get('Timeout') != (RUNTIME_LIFETIME if runtime else ASSEMBLY_LIFETIME):
+        ceiling = RUNTIME_LIFETIME if runtime else ASSEMBLY_LIFETIME
+        lifetime = ceiling if lifetime is None else lifetime
+        if type(lifetime) is not int or not 0 < lifetime <= ceiling or config.get('Timeout') != lifetime:
             raise Blocked('independent native container lifetime is missing or mismatched')
         policy = host.get('RestartPolicy', {})
         if policy.get('Name') not in ('no', '') or policy.get('MaximumRetryCount', 0) != 0:
@@ -462,12 +474,18 @@ class Gptbox(Bootstrap):
             raw = self.engine('inspect', '--type=container', name, ok=(0, 125))
             rows = json.loads(raw) if raw.strip() else []
             if not rows:
+                if self.role == 'development':
+                    self.engine('container', 'exists', name, ok=(1,))
                 continue
             if (not isinstance(rows, list) or len(rows) != 1
                     or rows[0]['Config'].get('Labels', {}).get('dev-pair.context') != expected
                     or image_id(rows[0]['Image']) != wanted_image):
                 raise Blocked('foreign container collision preserved during recovery')
-            self.engine('rm', '--force', image_id(rows[0]['Id']))
+            identity = image_id(rows[0]['Id'])
+            if self.role == 'development':
+                self.remove_development_container(identity)
+            else:
+                self.engine('rm', '--force', identity)
 
     def recover_image_work(self, expected):
         work = self.path(self.artifact_root + '/' + expected + '/image-work')
@@ -641,19 +659,54 @@ class Gptbox(Bootstrap):
         self.image_stage('complete',revision,expected)
         return result
 
+    def development_oci_end(self):
+        if self.role != 'development' or not isinstance(self.run, Commands):
+            return None
+        deadline = self.run.execution_deadline()
+        if deadline is None or deadline - time.monotonic() <= CLEANUP_EXECUTION + OCI_KILL_GRACE + 1:
+            raise Blocked('insufficient time for development OCI execution and cleanup')
+        return math.floor(deadline - CLEANUP_EXECUTION)
+
     def create_assembly_stage(self, name, expected, base):
-        return image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + expected,
-            '--timeout=' + str(ASSEMBLY_LIFETIME), '--restart=no',
+        end = self.development_oci_end()
+        lifetime = ASSEMBLY_LIFETIME
+        entrypoint, assembly_args = INIT[0], INIT[1:]
+        if end is not None:
+            lifetime = min(lifetime, math.floor((end - time.monotonic()) / 2))
+            if lifetime <= OCI_KILL_GRACE:
+                raise Blocked('insufficient time for finite development assembly')
+            entrypoint = '/bin/sh'
+            assembly_args = ['-ec', DEVELOPMENT_TIMED_EXEC, 'development-assembly', str(end), str(lifetime), *INIT]
+        identity = image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + expected,
+            '--timeout=' + str(lifetime), '--restart=no',
             '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private',
             '--userns=private', '--cap-add=SYS_ADMIN', '--security-opt=no-new-privileges',
             '--security-opt=label=type:container_engine_t', '--memory=2g', '--pids-limit=512', '--cpus=1',
             '--tmpfs=/run:rw,nosuid,nodev,mode=0755,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,notmpcopyup',
-            '--hooks-dir=' + str(self.path(self.control + '/empty-hooks')), '--entrypoint=/usr/bin/distrobox-init',
-            base, *INIT[1:], '--', FINAL_HOOK))
+            '--hooks-dir=' + str(self.path(self.control + '/empty-hooks')), '--entrypoint=' + entrypoint,
+            base, *assembly_args, '--', FINAL_HOOK))
+        if end is not None:
+            self.development_assembly = (identity, end, lifetime)
+        return identity
 
     def seal_assembly_stage(self, stage, base, revision, inputs):
-        self.inspect_container(stage, base, runtime=False)
-        output = self.engine('start', '--attach', stage, timeout=ASSEMBLY_LIFETIME)
+        lifetime, start_timeout = ASSEMBLY_LIFETIME, ASSEMBLY_LIFETIME
+        if self.role == 'development' and isinstance(self.run, Commands):
+            bound, end, lifetime = getattr(self, 'development_assembly', (None, None, None))
+            if bound != stage:
+                raise Blocked('development assembly lifetime is unbound')
+            state = self.inspect_container(stage, base, runtime=False, lifetime=lifetime)['State']
+            if state.get('Status') not in ('configured', 'created') or state.get('Running') is not False:
+                raise Blocked('development assembly was already started')
+            # Even a start delayed until the end of the attached command must
+            # fit the independently configured OCI lifetime and cleanup reserve.
+            end = min(end, self.development_oci_end())
+            start_timeout = min(lifetime, math.floor(end - time.monotonic() - lifetime))
+            if start_timeout <= OCI_KILL_GRACE:
+                raise Blocked('development assembly start no longer fits its inspected lifetime')
+        else:
+            self.inspect_container(stage, base, runtime=False)
+        output = self.engine('start', '--attach', stage, timeout=start_timeout)
         lines = output.strip().splitlines()
         attestation = json.loads(lines[-1], object_pairs_hook=fedora_oci.unique) if lines else None
         if (type(attestation) is not dict or attestation.get('kind') != 'genuine-distrobox-assembled'
@@ -662,7 +715,7 @@ class Gptbox(Bootstrap):
             raise Blocked('actual upstream finalizer attestation is missing or mismatched')
         self.record('assembly-attestation', attestation)
         if self.role == 'development':
-            stopped = self.inspect_container(stage, base, runtime=False)['State']
+            stopped = self.inspect_container(stage, base, runtime=False, lifetime=lifetime)['State']
             if stopped.get('Status') not in ('exited', 'stopped') or stopped.get('Running') is not False:
                 raise Blocked('development commit requires the exact stopped Distrobox stage')
             format_args = ('--format=oci',)
@@ -742,7 +795,13 @@ class Gptbox(Bootstrap):
         # Fixed source-controlled package/locale operation, never submitted
         # script input. This native inner bound also covers detached RUN
         # helpers; remaining build/VM budgets can still end sooner.
-        lines[1] = 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec ' + shlex.quote(lines[1][4:])
+        package_script = shlex.quote(lines[1][4:])
+        timed_build = self.role == 'development' and isinstance(self.run, Commands)
+        if timed_build:
+            lines[1] = ('ARG DP_OCI_END\nRUN /bin/sh -ec ' + shlex.quote(DEVELOPMENT_TIMED_EXEC) +
+                        ' development-build "$DP_OCI_END" 550 /bin/sh -ec ' + package_script)
+        else:
+            lines[1] = 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec ' + package_script
         recipe = '\n'.join(lines) + '\n'
         for name, data in {**files, 'inputs.json': input_bytes, 'Containerfile': recipe.encode()}.items():
             # Binary-safe atomic creation in a protected new build directory.
@@ -799,7 +858,9 @@ class Gptbox(Bootstrap):
                         with fedora_oci.verified(context, temporary_parent=verification_root, leased=True) as (plain, proof):
                             imported = fedora_oci.import_image(lambda *args, **kw: image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,*args,**kw), plain, uid=int(self.uid))
                         self.image_stage('build',revision,expected)
-                        base = image_id(image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--http-proxy=false', '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
+                        end = self.development_oci_end()
+                        build_args = ('--pid=private', '--build-arg=DP_OCI_END=' + str(end)) if end is not None else ()
+                        base = image_id(image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--http-proxy=false', *build_args, '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
                     except BaseException as error:
                         if first_error is None:first_error=error
                         raise
@@ -1498,6 +1559,7 @@ class DevelopmentGptbox(Gptbox):
         self.record('resources', {stage_name: base})
         stage = snapshot = None
         primary = None
+        execution_end = self.run.execution_deadline() if isinstance(self.run, Commands) else None
         try:
             stage = self.create_assembly_stage(stage_name, expected, base)
             sealed, seal = self.seal_assembly_stage(stage, base, revision, inputs)
@@ -1505,35 +1567,80 @@ class DevelopmentGptbox(Gptbox):
                 raise Blocked('development commit did not produce a new immutable image')
             self.image_stage('export', revision, expected)
             self.record('resources', {stage_name: base, snapshot_name: sealed})
+            end = self.development_oci_end()
+            snapshot_lifetime = min(RUNTIME_LIFETIME, math.floor(end - time.monotonic())) if end is not None else RUNTIME_LIFETIME
+            if snapshot_lifetime <= 0:
+                raise Blocked('insufficient time for bounded development snapshot')
             snapshot = image_id(self.engine('create', '--name=' + snapshot_name, '--label=dev-pair.context=' + expected,
-                '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                '--timeout=' + str(snapshot_lifetime), '--restart=no', '--network=none', '--read-only', '--cap-drop=ALL', '--security-opt=no-new-privileges',
                 '--hooks-dir=' + str(self.path(self.control + '/empty-hooks')), '--entrypoint=/usr/bin/false', 'sha256:' + sealed))
-            publication = self.export_release(attempt, sealed, inputs, seal, snapshot, pending, export_work, reserve)
+            publication = self.export_release(attempt, sealed, inputs, seal, snapshot, pending, export_work, reserve, snapshot_lifetime)
         except BaseException as error:
             primary = error
             raise
         finally:
-            cleanup_error = None
-            for identity in (snapshot, stage):
-                if identity:
-                    try:
-                        self.engine('rm', '--force', identity)
-                    except (Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
-                        if cleanup_error is None:
-                            cleanup_error = error
-            if cleanup_error is not None and primary is None:
-                raise cleanup_error
+            cleanup_error = self.cleanup_development_containers(expected, (snapshot, stage), execution_end, primary is not None)
+            if cleanup_error is not None:
+                try:
+                    self.record('resource-cleanup', {'context_sha256': expected, 'source_sha': revision,
+                                                     'status': 'unresolved; exact resources retained'})
+                except (Blocked, OSError, ValueError):
+                    pass
+                if primary is None:
+                    raise Blocked('development container cleanup unresolved; exact resources retained') from cleanup_error
         self.record('publication', {**publication, 'phase': 'ready'})
         self.image_stage('complete', revision, expected)
         return publication['inner']
 
-    def export_release(self, attempt, sealed, inputs, seal, snapshot, pending, export_work, reserve):
+    def remove_development_container(self, identity):
+        self.engine('rm', '--force', identity)
+        # Podman distinguishes a missing container (1) from inaccessible
+        # storage or engine failure (125), unlike inspect's generic failure.
+        self.engine('container', 'exists', identity, ok=(1,))
+
+    def cleanup_development_containers(self, expected, identities, execution_end, failed):
+        """Only exact recorded resources have cleanup authority beyond expiry."""
+        command_runner = self.run if isinstance(self.run, Commands) else None
+        previous = command_runner._cleanup_deadline if command_runner is not None else None
+        error = None
+        try:
+            budget = contextlib.nullcontext()
+            if command_runner is not None and execution_end is not None:
+                command_runner._cleanup_deadline = min(time.monotonic(), execution_end) + CLEANUP_EXECUTION
+                budget = command_runner.phase(CLEANUP_EXECUTION, 'dev-pair-development-cleanup', native=False)
+            with budget:
+                if failed:
+                    if command_runner is not None:
+                        self.reconcile_executor()
+                    # A create interrupted before its ID arrived can only be
+                    # reconciled by the protected name, image and context label.
+                    self.recover_resources(expected)
+                else:
+                    for identity in identities:
+                        if identity:
+                            try:
+                                self.remove_development_container(identity)
+                            except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
+                                if error is None:
+                                    error = exc
+        except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+            return exc
+        finally:
+            if command_runner is not None:
+                command_runner._cleanup_deadline = previous
+        return error
+
+    def export_release(self, attempt, sealed, inputs, seal, snapshot, pending, export_work, reserve, snapshot_lifetime):
         expected, revision = attempt['context_sha256'], attempt['source_sha']
         rows = json.loads(self.engine('inspect', '--type=container', snapshot), object_pairs_hook=fedora_oci.unique)
         if (type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != snapshot
                 or image_id(rows[0]['Image']) != sealed or rows[0]['State']['Status'] not in ('configured', 'created')
+                or rows[0]['Config'].get('Timeout') != snapshot_lifetime
                 or rows[0]['State'].get('Running') is not False):
             raise Blocked('development raw file read requires the exact never-started image snapshot')
+        policy = rows[0]['HostConfig'].get('RestartPolicy', {})
+        if policy.get('Name') not in ('no', '') or policy.get('MaximumRetryCount', 0) != 0:
+            raise Blocked('development snapshot restart would bypass its finite lifetime')
         labels = {'dev-pair.role': 'development', 'dev-pair.context': expected,
                   'dev-pair.inputs': sha(image_inputs_bytes(inputs)), 'dev-pair.standards': candidate.STANDARDS,
                   'dev-pair.distrobox': DBX_SHA, 'dev-pair.codex.version': '0.169.0',
@@ -1627,6 +1734,7 @@ def main():
         parser.error('prepare-development-host requires --bootstrap-source')
     try:
         app = DevelopmentGptbox() if args.stage in ('prepare-development-host', 'build-development') else Gptbox()
+        budget = contextlib.nullcontext()
         if args.work_deadline_monotonic is not None:
             if (args.stage not in ('prepare-development-host', 'build-development') or not args.apply
                     or not math.isfinite(args.work_deadline_monotonic) or args.work_deadline_monotonic <= time.monotonic()):
@@ -1634,16 +1742,18 @@ def main():
             # Existing phase, command and in-unit relay ceilings all consult this
             # monotonic deadline. Each stage can only use the earlier bound.
             app.run.deadline = args.work_deadline_monotonic
-        if args.stage == 'initialize':
-            result = app.initialize(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
-                                    args.bootstrap_source, args.password_file, args.apply, args.retry)
-        elif args.stage == 'prepare-development-host':
-            result = app.prepare_development_host(args.context, args.expected_context_sha256, args.distrobox_source,
-                                                  args.source_sha, args.bootstrap_source, args.password_file,
-                                                  args.apply, args.retry)
-        else:
-            result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
-        print(json.dumps(result, indent=2))
+            budget = app.run.phase(args.work_deadline_monotonic - time.monotonic(), 'dev-pair-development-stage', native=False)
+        with budget:
+            if args.stage == 'initialize':
+                result = app.initialize(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
+                                        args.bootstrap_source, args.password_file, args.apply, args.retry)
+            elif args.stage == 'prepare-development-host':
+                result = app.prepare_development_host(args.context, args.expected_context_sha256, args.distrobox_source,
+                                                      args.source_sha, args.bootstrap_source, args.password_file,
+                                                      args.apply, args.retry)
+            else:
+                result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
+            print(json.dumps(result, indent=2))
         return 0
     except (Blocked, OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError):
         print('gptbox operation blocked; no job/runtime admission; inspect protected evidence locally', file=sys.stderr)

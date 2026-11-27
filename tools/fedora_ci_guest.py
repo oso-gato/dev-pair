@@ -979,6 +979,73 @@ def make_password(directory):
         path.unlink(missing_ok=True)
 
 
+class DevelopmentPassword:
+    """Own only the newly created leaf, and retain its parent for readback."""
+    def __init__(self, directory):
+        self.directory = directory
+        self.path = directory / 'core-password'
+        self.fd = None
+        self.removed = False
+
+    def verify_parent(self):
+        require(self.fd is not None, 'Disposable password parent not held')
+        current = self.directory.lstat()
+        held = os.fstat(self.fd)
+        require(self.directory.resolve(strict=True) == self.directory and stat.S_ISDIR(held.st_mode) and
+                held.st_uid == os.geteuid() and stat.S_IMODE(held.st_mode) == 0o700 and
+                (held.st_dev, held.st_ino, held.st_mode, held.st_uid) ==
+                (current.st_dev, current.st_ino, current.st_mode, current.st_uid), 'Disposable password parent changed')
+
+    def leaf(self):
+        return os.stat(self.path.name, dir_fd=self.fd, follow_symlinks=False)
+
+    @contextlib.contextmanager
+    def create(self):
+        self.directory.mkdir(mode=0o700)
+        self.fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        self.verify_parent()
+        fd = os.open(self.path.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=self.fd)
+        owned = None
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                owned = os.fstat(stream.fileno())
+                stream.write(secrets.token_urlsafe(48) + '\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+            yield self.path
+        finally:
+            if owned is not None:
+                self.remove(owned)
+
+    def remove(self, owned):
+        self.verify_parent()
+        current = self.leaf()
+        require(stat.S_ISREG(current.st_mode) and current.st_uid == os.geteuid() and current.st_nlink == 1
+                and stat.S_IMODE(current.st_mode) == 0o600 and
+                (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino), 'Disposable password file changed')
+        os.unlink(self.path.name, dir_fd=self.fd)
+        self.removed = True
+
+    def absent(self):
+        if not self.removed:
+            return False
+        try:
+            self.verify_parent()
+            try:
+                self.leaf()
+            except FileNotFoundError:
+                self.verify_parent()
+                return True
+        except (OSError, ValueError, RuntimeError):
+            pass
+        return False
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
 def remove_password_after_prepare(secret, state_root, expected):
     path = state_root / 'initialize.json'
     if secret.exists() and path.exists():
@@ -1532,15 +1599,17 @@ def public_diagnostics(state_root, expected, source=None):
 def development_command(source, stage, target_args, end, maximum, extra=()):
     remaining(end, maximum)
     command_end = min(end, time.monotonic() + maximum)
-    # The child receives the work deadline. The supervisor waits slightly
+    # The child receives the clipped stage deadline. The supervisor waits
     # longer for the child's exact owned-unit cleanup after its phase expires.
     argv = ['/usr/bin/python3', '-B', str(source / 'tools/gptbox.py'), stage, '--apply',
-            '--work-deadline-monotonic', repr(end), *target_args, *extra]
+            '--work-deadline-monotonic', repr(command_end), *target_args, *extra]
     code, output = capture(argv, timeout=remaining(command_end + INITIALIZE_CLEANUP_SECONDS,
                                                   maximum + INITIALIZE_CLEANUP_SECONDS), maximum=16384)
     require(code == 0, 'Development command did not complete')
-    remaining(end, maximum)
-    return json.loads(output, object_pairs_hook=unique_object)
+    remaining(command_end, maximum)
+    result = json.loads(output, object_pairs_hook=unique_object)
+    remaining(command_end, maximum)
+    return result
 
 
 def development_readback(source, expected, built, end):
@@ -1601,6 +1670,7 @@ def development_release_evidence(module, app, expected, built, end):
 def development_service(expected, guest_sha):
     active, receipt, identity = DEVELOPMENT_PHASES[0], None, {}
     work_end = None
+    password = DevelopmentPassword(SECRET_DIRECTORY)
     try:
         require(digest(pathlib.Path(__file__)) == guest_sha, 'Executing development guest identity mismatch')
         executor = native_executor_identity(expected, guest_sha)
@@ -1617,29 +1687,36 @@ def development_service(expected, guest_sha):
         target_args = ['--source-sha', expected['source_sha'], '--distrobox-source', str(INPUT_DESTINATION / 'distrobox'),
                        '--context', str(INPUT_DESTINATION / 'context'), '--expected-context-sha256', expected['context_sha256']]
         active = 'development-host-prepare'
-        with make_password(SECRET_DIRECTORY) as password:
-            prepared = development_command(source, 'prepare-development-host', target_args, work_end,
+        prepare_end = min(work_end, time.monotonic() + DEVELOPMENT_PREPARE_SECONDS)
+        with password.create() as password_path:
+            prepared = development_command(source, 'prepare-development-host', target_args, prepare_end,
                                            DEVELOPMENT_PREPARE_SECONDS,
-                                           ('--bootstrap-source', DEVELOPMENT_BOOTSTRAP_SOURCE, '--password-file', str(password)))
-        require(not os.path.lexists(password) and prepared == {'kind': 'development-host-prerequisites',
+                                           ('--bootstrap-source', DEVELOPMENT_BOOTSTRAP_SOURCE, '--password-file', str(password_path)))
+        require(password.absent() and prepared == {'kind': 'development-host-prerequisites',
                  'source_sha': expected['source_sha'], 'context_sha256': expected['context_sha256'],
                  'host_prerequisites': 'complete', 'reused': False, 'job_admission': False} and
                 prepared['reused'] is False and prepared['job_admission'] is False,
                 'Development preparation did not complete on this fresh guest')
+        remaining(prepare_end, DEVELOPMENT_PREPARE_SECONDS)
         active = 'development-image'
         built = development_command(source, 'build-development', target_args, work_end, DEVELOPMENT_BUILD_SECONDS)
         active = 'development-readback'
         receipt = development_readback(source, expected, built, work_end)
         free = shutil.disk_usage('/').free
         require(free >= GUEST_ROOT_RESERVE, 'Guest final capacity below unchanged 8 GiB reserve')
-        require(not os.path.lexists(password), 'Development password cleanup unverified')
         remaining(work_end, INITIALIZE_SECONDS)
         identity['final_root_free_bytes'] = free
         active = 'complete'
     except (OSError, ValueError, KeyError, TypeError, ImportError, RecursionError, subprocess.SubprocessError):
         receipt = None  # The active stage is the only public failure detail.
 
-    password_absent = not os.path.lexists(SECRET_DIRECTORY / 'core-password')
+    try:
+        password_absent = password.absent()
+    finally:
+        password.close()
+    if active == 'complete' and not password_absent:
+        active, receipt = 'development-readback', None
+        identity.pop('final_root_free_bytes')
     count = len(DEVELOPMENT_PHASES) if active == 'complete' else DEVELOPMENT_PHASES.index(active)
     report = {'version': DEVELOPMENT_REPORT_VERSION, 'scenario': 'development', 'source_sha': expected['source_sha'],
               'guest_sha256': guest_sha, 'inputs': expected, 'identity': identity,
