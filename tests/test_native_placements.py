@@ -1,6 +1,6 @@
 """Local storage ownership, release custody and managed-entry checks for the native bridge."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import hashlib
 import os
 from pathlib import Path
@@ -137,8 +137,8 @@ class TestKernelOwnership(unittest.TestCase):
             placement = SimpleNamespace(record=Path(scratch) / 'lease.json', backings=Path(scratch),
                                         state={'volumes': {}}, save=Mock())
             volume = n.Volume(placement, 'build', Path('/native/build'), 16 * db.GIB)
-            stats = SimpleNamespace(f_bavail=23 * db.GIB, f_frsize=1, f_files=100000, f_favail=80000)
-            with patch.object(n.os, 'statvfs', return_value=stats), self.assertRaisesRegex(db.Blocked, 'reserve'):
+            stats = SimpleNamespace(f_bavail=16 * db.GIB, f_frsize=1, f_files=100000, f_favail=80000)
+            with patch.object(n.os, 'statvfs', return_value=stats), self.assertRaisesRegex(db.Blocked, 'headroom'):
                 volume.backing_file()
             self.assertFalse(volume.backing.exists())
             placement.save.assert_not_called()
@@ -151,26 +151,84 @@ class TestKernelOwnership(unittest.TestCase):
         with self.assertRaisesRegex(db.Blocked, 'three exclusive'):
             n.allocate_categories(set(range(1022)))
 
-    def test_real_retained_store_counts_against_aggregate_before_allocation(self):
-        scratch = Path(self.enterContext(TemporaryDirectory()))
-        maintenance = scratch / 'maintenance'
-        producer = scratch / 'producer'
-        for directory in (maintenance, producer):
-            directory.mkdir()
-            (directory / 'reserved-image').write_bytes(os.urandom(1024 * 1024))
-        allocated = n.retained_usage((maintenance, producer), set())
-        self.assertGreaterEqual(allocated, 2 * 1024 * 1024)
-        fitting = SimpleNamespace(allocated=lambda: 0, capacity=n.MANAGED_CEILING - n.HOST_METADATA_BYTES - allocated)
-        self.assertEqual(n.check_aggregate(allocated, (fitting,))['aggregate_peak_bytes'], n.MANAGED_CEILING)
-        fitting.capacity += 1
-        with self.assertRaisesRegex(db.Blocked, 'managed storage'):
-            n.check_aggregate(allocated, (fitting,))
+    def test_exact_kernel_free_space_preserves_remaining_metadata_and_inodes(self):
+        requested = 13 * db.GIB
+        sample = SimpleNamespace(f_bavail=requested + n.HOST_METADATA_BYTES, f_frsize=1,
+                                 f_files=100000, f_favail=n.HOST_INODE_HEADROOM)
+        with patch.object(n.os, 'statvfs', return_value=sample):
+            self.assertEqual(n.reserve_managed(Path('/managed'), requested), sample.f_bavail)
+            sample.f_bavail -= 1
+            with self.assertRaisesRegex(db.Blocked, 'headroom'):
+                n.reserve_managed(Path('/managed'), requested)
+            sample.f_bavail += 1
+            sample.f_files = sample.f_favail = 0
+            with self.assertRaisesRegex(db.Blocked, 'inode'):
+                n.reserve_managed(Path('/managed'), requested)
 
-    def test_existing_allocated_backing_is_counted_once_and_headroom_is_retained(self):
-        reserved = SimpleNamespace(allocated=lambda: 2 * db.GIB, capacity=4 * db.GIB)
-        result = n.check_aggregate(3 * db.GIB, (reserved,))
-        self.assertEqual(result['retained_bytes'], db.GIB)
-        self.assertEqual(result['aggregate_peak_bytes'], 5 * db.GIB + n.HOST_METADATA_BYTES)
+    def test_unregistered_mount_cannot_create_unbounded_write_class(self):
+        root = Path('/var/lib/dev-pair')
+        graph = root / 'development/builds/fixture'
+        row = '50 32 7:4 / /var/lib/dev-pair/development/builds/fixture rw - ext4 /dev/loop4 rw'.split()
+        n.verify_enrollment([row], {graph}, (root,))
+        with self.assertRaisesRegex(db.Blocked, 'unregistered mount'):
+            n.verify_enrollment([row], set(), (root,))
+
+    def test_normal_consumer_proves_external_reserve_for_exact_nested_parent(self):
+        host = Path(self.enterContext(TemporaryDirectory()))
+        enclosing = host / 'dev-pair'
+        role = enclosing / 'development'
+        build = role / 'builds' / 'fixture'
+        inner_backing = enclosing / 'native-placements/backings/fixture/build.ext4'
+        parent_backing = host / 'dev-pair-managed.ext4'
+        build.mkdir(parents=True)
+        inner_backing.parent.mkdir(parents=True)
+        for file in (inner_backing, parent_backing):
+            file.write_bytes(b'trusted fixture')
+        host_dev, managed_dev, build_dev = os.makedev(8, 1), os.makedev(7, 3), os.makedev(7, 5)
+        framed = {
+            host: SimpleNamespace(st_dev=host_dev),
+            enclosing: SimpleNamespace(st_dev=managed_dev, st_uid=0, st_gid=0, st_mode=stat.S_IFDIR | 0o755),
+            build.parent: SimpleNamespace(st_dev=managed_dev),
+            build: SimpleNamespace(st_dev=build_dev),
+            inner_backing: SimpleNamespace(st_dev=managed_dev, st_uid=0, st_gid=0, st_mode=stat.S_IFREG | 0o600,
+                                           st_nlink=1, st_size=8 * db.GIB, st_blocks=8 * db.GIB // 512),
+            parent_backing: SimpleNamespace(st_dev=host_dev, st_uid=0, st_gid=0, st_mode=stat.S_IFREG | 0o600,
+                                            st_nlink=1, st_size=20 * db.GIB, st_ino=19, st_blocks=20 * db.GIB // 512),
+        }
+        info = (f'4 1 8:1 / {host} rw - ext4 /dev/sda1 rw\n'
+                f'5 4 7:3 / {enclosing} rw,nosuid,nodev - ext4 /dev/loop3 rw\n'
+                f'6 5 7:5 / {build} rw,nosuid,nodev - ext4 /dev/loop5 rw\n')
+        stats = {
+            host: SimpleNamespace(f_bavail=8 * db.GIB, f_frsize=1, f_files=100000, f_favail=4096),
+            enclosing: SimpleNamespace(f_blocks=19 * db.GIB, f_bavail=db.GIB, f_frsize=1,
+                                       f_files=100000, f_favail=10000),
+            build: SimpleNamespace(f_blocks=7 * db.GIB, f_frsize=1),
+            build.parent: SimpleNamespace(f_bavail=db.GIB, f_frsize=1),
+        }
+        sysfs = Path('/sys/dev/block')
+        paths = {sysfs / '7:3/loop/backing_file': str(parent_backing), sysfs / '7:3/loop/offset': '0',
+                 sysfs / '7:3/loop/sizelimit': '0', sysfs / '7:5/loop/backing_file': str(inner_backing)}
+        actual_stat, actual_lstat = Path.stat, Path.lstat
+        with ExitStack() as patched:
+            patched.enter_context(patch.object(n.devbox, 'ROOT', role))
+            patched.enter_context(patch.object(n.devbox, 'MANAGED_BACKING', parent_backing))
+            patched.enter_context(patch.object(Path, 'stat',
+                lambda path, **kwargs: framed[path] if path in framed else actual_stat(path, **kwargs)))
+            patched.enter_context(patch.object(Path, 'lstat',
+                lambda path: framed[path] if path in framed else actual_lstat(path)))
+            patched.enter_context(patch.object(Path, 'exists', lambda path: path in paths or path in framed))
+            patched.enter_context(patch.object(Path, 'read_text', lambda path: paths[path]))
+            patched.enter_context(patch.object(n.os, 'statvfs', lambda path: stats[path]))
+            proof = n.devbox.storage_mount(build, 8 * db.GIB, info)
+            self.assertEqual(proof['managed_storage']['host_available_bytes'], 8 * db.GIB)
+            self.assertEqual(proof['managed_storage']['available_bytes'], db.GIB)
+            stats[host].f_files = stats[host].f_favail = 0
+            with self.assertRaisesRegex(db.Blocked, 'finite inode'):
+                n.devbox.storage_mount(build, 8 * db.GIB, info)
+            stats[host].f_files, stats[host].f_favail = 100000, 4096
+            framed[parent_backing].st_blocks -= 1
+            with self.assertRaisesRegex(db.Blocked, 'sparse'):
+                n.devbox.storage_mount(build, 8 * db.GIB, info)
 
     def test_inode_is_rebound_to_verified_new_minor_and_exchanged_leaf_is_rejected(self):
         scratch = Path(self.enterContext(TemporaryDirectory()))
@@ -290,7 +348,7 @@ print(devbox.__file__)
         self.assertIn('CAP_SETFCAP', caps)
         self.assertIn('CAP_CHOWN', caps)
         self.assertNotIn('CAP_SYS_ADMIN', caps)
-        self.assertIn('remove sudo', n.TOOLING_RECIPE.decode())
+        self.assertIn('rpm --test -e sudo && rpm -e sudo', n.TOOLING_RECIPE.decode())
         self.assertIn('test ! -e /usr/bin/sudo', n.TOOLING_RECIPE.decode())
 
 
@@ -350,6 +408,19 @@ class TestManagedEntry(unittest.TestCase):
                 candidate.managed('/usr/bin/podman', 'load', seconds=30)
         self.assertIsNotNone(candidate.state['activity'])
         proof.assert_not_called()
+
+    def test_idle_broker_and_launcher_are_tied_to_verified_user_bus_scope(self):
+        scope = '/user.slice/user-1234.slice/user@1234.service'
+        names = (('/usr/bin/dbus-broker','dbus-broker'), ('/usr/bin/dbus-broker-launch','dbus-broker-lau'))
+        for program, name in names:
+            with self.subTest(program=program), patch.object(n.os, 'readlink', return_value=program):
+                with patch.object(Path, 'read_text', return_value='0::' + scope + '/session.slice/dbus-broker.service\n'):
+                    self.assertTrue(n.idle_process(105, name, 101, scope, None))
+                with patch.object(Path, 'read_text', return_value='0::' + scope + '/app.slice/unrelated.service\n'):
+                    self.assertFalse(n.idle_process(105, name, 101, scope, None))
+        with patch.object(n.os, 'readlink', return_value='/usr/bin/python3'), \
+                patch.object(Path, 'read_text', return_value='0::' + scope + '/session.slice/dbus-broker.service'):
+            self.assertFalse(n.idle_process(105, 'dbus-broker', 101, scope, 105))
 
     def test_uncertain_signed_base_import_keeps_its_spool_on_bounded_storage(self):
         candidate = self.placement()
@@ -443,6 +514,7 @@ class TestManagedEntry(unittest.TestCase):
     def completion_fixture(self, candidate):
         candidate.job = 'test-entry'
         candidate.reconcile = Mock()
+        candidate.reconcile_verification = Mock()
         candidate.check_categories = Mock()
         candidate.establish_storage = Mock(return_value={'build': {'inodes': 8}})
         candidate.verify_archive = Mock()
@@ -459,21 +531,42 @@ class TestManagedEntry(unittest.TestCase):
         candidate.managed = Mock(return_value=(0, n.json_bytes(receipt)))
         return receipt
 
+    def test_known_spool_is_reclaimed_before_exhausted_image_retry(self):
+        candidate = self.placement()
+        self.completion_fixture(candidate)
+        candidate.scratch_path = Path(self.enterContext(TemporaryDirectory()))
+        spool = candidate.scratch_path / 'verification'
+        spool.mkdir()
+        (spool / 'captured-signed-layer').write_bytes(b'candidate-owned content')
+        candidate.state['verification'] = n.volume_inode(spool.stat())
+        candidate.validate_scratch = Mock()
+        candidate.reconcile_verification = n.Placement.reconcile_verification.__get__(candidate)
+        candidate.state['assembly_attempts'] = 2
+        candidate.state['images'] = None
+        candidate.initialize_scratch = Mock()
+        candidate.engine_store = Mock(return_value={})
+        candidate.prepare_images = n.Placement.prepare_images.__get__(candidate)
+        volume = SimpleNamespace(info={'prepared': True}, allocated=lambda: n.SCRATCH_BYTES, mount=Mock())
+        with patch.object(n, 'Volume', return_value=volume), self.assertRaisesRegex(db.Blocked, 'two-attempt'):
+            candidate.run(retry=True)
+        volume.mount.assert_called_once()
+        self.assertFalse(spool.exists())
+        self.assertIsNone(candidate.state['verification'])
+
     def test_same_boot_reapply_reuses_exact_result_and_new_boot_reproves(self):
         candidate = self.placement()
         self.completion_fixture(candidate)
-        with patch.object(n, 'reserve'):
-            first = candidate.run(retry=False)
-            self.assertFalse(first['reused'])
-            self.assertFalse(first['job_admission'])
-            replay = candidate.run(retry=False)
-            self.assertTrue(replay['reused'])
-            candidate.managed.assert_called_once()
-            candidate.boot = 'different-boot'
-            reboot = candidate.run(retry=False)
-            self.assertFalse(reboot['reused'])
-            self.assertEqual(reboot['boot_id'], 'different-boot')
-            self.assertEqual(candidate.managed.call_count, 2)
+        first = candidate.run(retry=False)
+        self.assertFalse(first['reused'])
+        self.assertFalse(first['job_admission'])
+        replay = candidate.run(retry=False)
+        self.assertTrue(replay['reused'])
+        candidate.managed.assert_called_once()
+        candidate.boot = 'different-boot'
+        reboot = candidate.run(retry=False)
+        self.assertFalse(reboot['reused'])
+        self.assertEqual(reboot['boot_id'], 'different-boot')
+        self.assertEqual(candidate.managed.call_count, 2)
 
     def test_failed_devbox_proof_stays_unpublished_and_retry_is_bounded(self):
         candidate = self.placement()

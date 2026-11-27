@@ -38,7 +38,7 @@ INODE_CEILING = 524288
 JOB_LIMIT = 48
 SCRATCH_BYTES = db.GIB
 HOST_METADATA_BYTES = 256 * 1024 ** 2
-HOST_INODE_HEADROOM = 4096
+HOST_INODE_HEADROOM = devbox.HOST_INODE_RESERVE
 BUILD_CONF = b"""[containers]
 default_capabilities = ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "CAP_FOWNER", "CAP_FSETID", "CAP_SETFCAP", "CAP_SETGID", "CAP_SETUID", "CAP_SYS_CHROOT"]
 
@@ -73,11 +73,12 @@ print(proof['device'])
 """
 TOOLING_RECIPE = f"""FROM {fedora_oci.IMAGE}
 LABEL dev-pair.role=devbox-tooling dev-pair.tooling.base-config={fedora_oci.CONFIG}
+RUN rpm --test -e sudo && rpm -e sudo && test ! -e /usr/bin/sudo
 RUN dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 \\
     --setopt=install_weak_deps=False --disablerepo="*" --enablerepo=fedora --enablerepo=updates \\
-    install podman crun shadow-utils python3 libcap policycoreutils && \\
-    dnf -y --setopt=clean_requirements_on_remove=False remove sudo && dnf clean all && \\
-    test ! -e /usr/bin/sudo && test ! -e /usr/bin/host-spawn && test ! -e /usr/bin/distrobox-host-exec
+    install podman crun shadow-utils python3 libcap policycoreutils util-linux && dnf clean all && \\
+    test ! -e /usr/bin/sudo && test ! -e /usr/bin/host-spawn && test ! -e /usr/bin/distrobox-host-exec && \\
+    command -v rev >/dev/null && test -x /usr/bin/newuidmap && test -x /usr/bin/newgidmap
 RUN rpm -qa --qf '%{{NAME}}-%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' > /tmp/tool-rpms && \\
     sort /tmp/tool-rpms > /usr/lib/dev-pair-tooling-rpms.txt && rm /tmp/tool-rpms
 """.encode()
@@ -367,64 +368,108 @@ def filesystem_uuid(device):
     return values['UUID']
 
 
-def reserve(path, additional=0):
+def reserve_managed(path, additional=0):
     sample = os.statvfs(path)
     available = sample.f_bavail * sample.f_frsize
-    require(available >= GUEST_RESERVE + additional + HOST_METADATA_BYTES,
-            'eight GiB host reserve and filesystem metadata headroom would be crossed')
-    require(not sample.f_files or sample.f_favail >= HOST_INODE_HEADROOM,
-            'host filesystem inode headroom is insufficient')
+    require(available >= additional + HOST_METADATA_BYTES,
+            'bounded managed extent lacks space for full new backing and metadata headroom')
+    require(sample.f_files >= sample.f_favail >= HOST_INODE_HEADROOM,
+            'managed filesystem inode headroom is insufficient')
     return available
 
 
-def retained_usage(roots, permitted_mounts):
-    """Charge stopped managed stores, including retained producer and maintenance images."""
-    def snapshot(rows):
-        return [row for row in rows if any(row[4].startswith(str(root) + '/') for root in roots)]
-
-    def measure():
-        _, raw = command('/usr/bin/du', '--one-file-system', '--block-size=1', '--summarize',
-                         '--', *roots, seconds=30)
-        parsed = [line.split(b'\t', 1) for line in raw.splitlines()]
-        require([os.fsdecode(path) for _, path in parsed] == list(map(str, roots))
-                and all(value.isdigit() for value, _ in parsed), 'invalid retained storage measurement')
-        return sum(int(value) for value, _ in parsed)
-
-    def identities():
-        result = []
-        for root in roots:
-            with directory_fd(root) as fd:
-                result.append(identity(os.fstat(fd)))
-        return result
-
-    rows = mount_rows()
-    before = snapshot(rows)
-    root_identity = identities()
-    devices = {row[0]: row[2] for row in rows}
-    require(all(Path(row[4]) in permitted_mounts for row in before)
-            and all(devices.get(row[1]) not in (None, row[2]) for row in before),
-            'foreign or duplicate mount intersects retained storage')
-    first, second = measure(), measure()
-    require(first == second and before == snapshot(mount_rows()) and root_identity == identities(),
-            'managed storage changed during admission')
-    return first
+def managed_snapshot():
+    return devbox.managed_storage(Path('/proc/self/mountinfo').read_text())
 
 
-def check_aggregate(measured, volumes):
-    allocations = [(volume.allocated(), volume.capacity) for volume in volumes]
-    backing_used = sum(used for used, _ in allocations)
-    requested = sum(max(used, capacity) for used, capacity in allocations)
-    require(measured >= backing_used, 'managed measurement does not cover the owned backing files')
-    peak = measured - backing_used + requested + HOST_METADATA_BYTES
-    require(peak <= MANAGED_CEILING, 'existing managed storage and placement peaks exceed twenty GiB')
-    return {'retained_bytes': measured - backing_used, 'backing_reservation_bytes': requested,
-            'metadata_headroom_bytes': HOST_METADATA_BYTES, 'aggregate_peak_bytes': peak}
+def verify_enrollment(rows, permitted, roots):
+    require(all(not any(row[4].startswith(str(root) + '/') for root in roots) or Path(row[4]) in permitted
+                for row in rows), 'unregistered mount intersects a managed write class')
+
+
+def verify_managed_classes(device, paths):
+    for path in paths:
+        with directory_fd(path) as fd:
+            value = os.fstat(fd).st_dev
+            require(device == f'{os.major(value)}:{os.minor(value)}',
+                    'declared managed write class is outside the enclosing filesystem')
+
+
+def verify_role_home(account, outer_path=None):
+    """Only the fixed outer graph may hold managed bytes outside the parent mount."""
+    home = Path(account.pw_dir)
+    devbox.private_dir(home, account)
+    skel = Path('/etc/skel')
+    known = {'.bash_logout', '.bash_profile', '.bashrc'}
+    allowed = known | ({'.local'} if outer_path else set())
+    with directory_fd(home) as fd:
+        for name in os.listdir(fd):
+            require(name in allowed, 'unmanaged persistent role home data is present')
+            if name not in known:
+                continue
+            template = skel / name
+            node = template.lstat()
+            require(stat.S_ISREG(node.st_mode) and node.st_uid == 0 and not node.st_mode & 0o022,
+                    'trusted Fedora home template differs')
+            source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+            try:
+                entry = os.fstat(source)
+                require(stat.S_ISREG(entry.st_mode) and entry.st_uid == account.pw_uid
+                        and 0 < entry.st_size == node.st_size <= 65536
+                        and os.read(source, 65537) == template.read_bytes(),
+                        'unmanaged persistent role home data is present')
+            finally:
+                os.close(source)
+    if outer_path:
+        for leaf, only in ((outer_path.parents[2], 'share'), (outer_path.parents[1], 'containers'),
+                           (outer_path.parent, outer_path.name)):
+            if present(leaf):
+                with directory_fd(leaf) as fd:
+                    require(set(os.listdir(fd)) <= {only}, 'unmanaged content surrounds the reserved outer graph')
+
+
+def user_manager(account):
+    unit = f'user@{account.pw_uid}.service'
+    scope = f'/user.slice/user-{account.pw_uid}.slice/{unit}'
+    _, raw = command(SYS, 'show', '--property=Id,LoadState,ActiveState,SubState,ControlGroup,MainPID', unit)
+    values = dict(line.split('=', 1) for line in raw.decode('ascii').splitlines())
+    require(values == {'Id': unit, 'LoadState': 'loaded', 'ActiveState': 'active', 'SubState': 'running',
+                       'ControlGroup': scope, 'MainPID': values.get('MainPID')}
+            and re.fullmatch(r'[1-9][0-9]{0,8}', values['MainPID'])
+            and int(values['MainPID']) > 1, 'verified managed systemd user manager is unavailable')
+    runtime = Path(f'/run/user/{account.pw_uid}')
+    devbox.private_dir(runtime, account)
+    bus = (runtime / 'bus').lstat()
+    require(stat.S_ISSOCK(bus.st_mode) and (bus.st_uid, bus.st_gid) == (account.pw_uid, account.pw_gid)
+            and command('/usr/bin/findmnt', '-n', '-o', 'FSTYPE', '--target', runtime)[1].strip() == b'tmpfs',
+            'verified managed user bus and tmpfs runtime are unavailable')
+    return int(values['MainPID']), scope
+
+
+def idle_process(pid, comm, manager_pid, scope, pause):
+    proc = Path('/proc') / str(pid)
+    program = os.readlink(proc / 'exe')
+    group = (proc / 'cgroup').read_text().strip()
+    prefix = '0::' + scope
+    systemd = '/usr/lib/systemd/systemd'
+    if program == systemd and group in (prefix, prefix + '/init.scope'):
+        if pid == manager_pid and comm == 'systemd':
+            return True
+        status = (proc / 'status').read_text()
+        return comm == '(sd-pam)' and re.search(rf'^PPid:\s+{manager_pid}$', status, re.M) is not None
+    if (program, comm) in (('/usr/bin/dbus-broker', 'dbus-broker'), ('/usr/bin/dbus-broker-launch', 'dbus-broker-lau')):
+        return group in {prefix + '/session.slice/dbus-broker.service', prefix + '/session.slice/dbus.service'}
+    return (pid == pause and program == db.PODMAN
+            and re.fullmatch(re.escape(prefix) + r'/(?:[a-zA-Z0-9_.-]+\.slice/)*libpod-pause-[a-zA-Z0-9_.-]+\.scope',
+                             group) is not None)
 
 
 def require_idle_roles(dev, maint):
-    """Idle user managers and their exact rootless pause PIDs are expected."""
-    exempt = {}
+    """Admit only the kernel/process identities of prepared role infrastructure."""
+    observed = {}
     for account in (dev, maint):
+        manager_pid, scope = user_manager(account)
+        pause_pid = None
         runtime = Path(f'/run/user/{account.pw_uid}')
         pause = runtime / 'libpod/tmp/pause.pid'
         try:
@@ -438,9 +483,11 @@ def require_idle_roles(dev, maint):
                 finally:
                     os.close(fd)
         except FileNotFoundError:
-            continue
-        require(re.fullmatch(rb'[1-9][0-9]{0,8}', raw), 'rootless pause process reference is invalid')
-        exempt[account.pw_uid] = int(raw)
+            pass
+        else:
+            require(re.fullmatch(rb'[1-9][0-9]{0,8}', raw), 'rootless pause process reference is invalid')
+            pause_pid = int(raw)
+        observed[account.pw_uid] = manager_pid, scope, pause_pid
     _, raw = command('/usr/bin/ps', '-e', '-ww', '-o', 'pid=,euid=,comm=')
     prefixes = tuple(str(root) + '/' for root in (devbox.ROOT.parent, Path(dev.pw_dir), Path(maint.pw_dir)))
     for line in raw.decode('utf-8', errors='replace').splitlines():
@@ -448,9 +495,12 @@ def require_idle_roles(dev, maint):
         uid = int(uid)
         if uid not in (dev.pw_uid, maint.pw_uid) and not 1000000 <= uid < 1131072:
             continue
-        require(uid in (dev.pw_uid, maint.pw_uid)
-                and (executable in ('systemd', '(sd-pam)') or exempt.get(uid) == int(pid)),
-                'managed roles must be idle before allocation')
+        try:
+            require(uid in observed and idle_process(int(pid), executable, *observed[uid]),
+                    'managed roles must be idle before allocation')
+        except FileNotFoundError:
+            # An exited process cannot retain live descriptors or allocate later.
+            continue
         descriptors = Path('/proc') / pid / 'fd'
         try:
             with os.scandir(descriptors) as entries:
@@ -491,7 +541,7 @@ class Volume:
 
     def backing_file(self):
         if self.info is None:
-            reserve(self.backing.parent, self.capacity)
+            reserve_managed(self.backing.parent, self.capacity)
             with self.backing.open('xb') as stream:
                 os.fchmod(stream.fileno(), 0o600)
                 os.fsync(stream.fileno())
@@ -505,7 +555,7 @@ class Volume:
             self.check_backing(node)
             if node.st_size != self.capacity or node.st_blocks * 512 < self.capacity:
                 require(not self.info['prepared'], 'prepared loop backing allocation changed')
-                reserve(self.backing.parent, self.capacity - min(node.st_blocks * 512, node.st_size))
+                reserve_managed(self.backing.parent, self.capacity - min(node.st_blocks * 512, node.st_size))
                 os.posix_fallocate(fd, 0, self.capacity)
                 os.fsync(fd)
             node = os.fstat(fd)
@@ -513,7 +563,6 @@ class Volume:
                     'loop backing must be fully allocated')
         finally:
             os.close(fd)
-        reserve(self.backing.parent)
 
     def check_device(self, device):
         require(device is not None and filesystem_uuid(device) == self.info['uuid'],
@@ -869,9 +918,22 @@ class Placement:
                         self.save()
 
     def establish_storage(self):
-        reserve(devbox.ROOT)
-        reserve(self.outer_path.parents[3])
         home = Path(self.account.pw_dir)
+        maint = pwd.getpwnam('dp-maint')
+        managed = managed_snapshot()
+        role_roots = (devbox.ROOT, devbox.ROOT.parent / 'maintenance')
+        publication = self.archive.parent.parent
+        classes = [devbox.ROOT.parent / 'bootstrap', publication, publication / 'release',
+                   publication / 'image-store', self.backings]
+        for root in role_roots:
+            classes.extend((root, *(root / name for name in ('builds', 'cache', 'checkpoints', 'deliverables',
+                                                            'evidence', 'state', 'workspaces'))))
+        maint_store = role_roots[1] / 'images'
+        if present(maint_store):
+            classes.append(maint_store)
+        verify_managed_classes(managed['device'], classes)
+        verify_role_home(self.account, self.outer_path)
+        verify_role_home(maint)
         for parent in reversed(self.outer_path.parents[:3]):
             with directory_fd(parent.parent) as fd:
                 try:
@@ -908,20 +970,22 @@ class Placement:
                             'unowned existing image store or build mount preserved')
         rows = mount_rows()
         permitted = set().union(*(volume.verify_existing(rows) for volume in volumes))
-        maint = pwd.getpwnam('dp-maint')
+        verify_enrollment(rows, permitted, (devbox.ROOT.parent, home, Path(maint.pw_dir)))
         require_idle_roles(self.account, maint)
-        measured = retained_usage((devbox.ROOT.parent, home, Path(maint.pw_dir)), permitted)
-        aggregate = check_aggregate(measured, volumes)
         additional = sum(max(0, volume.capacity - volume.allocated()) for volume in volumes)
-        reserve(self.backings, additional)
+        reserve_managed(self.backings, additional)
         outer_sample = outer.mount(self.initialize_outer)
         build_sample = build.mount(self.initialize_build)
         scratch_sample = scratch.mount(self.initialize_scratch)
         self.leaves()
+        after = managed_snapshot()
+        require(all(after[key] == managed[key] for key in ('device', 'source', 'backing_inode', 'backing_bytes')),
+                'enclosing managed storage changed during volume preparation')
+        verify_enrollment(mount_rows(), {outer.target, build.target, scratch.target},
+                          (devbox.ROOT.parent, home, Path(maint.pw_dir)))
+        after['reserved_placement_bytes'] = sum(volume.capacity for volume in volumes)
         return {'outer': outer_sample, 'build': build_sample, 'scratch': scratch_sample,
-                'minimum_host_free_bytes': GUEST_RESERVE, 'aggregate': aggregate,
-                'host_available_bytes': {'role': reserve(devbox.ROOT), 'home': reserve(home),
-                                         'backing': reserve(self.backings)}}
+                'minimum_host_free_bytes': GUEST_RESERVE, 'managed': after}
 
     def recipe(self, parent, name, data):
         path = parent / name
@@ -981,6 +1045,15 @@ class Placement:
                 os.fsync(parent)
         self.state['verification'] = None
         self.save()
+
+    def reconcile_verification(self):
+        if self.state['verification'] is None:
+            return
+        volume = Volume(self, 'scratch', self.scratch_path, SCRATCH_BYTES)
+        require(volume.info is not None and volume.info['prepared'] and volume.allocated() >= SCRATCH_BYTES,
+                'owned verification scratch backing is unresolved')
+        volume.mount(self.initialize_scratch)
+        self.cleanup_verification()
 
     def import_fedora_base(self):
         self.cleanup_verification()
@@ -1080,6 +1153,7 @@ class Placement:
 
     def run(self, *, retry):
         self.reconcile(interrupted=True)
+        self.reconcile_verification()
         self.stage = 'storage and MCS reservation'
         self.check_categories()
         storage = self.establish_storage()
@@ -1149,6 +1223,7 @@ def main():
                 'authorized root operator on Fedora 44 x86_64 required')
         producer = DevelopmentGptbox()
         producer.preflight()
+        managed_snapshot()
         for path in ('/usr/sbin/mkfs.ext4', '/usr/sbin/losetup', '/usr/sbin/blkid', db.PODMAN, db.CRUN):
             require(os.access(path, os.X_OK), f'required preinstalled Fedora tooling is unavailable: {path}')
         files = verified_source(producer, args.source_sha, args.distrobox_source)
@@ -1159,6 +1234,7 @@ def main():
         request = {'job': args.job, 'source_sha': args.source_sha, 'context_sha256': args.context_sha256,
                    'build_bytes': args.storage_gib * db.GIB, 'outer_bytes': args.outer_storage_gib * db.GIB}
         with producer.lock():
+            managed_snapshot()
             producer.verify_host_readiness(args.source_sha, args.context_sha256)
             account = role_account(producer)
             inner, archive = protected_publication(producer, args.source_sha, args.context_sha256)

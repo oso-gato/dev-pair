@@ -5,6 +5,17 @@ policy, and the exact independently reviewed source. The offline proof runs the
 existing pinned Distrobox entry points. It reports two starts in each placement
 and preserves the existing closed job admission.
 
+## Provision the managed filesystem
+
+Complete the authorized destination storage provisioning before first
+bootstrap. It prepares a dedicated ext4 mount at `/var/lib/dev-pair`, backed by
+the fully allocated root-only file `/var/lib/dev-pair-managed.ext4`. The file
+and mounted filesystem must fit within 20 GiB and have finite inode counts.
+The host filesystem outside that allocation retains at least eight GiB and
+4,096 available inodes. This proof checks both kernel mount and backing
+identities. An existing populated unmanaged root requires a separately
+authorized data migration.
+
 ## Prepare the same-host releases
 
 Prepare the maintenance and development input bundles at the same reviewed
@@ -69,15 +80,18 @@ coordinate separate Podman stores and other allocators on the host.
 ```
 
 The command takes the bootstrap lock, verifies the protected development
-publication, and checks for idle managed roles. It charges allocated blocks
-in the maintenance and development stores, producer artifacts and durable
-role data before allocating more space. The three loop-backed ext4 filesystems
+publication, and checks the idle systemd user managers, their scoped session
+buses and any exact Podman pause process. The maintenance and development
+work roots, producer artifacts and all three placement backing files live on
+the enclosing ext4. The kernel limit covers retained files and later growth,
+including writes to sparse files. An unexpected submount or persistent role
+home data outside the stock skeleton and the bounded outer graph blocks.
+The three loop-backed ext4 filesystems
 default to 8 GiB for the nested graph, archive and copy scratch, 4 GiB for the
 outer image graph, and 1 GiB for protected verification and outer copy scratch.
-All have finite inode tables. Existing data and the full reservations,
-including 256 MiB of host metadata headroom, must fit within the existing
-20 GiB managed ceiling. At least eight GiB remains available and finite host
-inode counters must leave headroom. The outer graph target is
+All have finite inode tables. Before fallocate the enclosing filesystem must
+have capacity for the full additional backing and 256 MiB of filesystem
+metadata headroom, plus finite inode headroom. The outer graph target is
 `/home/dp-dev/.local/share/containers/storage`. An existing populated or
 foreign graph blocks before volume creation. The kernel mounts retain their
 separate identities. For the runtime's remaining paths, the Podman runroot
@@ -88,15 +102,26 @@ The tool verifies Fedora's official signed archive, imports it by config ID,
 and checks the save-back graph. The root-owned scratch mount prevents the role
 from exchanging the verification or image-copy directories. The tool removes
 its exact verification spool after the managed import stops and preserves it
-when the result remains uncertain. A disposable rootless builder uses a separate
-capability profile for signed Fedora package setup, removes inherited sudo,
-and sets the two namespace helper file capabilities in the exact outer recipe.
+when the result remains uncertain. After reconciliation the tool reclaims its
+owned verification spool even when the image retry budget is exhausted. A
+disposable rootless builder uses a separate capability profile for signed Fedora
+package setup. It dependency-checks and erases the inherited sudo RPM inside
+the disposable root. The exact outer recipe sets the two namespace helper file
+capabilities.
 Package setup needs public access through the isolated builder network. The outer
 DevBox build uses the exact verified tooling image and pinned Distrobox entry,
 with networking disabled and local images only. The receipt retains the
 base, tooling and outer image identities and distinguishes the outer OCI image
 manifest digest from its config ID, the inner archive digest and the nested
 placement manifest SHA-256.
+
+The offline signed-root check exercised Fedora RPM's removal transaction with
+the builder capability set. The first image-construction operation requiring
+target evidence is the signed Fedora and updates repository install of
+`podman crun shadow-utils python3 libcap policycoreutils util-linux`. The build
+then checks `rev`, both mapping helpers, and the excluded programs before
+starting the outer image build. If a native phase blocks, preserve the first
+diagnostic and the protected placement record.
 
 The bridge stages the exact launcher source and host configuration in a
 root-owned directory readable by `dp-dev`. As `dp-dev` it verifies that the
@@ -120,7 +145,9 @@ the recorded proof with `reused: true`. An authorized reboot followed by the
 same command reattaches the recorded volumes and runs a new probe for that boot.
 It checks the backing identity and filesystem UUID before admitting an inode
 on the current loop device. The backing files and verified images persist
-across host reboot. The command does the reattachment when invoked.
+across host reboot. The enclosing managed root first needs its original
+enrolled loop slot so the existing producer receipt can revalidate. This
+command reattaches the three subordinate placement volumes when invoked.
 
 After a failed image setup or nested probe, use `--retry` only for the same
 authorized input. Image setup permits two attempts total and the probe permits
