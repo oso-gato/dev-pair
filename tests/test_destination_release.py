@@ -22,6 +22,7 @@ import bootstrap as b
 import commission_host as commission
 import destination_release as d
 import job_protocol as jobs
+import owner_day0
 import release_trust as t
 import renewal
 
@@ -221,8 +222,18 @@ class BootstrapAccessTests(unittest.TestCase):
                 data['source_sha'] = historical
                 sign(False, legacy=True)
                 self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
+                recorded = json.loads(pending.read_bytes())
+                self.assertEqual(recorded['legacy_origin'], 'standalone')
+                # Project the original 11f persistence format after the real
+                # signed legacy receipt has passed the complete cutover path.
+                historical_fields = ('phase', 'target', 'guard_sha256', 'core_keys_sha256', 'acl_sha256',
+                                     'provider_recovery', 'public_addresses', 'access_receipt_sha256')
+                original = json.dumps({key: recorded[key] for key in historical_fields}, sort_keys=True) + '\n'
+                app.atomic(b.CUTOVER, original, expected=pending.read_text())
                 original_standalone = pending.read_bytes()
-                self.assertEqual(json.loads(original_standalone)['legacy_origin'], 'standalone')
+                approved = owner_day0.DayZero(app=app)
+                self.assertTrue(approved.finalize())
+                self.assertEqual(pending.read_bytes(), original_standalone)
                 self.assertIsNone(json.loads(marker.read_text())['release_sha256'])
 
                 app.directory(commission.CONTROL, mode=0o700)
@@ -232,7 +243,7 @@ class BootstrapAccessTests(unittest.TestCase):
                     verify_selection=lambda *_: None))
                 self.assertEqual(first.selectors({}, data['boot_id'], {}, None), role_selection['release_sha256'])
                 self.assertEqual(controller.transition(), (None, None))
-                app.refresh_workload_gate()
+                self.assertTrue(approved.finalize())
                 self.assertEqual(pending.read_bytes(), original_standalone)
                 self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
 
@@ -247,10 +258,25 @@ class BootstrapAccessTests(unittest.TestCase):
                     app.finalize(str(receipt), previous_source='4' * 40)
                 self.assertEqual(pending.read_bytes(), original_standalone)
                 app.access_control_source(SOURCE, json.loads(original_standalone))
+                archive_name = hashlib.sha256(original_standalone).hexdigest() + '.json'
+                history = app.path(b.STATE + '/cutover-history/' + archive_name)
+
+                def interrupt_after_history(path, content, *args, **kwargs):
+                    if path == b.CUTOVER and 'role_artifacts' in json.loads(content):
+                        self.assertEqual(history.read_bytes(), original_standalone)
+                        raise RuntimeError('simulated interruption after archiving original cutover')
+                    return write(path, content, *args, **kwargs)
+
+                with patch.object(app, 'atomic', side_effect=interrupt_after_history):
+                    with self.assertRaisesRegex(RuntimeError, 'after archiving original cutover'):
+                        app.finalize(str(receipt), previous_source=historical)
+                self.assertTrue(approved.finalize())
+                self.assertEqual(pending.read_bytes(), original_standalone)
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
                 self.assertEqual(app.finalize(str(receipt), previous_source=historical)['access_scope'], 'full')
                 accepted = json.loads(pending.read_bytes())
                 self.assertEqual(accepted['target']['source_sha'], SOURCE)
-                self.assertEqual(accepted['legacy_origin'], 'standalone')
+                self.assertNotIn('legacy_origin', accepted)
                 archived = b.STATE + '/cutover-history/' + accepted['predecessor_cutover_sha256'] + '.json'
                 self.assertEqual(app.path(archived).read_bytes(), original_standalone)
 

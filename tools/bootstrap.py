@@ -3156,9 +3156,7 @@ class Bootstrap:
                 return
         elif (state.get('legacy_origin') in (None, 'standalone') and 'legacy_role_artifacts' not in state
               and not self.managed_workload_present()):
-            if state.get('legacy_origin') is None:
-                prior = checked_file(self.path(CUTOVER)).read_text()
-                self.atomic(CUTOVER, json.dumps({**state, 'legacy_origin': 'standalone'}, sort_keys=True) + '\n', expected=prior)
+            # Refresh the current admission without rewriting the original cutover.
             self.publish_workload_gate('legacy')
             return
         self.publish_workload_gate('held')
