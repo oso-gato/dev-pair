@@ -758,10 +758,11 @@ class ReportPipe:
 
 
 class Probe:
-    def __init__(self, source, root, scenario='maintenance'):
+    def __init__(self, source, root, scenario='maintenance', *, release=None):
         require(scenario in SCENARIOS, 'invalid requested Fedora scenario')
         self.source = source
         self.scenario = scenario
+        self.release = release
         self.repo = pathlib.Path(__file__).resolve().parents[1]
         self.lease = root
         info = root.lstat()
@@ -991,7 +992,11 @@ class Probe:
         slirp_features = ('--disable-host-loopback', '--netns-type')
         require(all(re.search(rb'(?<![\w-])'+feature.encode()+rb'(?=[=\s,]|$)', slirp_help)
                     for feature in slirp_features), 'preinstalled slirp lacks required loopback-denial/path-namespace features')
+        if self.release is not None:
+            self.release.preflight(self)
         self.report['kernel_storage_initial'] = self.storage.configure()
+        if self.release is not None:
+            self.release.allocate(self)
         self.initialize_directories()
         version = run_small(self.podman + ['version', '--format=json']).decode()
         self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
@@ -1106,6 +1111,8 @@ class Probe:
                         'standards_sha': record['standards_sha'], 'codex_sha256': public.CODEX_SHA, 'codex_source_sha': public.CODEX_SOURCE}
         if self.scenario == 'development':
             self.handoff.update(scenario='development', run_nonce=secrets.token_hex(16))
+        if self.release is not None:
+            self.handoff['platform_export'] = self.release.request(self)
         validate_inputs(self.handoff)
         for name in ('manifest.json', bundle_name):
             shutil.copyfile(handoff / name, payload / name)
@@ -1179,8 +1186,11 @@ class Probe:
                  '-nic', 'user,model=virtio-net-pci,ipv6=off', '-drive', 'file=/overlay/guest.qcow2,if=virtio,format=qcow2,cache=none',
                  '-drive', 'file=/disks/seed.iso,media=cdrom,readonly=on,format=raw',
                  '-drive', 'file=/disks/payload.iso,media=cdrom,readonly=on,format=raw']
+        vm_seconds = VM_SECONDS
+        if self.release is not None:
+            args, vm_seconds = self.release.vm_arguments(args, self.image)
         with ReportPipe(self.root / 'disks') as report_pipe:
-            console, report_data = self.helper(args, timeout=VM_SECONDS, report_pipe=report_pipe, observe_network=True)
+            console, report_data = self.helper(args, timeout=vm_seconds, report_pipe=report_pipe, observe_network=True)
         if self.scenario == 'maintenance':
             emit_text('DP_SERIAL_TAIL\n', console, 24000)
         guest = parse_serial(report_data, self.source, self.guest_sha, self.handoff)
@@ -1248,6 +1258,8 @@ class Probe:
                     evidence_tail(remaining.stderr, 1500))
         if self.storage.started:
             self.reconcile_processes()
+        if self.release is not None:
+            self.release.close()
         self.storage.release()
         self.lease.rmdir()
         self.phase('cleanup', 'pass', 'Verified owned process, mount, loop and backing removal')
@@ -1265,6 +1277,8 @@ class Probe:
             self.phase_end = min(execution_started + CONTROLLER_SECONDS - CLEANUP_SECONDS, time.monotonic() + VM_SECONDS)
             with deadline(self.phase_end - time.monotonic()):
                 self.boot()
+                if self.release is not None:
+                    self.release.capture(self)
         except (Blocked, OSError, ValueError, RecursionError, subprocess.SubprocessError) as exc:
             primary = self.primary_image_failure if active == 'tooling' else None
             self.report['blocker'] = ('Development VM execution or authenticated report blocked'
@@ -1299,7 +1313,15 @@ def main():
     parser.add_argument('--scenario', choices=SCENARIOS, default='maintenance')
     parser.add_argument('--github-event', type=pathlib.Path)
     parser.add_argument('--namespace-parent', help=argparse.SUPPRESS)
+    parser.add_argument('--platform-release-role', choices=(*SCENARIOS, 'devbox'), help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.platform_release_role is not None:
+        from platform_release_ci import entered, ci as platform_ci
+        try:
+            return entered(args.expected_source, args.platform_release_role, args.namespace_parent)
+        except (platform_ci.Blocked, OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError) as exc:
+            emit_text('PLATFORM_RELEASE_BLOCKED ', str(exc), 1500)
+            return 2
     event = actions_native_event(args.github_event)
     require(read_pull_request(event, args.expected_source, actions_event=True) == args.scenario,
             'Fedora scenario is outside the exact pull request label event')
