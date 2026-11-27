@@ -104,6 +104,10 @@ producer metadata, local predecessor, intake and installation evidence stay
 in place. A retired archive cannot serve as a future intake or installation
 input. Mixed selections without enough protected evidence to prove retirement
 authority and sites that still lack capacity stop before the large transfer.
+The ZIP spool has no reachable filename. A protected transaction records the
+exact extraction workspace before any transfer writes, so an interrupted
+invocation can discard its verified partial scratch on retry. Unknown entries
+remain protected and block intake until their ownership is resolved.
 
 The subjects and physical bytes are under
 `/var/lib/dev-pair/platform-releases/<platform-sha256>/`. Each role has a

@@ -332,15 +332,16 @@ class PlatformReleaseTests(unittest.TestCase):
         wanted = {name: (publisher.digest(data), len(data))}
         with zipfile.ZipFile(path, 'w') as archive:
             archive.writestr(name, data)
-        intake.extract_zip(path, output, wanted, self.end)
+        with path.open('rb') as source:
+            intake.extract_zip(source, output, wanted, self.end)
         self.assertEqual((output / name).read_bytes(), data)
         for i, (entry, payload) in enumerate(((name, b'a' * 10000), ('../' + name, data), (name + '.arbitrary', data))):
             with zipfile.ZipFile(path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr(entry, payload)
             rejected = self.root / f'rejected-{i}'
             rejected.mkdir()
-            with self.assertRaises(protocol.Blocked):
-                intake.extract_zip(path, rejected, wanted, self.end)
+            with path.open('rb') as source, self.assertRaises(protocol.Blocked):
+                intake.extract_zip(source, rejected, wanted, self.end)
             self.assertEqual(list(rejected.iterdir()), [])
 
     def test_transfer_workflow_separates_native_build_from_attestation_and_keeps_pr_path(self):

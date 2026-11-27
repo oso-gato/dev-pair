@@ -3,13 +3,16 @@
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 import fcntl
 import hashlib
 import os
 from pathlib import Path
 import re
 import resource
+import secrets
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -34,6 +37,10 @@ ZIP_OVERHEAD = 1024 * 1024
 META_LIMIT = 256 * 1024
 TRANSFER_INODES = 512 + 24  # Installer reserve plus a complete transfer's control and payload leaves.
 RETIREMENT = 'archives-retired.json'
+TRANSFER_LEASE = '.intake-transfer.json'
+TRANSFER_TICKET = '.transfer-owner.json'
+TRANSFER_PREFIX = '.intake-stage-'
+BOOT_PATTERN = '[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 ENV = {'PATH': '/usr/bin:/usr/sbin:/sbin:/bin', 'HOME': '/root', 'LANG': 'C.UTF-8',
        'GH_PROMPT_DISABLED': '1', 'GH_NO_UPDATE_NOTIFIER': '1', 'GH_HOST': 'github.com'}
 
@@ -56,7 +63,13 @@ def protected(path, *, directory=False):
 
 
 def read_api(endpoint, end, *, limit=META_LIMIT, output=None):
+    parent = os.getpid()
+
     def limits():
+        # A terminated intake must not leave a worker growing the anonymous ZIP.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0 or os.getppid() != parent:
+            os._exit(125)
         resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
@@ -74,8 +87,7 @@ def read_api(endpoint, end, *, limit=META_LIMIT, output=None):
             transfer(target)
             target.seek(0)
             return json_bytes(target.read(limit + 1))
-    with output.open('xb') as target:
-        transfer(target)
+    transfer(output)
 
 
 def intake_limit(directory, files, headroom=0):
@@ -106,14 +118,14 @@ def archive_geometry(directory, managed, mountinfo):
     return node.st_dev
 
 
-def retirement_device():
+def portable_volume(*, for_recovery=False):
     import devbox
 
     mountinfo = read_mountinfo()
     prefix = os.fsencode(ROOT) + b'/'
     require(not any(os.fsencode(row.split()[4]).startswith(prefix) for row in mountinfo.splitlines()),
             'portable inputs have nested mounts; retirement is unresolved')
-    managed = devbox.managed_storage(mountinfo)
+    managed = devbox.managed_storage(mountinfo, for_recovery=for_recovery)
     device = archive_geometry(ROOT, managed, mountinfo)
     mounts = [row.split() for row in mountinfo.splitlines()]
     archive_device = f'{os.major(device)}:{os.minor(device)}'
@@ -151,33 +163,33 @@ def artifacts(raw, source, agent):
     return result
 
 
-def extract_zip(zip_path, destination, wanted, end):
-    with zip_path.open('rb') as source:
-        # Bound the central directory before zipfile reads or allocates it.
-        end_record = zipfile._EndRecData(source)
-        require(end_record is not None and end_record[zipfile._ECD_DISK_NUMBER] == 0 and
-                end_record[zipfile._ECD_DISK_START] == 0 and
-                end_record[zipfile._ECD_ENTRIES_THIS_DISK] == end_record[zipfile._ECD_ENTRIES_TOTAL] == len(wanted) and
-                0 < end_record[zipfile._ECD_SIZE] <= CONTROL_LIMIT,
-                'Actions ZIP central directory exceeds its closed two-file bound')
-        source.seek(0)
-        with zipfile.ZipFile(source) as archive:
-            members = archive.infolist()
-            require(len(members) == len(wanted) and {item.filename for item in members} == set(wanted),
-                    'Actions ZIP content differs from its exact component')
-            for item in members:
-                mode = item.external_attr >> 16
-                require(not item.is_dir() and stat.S_IFMT(mode) in (0, stat.S_IFREG) and not item.flag_bits & 1 and
-                        item.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED),
-                        'Actions ZIP contains a link, special file or unsupported member')
-                expected, maximum = wanted[item.filename]
-                require(0 < item.file_size <= maximum and (expected is None or item.file_size == maximum),
-                        'Actions ZIP member byte limit or exact length differs')
-                with archive.open(item) as content, (destination / item.filename).open('xb') as target:
-                    actual = stream_exact(content, item.file_size, end, target)
-                    require(not content.read(1) and (expected is None or actual == expected),
-                            'Actions ZIP member failed its verified digest')
-                    os.fsync(target.fileno())
+def extract_zip(source, destination, wanted, end):
+    # Bound the central directory before zipfile reads or allocates it.
+    end_record = zipfile._EndRecData(source)
+    require(end_record is not None and end_record[zipfile._ECD_DISK_NUMBER] == 0 and
+            end_record[zipfile._ECD_DISK_START] == 0 and
+            end_record[zipfile._ECD_ENTRIES_THIS_DISK] == end_record[zipfile._ECD_ENTRIES_TOTAL] == len(wanted) and
+            0 < end_record[zipfile._ECD_SIZE] <= CONTROL_LIMIT,
+            'Actions ZIP central directory exceeds its closed two-file bound')
+    source.seek(0)
+    with zipfile.ZipFile(source) as archive:
+        members = archive.infolist()
+        require(len(members) == len(wanted) and {item.filename for item in members} == set(wanted),
+                'Actions ZIP content differs from its exact component')
+        for item in members:
+            mode = item.external_attr >> 16
+            require(not item.is_dir() and stat.S_IFMT(mode) in (0, stat.S_IFREG) and not item.flag_bits & 1 and
+                    item.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED),
+                    'Actions ZIP contains a link, special file or unsupported member')
+            expected, maximum = wanted[item.filename]
+            require(0 < item.file_size <= maximum and (expected is None or item.file_size == maximum),
+                    'Actions ZIP member byte limit or exact length differs')
+            with archive.open(item) as content, (destination / item.filename).open('xb') as target:
+                actual = stream_exact(content, item.file_size, end, target)
+                require(not content.read(1) and (expected is None or actual == expected),
+                        'Actions ZIP member failed its verified digest')
+                os.fsync(target.fileno())
+        release.sync_directory(destination)
 
 
 def fetch_artifact(rows, name, destination, wanted, end):
@@ -185,13 +197,16 @@ def fetch_artifact(rows, name, destination, wanted, end):
     maximum = ZIP_OVERHEAD + sum(value[1] for value in wanted.values())
     require(row['size_in_bytes'] <= maximum, 'Actions ZIP transport exceeds the approved byte bound')
     intake_limit(ROOT, [row['size_in_bytes'], sum(value[1] for value in wanted.values())])
-    with tempfile.TemporaryDirectory(dir=ROOT, prefix='.download-') as temporary:
-        path = Path(temporary) / 'transport.zip'
-        read_api(f'actions/artifacts/{row["id"]}/zip', end, limit=row['size_in_bytes'], output=path)
-        sha, length = file_hash(path, maximum, end, owner=0)
-        require(length == row['size_in_bytes'] and row['digest'] == 'sha256:' + sha,
+    with tempfile.TemporaryFile(dir=ROOT) as transport:
+        read_api(f'actions/artifacts/{row["id"]}/zip', end, limit=row['size_in_bytes'], output=transport)
+        node = os.fstat(transport.fileno())
+        require(node.st_nlink == 0 and node.st_uid == os.geteuid() and stat.S_IMODE(node.st_mode) == 0o600 and
+                node.st_size == row['size_in_bytes'], 'Actions ZIP scratch or exact transport length differs')
+        transport.seek(0)
+        sha = stream_exact(transport, node.st_size, end)
+        require(row['digest'] == 'sha256:' + sha and not transport.read(1),
                 'Actions ZIP differs from its exact transport identity')
-        extract_zip(path, destination, wanted, end)
+        extract_zip(transport, destination, wanted, end)
 
 
 def verify_subject(path, identity, source, run, role, end):
@@ -259,6 +274,126 @@ def staged_paths(end):
     return paths
 
 
+def durable_record(path, value):
+    raw = canonical(value)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        fd = os.open('.', os.O_TMPFILE | os.O_RDWR | os.O_CLOEXEC, 0o600, dir_fd=parent)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(fd)
+            os.link(f'/proc/self/fd/{fd}', path.name, dst_dir_fd=parent, follow_symlinks=True)
+            os.fsync(parent)
+    finally:
+        os.close(parent)
+
+
+def boot_identity():
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    require(re.fullmatch(BOOT_PATTERN, boot), 'portable transfer boot identity is unavailable')
+    return boot
+
+
+def transfer_record(path):
+    raw, value = release.readonly_json(protected(path), 0)
+    require(stat.S_IMODE(path.lstat().st_mode) == 0o600 and raw == canonical(value),
+            'portable transfer ownership record is not protected canonical data')
+    return raw, value
+
+
+def transfer_entries(stage, raw, device):
+    node = protected(stage, directory=True).lstat()
+    require(node.st_dev == device and stat.S_IMODE(node.st_mode) == 0o700,
+            'portable transfer directory differs from its owned allocation')
+    ticket = stage / TRANSFER_TICKET
+    if not os.path.lexists(ticket):
+        require(next(stage.iterdir(), None) is None, 'portable scratch lacks its exact protected ownership ticket')
+        return []
+    require(transfer_record(ticket)[0] == raw, 'portable transfer workspace ownership ticket differs')
+    checked = []
+    controls = {'platform.json', 'intake.json', 'site-predecessor.json', TRANSFER_TICKET}
+    for entry in stage.iterdir():
+        if entry.name in controls:
+            info = protected(entry).lstat()
+            require(info.st_dev == device and info.st_size <= CONTROL_LIMIT,
+                    'portable transfer control file exceeded its owned allocation')
+            if entry != ticket:
+                checked.append(entry)
+            continue
+        require(entry.name in {*ROLES, 'host'} and protected(entry, directory=True).lstat().st_dev == device,
+                'foreign entry in portable transfer workspace')
+        archive, evidence = (('host.tar', 'host-manifest.json') if entry.name == 'host' else
+                             (f'{entry.name}.oci.tar', 'part.json'))
+        for leaf in entry.iterdir():
+            require(leaf.name in (archive, evidence), 'foreign leaf in portable transfer workspace')
+            info = protected(leaf).lstat()
+            ceiling = CONTROL_LIMIT if leaf.name == evidence else (release.HOST_LIMIT if entry.name == 'host' else ARCHIVE_LIMIT)
+            require(info.st_dev == device and info.st_size <= ceiling,
+                    'portable transfer file exceeded its owned allocation')
+            checked.append(leaf)
+        checked.append(entry)
+    return checked + [ticket]
+
+
+def recover_transfer():
+    lease = ROOT / TRANSFER_LEASE
+    if not os.path.lexists(lease):
+        return
+    raw, record = transfer_record(lease)
+    require(set(record) == {'schema', 'platform_sha256', 'nonce', 'boot_id', 'root_inode', 'volume'} and
+            type(record['schema']) is int and record['schema'] == 1 and re.fullmatch(BOOT_PATTERN, record['boot_id']) and
+            re.fullmatch('[0-9a-f]{24}', record['nonce']) and record['root_inode'] == ROOT.lstat().st_ino,
+            'portable transfer lease differs from its fixed protected scope')
+    target = ROOT / hex_id(record['platform_sha256'])
+    stage = ROOT / (TRANSFER_PREFIX + record['nonce'])
+    device, inode, size, mounts = portable_volume(for_recovery=True)
+    volume = [device, inode, size, list(mounts)]
+    saved = record['volume']
+    require(type(saved) is list and len(saved) == len(volume) and saved[1:3] == volume[1:3] and
+            (record['boot_id'] != boot_identity() or saved == volume),
+            'portable transfer lease backing or mount identity changed')
+    if os.path.lexists(stage):
+        require(not os.path.lexists(target), 'portable transfer workspace and published target both exist')
+        for path in transfer_entries(stage, raw, device):
+            if path.is_dir():
+                path.rmdir()
+            else:
+                path.unlink()
+            release.sync_directory(path.parent)
+        stage.rmdir()
+    elif os.path.lexists(target):
+        require(protected(target, directory=True).lstat().st_dev == device and transfer_record(target / TRANSFER_TICKET)[0] == raw,
+                'portable transfer lease does not match published target custody')
+        retained_index(target.name)
+    release.sync_directory(ROOT)
+    lease.unlink()
+    release.sync_directory(ROOT)
+
+
+@contextmanager
+def transfer_workspace(identity):
+    lease = ROOT / TRANSFER_LEASE
+    nonce = secrets.token_hex(12)
+    stage, target = ROOT / (TRANSFER_PREFIX + nonce), ROOT / identity
+    require(not any(os.path.lexists(path) for path in (lease, stage, target)), 'portable transfer lease or target already exists')
+    device, inode, size, mounts = portable_volume()
+    value = {'schema': 1, 'platform_sha256': identity, 'nonce': nonce, 'boot_id': boot_identity(),
+             'root_inode': ROOT.lstat().st_ino, 'volume': [device, inode, size, list(mounts)]}
+    durable_record(lease, value)
+    try:
+        stage.mkdir(mode=0o700)
+        release.sync_directory(ROOT)
+        durable_record(stage / TRANSFER_TICKET, value)
+        yield stage
+        release.sync_directory(stage)
+        require(not os.path.lexists(target), 'portable transfer publication target appeared')
+        stage.rename(target)
+        release.sync_directory(ROOT)
+    finally:
+        recover_transfer()
+
+
 def portable_predecessor(directory, index):
     if index['schema'] == 3:
         _, binding = release.readonly_json(protected(directory / 'site-predecessor.json'), 0)
@@ -277,6 +412,7 @@ def bound_local_platform(controller, reference, catalog, *, required=True):
         return None
     binding = renewal.read_json(path)
     identity = hex_id(binding['platform_sha256'])
+    hex_id(binding['site_config_sha256'])
     _, index, receipt = catalog[identity]
     component = local['components']['maintenance-agent']
     require(set(binding) == {'schema', 'release_sha256', 'platform_sha256', 'base_platform_sha256',
@@ -321,11 +457,20 @@ def retirement_scope(controller, catalog, expected_previous, base, end):
     require(all(not os.path.lexists(catalog[identity][0] / RETIREMENT) for identity in keep),
             'active or recoverable portable release has missing retained archive authority')
 
+    settled = None
+    if journal is not None and journal['phase'] in ('rejected', 'rolled-back'):
+        request = journal['request']
+        settled = renewal.checked_request(request, request['scope'])
     for scope in ('initial', 'agent'):
         path = controller.control / 'offers' / (scope + '.json')
         if os.path.lexists(path):
             offer = offer_record(renewal.read_json(path), scope)
-            keep.add(offer['platform_sha256'])
+            rejected_offer = (settled is not None and settled['scope'] == scope and
+                              settled['previous_sha256'] == offer['previous_release_sha256'] and
+                              all(settled[key] == offer[key] for key in ('operation', 'affected_jobs', 'reason')) and
+                              bound_local_platform(controller, settled['target_sha256'], catalog) == offer['platform_sha256'])
+            if not rejected_offer:
+                keep.add(offer['platform_sha256'])
             if offer['previous_release_sha256'] is not None:
                 keep.add(bound_local_platform(controller, offer['previous_release_sha256'], catalog))
     for scope in renewal.SCOPE_COMPONENTS:
@@ -333,7 +478,9 @@ def retirement_scope(controller, catalog, expected_previous, base, end):
         if os.path.lexists(path):
             raw = renewal.read_json(path)
             request = renewal.checked_request(raw['request'] if scope == 'agent' else raw, scope)
-            keep.update(bound_local_platform(controller, request[key], catalog) for key in ('previous_sha256', 'target_sha256'))
+            keep.add(bound_local_platform(controller, request['previous_sha256'], catalog))
+            if request != settled:
+                keep.add(bound_local_platform(controller, request['target_sha256'], catalog))
 
     rejected = set()
     attempts = renewal.trusted_directory(controller.control / 'attempts')
@@ -399,7 +546,7 @@ def retain_for_transfer(paths, previous, base, demand, end):
         state = os.statvfs(ROOT)
         return state.f_bavail * state.f_frsize >= demand + GUEST_RESERVE and state.f_favail >= TRANSFER_INODES
 
-    volume = retirement_device()
+    volume = portable_volume()
     if enough():
         return
     import renewal
@@ -425,15 +572,14 @@ def retain_for_transfer(paths, previous, base, demand, end):
         if not owned:
             continue
         with controller.lock():
-            require(retirement_scope(controller, catalog, previous, base, end) == scope and retirement_device() == volume,
+            require(retirement_scope(controller, catalog, previous, base, end) == scope and portable_volume() == volume,
                     'portable retirement authority or physical backing changed')
             if retired is None:
                 state = os.statvfs(directory)
                 require(state.f_favail > 0 and state.f_bavail * state.f_frsize >= CONTROL_LIMIT,
                         'portable archive retirement needs space for its protected journal')
-                release.write_json(directory / RETIREMENT, {'schema': 1, 'platform_sha256': directory.name,
-                                   'intake_sha256': receipt, 'superseding_release_sha256': scope[0]})
-                release.sync_directory(directory)
+                durable_record(directory / RETIREMENT, {'schema': 1, 'platform_sha256': directory.name,
+                               'intake_sha256': receipt, 'superseding_release_sha256': scope[0]})
             for path, node in owned:
                 require(archive_inode(protected(path).lstat()) == node, 'owned portable archive changed after verification')
                 path.unlink()
@@ -466,6 +612,7 @@ def acquire(source, run, expected, previous, end, *, agent=False):
             'protected release operator and exact publisher run required')
     protected(ROOT, directory=True)
     require(Path(GITHUB).is_file(), 'protected read-only GitHub CLI unavailable')
+    recover_transfer()
     require(not os.path.lexists(ROOT / expected), 'platform package already staged at its exact digest')
     entries = staged_paths(end)
     require(previous is not None or not entries, 'initial release intake requires an empty platform store')
@@ -481,7 +628,7 @@ def acquire(source, run, expected, previous, end, *, agent=False):
         intake_limit(ROOT, [release.FILE_BUDGET], ARCHIVE_LIMIT + ZIP_OVERHEAD)
     checked_run(read_api(f'actions/runs/{run}', end), source, run, agent)
     rows = artifacts(read_api(f'actions/runs/{run}/artifacts?per_page=100', end), source, agent)
-    with release.output_directory(ROOT / expected) as stage:
+    with transfer_workspace(expected) as stage:
         names = {name: (None, CONTROL_LIMIT) for name in release.SUBJECTS}
         fetch_artifact(rows, release.artifact_name('subjects', source), stage, names, end)
         raw, value = release.readonly_json(stage / 'platform.json', 0)
