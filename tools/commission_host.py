@@ -311,7 +311,8 @@ class Commission:
             raw = self.read(AUTOMATIC_POLICY)
             policy = read_policy(raw, revision)
             require(raw == encoded(policy), 'recorded automatic commissioning policy bytes differ')
-            require(policy['machine_id'] == observed['machine_id'], 'automatic commissioning policy belongs to another machine')
+            require(policy['machine_id'] == observed['machine_id'] and not policy['timers'],
+                    'automatic commissioning policy belongs to another machine or admission scope')
             host_profile = None
         else:
             platform = self.services.initial_platform(revision)
@@ -338,10 +339,16 @@ class Commission:
                 prior = parse(self.read(PRIVATE + '/intent.json'))
                 require(prior.get('policy_sha256') == policy_sha,
                         'existing commissioning uses a different protected site authority')
+            placed = all(os.path.lexists(self.path(CONTROL + '/' + name + '.json')) for name in ('current', 'site-current'))
+            if not placed:
+                self.services.verify_initial_parts(policy['platform_sha256'])
             if host_profile is not None:
                 target, contents = host_profile
                 self.file(target, contents, 0o600)
             site, bundle = self.services.authority(policy)
+            if prepared:
+                require(self.services.initial_checklist(identity, site, revision, placed=placed) == policy['checklist'],
+                        'observed checklist geometry differs from the protected commissioning policy')
             files = self.package(policy, bundle)
             if action == 'prepare':
                 self.services.configuration(policy, site)
@@ -556,16 +563,34 @@ class Live:
                 raise Pending('release-trust', 'Independent protected release trust has not been provisioned.')
             for role in ('host', 'devbox', 'maintenance', 'development'):
                 ReleaseTrust(self.run).policy(role)
-            gh = Path(intake.GITHUB)
-            config = Path(intake.native_env().get('GH_CONFIG_DIR', '/root/.config/gh'))
-            if not gh.is_file() or not os.path.lexists(config / 'hosts.yml'):
-                raise Pending('release-read-custody', 'The protected read-only GitHub intake identity or tool is unavailable.')
-            intake.protected(config / 'hosts.yml')
+            self.require_release_custody()
             raise Pending('initial-full-release-selection',
                           'No eligible full release has reached protected intake. The initial publisher selection has no automated producer.',
                           source_gap=True)
         require(len(candidates) == 1, 'more than one protected full release is eligible for this exact source')
         return candidates[0]
+
+    def require_release_custody(self):
+        intake = self.installer.intake
+        config = Path(intake.native_env().get('GH_CONFIG_DIR', '/root/.config/gh'))
+        credential = config / 'hosts.yml'
+        gh = Path(intake.GITHUB)
+        message = 'The protected read-only GitHub intake identity or tool is unavailable.'
+        if not gh.is_file() or not os.path.lexists(credential):
+            raise Pending('release-read-custody', message)
+        gh = intake.protected(gh)
+        if not os.access(gh, os.X_OK):
+            raise Pending('release-read-custody', message)
+        path = intake.protected(credential)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            node = os.fstat(descriptor)
+            if (not stat.S_ISREG(node.st_mode) or (node.st_uid, node.st_gid) != (0, 0)
+                    or node.st_nlink != 1 or stat.S_IMODE(node.st_mode) != 0o600
+                    or not 0 < node.st_size <= 128 * 1024):
+                raise Pending('release-read-custody', 'The GitHub intake credential file is empty or outside root-private custody.')
+        finally:
+            os.close(descriptor)
 
     def initial_site(self, hostname):
         candidates = []
@@ -597,11 +622,11 @@ class Live:
                           source_gap=True)
         return str(path), body
 
-    def initial_checklist(self, identity, site, revision):
+    def initial_checklist(self, identity, site, revision, *, placed=False):
         from bootstrap import Blocked as BootstrapBlocked, checked_file
         from destination_release import Destination, MANAGED_INTENT, MANAGED_INODES, MANAGED_READY, PROVISION
         from native_placement_release import OUTER_BYTES
-        from native_placements import HOST_METADATA_BYTES, SCRATCH_BYTES
+        from native_placements import HOST_INODE_HEADROOM, HOST_METADATA_BYTES, SCRATCH_BYTES
         from host_handoff import tls_principal
 
         root = Path(CHECKLIST_SERVER)
@@ -642,10 +667,14 @@ class Live:
         except BootstrapBlocked:
             raise Pending('checklist-account-allocation', 'The proposed checklist subordinate IDs conflict with existing allocations.') from None
         capacity = os.statvfs(STATE)
-        jobs = sum(row['storage_bytes'] for row in site['jobs'].values())
         checklist = sum(DEFAULT_CHECKLIST[key] for key in ('validation_mib', 'live_mib', 'reserve_mib')) * 1024**2
-        bytes_needed = jobs + OUTER_BYTES + SCRATCH_BYTES + HOST_METADATA_BYTES + checklist
-        inodes_needed = sum(DEFAULT_CHECKLIST[key] for key in ('validation_inodes', 'live_inodes', 'reserve_inodes'))
+        bytes_needed = checklist
+        if not placed:
+            jobs = sum(row['storage_bytes'] for row in site['jobs'].values())
+            bytes_needed += jobs + OUTER_BYTES + SCRATCH_BYTES + HOST_METADATA_BYTES
+        # Each child ext4 is stored in a backing file. Its internal inode
+        # budget does not consume parent inodes. Charge its backing and receipt.
+        inodes_needed = max(HOST_INODE_HEADROOM, DEFAULT_CHECKLIST['reserve_inodes']) + 2 * 2
         if capacity.f_bavail * capacity.f_frsize < bytes_needed or capacity.f_favail < inodes_needed:
             raise Pending('checklist-storage-capacity', 'The approved placement and checklist storage do not fit the observed allocation.')
         return {'tls_profile': CHECKLIST_SERVER, **DEFAULT_CHECKLIST}
@@ -668,6 +697,9 @@ class Live:
         require(self.installer.machine(site, time.monotonic() + 15) == self.bootstrap.destination_identity()['boot_id'],
                 'physical site profile is unavailable for this boot')
         return site, bundle['files']
+
+    def verify_initial_parts(self, identity):
+        self.installer.intake.previous_release(identity, time.monotonic() + 180)
 
     def configuration(self, policy, site):
         from bootstrap import checked_file

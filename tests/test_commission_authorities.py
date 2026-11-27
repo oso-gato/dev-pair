@@ -100,6 +100,8 @@ class Authorities(unittest.TestCase):
             observed, files = self.live.authority(policy)
         self.assertEqual(observed, site)
         self.assertIn('tools/fixture.py', files)
+        with self.assertRaises(FileNotFoundError):
+            self.live.verify_initial_parts(platform)
         with self.assertRaisesRegex(c.Pending, 'initial-host-config'):
             self.live.initial_host_profile({**site, 'host_config_sha256': '0' * 64}, {'host': 'erebus'})
 
@@ -107,6 +109,9 @@ class Authorities(unittest.TestCase):
         import release_trust
         policy = self.root / 'release-trust.json'
         credential = self.root / 'hosts.yml'
+        gh = self.root / 'gh-fixture'
+        self.write(gh, b'#!/bin/sh\nexit 1\n')
+        gh.chmod(0o755)
         publisher = {'workflow': '.github/workflows/platform-release.yml', 'sha256': '1' * 64, 'registry': None}
         trust = {'version': 1, 'writer_app_id': 123, 'reviewer_ids': [456],
                  'check': {'context': 'release-source-check', 'app_id': 123,
@@ -114,7 +119,7 @@ class Authorities(unittest.TestCase):
                  'components': {role: publisher for role in ('host', 'devbox', 'maintenance', 'development')}}
         with patch.object(release_trust, 'POLICY', policy), \
                 patch.object(installer.intake, 'native_env', return_value={'GH_CONFIG_DIR': str(self.root)}), \
-                patch.object(installer.intake, 'GITHUB', '/usr/bin/true'):
+                patch.object(installer.intake, 'GITHUB', str(gh)):
             self.live.run = lambda *args, **kwargs: self.fail('read-only discovery tried to contact a remote')
             for expected, phase in [('release-trust', 'pending'), ('release-read-custody', 'pending'),
                                     ('initial-full-release-selection', 'source-gap')]:
@@ -125,12 +130,32 @@ class Authorities(unittest.TestCase):
                     self.write(policy, c.encoded(trust))
                 elif expected == 'release-read-custody':
                     self.write(credential, b'fixture custody\n')
+            for content, mode in ((b'', 0o600), (b'mode fixture\n', 0o644), (b'x' * (128 * 1024 + 1), 0o600)):
+                self.write(credential, content)
+                credential.chmod(mode)
+                with self.assertRaisesRegex(c.Pending, 'release-read-custody'):
+                    self.live.initial_platform('a' * 40)
+            self.write(credential, b'fixture credential custody\n')
+            gh.chmod(0o644)
+            with self.assertRaisesRegex(c.Pending, 'release-read-custody'):
+                self.live.initial_platform('a' * 40)
 
     def test_missing_tls_custody_holds_checklist_before_topology(self):
         with patch.object(c, 'CHECKLIST_SERVER', str(self.root / 'checklist-server')):
             with self.assertRaisesRegex(c.Pending, 'checklist-peer-custody') as pending:
                 self.live.initial_checklist({'machine_id': MACHINE}, {}, 'a' * 40)
         self.assertEqual(pending.exception.report['phase'], 'pending')
+
+    def test_hardlinked_peer_is_never_a_private_tls_input(self):
+        tls = self.root / 'profile'
+        tls.mkdir(mode=0o700)
+        self.write(tls / 'cert.pem', b'fixture cert\n')
+        alternate = self.root / 'shared-peer'
+        self.write(alternate, b'other data\n')
+        os.link(alternate, tls / 'peer.pem')
+        with patch.object(c, 'CHECKLIST_SERVER', str(tls)):
+            with self.assertRaisesRegex(c.Blocked, 'ancestry or inode'):
+                self.live.initial_checklist({'machine_id': MACHINE}, {}, 'a' * 40)
 
     def test_first_checklist_geometry_depends_on_managed_capacity_and_id_checks(self):
         import destination_release as destination
@@ -146,7 +171,7 @@ class Authorities(unittest.TestCase):
             self.write(path, c.encoded(record))
         observed = SimpleNamespace(record=lambda path: record, mount_observation=lambda *args, **kwargs: None,
                                    subid=lambda *args: False)
-        volume = SimpleNamespace(f_bavail=20 * 1024**3, f_frsize=1, f_favail=100000)
+        volume = SimpleNamespace(f_bavail=20 * 1024**3, f_frsize=1, f_favail=9000)
         site = {'jobs': {'checklist': {'storage_bytes': 8 * 1024**3}}}
         with patch.object(c, 'CHECKLIST_SERVER', str(tls)), \
                 patch.object(destination, 'MANAGED_INTENT', str(intent)), patch.object(destination, 'MANAGED_READY', str(ready)), \
@@ -155,6 +180,12 @@ class Authorities(unittest.TestCase):
                 patch.object(c.grp, 'getgrall', return_value=[]), patch.object(c.os, 'statvfs', return_value=volume):
             selected = self.live.initial_checklist({'machine_id': MACHINE}, site, 'a' * 40)
             self.assertEqual(selected, {'tls_profile': str(tls), **c.DEFAULT_CHECKLIST})
+            volume.f_favail = 1024
+            with self.assertRaisesRegex(c.Pending, 'checklist-storage-capacity'):
+                self.live.initial_checklist({'machine_id': MACHINE}, site, 'a' * 40)
+            volume.f_favail = 9000
+            volume.f_bavail = 4 * 1024**3
+            self.assertEqual(self.live.initial_checklist({'machine_id': MACHINE}, site, 'a' * 40, placed=True), selected)
             volume.f_bavail = 1024**3
             with self.assertRaisesRegex(c.Pending, 'checklist-storage-capacity'):
                 self.live.initial_checklist({'machine_id': MACHINE}, site, 'a' * 40)

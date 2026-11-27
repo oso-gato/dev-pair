@@ -319,7 +319,8 @@ class HostCommissioning(unittest.TestCase):
         self.services.initial_platform = lambda revision: PLATFORM
         self.services.initial_site = lambda hostname: (SITE, JOBS)
         self.services.initial_host_profile = lambda site, observed: None
-        self.services.initial_checklist = lambda identity, site, revision: FIRST['checklist']
+        self.services.initial_checklist = lambda identity, site, revision, **kwargs: FIRST['checklist']
+        self.services.verify_initial_parts = lambda platform: self.steps.append('verified-full-parts')
         self.services.authority = lambda policy: (JOBS, {})
         self.app.package = lambda policy, bundle: self.files([])
 
@@ -340,6 +341,33 @@ class HostCommissioning(unittest.TestCase):
         self.assertEqual(set(ready['held_features']), set(c.TIMERS))
         self.assertEqual(leaf.read_bytes(), saved)
         self.assertEqual(self.steps.count('F-stage'), 1)
+        self.assertEqual(self.steps.count('verified-full-parts'), 2)
+
+    def test_cached_prepare_and_apply_reverify_peer_and_geometry_before_stage(self):
+        self.automatic_services()
+        self.app.automatic('prepare', SOURCE)
+        saved = self.app.read(c.AUTOMATIC_POLICY)
+        for action in ('prepare', 'apply'):
+            with self.subTest(action=action), patch.object(self.services, 'initial_checklist',
+                    side_effect=c.Blocked('changed private TLS peer')):
+                with self.assertRaisesRegex(c.Blocked, 'changed private TLS peer'):
+                    self.app.automatic(action, SOURCE)
+        with patch.object(self.services, 'initial_checklist', return_value={**FIRST['checklist'], 'uid': 2001}):
+            with self.assertRaisesRegex(c.Blocked, 'observed checklist geometry'):
+                self.app.automatic('apply', SOURCE)
+        self.assertEqual(self.app.read(c.AUTOMATIC_POLICY), saved)
+        self.assertNotIn('F-stage', self.steps)
+        self.assertFalse(self.app.path(c.UNIT_ROOT + '/' + c.BOOT_FENCE).exists())
+
+    def test_incomplete_full_parts_block_before_policy_or_host_effects(self):
+        self.automatic_services()
+        with patch.object(self.services, 'verify_initial_parts', side_effect=FileNotFoundError('missing devbox archive')):
+            for action in ('prepare', 'apply'):
+                with self.subTest(action=action), self.assertRaisesRegex(FileNotFoundError, 'missing devbox archive'):
+                    self.app.automatic(action, SOURCE)
+        self.assertFalse(self.app.path(c.AUTOMATIC_POLICY).exists())
+        self.assertFalse(self.app.path(c.INSTALL + '/host-releases').exists())
+        self.assertNotIn('F-stage', self.steps)
 
     def test_cli_auto_path_reports_source_gap_without_policy_arguments_writes_or_install(self):
         self.automatic_services()
