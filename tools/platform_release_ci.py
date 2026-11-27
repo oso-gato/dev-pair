@@ -27,6 +27,9 @@ RUN_ENV = (*ci.RUNNER_ENV, 'GITHUB_SHA', 'GITHUB_REF', 'GITHUB_REF_PROTECTED', '
 EXPORT_VOLUME = 3 * GIB
 OUTER_SECONDS = 1200
 EVENT_LIMIT = 25 * 1024 ** 2
+PLATFORM_WORKFLOW = '.github/workflows/platform-release.yml'
+AGENT_WORKFLOW = '.github/workflows/agent-refresh.yml'
+AGENT_SCHEDULE = '0 19 * * *'
 
 
 def admitted_push(source, env):
@@ -34,7 +37,7 @@ def admitted_push(source, env):
     require(all(env.get(key) == value for key, value in {
         'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': release.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
         'GITHUB_REF': 'refs/heads/main', 'GITHUB_REF_PROTECTED': 'true', 'GITHUB_RUN_ATTEMPT': '1',
-        'GITHUB_SHA': source,
+        'GITHUB_SHA': source, 'GITHUB_WORKFLOW_REF': release.REPOSITORY + '/' + PLATFORM_WORKFLOW + '@refs/heads/main',
     }.items()), 'platform production requires the first exact protected main push')
     require(re.fullmatch(r'[1-9][0-9]{0,19}', env.get('GITHUB_RUN_ID', '')), 'missing exact platform publisher run ID')
     path = Path(env.get('GITHUB_EVENT_PATH', ''))
@@ -49,10 +52,6 @@ def admitted_push(source, env):
     value = json.loads(raw, object_pairs_hook=guest.unique_object)
     require(value.get('ref') == 'refs/heads/main' and value.get('after') == source and value.get('deleted') is False and
             value.get('repository', {}).get('full_name') == release.REPOSITORY, 'protected push event source mismatch')
-
-
-AGENT_WORKFLOW = '.github/workflows/agent-refresh.yml'
-AGENT_SCHEDULE = '0 19 * * *'
 
 
 def admitted_refresh(source, env):
@@ -94,6 +93,38 @@ class Export:
         self.final = final
         self.nonce = secrets.token_hex(16)
         self.volume = None
+
+    def report_identity(self):
+        event = os.environ.get('GITHUB_EVENT_NAME')
+        workflow = PLATFORM_WORKFLOW if event == 'push' else AGENT_WORKFLOW
+        require(event in ('push', 'schedule', 'workflow_dispatch') and
+                os.environ.get('GITHUB_WORKFLOW_REF') == release.REPOSITORY + '/' + workflow + '@refs/heads/main',
+                'platform report lacks its exact workflow identity')
+        trigger = {'event': event, 'ref': os.environ.get('GITHUB_REF'), 'run_id': os.environ.get('GITHUB_RUN_ID'),
+                   'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'), 'role': self.scenario}
+        if event == 'schedule':
+            trigger['schedule'] = AGENT_SCHEDULE
+        return workflow, trigger
+
+    def report_profile(self, probe):
+        probe.report['scenario'] = self.scenario
+        probe.report['artifact_transport'] = {'upload': 'after successful role and teardown',
+                                              'attestation': 'separate publish job', 'retention_days': 1}
+        limits = probe.report['limits']
+        limits.update(release_storage_bytes=EXPORT_VOLUME, release_inodes=3072, archive_bytes=ARCHIVE_LIMIT,
+                      post_build_verify_seconds=guest.PLATFORM_VERIFY_SECONDS)
+        if self.scenario == 'devbox':
+            for key in ('overlay_bytes', 'overlay_inodes', 'guest_virtual_bytes', 'vm_seconds',
+                        'vm_container_seconds', 'guest_cpus', 'guest_memory_bytes', 'public_seconds'):
+                del limits[key]
+            limits.update(outer_build_seconds=OUTER_SECONDS, build_memory_bytes=2 * GIB, build_cpus=2)
+            probe.report['executor'] = 'public-standard-ubuntu-24.04/DevBox-OCI'
+            probe.report['phases'] = {name: {'status': 'blocked', 'detail': 'Not reached'}
+                                      for name in ('runner-preflight', 'outer-devbox', 'cleanup')}
+        else:
+            limits.update(vm_seconds=ci.VM_SECONDS - guest.PLATFORM_VERIFY_SECONDS,
+                          guest_work_seconds=guest.INITIALIZE_SECONDS - guest.PLATFORM_EXPORT_SECONDS - guest.PLATFORM_VERIFY_SECONDS,
+                          guest_export_seconds=guest.PLATFORM_EXPORT_SECONDS)
 
     def preflight(self, probe):
         require(self.final.parent.is_dir() and self.final.parent.resolve(strict=True) == self.final.parent and
@@ -234,25 +265,35 @@ def build_devbox(probe):
             digest, size = file_hash(archive, ARCHIVE_LIMIT, end, owner=os.getuid(), output=output)
         image = {'role': 'devbox', 'source_sha': probe.source, 'context_sha256': context_sha,
                  'image_id': outer_id, 'archive_sha256': digest, 'archive_bytes': size, 'diff_ids': shape['diff_ids']}
-        release.write_image_part(stage, image,
-                                 {'tooling_image_id': tool_id, 'tooling_diff_ids': tool_shape['diff_ids'],
-                                  'tooling_recipe_sha256': ci.file_hash(tooling / 'Containerfile'), 'signed_base': proof}, end)
+        part = release.write_image_part(stage, image,
+                                        {'tooling_image_id': tool_id, 'tooling_diff_ids': tool_shape['diff_ids'],
+                                         'tooling_recipe_sha256': ci.file_hash(tooling / 'Containerfile'), 'signed_base': proof}, end)
     probe.storage.parent_free()
+    probe.report['platform_export'] = {**image, 'oci_manifest_sha256': part['oci_manifest_sha256']}
 
 
 def execute_devbox(probe):
     start = time.monotonic()
+    phase = 'runner-preflight'
     try:
         require((REPO / 'tools/native_placements.py').is_file(), 'reviewed G DevBox tooling recipe is missing from the integrated commit')
         probe.phase_end = start + OUTER_SECONDS
         with ci.deadline(OUTER_SECONDS):
             probe.preflight()
+            phase = 'outer-devbox'
             build_devbox(probe)
+            probe.phase(phase, 'pass', 'Signed Fedora tooling and exact outer OCI export verified')
+    except (Blocked, ci.Blocked, OSError, ValueError, ImportError, subprocess.SubprocessError) as error:
+        probe.phase(phase, 'blocked', str(error))
     finally:
         probe.phase_end = None
-        with ci.deadline(ci.CLEANUP_SECONDS):
-            probe.cleanup()
-    return 0
+        try:
+            with ci.deadline(ci.CLEANUP_SECONDS):
+                probe.cleanup()
+        except (Blocked, ci.Blocked, OSError, ValueError, subprocess.SubprocessError) as error:
+            probe.phase('cleanup', 'fail', str(error))
+        probe.finish_report()
+    return 0 if all(row['status'] == 'pass' for row in probe.report['phases'].values()) else 2
 
 
 def namespace(source, role):

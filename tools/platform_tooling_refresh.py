@@ -20,7 +20,9 @@ import fedora_ci as ci
 import fedora_oci
 import platform_release as release
 import public_inputs as public
-from platform_release_protocol import Blocked, canonical, file_hash, hex_id, require, seconds
+from platform_release_protocol import (
+    Blocked, file_hash, hex_id, require, seconds, UPSTREAM_RELEASE_LIMIT, upstream_release_json,
+)
 
 API = 'https://api.github.com/repos/openai/codex'
 TAG = r'rust-v([0-9]+\.[0-9]+\.[0-9]+)'
@@ -46,9 +48,13 @@ def api(opener, tail, end):
     url = API + tail
     request = urllib.request.Request(url, headers={'Accept': 'application/vnd.github+json',
                                                     'User-Agent': 'dev-pair-platform-tooling/1'})
+    release_reply = tail == '/releases/latest'
+    limit = UPSTREAM_RELEASE_LIMIT if release_reply else METADATA_LIMIT
     with opener.open(request, timeout=seconds(end, 10)) as response:
         require(response.geturl() == url and response.status == 200, 'official tooling metadata endpoint changed')
-        raw = response.read(METADATA_LIMIT + 1)
+        raw = response.read(limit + 1)
+    if release_reply:
+        return upstream_release_json(raw)
     require(0 < len(raw) <= METADATA_LIMIT, 'official tooling metadata exceeds its bound')
     return json.loads(raw, object_pairs_hook=ci.unique_object)
 

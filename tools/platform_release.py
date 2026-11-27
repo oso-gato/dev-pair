@@ -24,6 +24,7 @@ from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, EXPANSION_LIMIT, HOST_LIMIT, ROLES, STANDARDS,
     COMPONENT, Blocked, canonical, fields, file_hash, hex_id, image_record, json_bytes,
     regular, require, seconds, stream_exact, portable_index, portable_roles,
+    UPSTREAM_RELEASE_LIMIT, upstream_release_json,
 )
 
 REPOSITORY = 'oso-gato/dev-pair'
@@ -111,7 +112,7 @@ def source_checkout(source, revision):
 
 
 def stable_version(raw):
-    row = json_bytes(raw)
+    row = upstream_release_json(raw)
     tag = row.get('tag_name', '')
     match = re.fullmatch(r'rust-v([0-9]+\.[0-9]+\.[0-9]+)', tag)
     require(match is not None and row.get('draft') is False and row.get('prerelease') is False and
@@ -125,7 +126,7 @@ def official_version():
                                                     'User-Agent': 'dev-pair-platform-release/1'})
     with urllib.request.urlopen(request, timeout=8) as response:
         require(response.status == 200 and response.geturl() == LATEST, 'official stable Codex endpoint changed')
-        raw = response.read(CONTROL_LIMIT + 1)
+        raw = response.read(UPSTREAM_RELEASE_LIMIT + 1)
     return stable_version(raw)
 
 

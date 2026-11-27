@@ -1,3 +1,5 @@
+from contextlib import redirect_stdout
+import gzip
 import io
 import json
 import os
@@ -5,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+from textwrap import dedent
 import tempfile
 import time
 import unittest
@@ -39,7 +42,9 @@ class PlatformReleaseTests(unittest.TestCase):
                                              'repository': {'full_name': publisher.REPOSITORY}}))
         return {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': publisher.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
                 'GITHUB_REF': 'refs/heads/main', 'GITHUB_REF_PROTECTED': 'true', 'GITHUB_RUN_ATTEMPT': '1',
-                'GITHUB_SHA': self.source, 'GITHUB_RUN_ID': '12345', 'GITHUB_EVENT_PATH': str(path), **updates}
+                'GITHUB_SHA': self.source, 'GITHUB_RUN_ID': '12345', 'GITHUB_EVENT_PATH': str(path),
+                'GITHUB_WORKFLOW_REF': publisher.REPOSITORY + '/' + builder.PLATFORM_WORKFLOW + '@refs/heads/main',
+                **updates}
 
     def test_native_entry_requires_same_protected_main_push_before_privilege(self):
         env = self.for_push()
@@ -172,7 +177,7 @@ class PlatformReleaseTests(unittest.TestCase):
 
     def test_portable_index_binds_three_verified_oci_parts_and_exact_host(self):
         revision_path, self.source = self.git_repo()
-        parts = self.root / 'parts'
+        parts = self.root / 'platform-parts'
         parts.mkdir()
         host = parts / publisher.artifact_name('host', self.source)
         host_sha = publisher.build_host(revision_path, self.source, host)
@@ -212,9 +217,34 @@ class PlatformReleaseTests(unittest.TestCase):
                     if role == 'maintenance':
                         proof['result_sha256'] = publisher.digest(json.dumps(result, sort_keys=True).encode() + b'\n')
                 publisher.write_image_part(directory, image, proof, self.end)
-        output = self.root / 'subjects'
+        text = (ROOT / '.github/workflows/platform-release.yml').read_text()
+        step = text.split('      - name: Verify all parts and assemble the portable release index\n', 1)[1]
+        shell = dedent(step.split('        run: |\n', 1)[1].split('      - uses:', 1)[0])
+        shim = self.root / 'fixture-python.py'
+        shim.write_text(dedent("""\
+            import os
+            from pathlib import Path
+            import runpy
+            import sys
+
+            assert sys.argv[1:3] == ['-B', 'tools/platform_release.py']
+            script = Path(sys.argv[2]).resolve()
+            sys.path.insert(0, str(script.parent))
+            import fedora_oci
+            fedora_oci.DIFF = os.environ['FIXTURE_LAYER_DIFF']
+            sys.argv = sys.argv[2:]
+            runpy.run_path(str(script), run_name='__main__')
+        """))
+        env = {**os.environ, 'RUNNER_TEMP': str(self.root), 'GITHUB_SHA': self.source, 'GITHUB_RUN_ID': '1234',
+               'PREVIOUS': 'initial', 'ARTIFACT_BYTES': str(publisher.TRANSPORT_BUDGET),
+               'FIXTURE_LAYER_DIFF': base, 'PYTHON_SHIM': str(shim), 'FIXTURE_PYTHON': sys.executable}
+        command = 'python3() { "$FIXTURE_PYTHON" -B "$PYTHON_SHIM" "$@"; }\n' + shell
+        published = subprocess.run(['/bin/bash', '-e', '-c', command], cwd=ROOT, env=env,
+                                   capture_output=True, text=True, timeout=15)
+        self.assertEqual(published.returncode, 0, published.stderr)
+        platform_sha = published.stdout.strip()
+        output = self.root / ('platform-subjects-' + self.source)
         with mock.patch.object(fedora_oci, 'DIFF', base):
-            platform_sha = publisher.assemble(parts, output, self.source, 1234, 'initial', publisher.TRANSPORT_BUDGET)
             agent_sha = publisher.assemble(parts, self.root / 'agent', self.source, 5678, platform_sha,
                                            publisher.AGENT_BUDGET, agent=True, base=platform_sha)
         platform_raw, platform = publisher.readonly_json(output / 'platform.json')
@@ -318,3 +348,115 @@ class PlatformReleaseTests(unittest.TestCase):
             stream.addfile(member, io.BytesIO(data))
         with self.assertRaisesRegex(protocol.Blocked, 'unsupported archive member'):
             refresh.extract_binary(archive, self.root / 'no-code', self.end)
+
+    def upstream_metadata(self):
+        fixture = ROOT / 'tests/data/platform/codex-rust-v0.169.0-release.json.gz'
+        raw = gzip.decompress(fixture.read_bytes())
+        self.assertEqual(len(raw), 413671)
+        self.assertEqual(publisher.digest(raw), 'b784f8cfb2ae3cad0051c1e4273473810be8ea7153e2659afbe1e8fbfdbd76ea')
+        return raw
+
+    def response(self, raw):
+        response = io.BytesIO(raw)
+        response.status = 200
+        response.geturl = lambda: publisher.LATEST
+        return response
+
+    def test_real_multi_asset_metadata_is_admitted_by_both_production_readers(self):
+        raw = self.upstream_metadata()
+        with mock.patch.object(publisher.urllib.request, 'urlopen', return_value=self.response(raw)):
+            self.assertEqual(publisher.official_version(), '0.169.0')
+        opener = mock.Mock()
+        opener.open.return_value = self.response(raw)
+        result, tag, version = refresh.latest(opener, self.end)
+        self.assertEqual((len(result['assets']), tag, version), (194, 'rust-v0.169.0', '0.169.0'))
+        for kind, name in (('archive', 'codex.tar.gz'), ('bundle', 'codex.sigstore')):
+            url, size, digest = refresh.selected_asset(result, tag, kind)
+            approved = publisher.public_inputs.ARTIFACTS[name]
+            self.assertEqual((url, size), approved[:2])
+            self.assertIn(digest, (None, approved[2]))
+        with self.assertRaisesRegex(protocol.Blocked, 'release metadata exceeds'):
+            protocol.json_bytes(raw)
+        with mock.patch.object(publisher.urllib.request, 'urlopen',
+                               return_value=self.response(b'X' * (protocol.UPSTREAM_RELEASE_LIMIT + 1))):
+            with self.assertRaisesRegex(protocol.Blocked, 'official release metadata exceeds'):
+                publisher.official_version()
+
+    def test_newer_large_stable_reply_proposes_pins_and_preserves_prior_selection(self):
+        raw = self.upstream_metadata().replace(b'rust-v0.169.0', b'rust-v0.170.0')
+        resolver = mock.Mock()
+        resolver.open.side_effect = lambda *_args, **_kwargs: self.response(raw)
+        prior = self.root / 'current-selection'
+        prior.write_text('retained exact previous release')
+        output = self.root / 'pin-proposal'
+        with (
+            mock.patch.object(refresh.urllib.request, 'build_opener', return_value=resolver),
+            mock.patch.object(refresh.release, 'source_checkout'),
+            mock.patch.object(refresh, 'commit_for_tag', return_value='a' * 40),
+            mock.patch.object(refresh, 'acquire', return_value={'sha256': '3' * 64, 'bytes': 41, 'reused': False}),
+            mock.patch.object(refresh, 'extract_binary', return_value=('4' * 64, 19)),
+            mock.patch.object(Path, 'chmod'),
+            mock.patch.object(refresh, 'verify_signature', return_value='5' * 64),
+        ):
+            self.assertFalse(refresh.resolve(output, self.source))
+        _, proposal = publisher.readonly_json(output / 'tooling.json')
+        self.assertEqual((proposal['tag'], proposal['version'], proposal['approved_pins_match']),
+                         ('rust-v0.170.0', '0.170.0', False))
+        self.assertEqual(set(item.name for item in output.iterdir()), {'tooling.json'})
+        self.assertEqual(prior.read_text(), 'retained exact previous release')
+
+    def test_reports_identify_actual_workflow_trigger_role_limits_and_transfer_policy(self):
+        for event, role, workflow in (
+            ('pull_request', 'maintenance', '.github/workflows/fedora-vm.yml'),
+            ('push', 'maintenance', builder.PLATFORM_WORKFLOW),
+            ('push', 'devbox', builder.PLATFORM_WORKFLOW),
+            ('schedule', 'development', builder.AGENT_WORKFLOW),
+            ('workflow_dispatch', 'development', builder.AGENT_WORKFLOW),
+        ):
+            with self.subTest(event=event, role=role):
+                summary = self.root / 'step-summary'
+                summary.unlink(missing_ok=True)
+                env = self.for_push(GITHUB_EVENT_NAME=event, GITHUB_STEP_SUMMARY=str(summary),
+                                    GITHUB_WORKFLOW_REF=publisher.REPOSITORY + '/' + workflow + '@refs/heads/main')
+                export = None if event == 'pull_request' else builder.Export(role, self.root / 'artifact')
+                with mock.patch.dict(os.environ, env, clear=True), redirect_stdout(io.StringIO()) as log:
+                    probe = ci.Probe(self.source, self.root, role if role != 'devbox' else 'maintenance', release=export)
+                    probe.finish_report()
+                output = json.loads(log.getvalue().split(' ', 1)[1])
+                self.assertEqual((output['workflow'], output['workflow_sha256'], output['scenario']),
+                                 (workflow, ci.file_hash(ROOT / workflow), role))
+                self.assertEqual(output['trigger']['run_id'], '12345')
+                if export is None:
+                    self.assertIn('label', output['trigger'])
+                    self.assertIn('No artifact/cache uploads', summary.read_text())
+                    self.assertEqual(output['limits']['vm_seconds'], ci.VM_SECONDS)
+                else:
+                    self.assertNotIn('label', output['trigger'])
+                    self.assertEqual(output['trigger']['event'], event)
+                    self.assertEqual(output['limits']['release_storage_bytes'], builder.EXPORT_VOLUME)
+                    self.assertIn('uploads a successful role export', summary.read_text())
+                    if role == 'devbox':
+                        self.assertNotIn('vm_seconds', output['limits'])
+                        self.assertEqual(output['limits']['outer_build_seconds'], builder.OUTER_SECONDS)
+                    else:
+                        self.assertEqual(output['limits']['vm_seconds'], ci.VM_SECONDS - guest.PLATFORM_VERIFY_SECONDS)
+                    if event == 'schedule':
+                        self.assertEqual(output['trigger']['schedule'], builder.AGENT_SCHEDULE)
+
+    def test_outer_role_reports_verified_output_but_withholds_success_after_cleanup_failure(self):
+        with mock.patch.dict(os.environ, self.for_push(), clear=True):
+            probe = ci.Probe(self.source, self.root, release=builder.Export('devbox', self.root / 'output'))
+            with (
+                mock.patch.object(Path, 'is_file', return_value=True),
+                mock.patch.object(probe, 'preflight', side_effect=lambda:
+                                  probe.phase('runner-preflight', 'pass', 'local preflight fixture')),
+                mock.patch.object(builder, 'build_devbox'),
+                mock.patch.object(probe, 'cleanup', side_effect=ci.Blocked('owned cleanup unresolved')),
+                redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual(builder.execute_devbox(probe), 2)
+        report = json.loads(next(line.removeprefix('DP_REPORT ') for line in output.getvalue().splitlines()
+                                 if line.startswith('DP_REPORT ')))
+        self.assertEqual(report['scenario'], 'devbox')
+        self.assertEqual(report['phases']['outer-devbox']['status'], 'pass')
+        self.assertEqual(report['phases']['cleanup']['status'], 'fail')

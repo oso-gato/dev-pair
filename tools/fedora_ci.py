@@ -777,12 +777,17 @@ class Probe:
         self.image_copy_active = False
         self.engine_activity = False
         self.primary_image_failure = None
+        if release is None:
+            workflow = '.github/workflows/fedora-vm.yml'
+            trigger = {'run_id': os.environ.get('GITHUB_RUN_ID'), 'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
+                       'label_actor': os.environ.get('GITHUB_ACTOR'), 'label': NATIVE_LABEL_PREFIX[scenario] + source}
+        else:
+            workflow, trigger = release.report_identity()
         self.report = {'version': REPORT_VERSION, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
                        'controller_sha256': file_hash(pathlib.Path(__file__)),
-                       'workflow_sha256': file_hash(self.repo / '.github/workflows/fedora-vm.yml'),
+                       'workflow': workflow, 'workflow_sha256': file_hash(self.repo / workflow),
                        'storage_controller_sha256': file_hash(pathlib.Path(kernel_storage.__file__)),
-                       'trigger': {'run_id': os.environ.get('GITHUB_RUN_ID'), 'run_attempt': os.environ.get('GITHUB_RUN_ATTEMPT'),
-                                   'label_actor': os.environ.get('GITHUB_ACTOR'), 'label': NATIVE_LABEL_PREFIX[scenario] + source},
+                       'trigger': trigger,
                        'phases': {name: {'status': 'blocked', 'detail': 'Not reached'}
                                   for name in (PHASES if scenario == 'maintenance' else (*PHASES[:5], *DEVELOPMENT_PHASES, 'cleanup'))},
                        'limits': {'overlay_bytes': OVERLAY_LIMIT, 'host_reserve_bytes': HOST_RESERVE,
@@ -796,6 +801,8 @@ class Probe:
                                   'cpus': 3, 'memory_bytes': 8 * GIB, 'guest_cpus': 2, 'guest_memory_bytes': 6 * GIB},
                        'hostinger_acceptance': False, 'job_admission': False}
         self.report['scenario'] = scenario
+        if release is not None:
+            release.report_profile(self)
         self.engine_env = {**SAFE_ENV, 'TMPDIR': str(self.root / 'tmp'), 'HOME': str(self.root / 'home'),
                            'XDG_RUNTIME_DIR': str(self.root / 'runtime'), 'REGISTRY_AUTH_FILE': str(self.root / 'empty-auth.json'),
                            'CONTAINERS_CONF_OVERRIDE': str(self.root / 'containers.conf')}
@@ -977,7 +984,8 @@ class Probe:
         release = pathlib.Path('/etc/os-release').read_text()
         require('ID=ubuntu' in release and 'VERSION_ID="24.04"' in release, 'only ubuntu-24.04 standard runner supported')
         require(re.fullmatch('[0-9a-f]{40}', self.source), 'invalid exact source SHA')
-        require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source, 'checkout differs from exact PR head')
+        require(run_small(['/usr/bin/git', '-C', str(self.repo), 'rev-parse', 'HEAD']).decode().strip() == self.source,
+                'checkout differs from the exact admitted source')
         require(not run_small(['/usr/bin/git', '-C', str(self.repo), 'status', '--porcelain']), 'source checkout must be clean')
         for command in ('/usr/bin/podman', '/usr/bin/gpg', '/usr/bin/git', '/usr/bin/sudo',
                         '/usr/bin/timeout', '/usr/bin/prlimit', '/usr/bin/python3', '/usr/bin/slirp4netns',
@@ -1001,8 +1009,9 @@ class Probe:
         version = run_small(self.podman + ['version', '--format=json']).decode()
         self.report['runner'] = {'kernel': os.uname().release, 'image_version': os.environ.get('ImageVersion', 'unreported'),
                                  'podman': json.loads(version), 'slirp_version': evidence_tail(slirp_version, 1000), 'memory_bytes': mem,
-                                 'slirp_required_features': list(slirp_features), 'slirp_help_sha256': sha256(slirp_help),
-                                 'merge_sha': os.environ.get('DP_MERGE_SOURCE', 'unreported')}
+                                 'slirp_required_features': list(slirp_features), 'slirp_help_sha256': sha256(slirp_help)}
+        if self.release is None:
+            self.report['runner']['merge_sha'] = os.environ.get('DP_MERGE_SOURCE', 'unreported')
         self.phase('runner-preflight', 'pass', 'Actual standard-runner OS/source/tools/capacity checked; no host packages installed')
 
     def inputs(self):
@@ -1297,17 +1306,26 @@ class Probe:
             except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
                 self.phase('cleanup', 'fail', 'Owned development VM cleanup could not be verified'
                            if self.scenario == 'development' else str(exc))
-            emit_json('DP_REPORT', self.report)
-            summary = os.environ.get('GITHUB_STEP_SUMMARY')
-            if summary:
-                with open(summary, 'a') as output:
-                    output.write('### Fedora 44 VM component probe\n\n')
-                    output.write('Source: `' + self.source + '`; Hostinger/pair acceptance: **unverified**.\n\n')
-                    for name, phase in self.report['phases'].items():
-                        output.write('- ' + name + ': **' + phase['status'] + '** — ' + sanitize(phase['detail'], 500).replace('\n', ' ') + '\n')
-                    output.write('\nNo artifact/cache uploads, secrets, enrollment or model calls.\n')
+            self.finish_report()
         # Passing is exact-candidate disposable VM component evidence only.
         return 0 if all(p['status'] == 'pass' for p in self.report['phases'].values()) else 2
+
+    def finish_report(self):
+        emit_json('DP_REPORT', self.report)
+        summary = os.environ.get('GITHUB_STEP_SUMMARY')
+        if not summary:
+            return
+        with open(summary, 'a') as output:
+            heading = 'Fedora 44 VM component probe' if self.release is None else 'Protected Fedora platform build'
+            output.write(f'### {heading}\n\n')
+            output.write(f'Source `{self.source}`. Hostinger and pair acceptance are **unverified**.\n\n')
+            for name, phase in self.report['phases'].items():
+                output.write('- ' + name + ': **' + phase['status'] + '** — ' + sanitize(phase['detail'], 500).replace('\n', ' ') + '\n')
+            if self.release is None:
+                output.write('\nNo artifact/cache uploads, secrets, enrollment or model calls.\n')
+            else:
+                output.write('\nThe workflow uploads a successful role export after verified teardown. '
+                             'A separate publication job attests the portable index.\n')
 
 
 def main():

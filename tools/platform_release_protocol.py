@@ -14,6 +14,7 @@ ARCHIVE_LIMIT = 2 * GIB
 EXPANSION_LIMIT = 8 * GIB
 HOST_LIMIT = 32 * MIB
 CONTROL_LIMIT = 64 * 1024
+UPSTREAM_RELEASE_LIMIT = MIB
 BLOCK_SIZE = MIB
 MAGIC = b'DEV-PAIR-PLATFORM-ARCHIVE-v1\n'
 END = b'\nDEV-PAIR-PLATFORM-END-v1\n'
@@ -41,13 +42,23 @@ def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
-def json_bytes(data):
+def bounded_json(data, maximum, reason):
     def unique(rows):
         result = dict(rows)
         require(len(result) == len(rows), 'duplicate release field')
         return result
-    require(len(data) <= CONTROL_LIMIT, 'release metadata exceeds its bound')
+    require(0 < len(data) <= maximum, reason)
     return json.loads(data, object_pairs_hook=unique)
+
+
+def json_bytes(data):
+    return bounded_json(data, CONTROL_LIMIT, 'release metadata exceeds its bound')
+
+
+def upstream_release_json(data):
+    value = bounded_json(data, UPSTREAM_RELEASE_LIMIT, 'official release metadata exceeds its bound')
+    require(type(value) is dict, 'official release metadata must be an object')
+    return value
 
 
 def fields(value, names):
