@@ -21,8 +21,9 @@ ANSWERS = {'first': 'Initial job work saved.', 'next': 'Resumed original job wor
 
 
 class MockProvider:
-    def __init__(self, operation):
+    def __init__(self, operation, *, early_eof=False):
         self.operation = operation
+        self.early_eof = early_eof
         self.calls = []
 
     def responses(self, raw, _deadline):
@@ -33,11 +34,14 @@ class MockProvider:
         assert PROMPTS[self.operation].decode() in text
         assert all(f'Synthetic fixture document {name}' in text for name in runtime.STARTUP_IDS)
         self.calls.append({'model': body['model'], 'effort': body['reasoning']['effort']})
+        if self.early_eof and len(self.calls) == 1:
+            result = FakeResponse(b'')
+            return result, result
         response = {'id': 'resp_fixture_' + self.operation, 'model': MODEL,
                     'usage': {'input_tokens': 100, 'output_tokens': 12, 'total_tokens': 112}}
         item = {'id': 'msg_fixture_' + self.operation, 'type': 'message', 'role': 'assistant',
                 'content': [{'type': 'output_text', 'text': ANSWERS[self.operation]}]}
-        if self.operation == 'first':
+        if self.operation == 'first' and not self.early_eof:
             if len(self.calls) == 1:
                 item = {'type': 'function_call', 'id': 'fc_fixture_pwd', 'call_id': 'call_fixture_pwd',
                         'name': 'exec_command', 'arguments': json.dumps({'cmd': 'pwd', 'workdir': '/work/job'})}
@@ -151,13 +155,13 @@ def setup_mode(netns, operation, request_sha):
     os.execve(args[0], args, {'PATH': '/usr/bin:/bin'})
 
 
-def run(binary):
+def run(binary, *, ambiguous_retry=False):
     results = []
     with tempfile.TemporaryDirectory(prefix='dp-live-fixture-') as tmp:
         root = Path(tmp)
         runner = state.Harness(root, binary)
         f, details, approval = fixtures(root / 'role', runner)
-        for operation in ('first', 'next'):
+        for operation in (('first',) if ambiguous_retry else ('first', 'next')):
             identity = {**details, 'operation': operation, 'turn_seconds': 8,
                         'prompt_sha256': hashlib.sha256(PROMPTS[operation]).hexdigest()}
             if results:
@@ -173,7 +177,7 @@ def run(binary):
             channel.chmod(0o750)
             permission = {**grant(request_sha), 'max_request_bytes': 262144, 'spend_microusd': 3200}
             evidence = broker.Journal(root / f'{operation}.json', identity, permission)
-            provider = MockProvider(operation)
+            provider = MockProvider(operation, early_eof=ambiguous_retry)
             end = time.monotonic() + 12
             worker = threading.Thread(target=broker.listen, args=(channel / 'responses.sock', provider, identity,
                                                                   permission, evidence, end), daemon=True)
@@ -182,7 +186,7 @@ def run(binary):
                 while evidence.value['status'] != 'listening':
                     assert worker.is_alive() and end - time.monotonic() > 10
                     time.sleep(.01)
-                if operation == 'first':
+                if operation == 'first' and not ambiguous_retry:
                     approval_file = f / operation / 'approval.json'
                     approval_file.unlink()
                     write(approval_file, broker.canonical({**approval, 'startup_project_revision': '0' * 40}))
@@ -206,6 +210,16 @@ def run(binary):
                     assert not provider.calls
                     subprocess.run([*command, 'https://github.com/owner/product.git'], check=True)
                 result = execute(f, runner.binary, operation, request_sha, channel, end)
+                if ambiguous_retry:
+                    row, = evidence.value['attempts']
+                    assert result['status'] == 'failed-turn' and result['owned_cleanup'] == 'reaped'
+                    assert provider.calls == [{'model': MODEL, 'effort': 'high'}]
+                    assert row['status'] == 'effect-uncertain' and row['reserved_microusd'] > 0
+                    blocked = evidence.value['repeat_blocked']
+                    assert blocked == {'reason': 'earlier-effect-unresolved', 'attempt': 1,
+                                       'request_body_sha256': row['request_body_sha256']}
+                    results.append({'turn': result, 'attempt': row, 'repeat_blocked': blocked, 'mock_post_count': 1})
+                    continue
                 if result['status'] != 'completed-turn':
                     diagnostic = f / 'state/turns' / operation
                     raise RuntimeError(str(result) + (diagnostic / 'stderr.txt').read_text()[-1600:] +
@@ -225,7 +239,12 @@ def run(binary):
             finally:
                 worker.join(12)
                 assert not worker.is_alive()
-        assert results[0]['session_uuid'] == results[1]['session_uuid']
+        if not ambiguous_retry:
+            assert results[0]['session_uuid'] == results[1]['session_uuid']
+    if ambiguous_retry:
+        print(json.dumps({'binary_sha256': state.CODEX_SHA, 'provider': 'synthetic-early-eof',
+                          'owned_cleanup': True, **results[0]}))
+        return
     print(json.dumps({'binary_sha256': state.CODEX_SHA, 'results': results, 'owned_cleanup': True,
                       'provider': 'synthetic-stream', 'native_selinux_tested': False, 'tool_result_observed': True,
                       'wrong_origin_provider_attempts': 0, 'wrong_startup_revision_provider_attempts': 0,
@@ -235,6 +254,8 @@ def run(binary):
 if __name__ == '__main__':
     if len(sys.argv) == 2:
         run(Path(sys.argv[1]))
+    elif len(sys.argv) == 3 and sys.argv[2] == '--ambiguous-retry':
+        run(Path(sys.argv[1]), ambiguous_retry=True)
     elif sys.argv[1] == 'setup':
         setup_mode(*sys.argv[2:])
     elif sys.argv[1] == 'inner':

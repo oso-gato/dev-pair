@@ -210,7 +210,7 @@ class ProviderGatewayTests(unittest.TestCase):
             self.assertEqual(self.post(port, data=request(model='gpt-6.2-astra'))[0], 400)
             self.assertEqual(self.post(port, data=request(tools=[{'type': 'web_search'}]))[0], 400)
             self.assertEqual(self.post(port), (200, events()))
-            self.assertEqual(self.post(port)[0], 429)
+            self.assertEqual(self.post(port)[0], 409)
             self.assertEqual(len(api.bodies), 1)
             self.assertEqual(api.bodies[0]['service_tier'], 'default')
             self.assertEqual(api.bodies[0]['max_output_tokens'], 32)
@@ -231,7 +231,9 @@ class ProviderGatewayTests(unittest.TestCase):
             self.assertNotIn(b'gpt-6.2-astra', body)
             self.assertEqual(len(api.bodies), 1)
         entry, = json.loads(self.receipt.read_bytes())['attempts']
-        self.assertEqual(entry['status'], 'effect-uncertain')
+        self.assertEqual(entry['status'], 'billing-bound-violated')
+        self.assertEqual(entry['billing_violation'], 'unpriced-model')
+        self.assertEqual(entry['unpriced_model_sha256'], hashlib.sha256(b'gpt-6.2-astra').hexdigest())
         self.assertNotIn('observed_model', entry)
 
     def test_sanitizes_a_late_provider_error_after_stream_started(self):
@@ -263,7 +265,7 @@ class ProviderGatewayTests(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertIn(broker.FAILED_FRAME, body)
             self.assertNotIn(b'response.completed', body)
-            self.assertEqual(self.post(port)[0], 429)
+            self.assertEqual(self.post(port)[0], 409)
             allowance.quarantine.assert_called_once()
             self.assertEqual(len(api.bodies), 1)
         entry, = json.loads(self.receipt.read_bytes())['attempts']
@@ -342,16 +344,36 @@ class SharedAllowanceTests(unittest.TestCase):
         custody.start()
         self.addCleanup(custody.stop)
 
+    def increase_fixture_cap(self):
+        self.policy['spend_microusd'] = 4352
+        raw = broker.canonical(self.policy)
+        (self.job / 'allowance.json').write_bytes(raw)
+        self.digest = hashlib.sha256(raw).hexdigest()
+        self.grant.update(allowance_sha256=self.digest, spend_microusd=4352)
+
+    def submit(self, api, allowance, chosen, grant_value, journal, payload):
+        client, server = socket.socketpair()
+        with client, server:
+            client.settimeout(2)
+            client.sendall(bytes.fromhex(grant_value['request_sha256']) + struct.pack('!I', len(payload)) + payload)
+            broker.forward(server, api, chosen, grant_value, journal, time.monotonic() + 2, allowance=allowance)
+            status, = struct.unpack('!H', runtime.receive_exact(client, 2))
+            return status
+
     def test_held_cost_is_shared_across_role_and_grant_and_survives_reopen(self):
         allowance = broker.load_allowance('sample', self.digest)
         allowance.validate_grant(self.selection, self.grant)
         self.assertEqual(broker.remaining_allowance('sample', self.digest)['remaining_microusd'], 1900)
         self.assertFalse((self.job / 'usage.sqlite').exists())
-        self.assertTrue(allowance.reserve(self.selection, self.grant, 1, 1088))
+        self.assertTrue(allowance.reserve(self.selection, self.grant, 1, 1088, 'c' * 64))
         other = {**self.selection, 'role': 'maintenance', 'operation': 'second'}
         next_grant = {**self.grant, 'request_sha256': 'b' * 64}
         reopened = broker.load_allowance('sample', self.digest)
-        self.assertFalse(reopened.reserve(other, next_grant, 1, 1088))
+        self.assertEqual(reopened.remaining()['status'], 'unresolved')
+        self.assertEqual(reopened.remaining()['remaining_microusd'], 0)
+        self.assertFalse(reopened.reserve(other, next_grant, 1, 1088, 'd' * 64))
+        allowance.finish(self.selection, self.grant, 1, 'c' * 64, 'uncertain')
+        self.assertFalse(reopened.reserve(other, next_grant, 1, 1088, 'd' * 64))
         self.assertEqual(reopened.remaining()['remaining_microusd'], 812)
         reopened.quarantine()
         self.assertEqual(broker.remaining_allowance('sample', self.digest)['status'], 'quarantined')
@@ -365,6 +387,62 @@ class SharedAllowanceTests(unittest.TestCase):
             self.assertFalse(overlapping)
         with second.network_lease() as recovered:
             self.assertTrue(recovered)
+
+    def test_uncertain_request_fences_normalized_retry_and_different_next_body(self):
+        self.increase_fixture_cap()
+        allowance = broker.load_allowance('sample', self.digest)
+        journal = broker.Journal(self.root / 'ambiguous.json', self.selection, self.grant)
+        api = FakeProvider(b'')
+        self.assertEqual(self.submit(api, allowance, self.selection, self.grant, journal, request()), 502)
+        attempt, = journal.value['attempts']
+        self.assertEqual(attempt['status'], 'effect-uncertain')
+        # Client telemetry is removed by normalization.
+        retry = request(client_metadata={'retry': 'different input bytes'})
+        self.assertEqual(self.submit(api, allowance, self.selection, self.grant, journal, retry), 409)
+        self.assertEqual(journal.value['repeat_blocked'], {'reason': 'earlier-effect-unresolved', 'attempt': 1,
+                                                        'request_body_sha256': attempt['request_body_sha256']})
+        reopened = broker.load_allowance('sample', self.digest)
+        self.assertEqual(reopened.remaining()['status'], 'available')
+        self.assertEqual(reopened.remaining()['reserved_microusd'], 1088)
+        self.assertFalse(reopened.reserve(self.selection, self.grant, 2, 1088, 'c' * 64))
+        self.assertEqual(len(api.bodies), 1)
+
+    def test_completed_effect_allows_distinct_next_request_but_fences_replay(self):
+        self.increase_fixture_cap()
+        allowance = broker.load_allowance('sample', self.digest)
+        journal = broker.Journal(self.root / 'tool.json', self.selection, self.grant)
+        api = FakeProvider(events())
+        self.assertEqual(self.submit(api, allowance, self.selection, self.grant, journal, request()), 200)
+        self.assertEqual(self.submit(api, allowance, self.selection, self.grant, journal, request()), 409)
+        different = request(input=[{'type': 'function_call_output', 'call_id': 'call_fixture', 'output': '/work/job'}])
+        self.assertEqual(self.submit(api, allowance, self.selection, self.grant, journal, different), 200)
+        self.assertEqual([row['status'] for row in journal.value['attempts']], ['completed', 'completed'])
+        self.assertEqual(len(api.bodies), 2)
+        self.assertEqual(allowance.remaining()['reserved_microusd'], 2176)
+
+    def test_unpriced_model_in_failed_frame_quarantines_both_roles_without_usage(self):
+        self.increase_fixture_cap()
+        allowance = broker.load_allowance('sample', self.digest)
+        journal = broker.Journal(self.root / 'unpriced.json', self.selection, self.grant)
+        reported = 'synthetic-unpriced-identity'
+        api = FakeProvider(broker.sse('response.failed', {'type': 'response.failed', 'response': {
+            'model': reported, 'error': {'message': 'synthetic private diagnostic'}}}))
+        self.assertEqual(self.submit(api, allowance, self.selection, self.grant, journal, request()), 502)
+        raw = journal.path.read_bytes()
+        self.assertNotIn(reported.encode(), raw)
+        self.assertNotIn(b'private diagnostic', raw)
+        attempt, = json.loads(raw)['attempts']
+        self.assertEqual(attempt['status'], 'billing-bound-violated')
+        self.assertEqual(attempt['unpriced_model_sha256'], hashlib.sha256(reported.encode()).hexdigest())
+        self.assertTrue(attempt['quarantine_recorded'])
+        other = {**self.selection, 'role': 'maintenance', 'operation': 'different'}
+        other_grant = {**self.grant, 'request_sha256': 'b' * 64}
+        later = broker.Journal(self.root / 'other.json', other, other_grant)
+        reopened = broker.load_allowance('sample', self.digest)
+        self.assertEqual(reopened.remaining()['status'], 'quarantined')
+        self.assertEqual(self.submit(api, reopened, other, other_grant, later, request()), 429)
+        self.assertEqual(len(api.bodies), 1)
+        self.assertFalse(later.value['attempts'])
 
     def test_job_rejects_unproven_context_and_missing_or_changed_pricing(self):
         allowance = broker.load_allowance('sample', self.digest)

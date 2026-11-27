@@ -159,8 +159,19 @@ context length provides no launch authority.
 The broker reserves the full verified input ceiling plus forced maximum
 output before each POST. Every role and future turn for the job uses the same
 transactional `usage.sqlite` reservation ledger. An uncertain effect still
-consumes its reservation. Usage or tier outside the verified contract
-quarantines the job allowance and withholds completion. In-band provider
+consumes its reservation. The transaction binds the normalized request hash
+to the operation and attempt before the POST. The broker refuses another
+POST for that operation after an uncertain effect, and refuses an identical
+normalized body after completion. A completed request can still lead to a
+distinct tool continuation. The receipt identifies a blocked repeat and the
+original attempt. Reconcile the original effect before issuing a new operation.
+
+Usage, service tier or a reported model outside the verified tariff contract
+quarantines the shared job allowance and withholds completion. An unexpected
+model is recorded only as a digest. A missing model observation leaves the
+operation's effect uncertain. If a crash or storage failure leaves a pending
+reservation without a durable outcome, the whole allowance reports
+`unresolved` with zero remaining capacity until inspected. In-band provider
 failures are forwarded as fixed diagnostics after bounded SSE parsing.
 
 The protected receipt records reservations, observed model and usage and
@@ -231,6 +242,7 @@ an isolated Linux user/network namespace with bubblewrap.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 tests/role_job_stock.py "$PINNED_CODEX"
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 tests/role_job_stock.py "$PINNED_CODEX" --ambiguous-retry
 ```
 
 Both tests use synthetic data and no real provider call. The stock fixture

@@ -188,21 +188,33 @@ class JobAllowance:
         require(type(amount) is int and 0 <= amount <= self.approval['spend_microusd'], 'invalid provider reservations')
         return row[0][1], amount
 
+    @staticmethod
+    def pending_effect(db, reserved):
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='request_effect'").fetchone() is None:
+            return reserved > 0
+        return db.execute('SELECT 1 FROM hold LEFT JOIN request_effect USING(role, operation, attempt)'
+                          " WHERE request_effect.state IS NULL OR request_effect.state NOT IN ('completed', 'uncertain')"
+                          ' LIMIT 1').fetchone() is not None
+
     def remaining(self):
         quarantined = reserved = 0
+        pending = False
         if os.path.lexists(self.path):
             with self.connection() as db:
+                db.execute('BEGIN')
                 quarantined, reserved = self.read_state(db)
+                pending = self.pending_effect(db, reserved)
         expired = time.time() >= self.approval['expires_unix']
-        status = 'quarantined' if quarantined else 'expired' if expired else 'available'
+        status = 'quarantined' if quarantined else 'unresolved' if pending else 'expired' if expired else 'available'
         remaining = self.approval['spend_microusd'] - reserved if status == 'available' else 0
         return {'job': self.approval['job'], 'allowance_sha256': self.digest, 'spend_microusd': self.approval['spend_microusd'],
                 'expires_unix': self.approval['expires_unix'], 'status': status, 'reserved_microusd': reserved,
                 'remaining_microusd': remaining}
 
-    def reserve(self, selection, grant, number, amount):
+    def reserve(self, selection, grant, number, amount, body_sha):
         require(type(amount) is int and amount == reserved_cost(grant) > 0 and grant['allowance_sha256'] == self.digest,
                 'provider request lacks its exact full reservation')
+        require(type(body_sha) is str and HEX_SHA.fullmatch(body_sha), 'provider request lacks normalized identity')
         raw = protected_file(self.root / 'allowance.json', 16384)
         require(hashlib.sha256(raw).hexdigest() == self.digest, 'provider allowance was revoked or changed')
         with self.connection(writable=True) as db, db:
@@ -211,14 +223,36 @@ class JobAllowance:
             db.execute('CREATE TABLE IF NOT EXISTS allowance(digest TEXT PRIMARY KEY, quarantined INTEGER NOT NULL)')
             db.execute('CREATE TABLE IF NOT EXISTS hold(role TEXT, operation TEXT, attempt INTEGER, digest TEXT, amount INTEGER,'
                        ' PRIMARY KEY(role, operation, attempt))')
+            db.execute('CREATE TABLE IF NOT EXISTS request_effect(role TEXT, operation TEXT, attempt INTEGER,'
+                       " body_sha256 TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending', 'completed', 'uncertain')),"
+                       ' PRIMARY KEY(role, operation, attempt),'
+                       ' UNIQUE(role, operation, body_sha256))')
             db.execute('INSERT INTO allowance SELECT ?, 0 WHERE NOT EXISTS (SELECT 1 FROM allowance)', (self.digest,))
             quarantined, reserved = self.read_state(db)
             if (quarantined or time.time() >= self.approval['expires_unix']
-                    or reserved + amount > self.approval['spend_microusd']):
+                    or reserved + amount > self.approval['spend_microusd'] or self.pending_effect(db, reserved)):
                 return False
-            db.execute('INSERT INTO hold VALUES(?, ?, ?, ?, ?)', (selection['role'], selection['operation'],
-                                                                  number, grant['request_sha256'], amount))
+            role_job = (selection['role'], selection['operation'])
+            if db.execute('SELECT 1 FROM request_effect WHERE role = ? AND operation = ?'
+                          " AND (state <> 'completed' OR body_sha256 = ?) LIMIT 1", (*role_job, body_sha)).fetchone():
+                return False
+            db.execute('INSERT INTO hold VALUES(?, ?, ?, ?, ?)', (*role_job, number, grant['request_sha256'], amount))
+            db.execute('INSERT INTO request_effect VALUES(?, ?, ?, ?, ?)', (*role_job, number, body_sha, 'pending'))
         return True
+
+    def finish(self, selection, grant, number, body_sha, state):
+        require(state in ('completed', 'uncertain'), 'invalid completed provider reservation state')
+        with self.connection(writable=True) as db, db:
+            db.execute('PRAGMA synchronous=FULL')
+            db.execute('BEGIN IMMEDIATE')
+            self.read_state(db)
+            bound = db.execute('SELECT digest FROM hold WHERE role = ? AND operation = ? AND attempt = ?',
+                               (selection['role'], selection['operation'], number)).fetchone()
+            require(bound == (grant['request_sha256'],), 'provider settlement request identity changed')
+            changed = db.execute('UPDATE request_effect SET state = ? WHERE role = ? AND operation = ?'
+                                 " AND attempt = ? AND body_sha256 = ? AND state = 'pending'",
+                                 (state, selection['role'], selection['operation'], number, body_sha)).rowcount
+            require(changed == 1, 'provider settlement effect identity changed')
 
     def quarantine(self):
         with self.connection(writable=True) as db, db:
@@ -344,22 +378,29 @@ class EventWitness:
         self.event = None
         self.seen = 0
 
-    def response_field(self, item):
-        response = item.get('response')
-        require(type(response) is dict and response.get('model') in self.grant['observed_models'],
-                'provider returned an unapproved model')
-        if response.get('service_tier') not in (None, 'default'):
-            self.billing_violation()
+    def observe_model(self, model):
+        if type(model) is not str or not model.strip():
+            return False
+        if model not in self.grant['observed_models']:
+            self.attempt['unpriced_model_sha256'] = hashlib.sha256(model.encode('utf-8', errors='surrogatepass')).hexdigest()
+            self.billing_violation('unpriced-model')
         if 'observed_model' in self.attempt:
-            require(response['model'] == self.attempt['observed_model'], 'provider model identity changed within request')
+            require(model == self.attempt['observed_model'], 'provider model identity changed within request')
         else:
-            self.attempt['observed_model'] = response['model']
+            self.attempt['observed_model'] = model
+        return True
+
+    def response_field(self, response):
+        require(type(response) is dict and self.observe_model(response.get('model')), 'provider model identity unavailable')
+        if response.get('service_tier') not in (None, 'default'):
+            self.billing_violation('unpriced-service-tier')
         return response
 
-    def billing_violation(self):
-        self.attempt['status'] = 'billing-bound-violated'
+    def billing_violation(self, cause):
+        self.attempt.update(status='billing-bound-violated', billing_violation=cause)
         if self.allowance:
             self.allowance.quarantine()
+            self.attempt['quarantine_recorded'] = True
         raise RuntimeError('provider exceeded its approved billable bound')
 
     def usage(self, response):
@@ -370,7 +411,7 @@ class EventWitness:
         self.attempt.update(usage={key: usage[key] for key in USAGE_FIELDS}, observed_cost_upper_microusd=cost)
         if (usage['input_tokens'] > self.grant['max_context_tokens'] or usage['output_tokens'] > self.grant['max_output_tokens']
                 or cost > self.attempt['reserved_microusd']):
-            self.billing_violation()
+            self.billing_violation('usage-exceeded-bound')
 
     def frame(self, name, data):
         item = json.loads(data, object_pairs_hook=unique_object)
@@ -378,20 +419,27 @@ class EventWitness:
         kind = item['type']
         require(name in (None, kind) or name == 'error', 'provider frame identity differs')
         response = item.get('response')
+        self.observe_model(item.get('model'))
         if (kind in ('response.failed', 'response.incomplete', 'error') or name == 'error'
                 or item.get('error') is not None or type(response) is dict and response.get('error') is not None):
-            if type(response) is dict and response.get('usage') is not None:
-                self.usage(self.response_field(item))
+            if type(response) is dict:
+                self.observe_model(response.get('model'))
+                if response.get('service_tier') not in (None, 'default'):
+                    self.billing_violation('unpriced-service-tier')
+                if response.get('usage') is not None:
+                    self.usage(self.response_field(response))
             self.attempt['status'] = 'provider-stream-failed'
             return FAILED_FRAME
         if kind == 'response.created':
-            response = self.response_field(item)
+            response = self.response_field(response)
             return sse(kind, {'type': kind, 'response': {key: response[key] for key in ('id', 'model') if key in response}})
         if kind == 'response.completed':
-            response = self.response_field(item)
+            response = self.response_field(response)
             self.usage(response)
             self.attempt['status'] = 'completed'
             return sse(kind, {'type': kind, 'response': {key: response[key] for key in ('id', 'model', 'usage') if key in response}})
+        if type(response) is dict:
+            self.observe_model(response.get('model'))
         if kind in OUTPUT_EVENTS:
             require('observed_model' in self.attempt, 'provider output preceded verified model identity')
             return sse(kind, item)
@@ -473,6 +521,21 @@ class Journal:
         os.replace(stage, self.path)
         sync_directory(self.path.parent)
 
+    def block_repeat(self, body_sha):
+        for attempted in self.value['attempts']:
+            if attempted['status'] != 'completed':
+                reason = 'earlier-effect-unresolved'
+            elif attempted['request_body_sha256'] == body_sha:
+                reason = 'normalized-request-already-sent'
+            else:
+                continue
+            if 'repeat_blocked' not in self.value:
+                self.value['repeat_blocked'] = {'reason': reason, 'attempt': attempted['number'],
+                                               'request_body_sha256': body_sha}
+                self.update()
+            return True
+        return False
+
 
 def bounded_peer(channel, grant, expected_label):
     _, uid, gid = struct.unpack('3i', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
@@ -500,6 +563,7 @@ def provider_alarm(deadline, enabled):
 
 def forward(channel, provider, selection, grant, journal, deadline, expected_label=None, allowance=None):
     started = False
+    sent_complete = False
     attempt = None
     status = 400
     resources = ExitStack()
@@ -518,6 +582,11 @@ def forward(channel, provider, selection, grant, journal, deadline, expected_lab
             status = 413
             return
         payload = responses_request(receive_exact(channel, size, input_end), selection, grant)
+        body_sha = hashlib.sha256(payload).hexdigest()
+        status = 409
+        if journal.block_repeat(body_sha):
+            return
+        status = 400
         reserved = reserved_cost(grant)
         if (len(journal.value['attempts']) >= grant['max_requests'] or
                 (len(journal.value['attempts']) + 1) * reserved > grant['spend_microusd']):
@@ -529,11 +598,11 @@ def forward(channel, provider, selection, grant, journal, deadline, expected_lab
         number = len(journal.value['attempts']) + 1
         if allowance:
             if (not resources.enter_context(allowance.network_lease())
-                    or not allowance.reserve(selection, grant, number, reserved)):
+                    or not allowance.reserve(selection, grant, number, reserved, body_sha)):
                 status = 429
                 return
         attempt = {'number': number, 'status': 'reserved',
-                   'request_bytes': len(payload), 'request_body_sha256': hashlib.sha256(payload).hexdigest(),
+                   'request_bytes': len(payload), 'request_body_sha256': body_sha,
                    'reserved_microusd': reserved, 'peer_uid_gid_verified': True, 'peer_selinux_verified': bool(expected_label)}
         journal.value['attempts'].append(attempt)
         journal.update()
@@ -558,10 +627,11 @@ def forward(channel, provider, selection, grant, journal, deadline, expected_lab
                         send_frame(channel, frame)
                 require(started and witness.finished() and time.monotonic() < deadline, 'incomplete provider stream')
                 channel.sendall(struct.pack('!I', 0))
+                sent_complete = attempt['status'] == 'completed'
             finally:
                 connection.close()
     except (BrokerExpired, OSError, RuntimeError, ValueError, TypeError, http.client.HTTPException, RecursionError, sqlite3.Error):
-        if attempt is not None and attempt['status'] == 'reserved':
+        if attempt is not None and not sent_complete and attempt['status'] in ('reserved', 'completed'):
             attempt['status'] = 'effect-uncertain'
         if started:
             with suppress(OSError):
@@ -570,7 +640,14 @@ def forward(channel, provider, selection, grant, journal, deadline, expected_lab
     finally:
         try:
             if attempt is not None:
+                if attempt['status'] == 'completed' and not sent_complete:
+                    attempt['status'] = 'effect-uncertain'
                 journal.update()
+                needs_recovery = (attempt['status'] == 'reserved' or
+                                  attempt['status'] == 'billing-bound-violated' and not attempt.get('quarantine_recorded'))
+                if allowance and not needs_recovery:
+                    allowance.finish(selection, grant, attempt['number'], attempt['request_body_sha256'],
+                                     'completed' if sent_complete else 'uncertain')
             if not started:
                 with suppress(OSError):
                     channel.sendall(struct.pack('!H', status))
@@ -661,8 +738,7 @@ def main():
         if journal.value['availability'] != 'available':
             return 2
         listen(args.socket, provider, selection, grant, journal, deadline, channel_label=channel_label, allowance=allowance)
-        uncertain = any(attempt['status'] in ('reserved', 'effect-uncertain', 'billing-bound-violated')
-                        for attempt in journal.value['attempts'])
+        uncertain = any(attempt['status'] != 'completed' for attempt in journal.value['attempts'])
         journal.value['status'] = 'closed-effects-uncertain' if uncertain else 'closed'
         journal.update()
         return 0

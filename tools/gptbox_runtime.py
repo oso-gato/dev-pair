@@ -729,7 +729,7 @@ class LocalResponses(BaseHTTPRequestHandler):
                     require(observed == wanted, 'confined provider socket peer label differs')
                 channel.sendall(self.server.binding + struct.pack('!I', len(body)) + body)
                 status, = struct.unpack('!H', receive_exact(channel, 2, self.server.deadline))
-                require(status in (200, 400, 403, 413, 429, 502, 503), 'invalid provider result')
+                require(status in (200, 400, 403, 409, 413, 429, 502, 503), 'invalid provider result')
                 if status != 200:
                     self.send_error(status)
                     return
