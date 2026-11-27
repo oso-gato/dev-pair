@@ -23,9 +23,37 @@ sudo python3 tools/public_inputs.py extract --role development \
   --output "$PROTECTED_STAGING"
 ```
 
+## Prepare a fresh builder
+
+Use an authorized disposable Fedora 44 x86_64 guest with enforcing SELinux. Run
+the command from the protected extraction above. It accepts the development
+context and the exact extracted source and Distrobox inputs. Supply the allowed
+temporary bootstrap SSH CIDR and a disposable `core` password in a protected
+root-owned file. The caller owns removal of this file.
+
+```sh
+sudo python3 -B "$PROTECTED_STAGING/dev-pair/tools/gptbox.py" prepare-development-host --apply \
+  --source-sha "$REVIEWED_SOURCE_SHA" \
+  --context "$PROTECTED_STAGING/context" \
+  --expected-context-sha256 "$TRUSTED_CONTEXT_SHA256" \
+  --distrobox-source "$PROTECTED_STAGING/distrobox" \
+  --bootstrap-source "$TEMPORARY_BOOTSTRAP_CIDR" \
+  --password-file "$DISPOSABLE_CORE_PASSWORD_FILE"
+```
+
+The command runs the existing host prerequisites under the 600-second native
+preparation budget. When Git is absent it installs only the signed Fedora
+`git-core` prerequisite before verifying the exact source and upstream scripts.
+It publishes `/var/lib/dev-pair/bootstrap/host-ready.json` after successful
+convergence. Image assembly is a separate command. An interrupted preparation requires
+`--retry` with the same inputs and CIDRs. A retry reconciles recorded owned
+native units before host effects, with at most two preparation attempts. Use a
+fresh guest for a different target. The no-`--apply` preview checks the protected
+inputs and reports whether the Git-dependent checks are complete.
+
 ## Assemble and export
 
-Use an authorized enforcing Fedora 44 x86_64 builder with protected bootstrap readiness evidence, rootless Podman and signed bootstrap tooling. The producer checks the recorded host package inventory and the live `dp-maint` identity, private group, subordinate ranges and denied sudo policy before using that account. The prior maintenance bootstrap may have a different source and context. The executor has its own development graph and runroot. It needs signed Fedora package repository access for construction and enough scratch capacity for the candidate and its export. The release archive is limited to 2 GiB and the archive verifier permits up to 8 GiB of expanded layer data. The export checks free capacity for its work files and the existing eight GiB reserve.
+Use an authorized enforcing Fedora 44 x86_64 builder with protected bootstrap readiness evidence, rootless Podman and signed bootstrap tooling. The producer checks the recorded host package inventory and the live `dp-maint` identity, private group, subordinate ranges and denied sudo policy before using that account. A builder prepared with `prepare-development-host` uses that exact development target. A builder provisioned through the existing maintenance bootstrap may have a different source and context. The executor has its own development graph and runroot. It needs signed Fedora package repository access for construction and enough scratch capacity for the candidate and its export. The release archive is limited to 2 GiB and the archive verifier permits up to 8 GiB of expanded layer data. The export checks free capacity for its work files and the existing eight GiB reserve.
 
 ```sh
 sudo python3 "$PROTECTED_STAGING/dev-pair/tools/gptbox.py" build-development --apply \
