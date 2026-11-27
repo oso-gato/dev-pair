@@ -386,25 +386,28 @@ class Commission:
             return report
         policy_sha = digest(raw)
         with self.lock():
-            self.require_first_site(observed['machine_id'], policy['site_config_sha256'])
             applying = os.path.lexists(self.path(PRIVATE + '/intent.json'))
             if applying:
                 prior = parse(self.read(PRIVATE + '/intent.json'))
                 require(prior.get('policy_sha256') == policy_sha,
                         'existing commissioning uses a different protected site authority')
-            placed = all(os.path.lexists(self.path(CONTROL + '/' + name + '.json')) for name in ('current', 'site-current'))
+            selectors = [os.path.lexists(self.path(CONTROL + '/' + name + '.json')) for name in ('current', 'site-current')]
+            placed = all(selectors)
+            can_restore = prepared and not applying and not any(selectors)
+            first_site = self.require_first_site(observed['machine_id'], policy['site_config_sha256'], restore=can_restore)
             if not placed and not checked_parts:
                 self.services.verify_initial_parts(policy['platform_sha256'])
+            restored = (can_restore and first_site is not None and self.services.first_site_profiles_missing(first_site))
+            if restored:
+                self.restore_prepared_site(policy, observed, first_site)
             if host_profile is not None:
                 target, contents = host_profile
                 self.file(target, contents, 0o600)
             site, bundle = self.services.authority(policy)
-            if prepared:
-                self.services.prepare_checklist_pair(self, observed, revision, issue=False)
+            if prepared and not restored:
                 # The native stage checks its own remaining allocation after an
                 # owned apply starts. Its existing backing must not be counted twice.
-                require(self.services.initial_checklist(identity, site, revision, placed=placed or applying) == policy['checklist'],
-                        'observed checklist geometry differs from the protected commissioning policy')
+                self.verify_prepared_checklist(policy, observed, site, placed=placed or applying)
             files = self.package(policy, bundle)
             if action == 'prepare':
                 self.services.configuration(policy, site)
@@ -474,6 +477,24 @@ class Commission:
         if record is not None:
             require(selected == digest(encoded(record['site'])), 'selected site differs from the protected first-site intent')
             self.services.verify_first_site_host(record, restore=restore)
+        return record
+
+    def restore_prepared_site(self, policy, observed, record):
+        # An alternate protected site may have been restored in place of ours.
+        self.initial_site_candidate(observed, restore=True)
+        revision = policy['source_sha']
+        require(record['source_sha'] == revision and record['site']['hostname'] == observed['host'],
+                'prepared first-site intent belongs to another source or host')
+        origin = self.services.first_site_authority(observed, revision)
+        require(record['bootstrap_source_sha'] == origin, 'prepared first-site intent belongs to another bootstrap')
+        self.verify_prepared_checklist(policy, observed, record['site'], placed=False)
+        self.services.publish_first_site(self, record)
+
+    def verify_prepared_checklist(self, policy, observed, site, *, placed):
+        revision = policy['source_sha']
+        self.services.prepare_checklist_pair(self, observed, revision, issue=False)
+        require(self.services.initial_checklist(observed, site, revision, placed=placed) == policy['checklist'],
+                'observed checklist geometry differs from the protected commissioning policy')
 
     def selectors(self, policy, boot, site, intent):
         controller = self.services.renewal()
@@ -804,22 +825,27 @@ class Live:
         require(host == self.default_host_profile(site['hostname']) and site['host_config_sha256'] == host_sha and
                 set(site['jobs']) == {DEFAULT_SITE_SLOT} and site['jobs'][DEFAULT_SITE_SLOT]['storage_bytes'] == DEFAULT_SITE_BYTES,
                 'protected first-site host profile differs from the reviewed default')
-        return self.installer.HOST_CONFIGS / (host_sha + '.json'), host_bytes, site_sha, site_bytes
+        return (self.installer.HOST_CONFIGS / (host_sha + '.json'), host_bytes,
+                self.installer.SITE_CONFIGS / (site_sha + '.json'), site_bytes)
+
+    def first_site_profiles_missing(self, record):
+        host_path, _, site_path, _ = self.first_site_profiles(record)
+        return not os.path.lexists(host_path) or not os.path.lexists(site_path)
 
     def verify_first_site_host(self, record, *, restore):
         host_path, host_bytes, _, _ = self.first_site_profiles(record)
         if not os.path.lexists(host_path):
             if restore:
                 return
-            raise Pending('initial-host-config', 'The recorded first host profile will be restored when commissioning resumes.')
+            raise Pending('initial-host-config', 'The recorded first host profile is missing.')
         require(capture(host_path, 0, mode=0o600, maximum=65536) == host_bytes,
                 'host profile differs from the protected first-site intent')
 
     def publish_first_site(self, app, record):
-        host_path, host_bytes, site_sha, site_bytes = self.first_site_profiles(record)
+        host_path, host_bytes, site_path, site_bytes = self.first_site_profiles(record)
         app.file(str(host_path), host_bytes, 0o600)
-        app.file(str(self.installer.SITE_CONFIGS / (site_sha + '.json')), site_bytes, 0o600)
-        return site_sha
+        app.file(str(site_path), site_bytes, 0o600)
+        return site_path.stem
 
     @staticmethod
     def default_host_profile(hostname):

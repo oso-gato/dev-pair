@@ -407,6 +407,81 @@ class Authorities(unittest.TestCase):
             with self.assertRaisesRegex(c.Blocked, 'differ from the recorded local issuance'):
                 self.live.prepare_checklist_pair(app, observed, source, issue=False)
 
+    def test_prepared_first_site_recovers_only_its_missing_profiles(self):
+        platform, source = self.approved_full()
+        origin = 'e' * 40
+        observed = {'host': 'erebus', 'machine_id': MACHINE, 'boot_id': BOOT, 'arch': 'x86_64',
+                    'pid1': 'systemd', 'selinux': '1', 'os_release': 'ID=fedora\nVERSION_ID=44\n'}
+        host = self.live.default_host_profile(observed['host'])
+        site = {'schema': 1, 'hostname': observed['host'], 'host_config_sha256': c.digest(c.encoded(host)),
+                'jobs': {c.DEFAULT_SITE_SLOT: {'storage_bytes': c.DEFAULT_SITE_BYTES,
+                                              'categories': {'inner': [10, 11], 'outer': [10, 11, 12]}}}}
+        site_sha = c.digest(c.encoded(site))
+        site_path, host_path = self.site / (site_sha + '.json'), self.hosts / (site['host_config_sha256'] + '.json')
+        record = {'schema': 1, 'machine_id': MACHINE, 'source_sha': source, 'bootstrap_source_sha': origin,
+                  'site': site, 'host': host}
+        checklist = {'tls_profile': c.CHECKLIST_SERVER, **c.DEFAULT_CHECKLIST}
+        policy = {'schema': 1, 'source_sha': source, 'machine_id': MACHINE, 'platform_sha256': platform,
+                  'site_config_sha256': site_sha, 'timers': [], 'checklist': checklist}
+        app = c.Commission(self.root, Path('/'), None, 0, self.live)
+        self.live.inventory = lambda revision: observed
+        checked = []
+        self.live.verify_initial_parts = lambda platform: checked.append('parts')
+        self.live.first_site_authority = lambda *a: checked.append('origin') or origin
+        self.live.prepare_checklist_pair = lambda *a, issue: checked.append(('tls', issue))
+        self.live.initial_checklist = lambda *a, placed: checked.append(('capacity', placed)) or checklist
+        self.live.configuration = lambda *a: checked.append('configuration')
+        app.package = lambda *a: {}
+        root = self.root / 'local-policy'
+        with patch.object(c, 'PRIVATE', str(root)), patch.object(c, 'INITIAL_SITE', str(root / 'initial-site.json')), \
+                patch.object(c, 'AUTOMATIC_POLICY', str(root / 'automatic-policy.json')), \
+                patch.object(installer, 'machine', return_value=BOOT):
+            app.directory(c.PRIVATE, 0o700)
+            app.file(c.INITIAL_SITE, c.encoded(record), 0o600)
+            app.file(c.AUTOMATIC_POLICY, c.encoded(policy), 0o600)
+            self.live.publish_first_site(app, record)
+
+            def apply(*args):
+                self.assertEqual((host_path.read_bytes(), site_path.read_bytes()), (c.encoded(host), c.encoded(site)))
+                checked.append('native-apply-entry')
+                return {'phase': 'native-apply-entry'}
+
+            app.apply = apply
+            for action, missing in (('prepare', host_path), ('apply', site_path)):
+                with self.subTest(action=action):
+                    expected = missing.read_bytes()
+                    missing.unlink()
+                    with self.assertRaises((c.Pending, FileNotFoundError)):
+                        app.automatic('discover', source)
+                    self.assertFalse(missing.exists())
+                    checked.clear()
+                    self.assertEqual(app.automatic(action, source)['phase'],
+                                     'prepared' if action == 'prepare' else 'native-apply-entry')
+                    self.assertEqual(missing.read_bytes(), expected)
+                    self.assertEqual(checked[:4], ['parts', 'origin', ('tls', False), ('capacity', False)])
+
+            host_path.unlink()
+            with patch.object(self.live, 'first_site_authority', return_value='0' * 40):
+                with self.assertRaisesRegex(c.Blocked, 'belongs to another bootstrap'):
+                    app.automatic('prepare', source)
+            with patch.object(self.live, 'prepare_checklist_pair', side_effect=c.Pending('checklist-peer-custody', 'lost input')):
+                with self.assertRaisesRegex(c.Pending, 'checklist-peer-custody'):
+                    app.automatic('apply', source)
+            self.assertFalse(host_path.exists())
+            (root / 'intent.json').write_bytes(c.encoded({'policy_sha256': c.digest(c.encoded(policy))}))
+            (root / 'intent.json').chmod(0o600)
+            with self.assertRaisesRegex(c.Pending, 'initial-host-config'):
+                app.automatic('prepare', source)
+            self.assertFalse(host_path.exists())
+            (root / 'intent.json').unlink()
+
+            Path(c.INITIAL_SITE).unlink()
+            with self.assertRaises(FileNotFoundError):
+                with patch.object(installer, 'machine', side_effect=FileNotFoundError('external host profile')):
+                    app.automatic('prepare', source)
+            self.assertFalse(host_path.exists())
+            self.assertEqual(Path(c.AUTOMATIC_POLICY).read_bytes(), c.encoded(policy))
+
     def test_approved_initial_release_acquisition_uses_existing_locked_f_entry(self):
         import native_placements as native
 
