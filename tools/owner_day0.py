@@ -482,7 +482,13 @@ class DayZero:
         if phase in ('pending', 'source-gap'):
             self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
         elif phase == 'ready':
-            self.stage(identity, revision, 'commissioned', 'Use the named core tailnet route for admitted work.')
+            terminal = observed.get('owner_terminal')
+            if terminal == '/usr/local/bin/dev-pair' and 'owner-intake' not in observed.get('held_features', []):
+                self.stage(identity, revision, 'owner-terminal-ready',
+                           'The named core tailnet terminal is available for approved jobs.')
+            else:
+                self.stage(identity, revision, 'managed-listener-ready',
+                           'The managed checklist listener is ready. The owner terminal and workload activation remain held.')
         else:
             self.stage(identity, revision, 'commissioning-pending',
                        'The protected commissioning controller is still waiting. Run ./day0.sh resume.')

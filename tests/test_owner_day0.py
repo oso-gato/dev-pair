@@ -371,3 +371,17 @@ class DayZeroTests(unittest.TestCase):
             receipt.write_text(json.dumps({**proof, 'source_sha': 'a' * 40}))
             with self.assertRaisesRegex(bootstrap.Blocked, 'source checkout differs'):
                 app._initialize(str(work), context, str(work), revision, None, console_receipt=str(receipt))
+
+
+    def test_managed_listener_readiness_does_not_claim_an_owner_terminal(self):
+        controller = self.entry.repo / 'tools/commission_host.py'
+        controller.parent.mkdir(parents=True)
+        controller.touch()
+        self.entry.stage = Mock()
+        self.entry.call = Mock(return_value={'phase': 'ready', 'owner_terminal': None, 'held_features': ['owner-intake']})
+        self.entry.commission(self.identity, SOURCE)
+        self.assertEqual(self.entry.stage.call_args.args[2], 'managed-listener-ready')
+        self.assertIn('remain held', self.entry.stage.call_args.args[3])
+        self.entry.call.return_value = {'phase': 'ready', 'owner_terminal': '/usr/local/bin/dev-pair', 'held_features': []}
+        self.entry.commission(self.identity, SOURCE)
+        self.assertEqual(self.entry.stage.call_args.args[2], 'owner-terminal-ready')
