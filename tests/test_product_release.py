@@ -297,7 +297,7 @@ class PipelineFixture:
 
     def published(self, source, review):
         self.calls.append('protected OCI')
-        return dict(source_sha=source, subject=delivery.REGISTRY + '@sha256:' + '3'*64, run_id=99,
+        return dict(source_sha=source, subject=delivery.REGISTRY + '@sha256:' + '3'*64, run_id=99, run_attempt=1,
                     artifact_sha256='3'*64, **review)
 
     def activation(self):
@@ -397,6 +397,25 @@ class PromotionPipelineTests(unittest.TestCase):
             self.advance()
         self.assertNotIn('native deployment adapter', self.backend.calls)
         self.backend.deployed['active']['artifact_sha256'] = '9' * 64
+        self.assertEqual(self.advance()['phase'], 'confirmed')
+        self.assertEqual(self.backend.calls.count('native deployment adapter'), 1)
+
+    def test_same_image_and_run_cannot_confirm_a_different_publication_attempt(self):
+        current = self.advance()
+        self.backend.pull = pull(current['proposal'], merged=True)
+        self.backend.interrupted = False
+        with self.assertRaisesRegex(delivery.Wait, 'signed-destination-evidence'):
+            self.advance()
+        held = p.loads(read_private(self.state, 16384))
+        active = self.backend.deployed['active']
+        active['run_attempt'] = 2
+        self.backend.proof = True
+        with self.assertRaisesRegex(ValueError, 'earlier deployment requires independent confirmation'):
+            self.advance()
+        self.assertNotIn('independent destination confirmation', self.backend.calls)
+        missing = {key: value for key, value in held['release'].items() if key != 'run_attempt'}
+        self.assertFalse(delivery.matches(active, missing, self.binding))
+        active['run_attempt'] = 1
         self.assertEqual(self.advance()['phase'], 'confirmed')
         self.assertEqual(self.backend.calls.count('native deployment adapter'), 1)
 

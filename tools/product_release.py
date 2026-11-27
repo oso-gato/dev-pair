@@ -331,9 +331,12 @@ class Live:
 
 
 def matches(activation, release, binding):
-    return activation is not None and all(activation.get(key) == release[key] for key in
-           ('source_sha', 'subject', 'run_id', 'artifact_sha256', 'source_tree', 'pull_request', 'review_head')) and (
-           activation.get('dns_name') == binding['dns_name'] and not activation.get('quarantined'))
+    attempt = release.get('run_attempt')
+    return (type(attempt) is int and attempt > 0 and activation is not None and
+            type(activation.get('run_attempt')) is int and activation['run_attempt'] == attempt and
+            all(activation.get(key) == release[key] for key in
+                ('source_sha', 'subject', 'run_id', 'artifact_sha256', 'source_tree', 'pull_request', 'review_head')) and
+            activation.get('dns_name') == binding['dns_name'] and not activation.get('quarantined'))
 
 
 def advance(state, binding, bundle, result, site, backend, save):
