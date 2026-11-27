@@ -15,14 +15,16 @@ import tarfile
 import tempfile
 import time
 
+import checklist_build_storage as build_storage
 import host_handoff as h
 import job_protocol as p
-from ledger_recovery import sync_directory, trusted_directory, write_private
+from ledger_recovery import read_private, sync_directory, trusted_directory, write_private
 
 ROOT = Path('/var/lib/dev-pair')
 KIT = Path('/usr/libexec/dev-pair')
 RECEIPTS = ROOT / 'checklist-receipts'
 BASE = Path('/etc/dev-pair/checklist/build-base.json')
+CONTAINERS = BASE.with_name('validation-containers.conf')
 SELF = Path(__file__).resolve()
 RECIPE = SELF.parent.parent / 'examples/checklist/Containerfile'
 BUILD_INPUTS = Path('/run/dev-pair/checklist-build-inputs')
@@ -40,8 +42,9 @@ def remaining(end):
     return h.time_left(end)
 
 
-def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None):
+def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None):
     """Bound command output independently of pipe reader and child lifetime."""
+    p.require(data is None or stdin is None, 'fixed command input has two sources')
     # The only input is a bounded trusted-controller JSON document or prompt.
     with tempfile.TemporaryFile() as incoming, selectors.DefaultSelector() as ready:
         if data is not None:
@@ -49,17 +52,23 @@ def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None):
             incoming.write(data)
             incoming.seek(0)
         remaining(end)
-        with subprocess.Popen(argv, stdin=incoming, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        with subprocess.Popen(argv, stdin=incoming if stdin is None else stdin,
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                               env=ENV, start_new_session=True) as process:
             output = bytearray()
+            copied = 0
             try:
                 ready.register(process.stdout, selectors.EVENT_READ)
                 while ready.select(remaining(end)):
-                    chunk = os.read(process.stdout.fileno(), min(8192, cap + 1 - len(output)))
+                    chunk = os.read(process.stdout.fileno(), min(8192, cap + 1 - copied))
                     if not chunk:
                         break
-                    output.extend(chunk)
-                    p.require(len(output) <= cap, 'fixed command output exceeds its limit')
+                    copied += len(chunk)
+                    p.require(copied <= cap, 'fixed command output exceeds its limit')
+                    if stdout is None:
+                        output.extend(chunk)
+                    else:
+                        stdout.write(chunk)
                 else:
                     raise TimeoutError('fixed command output deadline expired')
                 code = process.wait(timeout=remaining(end))
@@ -283,12 +292,13 @@ def candidate_image(info, image, revision=None):
     return ident, digest, expected
 
 
-def archive_manifest(path, ident, digest, end):
+def archive_manifest(path, ident, digest, end, *, protected=False):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     with os.fdopen(os.open(path, flags), 'rb') as stream:
         node = os.fstat(stream.fileno())
-        owner = pwd.getpwnam('dp-checklist').pw_uid
+        owner = 0 if protected else pwd.getpwnam('dp-checklist').pw_uid
         p.require(stat.S_ISREG(node.st_mode) and node.st_nlink == 1 and node.st_uid == owner and
+                  (not protected or node.st_gid == 0 and stat.S_IMODE(node.st_mode) == 0o600) and
                   0 < node.st_size <= MAX_ARCHIVE, 'invalid bounded builder OCI archive')
         wanted = {'index.json', 'blobs/sha256/' + digest, 'blobs/sha256/' + ident}
         captured = {}
@@ -316,6 +326,37 @@ def archive_manifest(path, ident, digest, end):
               'OCI exported config differs from the inspected image')
 
 
+def transfer_spool(runtime, storage_dev, *, create):
+    runtime.protected(RECEIPTS, file=False)
+    control = RECEIPTS / '.build-lifecycle'
+    if create:
+        try:
+            trusted_directory(control, create=True)
+        except FileExistsError:
+            pass
+    return build_storage.Spool(control, runtime.STORAGE, storage_dev, MAX_ARCHIVE)
+
+
+def sweep_spool(end):
+    p.require(os.geteuid() == 0, 'protected checklist build conductor required')
+    runtime = h.host_runtime()
+    if not os.path.lexists(RECEIPTS / '.build-lifecycle'):
+        return {'event': 'uninitialized'}
+    with runtime.dispatch_gate():
+        spool = transfer_spool(runtime, checked_storage(runtime, end), create=False)
+        try:
+            with spool.locked(create=False) as fd:
+                return {'event': 'empty'} if fd is None else spool.reclaim(fd)
+        except BlockingIOError:
+            return {'event': 'active-build-retained'}
+
+
+def input_proof(base, recipe, source):
+    return p.canonical({'schema': 1, 'base': base, 'recipe_sha256': p.sha256(recipe),
+                        'source_blob_sha256': p.sha256(source), 'target': 'linux/amd64',
+                        'output_cache': 'clean', 'network': 'none', 'pull': 'never'}).encode()
+
+
 def build(job, repository, agreement_sha, revision, end):
     p.require(os.geteuid() == 0, 'protected checklist build conductor required')
     runtime = h.host_runtime()
@@ -323,58 +364,111 @@ def build(job, repository, agreement_sha, revision, end):
     work = ROOT / 'development/workspaces' / job
     source = approved_source(git_runner(work, 'dp-dev', end), work, approval, revision)
     path = envelope_path(job, revision)
+    proof = path.with_suffix('.build-inputs')
     runtime.protected(RECEIPTS, file=False)
-    if os.path.lexists(path):
-        observed = p.loads(protected_file(path, 4096))
-        p.require(observed['job_id'] == job and observed['candidate']['source_revision'] == revision,
-                  'historical candidate receipt identity mismatch')
-        return preload(path, observed, end)
-
+    # An exact prior receipt remains replayable, including releases predating input proof.
+    retained = os.path.lexists(path)
+    bound = os.path.lexists(proof)
+    if retained and not bound:
+        return retained_candidate(path, job, revision, end)
     base = p.loads(protected_file(BASE, 4096))
     p.fields(base, 'version image verification_sha256')
     p.number(base['version'], 1, 1)
     p.digest(base['verification_sha256'])
     p.require(re.fullmatch(runtime.IMAGE, base['image']), 'approved build base must be an exact OCI reference')
     recipe = protected_file(RECIPE, 8192)
+    inputs = input_proof(base, recipe, source)
+    if bound:
+        p.require(read_private(proof, 4096) == inputs,
+                  'checklist build inputs changed. The prior candidate remains available for its original validation')
+    if retained:
+        return retained_candidate(path, job, revision, end)
+
     storage_dev = checked_storage(runtime, end)
     account = pwd.getpwnam(runtime.ACCOUNT)
     build = runtime.STORAGE / 'builder'
-    for leaf in (build, build / 'graph', build / 'tmp'):
-        info = leaf.lstat()
-        p.require(stat.S_ISDIR(info.st_mode) and leaf.resolve(strict=True) == leaf and
-                  info.st_uid == account.pw_uid and stat.S_IMODE(info.st_mode) == 0o700 and
-                  info.st_dev == storage_dev, 'builder storage must be private and bounded')
+    image_copy = runtime.STORAGE / 'image-copy'
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    volume = os.open(runtime.STORAGE, flags)
+    try:
+        mount = build_storage.mount_id(volume)
+        for leaf in (build, build / 'graph', build / 'tmp', image_copy, runtime.STORAGE / 'graph'):
+            fd = os.open(leaf, flags)
+            try:
+                info = os.fstat(fd)
+                p.require(leaf.resolve(strict=True) == leaf and (info.st_uid, info.st_gid) ==
+                          (account.pw_uid, account.pw_gid) and stat.S_IMODE(info.st_mode) == 0o700 and
+                          info.st_dev == storage_dev and build_storage.mount_id(fd) == mount,
+                          'builder storage must be private and bounded')
+            finally:
+                os.close(fd)
+    finally:
+        os.close(volume)
+    p.require(protected_file(CONTAINERS, 4096) == f'[engine]\nimage_copy_tmp_dir="{image_copy}"\n'.encode(),
+              'checklist build requires the declared bounded image-copy configuration')
     run = Path('/run/user') / str(account.pw_uid)
 
-    def podman(graph, runroot, *args, cap=p.MAX_MESSAGE):
+    def podman(graph, runroot, *args, cap=p.MAX_MESSAGE, stdin=None, stdout=None):
         return invoke(as_role(runtime.ACCOUNT, '/usr/bin/podman', '--root', graph, '--runroot', runroot, *args,
                 environment={'XDG_RUNTIME_DIR': str(run), 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(run / 'bus'),
-                             'TMPDIR': str(build / 'tmp')}), end, cap=cap)
+                             'CONTAINERS_CONF': str(CONTAINERS), 'TMPDIR': str(build / 'tmp')}),
+                      end, cap=cap, stdin=stdin, stdout=stdout)
 
     store = (build / 'graph', run / 'dev-pair-checklist-builder')
     validation = (runtime.STORAGE / 'graph', run / 'dev-pair-checklist-runroot')
+    spool = transfer_spool(runtime, storage_dev, create=True)
+    tag = 'localhost/dev-pair-checklist:' + p.identity([job, revision, p.sha256(inputs)])
+    with spool.locked(create=True) as directory:
+        with spool.transfer(directory, job, revision) as staged:
+            ident, receipt = build_and_load(runtime, podman, store, validation, image_copy, account, base, recipe,
+                                            source, job, revision, tag, staged, end)
+        print(p.canonical({'job': job, 'revision': revision, 'spool': staged[2]}), file=sys.stderr, flush=True)
+        if not bound:
+            build_storage.replace_private(spool.control / 'inputs.new', proof, inputs)
+        return publish_candidate(path, receipt, ident, end)
+
+
+def retained_candidate(path, job, revision, end):
+    observed = p.loads(protected_file(path, 4096))
+    p.require(observed['job_id'] == job and observed['candidate']['source_revision'] == revision,
+              'historical candidate receipt identity mismatch')
+    return preload(path, observed, end)
+
+
+def build_and_load(runtime, podman, store, validation, image_copy, account, base, recipe,
+                   source, job, revision, tag, staged, end):
     for graph, runroot in (store, validation):
         info = podman(graph, runroot, 'info', '--format', '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} '
-                      '{{.Store.GraphRoot}} {{.Store.RunRoot}}').decode().strip()
-        p.require(info == f'true true {graph} {runroot}', 'Podman build or import storage identity changed')
-    _, _, checked_base = candidate_image(p.loads(podman(*store, 'image', 'inspect', base['image'])), base['image'])
-    tag = 'localhost/dev-pair-checklist:' + revision
-    with tempfile.TemporaryDirectory(prefix='spool-', dir=build / 'tmp') as temporary, \
-            build_context(runtime, account.pw_gid, recipe, source, end) as context:
-        spool = Path(temporary)
-        os.chown(spool, account.pw_uid, account.pw_gid)
-        podman(*store, 'build', '--quiet', '--platform', 'linux/amd64', '--format', 'oci', '--pull=never',
+                      '{{.Store.GraphRoot}} {{.Store.RunRoot}} {{.Store.ImageCopyTmpDir}}').decode().strip()
+        p.require(info == f'true true {graph} {runroot} {image_copy}', 'Podman build or import storage identity changed')
+    base_id, base_digest, checked_base = candidate_image(
+        p.loads(podman(*store, 'image', 'inspect', base['image'])), base['image'])
+    archive, transfer, _ = staged
+    with build_context(runtime, account.pw_gid, recipe, source, end) as context:
+        podman(*store, 'build', '--quiet', '--platform', 'linux/amd64', '--format', 'oci', '--pull=never', '--no-cache',
                '--network=none', '--timestamp=0', '--tag', tag, '--build-arg', 'CHECKLIST_BASE=' + checked_base,
                '--build-arg', 'CHECKLIST_SOURCE=' + revision, '--file', context / 'Containerfile', context)
         ident, digest, image = candidate_image(p.loads(podman(*store, 'image', 'inspect', tag)), tag, revision)
-        archive = spool / 'candidate.oci'
-        podman(*store, 'save', '--format=oci-archive', '--output', archive, tag)
-        archive_manifest(archive, ident, digest, end)
-        podman(*validation, 'load', '--input', archive)
+        podman(*store, 'save', '--format=oci-archive', tag, cap=MAX_ARCHIVE, stdout=transfer)
+        transfer.flush()
+        os.fsync(transfer.fileno())
+        archive_manifest(archive, ident, digest, end, protected=True)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        with os.fdopen(os.open(archive, flags), 'rb') as incoming:
+            podman(*validation, 'load', stdin=incoming)
         observed = candidate_image(p.loads(podman(*validation, 'image', 'inspect', image)), image, revision)
         p.require(observed == (ident, digest, image), 'validation store importer changed the exact candidate')
+    print(p.canonical({'event': 'checklist-build-inputs', 'job': job, 'revision': revision,
+                       'base_config_sha256': base_id, 'base_manifest_sha256': base_digest,
+                       'verified_local_base_hits': 1, 'input_downloads': 0, 'network': 'none',
+                       'transfer_bytes': os.fstat(transfer.fileno()).st_size}),
+          file=sys.stderr, flush=True)
     result = {'version': 1, 'job_id': job, 'candidate': {'source_revision': revision, 'artifact_sha256': digest},
               'image': image}
+    return ident, result
+
+
+def publish_candidate(path, result, ident, end):
     fd, pending = tempfile.mkstemp(prefix='.pending-', dir=RECEIPTS)
     try:
         with os.fdopen(fd, 'wb') as out:
@@ -404,7 +498,12 @@ def preload(path, receipt, end, *, expected_id=None):
 
 if __name__ == '__main__':
     try:
-        p.require(sys.argv[1:] == ['__storage-witness'], 'fixed checklist storage witness required')
-        print(p.canonical(storage_witness(h.host_runtime())))
+        if sys.argv[1:] == ['sweep-spool']:
+            os.umask(0o077)
+            result = sweep_spool(time.monotonic() + 15)
+        else:
+            p.require(sys.argv[1:] == ['__storage-witness'], 'fixed checklist operation required')
+            result = storage_witness(h.host_runtime())
+        print(p.canonical(result))
     except (OSError, ValueError):
-        raise SystemExit('managed checklist storage verification failed') from None
+        raise SystemExit('managed checklist storage operation blocked') from None
