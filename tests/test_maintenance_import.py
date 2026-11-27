@@ -88,8 +88,8 @@ class Fixture(g.Gptbox):
         run.images['sha256:' + SEALED] = {'Id': SEALED, 'Digest': 'sha256:' + MANIFEST, 'Architecture': 'amd64',
                                           'Os': 'linux', 'Labels': labels, 'RootFS': {'Layers': [LAYER]}}
 
-    def preflight(self):
-        self.calls.append('host-preflight')
+    def preflight(self, *, managed_runtime=False):
+        self.calls.append('runtime-preflight' if managed_runtime else 'host-preflight')
 
     def protect_host_sources(self, upstream, revision):
         self.calls.append('protected-source')
@@ -299,6 +299,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(result['boot_id'], BOOT)
         self.assertEqual(result['phase'], 'preflight')
+        self.assertIn('runtime-preflight', self.app.calls)
         self.assertEqual(self.app.run.starts, 0)
         self.assertFalse(self.app.path(self.receipt_path()).exists())
         self.protocol.portable_index.assert_called_once()
