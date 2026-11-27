@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 
-from bootstrap import Blocked, Bootstrap, SUDO_PACKAGE_QUERY, checked_file, relay
+from bootstrap import Blocked, Bootstrap, SUDO_PACKAGE_QUERY, TRUST_SIGNERS, checked_file, relay
 from release_trust import DIGEST, SHA, ReleaseTrust, protect, require
 from selinux_bootstrap import INSTALL as SELINUX_INSTALL, OVERRIDE as SELINUX_OVERRIDE, code_digest as selinux_code_digest
 
@@ -53,8 +53,10 @@ EXECUTOR_OVERRIDE = '/etc/systemd/system/' + EXECUTOR + '.d/checklist-release.co
 RENEWAL = ROOT + '/renewal'
 MANAGED_LISTENER = CONTROL + '/managed-listener.json'
 U_HOST_VERIFY = '/usr/libexec/dev-pair/renewal/host-release'
+U_BOOT_FENCE = 'dev-pair-renewal-boot-fence.service'
 U_OBSERVE = 'dev-pair-renewal-host-observe.service'
 U_RECOVERY = 'dev-pair-renewal-recovery.service'
+ROLE_ANCESTORS = (Path('/etc/dev-pair'), Path('/usr/libexec/dev-pair'), Path('/etc/containers/systemd/users'))
 PORT = 18279
 PROXY = f'http://127.0.0.1:{PORT}'
 TLS_FILES = ('cert.pem', 'peer.pem', 'key.pem')
@@ -438,6 +440,95 @@ class Destination(Bootstrap):
             selected[name] = actual
         return selected
 
+    @staticmethod
+    def role_path_info(path):
+        info = path.lstat()
+        require(info.st_uid == info.st_gid == 0 and not info.st_mode & 0o022 and not stat.S_ISLNK(info.st_mode),
+                'checklist executable path must be protected and root-owned')
+        return info
+
+    def role_search_plan(self, files, directories, uid, *, listing=()):
+        selected = {Path(path) for path in (*files, *directories)}
+        listing = {Path(path) for path in listing}
+        parents = {part for path in selected for part in path.parents} | {Path(path) for path in directories}
+        needed = selected | parents
+        grant, hidden = [], set()
+        for directory in sorted(parents):
+            if not os.path.lexists(directory):
+                continue
+            info = self.role_path_info(directory)
+            require(stat.S_ISDIR(info.st_mode), 'fixed checklist ancestor is not a directory')
+            bits = 0o005 if directory in listing else 0o001
+            if info.st_mode & bits == bits:
+                continue
+            access = 'r-x' if directory in listing else '--x'
+            require(any(directory.is_relative_to(root) for root in ROLE_ANCESTORS)
+                    and stat.S_IMODE(info.st_mode) in (0o700, 0o700 | (bits << 3)),
+                    'fixed checklist ancestor lacks its dedicated protected search policy')
+            acl = self.run('/usr/bin/getfacl', '--omit-header', '--absolute-names', '--numeric', '--', str(directory), timeout=5)
+            entries = acl.strip().splitlines()
+            plain = ['user::rwx', 'group::---', 'other::---']
+            exact = ['user::rwx', f'user:{uid}:{access}', 'group::---', f'mask::{access}', 'other::---']
+            require(entries in (plain, exact), 'existing ancestor ACL conflicts with a dedicated checklist search grant')
+            if entries == plain:
+                grant.append((directory, info.st_dev, info.st_ino, access))
+            for child_dir in parents:
+                if child_dir.is_relative_to(directory) and os.path.lexists(child_dir):
+                    for child in child_dir.iterdir():
+                        if child in needed:
+                            continue
+                        require(child_dir not in listing, 'Quadlet input directory contains an unowned entry')
+                        private = self.role_path_info(child)
+                        if child == Path('/etc/dev-pair/limits.json'):
+                            require(stat.S_ISREG(private.st_mode) and private.st_nlink == 1,
+                                    'fixed public limits are not a protected regular file')
+                            continue
+                        require(not private.st_mode & 0o077, 'search grant would expose an unrelated existing checklist sibling')
+                        hidden.add(str(child))
+        return grant, sorted(hidden)
+
+    def grant_role_search(self, grants, uid):
+        for directory, device, inode, access in grants:
+            info = self.role_path_info(directory)
+            require((info.st_dev, info.st_ino, stat.S_IMODE(info.st_mode)) == (device, inode, 0o700),
+                    'protected checklist search directory changed before grant')
+            self.run('/usr/bin/setfacl', '--modify', f'user:{uid}:{access}', '--', str(directory), timeout=5)
+
+    def managed_role_files(self):
+        site = self.record(RENEWAL + '/site-current.json')
+        require(type(site) is str and re.fullmatch(DIGEST, site), 'protected initial host selection reference is invalid')
+        raw = checked_file(RENEWAL + '/releases/' + site + '.json').read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == site, 'selected host release manifest differs from its protected digest')
+        release = json.loads(raw, object_pairs_hook=relay.unique)
+        digest = release['components']['host']['artifact_sha256']
+        require(type(digest) is str and re.fullmatch(DIGEST, digest), 'invalid selected host bundle identity')
+        directory = Path('/usr/libexec/dev-pair/host-releases') / digest
+        manifest = protect(directory / 'manifest.json')
+        require(manifest.stat().st_size <= 1024**2 and hashlib.sha256(manifest.read_bytes()).hexdigest() == digest,
+                'selected managed host bundle manifest differs')
+        rows = json.loads(manifest.read_bytes(), object_pairs_hook=relay.unique)['files']
+        result = {str(directory / name): rows[name] for name in FILES if not name.startswith('examples/')}
+        wrapper = protect('/usr/libexec/dev-pair/renewal/checklist-entry')
+        require(wrapper.stat().st_size <= 65536, 'managed checklist entry exceeds its audit bound')
+        result[str(wrapper)] = hashlib.sha256(wrapper.read_bytes()).hexdigest()
+        result[str(manifest)] = digest
+        return result
+
+    def verify_role_paths(self, uid, digests, directories, hidden, *, listing=()):
+        code = ("import hashlib,json,os,sys\n"
+                "uid,files,dirs,hidden,listing=json.loads(sys.stdin.buffer.read())\n"
+                "assert os.getuid()==os.geteuid()==os.getgid()==os.getegid()==uid\n"
+                "for path in dirs: assert os.path.isdir(path) and os.access(path,os.X_OK)\n"
+                "for path in listing:\n"
+                " with os.scandir(path): pass\n"
+                "for path,expected in files.items():\n"
+                " with os.fdopen(os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK),'rb') as stream:\n"
+                "  data=stream.read(4*1024**2+1); assert len(data)<=4*1024**2 and hashlib.sha256(data).hexdigest()==expected\n"
+                "for path in hidden: assert not os.access(path,os.R_OK) and not os.access(path,os.X_OK)\n")
+        proof = json.dumps([uid, digests, directories, hidden, listing], separators=(',', ':'))
+        require(len(proof.encode()) <= 16384, 'checklist role path attestation inputs exceed their bound')
+        self.subprocess_role(uid, '/usr/bin/python3', '-IB', '-c', code, input_text=proof, timeout=20)
+
     def provision(self, args):
         if not os.path.lexists(PROVISION):
             self.preflight()
@@ -466,10 +557,29 @@ class Destination(Bootstrap):
                 'physical storage reserve is no longer available')
         secrets = {file: checked_file(Path(args.tls_profile) / file, secret=True).read_bytes() for file in TLS_FILES}
         require(all(0 < len(value) <= 8192 for value in secrets.values()), 'invalid checklist TLS profile size')
+        role_files = {CODE + '/' + name: code[name] for name in FILES}
+        for role, path in STORAGE.items():
+            role_files[GATE + '/' + role + '-containers.conf'] = f'[engine]\nimage_copy_tmp_dir="{path}/image-copy"\n'
+        role_hashes = {path: hashlib.sha256(contents.encode()).hexdigest() for path, contents in role_files.items()}
+        if managed_listener:
+            role_hashes.update(self.managed_role_files())
+        direct_dirs = [GATE, str(Path(self.unit_path(args.uid)).parent)]
+        listing = (direct_dirs[1],)
+        approval = GATE + '/approval.json'
+        if os.path.lexists(approval):
+            role_hashes[approval] = hashlib.sha256(checked_file(approval).read_bytes()).hexdigest()
+        quadlet = self.unit_path(args.uid)
+        if os.path.lexists(quadlet):
+            state = self.initial_activation()
+            digest = hashlib.sha256(checked_file(quadlet).read_bytes()).hexdigest()
+            known = [state['active'], state['pending']['release'] if state['pending'] else None]
+            require(any(item and item['unit_sha256'] == digest for item in known), 'unknown installed checklist Quadlet')
+            role_hashes[quadlet] = digest
         live_groups = [entry.gr_gid for entry in grp.getgrall()]
         live_users = [entry.pw_uid for entry in pwd.getpwall()]
         require(not args.subid_start <= args.uid < args.subid_start + 65536, 'checklist UID overlaps its subordinate range')
         with self.lock('checklist-release.lock'):
+            grants, private_siblings = self.role_search_plan(role_hashes, direct_dirs, args.uid, listing=listing)
             self.directory(CONTROL)
             previous = self.record(PROVISION) if Path(PROVISION).exists() else {}
             if not previous:
@@ -495,35 +605,42 @@ class Destination(Bootstrap):
                 self.run('/usr/sbin/useradd', '--no-create-home', '--home-dir', HOME, '--user-group', '--uid',
                          str(args.uid), '--shell', '/usr/sbin/nologin', '-K', 'SUB_UID_COUNT=0', '-K', 'SUB_GID_COUNT=0', OWNER,
                          timeout=20)
-            self.run('/usr/sbin/usermod', '--lock', OWNER, timeout=10)
             uid = self.account()
             require(uid == args.uid, 'checklist account changed from protected intent')
             self.run('/usr/sbin/visudo', '-c', timeout=10)
             package = self.run(*SUDO_PACKAGE_QUERY, timeout=10, sudo_package=True)
             self.run('/usr/bin/sudo', '-l', '-U', OWNER, timeout=10,
                      sudo_probe={'role': OWNER, 'host_verified': True, 'package': package})
+            self.grant_role_search(grants, uid)
+            for path in direct_dirs:
+                if not os.path.lexists(path):
+                    self.directory(path, mode=0o755)
+            for path, content in role_files.items():
+                self.atomic(path, content, mode=0o644)
+            for path in (HOME, HOME + '/tls'):
+                self.owned_directory(path, uid)
+            for name in ('cert.pem', 'peer.pem'):
+                value = secrets[name]
+                self.role_secret(HOME + '/tls', name, value, uid)
+                role_hashes[HOME + '/tls/' + name] = hashlib.sha256(value).hexdigest()
+            self.run('/usr/sbin/restorecon', '-RF', CODE, GATE, direct_dirs[1], HOME + '/tls', timeout=15)
+            self.verify_role_paths(uid, role_hashes, direct_dirs, sorted({*private_siblings, TRUST_SIGNERS}), listing=listing)
+            self.role_secret(HOME + '/tls', 'key.pem', secrets['key.pem'], uid)
             for file, flag, live in (('/etc/subuid', '--add-subuids', live_users), ('/etc/subgid', '--add-subgids', live_groups)):
                 self.subid(file, flag, uid, args.subid_start, live)
+            if (not os.path.lexists(TRUST_CODE)
+                    and not Path(TRUST_CODE).parent.lstat().st_mode & stat.S_IXOTH):
+                self.directory(TRUST_CODE, mode=0o700)
             for relative, contents in code.items():
-                if relative.endswith('/' + EXECUTOR):
-                    target = '/etc/systemd/system/' + EXECUTOR
-                elif relative in FILES:
-                    target = CODE + '/' + relative
-                else:
-                    target = TRUST_CODE + '/' + Path(relative).name
-                self.atomic(target, contents, mode=0o644)
-            self.directory(GATE, mode=0o755)
+                if relative not in FILES:
+                    target = ('/etc/systemd/system/' + EXECUTOR if relative.endswith('/' + EXECUTOR)
+                              else TRUST_CODE + '/' + Path(relative).name)
+                    self.atomic(target, contents, mode=0o644)
             self.directory(FENCE, mode=0o755)
             self.atomic(FENCE + '/owner.lock', '', mode=0o644)
             self.directory(RECEIPTS)
-            for path in (HOME, HOME + '/tls'):
-                self.owned_directory(path, uid)
-            for name, value in secrets.items():
-                self.role_secret(HOME + '/tls', name, value, uid)
             for role, path in STORAGE.items():
                 self.reserve(path, specs[role], uid, args.reserve_mib, args.reserve_inodes)
-                self.atomic(GATE + '/' + role + '-containers.conf',
-                            f'[engine]\nimage_copy_tmp_dir="{path}/image-copy"\n', mode=0o644)
             self.atomic(f'/etc/systemd/system/user@{uid}.service.d/60-dev-pair-checklist.conf',
                         '[Unit]\nRequiresMountsFor=' + VALIDATION + ' ' + LIVE + '\n', mode=0o644)
             self.run('/usr/sbin/restorecon', '-RF', CODE, TRUST_CODE, '/etc/systemd/system/' + EXECUTOR, timeout=15)
@@ -586,22 +703,49 @@ class Destination(Bootstrap):
                 'renewal host verifier did not attest this live selected executor')
         self.executor_ready(returned['handoff']['unit'], uid)
 
+    def require_boot_fence(self):
+        require(self.record(FENCE + '/frozen') == 'boot', 'commissioning requires the owned boot dispatch fence')
+
+    def ensure_boot_fence(self):
+        if not os.path.lexists(FENCE + '/frozen'):
+            # The oneshot may still be active even after its marker was consumed.
+            self.run(SYSTEMCTL, 'restart', U_BOOT_FENCE, timeout=30)
+        self.require_boot_fence()
+
+    def recovery_start(self):
+        value = self.run(SYSTEMCTL, 'show', '--property=ExecMainStartTimestampMonotonic', '--value',
+                         U_RECOVERY, timeout=10).strip()
+        require(re.fullmatch(r'[0-9]{1,20}', value), 'renewal recovery start witness is unavailable')
+        return int(value)
+
+    def require_recovery_enabled(self):
+        enabled = self.run(SYSTEMCTL, 'is-enabled', U_RECOVERY, ok=(0, 1), timeout=10).strip()
+        require(enabled == 'enabled', 'renewal recovery is not enabled for the next boot')
+
     def managed_executor(self, unit, uid):
         site, boot = self.record(RENEWAL + '/site-current.json'), self.destination_identity()['boot_id']
         require(type(site) is str and re.fullmatch(DIGEST, site), 'protected initial host selection reference is invalid')
         prior = self.record(MANAGED_LISTENER) if os.path.lexists(MANAGED_LISTENER) else None
-        record = {'version': 1, 'site': site, 'boot': boot, 'phase': 'queue-observe'}
-        if prior and (prior['site'], prior['boot']) == (site, boot):
+        record = {'version': 2, 'site': site, 'boot': boot, 'phase': 'queue-observe'}
+        if prior and prior.get('version') == 2 and (prior['site'], prior['boot']) == (site, boot):
             record = prior
         else:
             self.atomic(MANAGED_LISTENER, record_text(record), expected=record_text(prior) if prior else None)
         if record['phase'] == 'queue-observe':
+            recovery_running, _ = self.manager_job(U_RECOVERY)
+            if recovery_running:
+                return 'renewal-readback-running'
+            if 'recovery_after' not in record:
+                before = record
+                record = {**record, 'recovery_after': self.recovery_start()}
+                self.atomic(MANAGED_LISTENER, record_text(record), expected=record_text(before))
             running, _ = self.manager_job(U_OBSERVE)
             if running:
+                self.require_boot_fence()
                 self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'observe'}), expected=record_text(record))
                 return 'host-observation-running'
             self.run(SYSTEMCTL, 'enable', unit, timeout=30)
-            self.run(SYSTEMCTL, 'start', 'dev-pair-renewal-boot-fence.service', timeout=30)
+            self.ensure_boot_fence()
             self.run(SYSTEMCTL, 'start', '--no-block', U_OBSERVE, timeout=15)
             self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'observe'}), expected=record_text(record))
             return 'host-observation-queued'
@@ -616,8 +760,12 @@ class Destination(Bootstrap):
             self.atomic(MANAGED_LISTENER, record_text(advanced), expected=record_text(record))
             record = advanced
         if record['phase'] == 'queue-recovery':
-            running, _ = self.manager_job(U_RECOVERY)
-            if not running and os.path.lexists(FENCE + '/frozen'):
+            running, result = self.manager_job(U_RECOVERY)
+            if self.recovery_start() > record['recovery_after']:
+                require(running or result == 'success', 'owned renewal recovery failed during commissioning')
+                self.run(SYSTEMCTL, 'enable', U_RECOVERY, timeout=20)
+            else:
+                self.ensure_boot_fence()
                 self.run(SYSTEMCTL, 'enable', '--now', '--no-block', U_RECOVERY, timeout=20)
             self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'recovery'}), expected=record_text(record))
             return 'renewal-readback-running' if running else 'renewal-readback-queued'
@@ -630,6 +778,9 @@ class Destination(Bootstrap):
         self.verify_managed_executor(site, uid)
         if os.path.lexists(FENCE + '/frozen'):
             return 'renewal-readback-fenced'
+        require(result == 'success' and self.recovery_start() > record['recovery_after'],
+                'renewal recovery has no fresh successful manager witness for this commissioning')
+        self.require_recovery_enabled()
         if record['phase'] != 'ready':
             self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'ready'}), expected=record_text(record))
         return 'ready'
@@ -690,9 +841,15 @@ class Destination(Bootstrap):
                 if require_cutover:
                     listener = self.record(MANAGED_LISTENER)
                     site = self.record(RENEWAL + '/site-current.json')
-                    require(listener['phase'] == 'ready' and listener['site'] == site,
+                    require(listener['version'] == 2 and listener['phase'] == 'ready' and listener['site'] == site,
                             'production release requires current completed managed listener readback')
                     self.verify_managed_executor(site, uid)
+                    recovery_running, recovery_result = self.manager_job(U_RECOVERY)
+                    same_boot = listener['boot'] == self.destination_identity()['boot_id']
+                    minimum_start = listener['recovery_after'] if same_boot else 0
+                    require(not recovery_running and recovery_result == 'success' and self.recovery_start() > minimum_start,
+                            'production release requires current boot renewal recovery')
+                    self.require_recovery_enabled()
                     guard = self.verify_final_guard()
                     _, dns = self.tailscale_state()
                     require(guard['target']['dns_name'] == dns, 'checklist proxy differs from independently verified cutover')

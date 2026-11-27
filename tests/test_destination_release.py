@@ -548,13 +548,23 @@ class ProvisioningTests(unittest.TestCase):
             app = d.Destination()
             effects = []
             jobs = {d.U_OBSERVE: (False, 'success'), d.U_RECOVERY: (False, 'success')}
+            started = [100]
+            enabled = [False]
 
             def systemctl(*args, **kwargs):
                 self.assertEqual(args[0], d.SYSTEMCTL)
                 effects.append(args[1:])
-                if args[-1] == 'dev-pair-renewal-boot-fence.service':
-                    marker.write_text('boot')
+                if args[-1] == d.U_BOOT_FENCE and args[1] == 'restart':
+                    marker.write_text(json.dumps('boot'))
                 if args[-1] in jobs:
+                    if args[-1] == d.U_OBSERVE:
+                        self.assertEqual(json.loads(marker.read_text()), 'boot')
+                    if args[-1] == d.U_RECOVERY and args[1] == 'enable':
+                        self.assertEqual(json.loads(marker.read_text()), 'boot')
+                        enabled[0] = True
+                        started[0] = 110
+                    if args[1] == 'is-enabled':
+                        return 'enabled\n' if enabled[0] else 'disabled\n'
                     jobs[args[-1]] = (True, 'success')
                 return ''
 
@@ -564,6 +574,7 @@ class ProvisioningTests(unittest.TestCase):
                     patch.object(app, 'atomic', side_effect=lambda path, raw, **kwargs: Path(path).write_text(raw)), \
                     patch.object(app, 'subprocess_role') as initializer, \
                     patch.object(app, 'destination_identity', return_value={'boot_id': 'fixture-boot'}), \
+                    patch.object(app, 'recovery_start', side_effect=lambda: started[0]), \
                     patch.object(app, 'manager_job', side_effect=lambda unit: jobs[unit]), \
                     patch.object(app, 'verify_managed_executor', side_effect=lambda *_args: effects.append(('observed',))):
                 uid = os.getuid()
@@ -571,17 +582,40 @@ class ProvisioningTests(unittest.TestCase):
                 self.assertEqual(queued, 'host-observation-queued')
                 self.assertEqual(app.start_executor(uid, True, True)[1], 'host-observation-running')
                 jobs[d.U_OBSERVE] = (False, 'success')
+                marker.unlink()  # An older consumed marker must not bypass the recovery queue.
                 self.assertEqual(app.start_executor(uid, True, True)[1], 'renewal-readback-queued')
                 self.assertEqual(app.start_executor(uid, True, True)[1], 'renewal-readback-running')
                 jobs[d.U_RECOVERY] = (False, 'success')
                 self.assertEqual(app.start_executor(uid, True, True)[1], 'renewal-readback-fenced')
                 marker.unlink()
+                started[0] = 100
+                with self.assertRaisesRegex(b.Blocked, 'fresh successful manager witness'):
+                    app.start_executor(uid, True, True)
+                started[0] = 110
+                enabled[0] = False
+                with self.assertRaisesRegex(b.Blocked, 'not enabled'):
+                    app.start_executor(uid, True, True)
+                enabled[0] = True
                 self.assertEqual(app.start_executor(uid, True, True)[1], 'ready')
                 initializer.assert_not_called()
-            self.assertEqual(effects[:5], [('enable', unit), ('start', 'dev-pair-renewal-boot-fence.service'),
+            self.assertEqual(effects[:6], [('enable', unit), ('restart', d.U_BOOT_FENCE),
                                           ('start', '--no-block', d.U_OBSERVE), ('observed',),
+                                          ('restart', d.U_BOOT_FENCE),
                                           ('enable', '--now', '--no-block', d.U_RECOVERY)])
             self.assertEqual(json.loads(requested.read_bytes())['phase'], 'ready')
+
+    def test_existing_owned_fence_is_preserved_and_foreign_fence_is_rejected(self):
+        app = d.Destination()
+        with tempfile.TemporaryDirectory() as directory:
+            marker = Path(directory) / 'frozen'
+            marker.write_text('"boot"\n')
+            with patch.object(d, 'FENCE', directory), patch.object(app, 'run') as runner, \
+                    patch.object(app, 'record', side_effect=lambda path: json.loads(Path(path).read_text())):
+                app.ensure_boot_fence()
+                marker.write_text('"different active renewal"\n')
+                with self.assertRaisesRegex(b.Blocked, 'owned boot dispatch fence'):
+                    app.ensure_boot_fence()
+                runner.assert_not_called()
 
     def test_restrictive_umask_preserves_traversable_code_and_quadlet_ancestors(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -605,6 +639,66 @@ class ProvisioningTests(unittest.TestCase):
                     self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
             self.assertEqual(private.stat().st_mode & 0o777, 0o700)
             self.assertEqual(private.parent.stat().st_mode & 0o777, 0o755)
+
+    def test_populated_private_ancestor_grants_only_named_search_and_retains_signer_material(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            root.chmod(0o755)
+            app = d.Destination(root)
+            fixed = root / 'etc/dev-pair'
+            original = os.umask(0o077)
+            try:
+                signer = fixed / 'trust/allowed_signers'
+                signer.parent.mkdir(parents=True)
+                signer.write_text('fixture signing material')
+                path = fixed / 'checklist/validation-containers.conf'
+                app.atomic('/etc/dev-pair/checklist/validation-containers.conf', 'fixture public config\n', mode=0o644)
+            finally:
+                os.umask(original)
+            (root / 'etc').chmod(0o755)
+            acl = ['user::rwx', 'group::---', 'other::---']
+            calls = []
+
+            def run(*args, **kwargs):
+                calls.append(args)
+                if args[0].endswith('getfacl'):
+                    return '\n'.join(acl) + '\n'
+                self.assertEqual(args[2], 'user:1940:--x')
+                acl[:] = ['user::rwx', 'user:1940:--x', 'group::---', 'mask::--x', 'other::---']
+
+            with patch.object(d, 'ROLE_ANCESTORS', (fixed,)), patch.object(app, 'role_path_info', side_effect=lambda p: p.lstat()), \
+                    patch.object(app, 'run', side_effect=run):
+                unrelated = fixed / 'unrelated-config'
+                unrelated.write_text('must not be exposed')
+                unrelated.chmod(0o644)
+                with self.assertRaisesRegex(b.Blocked, 'expose an unrelated'):
+                    app.role_search_plan([str(path)], [], 1940)
+                self.assertFalse(any(command[0].endswith('setfacl') for command in calls))
+                unrelated.chmod(0o600)
+                grants, hidden = app.role_search_plan([str(path)], [], 1940)
+                self.assertEqual([item[0] for item in grants], [fixed])
+                self.assertEqual(set(hidden), {str(signer.parent), str(unrelated)})
+                app.grant_role_search(grants, 1940)
+                self.assertEqual(app.role_search_plan([str(path)], [], 1940)[0], [])
+            self.assertEqual(signer.read_text(), 'fixture signing material')
+            self.assertEqual(signer.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(signer.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+
+    def test_role_probe_opens_exact_bytes_and_rejects_digest_or_actor_mismatch(self):
+        app = d.Destination()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public = root / 'peer.pem'
+            public.write_text('fixture certificate')
+            digest = hashlib.sha256(public.read_bytes()).hexdigest()
+            commands = b.Commands()
+            with patch.object(app, 'subprocess_role', side_effect=lambda _uid, *args, **kwargs: commands(*args, **kwargs)):
+                app.verify_role_paths(os.getuid(), {str(public): digest}, [directory], [str(root / 'unreachable')])
+                with self.assertRaises(b.Blocked):
+                    app.verify_role_paths(os.getuid(), {str(public): '0' * 64}, [directory], [])
+                with self.assertRaises(b.Blocked):
+                    app.verify_role_paths(os.getuid() + 1, {str(public): digest}, [directory], [])
 
     def test_primary_identity_cannot_overlap_earlier_subordinate_block(self):
         app = d.Destination()
