@@ -202,6 +202,12 @@ ext4 or tmpfs, the worker checks that the visible mount is a canonical self-bind
 and that the entry beneath it has the expected inode. It repeats the proof
 after traversal, keeps the scanned and canonical source mounts pinned, and
 charges the extra directory entries to the same scan limits.
+When the strict canonical source lookup returns EXDEV, fixed reason codes
+identify a regular file, another nondirectory, or an empty canonical name.
+Directory fallback codes identify the parent open, parent identity, unsupported
+filesystem, visible leaf open, or a leaf still on the scratch mount. Overlay
+has its own filesystem code. Other EXDEV errors within the fallback use
+`bind-source-before-exdev`.
 Unverified same-device mounts block. A descendant disappearance can yield a
 provisional sample or trigger another attempt without contributing a total.
 Across at most three attempts, the largest usable sample counts against the

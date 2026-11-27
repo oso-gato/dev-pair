@@ -23,6 +23,10 @@ REASONS=(
     'mountinfo-root-missing','mountinfo-entry-missing','held-root-path-missing','held-entry-path-missing',
     'held-entry-path-mismatch','root-path-outside-mount','bind-source-outside-root',
     'bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev',
+    'bind-source-before-exdev-regular','bind-source-before-exdev-nondirectory','bind-source-before-exdev-empty-name',
+    'bind-source-before-exdev-parent-open','bind-source-before-exdev-parent-identity',
+    'bind-source-before-exdev-overlay','bind-source-before-exdev-filesystem',
+    'bind-source-before-exdev-leaf-open','bind-source-before-exdev-leaf-mount',
     'bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev',
     'entry-reopen-missing','entry-resolve-exdev','entry-reopen-exdev','entry-limit','inode-limit','depth-limit','deadline',
     'enumeration-disappeared',
@@ -105,25 +109,36 @@ def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound,*,filesystem=N
     try:return mounted_source.relative_to(owned_source)
     except ValueError:raise ScanError('bind-source-outside-root') from None
 
-def _open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons):
+def _open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons,*,after):
     missing,mismatch,exdev=reasons
     parent_fd=None
     try:
-        parent_fd=_node(root_fd,source.parent)
+        try:parent_fd=_node(root_fd,source.parent)
+        except OSError as error:
+            if not after and error.errno==errno.EXDEV:raise ScanError('bind-source-before-exdev-parent-open') from None
+            raise
         parent=os.fstat(parent_fd)
-        require(stat.S_ISDIR(parent.st_mode) and parent.st_dev==expected[0] and _mount_id(parent_fd)==root_id,exdev)
+        require(stat.S_ISDIR(parent.st_mode) and parent.st_dev==expected[0] and _mount_id(parent_fd)==root_id,
+                exdev if after else 'bind-source-before-exdev-parent-identity')
         # The Linux x86_64 statfs buffer begins with a long f_type. Reserve
         # room for the complete structure and accept only known inode semantics.
         filesystem_stat=(ctypes.c_long*16)()
         if LIBC.fstatfs(parent_fd,ctypes.byref(filesystem_stat))!=0:
             raise OSError(ctypes.get_errno(),'parent filesystem check failed')
-        filesystem={0xEF53:b'ext4',0x01021994:b'tmpfs'}.get(filesystem_stat[0])
-        require(filesystem is not None,exdev)
-        leaf_fd=_node(parent_fd,source.name,same_mount=False)
+        filesystem_type=filesystem_stat[0]
+        filesystem={0xEF53:b'ext4',0x01021994:b'tmpfs'}.get(filesystem_type)
+        if filesystem is None:
+            if after:raise ScanError(exdev)
+            reason='bind-source-before-exdev-overlay' if filesystem_type==0x794c7630 else 'bind-source-before-exdev-filesystem'
+            raise ScanError(reason)
+        try:leaf_fd=_node(parent_fd,source.name,same_mount=False)
+        except OSError as error:
+            if not after and error.errno==errno.EXDEV:raise ScanError('bind-source-before-exdev-leaf-open') from None
+            raise
         try:
             require(_node_identity(os.fstat(leaf_fd))==expected,mismatch)
             leaf_mount=_mount_id(leaf_fd)
-            require(leaf_mount!=root_id,exdev)
+            require(leaf_mount!=root_id,exdev if after else 'bind-source-before-exdev-leaf-mount')
             # Read a fresh cursor for the covered directory entry. Stat or open
             # on the name would resolve to the visible mount instead.
             witness_fd=os.open('.',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent_fd)
@@ -161,9 +176,16 @@ def _verify_bind_source(root_fd,root_id,source,expected,bound,charge_entry,*,aft
     except FileNotFoundError:raise ScanError(missing) from None
     except OSError as error:
         if error.errno!=errno.EXDEV:raise
-        if expected[2]!=stat.S_IFDIR or not source.name or (after and source_pin is None):
+        if expected[2]!=stat.S_IFDIR:
+            if not after:
+                resolve_exdev=('bind-source-before-exdev-regular' if expected[2]==stat.S_IFREG
+                               else 'bind-source-before-exdev-nondirectory')
             raise ScanError(resolve_exdev) from None
-        leaf_fd=_open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons)
+        if not source.name:
+            raise ScanError(resolve_exdev if after else 'bind-source-before-exdev-empty-name') from None
+        if after and source_pin is None:
+            raise ScanError(resolve_exdev) from None
+        leaf_fd=_open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons,after=after)
         if not after:return leaf_fd
         try:require(_mount_id(leaf_fd)==_mount_id(source_pin),identity_mismatch)
         finally:os.close(leaf_fd)

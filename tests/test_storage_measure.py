@@ -1,5 +1,6 @@
 """Real allocated-block GNUdu differential; descriptor and caller failures closed."""
 from contextlib import redirect_stdout
+import ctypes
 import errno
 import hashlib
 from io import StringIO
@@ -8,14 +9,16 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
 import threading
 import time
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import ANY, Mock, call, patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
 import storage_measure as worker
 import fedora_ci as ci
@@ -208,12 +211,21 @@ class MeasurementTests(unittest.TestCase):
             with patch.object(worker.os,'scandir',side_effect=wrong_covered_inode):
                 check_failure('bind-source-before-identity')
 
-            def overlay_parent(fd,buffer):
-                assert Path(os.readlink(f'/proc/self/fd/{fd}'))==root
-                ctypes.cast(buffer,ctypes.POINTER(ctypes.c_long))[0]=0x794c7630
-                return 0
-            with patch.object(worker.LIBC,'fstatfs',side_effect=overlay_parent):
-                check_failure('bind-source-before-exdev')
+            for magic,reason in ((0x794c7630,'bind-source-before-exdev-overlay'),
+                                 (0x9123683e,'bind-source-before-exdev-filesystem')):
+                def unsupported_parent(fd,buffer):
+                    assert Path(os.readlink(f'/proc/self/fd/{fd}'))==root
+                    ctypes.cast(buffer,ctypes.POINTER(ctypes.c_long))[0]=magic
+                    return 0
+                with patch.object(worker.LIBC,'fstatfs',side_effect=unsupported_parent):
+                    check_failure(reason)
+            ''',backing=backing)
+
+    def test_actual_tmpfs_regular_file_self_bind_fails_with_regular_reason(self):
+        backing=self.tmpfs_backing()
+        source=backing/'regular';source.write_bytes(b'x'*8192)
+        self.isolated_mount_scan(self.root,['--bind',source,self.root/'regular'],'''
+            check_failure('bind-source-before-exdev-regular')
             ''',backing=backing)
 
     def test_actual_canonical_source_overbind_and_parent_mount_are_rejected(self):
@@ -228,7 +240,7 @@ class MeasurementTests(unittest.TestCase):
                     reason='bind-source-before-identity'
                 else:
                     mounts+=['--bind',backing/'parent',self.root/'parent']
-                    reason='bind-source-before-exdev'
+                    reason='bind-source-before-exdev-parent-open'
                 self.isolated_mount_scan(self.root,mounts,'''
                     def never_enumerate_alias(fd):
                         assert Path(os.readlink(f'/proc/self/fd/{fd}'))!=root/'mounted'
@@ -390,6 +402,70 @@ class MeasurementTests(unittest.TestCase):
                 self.assertIsNone(projected['allocated_bytes'])
                 self.assertEqual(projected['counters']['entries'],entries)
                 self.assertEqual(projected['reason'],reason)
+
+    def test_strict_source_exdev_classification_does_not_open_fallback(self):
+        for kind,source,reason in (
+            (stat.S_IFREG,Path('.'),'bind-source-before-exdev-regular'),
+            (stat.S_IFLNK,Path('leaf'),'bind-source-before-exdev-nondirectory'),
+            (stat.S_IFDIR,Path('.'),'bind-source-before-exdev-empty-name'),
+            (stat.S_IFDIR,Path('leaf'),None),
+        ):
+            for after in (False,True) if reason is not None else (True,):
+                with self.subTest(kind=kind,source=source,after=after):
+                    exdev=OSError(errno.EXDEV,'synthetic strict open')
+                    expected='bind-source-after-exdev' if after else reason
+                    with (patch.object(worker,'_node',side_effect=exdev) as node,
+                          patch.object(worker,'_open_source_self_bind') as fallback,
+                          self.assertRaises(worker.ScanError) as failure):
+                        worker._verify_bind_source(11,b'1',source,(1,2,kind),self.fail,self.fail,after=after)
+                    self.assertEqual(str(failure.exception),expected)
+                    node.assert_called_once_with(11,source)
+                    fallback.assert_not_called()
+
+    def test_self_bind_exdev_classification_preserves_operation_sequence(self):
+        source=Path('parent/leaf')
+        strict=[call.node(11,source),call.node(11,source.parent)]
+        parent_stat=[call.fstat(12)]
+        filesystem=[call.mount_id(12),call.fstatfs(12,ANY)]
+        leaf_open=[call.node(12,source.name,same_mount=False)]
+        parent_close=[call.close(12)]
+        cases=(
+            ('parent-open',strict),
+            ('parent-identity',strict+parent_stat+parent_close),
+            ('overlay',strict+parent_stat+filesystem+parent_close),
+            ('leaf-open',strict+parent_stat+filesystem+leaf_open+parent_close),
+            ('leaf-mount',strict+parent_stat+filesystem+leaf_open+
+             [call.fstat(13),call.mount_id(13),call.close(13)]+parent_close),
+            ('',strict+parent_stat+filesystem+parent_close),
+        )
+        for branch,operations in cases:
+            for after in (False,True):
+                with self.subTest(branch=branch,after=after):
+                    exdev=OSError(errno.EXDEV,'synthetic fallback operation')
+                    trace=Mock()
+                    trace.node.side_effect=[exdev,exdev if branch=='parent-open' else 12,
+                                            exdev if branch=='leaf-open' else 13]
+                    parent=SimpleNamespace(st_dev=6 if branch=='parent-identity' else 1,st_mode=stat.S_IFDIR)
+                    leaf=SimpleNamespace(st_dev=1,st_ino=2,st_mode=stat.S_IFDIR)
+                    trace.fstat.side_effect={12:parent,13:leaf}.__getitem__
+                    trace.mount_id.return_value=b'1'
+
+                    def fstatfs(fd,buffer):
+                        if not branch:raise exdev
+                        magic=0x794c7630 if branch=='overlay' else 0x01021994
+                        ctypes.cast(buffer,ctypes.POINTER(ctypes.c_long))[0]=magic
+                        return 0
+
+                    trace.fstatfs.side_effect=fstatfs
+                    reason='bind-source-after-exdev' if after else 'bind-source-before-exdev'
+                    if not after and branch:reason+='-'+branch
+                    with (patch.object(worker,'_node',trace.node),patch.object(worker.os,'fstat',trace.fstat),
+                          patch.object(worker,'_mount_id',trace.mount_id),patch.object(worker.LIBC,'fstatfs',trace.fstatfs),
+                          patch.object(worker.os,'close',trace.close),self.assertRaises(worker.ScanError) as failure):
+                        worker._verify_bind_source(11,b'1',source,(1,2,stat.S_IFDIR),self.fail,self.fail,
+                                                   after=after,source_pin=14 if after else None)
+                    self.assertEqual(str(failure.exception),reason)
+                    self.assertEqual(trace.mock_calls,operations)
 
     def test_parser_no_total_is_never_a_usable_integer_and_typed_failure_survives(self):
         expected=self.expected();sha=ci.file_hash(Path(worker.__file__))
