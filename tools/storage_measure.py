@@ -1,22 +1,29 @@
 #!/usr/bin/python3
 """Fixed read-only allocated-block scan for the CI controller's owned scratch."""
 import argparse
+import array
 import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import re
+import signal
+import socket
 import stat
 import time
+from typing import NamedTuple
 
 ENTRIES=524288
 INODES=262144
 DEPTH=64
 ADDRESS_SPACE=256*1024**2
 FDS=256
+INODE_FILESYSTEMS={0xEF53:b'ext4',0x01021994:b'tmpfs'}
+BACKING_FLAGS=os.ST_RDONLY|os.ST_NOSUID|os.ST_NODEV|os.ST_NOEXEC
 REASONS=(
     'none','root-identity','identity-changed','permission','io','unsupported','mount-boundary',
     'mount-id-missing','mount-id-equal','mountinfo-unavailable','mountinfo-row-shape','mountinfo-device',
@@ -33,6 +40,7 @@ REASONS=(
 )
 class ScanError(ValueError):pass
 class NoTotal(ScanError):pass
+class SourceParentEXDEV(ScanError):pass
 
 def require(ok,reason):
     if not ok:raise ScanError(reason)
@@ -109,24 +117,27 @@ def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound,*,filesystem=N
     try:return mounted_source.relative_to(owned_source)
     except ValueError:raise ScanError('bind-source-outside-root') from None
 
+def _filesystem_type(fd):
+    # The Linux x86_64 statfs buffer begins with a long f_type.
+    result=(ctypes.c_long*16)()
+    if LIBC.fstatfs(fd,ctypes.byref(result))!=0:
+        raise OSError(ctypes.get_errno(),'filesystem check failed')
+    return result[0]
+
 def _open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons,*,after):
     missing,mismatch,exdev=reasons
     parent_fd=None
     try:
         try:parent_fd=_node(root_fd,source.parent)
         except OSError as error:
-            if not after and error.errno==errno.EXDEV:raise ScanError('bind-source-before-exdev-parent-open') from None
+            if error.errno==errno.EXDEV:
+                raise SourceParentEXDEV(exdev if after else 'bind-source-before-exdev-parent-open') from None
             raise
         parent=os.fstat(parent_fd)
         require(stat.S_ISDIR(parent.st_mode) and parent.st_dev==expected[0] and _mount_id(parent_fd)==root_id,
                 exdev if after else 'bind-source-before-exdev-parent-identity')
-        # The Linux x86_64 statfs buffer begins with a long f_type. Reserve
-        # room for the complete structure and accept only known inode semantics.
-        filesystem_stat=(ctypes.c_long*16)()
-        if LIBC.fstatfs(parent_fd,ctypes.byref(filesystem_stat))!=0:
-            raise OSError(ctypes.get_errno(),'parent filesystem check failed')
-        filesystem_type=filesystem_stat[0]
-        filesystem={0xEF53:b'ext4',0x01021994:b'tmpfs'}.get(filesystem_type)
+        filesystem_type=_filesystem_type(parent_fd)
+        filesystem=INODE_FILESYSTEMS.get(filesystem_type)
         if filesystem is None:
             if after:raise ScanError(exdev)
             reason='bind-source-before-exdev-overlay' if filesystem_type==0x794c7630 else 'bind-source-before-exdev-filesystem'
@@ -166,7 +177,146 @@ def _open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,re
     finally:
         if parent_fd is not None:os.close(parent_fd)
 
-def _verify_bind_source(root_fd,root_id,source,expected,bound,charge_entry,*,after=False,source_pin=None):
+def _mount(source,target,flags):
+    if LIBC.mount(source,target,None,ctypes.c_ulong(flags),None)!=0:
+        raise OSError(ctypes.get_errno(),'private mount rejected')
+
+def _send_backing_root(channel,root,expected,live_mount,worker_pid):
+    if LIBC.prctl(1,signal.SIGKILL,0,0,0)!=0 or os.getppid()!=worker_pid:  # PR_SET_PDEATHSIG
+        raise ScanError('mount-boundary')
+    if LIBC.unshare(0x20000)!=0:  # CLONE_NEWNS
+        raise OSError(ctypes.get_errno(),'private namespace rejected')
+    flags=os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC
+    cloned=os.open(root,flags)
+    try:
+        clone_mount=_mount_id(cloned)
+        require(identity(os.fstat(cloned))==expected and clone_mount!=live_mount,'root-identity')
+        ms_private=1<<18
+        ms_bind=1<<12
+        _mount(None,b'/',ms_private|(1<<14))  # MS_PRIVATE | MS_REC comes before the bind.
+        cloned_path=f'/proc/self/fd/{cloned}'.encode()
+        _mount(cloned_path,cloned_path,ms_bind)
+        backing=os.open(root,flags)
+        try:
+            require(identity(os.fstat(backing))==expected and _mount_id(backing) not in (clone_mount,live_mount),'root-identity')
+            backing_path=f'/proc/self/fd/{backing}'.encode()
+            _mount(None,backing_path,ms_private)
+            # MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC.
+            remount_flags=ms_bind|32|1|2|4|8
+            if os.fstatvfs(backing).f_flag&8192:remount_flags|=256  # Preserve MS_NOSYMFOLLOW.
+            _mount(None,backing_path,remount_flags)
+            require(os.fstatvfs(backing).f_flag&BACKING_FLAGS==BACKING_FLAGS,'mount-boundary')
+            rights=array.array('i',[backing])
+            require(channel.sendmsg([b'B'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])==1,'mount-boundary')
+        finally:os.close(backing)
+    finally:os.close(cloned)
+
+def _wait_backing_child(pid,end):
+    while True:
+        exited,status=os.waitpid(pid,os.WNOHANG)
+        if exited:return status
+        left=end-time.monotonic()
+        if left<=0:return None
+        time.sleep(min(.001,left))
+
+def _open_backing_root(root,expected,live_mount,end):
+    worker_pid=os.getpid()
+    # Leave part of the single existing deadline available to kill and reap.
+    left=end-time.monotonic()
+    require(left>0,'deadline')
+    response_end=end-min(.05,left/2)
+    receiver,sender=socket.socketpair(socket.AF_UNIX,socket.SOCK_SEQPACKET)
+    with receiver,sender:
+        status=None
+        received=array.array('i')
+        pid=os.fork()
+        if pid==0:
+            try:
+                receiver.close()
+                _send_backing_root(sender,root,expected,live_mount,worker_pid)
+            except BaseException:os._exit(1)
+            os._exit(0)
+        try:
+            sender.close()
+            left=response_end-time.monotonic()
+            require(left>0,'deadline')
+            receiver.settimeout(left)
+            size=received.itemsize
+            try:
+                payload,control,flags,_=receiver.recvmsg(1,socket.CMSG_SPACE(size),socket.MSG_CMSG_CLOEXEC)
+            except TimeoutError:raise ScanError('deadline') from None
+            for level,kind,data in control:
+                if (level,kind)==(socket.SOL_SOCKET,socket.SCM_RIGHTS):
+                    received.frombytes(data[:len(data)//size*size])
+            require(payload==b'B' and not flags&(socket.MSG_TRUNC|socket.MSG_CTRUNC) and
+                    len(control)==1 and len(control[0][2])==size and len(received)==1,'mount-boundary')
+            status=_wait_backing_child(pid,response_end)
+            require(status is not None,'deadline')
+            require(status==0,'mount-boundary')
+            backing=received[0]
+            node=os.fstat(backing)
+            require(stat.S_ISDIR(node.st_mode) and identity(node)==expected and _mount_id(backing)!=live_mount,'root-identity')
+            require(fcntl.fcntl(backing,fcntl.F_GETFL)&os.O_PATH and not os.get_inheritable(backing) and
+                    os.fstatvfs(backing).f_flag&BACKING_FLAGS==BACKING_FLAGS,'mount-boundary')
+            return received.pop()
+        finally:
+            for received_fd in received:os.close(received_fd)
+            if status is None:
+                try:os.kill(pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                require(_wait_backing_child(pid,end) is not None,'deadline')
+
+class _BackingSource(NamedTuple):
+    identities:tuple
+    pins:tuple
+
+    def close(self):
+        for fd in self.pins:os.close(fd)
+
+def _open_backing_source(root_fd,root_id,backing,filesystem,source,expected,bound,charge_entry,depth_limit,reasons):
+    _,mismatch,exdev=reasons
+    parts=source.parts
+    require(len(parts)<=depth_limit,'depth-limit')
+    require(parts and not source.is_absolute() and '..' not in parts,exdev)
+    clean_parent,live_parent=backing,root_fd
+    mount_id=root_id
+    crossed_parent=False
+    pins=[]
+    identities=[]
+    prefix=Path()
+    try:
+        for index,component in enumerate(parts):
+            bound();charge_entry()
+            clean_fd=_node(clean_parent,component)
+            try:live_fd=_node(live_parent,component,same_mount=False)
+            except BaseException:
+                os.close(clean_fd)
+                raise
+            if clean_parent!=backing:os.close(clean_parent)
+            if live_parent!=root_fd and live_parent not in pins:os.close(live_parent)
+            clean_parent,live_parent=clean_fd,live_fd
+            node=_node_identity(os.fstat(live_fd))
+            require(node[0]==expected[0] and node[2]==stat.S_IFDIR and
+                    node==_node_identity(os.fstat(clean_fd)),mismatch)
+            prefix=prefix/component
+            current_mount=_mount_id(live_fd)
+            if current_mount!=mount_id:
+                require(_bind_source(root_fd,root_id,live_fd,current_mount,expected[0],bound,filesystem=filesystem)==prefix,mismatch)
+                pins.append(live_fd)
+                if index<len(parts)-1:crossed_parent=True
+            mount_id=current_mount
+            identities.append((node,mount_id))
+        require(crossed_parent and node==expected,mismatch)
+        if live_parent not in pins:pins.append(live_parent)
+        return _BackingSource(tuple(identities),tuple(pins))
+    except BaseException:
+        for pin in pins:os.close(pin)
+        raise
+    finally:
+        if live_parent!=root_fd and live_parent not in pins:os.close(live_parent)
+        if clean_parent!=backing:os.close(clean_parent)
+
+def _verify_bind_source(root_fd,root_id,source,expected,bound,charge_entry,*,after=False,source_pin=None,backing_source=None):
     reasons=(
         ('bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev') if after else
         ('bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev')
@@ -185,9 +335,16 @@ def _verify_bind_source(root_fd,root_id,source,expected,bound,charge_entry,*,aft
             raise ScanError(resolve_exdev if after else 'bind-source-before-exdev-empty-name') from None
         if after and source_pin is None:
             raise ScanError(resolve_exdev) from None
-        leaf_fd=_open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons,after=after)
+        try:leaf_fd=_open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons,after=after)
+        except SourceParentEXDEV as parent_error:
+            if backing_source is None or (after and not isinstance(source_pin,_BackingSource)):raise
+            proven=backing_source(source,expected,reasons,str(parent_error))
+            if not after:return proven
+            try:require(proven.identities==source_pin.identities,identity_mismatch)
+            finally:proven.close()
+            return None
         if not after:return leaf_fd
-        try:require(_mount_id(leaf_fd)==_mount_id(source_pin),identity_mismatch)
+        try:require(not isinstance(source_pin,_BackingSource) and _mount_id(leaf_fd)==_mount_id(source_pin),identity_mismatch)
         finally:os.close(leaf_fd)
         return None
     try:require(source_pin is None and _node_identity(os.fstat(source_fd))==expected,identity_mismatch)
@@ -197,6 +354,7 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
     root=Path(root);end=time.monotonic()+4.5 if end is None else end
     counters={'entries':0,'unique_inodes':0,'vanished':0};seen={};active=set();total=0
     root_mount=None
+    backing_fd=backing_filesystem=None
     fd=os.open(root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK)
     def root_check():
         held=os.fstat(fd);current=os.stat(root,follow_symlinks=False)
@@ -210,6 +368,28 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
     def charge_entry():
         counters['entries']+=1
         require(counters['entries']<=entry_limit,'entry-limit')
+    def backing_source(source,node_identity,reasons,rejection):
+        nonlocal backing_fd,backing_filesystem
+        require(len(source.parts)<=depth_limit,'depth-limit')
+        if backing_fd is None:
+            bound()
+            try:root_check()
+            except FileNotFoundError:raise ScanError('root-identity') from None
+            try:
+                backing_filesystem=INODE_FILESYSTEMS.get(_filesystem_type(fd))
+                require(backing_filesystem is not None,rejection)
+                backing_fd=_open_backing_root(root,expected,root_mount,end)
+            except ScanError as error:
+                if str(error)=='deadline':raise
+                raise ScanError(rejection) from None
+            except OSError:raise ScanError(rejection) from None
+        try:
+            return _open_backing_source(fd,root_mount,backing_fd,backing_filesystem,source,node_identity,
+                                        bound,charge_entry,depth_limit,reasons)
+        except FileNotFoundError:raise ScanError(reasons[0]) from None
+        except OSError as error:
+            if error.errno==errno.EXDEV:raise ScanError(rejection) from None
+            raise
     def account(node,through_bind):
         nonlocal total
         require(type(node.st_dev) is int and node.st_dev>=0 and type(node.st_ino) is int and node.st_ino>0,'unsupported')
@@ -247,7 +427,8 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
             if same_device:
                 if crossed:
                     source=_bind_source(fd,root_mount,node_fd,mount_id,opened.st_dev,bound)
-                    source_pin=_verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry)
+                    source_pin=_verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry,
+                                                   backing_source=backing_source)
                 if directory_node:
                     # An ancestor bind is a cycle; a sibling alias is a separate
                     # visit. GNU du counts single-link files again on that visit.
@@ -276,10 +457,12 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                     require(_node_identity(os.fstat(after))==node_identity,'identity-changed')
                     if crossed:require(_mount_id(after)==mount_id,'identity-changed')
                     if source is not None:
-                        _verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry,after=True,source_pin=source_pin)
+                        _verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry,
+                                            after=True,source_pin=source_pin,backing_source=backing_source)
                 finally:os.close(after)
         finally:
-            if source_pin is not None:os.close(source_pin)
+            if isinstance(source_pin,_BackingSource):source_pin.close()
+            elif source_pin is not None:os.close(source_pin)
             os.close(node_fd)
     def walk(directory,node,depth,through_bind):
         bound();require(depth<=depth_limit,'depth-limit')
@@ -305,7 +488,9 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         root_check();return {'status':'no-total','allocated_bytes':None,'reason':'enumeration-disappeared','counters':counters}
     except (ScanError,OSError) as error:
         error.scan_counters=dict(counters);raise
-    finally:os.close(fd)
+    finally:
+        if backing_fd is not None:os.close(backing_fd)
+        os.close(fd)
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)

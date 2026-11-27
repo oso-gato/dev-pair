@@ -41,15 +41,23 @@ class MeasurementTests(unittest.TestCase):
         result=worker.scan(self.root,self.expected());self.assertEqual(result['status'],'complete');self.assertEqual(result['allocated_bytes'],self.oracle())
         actual=ci.measure_storage(self.root,sudo=False);self.assertFalse(actual['provisional']);self.assertEqual(actual['bytes'],self.oracle())
 
-    def isolated_mount_scan(self, fixture, mounts, check, *, backing=None, remount=False):
+    def isolated_mount_scan(self, fixture, mounts, check, *, backing=None, remount=False, proof=False):
         sandbox=shutil.which('bwrap')
         if sandbox is None:self.skipTest('bubblewrap is unavailable')
         base=[sandbox,'--unshare-user','--uid','0','--gid','0','--unshare-pid','--unshare-net','--ro-bind','/','/']
-        if remount:base.extend(('--cap-add','CAP_SYS_ADMIN'))
+        if remount or proof:base.extend(('--cap-add','CAP_SYS_ADMIN'))
         probe=subprocess.run([*base,'--','/usr/bin/true'],capture_output=True,text=True,timeout=5)
         if probe.returncode and ('namespace' in probe.stderr or 'Operation not permitted' in probe.stderr):
             self.skipTest('private mount namespace is unavailable')
         self.assertEqual(probe.returncode,0,probe.stderr)
+        if proof:
+            probe=subprocess.run([*base,'--',sys.executable,'-I','-B','-c',
+                'import ctypes,errno,sys; libc=ctypes.CDLL(None,use_errno=True)\n'
+                'if libc.unshare(0x20000)!=0:\n'
+                ' sys.exit(77 if ctypes.get_errno() in (errno.EPERM,errno.EACCES,errno.ENOSYS) else 1)'],
+                capture_output=True,text=True,timeout=5)
+            if probe.returncode==77:self.skipTest('nested private mount namespace is unavailable')
+            self.assertEqual(probe.returncode,0,probe.stderr)
         source=textwrap.dedent('''
             from contextlib import redirect_stdout
             from io import StringIO
@@ -248,6 +256,157 @@ class MeasurementTests(unittest.TestCase):
                     with patch.object(worker.os,'scandir',side_effect=never_enumerate_alias):
                         check_failure(REASON)
                     '''.replace('REASON',repr(reason)),backing=backing)
+
+    def crossed_parent_fixture(self, *, masked=False):
+        backing=self.tmpfs_backing()
+        parent=backing/'parent';source=parent/'child';source.mkdir(parents=True)
+        (source/'data').write_bytes(b'x'*8192)
+        alias=backing/'alias';alias.mkdir();(alias/'covered').write_bytes(b'x'*32768)
+        visible=parent
+        if masked:
+            visible=backing/'replacement';visible.mkdir()
+        return backing,['--bind',visible,self.root/'parent','--bind',source,self.root/'alias']
+
+    def test_actual_crossed_canonical_parent_uses_live_du_and_releases_private_proof(self):
+        backing,mounts=self.crossed_parent_fixture()
+        backing_du=subprocess.check_output(['/usr/bin/du','-sxB1',backing],timeout=3)
+        self.assertEqual(int(backing_du.split()[0]),40960)
+        self.isolated_mount_scan(self.root,mounts,'''
+            import time
+
+            before_mounts=Path('/proc/self/mountinfo').read_bytes()
+            before_fds=set(os.listdir('/proc/self/fd'))
+            open_backing=worker._open_backing_root
+            backing_ids=[]
+            def observe_backing(*args):
+                fd=open_backing(*args)
+                backing_ids.append(worker._mount_id(fd))
+                assert not os.get_inheritable(fd)
+                assert os.fstatvfs(fd).f_flag & worker.BACKING_FLAGS == worker.BACKING_FLAGS
+                return fd
+            def live_only(fd):
+                assert worker._mount_id(fd) not in backing_ids
+                return scandir(fd)
+            with patch.object(worker,'_open_backing_root',side_effect=observe_backing), \\
+                 patch.object(worker.os,'scandir',side_effect=live_only):
+                sample=worker.scan(root,expected)
+            assert len(backing_ids)==1, backing_ids
+            native=int(subprocess.check_output(['/usr/bin/du','-sxB1',root],timeout=3).split()[0])
+            assert sample['status']=='complete' and sample['allocated_bytes']==native==16384, sample
+            controlled=ci.measure_storage(root,sudo=False)
+            assert not controlled['provisional'] and controlled['bytes']==native, controlled
+
+            open_source=worker._open_backing_source
+            def no_unpaid_proof(root_fd,root_id,backing,filesystem,source,identity,bound,charge,depth,reasons):
+                def check_limit():
+                    charge()
+                    raise worker.ScanError('entry-limit')
+                return open_source(root_fd,root_id,backing,filesystem,source,identity,bound,check_limit,depth,reasons)
+            with patch.object(worker,'_open_backing_source',side_effect=no_unpaid_proof):
+                check_failure('entry-limit')
+
+            with patch.object(worker.LIBC,'unshare',return_value=-1):
+                check_failure('bind-source-before-exdev-parent-open')
+            mount=worker._mount
+            def hold_helper(source,target,flags):
+                time.sleep(3)
+                return mount(source,target,flags)
+            with patch.object(worker,'_mount',side_effect=hold_helper):
+                started=time.monotonic()
+                try:worker.scan(root,expected,end=started+.4)
+                except worker.ScanError as error:assert str(error)=='deadline', error
+                else:raise AssertionError('timed-out proof was accepted')
+                assert time.monotonic()-started<1
+            assert Path('/proc/self/mountinfo').read_bytes()==before_mounts
+            assert set(os.listdir('/proc/self/fd'))==before_fds
+            try:os.waitpid(-1,os.WNOHANG)
+            except ChildProcessError:pass
+            else:raise AssertionError('proof helper was not reaped')
+            ''',backing=backing,proof=True)
+
+    def test_actual_backing_proof_rejects_masked_and_replaced_canonical_ancestor(self):
+        backing,mounts=self.crossed_parent_fixture(masked=True)
+        self.isolated_mount_scan(self.root,mounts,'''
+            def never_enumerate_alias(fd):
+                assert Path(os.readlink(f'/proc/self/fd/{fd}'))!=root/'alias'
+                return scandir(fd)
+            with patch.object(worker.os,'scandir',side_effect=never_enumerate_alias):
+                check_failure('bind-source-before-identity')
+            ''',backing=backing,proof=True)
+        backing,mounts=self.crossed_parent_fixture()
+        self.isolated_mount_scan(self.root,mounts,'''
+            import ctypes
+
+            libc=ctypes.CDLL(None,use_errno=True)
+            replaced=False
+            def remount_parent(fd):
+                global replaced
+                if not replaced and Path(os.readlink(f'/proc/self/fd/{fd}'))==root/'alias':
+                    path=os.fsencode(root/'parent')
+                    assert libc.umount2(path,2)==0, ctypes.get_errno()  # MNT_DETACH
+                    assert libc.mount(path,path,None,4096,None)==0, ctypes.get_errno()  # MS_BIND
+                    replaced=True
+                return scandir(fd)
+            with patch.object(worker.os,'scandir',side_effect=remount_parent):
+                check_failure('bind-source-after-identity')
+            assert replaced
+            ''',backing=backing,proof=True)
+
+    def test_backing_protocol_rejects_multiple_descriptors_and_reaps_child(self):
+        import array
+        import socket
+
+        before=set(os.listdir('/proc/self/fd'))
+        def send_multiple(channel,root,*unused):
+            fd=os.open(root,os.O_PATH)
+            try:
+                rights=array.array('i',[fd,fd])
+                channel.sendmsg([b'B'],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,rights)])
+            finally:os.close(fd)
+        with patch.object(worker,'_send_backing_root',side_effect=send_multiple),self.assertRaisesRegex(worker.ScanError,'mount-boundary'):
+            worker._open_backing_root(self.root,self.expected(),b'1',time.monotonic()+1)
+        self.assertEqual(set(os.listdir('/proc/self/fd')),before)
+        with self.assertRaises(ChildProcessError):os.waitpid(-1,os.WNOHANG)
+
+    def test_actual_backing_helper_terminates_if_worker_is_killed(self):
+        backing=self.tmpfs_backing()
+        self.isolated_mount_scan(self.root,[],'''
+            import select
+            import signal
+            import time
+
+            root_fd=os.open(root,os.O_PATH)
+            try:root_mount=worker._mount_id(root_fd)
+            finally:os.close(root_fd)
+            read_fd,write_fd=os.pipe()
+            launched=os.fork()
+            if launched==0:
+                try:
+                    os.close(read_fd)
+                    def pause_at_first_mount(*unused):
+                        os.write(write_fd,str(os.getpid()).encode())
+                        os.close(write_fd)
+                        time.sleep(20)
+                    with patch.object(worker,'_mount',side_effect=pause_at_first_mount):
+                        worker._open_backing_root(root,expected,root_mount,time.monotonic()+3)
+                finally:os._exit(1)
+            os.close(write_fd)
+            try:
+                assert select.select([read_fd],[],[],2)[0], 'helper did not reach its first mount'
+                helper=int(os.read(read_fd,32))
+            finally:
+                os.close(read_fd)
+                os.kill(launched,signal.SIGKILL)
+                os.waitpid(launched,0)
+            end=time.monotonic()+1
+            while time.monotonic()<end:
+                try:os.waitpid(helper,os.WNOHANG)
+                except ChildProcessError:pass
+                try:os.kill(helper,0)
+                except ProcessLookupError:break
+                time.sleep(.01)
+            else:raise AssertionError('private helper outlived its worker')
+            ''',backing=backing,proof=True)
 
     def test_actual_canonical_self_bind_replaced_during_alias_enumeration_has_no_total(self):
         backing=self.tmpfs_backing()

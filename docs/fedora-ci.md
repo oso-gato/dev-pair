@@ -202,6 +202,13 @@ ext4 or tmpfs, the worker checks that the visible mount is a canonical self-bind
 and that the entry beneath it has the expected inode. It repeats the proof
 after traversal, keeps the scanned and canonical source mounts pinned, and
 charges the extra directory entries to the same scan limits.
+If the source's strict parent lookup also returns EXDEV, a bounded child in a
+private mount namespace can pass a read-only nonrecursive bind of the owned
+scratch root back as a metadata descriptor. The worker checks each live source
+component against that backing view and verifies the canonical mount source of
+every crossed prefix. It holds live mount identities through the post-scan
+check. All block accounting and enumeration still use the live filesystem.
+Unavailable proof or a changed identity blocks the sample.
 When the strict canonical source lookup returns EXDEV, fixed reason codes
 identify a regular file, another nondirectory, or an empty canonical name.
 Directory fallback codes identify the parent open, parent identity, unsupported
