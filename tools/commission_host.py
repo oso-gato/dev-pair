@@ -315,17 +315,27 @@ class Commission:
             return intent
 
     def unit(self, unit, files, *, uid=None, timer=False):
+        import systemd_service_profile as profile
+
         template = re.sub(r'@[^.]+\.service$', '@.service', unit)
         fragment = UNIT_ROOT + '/' + template
         drops = sorted(name for name in files if name.startswith(fragment + '.d/'))
         properties = 'LoadState,FragmentPath,DropInPaths,UnitFileState,ActiveState,SubState,' + (
-            'Unit,NextElapseUSecRealtime,NextElapseUSecMonotonic' if timer else 'ExecStart,User,Group')
+            'Unit,NextElapseUSecRealtime,NextElapseUSecMonotonic' if timer else
+            ','.join(('ExecStart', 'User', 'Group', *profile.PROPERTIES)))
         output = self.run(SYSTEMCTL, 'show', '--all', '--property=' + properties, unit, timeout=15)
-        row = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
-        require(set(row) == set(properties.split(',')) and row['LoadState'] == 'loaded' and
-                row['FragmentPath'] == fragment and row['DropInPaths'].split() == drops,
-                'systemd loaded a different fragment or override for ' + unit)
-        if not timer:
+        pairs = [line.split('=', 1) for line in output.splitlines()]
+        row = dict(pairs)
+        require(len(pairs) == len(row) and set(row) == set(properties.split(',')) and
+                row['LoadState'] == 'loaded' and row['FragmentPath'] == fragment,
+                'systemd loaded a different fragment for ' + unit)
+        if timer:
+            require(row['DropInPaths'].split() == drops, 'systemd loaded a different timer override for ' + unit)
+        else:
+            try:
+                profile.observe(row, drops, self.path, self.run, owner=self.owner)
+            except ValueError as error:
+                raise Blocked('unverified effective service profile for ' + unit + '. ' + str(error)) from None
             if uid is None:
                 raw = files[fragment][0].decode()
                 command = re.findall(r'^ExecStart=(.+)$', raw, re.M)
@@ -337,7 +347,7 @@ class Commission:
                 start = INSTALL + '/renewal/checklist-entry'
                 require(row['User'] == row['Group'] == 'dp-checklist',
                         'systemd checklist executor identity differs')
-            require('argv[]=' + start + ' ;' in row['ExecStart'],
+            require(profile.exec_start_matches(row['ExecStart'], start),
                     'systemd effective command differs for ' + unit)
         return row
 
@@ -389,10 +399,12 @@ class Commission:
             if any(existing) and not all(existing):
                 require(initial is not None, 'unowned partial live release selection preserved')
             self.file(PRIVATE + '/intent.json', encoded(intent), 0o600)
+            self.directory(INSTALL + '/host-releases', 0o755)
             for target, (contents, mode, feature) in files.items():
                 if feature != 'owner-entry':
                     self.file(target, contents, mode)
-            self.run('/usr/sbin/restorecon', '-F', *(target for target, item in files.items() if item[2] != 'owner-entry'),
+            self.run('/usr/sbin/restorecon', '-F', INSTALL + '/host-releases',
+                     *(target for target, item in files.items() if item[2] != 'owner-entry'),
                      timeout=30)
             self.run('/usr/bin/systemd-tmpfiles', '--create', '/etc/tmpfiles.d/dev-pair-renewal.conf', timeout=30)
             self.run(SYSTEMCTL, 'daemon-reload', timeout=25)
@@ -404,6 +416,7 @@ class Commission:
                              f'dev-pair-intake@{sample}.service', f'dev-pair-product@{sample}.service'):
                     self.unit(unit, files)
             if not any(existing):
+                self.services.prepare_host_bundle(policy)
                 self.services.stage(policy, boot)
             selected = self.selectors(policy, boot, site, initial)
             provision = self.services.provision(policy)
@@ -507,6 +520,13 @@ class Live:
                 and result['site_config_sha256'] == policy['site_config_sha256']
                 and result['base_platform_sha256'] == policy['platform_sha256'],
                 'native installation readback differs from the approved initial platform')
+
+    def prepare_host_bundle(self, policy):
+        stage, index, _ = self.installer.intake.retained_index(policy['platform_sha256'])
+        host = index['components']['host']
+        expected = {'manifest_sha256': host['bundle_manifest_sha256']}
+        require(self.installer.install_host(stage, host, time.monotonic() + 60) == expected,
+                'protected initial host bundle store readback differs')
 
     def renewal(self):
         return self.renewal_module.Renewal(Path(STATE), None)

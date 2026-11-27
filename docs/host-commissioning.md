@@ -57,7 +57,9 @@ the independently opened destination. Apply after that inspection.
 ```
 
 The entry verifies the protected package and installs its fixed service
-closure. It stages the exact platform through the native installer, publishes
+closure. It prepares the root-owned host release store and reads back the
+exact signed host bundle before the native installer can touch the role stores.
+It stages the exact platform through the native installer, publishes
 the local initial release through the renewal resolver and writes both
 selectors under its lock. The checklist provisioner initializes independent
 history, then observes the signed service under the persistent boot fence.
@@ -69,7 +71,10 @@ intent. Reapplication reads a compatible live successor and retains saved work.
 The ready response contains the selected local release, the admitted timer
 targets and their observed next firing. The root service for an omitted timer
 stays inactive. A selected timer is enabled only after the managed listener and
-boot recovery pass. The entry publishes the named operator's constrained sudo
+boot recovery pass. The controller measures the effective service command
+and timeout settings. It verifies the Fedora systemd timeout drop-in against
+the trusted installed package and the pinned Fedora key. The entry publishes
+the named operator's constrained sudo
 rule after these checks. On the verified tailnet route, the owner can then run
 the [normal terminal command](owner-intake.md).
 

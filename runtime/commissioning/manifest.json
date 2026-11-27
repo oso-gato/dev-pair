@@ -81,5 +81,6 @@
     {"source": "tools/startup_delivery.py", "target": "/usr/libexec/dev-pair/tools/startup_delivery.py", "mode": "0644", "feature": "base"},
     {"source": "tools/storage.py", "target": "/usr/libexec/dev-pair/tools/storage.py", "mode": "0644", "feature": "base"},
     {"source": "tools/storage_measure.py", "target": "/usr/libexec/dev-pair/tools/storage_measure.py", "mode": "0644", "feature": "base"},
-    {"source": "tools/storage_observation.py", "target": "/usr/libexec/dev-pair/tools/storage_observation.py", "mode": "0644", "feature": "base"}
+    {"source": "tools/storage_observation.py", "target": "/usr/libexec/dev-pair/tools/storage_observation.py", "mode": "0644", "feature": "base"},
+    {"source": "tools/systemd_service_profile.py", "target": "/usr/libexec/dev-pair/tools/systemd_service_profile.py", "mode": "0644", "feature": "base"}
 ]}

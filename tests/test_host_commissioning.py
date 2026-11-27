@@ -6,9 +6,11 @@ import re
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import commission_host as c
+import systemd_service_profile as profile
 
 SOURCE = '1' * 40
 PLATFORM = '2' * 64
@@ -31,8 +33,17 @@ class Systemd:
         self.root, self.steps = root, steps
         self.enabled, self.active = set(), set()
         self.bad_exec = None
+        self.vendor_key = b'public Fedora test key'
+        self.vendor_payload = b'# Fedora test payload\n[Service]\nTimeoutStopFailureMode=abort\n'
+        self.vendor_facts = {}
 
     def __call__(self, binary, command, *args, **unused):
+        if binary == '/usr/bin/rpm':
+            self.steps.append('vendor-rpm')
+            if args[-1] == '--info':
+                return 'Signature   : RSA/SHA256, Thu 01 Jan 1970, Key ID ' + profile.FINGERPRINT[-16:] + '\n'
+            return 'systemd\t1.fc44\tx86_64\t8\n' + (
+                profile.VENDOR + '\t' + c.digest(self.vendor_payload) + '\t-rw-r--r--\troot\troot\n')
         if binary != c.SYSTEMCTL:
             self.steps.append(command if binary.endswith('restorecon') else binary)
             return ''
@@ -51,6 +62,9 @@ class Systemd:
         fragment = c.UNIT_ROOT + '/' + template
         path = self.root / fragment.lstrip('/')
         drops = sorted(path.with_name(path.name + '.d').glob('*.conf'))
+        vendor = self.root / profile.VENDOR.lstrip('/')
+        if unit.endswith('.service') and vendor.exists():
+            drops.insert(0, vendor)
         exists = path.exists()
         data = path.read_text() if exists else ''
         command = next((line[10:] for line in data.splitlines() if line.startswith('ExecStart=')), '')
@@ -61,15 +75,21 @@ class Systemd:
         user = 'dp-checklist' if unit.startswith('dev-pair-checklist-executor@') else 'root'
         active = unit in self.active
         next_unit = next((short for timer, short in c.TIMERS.values() if timer == unit), '')
+        executable = command.split()[0] if command else ''
         row = {'LoadState': 'loaded' if exists else 'not-found',
                'FragmentPath': fragment if exists else '',
                'DropInPaths': ' '.join('/' + str(drop.relative_to(self.root)) for drop in drops),
                'UnitFileState': 'enabled' if unit in self.enabled else 'disabled' if exists else '',
                'ActiveState': 'active' if active else 'inactive', 'SubState': 'waiting' if active else 'dead',
                'User': user, 'Group': user,
-               'ExecStart': '{ argv[]=' + command.replace('%i', unit.partition('@')[2].removesuffix('.service')) + ' ; }',
+               'ExecStart': '{ path=' + executable + ' ; argv[]=' +
+                 command.replace('%i', unit.partition('@')[2].removesuffix('.service')) + ' ; }',
                'Unit': next_unit, 'NextElapseUSecRealtime': 'Fri 2026-11-27 19:00:00 UTC' if active else '',
                'NextElapseUSecMonotonic': 'n/a'}
+        row.update(dict.fromkeys(profile.PROPERTIES, ''), NeedDaemonReload='no', KillMode='control-group',
+                   SendSIGKILL='yes', FinalKillSignal='9', TimeoutStartFailureMode='terminate',
+                   TimeoutStopFailureMode='abort' if vendor.exists() else 'terminate')
+        row.update(self.vendor_facts)
         return ''.join(f'{key}={row[key]}\n' for key in fields)
 
 
@@ -93,6 +113,12 @@ class ExistingPaths:
     def stage(self, policy, boot):
         self.steps.append('F-stage')
         assert 'daemon-reload' in self.steps
+        assert self.steps.index('F-host-bundle') < self.steps.index('F-stage')
+
+    def prepare_host_bundle(self, policy):
+        store = self.app.path(c.INSTALL + '/host-releases')
+        assert store.is_dir() and store.stat().st_mode & 0o777 == 0o755
+        self.steps.append('F-host-bundle')
 
     def resolve_initial(self, controller, policy, boot, site):
         self.steps.append('U-resolve')
@@ -235,6 +261,31 @@ class HostCommissioning(unittest.TestCase):
             self.apply()
         self.assertNotIn('dev-pair-checklist-spool.timer', self.manager.enabled)
         self.assertFalse(self.app.path('/etc/sudoers.d/60-dev-pair-owner').exists())
+
+    def test_fedora_vendor_dropin_is_measured_and_effective_properties_are_checked(self):
+        with patch.object(profile, 'KEY_SHA', c.digest(self.manager.vendor_key)):
+            self.app.file(profile.VENDOR_KEY, self.manager.vendor_key, 0o644)
+            self.app.file(profile.VENDOR, self.manager.vendor_payload, 0o644)
+            self.assertEqual(self.apply()['phase'], 'host-observation-queued')
+            self.assertGreaterEqual(self.steps.count('vendor-rpm'), 2)
+            self.manager.vendor_facts['TimeoutStopFailureMode'] = 'terminate'
+            with self.assertRaisesRegex(c.Blocked, 'effective timeout mode differs'):
+                self.apply()
+            self.manager.vendor_facts.clear()
+            target = self.app.path(profile.VENDOR)
+            target.write_bytes(self.manager.vendor_payload + b'ExecStartPre=/usr/bin/false\n')
+            with self.assertRaisesRegex(c.Blocked, 'installed RPM payload'):
+                self.apply()
+            self.manager.vendor_payload = target.read_bytes()
+            with self.assertRaisesRegex(c.Blocked, 'unapproved settings'):
+                self.apply()
+
+    def test_incompatible_host_release_store_blocks_before_f_native_stage(self):
+        self.app.directory(c.INSTALL + '/host-releases', 0o700)
+        with self.assertRaisesRegex(c.Blocked, 'mode differs'):
+            self.apply()
+        self.assertNotIn('F-stage', self.steps)
+        self.assertNotIn('F-host-bundle', self.steps)
 
     def test_policy_rejects_unbound_source_and_arbitrary_units(self):
         self.assertEqual(c.read_policy(c.encoded(FIRST), SOURCE), FIRST)
