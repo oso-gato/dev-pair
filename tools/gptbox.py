@@ -27,6 +27,7 @@ from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPR
                            git_output, host_job_inputs, repository_origin)
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
+CODEX_VERSION = '0.169.0'
 CODEX_SHA = 'b452ca20f838a8855a88a41050ee4a694033fff4ea3ecdad5633e6e0e8d13f2b'
 import fedora_oci
 FEDORA = fedora_oci.IMAGE
@@ -172,11 +173,21 @@ class ProbeCommands(Commands):
 
 class Gptbox(Bootstrap):
     role = 'maintenance'
+    ci_tooling_identity = None
+    ci_tooling_request = None
     artifact_root = ARTIFACTS
     control = CONTROL
 
     def __init__(self, root=Path('/'), run=None):
         super().__init__(root, run or ProbeCommands())
+
+    @property
+    def codex_version(self):
+        return self.ci_tooling_identity[0] if self.ci_tooling_identity is not None else CODEX_VERSION
+
+    @property
+    def codex_sha(self):
+        return self.ci_tooling_identity[1] if self.ci_tooling_identity is not None else CODEX_SHA
 
     def protected(self, path):
         path = Path(path)
@@ -288,13 +299,54 @@ class Gptbox(Bootstrap):
             if recorded.encode() != data:
                 raise Blocked('adapter revision does not identify executing source')
 
+    def use_ci_tooling(self, expected_digest):
+        """Use only the tooling attached to the authenticated disposable producer request."""
+        source = Path('/root/dev-pair-ci-inputs/dev-pair')
+        if (self.root != Path('/') or os.getuid() != 0 or os.geteuid() != 0 or
+                Path(__file__).resolve().parents[1] != source or
+                Path('/proc/self/cgroup').read_text().strip() != '0::/system.slice/dev-pair-ci-provision.service'):
+            raise Blocked('refresh tooling is confined to the authenticated native CI producer')
+        request_path = Path('/var/lib/dev-pair/ci-executor/request.json')
+        request = json.loads(self.protected_bytes(request_path, 65536, 0o600), object_pairs_hook=fedora_oci.unique)
+        incoming = request['inputs']
+        revision = request['source_sha']
+        if (type(request['version']) is not int or request['version'] != 2 or incoming['source_sha'] != revision or
+                incoming.get('refresh_tooling_sha256') != raw_digest(expected_digest) or
+                incoming.get('scenario', 'maintenance') != self.role or 'platform_export' not in incoming):
+            raise Blocked('native CI request does not authorize this exact refresh role or evidence')
+        self.source(revision)
+        helper = fedora_oci._public_inputs()
+        helper_path = self.protected(Path(helper.__file__))
+        if self.run('/usr/bin/git', '-C', str(source), 'show', revision + ':tools/public_inputs.py').encode() != helper_path.read_bytes():
+            raise Blocked('refresh input verification helper differs from reviewed source')
+        evidence = source.parent / 'evidence'
+        raw = self.protected_bytes(evidence / 'tooling.json', 65536, 0o444)
+        tooling = helper.tooling_record(json.loads(raw, object_pairs_hook=fedora_oci.unique), revision)
+        artifacts, version, codex_source, binary, size = helper.selected_tooling(tooling)
+        receipt_raw = self.protected_bytes(evidence / 'verification-receipt.json', 65536, 0o444)
+        receipt = json.loads(receipt_raw, object_pairs_hook=fedora_oci.unique)
+        proof = self.protected_bytes(evidence / 'cosign-verification.txt', 1024 * 1024, 0o444)
+        bundle = self.protected_bytes(evidence / 'codex.sigstore', artifacts['codex.sigstore'][1], 0o444)
+        if (sha(raw) != expected_digest or raw != helper.canonical(tooling) or
+                (version, codex_source, binary) != (incoming['codex_version'], incoming['codex_source_sha'], incoming['codex_sha256']) or
+                receipt['helper_source_sha'] != revision or type(receipt['exit_status']) is not int or receipt['exit_status'] != 0 or
+                receipt['result'] != 'Verified OK' or b'Verified OK' not in proof or
+                receipt['verification_output_sha256'] != sha(proof) or receipt['artifacts'] != helper.artifact_receipt(artifacts) or
+                (receipt['codex_source_sha'], receipt['codex_binary_sha256'], receipt['codex_binary_bytes']) != (codex_source, binary, size) or
+                (len(bundle), sha(bundle)) != artifacts['codex.sigstore'][1:]):
+            raise Blocked('native CI tooling does not match the original strict signature verification')
+        self.ci_tooling_identity = (version, binary)
+        self.ci_tooling_request = (source.parent / 'context', incoming['context_sha256'], revision)
+
     def context_inputs(self, context, expected, revision):
+        if self.ci_tooling_request is not None and (Path(context), expected, revision) != self.ci_tooling_request:
+            raise Blocked('context differs from the exact native CI tooling request')
         self.protected(context)
         for file in Path(context).iterdir():
             self.protected(file)
         _, _, manifest = self.check_gptbox_inputs(context, expected, expected_role=self.role)
         if (manifest['role'] != self.role or manifest['fedora']['image'] != FEDORA
-                or manifest['codex']['version'] != '0.169.0' or manifest['codex']['sha256'] != CODEX_SHA):
+                or manifest['codex']['version'] != self.codex_version or manifest['codex']['sha256'] != self.codex_sha):
             raise Blocked('adapter requires independently verified pinned inputs for its role')
         if manifest['source_sha'] != revision or not re.fullmatch(r'[0-9a-f]{40}', revision or ''):
             raise Blocked('context source differs from requested adapter target')
@@ -797,7 +849,7 @@ class Gptbox(Bootstrap):
         labels = self.maintenance_labels(context, revision, sealed)
         pinned = {'dev-pair.inputs': built['inputs_sha256'], 'dev-pair.runtime': built['runtime_sha256'],
                   'dev-pair.init': built['init_sha256'], 'dev-pair.codex.sha256': built['codex_sha256'],
-                  'dev-pair.codex.version': '0.169.0'}
+                  'dev-pair.codex.version': self.codex_version}
         if (assembly != seal or type(assembly['uid']) is not int or type(assembly['gid']) is not int
                 or any(labels.get(key) != value for key, value in pinned.items())):
             raise Blocked('local maintenance Distrobox seal differs from the prepared and sealed images')
@@ -1088,7 +1140,7 @@ class Gptbox(Bootstrap):
             rows=json.loads(self.engine('image','inspect',prepared['image_id']))
             if type(rows) is not list or len(rows)!=1 or type(rows[0]) is not dict or type(rows[0].get('Id')) is not str or image_id(rows[0]['Id'])!=image_id(prepared['image_id']) or rows[0].get('Os')!='linux' or rows[0].get('Architecture')!='amd64':raise Blocked('prepared immutable image unavailable')
             labels=rows[0].get('Labels') or (rows[0].get('Config',{}).get('Labels',{}) if type(rows[0].get('Config',{})) is dict else {})
-            wanted={'dev-pair.context':expected,'org.opencontainers.image.revision':revision,'dev-pair.role':'maintenance','dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':'0.169.0'}
+            wanted={'dev-pair.context':expected,'org.opencontainers.image.revision':revision,'dev-pair.role':'maintenance','dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':self.codex_version}
             if prepared['kind']=='full-adapter-candidate':wanted.update({'dev-pair.distrobox':DBX_SHA,'dev-pair.inputs':prepared['inputs_sha256'],'dev-pair.runtime':prepared['runtime_sha256'],'dev-pair.init':prepared['init_sha256'],'dev-pair.codex.sha256':prepared['codex_sha256']})
             if type(labels) is not dict or any(labels.get(k)!=v for k,v in wanted.items()):raise Blocked('prepared immutable image labels mismatch')
         if self.path(self.target + '/result.json').exists():
@@ -1145,7 +1197,7 @@ class Gptbox(Bootstrap):
             # A separate immutable runtime, never the writable assembly container.
             self.image_stage('runtime',revision,expected)
             runtime_id = self.create_maintenance_probe(runtime_name, expected, sealed)
-            self.maintenance_probe_cycles(runtime_id, sealed, '0.169.0')
+            self.maintenance_probe_cycles(runtime_id, sealed, self.codex_version)
             result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
                       'distrobox_sha': DBX_SHA, 'fedora_base': imported, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
                       'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
@@ -1299,7 +1351,7 @@ class Gptbox(Bootstrap):
                   'rpm -qa --qf "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n" | sort > /usr/lib/dev-pair/gptbox/rpms.txt; '
                   'rm /tmp/upstream-packages /tmp/resolved-packages; dnf clean all\n'
                   f'COPY --chmod=0555 codex /opt/dev-pair/bin/codex\nCOPY --chmod=0555 distrobox-init /usr/bin/distrobox-init\nCOPY --chmod=0555 runtime.py {RUNTIME}\nCOPY --chmod=0444 inputs.json {BASE}/inputs.json\n'
-                  f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA} org.opencontainers.image.revision={revision} dev-pair.role={self.role} dev-pair.standards={candidate.STANDARDS} dev-pair.codex.version=0.169.0 dev-pair.inputs={input_digest} dev-pair.runtime={sha(runtime)} dev-pair.init={sha(files['distrobox-init'])} dev-pair.codex.sha256={sha(files['codex'])}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n')
+                  f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA} org.opencontainers.image.revision={revision} dev-pair.role={self.role} dev-pair.standards={candidate.STANDARDS} dev-pair.codex.version={self.codex_version} dev-pair.inputs={input_digest} dev-pair.runtime={sha(runtime)} dev-pair.init={sha(files['distrobox-init'])} dev-pair.codex.sha256={sha(files['codex'])}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n')
         lines = recipe.splitlines()
         # Fixed source-controlled package/locale operation, never submitted
         # script input. This native inner bound also covers detached RUN
@@ -1389,7 +1441,7 @@ class Gptbox(Bootstrap):
         labels=rows[0].get('Labels') or config.get('Labels',{})
         if type(labels) is not dict:raise Blocked('malformed full candidate labels')
         wanted={'dev-pair.context':expected,'dev-pair.distrobox':DBX_SHA,'org.opencontainers.image.revision':revision,
-            'dev-pair.role':self.role,'dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':'0.169.0',
+            'dev-pair.role':self.role,'dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':self.codex_version,
             'dev-pair.inputs':binding['inputs_sha256'],'dev-pair.runtime':binding['runtime_sha256'],'dev-pair.init':binding['init_sha256'],'dev-pair.codex.sha256':binding['codex_sha256']}
         if (type(rows) is not list or len(rows)!=1 or image_id(rows[0]['Id'])!=base or rows[0].get('Architecture')!='amd64' or
             rows[0].get('Os')!='linux' or any(labels.get(k)!=v for k,v in wanted.items())):
@@ -2238,7 +2290,7 @@ class DevelopmentGptbox(Gptbox):
             raise Blocked('development snapshot restart would bypass its finite lifetime')
         labels = {'dev-pair.role': 'development', 'dev-pair.context': expected,
                   'dev-pair.inputs': sha(image_inputs_bytes(inputs)), 'dev-pair.standards': candidate.STANDARDS,
-                  'dev-pair.distrobox': DBX_SHA, 'dev-pair.codex.version': '0.169.0',
+                  'dev-pair.distrobox': DBX_SHA, 'dev-pair.codex.version': self.codex_version,
                   'org.opencontainers.image.revision': revision}
         rows = json.loads(self.engine('image', 'inspect', 'sha256:' + sealed), object_pairs_hook=fedora_oci.unique)
         if (type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != sealed
@@ -2428,6 +2480,7 @@ def main():
     access.add_argument('--console-receipt')
     parser.add_argument('--password-file')
     parser.add_argument('--work-deadline-monotonic', type=float, help=argparse.SUPPRESS)
+    parser.add_argument('--ci-tooling-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.stage == 'prepare-development-host' and not args.bootstrap_source:
         parser.error('prepare-development-host requires --bootstrap-source')
@@ -2435,6 +2488,8 @@ def main():
         parser.error('--console-receipt is supported only for maintenance initialize')
     try:
         app = DevelopmentGptbox() if args.stage in ('prepare-development-host', 'build-development') else Gptbox()
+        if args.ci_tooling_sha256 is not None:
+            app.use_ci_tooling(args.ci_tooling_sha256)
         budget = contextlib.nullcontext()
         if args.work_deadline_monotonic is not None:
             if (args.stage not in ('prepare-development-host', 'build-development') or not args.apply

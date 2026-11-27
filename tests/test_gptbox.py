@@ -455,6 +455,10 @@ class GptboxTests(unittest.TestCase):
         self.assertFalse(any(call[0][0] == '/usr/bin/systemd-run' for call in self.engine.calls))
 
 class ProductionInputContractTests(unittest.TestCase):
+    def test_refresh_tooling_is_unavailable_outside_the_authenticated_native_guest(self):
+        with self.assertRaisesRegex(g.Blocked, 'authenticated native CI producer'):
+            g.Gptbox().use_ci_tooling('b' * 64)
+
     def test_production_inputs_accepts_real_helper_triple_and_checks_git_objects(self):
         # Actual production inputs()/check_gptbox_inputs()/candidate verification run.
         # The tiny ELF/upstream scripts are explicitly UNTRUSTED synthetic artifacts;
