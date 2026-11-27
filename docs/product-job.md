@@ -26,22 +26,47 @@ origin, commit and tree and uses the same private startup approval and
 ordinary role and provider custody.
 
 The maintenance turn reviews scope and validation feasibility with its
-existing restrictions. DevBox implements and commits the approved change.
-The protected conductor retains the original session identity and a
-successful stock command start and completion from the admitted role turn.
-The command observes the exact clean Git HEAD immediately before and after
-the repository's local test. The conductor compares that evidence with the
-final checkout, verifies ancestry, and mirrors the same clean commit to
-the maintenance checkout for renewal. The command runs inside the existing
-DevBox placement and its normal operating and provider limits. The
-conductor records the command and output hashes, candidate, checkpoint,
-exit status and original session UUID.
+existing restrictions. DevBox edits the approved project source and runs
+the agreed local test. The conductor retains the original session identity
+and a successful stock command start and completion from the admitted role
+turn. It compares the Git source files witnessed before and after that
+test, verifies the working tree after the role exits, and publishes the new
+commit under controller custody. It mirrors the same clean commit to the
+maintenance checkout for renewal. The conductor records the command and
+output hashes, tested source, candidate, checkpoint, exit status and
+original session UUID.
 
 `local-validation-recorded` indicates observed DevBox test evidence at the
 saved candidate. `awaiting-external-validation` keeps the same local evidence
 and the agreed external check pending until an admitted adapter is available.
 The generic modes issue no checklist restart or external host request.
 Independent acceptance and controlled release still use their normal paths.
+
+## Publishing changes from the confined workspace
+
+The same source handoff serves all three adapters. Stock DevBox retains its
+read-only Git metadata and its existing permissions to edit product source.
+The development turn leaves the tested changes in place. The fixed witness
+reads bounded Git-representable files and safe relative symlinks on both
+sides of one local test. Keep generated and ignored files under the declared
+build root. The conductor checks the approved repository and original clean
+base before launching the role.
+
+After the normal role records its completed, reaped turn, the conductor checks
+the retained request, original session, test command and output. It reads the
+role's files again. Git object and commit construction run in a protected
+directory outside the workspace, with hooks and product-configured filters
+disabled. The conductor saves the operation binding, tested digest, tree,
+candidate and verified transfer under the job's `candidate/` directory before
+updating the owned HEAD with a compare-and-set operation and updating the index
+under Git's lock. Recovery accepts only the retained source snapshot and known
+branch states. It can finish an interrupted index update and return the
+original commit. A change after the test preserves the working data and stops
+publication. Equivalent Git trees retain the original commit.
+
+For a checklist repair, the new revision follows the existing fresh rootless
+OCI build, checkpoint, request and retest. The protected commit and bundle
+identify exact input for subsequent independent review and product release.
 
 ## Prepare the authorized job
 
@@ -55,7 +80,8 @@ pinned development mTLS profile at `/etc/dev-pair/checklist-client`.
 Create the root-owned mode-0700 directory
 `/var/lib/dev-pair/product-jobs` with its mode-0600 `owner.lock` and mode-0700
 `jobs` and `profiles` directories. Install the trusted product sources and
-the reviewed runtime dependencies at `/usr/libexec/dev-pair`. Install
+reviewed runtime dependencies at `/usr/libexec/dev-pair`, including
+`tools/candidate_git.py` and `tools/candidate_snapshot.py`. Install
 [`dev-pair-product@.service`](../runtime/product-job/dev-pair-product@.service).
 Install the companion [tmpfiles entry](../runtime/product-job/dev-pair-product.conf)
 after provisioning the checklist account. The service limits each worker to
@@ -170,13 +196,14 @@ same stored request before acting again. The host executor can reconcile
 proven interrupted effects. Unknown outcomes remain blocked. The same job ID
 always retains its original brief.
 
-The development turn receives the original brief and exact host verdict,
-including failure diagnostics. It must finish with a structured candidate SHA
-and summary. The issuer verifies that SHA against the actual authorized Git
-checkout and acquisition ancestry before producing a fresh artifact. A job
-whose starting candidate already passes can validate an unchanged candidate.
-To verify the failure and repair journey, use an authorized starting commit
-whose real native observation reproduces the defect.
+The checklist development turn receives the original brief and exact host
+verdict, including failure diagnostics. It leaves tested source edits and
+returns the unchanged base SHA and a summary. The conductor publishes the
+verified commit and the issuer checks its authorized Git ancestry before
+producing a fresh artifact. A job whose starting candidate already passes can
+validate an unchanged candidate. To verify the failure and repair journey,
+use an authorized starting commit whose native observation reproduces the
+defect.
 
 ## Evidence and deployment boundary
 
@@ -190,4 +217,12 @@ a DevBox-authored repair, and actual destination delivery require live proof.
 
 ```sh
 /usr/bin/python3 -B -m unittest discover -s tests -p test_product_job.py -v
+/usr/bin/python3 -B tests/candidate_materialization_stock.py \
+  --binary /path/to/verified/codex --role-source /path/to/approved/role-source
 ```
+
+The stock sandbox fixture exercises ordinary edits and a fresh test under
+the approved managed policy for all three adapters. It checks the conductor
+with fixture role receipts and actual test observations, and verifies one
+trusted commit, a clean workspace and exact replay. Native authenticated
+role operation and actual Fedora host retest remain separate evidence.

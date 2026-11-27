@@ -16,6 +16,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import checklist_candidate as candidate
+import candidate_git
+import candidate_snapshot
 import host_handoff as handoff
 import job_protocol as p
 import ledger_recovery as recovery
@@ -170,7 +172,13 @@ class ProductJobTests(unittest.TestCase):
                     raise BlockingIOError('fixture disconnected after durable host failure')
                 case.assertEqual(result, failure)
                 effects.append(('development', result['result']['attempt_id']))
-                return {'session_uuid': 'fixture-development', 'candidate_sha': repaired}
+                return {'session_uuid': 'fixture-development', 'base_sha': source,
+                        'local_validation': {'exit_status': 0, 'snapshot_sha256': 'd' * 64}}
+
+            def materialize(self, checkpoint, development):
+                case.assertEqual(checkpoint['candidate']['source_revision'], source)
+                effects.append(('materialized', development['local_validation']['snapshot_sha256']))
+                return {'candidate_sha': repaired, 'binding': {'base_sha': source, 'snapshot_sha256': 'd' * 64}}
 
             def host_test(self, ordinal, checkpoint):
                 effects.append(('host', ordinal, checkpoint['candidate']['source_revision']))
@@ -185,7 +193,7 @@ class ProductJobTests(unittest.TestCase):
         self.assertEqual(state['phase'], 'passed')
         self.assertEqual(state['final'], success)
         self.assertEqual(effects, [('build', 1, source), ('maintenance', source), ('host', 1, source),
-                                   ('interrupted',), ('development', 'effect-1'), ('build', 2, repaired),
+                                   ('interrupted',), ('development', 'effect-1'), ('materialized', 'd' * 64), ('build', 2, repaired),
                                    ('host', 2, repaired)])
 
     def test_general_repository_records_actual_local_test_and_holds_only_external_boundary(self):
@@ -205,6 +213,7 @@ class ProductJobTests(unittest.TestCase):
         maintenance = self.root / 'maintenance/workspaces/demo'
         maintenance.parent.mkdir(parents=True)
         (self.root / 'maintenance/conductor-inputs').mkdir(mode=0o700)
+        (self.root / 'development/conductor-inputs').mkdir(mode=0o700)
         subprocess.run(['/usr/bin/git', 'clone', '--no-local', str(workspace), str(maintenance)], check=True,
                        capture_output=True, timeout=4)
         self.git(maintenance, 'remote', 'set-url', 'origin', 'https://github.com/' + self.repo)
@@ -217,16 +226,16 @@ class ProductJobTests(unittest.TestCase):
         backend.ledger = mock.Mock()
         backend.host_test = mock.Mock(side_effect=AssertionError('general mode cannot use the host recipe'))
         role_effects = []
+        root = self.root / 'candidate-job'
+        root.mkdir(mode=0o700)
 
         def turn(role, checkpoint):
             role_effects.append((role, checkpoint['candidate']['source_revision']))
             if role == 'maintenance':
                 return {'session_uuid': 'unchanged-maintenance-uuid'}
             (workspace / 'product.txt').write_text('Approved change\n')
-            self.git(workspace, 'add', 'product.txt')
-            self.git(workspace, 'commit', '-m', 'Complete agreed product change')
-            revision = self.git(workspace, 'rev-parse', 'HEAD')
-            script = job.LOCAL_TEST_PREFIX + '/usr/bin/python3 -B -m unittest test_product.py' + job.LOCAL_TEST_SUFFIX
+            prefix, suffix = candidate_git.witness()
+            script = prefix + '/usr/bin/python3 -B -m unittest test_product.py' + suffix
             actual = subprocess.run(['/bin/sh', '-c', script.replace('/work/job', shlex.quote(str(workspace)))],
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, timeout=5)
             command = shlex.join(['/bin/bash', '-lc', script])
@@ -236,13 +245,21 @@ class ProductJobTests(unittest.TestCase):
                 {'type': 'item.completed', 'item': dict(item, status='completed', exit_code=actual.returncode,
                                                         aggregated_output=actual.stdout.decode())},
                 {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': p.canonical(
-                    {'candidate_sha': revision, 'summary': 'The agreed local product test passed.'})}},
+                    {'base_sha': initial, 'summary': 'The agreed local product test passed.'})}},
             ]
             events = '\n'.join(map(p.canonical, rows)).encode()
-            developed = job.proposal(events, local=True)
+            developed = job.proposal(events, source=True)
             return dict(developed, session_uuid='unchanged-development-uuid', events_sha256=p.sha256(events))
 
         backend.turn = turn
+        def materialize(checkpoint, development):
+            self.assertEqual(checkpoint['candidate']['source_revision'], initial)
+            binding = {'job_id': 'demo', 'operation': 'demo-development', 'base_sha': initial,
+                       'snapshot_sha256': development['local_validation']['snapshot_sha256'],
+                       'session_uuid': development['session_uuid']}
+            return candidate_git.materialize(self.root, root, approval, binding, time.monotonic() + 20)
+
+        backend.materialize = mock.Mock(side_effect=materialize)
         state = dict.fromkeys(('initial', 'maintenance', 'first', 'development', 'repair', 'final'))
         persisted = self.root / 'general.json'
         with self.local_git(), mock.patch.object(job, 'ROOT', self.root):
@@ -259,6 +276,7 @@ class ProductJobTests(unittest.TestCase):
         revision = self.git(workspace, 'rev-parse', 'HEAD')
         self.assertEqual((outcome['candidate_sha'], self.git(maintenance, 'rev-parse', 'HEAD')), (revision, revision))
         self.assertEqual(role_effects, [('maintenance', initial), ('development', initial)])
+        backend.materialize.assert_called_once()
         backend.host_test.assert_not_called()
 
     def test_general_validation_requires_a_successful_witness_of_the_final_revision(self):
@@ -280,6 +298,71 @@ class ProductJobTests(unittest.TestCase):
                            aggregated_output=marker + '\nOK\n' + job.LOCAL_HEAD_MARKER + 'b' * 40)}]):
             with self.assertRaisesRegex(ValueError, 'no successful stock test'):
                 read(events)
+
+    def test_dirty_tested_bytes_materialize_once_and_recover_after_ref_publication(self):
+        workspace, source, approval = self.source_workspace()
+        old = workspace / 'obsolete.txt'
+        old.write_text('Old file\n')
+        self.git(workspace, 'add', 'obsolete.txt')
+        self.git(workspace, 'commit', '-m', 'Add obsolete file')
+        base = self.git(workspace, 'rev-parse', 'HEAD')
+        approval.update(acquired_commit=base, acquired_tree=self.git(workspace, 'rev-parse', 'HEAD^{tree}'))
+        job_root = self.root / 'job'
+        job_root.mkdir(mode=0o700)
+        (self.root / 'development/conductor-inputs').mkdir(mode=0o700)
+        source.write_text('# repaired source\n')
+        old.unlink()
+        newcomer = workspace / 'added source.txt'
+        newcomer.write_text('New relevant source\n')
+        prefix, suffix = candidate_git.witness()
+        script = prefix + '/usr/bin/python3 -IB -c "from pathlib import Path; assert Path(\'added source.txt\').is_file()"' + suffix
+        actual = subprocess.run(['/bin/sh', '-c', script.replace('/work/job', shlex.quote(str(workspace)))],
+                                check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10)
+        command = shlex.join(['/bin/bash', '-c', script])
+        item = {'id': 'item_5', 'type': 'command_execution', 'command': command}
+        witness = [{'type': 'item.started', 'item': item},
+                   {'type': 'item.completed', 'item': dict(item, exit_code=0, status='completed',
+                                                          aggregated_output=actual.stdout.decode())},
+                   {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': p.canonical(
+                       {'base_sha': base, 'summary': 'The local test observed the added source.'})}}]
+        proposed = job.proposal('\n'.join(map(p.canonical, witness)).encode(), source=True)
+        digest = candidate_snapshot.scan(workspace)[0]
+        self.assertEqual(proposed['local_validation']['snapshot_sha256'], digest)
+        binding = {'job_id': 'demo', 'operation': 'demo-development', 'base_sha': base, 'snapshot_sha256': digest,
+                   'session_uuid': '01a21ce9-a96d-7a13-85e7-fa8bbbcf6ba4'}
+        git_runner = candidate.git_runner
+
+        def pause_live_index(*args, **kwargs):
+            invoke = git_runner(*args, **kwargs)
+
+            def run(*command, **options):
+                if command[0] == 'read-tree':
+                    raise BlockingIOError('fixture worker interrupted before index update')
+                return invoke(*command, **options)
+
+            return run
+
+        with self.local_git():
+            with mock.patch.object(candidate, 'git_runner', side_effect=pause_live_index), \
+                    self.assertRaisesRegex(BlockingIOError, 'before index update'):
+                candidate_git.materialize(self.root, job_root, approval, binding, time.monotonic() + 20)
+            retained = p.loads((job_root / 'candidate' / 'receipt.json').read_bytes())
+            self.assertEqual(self.git(workspace, 'rev-parse', 'HEAD'), retained['candidate_sha'])
+            self.assertEqual(source.read_text(), '# repaired source\n')
+            self.assertFalse(old.exists())
+            self.assertEqual(newcomer.read_text(), 'New relevant source\n')
+            self.assertEqual(candidate_git.materialize(self.root, job_root, approval, binding, time.monotonic() + 20), retained)
+            self.assertEqual(candidate_git.materialize(self.root, job_root, approval, binding, time.monotonic() + 20), retained)
+            dirty = workspace / 'new-uncommitted-change.txt'
+            dirty.write_text('Keep post-test changes visible.\n')
+            with self.assertRaisesRegex(ValueError, 'files changed after'):
+                candidate_git.materialize(self.root, job_root, approval, binding, time.monotonic() + 20)
+            self.assertEqual(dirty.read_text(), 'Keep post-test changes visible.\n')
+            dirty.unlink()
+        self.assertEqual(self.git(workspace, 'rev-list', '--count', base + '..HEAD'), '1')
+        self.assertEqual(self.git(workspace, 'rev-parse', 'HEAD^'), base)
+        self.assertEqual(self.git(workspace, 'show', 'HEAD:added source.txt'), 'New relevant source')
+        self.assertEqual(self.git(workspace, 'status', '--porcelain=v1', '--untracked-files=all'), '')
 
     def test_invalid_or_unapproved_product_inputs_fail_closed(self):
         with self.assertRaisesRegex(ValueError, 'authorized validation adapter'):

@@ -13,7 +13,9 @@ import stat
 import subprocess
 import tempfile
 import time
+import uuid
 
+import candidate_git
 import checklist_candidate as candidate
 import host_handoff as h
 import job_protocol as p
@@ -141,7 +143,7 @@ def closed_write(path, body):
     sync_directory(path.parent)
 
 
-def proposal(events, *, local=False):
+def proposal(events, *, local=False, source=False):
     last = None
     for line in events.splitlines():
         event = json.loads(line)
@@ -152,22 +154,25 @@ def proposal(events, *, local=False):
     last = last.strip()
     fenced = re.fullmatch(r'```(?:json)?\s*([^`]+)\s*```', last, re.DOTALL)
     row = p.loads((fenced[1].strip() if fenced else last).encode())
-    blocker = local and type(row) is dict and 'validation_blocker' in row
-    p.fields(row, 'candidate_sha summary validation_blocker' if blocker else 'candidate_sha summary')
-    p.digest(row['candidate_sha'], 40)
+    blocker = (local or source) and type(row) is dict and 'validation_blocker' in row
+    revision = 'base_sha' if source else 'candidate_sha'
+    p.fields(row, revision + ' summary' + (' validation_blocker' if blocker else ''))
+    p.digest(row[revision], 40)
     p.text(row['summary'], 1000)
     if blocker:
         p.text(row['validation_blocker'], 500)
         return row
-    if local:
+    if source:
+        row['local_validation'] = observed_source_validation(events)
+    elif local:
         row['local_validation'] = observed_validation(events, row['candidate_sha'])
     return row
 
 
-def local_validation_script(command):
-    if type(command) is not str or not 0 < len(command.encode()) <= 4096:
+def local_validation_script(command, prefix, suffix):
+    if type(command) is not str or not 0 < len(command.encode()) <= 12288:
         return False
-    if command.startswith(LOCAL_TEST_PREFIX):
+    if command.startswith(prefix):
         script = command
     else:
         try:
@@ -178,14 +183,25 @@ def local_validation_script(command):
                 or argv[1:-1] not in (['-c'], ['-lc'], ['-l', '-c'])):
             return False
         script = argv[-1]
-    return (script.startswith(LOCAL_TEST_PREFIX) and script.endswith(LOCAL_TEST_SUFFIX) and
-            bool(script[len(LOCAL_TEST_PREFIX):-len(LOCAL_TEST_SUFFIX)].strip()))
+    return (script.startswith(prefix) and script.endswith(suffix) and bool(script[len(prefix):-len(suffix)].strip()))
 
 
 def observed_validation(events, revision):
     """Read a stock command result and its Git witness from the retained turn."""
+    matched = observed_command(events, LOCAL_HEAD_MARKER, 40, LOCAL_TEST_PREFIX, LOCAL_TEST_SUFFIX, expected=revision)
+    p.require(matched is not None, 'no successful stock test witnessed the final commit before and after local validation')
+    return dict(matched[1], candidate_sha=revision)
+
+
+def observed_source_validation(events):
+    prefix, suffix = candidate_git.witness()
+    matched = observed_command(events, candidate_git.snapshot.MARKER, 64, prefix, suffix)
+    p.require(matched is not None, 'no successful stock test witnessed the same source bytes before and after local validation')
+    return dict(matched[1], snapshot_sha256=matched[0])
+
+
+def observed_command(events, marker, digest_length, prefix, suffix, *, expected=None):
     starts, matched = {}, None
-    marker = LOCAL_HEAD_MARKER + revision
     for line in events.splitlines():
         event = json.loads(line)
         item = event.get('item')
@@ -195,24 +211,26 @@ def observed_validation(events, revision):
         if type(item_id) is not str or not re.fullmatch(r'item_[0-9]{1,6}', item_id):
             continue
         if event.get('type') == 'item.started':
-            if local_validation_script(command):
+            if local_validation_script(command, prefix, suffix):
                 p.require(item_id not in starts, 'duplicate stock local validation start')
                 starts[item_id] = command
         elif event.get('type') == 'item.completed' and item_id in starts:
-            expected = starts.pop(item_id)
+            started_command = starts.pop(item_id)
             output = item.get('aggregated_output')
-            if command != expected or type(output) is not str:
+            if command != started_command or type(output) is not str:
                 continue
             lines = output.splitlines()
-            if not lines or lines[0] != marker:
+            if not lines or not lines[0].startswith(marker):
+                continue
+            observed = lines[0][len(marker):]
+            if not re.fullmatch('[0-9a-f]{%s}' % digest_length, observed) or expected is not None and observed != expected:
                 continue
             matched = None
             if (item.get('status') == 'completed' and type(item.get('exit_code')) is int and item['exit_code'] == 0
-                    and len(lines) >= 2 and lines[-1] == marker and
-                    [row for row in lines if row.startswith(LOCAL_HEAD_MARKER)] == [marker, marker]):
-                matched = {'candidate_sha': revision, 'item_id': item_id, 'exit_status': 0,
-                           'command_sha256': p.sha256(command.encode()), 'output_sha256': p.sha256(output.encode())}
-    p.require(matched is not None, 'no successful stock test witnessed the final commit before and after local validation')
+                    and len(lines) >= 2 and lines[-1] == lines[0] and
+                    [row for row in lines if row.startswith(marker)] == [lines[0], lines[0]]):
+                matched = (observed, {'item_id': item_id, 'exit_status': 0,
+                                    'command_sha256': p.sha256(command.encode()), 'output_sha256': p.sha256(output.encode())})
     return matched
 
 
@@ -372,30 +390,30 @@ class FedoraJob:
             prompt = ('Review the agreed product outcome and validation scope. Inspect the approved repository read-only. '
                       'Record which validation is possible in DevBox and which requested boundary needs a separate adapter. '
                       'Keep the checkout clean. Take no host or external actions.\n\n' + brief)
-        elif local:
-            prompt = ('Implement the approved product agreement in this confined DevBox workspace. Use local dependencies '
-                      'and ordinary repository test commands. Keep all effects in the authorized workspace. '
-                      'Record the agreed outcome, acceptance and validation boundary in the project requirements and architecture. '
-                      'External operations require a separate admitted adapter. Commit the candidate, leave the tree clean, '
-                      'and run a real relevant test command in the shell with this exact prefix and suffix around it:\n'
-                      + LOCAL_TEST_PREFIX + '<repo test command>' + LOCAL_TEST_SUFFIX +
-                      '\nThe witness must report the same final HEAD before and after the test. End with only JSON containing '
-                      'candidate_sha (full HEAD) and summary (one line). '
-                      'If the agreed check cannot run, also include validation_blocker (one line).\n\n' + brief)
         elif role == 'maintenance':
             prompt = ('Review the approved product brief and confirm the host-only checklist persistence check. '
                       'Use the fixed host recipe. Do not execute administrative commands or change the checkout.\n\n' + brief)
         else:
-            diagnostic = p.canonical(first)
-            prompt = ('Complete the approved brief in this authorized repository. The durable host check result below '
-                      'is tied to the current Git candidate. If it reports a failure, diagnose and repair '
-                      'the product. Test locally, commit the candidate, and emit a final JSON object with '
-                      'candidate_sha (full 40-character HEAD) and summary (one line). Leave the protected host '
-                      'executor and approval alone.\n\nBrief:\n' + brief + '\n\nHost result:\n' + diagnostic)
+            prefix, suffix = candidate_git.witness()
+            context = ('Record agreed scope, acceptance and validation boundaries in the project requirements and architecture.'
+                       if local else 'Use the durable host result below to diagnose and repair the checklist.')
+            prompt = ('Implement the approved agreement in this confined DevBox workspace. ' + context +
+                      '\nLeave intended source edits and new source files in place for the trusted candidate publisher. '
+                      'Git metadata is read-only. Use the declared build directory for generated files. '
+                      'External operations require a separate admitted adapter. Run a real relevant local test with this '
+                      'exact prefix and suffix around the repository test command:\n' +
+                      prefix + '<repo test command>' + suffix +
+                      '\nThe witness must report the same source digest before and after the test. End with only JSON '
+                      'containing base_sha (the unchanged full Git HEAD) and summary (one line). '
+                      'If the agreed check cannot run, also include validation_blocker (one line).\n\n' + brief)
+            if not local:
+                prompt += '\n\nHost result:\n' + p.canonical(first)
         raw = prompt.encode()
         p.require(len(raw) <= 16384, 'bound role prompt exceeds its approved limit')
         saved_profile = profile(self.job, role)
         with self.runtime.dispatch_gate():
+            if role == 'development':
+                self.approve_development_base(operation, checkpoint)
             request, digest, account = self.stage_turn(role, operation, raw, checkpoint, saved_profile)
         controller, job, live_cp = self.controller.ledger.checkpoint(self.job)
         p.require(live_cp == checkpoint, 'host checkpoint no longer matches the staged role turn')
@@ -420,9 +438,72 @@ class FedoraJob:
         p.require(output['request_sha256'] == digest and output['session_uuid'] == result['uuid'] and
                   output['events_sha256'] == p.sha256(events) and output['events_bytes'] == len(events) and
                   output['runtime_admitted'] is True and output['status'] == 'completed-turn' and
+                  output.get('owned_cleanup') == 'reaped' and
                   self.gptbox.completed_turn(events) == result['uuid'], 'retained authenticated role result changed')
         return {'session_uuid': result['uuid'], 'operation': operation, 'events_sha256': output['events_sha256'],
-                **(proposal(events, local=local) if role == 'development' else {})}
+                'request_sha256': digest, **(proposal(events, source=True) if role == 'development' else {})}
+
+    def approve_development_base(self, operation, checkpoint):
+        base = checkpoint['candidate']['source_revision']
+        path = trusted_directory(job_path(self.job)) / 'development-base.json'
+        value = {'operation': operation, 'job_id': self.job, 'base_sha': base,
+                 'checkpoint_sha256': p.identity(checkpoint), 'agreement_sha256': self.agreement_sha}
+        if os.path.lexists(path):
+            saved = p.loads(read_private(path, 4096))
+            snapshot_sha256 = saved.pop('base_snapshot_sha256')
+            p.digest(snapshot_sha256)
+            p.require(saved == value, 'development operation base changed')
+            return
+        self.runtime.protected(candidate_git.SCANNER, file=True)
+        end = time.monotonic() + 25
+        workspace, git = candidate_git.workspace_at(ROOT, self.job, base, self.approval, end)
+        p.require(not git('status', '--porcelain=v1', '--untracked-files=all', cap=candidate_git.GIT_METADATA),
+                  'development source contains prior work outside this operation')
+        baseline, _ = candidate_git.capture(workspace, git, end)
+        durable_json(path, dict(value, base_snapshot_sha256=baseline))
+
+    def materialize(self, checkpoint, development):
+        p.require(development['operation'] == self.job + '-development' and
+                  development['base_sha'] == checkpoint['candidate']['source_revision'],
+                  'tested source no longer matches the authorized development operation')
+        observed = development['local_validation']
+        p.require(observed['exit_status'] == 0, 'local test must pass before materializing the candidate')
+        p.require(str(uuid.UUID(development['session_uuid'])) == development['session_uuid'],
+                  'candidate publication requires the original authenticated session')
+        for name in ('events_sha256', 'request_sha256'):
+            p.digest(development[name])
+        p.digest(observed['snapshot_sha256'])
+        root = trusted_directory(job_path(self.job))
+        binding = dict(job_id=self.job, operation=development['operation'], base_sha=development['base_sha'],
+                       checkpoint_sha256=p.identity(checkpoint), agreement_sha256=self.agreement_sha,
+                       approval_sha256=p.sha256(self.approval_raw), startup_sha256=self.plan['startup_sha256'],
+                       session_uuid=development['session_uuid'], events_sha256=development['events_sha256'],
+                       request_sha256=development['request_sha256'], snapshot_sha256=observed['snapshot_sha256'],
+                       validation_sha256=p.identity(observed))
+        with self.runtime.dispatch_gate():
+            _, _, current = self.controller.ledger.checkpoint(self.job)
+            p.require(current == checkpoint, 'authoritative checkpoint changed before candidate publication')
+            before = p.loads(read_private(root / 'development-base.json', 4096))
+            binding['base_snapshot_sha256'] = before.pop('base_snapshot_sha256')
+            p.digest(binding['base_snapshot_sha256'])
+            p.require(before == {key: binding[key] for key in (
+                'operation', 'job_id', 'base_sha', 'checkpoint_sha256', 'agreement_sha256')},
+                'candidate publication lacks the authorized original checkout')
+            self.runtime.protected(candidate_git.SCANNER, file=True)
+            role = pwd.getpwnam('dp-dev')
+            path = ROOT / 'development/state' / self.job / 'turns' / development['operation']
+            output = p.loads(read_role(path / 'result.json', role.pw_uid, 8192))
+            events = read_role(path / 'events.jsonl', role.pw_uid, 4 * 1024 * 1024)
+            p.require(output.get('owned_cleanup') == 'reaped' and output.get('runtime_admitted') is True and
+                      output.get('status') == 'completed-turn' and
+                      output.get('request_sha256') == binding['request_sha256'] and
+                      output.get('session_uuid') == binding['session_uuid'] and
+                      output.get('events_sha256') == binding['events_sha256'] == p.sha256(events) and
+                      output.get('events_bytes') == len(events) and self.gptbox.completed_turn(events) == binding['session_uuid'] and
+                      observed_source_validation(events) == observed,
+                      'retained role termination or tested source evidence changed')
+            return candidate_git.materialize(ROOT, root, self.approval, binding,
+                                             time.monotonic() + self.agreement['build_seconds'])
 
     def host_test(self, ordinal, checkpoint):
         controller, job, checked = self.controller.ledger.checkpoint(self.job)
@@ -485,19 +566,30 @@ def execute(value, state, backend, save):
             save(state)
         return state[key]
 
+    def revision_for(developed):
+        p.require('validation_blocker' not in developed,
+                  'DevBox local validation stopped. ' + developed.get('validation_blocker', ''))
+        if 'base_sha' not in developed:
+            return developed['candidate_sha']
+        state.setdefault('materialized', None)
+        retained = step('materialized', 'materializing-candidate', backend.materialize, initial, developed)
+        p.require(retained['binding']['base_sha'] == developed['base_sha'] and
+                  retained['binding']['snapshot_sha256'] == developed['local_validation']['snapshot_sha256'],
+                  'retained commit differs from the tested source')
+        return retained['candidate_sha']
+
     initial = step('initial', 'building', backend.build, 1, value['agreement']['initial_commit'])
     step('maintenance', 'maintenance-turn', backend.turn, 'maintenance', initial)
     if value['adapter'] != CHECKLIST_ADAPTER:
         development = step('development', 'development-turn', backend.turn, 'development', initial)
-        revision = development['candidate_sha']
-        p.require('validation_blocker' not in development,
-                  'DevBox local validation stopped. ' + development.get('validation_blocker', ''))
+        revision = revision_for(development)
         evidence = development['local_validation']
-        p.require(evidence['candidate_sha'] == revision and evidence['exit_status'] == 0,
+        p.require(evidence.get('candidate_sha', revision) == revision and evidence['exit_status'] == 0,
                   'observed local validation does not bind the proposed candidate')
         final = step('repair', 'binding-local-candidate', backend.build, 2, revision)
         p.require(final['candidate']['source_revision'] == revision, 'verified checkout differs from tested candidate')
-        state['local_validation'] = dict(evidence, session_uuid=development['session_uuid'],
+        state['local_validation'] = dict(evidence, candidate_sha=revision,
+                                         base_sha=initial['candidate']['source_revision'], session_uuid=development['session_uuid'],
                                          events_sha256=development['events_sha256'], checkpoint_id=final['checkpoint_id'],
                                          source_changed=revision != initial['candidate']['source_revision'])
         external = value['adapter'] == EXTERNAL_ADAPTER
@@ -511,7 +603,7 @@ def execute(value, state, backend, save):
     first = step('first', 'host-check', backend.host_test, 1, initial)
     p.require(first['progress'] in ('host-checks-passed', 'repair-required'), 'first host check is blocked')
     developed = step('development', 'development-turn', backend.turn, 'development', initial, first)
-    revised = developed['candidate_sha']
+    revised = revision_for(developed)
     if revised == initial['candidate']['source_revision']:
         p.require(first['progress'] == 'host-checks-passed', 'DevBox did not produce a changed candidate after failure')
         state['final'] = first
