@@ -1,9 +1,12 @@
 """Disposable synthetic keys only; real GPG pipes, no engine or private corpus."""
 import base64
+import contextlib
 import copy
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -97,16 +100,57 @@ class CapsuleTests(unittest.TestCase):
             fingerprints=[line.split(b':')[9].decode() for line in result.stdout.splitlines() if line.startswith(b'fpr:')]
             self.assertEqual(fingerprints[0],s.FINGERPRINT)
     def test_fixed_iso_source_recipient_and_deterministic_public_ownership(self):
-        import ast,inspect,textwrap
         import fedora_ci as ci
-        tree=ast.parse(textwrap.dedent(inspect.getsource(ci.Probe.payload)))
-        lists=[node for node in ast.walk(tree) if isinstance(node,ast.List) and any(isinstance(value,ast.Constant) and value.value=='DPPAYLOAD' for value in node.elts)]
-        self.assertEqual(len(lists),1)
-        values=[item.value for item in lists[0].elts if isinstance(item,ast.Constant)]
-        self.assertEqual(values[values.index('-uid'):values.index('-uid')+4],['-uid','0','-gid','0'])
-        self.assertIn('native35-recipient.asc=/payload/native35-recipient.asc',values)
-        self.assertIn('native35-gpg-home=/payload/native35-gpg-home',values)
-        self.assertIn('manifest.json=/payload/manifest.json',values);self.assertIn('maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz',values)
+        from test_public_inputs import PublicInputsTests
+
+        fixture = PublicInputsTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        _, bundle, manifest, record = fixture.fixture_payload()
+        probe = ci.Probe(record['source_sha'], fixture.root)
+        probe.image = 'sha256:' + 'a' * 64
+        probe.report['cloud_image'] = {}
+        (probe.root / 'payload').mkdir()
+
+        def public_command(argv, *args):
+            if 'fetch' in argv:
+                return b'{}'
+            self.assertIn('build', argv)
+            self.assertEqual(argv[argv.index('--role') + 1], 'maintenance')
+            handoff = Path(argv[argv.index('--output') + 1])
+            (handoff / 'verification').mkdir(parents=True)
+            shutil.copyfile(bundle, handoff / 'maintenance-inputs.tar.gz')
+            shutil.copyfile(manifest, handoff / 'manifest.json')
+            (handoff / 'verification/receipt.json').write_text('{}')
+            return json.dumps({
+                'source_sha': record['source_sha'],
+                'manifest_sha256': ci.file_hash(manifest),
+                'context_sha256': record['context_sha256'],
+                'payload_sha256': record['payload']['sha256'],
+            }).encode()
+
+        def iso_helper(argv):
+            return b'{"format":"qcow2","virtual-size":34359738368}' if 'info' in argv else b''
+
+        with (
+            patch.object(probe, 'bounded', side_effect=public_command),
+            patch.object(probe, 'helper', side_effect=iso_helper) as helper,
+            patch.object(ci, 'verification_evidence', return_value={'receipt': {}}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            probe.payload()
+
+        [argv] = [call.args[0] for call in helper.call_args_list if 'DPPAYLOAD' in call.args[0]]
+        self.assertEqual(argv[argv.index('-uid') + 1], '0')
+        self.assertEqual(argv[argv.index('-gid') + 1], '0')
+        grafts = argv[argv.index('-graft-points') + 1:]
+        for graft in (
+            'native35-recipient.asc=/payload/native35-recipient.asc',
+            'native35-gpg-home=/payload/native35-gpg-home',
+            'manifest.json=/payload/manifest.json',
+            'maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz',
+        ):
+            self.assertIn(graft, grafts)
     def test_bounded_header_variants_and_incomplete_streams(self):
         buffers,payload=operands(b'x'*5100)
         for uid in (1000,2**32-1):
