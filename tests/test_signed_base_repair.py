@@ -55,7 +55,7 @@ class SignedBaseRepair(unittest.TestCase):
         self.assertEqual(list(self.parent.iterdir()),[])
         probe=ci.Probe('a'*40,self.root)
         probe.image_copy_active=True
-        with patch.object(ci,'measure_storage',return_value={'bytes':ci.OVERHEAD_LIMIT-f.UNLINKED_RESERVE+1}):
+        with patch.object(probe.storage,'observe',return_value={'overhead':{'available_bytes':f.UNLINKED_RESERVE-1}}):
             with self.assertRaisesRegex(ci.Blocked,'unlinked'):probe.storage_measurement()
 
     def test_actual_cleared_environment_and_separate_readonly_input_surface(self):
@@ -106,7 +106,7 @@ class SignedBaseRepair(unittest.TestCase):
         def download(url,target,*args,**kwargs):urls.append(url);Path(target).write_bytes(data)
         class Opener:
             def open(self,url,**kwargs):urls.append(url);return io.BytesIO(data)
-        probe=ci.Probe('a'*40,self.parent);(self.parent/'payload').mkdir()
+        probe=ci.Probe('a'*40,self.parent);(probe.root/'payload').mkdir(parents=True)
         def remove(argv,**kwargs):
             self.assertEqual(argv[:5],['sudo','-n','/bin/rm','-rf','--']);shutil.rmtree(argv[-1]);return b''
         with patch.object(ci,'run_small',side_effect=remove),patch.object(f,'ARTIFACTS',fedora),patch.object(p,'ARTIFACTS',inputs),patch.object(ci,'download',side_effect=download), \

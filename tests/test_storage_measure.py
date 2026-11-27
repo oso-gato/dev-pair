@@ -655,16 +655,6 @@ class MeasurementTests(unittest.TestCase):
             def __next__(self):raise FileNotFoundError(errno.ENOENT,'synthetic')
         with patch.object(worker.os,'scandir',return_value=Missing()):value=worker.scan(self.root,self.expected())
         self.assertIsNone(value['allocated_bytes']);self.assertEqual(value['status'],'no-total')
-    def test_fixed_source_limits_and_measurement_cannot_clear_image_copy_latch(self):
-        probe=ci.Probe('a'*40,self.root);probe.image_copy_active=True
-        value=worker_result(self.root,ci.OVERHEAD_LIMIT-ci.fedora_oci.UNLINKED_RESERVE)
-        with patch.object(ci,'capture_du',return_value=value):self.assertEqual(probe.storage_measurement()['unlinked_spool_reserve_bytes'],ci.fedora_oci.UNLINKED_RESERVE)
-        self.assertTrue(probe.image_copy_active)
-        with patch.object(ci,'capture_du',return_value=worker_result(self.root,ci.OVERHEAD_LIMIT-ci.fedora_oci.UNLINKED_RESERVE+512)),self.assertRaises(ci.Blocked):probe.storage_measurement()
-        self.assertTrue(probe.image_copy_active)
-        with patch.object(ci,'capture_du',return_value=subprocess.CompletedProcess([],-6,b'',b'PRIVATE')),self.assertRaises(ci.StorageMeasurementBlocked):probe.storage_measurement()
-        self.assertTrue(probe.image_copy_active);self.assertNotIn('PRIVATE',json.dumps(probe.report))
-
     def test_root_disappearance_replacement_and_small_protocol_limit(self):
         expected=self.expected();(self.root/'entry').touch();original=worker._node;moved=self.root.with_name(self.root.name+'-held')
         def replace(fd,name):

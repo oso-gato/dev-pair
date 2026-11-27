@@ -28,76 +28,88 @@ class DevelopmentSelectionTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.source = 'a' * 40
 
-    def event(self, action, label='', repo='oso-gato/dev-pair'):
-        return {'action': action, 'label': {'name': label}, 'repository': {'full_name': 'oso-gato/dev-pair'},
+    def event(self, action='labeled', label=None, repo='oso-gato/dev-pair'):
+        return {'action': action, 'label': {'name': label if label is not None else 'fedora-d-' + self.source},
+                'repository': {'full_name': 'oso-gato/dev-pair'}, 'sender': {'login': 'example-owner'},
                 'pull_request': {'head': {'sha': self.source, 'repo': {'full_name': repo}}}}
 
-    def run_cli(self, event, *options, trusted=True, supplied=True, event_name='pull_request'):
+    def run_cli(self, event, scenario='development', *, env=None, supplied=None):
         event_file = self.root / 'event.json'
         event_file.write_text(json.dumps(event))
-        env = {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': event_name, 'GITHUB_REPOSITORY': 'oso-gato/dev-pair',
-               'GITHUB_EVENT_PATH': str(event_file)} if trusted else {}
-        event_args = ['--github-event', str(event_file if supplied is True else supplied)] if supplied else []
-        with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(sys, 'argv', ['fedora_ci.py', '--expected-source', self.source, *event_args, *options]), \
-                mock.patch.object(ci, 'scratch_root', return_value=self.root) as scratch, \
-                mock.patch.object(ci, 'Probe') as probe:
-            probe.return_value.execute.return_value = 0
+        expected = {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'pull_request', 'GITHUB_REPOSITORY': 'oso-gato/dev-pair',
+                    'GITHUB_EVENT_PATH': str(event_file), 'GITHUB_RUN_ID': '123456789', 'GITHUB_RUN_ATTEMPT': '1',
+                    'GITHUB_ACTOR': 'example-owner'}
+        if env:
+            expected.update(env)
+        args = ['fedora_ci.py', '--expected-source', self.source, '--scenario', scenario]
+        if supplied:
+            args.extend(('--github-event', str(supplied)))
+        with mock.patch.dict(os.environ, expected, clear=True), mock.patch.object(sys, 'argv', args), \
+                mock.patch.object(ci, 'scratch_root') as scratch, \
+                mock.patch.object(ci, 'run_in_private_mount_namespace', return_value=0) as native:
             try:
                 self.assertEqual(ci.main(), 0)
             except (OSError, ci.Blocked):
-                scratch.assert_not_called()
-                probe.assert_not_called()
+                native.assert_not_called()
                 raise
-            return probe.call_args
+            finally:
+                scratch.assert_not_called()
+            return native.call_args.args
 
-    def test_workflow_and_controller_require_exact_event_head_and_fixed_label(self):
-        for action in ('opened', 'synchronize', 'reopened'):
-            self.assertEqual(self.run_cli(self.event(action, ci.DEVELOPMENT_LABEL)).args,
-                             (self.source, self.root, 'maintenance'))
-        self.assertEqual(self.run_cli(self.event('labeled', ci.DEVELOPMENT_LABEL), '--scenario', 'development').args,
-                         (self.source, self.root, 'development'))
-        self.assertEqual(self.run_cli(self.event('opened'), trusted=False, supplied=False).args, (self.source, self.root, 'maintenance'))
-        for event in (self.event('labeled', 'other'), self.event('labeled', ci.DEVELOPMENT_LABEL.upper()),
-                      self.event('unlabeled', ci.DEVELOPMENT_LABEL), self.event('opened', ci.DEVELOPMENT_LABEL),
-                      self.event('labeled', ci.DEVELOPMENT_LABEL, 'fork/project')):
-            with self.assertRaisesRegex(ci.Blocked, 'outside the exact pull request label event'):
-                self.run_cli(event, '--scenario', 'development')
-        wanted = self.event('labeled', ci.DEVELOPMENT_LABEL)
-        with self.assertRaisesRegex(ci.Blocked, 'requires the Actions'):
-            self.run_cli(wanted, '--scenario', 'development', trusted=False, supplied=False)
-        with self.assertRaisesRegex(ci.Blocked, 'requires the Actions'):
-            self.run_cli(wanted, '--scenario', 'development', trusted=False)
-        with self.assertRaisesRegex(ci.Blocked, 'requires the Actions'):
-            self.run_cli(wanted, '--scenario', 'development', event_name='workflow_dispatch')
+    def test_both_native_roles_require_exact_head_label_sender_and_first_run(self):
+        for scenario, prefix in ci.NATIVE_LABEL_PREFIX.items():
+            selected = self.event(label=prefix + self.source)
+            self.assertEqual(self.run_cli(selected, scenario), (self.source, scenario))
+            for action in ('opened', 'synchronize', 'reopened', 'unlabeled'):
+                with self.assertRaisesRegex(ci.Blocked, 'outside the exact'):
+                    self.run_cli(self.event(action, prefix + self.source), scenario)
+            for label in ('other', 'fedora-development-producer', prefix + 'b' * 40, prefix.upper() + self.source):
+                with self.assertRaisesRegex(ci.Blocked, 'outside the exact'):
+                    self.run_cli(self.event(label=label), scenario)
+            with self.assertRaisesRegex(ci.Blocked, 'outside the exact'):
+                self.run_cli(self.event(label=prefix + self.source, repo='fork/project'), scenario)
+            for env, failure in (({'GITHUB_ACTIONS': ''}, 'requires the Actions'),
+                                 ({'GITHUB_EVENT_NAME': 'workflow_dispatch'}, 'requires the Actions'),
+                                 ({'GITHUB_RUN_ATTEMPT': '2'}, 'first attempt'),
+                                 ({'GITHUB_RUN_ID': 'missing'}, 'exact Actions run'),
+                                 ({'GITHUB_ACTOR': 'another-actor'}, 'label actor')):
+                with self.assertRaisesRegex(ci.Blocked, failure):
+                    self.run_cli(selected, scenario, env=env)
         decoy = self.root / 'other.json'
-        decoy.write_text(json.dumps(wanted))
+        decoy.write_text('{}')
         with self.assertRaisesRegex(ci.Blocked, 'differs from the Actions event'):
-            self.run_cli(wanted, '--scenario', 'development', supplied=decoy)
-        with self.assertRaisesRegex(ci.Blocked, 'differs from the pull request event'):
-            self.run_cli(self.event('labeled', ci.DEVELOPMENT_LABEL))
-        stale = self.event('labeled', ci.DEVELOPMENT_LABEL)
+            self.run_cli(self.event(), supplied=decoy)
+        with self.assertRaisesRegex(ci.Blocked, 'outside the exact'):
+            self.run_cli(self.event(), 'maintenance')
+        stale = self.event()
         stale['pull_request']['head']['sha'] = 'b' * 40
-        with self.assertRaises(ci.Blocked):
-            self.run_cli(stale, '--scenario', 'development')
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            self.run_cli(self.event('opened'), '--scenario', 'arbitrary')
+        with self.assertRaisesRegex(ci.Blocked, 'event head differs'):
+            self.run_cli(stale)
 
+    def test_workflow_only_invokes_native_controller_for_exact_label_event(self):
         workflow = Path(ci.__file__).parents[1] / '.github/workflows/fedora-vm.yml'
         text = workflow.read_text()
         self.assertIn('contents: read', text)
-        self.assertIn('group: fedora-vm-${{ github.event.pull_request.number }}', text)
+        self.assertIn('group: fedora-vm-${{ github.event.pull_request.number }}-', text)
+        self.assertIn("if: github.event.action == 'labeled'", text)
+        self.assertIn('github.run_attempt == 1', text)
         self.assertIn('cancel-in-progress: false', text)
         self.assertIn('ref: ${{ github.event.pull_request.head.sha }}', text)
+        self.assertIn('python3 -B -m unittest discover', text)
         self.assertNotIn('workflow_dispatch', text)
         script = re.search(r'        run: \|\n((?:          .*\n)+)', text)[1]
-        output = self.root / 'github-output'
-        for action, label, wanted in (('opened', '', 'maintenance'), ('synchronize', ci.DEVELOPMENT_LABEL, 'maintenance'),
-                                      ('labeled', ci.DEVELOPMENT_LABEL, 'development'), ('labeled', ci.DEVELOPMENT_LABEL.upper(), None)):
-            output.unlink(missing_ok=True)
-            subprocess.run(['/bin/sh', '-ec', script], check=True, env={'DP_EVENT_ACTION': action, 'DP_EVENT_LABEL': label,
-                                                                       'GITHUB_OUTPUT': str(output)})
-            self.assertEqual(output.read_text().strip() if output.exists() else None, f'value={wanted}' if wanted else None)
+        for label, scenario in (('fedora-m-' + self.source, 'maintenance'),
+                                ('fedora-d-' + self.source, 'development'),
+                                ('fedora-m-' + 'b' * 40, None), ('fedora-development-producer', None)):
+            env = {'DP_EVENT_LABEL': label, 'DP_EXPECTED_SOURCE': self.source, 'GITHUB_EVENT_PATH': '/event.json'}
+            result = subprocess.run(['/bin/sh', '-ec', 'python3() { printf "%s\\n" "$@"; }\n' + script],
+                                    capture_output=True, text=True, env=env)
+            if scenario:
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ['-B', 'tools/fedora_ci.py', '--expected-source',
+                                                              self.source, '--scenario', scenario, '--github-event', '/event.json'])
+            else:
+                self.assertEqual((result.returncode, result.stdout), (2, ''))
 
     def test_role_bound_bundle_admission_and_systemd_identity(self):
         fixture = public_fixture.PublicInputsTests()
@@ -146,7 +158,7 @@ class DevelopmentSelectionTests(unittest.TestCase):
         probe = ci.Probe(self.source, self.root, 'development')
         probe.image = 'sha256:' + 'a' * 64
         probe.report['cloud_image'] = {}
-        (self.root / 'payload').mkdir()
+        (probe.root / 'payload').mkdir(parents=True)
         commands = []
 
         def public_command(argv, *args):
@@ -179,13 +191,13 @@ class DevelopmentSelectionTests(unittest.TestCase):
             commands.clear()
             probe.payload()
         self.assertEqual(sum('build' in command for command in commands), 1)
-        self.assertEqual(sorted(node.name for node in (self.root / 'payload').glob('*inputs.tar.gz')), ['development-inputs.tar.gz'])
+        self.assertEqual(sorted(node.name for node in (probe.root / 'payload').glob('*inputs.tar.gz')), ['development-inputs.tar.gz'])
         graft = next(command for command in commands if '-graft-points' in command)
         self.assertIn('development-inputs.tar.gz=/payload/development-inputs.tar.gz', graft)
         self.assertNotIn('native35', ' '.join(graft))
         self.assertNotIn('raw-canary', json.dumps(probe.report))
         self.assertEqual(probe.handoff['scenario'], 'development')
-        self.assertIn(probe.handoff['run_nonce'], (self.root / 'seed/user-data').read_text())
+        self.assertIn(probe.handoff['run_nonce'], (probe.root / 'seed/user-data').read_text())
 
     def test_development_controller_withholds_failed_console_and_unvalidated_serial_bytes(self):
         probe = ci.Probe(self.source, self.root, 'development')

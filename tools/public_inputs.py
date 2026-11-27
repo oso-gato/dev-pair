@@ -113,7 +113,7 @@ def wall_limit(seconds):
 
 
 def environment(home, network=False):
-    result = {'HOME': str(home), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+    result = {'HOME': str(home), 'TMPDIR': str(home.parent), 'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
               'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
     if network:
         result.update({key: os.environ[key] for key in PROXY_ENV if key in os.environ})

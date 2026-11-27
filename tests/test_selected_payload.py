@@ -110,7 +110,7 @@ class CapsuleTests(unittest.TestCase):
         probe = ci.Probe(record['source_sha'], fixture.root)
         probe.image = 'sha256:' + 'a' * 64
         probe.report['cloud_image'] = {}
-        (probe.root / 'payload').mkdir()
+        (probe.root / 'payload').mkdir(parents=True)
 
         def public_command(argv, *args):
             if 'fetch' in argv:
