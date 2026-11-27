@@ -5,12 +5,15 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bootstrap as b
@@ -26,6 +29,9 @@ DNS = 'erebus.tail123.ts.net'
 TESTED = 'd' * 40
 TREE = 'e' * 40
 GATE_WORKFLOW = '.github/workflows/release-check.yml'
+BASE = {'image': 'ghcr.io/independent/checklist-base@sha256:' + '8' * 64, 'repo': 'independent/base-source',
+        'workflow': '.github/workflows/base.yml', 'source': '9' * 40, 'ref': 'refs/heads/main'}
+BASE_INVOCATION = 'https://github.com/independent/base-source/actions/runs/34/attempts/2'
 
 
 def workflow_content(path, data):
@@ -138,19 +144,26 @@ class PublicationFixture(t.ReleaseTrust):
                                 'repository': {'full_name': t.REPOSITORY}, 'head_repository': {'full_name': t.REPOSITORY}}}
         self.check = check
         self.invocation = f'https://github.com/{t.REPOSITORY}/actions/runs/78/attempts/1'
+        self.base_invocation = BASE_INVOCATION
+        self.base = {'version': 1, 'policy': BASE.copy(), 'invocation': BASE_INVOCATION}
+        self.event = 'push'
         self.calls = []
 
     def policy(self, component):
         return {'reviewer_ids': [111], 'writer_app_id': 77, 'check': self.check, 'components': {
-            'checklist': {'registry': IMAGE.split('@')[0], 'workflow': WORKFLOW, 'sha256': self.publisher_hash}}}
+            'checklist': {'registry': IMAGE.split('@')[0], 'workflow': WORKFLOW, 'sha256': self.publisher_hash, 'base': BASE}}}
 
     def api(self, endpoint, *, pages=False):
         return self.values[endpoint]
 
     def run(self, *args, **kwargs):
         self.calls.append(args)
-        return json.dumps([{'verificationResult': {'signature': {'certificate': {'extensions': {
-            'runInvocationURI': self.invocation, 'buildTrigger': 'push'}}}}}])
+        invocation = self.base_invocation if args[3] == 'oci://' + BASE['image'] else self.invocation
+        result = {'signature': {'certificate': {'extensions': {'runInvocationURI': invocation, 'buildTrigger': self.event}}}}
+        if '--predicate-type' in args:
+            result['statement'] = {'predicate': {'proof': self.base,
+                                                 'proof_sha256': hashlib.sha256((t.canonical(self.base) + '\n').encode()).hexdigest()}}
+        return json.dumps([{'verificationResult': result}])
 
 
 class PublicationTests(unittest.TestCase):
@@ -159,14 +172,55 @@ class PublicationTests(unittest.TestCase):
         result = fixture.verify('checklist', SOURCE, IMAGE, 78)
         self.assertEqual(result['artifact_sha256'], DIGEST)
         self.assertEqual(result['review_head'], HEAD)
-        (verification,) = fixture.calls
+        verification, base_record, upstream = fixture.calls
         self.assertIn('oci://' + IMAGE, verification)
         self.assertIn(t.REPOSITORY + '/' + WORKFLOW, verification)
         self.assertEqual(verification[verification.index('--source-digest') + 1], SOURCE)
         self.assertIn('--deny-self-hosted-runners', verification)
+        self.assertIn(t.BASE_PREDICATE, base_record)
+        self.assertIn('oci://' + BASE['image'], upstream)
+        self.assertEqual(result['base']['upstream_attempt'], BASE_INVOCATION)
         fixture.invocation = fixture.invocation.replace('/attempts/1', '/attempts/2')
         with self.assertRaisesRegex(b.Blocked, 'exact trusted publication attempt'):
             fixture.verify('checklist', SOURCE, IMAGE, 78)
+
+    def test_release_rejects_wrong_base_label_policy_and_signature_attempt(self):
+        fixture = PublicationFixture()
+        fixture.base['policy']['image'] = BASE['image'].replace('8' * 64, '7' * 64)
+        with self.assertRaisesRegex(b.Blocked, 'approved base evidence'):
+            fixture.verify('checklist', SOURCE, IMAGE, 78)
+        fixture = PublicationFixture()
+        fixture.base_invocation = BASE_INVOCATION.replace('/attempts/2', '/attempts/1')
+        with self.assertRaisesRegex(b.Blocked, 'upstream base signature'):
+            fixture.verify('checklist', SOURCE, IMAGE, 78)
+        app = d.Destination()
+        metadata = {'Id': '8' * 64, 'Digest': 'sha256:' + DIGEST, 'RepoDigests': [IMAGE], 'Architecture': 'amd64', 'Os': 'linux',
+                    'Labels': {'org.opencontainers.image.revision': SOURCE, 'dev-pair.data-compatibility': d.COMPATIBILITY}}
+        base = {'image': BASE['image'], 'proof_sha256': '7' * 64}
+        with patch.object(app, 'podman', side_effect=lambda *args: json.dumps([metadata])):
+            with self.assertRaisesRegex(b.Blocked, 'independently verified signed base'):
+                app.image_identity(1234, 'live', IMAGE, SOURCE, production=True, base=base)
+            metadata['Labels'].update({'dev-pair.checklist.base': base['image'], 'dev-pair.checklist.base-proof': base['proof_sha256']})
+            self.assertEqual(app.image_identity(1234, 'live', IMAGE, SOURCE, production=True, base=base), '8' * 64)
+
+    def test_nightly_and_on_demand_are_only_admitted_for_independently_pinned_agent_workflow(self):
+        for event in ('schedule', 'workflow_dispatch'):
+            fixture = PublicationFixture()
+            refresh = '.github/workflows/agent-refresh.yml'
+            workflow = b'name: exact independent refresh\n'
+            publisher = {'registry': None, 'workflow': WORKFLOW, 'sha256': fixture.publisher_hash,
+                         'agent_refresh': {'workflow': refresh, 'sha256': hashlib.sha256(workflow).hexdigest()}}
+            fixture.values['actions/runs/78'].update(event=event, path=refresh)
+            fixture.values[f'contents/{refresh}?ref={SOURCE}'] = workflow_content(refresh, workflow)
+            fixture.event = event
+            original_policy = fixture.policy('checklist')
+            policy = {**original_policy, 'components': {**original_policy['components'], 'maintenance': publisher}}
+            with patch.object(fixture, 'policy', return_value=policy), patch.object(t, 'file_digest', return_value=DIGEST), \
+                    patch.object(fixture, 'platform_subject', return_value={'portable_kind': 'dev-pair-agent-release'}):
+                result = fixture.verify('maintenance', SOURCE, '/approved/platform.json', 78, artifact_sha256=DIGEST)
+                self.assertEqual(result['workflow'], refresh)
+                with self.assertRaisesRegex(b.Blocked, 'event lacks independent component authorization'):
+                    fixture.verify('checklist', SOURCE, IMAGE, 78)
 
     def test_absent_gate_stale_approval_and_untrusted_check_deny_before_attestation(self):
         for mutation in ('protected', 'review', 'check', 'bypass', 'workflow-content', 'renamed-check', 'environment',
@@ -238,7 +292,7 @@ class RolloutTests(unittest.TestCase):
 
         @contextlib.contextmanager
         def gate():
-            yield {}, 1234, DNS
+            yield {'platform_sha': '9' * 40}, 1234, DNS
 
         def trust(component, source, image, run_id):
             return {'version': 1, 'subject': image, 'source_sha': source, 'artifact_sha256': image.rsplit(':', 1)[-1]}
@@ -346,26 +400,211 @@ class RolloutTests(unittest.TestCase):
                 self.assertEqual(db.execute('SELECT title FROM items').fetchall(), [('Accepted after promotion',)])
             self.assertTrue(route[0])
 
+    def test_interrupted_then_failed_reinstall_archives_both_and_restores_verified_item(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app, state, database, unit, route = self.fixture(Path(directory), initial=False)
+            proposed = IMAGE.replace(DIGEST, 'e' * 64)
+            install = app.install_unit
+
+            def interrupted(*args):
+                install(*args)
+                raise KeyboardInterrupt()
+
+            with patch.object(app, 'install_unit', side_effect=interrupted):
+                with self.assertRaises(KeyboardInterrupt):
+                    app.deploy(HEAD, proposed, 78, None)
+            self.assertEqual(state['pending']['phase'], 'prepared')
+            self.assertFalse(route[0])
+            with self.assertRaisesRegex(b.Blocked, 'unhealthy candidate changed items'):
+                app.deploy(HEAD, proposed, 78, None)
+            self.assertIsNone(state['pending'])
+            self.assertTrue(route[0])
+            self.assertEqual(unit.read_text(), IMAGE)
+            self.assertEqual(len(list((Path(directory) / 'backups').glob('*.failed-sqlite3.*'))), 2)
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                self.assertEqual(db.execute('SELECT title,done FROM items').fetchall(), [('Existing completed item', 1)])
+
+    def test_external_first_rejection_quiesces_owned_release_and_admits_data_preserving_correction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, state, database, unit, route = self.fixture(root, initial=True)
+            app.deploy(SOURCE, IMAGE, 78, None)
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                db.execute("INSERT INTO items(title,done) VALUES('Accepted browser item',1)")
+                db.commit()
+            evidence = root / 'review.json'
+            evidence.write_text('fixture signed rejection')
+            rejected = {'source_sha': '9' * 40, 'release_source': SOURCE, 'image': IMAGE, 'dns_name': DNS,
+                        'failed_check': 'tailnet-loss', 'observation_sha256': '7' * 64}
+            with patch.object(app, 'recent_destination_evidence', return_value=rejected):
+                app.reject(str(evidence))
+            self.assertTrue(state['active']['quarantined'])
+            self.assertIsNone(state['pending'])
+            self.assertFalse(route[0])
+            self.assertFalse(unit.exists())
+            self.assertTrue(Path(state['last_rejected']['baseline']['path']).is_file())
+            corrected = IMAGE.replace(DIGEST, 'f' * 64)
+            result = app.deploy('7' * 40, corrected, 79, None)
+            self.assertEqual(result['active']['subject'], corrected)
+            self.assertIsNone(result['previous'])
+            self.assertTrue(route[0])
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                self.assertEqual(db.execute('SELECT title,done FROM items').fetchall(), [('Accepted browser item', 1)])
+
+    def test_maximum_multilingual_inventory_uses_real_capture_http_backup_and_restore(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app, _, database, _, _ = self.fixture(root, initial=False)
+            title = '📋' * 120
+            with contextlib.closing(sqlite3.connect(database)) as db:
+                db.execute('DELETE FROM items')
+                db.executemany('INSERT INTO items(title,done) VALUES (?,1)', [(title,)] * 1000)
+                db.commit()
+            commands = b.Commands()
+            with patch.object(app, 'subprocess_role', side_effect=lambda _uid, *args, **kwargs: commands(*args, **kwargs)):
+                expected = app.data_snapshot(1234, str(database))
+                backup = app.backup(1234, '2' * 32)
+                self.assertEqual(backup['inventory_sha256'], expected)
+                with contextlib.closing(sqlite3.connect(database)) as db:
+                    db.execute('DELETE FROM items')
+                    db.commit()
+                app.restore_failed_data(1234, {'baseline': backup, 'attempt': '2' * 32})
+                self.assertEqual(app.data_snapshot(1234, str(database)), expected)
+            tool = Path(__file__).resolve().parents[1] / 'examples/checklist/checklist.py'
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.bind(('127.0.0.1', 0))
+                listener.listen()
+                port = listener.getsockname()[1]
+                command = ['/usr/bin/python3', '-IB', str(tool), 'serve', '--database', str(database),
+                           '--listen-fd', str(listener.fileno())]
+                with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                      pass_fds=(listener.fileno(),)) as process:
+                    try:
+                        self.assertTrue(select.select([process.stdout], [], [], 5)[0])
+                        self.assertEqual(process.stdout.readline().strip(), f'http://127.0.0.1:{port}')
+                        with patch.object(d, 'PORT', port):
+                            self.assertEqual(app.browser_inventory(f'127.0.0.1:{port}'), expected)
+                    finally:
+                        process.terminate()
+                        process.communicate(timeout=5)
+
 
 class ProvisioningTests(unittest.TestCase):
-    def test_managed_executor_observes_protected_selection_before_listener_admission(self):
-        app = d.Destination()
-        effects = []
+    def test_completed_transition_is_preserved_before_mounted_copy_and_unrelated_data_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            root = home / 'dev-pair'; root.mkdir()
+            old = root / 'selinux-bootstrap'; old.mkdir()
+            contents = {name: name + '\n' for name in ('intent.json', 'complete.json', 'relabel-done.json', 'config-original', 'lock')}
+            for name, value in contents.items():
+                (old / name).write_text(value)
+            original = home / 'selinux-preserved'
+            receipt = home / 'managed.json'
+            ready = root / '.managed-storage-ready'
+            digest = {name: hashlib.sha256(raw.encode()).hexdigest() for name, raw in contents.items()}
+            previous = (str(old), contents, digest)
+            app = d.Destination()
+            steps = []
 
-        def systemctl(*args, **kwargs):
-            self.assertEqual(args[0], d.SYSTEMCTL)
-            effects.append(args[1:])
-            return 'inactive\n' if args[1] == 'is-active' else ''
+            def mount(where, spec, **kwargs):
+                self.assertTrue(original.is_dir())
+                self.assertEqual(list(root.iterdir()), [])
+                self.assertEqual(json.loads(receipt.read_bytes())['transition'], digest)
+                steps.append('mount')
 
-        with patch.object(app, 'run', side_effect=systemctl), \
-                patch.object(app, 'subprocess_role', side_effect=lambda *args: effects.append(('prepare', args[-1]))), \
-                patch.object(app, 'executor_ready', side_effect=lambda unit, uid: effects.append(('listener', unit, uid))), \
-                patch.object(d, 'protect', side_effect=lambda path: effects.append(('protect', path))):
-            unit, needs_readback = app.start_executor(1234, True, False)
-        self.assertTrue(needs_readback)
-        self.assertEqual(effects, [('is-active', unit), ('prepare', 'initialize-host-history'), ('enable', unit),
-                                   ('start', 'dev-pair-renewal-boot-fence.service'), ('start', 'dev-pair-renewal-host-observe.service'),
-                                   ('protect', d.FENCE + '/selected-host.json'), ('listener', unit, 1234)])
+            args = SimpleNamespace(managed_mib=2048, managed_inodes=8192, reserve_inodes=4096)
+            with patch.object(d, 'ROOT', str(root)), patch.object(d, 'TRANSITION', str(old)), \
+                    patch.object(d, 'PRESERVED_TRANSITION', str(original)), patch.object(d, 'MANAGED_INTENT', str(receipt)), \
+                    patch.object(d, 'MANAGED_READY', str(ready)), patch.object(app, 'mount', side_effect=mount), \
+                    patch.object(app, 'allocate', side_effect=lambda *args: steps.append('allocated')), \
+                    patch.object(app, 'directory', side_effect=lambda path, mode=0o700: Path(path).mkdir(mode=mode, exist_ok=True)), \
+                    patch.object(app, 'atomic', side_effect=lambda path, raw, **kwargs: Path(path).write_text(raw)), \
+                    patch.object(app, 'run', side_effect=lambda *args, **kwargs: '/dev/loop7\n' if '--find' in args else 'Enforcing\n'), \
+                    patch.object(app, 'transition_contents', side_effect=lambda where: {p.name: p.read_text() for p in Path(where).iterdir()}), \
+                    patch.object(app, 'destination_identity', return_value={'machine_id': 'fixture-machine'}):
+                unrelated = root / 'owner-file'
+                unrelated.write_text('preserve unrelated')
+                with self.assertRaisesRegex(b.Blocked, 'hide unrelated'):
+                    app.enroll_managed_storage(args, None, False, previous)
+                self.assertEqual(unrelated.read_text(), 'preserve unrelated')
+                self.assertFalse(steps)
+                unrelated.unlink()
+                self.assertTrue(app.enroll_managed_storage(args, None, False, previous)['preserved_transition'])
+            self.assertEqual(steps, ['allocated', 'mount'])
+            self.assertEqual({p.name: p.read_text() for p in original.iterdir()}, contents)
+            self.assertEqual({p.name: p.read_text() for p in old.iterdir()}, contents)
+            self.assertEqual(ready.read_bytes(), receipt.read_bytes())
+
+    def test_direct_to_managed_waits_for_observation_and_unfenced_recovery_without_reinitializing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / 'executor'; home.mkdir()
+            (home / 'execution-history').mkdir(mode=0o700)
+            fence = root / 'fence'; fence.mkdir()
+            marker = fence / 'frozen'
+            requested = root / 'managed-listener.json'
+            current = root / 'site-current.json'
+            current.write_text(json.dumps('a' * 64))
+            app = d.Destination()
+            effects = []
+            jobs = {d.U_OBSERVE: (False, 'success'), d.U_RECOVERY: (False, 'success')}
+
+            def systemctl(*args, **kwargs):
+                self.assertEqual(args[0], d.SYSTEMCTL)
+                effects.append(args[1:])
+                if args[-1] == 'dev-pair-renewal-boot-fence.service':
+                    marker.write_text('boot')
+                if args[-1] in jobs:
+                    jobs[args[-1]] = (True, 'success')
+                return ''
+
+            with patch.object(d, 'HOME', str(home)), patch.object(d, 'FENCE', str(fence)), patch.object(d, 'RENEWAL', str(root)), \
+                    patch.object(d, 'MANAGED_LISTENER', str(requested)), patch.object(app, 'run', side_effect=systemctl), \
+                    patch.object(app, 'record', side_effect=lambda path: json.loads(Path(path).read_text())), \
+                    patch.object(app, 'atomic', side_effect=lambda path, raw, **kwargs: Path(path).write_text(raw)), \
+                    patch.object(app, 'subprocess_role') as initializer, \
+                    patch.object(app, 'destination_identity', return_value={'boot_id': 'fixture-boot'}), \
+                    patch.object(app, 'manager_job', side_effect=lambda unit: jobs[unit]), \
+                    patch.object(app, 'verify_managed_executor', side_effect=lambda *_args: effects.append(('observed',))):
+                uid = os.getuid()
+                unit, queued = app.start_executor(uid, True, True)
+                self.assertEqual(queued, 'host-observation-queued')
+                self.assertEqual(app.start_executor(uid, True, True)[1], 'host-observation-running')
+                jobs[d.U_OBSERVE] = (False, 'success')
+                self.assertEqual(app.start_executor(uid, True, True)[1], 'renewal-readback-queued')
+                self.assertEqual(app.start_executor(uid, True, True)[1], 'renewal-readback-running')
+                jobs[d.U_RECOVERY] = (False, 'success')
+                self.assertEqual(app.start_executor(uid, True, True)[1], 'renewal-readback-fenced')
+                marker.unlink()
+                self.assertEqual(app.start_executor(uid, True, True)[1], 'ready')
+                initializer.assert_not_called()
+            self.assertEqual(effects[:5], [('enable', unit), ('start', 'dev-pair-renewal-boot-fence.service'),
+                                          ('start', '--no-block', d.U_OBSERVE), ('observed',),
+                                          ('enable', '--now', '--no-block', d.U_RECOVERY)])
+            self.assertEqual(json.loads(requested.read_bytes())['phase'], 'ready')
+
+    def test_restrictive_umask_preserves_traversable_code_and_quadlet_ancestors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            app = b.Bootstrap(root)
+            original = os.umask(0o077)
+            try:
+                code = root / 'usr/libexec/dev-pair/checklist/tools/host_handoff.py'
+                unit = root / 'etc/containers/systemd/users/1940/checklist.container'
+                for path in (code, unit):
+                    app.atomic('/' + str(path.relative_to(root)), 'test bytes\n', mode=0o644)
+                private = root / 'var/lib/dev-pair/checklist-executor'
+                app.directory('/' + str(private.relative_to(root)))
+            finally:
+                os.umask(original)
+            for path in (code, unit):
+                self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+                for parent in path.parents:
+                    if parent == root:
+                        break
+                    self.assertEqual(parent.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(private.parent.stat().st_mode & 0o777, 0o755)
 
     def test_primary_identity_cannot_overlap_earlier_subordinate_block(self):
         app = d.Destination()

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import time
 
@@ -21,11 +22,27 @@ DIGEST = r'[0-9a-f]{64}'
 REGISTRY = r'ghcr\.io/oso-gato/[a-z0-9]+(?:[._/-][a-z0-9]+)*'
 WORKFLOW = r'\.github/workflows/[a-z0-9-]+\.yml'
 GITHUB = '/usr/bin/gh'
+BASE_PREDICATE = 'https://github.com/oso-gato/dev-pair/checklist-base/v1'
 
 
 def require(condition, reason):
     if not condition:
         raise Blocked(reason)
+
+
+def base_policy(value):
+    require(type(value) is dict and set(value) == {'image', 'repo', 'workflow', 'source', 'ref'}
+            and all(type(item) is str for item in value.values())
+            and re.fullmatch(r'[a-z0-9.-]+/[a-z0-9._/-]+@sha256:' + DIGEST, value['image'])
+            and re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', value['repo'])
+            and re.fullmatch(WORKFLOW, value['workflow']) and re.fullmatch(SHA, value['source'])
+            and re.fullmatch(r'refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]{0,127}', value['ref']),
+            'exact independently approved checklist base and signer required')
+    return value
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'))
 
 
 def protect(path):
@@ -92,12 +109,60 @@ class ReleaseTrust:
         require(type(components) is dict and set(components) <= set(COMPONENTS) and component in components,
                 'component lacks protected publisher authorization')
         publisher = components[component]
-        require(type(publisher) is dict and set(publisher) == {'workflow', 'registry', 'sha256'}
+        required = {'workflow', 'registry', 'sha256'} | ({'base'} if component == 'checklist' else set())
+        allowed = required | ({'agent_refresh'} if component in ('maintenance', 'development') else set())
+        require(type(publisher) is dict and required <= set(publisher) <= allowed
                 and type(publisher['workflow']) is str and re.fullmatch(WORKFLOW, publisher['workflow'])
                 and type(publisher['sha256']) is str and re.fullmatch(DIGEST, publisher['sha256'])
                 and (publisher['registry'] is None or type(publisher['registry']) is str and
                      re.fullmatch(REGISTRY, publisher['registry'])), 'protected publisher identity is invalid')
+        if component == 'checklist':
+            base_policy(publisher['base'])
+        if 'agent_refresh' in publisher:
+            refresh = publisher['agent_refresh']
+            require(type(refresh) is dict and set(refresh) == {'workflow', 'sha256'} and publisher['registry'] is None
+                    and type(refresh['workflow']) is str and re.fullmatch(WORKFLOW, refresh['workflow'])
+                    and refresh['workflow'] != publisher['workflow'] and type(refresh['sha256']) is str
+                    and re.fullmatch(DIGEST, refresh['sha256']), 'protected agent refresh publisher is invalid')
         return value
+
+    def attestations(self, subject, repo, workflow, source, ref, *, predicate=None):
+        predicate_args = ('--predicate-type', predicate) if predicate else ()
+        result = json.loads(self.run(GITHUB, 'attestation', 'verify', subject, '--hostname', 'github.com',
+                                     '--repo', repo, '--format', 'json', '--signer-workflow', repo + '/' + workflow,
+                                     '--source-ref', ref, '--source-digest', source, '--signer-digest', source,
+                                     '--deny-self-hosted-runners', '--limit', '20', *predicate_args, timeout=60),
+                            object_pairs_hook=relay.unique)
+        require(type(result) is list and 0 < len(result) <= 20, 'required verified provenance is unavailable')
+        return [(entry['verificationResult']['signature']['certificate']['extensions'],
+                 entry['verificationResult'].get('statement', {})) for entry in result]
+
+    def verify_base(self, policy, invocation=None):
+        policy = base_policy(policy)
+        verified = self.attestations('oci://' + policy['image'], policy['repo'], policy['workflow'], policy['source'], policy['ref'])
+        pattern = r'https://github\.com/' + re.escape(policy['repo']) + r'/actions/runs/[1-9][0-9]*/attempts/[1-9][0-9]*'
+        matching = sorted({extensions['runInvocationURI'] for extensions, _ in verified
+                           if re.fullmatch(pattern, extensions.get('runInvocationURI', ''))})
+        require(matching and (invocation is None or invocation in matching), 'approved upstream base signature or selected invocation is unavailable')
+        return {'version': 1, 'policy': policy, 'invocation': invocation or matching[0]}
+
+    @staticmethod
+    def platform_subject(path, source, run_id, component, digest, event):
+        try:
+            from platform_release_protocol import COMPONENT, CONTROL_LIMIT, canonical as platform_bytes, json_bytes, portable_index
+        except ModuleNotFoundError:
+            raise Blocked('protected platform release index verifier is unavailable') from None
+        path = protect(path)
+        require(path.name == 'platform.json' and 0 < path.stat().st_size <= CONTROL_LIMIT,
+                'expected the bounded portable platform.json attestation subject')
+        raw = path.read_bytes()
+        require(hashlib.sha256(raw).hexdigest() == digest, 'portable signed index bytes changed')
+        index = portable_index(json_bytes(raw), source, run_id)
+        expected = 'dev-pair-platform-release' if event == 'push' else 'dev-pair-agent-release'
+        name = 'host' if component == 'host' else COMPONENT[component]
+        require(raw == platform_bytes(index) and index['kind'] == expected and name in index['components'],
+                'portable release does not authorize the selected component for this event')
+        return {'portable_kind': index['kind'], 'component_subject': index['components'][name]}
 
     def main(self, source):
         branch = self.api('branches/main')
@@ -218,48 +283,80 @@ class ReleaseTrust:
             self.checklist_environment(policy['writer_app_id'])
         run = self.api(f'actions/runs/{run_id}')
         attempt = run['run_attempt']
-        workflow = publisher['workflow']
-        self.workflow(workflow, source, publisher['sha256'])
-        require(run['id'] == run_id and type(attempt) is int and attempt > 0 and run['event'] == 'push'
+        event = run['event']
+        selected = publisher if event == 'push' else publisher.get('agent_refresh')
+        require(selected and (event == 'push' or component in ('maintenance', 'development') and event in ('schedule', 'workflow_dispatch')),
+                'publisher event lacks independent component authorization')
+        platform = self.platform_subject(subject, source, run_id, component, artifact_sha256, event) if component != 'checklist' else {}
+        workflow = selected['workflow']
+        self.workflow(workflow, source, selected['sha256'])
+        require(run['id'] == run_id and type(attempt) is int and attempt > 0
                 and run['status'] == 'completed' and run['conclusion'] == 'success'
                 and run['head_branch'] == 'main' and run['head_sha'] == source
                 and run['path'] == workflow and run['repository']['full_name'] == REPOSITORY
                 and run['head_repository']['full_name'] == REPOSITORY,
-                'publisher run is not the exact successful main push workflow')
-        results = json.loads(self.run(GITHUB, 'attestation', 'verify', attestation_subject,
-                                     '--hostname', 'github.com', '--repo', REPOSITORY, '--format', 'json',
-                                     '--signer-workflow', REPOSITORY + '/' + workflow,
-                                     '--source-ref', 'refs/heads/main', '--source-digest', source,
-                                     '--signer-digest', source, '--deny-self-hosted-runners', timeout=60),
-                             object_pairs_hook=relay.unique)
+                'publisher run is not the exact authorized successful main workflow')
+        results = self.attestations(attestation_subject, REPOSITORY, workflow, source, 'refs/heads/main')
         invocation = f'https://github.com/{REPOSITORY}/actions/runs/{run_id}/attempts/{attempt}'
-        for result in results:
-            extensions = result['verificationResult']['signature']['certificate']['extensions']
-            if extensions.get('runInvocationURI') == invocation and extensions.get('buildTrigger') == 'push':
-                break
-        else:
-            raise Blocked('artifact attestation does not bind the exact trusted publication attempt')
+        def same_run(extensions):
+            return extensions.get('runInvocationURI') == invocation and extensions.get('buildTrigger') == event
+        require(any(same_run(extensions) for extensions, _ in results), 'artifact attestation does not bind the exact trusted publication attempt')
+        base = {}
+        if component == 'checklist':
+            results = self.attestations(attestation_subject, REPOSITORY, workflow, source, 'refs/heads/main', predicate=BASE_PREDICATE)
+            proven = [statement['predicate'] for extensions, statement in results if same_run(extensions)]
+            require(len(proven) == 1 and set(proven[0]) == {'proof', 'proof_sha256'}, 'publication lacks a unique signed base record')
+            proof, digest = proven[0]['proof'], proven[0]['proof_sha256']
+            require(type(proof) is dict and set(proof) == {'version', 'policy', 'invocation'}
+                    and proof['policy'] == publisher['base'] and type(digest) is str
+                    and hashlib.sha256((canonical(proof) + '\n').encode()).hexdigest() == digest,
+                    'published base differs from independently approved base evidence')
+            require(self.verify_base(publisher['base'], proof['invocation']) == proof,
+                    'independent upstream base signature does not match the signed publication record')
+            base['base'] = {'image': proof['policy']['image'], 'proof_sha256': digest, 'upstream_attempt': proof['invocation']}
         self.main(source)
         return {'version': 1, 'component': component, 'source_sha': source, 'subject': subject,
-                'artifact_sha256': artifact_sha256, 'workflow': workflow, 'run_id': run_id, 'run_attempt': attempt, **review}
+                'artifact_sha256': artifact_sha256, 'workflow': workflow, 'run_id': run_id, 'run_attempt': attempt,
+                **review, **base, **platform}
+
+
+def ci_base_proof():
+    policy = json.loads(os.environ['CHECKLIST_BASE_POLICY'], object_pairs_hook=relay.unique)
+    token = os.environ['GH_TOKEN']
+    require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('GITHUB_EVENT_NAME') == 'push' and token,
+            'checklist base proof requires the protected publisher build job')
+
+    def run(*args, timeout):
+        env = {'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C.UTF-8', 'HOME': str(Path.home()),
+               'GH_TOKEN': token, 'GH_PROMPT_DISABLED': '1'}
+        result = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, env=env)
+        require(result.returncode == 0 and len(result.stdout) <= 1024**2, 'approved base provenance verification failed')
+        return result.stdout
+
+    return canonical(ReleaseTrust(run).verify_base(policy))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('verify',))
-    parser.add_argument('--component', choices=COMPONENTS, required=True)
-    parser.add_argument('--source-sha', required=True)
-    parser.add_argument('--subject', required=True, help='exact registry reference or protected local file')
-    parser.add_argument('--sha256', help='independent local artifact SHA256')
-    parser.add_argument('--run-id', type=int, required=True)
+    stages = parser.add_subparsers(dest='stage', required=True)
+    stages.add_parser('checklist-base-proof')
+    verify = stages.add_parser('verify')
+    verify.add_argument('--component', choices=COMPONENTS, required=True)
+    verify.add_argument('--source-sha', required=True)
+    verify.add_argument('--subject', required=True, help='exact registry reference or protected local file')
+    verify.add_argument('--sha256', help='independent local artifact SHA256')
+    verify.add_argument('--run-id', type=int, required=True)
     args = parser.parse_args()
     try:
+        if args.stage == 'checklist-base-proof':
+            print(ci_base_proof())
+            return 0
         require(os.geteuid() == 0, 'release verification uses the protected host transport identity')
         result = ReleaseTrust().verify(args.component, args.source_sha, args.subject, args.run_id,
                                        artifact_sha256=args.sha256)
         print(json.dumps(result, sort_keys=True))
         return 0
-    except (Blocked, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+    except (Blocked, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError, subprocess.SubprocessError) as exc:
         print('release blocked: ' + (str(exc) if isinstance(exc, Blocked) else 'required GitHub or protected input evidence is unavailable'),
               file=sys.stderr)
         return 2

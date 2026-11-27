@@ -1451,7 +1451,21 @@ class Bootstrap:
                     raise Blocked('managed configuration path must be root-owned and protected')
             if parent == self.root:
                 break
-        p.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+        ancestors = []
+        for parent in p.parents:
+            if parent == self.root:
+                break
+            ancestors.append(parent)
+        for parent in reversed(ancestors):
+            try:
+                parent.mkdir(mode=0o755)
+            except FileExistsError:
+                continue
+            fd = os.open(parent, os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fchmod(fd, 0o755)
+            finally:
+                os.close(fd)
         if p.exists():
             if p.read_text() == content:
                 if stat.S_IMODE(p.stat().st_mode) != mode:
@@ -1476,7 +1490,7 @@ class Bootstrap:
             if os.path.exists(name):
                 os.unlink(name)
 
-    def preflight(self):
+    def preflight(self, *, require_enforcing=True):
         if os.geteuid() != 0:
             raise Blocked('root is required')
         release = dict(re.findall(r'^([A-Z_]+)=["\']?([^\n"\']*)', self.text('/etc/os-release'), re.M))
@@ -1486,10 +1500,18 @@ class Bootstrap:
             raise Blocked('only x86_64/aarch64 supported')
         if self.text('/proc/1/comm').strip() != 'systemd':
             raise Blocked('host PID 1 must be systemd')
-        if self.run('/usr/sbin/getenforce').strip() != 'Enforcing':
+        selinux = self.run('/usr/sbin/getenforce').strip()
+        if selinux not in ('Disabled', 'Permissive', 'Enforcing'):
+            raise Blocked('unknown live SELinux state')
+        if require_enforcing and selinux != 'Enforcing':
             raise Blocked('SELinux must be enforcing; run selinux_bootstrap.py initial convergence first')
+        managed = self.path('/var/lib/dev-pair-managed-storage.json')
+        if require_enforcing and managed.exists():
+            ready = self.path('/var/lib/dev-pair/.managed-storage-ready')
+            if not ready.is_file() or ready.is_symlink() or ready.read_bytes() != managed.read_bytes():
+                raise Blocked('finish the admitted managed filesystem before bootstrap')
         transition = self.path('/var/lib/dev-pair/selinux-bootstrap')
-        if (transition / 'intent.json').exists():
+        if require_enforcing and (transition / 'intent.json').exists():
             try:
                 complete = json.loads((transition / 'complete.json').read_text())
                 modes = re.findall(r'^\s*SELINUX\s*=\s*["\']?([^#\s"\']+)',
@@ -1553,7 +1575,7 @@ class Bootstrap:
                 if self.resolved_service(snapshot=True)!=batch:raise ValueError()
             except (Blocked,OSError,ValueError):
                 raise Blocked('unexpected listener: resolved identity changed') from None
-        return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': 'Enforcing',
+        return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': selinux,
                 'phase': 'bootstrap', 'ssh_cutover': 'independent evidence required'}
 
     def resolved_process_start(self,pid):
@@ -1893,9 +1915,10 @@ class Bootstrap:
                     child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 os.close(fd)
                 fd = child
+                if created:
+                    os.fchmod(fd, mode if leaf else 0o755)
                 if leaf:
                     if created:
-                        os.fchmod(fd, mode)
                         if change_owner:
                             os.fchown(fd, uid, gid)
                     info = os.fstat(fd)

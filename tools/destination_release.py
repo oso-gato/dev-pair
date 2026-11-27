@@ -18,6 +18,7 @@ import uuid
 
 from bootstrap import Blocked, Bootstrap, SUDO_PACKAGE_QUERY, checked_file, relay
 from release_trust import DIGEST, SHA, ReleaseTrust, protect, require
+from selinux_bootstrap import INSTALL as SELINUX_INSTALL, OVERRIDE as SELINUX_OVERRIDE, code_digest as selinux_code_digest
 
 ROOT = '/var/lib/dev-pair'
 HOME = ROOT + '/checklist-executor'
@@ -37,6 +38,11 @@ ACTIVATION = CONTROL + '/release.json'
 MANAGED_INTENT = '/var/lib/dev-pair-managed-storage.json'
 MANAGED_IMAGE = '/var/lib/dev-pair-managed.ext4'
 MANAGED_INODES = 1310720
+MANAGED_READY = ROOT + '/.managed-storage-ready'
+TRANSITION = ROOT + '/selinux-bootstrap'
+PRESERVED_TRANSITION = '/var/lib/dev-pair-selinux-preserved'
+TRANSITION_FILES = {'boots.json', 'complete.json', 'config-original', 'intent.json', 'journal.jsonl', 'lock',
+                    'marker-recovery.json', 'reboot.json', 'reboots.json', 'relabel-attempt.json', 'relabel-done.json', 'relabel-plan.json'}
 STORAGE = {'validation': VALIDATION, 'live': LIVE}
 NETWORKS = {'validation': 'dev-pair-checklist-internal', 'live': 'dev-pair-checklist-release'}
 FILES = ('tools/host_handoff.py', 'tools/job_protocol.py', 'tools/ledger_recovery.py', 'tools/jobs.py',
@@ -45,6 +51,10 @@ FILES = ('tools/host_handoff.py', 'tools/job_protocol.py', 'tools/ledger_recover
 EXECUTOR = 'dev-pair-checklist-executor@.service'
 EXECUTOR_OVERRIDE = '/etc/systemd/system/' + EXECUTOR + '.d/checklist-release.conf'
 RENEWAL = ROOT + '/renewal'
+MANAGED_LISTENER = CONTROL + '/managed-listener.json'
+U_HOST_VERIFY = '/usr/libexec/dev-pair/renewal/host-release'
+U_OBSERVE = 'dev-pair-renewal-host-observe.service'
+U_RECOVERY = 'dev-pair-renewal-recovery.service'
 PORT = 18279
 PROXY = f'http://127.0.0.1:{PORT}'
 TLS_FILES = ('cert.pem', 'peer.pem', 'key.pem')
@@ -237,6 +247,64 @@ class Destination(Bootstrap):
     def has_mount_at(path):
         return any(row.split()[4] == path for row in Path('/proc/self/mountinfo').read_text().splitlines())
 
+    @staticmethod
+    def transition_contents(directory):
+        directory = Path(directory)
+        info = directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == 0o700,
+                'SELinux transition directory has unrecognized ownership')
+        contents = {}
+        for path in directory.iterdir():
+            require(path.name in TRANSITION_FILES, 'unrecognized state beside the SELinux transition must be preserved')
+            info = protect(path).stat()
+            require(info.st_size <= 256 * 1024 and stat.S_IMODE(info.st_mode) == 0o600, 'SELinux transition file is not protected')
+            contents[path.name] = path.read_bytes().decode('utf-8')
+        require({'intent.json', 'complete.json', 'relabel-done.json', 'config-original', 'lock'} <= contents.keys(),
+                'finish the existing SELinux transition before enrolling storage')
+        return contents
+
+    @contextlib.contextmanager
+    def previous_transition(self, *, expected):
+        directory = PRESERVED_TRANSITION if os.path.lexists(PRESERVED_TRANSITION) else TRANSITION
+        if not os.path.lexists(directory):
+            require(expected is None, 'recorded SELinux transition archive is unavailable')
+            yield None
+            return
+        lock = protect(Path(directory) / 'lock')
+        with os.fdopen(os.open(lock, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            contents = self.transition_contents(directory)
+            fingerprint = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in contents.items()}
+            if expected is not None:
+                require(fingerprint == expected, 'recorded SELinux transition bytes changed')
+            else:
+                require(directory == TRANSITION and not os.path.lexists('/.autorelabel')
+                        and not os.path.lexists(SELINUX_OVERRIDE),
+                        'SELinux transition must be complete and disarmed before migration')
+                self.preflight()
+                original = json.loads(contents['intent.json'])
+                relabeled = json.loads(contents['relabel-done.json'])
+                complete = json.loads(contents['complete.json'])
+                for name in ('bootstrap.py', 'selinux_bootstrap.py'):
+                    require(stat.S_IMODE(protect(Path(SELINUX_INSTALL) / name).stat().st_mode) == 0o555,
+                            'installed SELinux transition code is not immutable')
+                require(complete['phase'] == 'enforcing'
+                        and complete['code_sha256'] == original['code_sha256'] == relabeled['code_sha256']
+                        and complete['code_sha256'] == selinux_code_digest(Path(SELINUX_INSTALL))
+                        and complete['relabel_boot_id'] == relabeled['boot_id']
+                        and len({complete['boot_id'], relabeled['boot_id'], original['origin_boot_id']}) == 3
+                        and self.run(SYSTEMCTL, 'is-enabled', 'dev-pair-selinux-finalize.service', ok=(0, 1), timeout=10).strip() == 'disabled',
+                        'only a completed, disarmed SELinux transition can be relocated')
+            yield directory, contents, fingerprint
+
+    @staticmethod
+    def sync_path(path):
+        fd = os.open(path, os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def managed_storage(self, args):
         require(1024 <= args.managed_mib <= 20480 and 4096 <= args.managed_inodes <= MANAGED_INODES - 512
                 and args.reserve_inodes >= 4096, 'invalid bounded managed filesystem geometry or physical inode reserve')
@@ -255,30 +323,55 @@ class Destination(Bootstrap):
                     and stat.S_IMODE(info.st_mode) == 0o600, 'unexpected managed-storage lock identity')
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             state = self.record(MANAGED_INTENT) if os.path.lexists(MANAGED_INTENT) else None
+            mounted = self.has_mount_at(ROOT)
             if not state:
-                self.preflight()
-                root = Path(ROOT)
-                require(not self.has_mount_at(ROOT) and not os.path.lexists(MANAGED_IMAGE)
-                        and not root.is_symlink() and (not root.exists() or root.is_dir() and not any(root.iterdir())),
-                        'refusing to mount managed storage over an occupied or unowned existing root')
-            loop = state['filesystem']['loop'] if state else self.run('/usr/sbin/losetup', '--find', timeout=10).strip()
-            require(re.fullmatch(r'/dev/loop[0-9]+', loop), 'cannot enroll an exact managed loop device')
-            spec = {'mib': args.managed_mib, 'inodes': args.managed_inodes, 'image': MANAGED_IMAGE, 'loop': loop,
-                    'uuid': state['filesystem']['uuid'] if state else str(uuid.uuid4())}
-            wanted = {'version': 1, 'machine_id': self.destination_identity()['machine_id'], 'filesystem': spec,
-                      'reserve_inodes': args.reserve_inodes}
-            require(not state or state == wanted, 'managed-storage retry differs from the protected intent')
-            if not self.has_mount_at(ROOT) and Path(ROOT).exists():
-                require(Path(ROOT).is_dir() and not Path(ROOT).is_symlink() and not any(Path(ROOT).iterdir()),
-                        'refusing to hide existing files beneath the managed ext4 root')
-            self.atomic(MANAGED_INTENT, record_text(wanted))
-            self.allocate(spec, MANAGED_INTENT + '.backing', 8192, args.reserve_inodes)
-            self.mount(ROOT, spec, max_inodes=MANAGED_INODES)
-            self.directory(ROOT, mode=0o755)
-            self.run('/usr/sbin/restorecon', '-F', ROOT, timeout=10)
-            return {'path': ROOT, 'filesystem': spec, 'physical_reserve_mib': 8192}
+                self.preflight(require_enforcing=False)
+                require(not mounted and not os.path.lexists(MANAGED_IMAGE) and not os.path.lexists(PRESERVED_TRANSITION),
+                        'refusing to adopt existing managed storage or transition archive')
+            transition = state.get('transition') if state else None
+            migration = self.previous_transition(expected=transition) if not state or transition else contextlib.nullcontext(None)
+            with migration as previous:
+                return self.enroll_managed_storage(args, state, mounted, previous)
         finally:
             os.close(lock)
+
+    def enroll_managed_storage(self, args, state, mounted, previous):
+        root = Path(ROOT)
+        if not mounted and os.path.lexists(root):
+            expected = {'selinux-bootstrap'} if previous and previous[0] == TRANSITION else set()
+            require(not root.is_symlink() and root.is_dir() and {entry.name for entry in root.iterdir()} == expected,
+                    'refusing to hide unrelated files beneath the managed ext4 root')
+        loop = state['filesystem']['loop'] if state else self.run('/usr/sbin/losetup', '--find', timeout=10).strip()
+        require(re.fullmatch(r'/dev/loop[0-9]+', loop), 'cannot enroll an exact managed loop device')
+        spec = {'mib': args.managed_mib, 'inodes': args.managed_inodes, 'image': MANAGED_IMAGE, 'loop': loop,
+                'uuid': state['filesystem']['uuid'] if state else str(uuid.uuid4())}
+        wanted = {'version': 1, 'machine_id': self.destination_identity()['machine_id'], 'filesystem': spec,
+                  'reserve_inodes': args.reserve_inodes}
+        if previous:
+            wanted['transition'] = previous[2]
+        require(not state or state == wanted, 'managed-storage retry differs from the protected intent')
+        self.atomic(MANAGED_INTENT, record_text(wanted))
+        self.allocate(spec, MANAGED_INTENT + '.backing', 8192, args.reserve_inodes)
+        if previous and previous[0] == TRANSITION:
+            require(not mounted and not os.path.lexists(PRESERVED_TRANSITION), 'unexpected transition archive conflict')
+            os.rename(TRANSITION, PRESERVED_TRANSITION)
+            self.sync_path(ROOT)
+            self.sync_path(Path(PRESERVED_TRANSITION).parent)
+        self.mount(ROOT, spec, max_inodes=MANAGED_INODES)
+        self.directory(ROOT, mode=0o755)
+        if previous and not os.path.lexists(MANAGED_READY):
+            self.directory(TRANSITION)
+            for name, text in previous[1].items():
+                self.atomic(TRANSITION + '/' + name, text)
+            require(self.transition_contents(TRANSITION) == previous[1], 'copied SELinux transition does not match preserved record')
+        elif previous:
+            current = self.transition_contents(TRANSITION)
+            require(all(current.get(name) == previous[1][name] for name in ('intent.json', 'complete.json', 'relabel-done.json')),
+                    'admitted SELinux transition authority changed')
+        if self.run('/usr/sbin/getenforce', timeout=10).strip() != 'Disabled':
+            self.run('/usr/sbin/restorecon', '-RF' if previous else '-F', TRANSITION if previous else ROOT, timeout=20)
+        self.atomic(MANAGED_READY, record_text(wanted))
+        return {'path': ROOT, 'filesystem': spec, 'physical_reserve_mib': 8192, 'preserved_transition': bool(previous)}
 
     def reserve(self, path, spec, uid, reserve_mib, reserve_inodes):
         self.directory(ROOT + '/checklist-storage', mode=0o711)
@@ -333,8 +426,10 @@ class Destination(Bootstrap):
     def source_files(self, source):
         self.destination_source(source)
         repo = Path(__file__).absolute().parents[1]
-        files = (*FILES, 'runtime/checklist/' + EXECUTOR, 'tools/release_trust.py', 'tools/bootstrap.py',
+        files = (*FILES, 'runtime/checklist/' + EXECUTOR, 'tools/release_trust.py', 'tools/bootstrap.py', 'tools/selinux_bootstrap.py',
                  'tools/native_io.py', 'tools/native_relay.py', 'tools/selected_payload.py', 'tools/destination_release.py')
+        if os.path.lexists(repo / 'tools/platform_release_protocol.py'):
+            files += ('tools/platform_release_protocol.py',)
         selected = {}
         for name in files:
             actual = protect(repo / name).read_text()
@@ -448,34 +543,96 @@ class Destination(Bootstrap):
                                      'import os,sys; os.stat(sys.argv[1]); assert not os.access(sys.argv[1], os.R_OK)', backing)
                 self.setup_network(uid, role)
             was_ready = os.path.lexists(CONTROL + '/ready.json')
-            unit, needs_recovery = self.start_executor(uid, managed_listener, was_ready)
-            self.atomic(CONTROL + '/ready.json', record_text(intent))
-            if needs_recovery:
-                self.run(SYSTEMCTL, 'enable', '--now', 'dev-pair-renewal-recovery.service', timeout=120)
-            return {'provisioned': True, 'uid': uid, 'platform_sha': args.platform_sha, 'executor': unit,
-                    'listener_mode': 'managed' if managed_listener else 'commissioning'}
+            unit, readiness = self.start_executor(uid, managed_listener, was_ready)
+            if readiness == 'ready':
+                self.atomic(CONTROL + '/ready.json', record_text(intent))
+            return {'provisioned': readiness == 'ready', 'uid': uid, 'platform_sha': args.platform_sha,
+                    'executor': unit, 'listener_state': readiness, 'listener_mode': 'managed' if managed_listener else 'commissioning'}
 
     def start_executor(self, uid, managed_listener, was_ready):
         unit = f'dev-pair-checklist-executor@{uid}.service'
-        if was_ready:
-            history = Path(HOME + '/execution-history').lstat()
+        history_path = Path(HOME + '/execution-history')
+        if os.path.lexists(history_path):
+            history = history_path.lstat()
             require(stat.S_ISDIR(history.st_mode) and history.st_uid == uid and stat.S_IMODE(history.st_mode) == 0o700,
                     'protected prior provisioning lacks its independent execution history')
-        active = self.run(SYSTEMCTL, 'is-active', unit, ok=(0, 3, 4), timeout=10).strip() == 'active'
-        if active:
-            self.executor_ready(unit, uid)
         else:
+            require(not was_ready and not os.path.lexists(FENCE + '/frozen'),
+                    'cannot recreate missing execution history on a previously provisioned or fenced host')
+            require(self.run(SYSTEMCTL, 'is-active', unit, ok=(0, 3, 4), timeout=10).strip() != 'active',
+                    'active checklist executor has no provisioned history')
             self.subprocess_role(uid, '/usr/bin/python3', '-EBs', CODE + '/tools/host_handoff.py', 'initialize-host-history')
         if managed_listener:
-            self.run(SYSTEMCTL, 'enable', unit, timeout=30)
-            if not active:
-                self.run(SYSTEMCTL, 'start', 'dev-pair-renewal-boot-fence.service', timeout=30)
-                self.run(SYSTEMCTL, 'start', 'dev-pair-renewal-host-observe.service', timeout=60)
-            protect(FENCE + '/selected-host.json')
-        else:
-            self.run(SYSTEMCTL, 'enable', '--now', unit, timeout=30)
+            return unit, self.managed_executor(unit, uid)
+        require(not os.path.lexists(MANAGED_LISTENER), 'managed executor intent cannot return to direct commissioning')
+        self.run(SYSTEMCTL, 'enable', '--now', unit, timeout=30)
         self.executor_ready(unit, uid)
-        return unit, managed_listener and (not active or os.path.lexists(FENCE + '/frozen'))
+        return unit, 'ready'
+
+    def manager_job(self, unit):
+        output = self.run(SYSTEMCTL, 'show', '--all', '--property=Job,ActiveState,Result', unit, timeout=10)
+        fields = dict(row.split('=', 1) for row in output.splitlines())
+        require(set(fields) == {'Job', 'ActiveState', 'Result'} and re.fullmatch(r'[0-9]*', fields['Job']),
+                'systemd manager job readback is incomplete')
+        return bool(int(fields['Job'] or '0')) or fields['ActiveState'] in ('activating', 'deactivating'), fields['Result']
+
+    def verify_managed_executor(self, site, uid):
+        protect(U_HOST_VERIFY)
+        selector = self.record(FENCE + '/selected-host.json')
+        returned = json.loads(self.run(U_HOST_VERIFY, 'verify', site, timeout=30), object_pairs_hook=relay.unique)
+        require(returned['boot_id'] == self.destination_identity()['boot_id']
+                and returned['component']['artifact_sha256'] == selector['artifact_sha256']
+                and returned['handoff']['unit'] == f'dev-pair-checklist-executor@{uid}.service',
+                'renewal host verifier did not attest this live selected executor')
+        self.executor_ready(returned['handoff']['unit'], uid)
+
+    def managed_executor(self, unit, uid):
+        site, boot = self.record(RENEWAL + '/site-current.json'), self.destination_identity()['boot_id']
+        require(type(site) is str and re.fullmatch(DIGEST, site), 'protected initial host selection reference is invalid')
+        prior = self.record(MANAGED_LISTENER) if os.path.lexists(MANAGED_LISTENER) else None
+        record = {'version': 1, 'site': site, 'boot': boot, 'phase': 'queue-observe'}
+        if prior and (prior['site'], prior['boot']) == (site, boot):
+            record = prior
+        else:
+            self.atomic(MANAGED_LISTENER, record_text(record), expected=record_text(prior) if prior else None)
+        if record['phase'] == 'queue-observe':
+            running, _ = self.manager_job(U_OBSERVE)
+            if running:
+                self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'observe'}), expected=record_text(record))
+                return 'host-observation-running'
+            self.run(SYSTEMCTL, 'enable', unit, timeout=30)
+            self.run(SYSTEMCTL, 'start', 'dev-pair-renewal-boot-fence.service', timeout=30)
+            self.run(SYSTEMCTL, 'start', '--no-block', U_OBSERVE, timeout=15)
+            self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'observe'}), expected=record_text(record))
+            return 'host-observation-queued'
+        if record['phase'] == 'observe':
+            running, result = self.manager_job(U_OBSERVE)
+            if running:
+                return 'host-observation-running'
+            if result not in ('success', ''):
+                raise Blocked('managed host observation failed; inspect the owned renewal service before replay')
+            self.verify_managed_executor(site, uid)
+            advanced = {**record, 'phase': 'queue-recovery'}
+            self.atomic(MANAGED_LISTENER, record_text(advanced), expected=record_text(record))
+            record = advanced
+        if record['phase'] == 'queue-recovery':
+            running, _ = self.manager_job(U_RECOVERY)
+            if not running and os.path.lexists(FENCE + '/frozen'):
+                self.run(SYSTEMCTL, 'enable', '--now', '--no-block', U_RECOVERY, timeout=20)
+            self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'recovery'}), expected=record_text(record))
+            return 'renewal-readback-running' if running else 'renewal-readback-queued'
+        require(record['phase'] in ('recovery', 'ready'), 'unknown managed listener commissioning state')
+        running, result = self.manager_job(U_RECOVERY)
+        if running:
+            return 'renewal-readback-running'
+        if result not in ('success', ''):
+            raise Blocked('owned renewal recovery failed; dispatch remains fenced')
+        self.verify_managed_executor(site, uid)
+        if os.path.lexists(FENCE + '/frozen'):
+            return 'renewal-readback-fenced'
+        if record['phase'] != 'ready':
+            self.atomic(MANAGED_LISTENER, record_text({**record, 'phase': 'ready'}), expected=record_text(record))
+        return 'ready'
 
     def executor_ready(self, unit, uid):
         deadline = time.monotonic() + 8
@@ -531,6 +688,11 @@ class Destination(Bootstrap):
                         'physical storage reserve is no longer available')
                 dns = None
                 if require_cutover:
+                    listener = self.record(MANAGED_LISTENER)
+                    site = self.record(RENEWAL + '/site-current.json')
+                    require(listener['phase'] == 'ready' and listener['site'] == site,
+                            'production release requires current completed managed listener readback')
+                    self.verify_managed_executor(site, uid)
                     guard = self.verify_final_guard()
                     _, dns = self.tailscale_state()
                     require(guard['target']['dns_name'] == dns, 'checklist proxy differs from independently verified cutover')
@@ -558,7 +720,7 @@ class Destination(Bootstrap):
             if path:
                 path.unlink(missing_ok=True)
 
-    def image_identity(self, uid, role, image, source, *, production):
+    def image_identity(self, uid, role, image, source, *, production, base=None):
         metadata, = json.loads(self.podman(uid, role, 'image', 'inspect', image))
         labels = metadata.get('Labels') or metadata['Config']['Labels']
         digest = image.rsplit('@', 1)[1]
@@ -569,6 +731,9 @@ class Destination(Bootstrap):
                 'Podman image manifest, platform or source differs from the held release')
         require(not production or labels.get('dev-pair.data-compatibility') == COMPATIBILITY,
                 'checklist image does not declare the supported rollback data format')
+        require(not production or base and labels.get('dev-pair.checklist.base') == base['image']
+                and labels.get('dev-pair.checklist.base-proof') == base['proof_sha256'],
+                'checklist image does not bind its independently verified signed base')
         return ident
 
     def preload_validation(self, receipt_path, secret):
@@ -646,23 +811,27 @@ class Destination(Bootstrap):
         deadline = time.monotonic() + 8
         while True:
             try:
-                with contextlib.closing(http.client.HTTPConnection('127.0.0.1', PORT, timeout=1)) as connection:
-                    connection.request('GET', '/', headers={'Host': dns})
-                    response = connection.getresponse()
-                    require(response.status == 200 and b'<title>Checklist</title>' in response.read(16384),
-                            'checklist loopback browser journey did not respond')
-                with contextlib.closing(http.client.HTTPConnection('127.0.0.1', PORT, timeout=1)) as connection:
-                    connection.request('GET', '/items', headers={'Host': dns})
-                    response = connection.getresponse()
-                    raw = response.read(1024**2 + 1)
-                    require(response.status == 200 and len(raw) <= 1024**2, 'checklist inventory endpoint did not respond')
-                    observed = inventory_digest(json.loads(raw, object_pairs_hook=relay.unique))
-                    require(expected_data is None or observed == expected_data, 'actual checklist items changed during rollout')
-                    return fields['InvocationID']
+                observed = self.browser_inventory(dns)
+                require(expected_data is None or observed == expected_data, 'actual checklist items changed during rollout')
+                return fields['InvocationID']
             except OSError:
                 if time.monotonic() >= deadline:
                     raise Blocked('checklist loopback service did not become ready') from None
                 time.sleep(0.2)
+
+    @staticmethod
+    def browser_inventory(dns):
+        with contextlib.closing(http.client.HTTPConnection('127.0.0.1', PORT, timeout=1)) as connection:
+            connection.request('GET', '/', headers={'Host': dns})
+            response = connection.getresponse()
+            require(response.status == 200 and b'<title>Checklist</title>' in response.read(16384),
+                    'checklist loopback browser journey did not respond')
+        with contextlib.closing(http.client.HTTPConnection('127.0.0.1', PORT, timeout=1)) as connection:
+            connection.request('GET', '/items', headers={'Host': dns})
+            response = connection.getresponse()
+            raw = response.read(1024**2 + 1)
+            require(response.status == 200 and len(raw) <= 1024**2, 'checklist inventory endpoint did not respond')
+            return inventory_digest(json.loads(raw, object_pairs_hook=relay.unique))
 
     def data_items(self, uid, path):
         tool = protect(CODE + '/examples/checklist/checklist.py')
@@ -671,8 +840,8 @@ class Destination(Bootstrap):
                 "sys.path.insert(0, str(Path(sys.argv[1]).parent)); import checklist as c\n"
                 "with closing(c.connect(p,readonly=True)) as db:\n"
                 " c.verify_database(db); assert db.execute(\"SELECT type,name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'\").fetchall()==[('table','items',c.SCHEMA)]; "
-                "print(json.dumps([c.item_object(row) for row in db.execute("
-                "'SELECT id,title,done FROM items ORDER BY id')]))")
+                "sys.stdout.buffer.write(json.dumps([c.item_object(row) for row in db.execute("
+                "'SELECT id,title,done FROM items ORDER BY id')],ensure_ascii=False,separators=(',',':')).encode('utf-8'))")
         raw = self.subprocess_role(uid, '/usr/bin/python3', '-IB', '-c', code, str(tool), path)
         return json.loads(raw, object_pairs_hook=relay.unique)
 
@@ -697,7 +866,14 @@ class Destination(Bootstrap):
         require(self.data_snapshot(uid, backup) == self.data_snapshot(uid, restored) == target,
                 'checklist backup and clean restore contents do not match quiesced data')
         self.subprocess_role(uid, '/usr/bin/rm', '--', restored)
+        self.sync_database(uid, backup)
         return {'path': backup, 'inventory_sha256': target}
+
+    def sync_database(self, uid, path):
+        sync = ('import os,sys; p=sys.argv[1]; '
+                'f=os.open(p,os.O_RDONLY|os.O_NOFOLLOW); os.fsync(f); os.close(f); '
+                'd=os.open(os.path.dirname(p),os.O_DIRECTORY|os.O_NOFOLLOW); os.fsync(d); os.close(d)')
+        self.subprocess_role(uid, '/usr/bin/python3', '-IB', '-c', sync, path)
 
     def archive_failed_data(self, uid, attempt):
         require(re.fullmatch(r'[0-9a-f]{32}', attempt), 'invalid checklist preservation attempt')
@@ -705,9 +881,10 @@ class Destination(Bootstrap):
         code = ("import os,stat,sys\n"
                 "source,target=sys.argv[1:]\n"
                 "for suffix in ('','-journal','-wal','-shm'):\n"
-                " a,b=source+suffix,target+suffix\n"
+                " a=source+suffix\n"
                 " if not os.path.lexists(a): continue\n"
                 " current=os.lstat(a); assert stat.S_ISREG(current.st_mode) and current.st_uid==os.getuid()\n"
+                " b=target+suffix+'.'+str(current.st_ino)\n"
                 " if not os.path.lexists(b): os.link(a,b,follow_symlinks=False)\n"
                 " saved=os.lstat(b); assert (current.st_dev,current.st_ino)==(saved.st_dev,saved.st_ino)\n"
                 " for path in (a,b):\n"
@@ -716,7 +893,11 @@ class Destination(Bootstrap):
                 " for path in (os.path.dirname(a),os.path.dirname(b)):\n"
                 "  fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW); os.fsync(fd); os.close(fd)\n")
         self.subprocess_role(uid, '/usr/bin/python3', '-IB', '-c', code, self.database_path(), target)
-        return target if os.path.lexists(target) else None
+        archives = sorted(path for path in Path(target).parent.glob(Path(target).name + '.*')
+                          if re.fullmatch(re.escape(target) + r'\.[1-9][0-9]*', str(path)))
+        if archives:
+            return str(archives[-1])
+        return None
 
     def restore_failed_data(self, uid, pending):
         baseline = pending['baseline']
@@ -734,6 +915,7 @@ class Destination(Bootstrap):
         tool = protect(CODE + '/examples/checklist/checklist.py')
         self.subprocess_role(uid, '/usr/bin/python3', '-IB', str(tool), 'restore', '--backup', baseline['path'], '--database', source)
         require(self.data_snapshot(uid, source) == expected, 'restored live checklist inventory differs from the pre-activation snapshot')
+        self.sync_database(uid, source)
 
     def save_activation(self, state):
         self.atomic(ACTIVATION, record_text(state), expected=self.text(ACTIVATION) or None)
@@ -767,6 +949,7 @@ class Destination(Bootstrap):
         active, pending = state['active'], state['pending']
         old = self.render_unit(uid, dns, active) if active else ''
         new = self.render_unit(uid, dns, release)
+        allowed = ('', old, new) if active and active.get('quarantined') else (old, new)
         if pending:
             require(pending['operation'] == operation and pending['release'] == release,
                     'interrupted rollout requires exact completion or protected rollback')
@@ -777,13 +960,15 @@ class Destination(Bootstrap):
             free = os.statvfs(LIVE)
             require(free.f_bavail * free.f_frsize >= 16 * MIB and free.f_favail >= 16,
                     'live image and rollback snapshots cannot overlap in the bounded checklist allocation')
-            self.current_unit(uid, (old,))
+            if active:
+                self.data_snapshot(uid, self.database_path())
+            self.current_unit(uid, ('', old) if active and active.get('quarantined') else (old,))
             pending = {'operation': operation, 'release': release, 'attempt': uuid.uuid4().hex,
                        'phase': 'reserved', 'baseline': None}
             state = {**state, 'pending': pending}
             self.save_activation(state)
         try:
-            self.quiesce(uid, dns, (old, new))
+            self.quiesce(uid, dns, allowed)
             if pending['phase'] == 'reserved':
                 baseline = self.backup(uid, pending['attempt']) if active else None
                 pending = {**pending, 'phase': 'prepared', 'baseline': baseline}
@@ -791,15 +976,17 @@ class Destination(Bootstrap):
                 self.save_activation(state)
             elif active:
                 self.restore_failed_data(uid, pending)
-            self.install_unit(uid, dns, release, (old, new))
+            self.install_unit(uid, dns, release, allowed)
             expected = pending['baseline']['inventory_sha256'] if active else inventory_digest([])
             self.health(uid, dns, release, expected)
             require(self.data_snapshot(uid, self.database_path()) == expected,
                     'stored checklist data changed during isolated rollout')
+            self.sync_database(uid, self.database_path())
         except Exception:
             self.recover(uid, dns, state)
             raise
-        result = {**state, 'active': {**release, 'backup': pending['baseline']}, 'previous': active,
+        previous = state['previous'] if active and active.get('quarantined') else active
+        result = {**state, 'active': {**release, 'backup': pending['baseline']}, 'previous': previous,
                   'pending': None, 'confirmed': release['artifact_sha256'] if operation == 'rollback' else None,
                   'route_pending': True}
         self.save_activation(result)
@@ -815,12 +1002,15 @@ class Destination(Bootstrap):
                 require(pending['operation'] == 'deploy' and all(pending['release'].get(key) == value for key, value in release.items()),
                         'an interrupted different release requires rollback before further deployment')
             elif active and all(active.get(key) == value for key, value in release.items()):
+                require(not active.get('quarantined'), 'a rejected digest requires an independently approved correction')
                 self.health(uid, dns, active)
                 return self.finish_route(state, dns)
-            require(not active or state['confirmed'] == active['artifact_sha256'],
+            require(not active or active.get('quarantined') or state['confirmed'] == active['artifact_sha256'],
                     'current release requires independent destination confirmation before replacement')
+            require(not active or not active.get('quarantined') or image != active['subject'],
+                    'correction must use another independently approved artifact digest')
             self.pull(uid, 'live', image, secret)
-            release.update(image_id=self.image_identity(uid, 'live', image, source, production=True), dns_name=dns,
+            release.update(image_id=self.image_identity(uid, 'live', image, source, production=True, base=release.get('base')), dns_name=dns,
                            compatibility=COMPATIBILITY)
             release['unit_sha256'] = hashlib.sha256(self.render_unit(uid, dns, release).encode()).hexdigest()
             ReleaseTrust(self.run).main(source)
@@ -828,17 +1018,27 @@ class Destination(Bootstrap):
 
     def recover(self, uid, dns, state):
         active, pending = state['active'], state['pending']
+        if pending['operation'] == 'reject':
+            return self.quarantine(uid, dns, state)
         wanted = pending['release']
         new = self.render_unit(uid, dns, wanted)
         old = self.render_unit(uid, dns, active) if active else ''
         current = self.quiesce(uid, dns, ('', old, new))
         if active:
-            require(active['compatibility'] == COMPATIBILITY and active['dns_name'] == dns
-                    and self.image_identity(uid, 'live', active['subject'], active['source_sha'], production=True) == active['image_id'],
+            require(active['compatibility'] == COMPATIBILITY and active['dns_name'] == dns,
                     'prior compatible checksum is unavailable for recovery')
             baseline = pending['baseline']
             if pending['phase'] == 'prepared':
                 self.restore_failed_data(uid, pending)
+            if active.get('quarantined'):
+                self.remove_unit(uid, current)
+                result = {**state, 'pending': None, 'route_pending': False,
+                          'last_failed': {'attempt': pending['attempt'], 'release': wanted, 'baseline': baseline}}
+                self.save_activation(result)
+                return result
+            require(self.image_identity(uid, 'live', active['subject'], active['source_sha'], production=True,
+                                        base=active.get('base')) == active['image_id'],
+                    'prior exact digest is unavailable for recovery')
             expected = baseline['inventory_sha256'] if baseline else self.data_snapshot(uid, self.database_path())
             self.install_unit(uid, dns, active, ('', old, new))
             self.health(uid, dns, active, expected)
@@ -847,9 +1047,7 @@ class Destination(Bootstrap):
                       'last_failed': {'attempt': pending['attempt'], 'release': wanted, 'baseline': baseline}}
             self.save_activation(result)
             return self.finish_route(result, dns)
-        if current:
-            Path(self.unit_path(uid)).unlink()
-            self.user_unit(uid, 'daemon-reload')
+        self.remove_unit(uid, current)
         archive = self.archive_failed_data(uid, pending['attempt'])
         require(not os.path.lexists(self.database_path()) and not self.serve_config(dns),
                 'failed initial rollout still owns live data or ingress')
@@ -857,6 +1055,46 @@ class Destination(Bootstrap):
                   'last_failed': {'attempt': pending['attempt'], 'release': wanted, 'data_archive': archive}}
         self.save_activation(result)
         return result
+
+    def remove_unit(self, uid, current):
+        if current:
+            path = Path(self.unit_path(uid))
+            path.unlink()
+            self.sync_path(path.parent)
+            self.user_unit(uid, 'daemon-reload')
+
+    def quarantine(self, uid, dns, state):
+        pending, active = state['pending'], state['active']
+        current = self.quiesce(uid, dns, ('', self.render_unit(uid, dns, active)))
+        baseline = self.backup(uid, pending['attempt'])
+        self.remove_unit(uid, current)
+        result = {**state, 'pending': None, 'route_pending': False,
+                  'active': {**active, 'quarantined': True},
+                  'last_rejected': {'attempt': pending['attempt'], 'release': active, 'baseline': baseline,
+                                    'evidence_sha256': pending['evidence_sha256']}}
+        self.save_activation(result)
+        return result
+
+    def reject(self, evidence):
+        with self.release_gate() as (setup, uid, dns):
+            state = self.initial_activation()
+            active = state['active']
+            require(active and not active.get('quarantined') and not state['confirmed'] and not state['previous']
+                    and not state['pending'], 'rejection requires a first release awaiting external confirmation')
+            data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
+                                                    {'release_source', 'image', 'dns_name', 'failed_check', 'observation_sha256'},
+                                                    lifetime=1800)
+            require(data['source_sha'] == setup['platform_sha'] and data['release_source'] == active['source_sha']
+                    and data['image'] == active['subject'] and data['dns_name'] == dns
+                    and data['failed_check'] in ('authorized-browser', 'public-denial', 'unauthorized-denial',
+                                                 'tailnet-loss', 'restart', 'reboot', 'clean-restore', 'remote-root')
+                    and type(data['observation_sha256']) is str and re.fullmatch(DIGEST, data['observation_sha256']),
+                    'rejection evidence does not bind this first release and its failed destination check')
+            self.data_snapshot(uid, self.database_path())
+            state = {**state, 'pending': {'operation': 'reject', 'attempt': uuid.uuid4().hex, 'release': active,
+                                         'evidence_sha256': hashlib.sha256(protect(evidence).read_bytes()).hexdigest()}}
+            self.save_activation(state)
+            return self.quarantine(uid, dns, state)
 
     def rollback(self):
         with self.release_gate() as (_, uid, dns):
@@ -868,7 +1106,8 @@ class Destination(Bootstrap):
                     and prior['compatibility'] == active['compatibility'] == COMPATIBILITY
                     and prior['dns_name'] == dns and active['dns_name'] == dns,
                     'no known compatible previous checklist release')
-            require(self.image_identity(uid, 'live', prior['subject'], prior['source_sha'], production=True) == prior['image_id'],
+            require(self.image_identity(uid, 'live', prior['subject'], prior['source_sha'], production=True,
+                                        base=prior.get('base')) == prior['image_id'],
                     'previous exact digest is unavailable for rollback')
             return self.activate(uid, dns, state, prior, 'rollback')
 
@@ -876,7 +1115,8 @@ class Destination(Bootstrap):
         with self.release_gate() as (setup, uid, dns):
             state = self.initial_activation()
             release = state['active']
-            require(release and not state['pending'] and not state['route_pending'], 'no settled rollout to confirm')
+            require(release and not release.get('quarantined') and not state['pending'] and not state['route_pending'],
+                    'no settled rollout to confirm')
             data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
                                                     {'release_source', 'image', 'dns_name', 'guard_sha256', 'probes',
                                                      'item_id', 'item_title_sha256'}, lifetime=1800)
@@ -945,7 +1185,9 @@ def main():
     rollback = stages.add_parser('rollback')
     confirm = stages.add_parser('confirm')
     confirm.add_argument('--evidence', required=True)
-    for stage in (storage, provision, preload, deploy, rollback, confirm):
+    reject = stages.add_parser('reject')
+    reject.add_argument('--evidence', required=True)
+    for stage in (storage, provision, preload, deploy, rollback, confirm, reject):
         stage.add_argument('--apply', action='store_true', required=True)
     stages.add_parser('status')
     args = parser.parse_args()
@@ -964,8 +1206,12 @@ def main():
             result = app.rollback()
         elif args.stage == 'confirm':
             result = app.confirm(args.evidence)
+        elif args.stage == 'reject':
+            result = app.reject(args.evidence)
         else:
-            result = app.initial_activation()
+            listener = app.record(MANAGED_LISTENER) if os.path.lexists(MANAGED_LISTENER) else None
+            result = {**app.initial_activation(), 'managed_listener': listener,
+                      'renewal_fenced': os.path.lexists(FENCE + '/frozen')}
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     except (Blocked, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
