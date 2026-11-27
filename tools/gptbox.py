@@ -18,7 +18,7 @@ import tarfile
 import time
 from types import ModuleType
 
-from bootstrap import (Bootstrap, Blocked, STATE, Commands, PrepareCost, KEYS_URL, PACKAGES, SOURCE_BASELINE,
+from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Commands, PrepareCost, KEYS_URL, PACKAGES, SOURCE_BASELINE,
                        SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
@@ -47,10 +47,14 @@ ASSEMBLY_LIFETIME = 900
 RUNTIME_LIFETIME = 180
 INITIALIZE_EXECUTION = 2280
 PREPARE_EXECUTION = 600
+PREPARE_NATIVE = 'dev-pair-initialize-prepare'
 ADAPTER_EXECUTION = 1620
 IMAGE_EXECUTION = 600
 CLEANUP_EXECUTION = 45
 COMMAND_CLEANUP_GRACE = 45
+ADAPTER_SOURCE_FILES = ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py',
+                        'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py',
+                        'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py')
 
 
 def sha(data):
@@ -155,24 +159,28 @@ class Gptbox(Bootstrap):
         repo = Path(__file__).resolve().parents[1]
         if self.run('/usr/bin/git', '-C', str(repo), 'rev-parse', 'HEAD').strip() != revision:
             raise Blocked('adapter source HEAD differs from requested exact target')
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py'):
+        for name in ADAPTER_SOURCE_FILES:
             data = self.protected(Path(__file__).with_name(name)).read_bytes()
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
                 raise Blocked('adapter revision does not identify executing source')
 
-    def inputs(self, context, expected, upstream, revision):
+    def context_inputs(self, context, expected, revision):
         self.protected(context)
         for file in Path(context).iterdir():
             self.protected(file)
         _, _, manifest = self.check_gptbox_inputs(context, expected, expected_role=self.role)
-        self.source_stage = 'context-source'
-        candidate.verify(context, expected)
         if (manifest['role'] != self.role or manifest['fedora']['image'] != FEDORA
                 or manifest['codex']['version'] != '0.169.0' or manifest['codex']['sha256'] != CODEX_SHA):
             raise Blocked('adapter requires independently verified pinned inputs for its role')
-        if manifest['source_sha'] != revision:
+        if manifest['source_sha'] != revision or not re.fullmatch(r'[0-9a-f]{40}', revision or ''):
             raise Blocked('context source differs from requested adapter target')
+        return manifest
+
+    def inputs(self, context, expected, upstream, revision):
+        manifest = self.context_inputs(context, expected, revision)
+        self.source_stage = 'context-source'
+        candidate.verify(context, expected)
         self.source_stage = 'executing-source'
         self.source(revision)
         self.source_stage = 'upstream-head-and-bytes'
@@ -870,7 +878,7 @@ class Gptbox(Bootstrap):
         self.protected(upstream)
         for name in ('distrobox-init', 'distrobox-enter'):
             self.protected(Path(upstream) / name)
-        for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py'):
+        for name in ADAPTER_SOURCE_FILES:
             self.protected(Path(__file__).with_name(name))
         self.protected(Path(fedora_oci._public_inputs().__file__))
         if self.path('/usr/bin/git').exists():
@@ -888,6 +896,7 @@ class Gptbox(Bootstrap):
         # The journey lock and existing global bootstrap lock span the private
         # host handoff and image/assembly; public entry points take that lock separately.
         with self.lock('initialize.lock'), self.lock():
+            self._reject_development_host_intent()
             prior = json.loads(self.text(path, '{}'))
             if prior and (type(prior.get('schema',1)) is not int or prior.get('schema',1) not in (1,2)):raise Blocked('unsupported initializer state schema')
             if prior and (prior.get('phase') not in ('prepare','maintenance-gptbox','complete') or any(prior.get(k) not in ('pending','blocked','complete') for k in ('prepare','maintenance_gptbox'))):raise Blocked('invalid initializer phase record')
@@ -969,7 +978,7 @@ class Gptbox(Bootstrap):
                 record['role_directory_batches'] = {key:dict(value) for key,value in
                     getattr(preparation,'role_directory_batches',{}).items()}
             try:
-                with preparation.run.phase(PREPARE_EXECUTION, 'dev-pair-initialize-prepare'):
+                with preparation.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE):
                     keys = github_keys()
                     # The shared preparation/adapter context unit has a fixed
                     # owner description. Retry reconciles it before prepare.
@@ -1041,6 +1050,174 @@ class DevelopmentGptbox(Gptbox):
     role = 'development'
     artifact_root = DEVELOPMENT_ARTIFACTS
 
+    def protect_host_sources(self, upstream, revision):
+        def regular(path):
+            node = self.protected(path).lstat()
+            if not stat.S_ISREG(node.st_mode) or node.st_nlink != 1:
+                raise Blocked('development host source requires protected regular files')
+
+        repo = Path(__file__).parents[1]
+        upstream = Path(upstream)
+        for name in ADAPTER_SOURCE_FILES:
+            regular(repo / 'tools' / name)
+        regular(Path(fedora_oci._public_inputs().__file__))
+        regular(repo / 'runtime/devbox/controller.py')
+        for name in ('distrobox-init', 'distrobox-enter'):
+            regular(upstream / name)
+        # Only sanitized, digest-verified public-input extraction is admitted.
+        # Protect the Git inputs too, including configuration and object paths.
+        for checkout, head in ((repo, revision), (upstream, DBX_SHA)):
+            metadata = checkout / '.git'
+            for relative, names in (('', {'HEAD', 'config', 'shallow', 'refs', 'objects'}),
+                                    ('refs', {'heads'}), ('refs/heads', {'public-input'}),
+                                    ('objects', {'pack'})):
+                directory = self.protected(metadata / relative)
+                if {p.name for p in directory.iterdir()} != names:
+                    raise Blocked('development host requires the extracted public-input Git layout')
+            for relative, value in {
+                'HEAD': 'ref: refs/heads/public-input\n',
+                'config': '[core]\nrepositoryformatversion=0\nbare=false\nfilemode=true\n',
+                'shallow': head + '\n', 'refs/heads/public-input': head + '\n',
+            }.items():
+                data = self.protected_bytes(metadata / relative, 4096)
+                if data != value.encode():
+                    raise Blocked('development host Git metadata differs from the extracted target')
+            pack = self.protected(metadata / 'objects/pack')
+            names = {p.name for p in pack.iterdir()}
+            if len(names) not in (2, 3) or any(not re.fullmatch(r'pack-[0-9a-f]{40}\.(pack|idx|rev)', name) for name in names):
+                raise Blocked('unexpected development host Git object layout')
+            prefix = next(iter(names)).rsplit('.', 1)[0]
+            if names not in ({prefix + '.pack', prefix + '.idx'}, {prefix + '.pack', prefix + '.idx', prefix + '.rev'}):
+                raise Blocked('development host Git object pack and index do not match')
+            for name in names:
+                regular(pack / name)
+
+    def prepare_development_host(self, context, expected, upstream, revision, sources, password_file=None,
+                                 apply=False, retry=False):
+        sources = validate_sources(sources)
+        result = {'kind': 'development-host-prerequisites', 'source_sha': revision,
+                  'context_sha256': expected, 'job_admission': False}
+        with contextlib.ExitStack() as locked:
+            with self.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE, native=False):
+                self.preflight()
+                self.context_inputs(context, expected, revision)
+                self.protect_host_sources(upstream, revision)
+                git_available = self.path('/usr/bin/git').exists()
+                if not apply:
+                    if git_available:
+                        self.inputs(context, expected, upstream, revision)
+                    return {**result, 'preview': 'prepare-development-host', 'changes': False,
+                            'source_verification': 'complete' if git_available else 'pending signed Git prerequisite'}
+                locked.enter_context(self.lock())
+                preparation = self.preparation()
+                with preparation.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE):
+                    ready = self._prepare_development_host(preparation, context, expected, upstream, revision,
+                                                           sources, password_file, retry)
+            if ready is not None:
+                # No readiness can be consumed after a failed phase or expiry.
+                self.atomic(STATE + '/host-ready.json', image_inputs_bytes(ready).decode())
+        return {**result, 'host_prerequisites': 'complete', 'reused': ready is None}
+
+    def _prepare_development_host(self, preparation, context, expected, upstream, revision, sources,
+                                  password_file, retry):
+        target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
+                  'bootstrap_sources': sources}
+        intent = self.path(DEVELOPMENT_HOST_INTENT)
+        members = {node.name for node in self.state.iterdir()}
+        raw = None
+        record = {'schema': 1, 'target': target, 'phase_prefixes': [], 'native_units': []}
+        desired = preparation._host_desired('core', sources, expected).encode()
+        if intent.name in members:
+            raw = self.protected_bytes(intent, 65536, 0o600).decode()
+            record = json.loads(raw, object_pairs_hook=fedora_oci.unique)
+            if (type(record) is not dict or set(record) != {'schema', 'target', 'phase_prefixes', 'native_units'}
+                    or type(record['schema']) is not int or record['schema'] != 1 or record['target'] != target):
+                raise Blocked('development host target differs from protected prior intent')
+            phases, units = record['phase_prefixes'], record['native_units']
+            if (type(phases) is not list or not 1 <= len(phases) <= 2
+                    or any(type(prefix) is not str or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}', prefix) for prefix in phases)
+                    or len(set(phases)) != len(phases) or type(units) is not list or len(units) > 512
+                    or any(type(unit) is not str or unit.rsplit('-', 1)[0] not in phases
+                           or not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}-[0-9a-f]{8}', unit) for unit in units)
+                    or len(set(units)) != len(units)):
+                raise Blocked('invalid protected development host native ownership record')
+            if members & {'initialize.json', 'prepared', 'gptbox-image.json', 'gptbox-adapter', 'node.json', 'enrollment-intent.json'}:
+                raise Blocked('prior maintenance bootstrap state conflicts with development host intent')
+            if 'desired.json' in members and self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600) != desired:
+                raise Blocked('development host desired state differs from protected prior intent')
+            if 'packages.txt' in members:
+                self.protected_bytes(self.path(STATE + '/packages.txt'), 16384, 0o600)
+            if 'host-ready.json' in members:
+                self.inputs(context, expected, upstream, revision)
+                self.verify_host_readiness(revision, expected)
+                self.verify_builder()
+                return None
+            if not retry:
+                raise Blocked('partial development host preparation requires explicit exact-target --retry')
+        elif members - {'lock'}:
+            raise Blocked('development host preparation requires a fresh bootstrap state')
+
+        # Before the desired record, this operation could only have installed signed Git.
+        if 'desired.json' not in members:
+            if members & {'operator-password-set', 'packages.txt', 'identity-core.json', 'identity-dp-maint.json', 'identity-dp-dev.json'}:
+                raise Blocked('unbound bootstrap state preserved')
+            for name in ('/etc/dev-pair', '/etc/ssh/dev-pair-keys', '/etc/ssh/sshd_config.d/00-dev-pair-operator.conf',
+                         '/etc/sudoers.d/dev-pair-operator', '/etc/systemd/resolved.conf.d/90-dev-pair-discovery.conf',
+                         '/etc/cloud/cloud.cfg.d/99-dev-pair-hostname.cfg', '/etc/sysctl.d/90-dev-pair-mosh.conf',
+                         '/etc/profile.d/90-dev-pair-core-tmux.sh', '/etc/yum.repos.d/dev-pair-tailscale.repo',
+                         '/etc/systemd/system/dev-pair-bootstrap-guard.service',
+                         '/etc/systemd/system/tailscaled.service.d/50-dev-pair-guard.conf',
+                         '/var/lib/dev-pair/maintenance', '/var/lib/dev-pair/development'):
+                path = self.path(name)
+                if path.exists() or path.is_symlink():
+                    raise Blocked('development host preparation refuses unbound managed host paths')
+            for name in ('core', 'dp-maint', 'dp-dev'):
+                home = self.path('/home/' + name)
+                if (home.exists() or home.is_symlink()
+                        or self.run('/usr/bin/getent', 'passwd', name, ok=(0, 2), timeout=10).strip()):
+                    raise Blocked('development host preparation refuses preexisting bootstrap accounts')
+        password = operator_password(password_file) if password_file else None
+        if 'operator-password-set' in members:
+            if self.protected_bytes(self.path(STATE + '/operator-password-set'), 4096, 0o600) != b'password configured; value remains external\n':
+                raise Blocked('existing operator password marker conflicts with development host intent')
+        elif password is None:
+            raise Blocked('first development host preparation requires a protected core password file')
+
+        for unit in record['native_units']:
+            preparation.run.reconcile_native(('--unit=' + unit, '--description=dev-pair-owned-' + unit), {})
+        if len(record['phase_prefixes']) >= 2:
+            raise Blocked('development host preparation retry budget exhausted')
+        source = self.inputs(context, expected, upstream, revision)[0] if self.path('/usr/bin/git').exists() else None
+
+        def save():
+            nonlocal raw
+            data = image_inputs_bytes(record).decode()
+            self.atomic(DEVELOPMENT_HOST_INTENT, data, expected=raw)
+            raw = data
+
+        prefix = preparation.run.native_prefix
+        if not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}', prefix or '') or prefix in record['phase_prefixes']:
+            raise Blocked('development host native phase identity collision')
+        record['phase_prefixes'].append(prefix)
+        save()
+
+        def register(unit):
+            if (not re.fullmatch(re.escape(prefix) + r'-[0-9a-f]{8}', unit)
+                    or unit in record['native_units'] or len(record['native_units']) >= 512):
+                raise Blocked('development host native unit ownership limit or conflict')
+            record['native_units'].append(unit)
+            save()
+
+        def prove_source():
+            return source if source is not None else self.inputs(context, expected, upstream, revision)[0]
+
+        preparation.run.native_register = register
+        try:
+            return preparation._host_prerequisites('core', github_keys, sources, context, expected,
+                                                    password=password, source_check=prove_source, development_host=True)
+        finally:
+            preparation.run.native_register = None
+
     def source(self, revision):
         super().source(revision)
         repo = Path(__file__).resolve().parents[1]
@@ -1063,7 +1240,7 @@ class DevelopmentGptbox(Gptbox):
         except FileNotFoundError:
             raise Blocked(f'required protected development evidence is missing: {path.name}') from None
 
-    def verify_host_readiness(self):
+    def verify_host_readiness(self, revision=None, expected=None):
         desired_raw = self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600)
         desired = json.loads(desired_raw, object_pairs_hook=fedora_oci.unique)
         fields = {'schema', 'standards_sha', 'source_baseline', 'bootstrap_sha256',
@@ -1078,6 +1255,8 @@ class DevelopmentGptbox(Gptbox):
             raise Blocked('existing authorized host desired state is invalid')
         packages = self.protected_bytes(self.path(STATE + '/packages.txt'), 16384, 0o600)
         ready = self.path(STATE + '/host-ready.json')
+        intent = self.path(DEVELOPMENT_HOST_INTENT)
+        development_host = intent.exists() or intent.is_symlink()
         if ready.exists() or ready.is_symlink():
             record = json.loads(self.protected_bytes(ready, 16384, 0o600), object_pairs_hook=fedora_oci.unique)
             pins = {'schema': 1, 'kind': 'host-prerequisites', 'context_sha256': desired['gptbox_context_sha256'],
@@ -1087,6 +1266,10 @@ class DevelopmentGptbox(Gptbox):
                     or type(record.get('source_sha')) is not str or not re.fullmatch('[0-9a-f]{40}', record['source_sha'])
                     or record != {**pins, 'source_sha': record['source_sha']}):
                 raise Blocked('protected host prerequisite record does not match existing host evidence')
+            if development_host and (record['source_sha'], record['context_sha256']) != (revision, expected):
+                raise Blocked('build target differs from the prepared development host')
+        elif development_host:
+            raise Blocked('development host preparation has not published readiness')
         elif self.protected_bytes(self.path(STATE + '/prepared'), 16384, 0o600) != desired_raw:
             raise Blocked('protected prepared marker does not match authorized host desired state')
         if self.run('/usr/bin/rpm', '-q', *PACKAGES, 'tailscale', timeout=15).encode() != packages:
@@ -1136,8 +1319,6 @@ class DevelopmentGptbox(Gptbox):
         with phase(120):
             self.preflight()
             manifest, self.scripts = self.inputs(context, expected, upstream, revision)
-            if apply:
-                self.verify_host_readiness()
         if not apply:
             return {'preview': 'build-development', 'changes': False, 'source_sha': revision,
                     'context_sha256': expected, 'job_admission': False}
@@ -1151,6 +1332,7 @@ class DevelopmentGptbox(Gptbox):
         export_work = artifact_target + '/export-work'
         with self.lock():
             with phase(DEVELOPMENT_EXECUTION):
+                self.verify_host_readiness(revision, expected)
                 builder = self.verify_builder()
                 attempt = self.read_attempt(expected, revision)
                 publication = self.read_publication(attempt)
@@ -1409,7 +1591,7 @@ class DevelopmentGptbox(Gptbox):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('assemble', 'initialize', 'build-development'))
+    parser.add_argument('stage', choices=('assemble', 'initialize', 'prepare-development-host', 'build-development'))
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--retry', action='store_true', help='reconcile and retry one incomplete exact target; at most two attempts')
     parser.add_argument('--context', required=True)
@@ -1419,11 +1601,17 @@ def main():
     parser.add_argument('--bootstrap-source', action='append')
     parser.add_argument('--password-file')
     args = parser.parse_args()
+    if args.stage == 'prepare-development-host' and not args.bootstrap_source:
+        parser.error('prepare-development-host requires --bootstrap-source')
     try:
-        app = DevelopmentGptbox() if args.stage == 'build-development' else Gptbox()
+        app = DevelopmentGptbox() if args.stage in ('prepare-development-host', 'build-development') else Gptbox()
         if args.stage == 'initialize':
             result = app.initialize(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
                                     args.bootstrap_source, args.password_file, args.apply, args.retry)
+        elif args.stage == 'prepare-development-host':
+            result = app.prepare_development_host(args.context, args.expected_context_sha256, args.distrobox_source,
+                                                  args.source_sha, args.bootstrap_source, args.password_file,
+                                                  args.apply, args.retry)
         else:
             result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
         print(json.dumps(result, indent=2))

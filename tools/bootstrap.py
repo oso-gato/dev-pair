@@ -48,6 +48,7 @@ except ModuleNotFoundError:
 STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
+DEVELOPMENT_HOST_INTENT = STATE + '/prepare-development-host.json'
 PACKAGES = ('podman', 'distrobox', 'passt', 'fuse-overlayfs', 'container-selinux',
             'policycoreutils', 'shadow-utils', 'sudo', 'openssh-server', 'nftables', 'git-core', 'util-linux',
             'mosh', 'tmux', 'chrony', 'slirp4netns', 'gnupg2')
@@ -1508,7 +1509,7 @@ class Bootstrap:
         desired = json.loads(self.text(STATE + '/desired.json', '{}'))
         target = json.loads(self.text(STATE + '/initialize.json', '{}')).get('target', {})
         witness['context_sha256'] = desired.get('gptbox_context_sha256')
-        witness['source_sha'] = target.get('source_sha')
+        witness['source_sha'] = getattr(self, 'development_host_source', None) or target.get('source_sha')
         self.resolved_witness = witness
         def save_witness():
             if self.state.is_dir():
@@ -1659,6 +1660,10 @@ class Bootstrap:
             raise Blocked('bootstrap state directory must be private and not a symlink')
         fd = os.open(self.state / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_uid != (0 if self.root == Path('/') else os.getuid())):
+                raise Blocked('bootstrap lock must be a protected regular file')
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -1900,12 +1905,29 @@ class Bootstrap:
     def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None):
         return self._converge_host(name,key,sources,gptbox_context,expected_context,password=password,source_check=source_check)
 
-    def _host_prerequisites(self, name, key, sources, context, expected, *, password=None, source_check=None):
-        # Caller holds the existing global bootstrap lock through image/assembly.
-        return self._converge_host(name,key,sources,context,expected,password=password,source_check=source_check,host_only=True,locked=True)
+    def _host_prerequisites(self, name, key, sources, context, expected, *, password=None, source_check=None,
+                            development_host=False):
+        # The caller holds the global bootstrap lock through readiness publication.
+        return self._converge_host(name,key,sources,context,expected,password=password,source_check=source_check,
+                                   host_only=True,locked=True,development_host=development_host)
 
-    def _converge_host(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None,host_only=False,locked=False):
+    def _host_desired(self, name, sources, expected_context):
+        return json.dumps({'schema': 1, 'standards_sha': STANDARDS, 'source_baseline': SOURCE_BASELINE,
+                           'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                           'gptbox_context_sha256': expected_context, 'operator': name,
+                           'keys_source': KEYS_URL, 'bootstrap_sources': sources}, sort_keys=True) + '\n'
+
+    def _reject_development_host_intent(self):
+        path = self.path(DEVELOPMENT_HOST_INTENT)
+        if path.exists() or path.is_symlink():
+            raise Blocked('bootstrap state belongs to the development host preparation')
+
+    def _converge_host(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None,
+                       source_check=None,host_only=False,locked=False,development_host=False):
         self.mark_prepare_step('input-admission')
+        if development_host and (not host_only or not locked or gptbox_context is None
+                                 or not callable(source_check) or not callable(key)):
+            raise Blocked('development host prerequisites require locked exact-source admission')
         if gptbox_context is not None and (not isinstance(expected_context, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_context)):
             raise Blocked('a separately trusted context SHA256 is required before preparation')
         sources = validate_sources(sources)
@@ -1923,11 +1945,16 @@ class Bootstrap:
         self.preflight()
         if gptbox_context is not None:
             self.mark_prepare_step('context-content')
-            self.check_gptbox_inputs(gptbox_context, expected_context)
-            if self.path('/usr/bin/git').exists():
+            if development_host:
+                self.check_gptbox_inputs(gptbox_context, expected_context, expected_role='development')
+            else:
+                self.check_gptbox_inputs(gptbox_context, expected_context)
+            if not development_host and self.path('/usr/bin/git').exists():
                 self.mark_prepare_step('context-source')
                 _,_,host_manifest=self.validate_gptbox_context(gptbox_context, expected_context)
         with contextlib.nullcontext() if locked else self.lock():
+            if not development_host:
+                self._reject_development_host_intent()
             if gptbox_context is not None:
                 if not self.path('/usr/bin/git').exists():
                     self.step('git-prerequisite', lambda: self.run('/usr/bin/dnf', '-y',
@@ -1935,16 +1962,18 @@ class Bootstrap:
                               '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'))
                 self.mark_prepare_step('context-source')
                 # Full source verification precedes desired binding, accounts, ingress and normal packages.
-                _,_,host_manifest=self.validate_gptbox_context(gptbox_context, expected_context)
-                if source_check:
+                if development_host:
                     self.mark_prepare_step('adapter-source-and-upstream')
-                    source_check()
+                    host_manifest = source_check()
+                    self.development_host_source = host_manifest['source_sha']
+                    key = key()
+                else:
+                    _,_,host_manifest=self.validate_gptbox_context(gptbox_context, expected_context)
+                    if source_check:
+                        self.mark_prepare_step('adapter-source-and-upstream')
+                        source_check()
             self.mark_prepare_step('desired-state')
-            desired = json.dumps({'schema': 1, 'standards_sha': STANDARDS,
-                                  'source_baseline': SOURCE_BASELINE,
-                                  'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                                  'gptbox_context_sha256': expected_context, 'operator': name,
-                                  'keys_source': KEYS_URL, 'bootstrap_sources': sources}, sort_keys=True) + '\n'
+            desired = self._host_desired(name, sources, expected_context)
             self.atomic(f'{STATE}/desired.json', desired)
             self.step('resolved-discovery', self.configure_resolved)
             self.step('packages', lambda: self.run('/usr/bin/dnf', '-y', '--setopt=gpgcheck=1',
@@ -1987,6 +2016,9 @@ class Bootstrap:
                 ready={'schema':1,'kind':'host-prerequisites','source_sha':host_manifest['source_sha'],
                     'context_sha256':expected_context,'standards_sha':STANDARDS,'bootstrap_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                     'desired_sha256':hashlib.sha256(desired.encode()).hexdigest(),'packages_sha256':hashlib.sha256(versions.encode()).hexdigest()}
+                if development_host:
+                    # The development caller publishes only after the native phase exits.
+                    return ready
                 old_ready=self.text(STATE+'/host-ready.json')
                 if old_ready:
                     previous=json.loads(old_ready,object_pairs_hook=relay.unique)
