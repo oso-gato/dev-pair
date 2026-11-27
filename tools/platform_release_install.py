@@ -4,6 +4,7 @@
 import argparse
 import gzip
 import copy
+import errno
 import os
 from pathlib import Path
 import pwd
@@ -170,16 +171,22 @@ def approved_placement(identity, base, site, config, phase, end):
     return {'outer': outer, 'jobs': jobs}
 
 
-def bounded_volume(graph, reserve=0, *, need_import=True):
+def volume_identity(graph, *, for_recovery=False):
     require(hasattr(devbox, 'managed_storage'), 'G managed ext4 capacity observer is unavailable in installed source')
     with open('/proc/self/mountinfo', 'rb') as stream:
         raw = stream.read(1024**2 + 1)
     require(0 < len(raw) <= 1024**2, 'native mount inventory exceeds its bound')
-    state = devbox.managed_storage(raw.decode())
+    state = devbox.managed_storage(raw.decode(), for_recovery=for_recovery)
     node = graph.lstat()
     device = f'{os.major(node.st_dev)}:{os.minor(node.st_dev)}'
-    require(graph.resolve(strict=True) == graph and stat.S_ISDIR(node.st_mode) and device == state['device'] and
-            state['available_inodes'] >= 512 and state['available_bytes'] >= reserve + HOST_RELEASE_HEADROOM,
+    require(graph.resolve(strict=True) == graph and stat.S_ISDIR(node.st_mode) and device == state['device'],
+            'maintenance image store differs from the measured managed filesystem')
+    return state
+
+
+def bounded_volume(graph, reserve=0, *, need_import=True):
+    state = volume_identity(graph)
+    require(state['available_inodes'] >= 512 and state['available_bytes'] >= reserve + HOST_RELEASE_HEADROOM,
             'bounded maintenance image store lacks its import overlap or inode headroom' if need_import else
             'bounded maintenance image store lacks its physical recovery reserve')
     return state
@@ -314,7 +321,7 @@ class ImportLease:
                 props['ControlGroup'] in ('', f'/system.slice/{name}'), 'maintenance import unit ownership differs')
         return props
 
-    def retire(self, end, *, completed=False, image_missing=False):
+    def retire(self, end, *, completed=False, image_missing=False, recovering=False):
         unit = self.record['unit']
         name = unit['name']
         props = self.properties(end)
@@ -338,12 +345,28 @@ class ImportLease:
                           min(end, time.monotonic() + 10))
         require(not jobs.strip(), 'maintenance owned unit still has a queued manager operation')
         if not unit['quiesced']:
-            self.update(unit={**unit, 'quiesced': True})
+            try:
+                self.update(unit={**unit, 'quiesced': True})
+            except OSError as exc:
+                # The live stop proof can authorize exact cleanup even when a
+                # replacement lease cannot be allocated on this filesystem.
+                if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+                    raise
         empty_cgroup(name)
-        self.update(unit=None)
+        if recovering:
+            self.finish(retired_unit=name)
+            return
+        try:
+            self.update(unit=None)
+        except OSError as exc:
+            if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+                raise
+            self.finish(retired_unit=name)
+            raise Blocked('maintenance volume exhausted after native work; exact owned spool reclaimed for retry') from exc
 
-    def finish(self):
-        require(self.read() == self.record and self.record['unit'] is None,
+    def finish(self, *, retired_unit=None):
+        unit = self.record['unit']
+        require(self.read() == self.record and (unit['name'] if unit else None) == retired_unit,
                 'maintenance import lease or native cleanup is unresolved')
         if os.path.lexists(self.spool):
             node = self.spool.lstat()
@@ -374,9 +397,16 @@ class ImportLease:
     def recover(self, end):
         if os.path.lexists(self.path):
             self.record = self.read()
-            if self.record['unit'] is not None:
-                self.retire(end)
-            self.finish()
+            if self.record['unit'] is None:
+                self.finish()
+            else:
+                self.retire(end, recovering=True)
+
+
+def recover_maintenance(account, end):
+    if os.path.lexists(ROOT / LEASE_NAME):
+        identity = volume_identity(MAINTENANCE, for_recovery=True)
+        ImportLease(account, identity).recover(end)
 
 
 class Maintenance:
@@ -530,9 +560,9 @@ def maintenance_import_record(stage, index, runtime, boot):
 
 def observe_maintenance_engine(stage, index, account, runtime, end, *, allow_load):
     row = index['components']['maintenance-agent']
+    recover_maintenance(account, end)
     capacity = bounded_volume(MAINTENANCE, 1024**2)
     lease = ImportLease(account, capacity)
-    lease.recover(end)
     image, manifest = (row[name] for name in ('oci_config_sha256', 'oci_manifest_sha256'))
     try:
         lease.prepare(stage, image)
@@ -821,9 +851,9 @@ def reobserve_maintenance(identity, site_sha, end):
             type(prior['schema']) is int and type(prior_boot) is str and re.fullmatch(BOOT_PATTERN, prior_boot) and
             prior == maintenance_import_record(stage, index, runtime, prior_boot),
             'retained native import does not identify the selected immutable image or store')
+    recover_maintenance(account, end)
     volume = bounded_volume(MAINTENANCE, need_import=False)
     stage_budget(stage, volume)
-    ImportLease(account, volume).recover(end)
     maintenance_probe(stage, index, 'preflight', end)
     observe_maintenance_engine(stage, index, account, runtime, end, allow_load=False)
     require(current_boot() == boot and approved_maintenance_selection(stage, index, base, intake_sha, site_sha, site) == reference,
@@ -846,9 +876,9 @@ def install(identity, site_sha, end):
         base_stage, base_index = stage, index
     exact_local_programs(base_stage, end)
     account, runtime = maintenance_identity()
+    recover_maintenance(account, end)
     volume = bounded_volume(MAINTENANCE, need_import=False)
     stage_budget(stage, volume)
-    ImportLease(account, volume).recover(end)
     if agent:
         stage_budget(base_stage, volume)
         # Agent update may only keep the actual installed host bundle.

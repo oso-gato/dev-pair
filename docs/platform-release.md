@@ -128,7 +128,9 @@ directory and exact transient systemd unit in a protected lease before native
 execution. Before another staging attempt, the installer reconciles that lease
 and removes its copy only after the owned unit has stopped and its cgroup is
 empty. Uncertain launch or cleanup retains the lease and the copy. The retry
-first observes whether the exact image already exists in the role store.
+can reclaim its owned copy even when the measured volume is below the fresh
+import reserve. New work starts only after the full reserve is measured again.
+The retry first observes whether the exact image already exists in the role store.
 
 G preflights and stages each job through its bounded role store. A
 root-protected `development-placement.json` selects the exact site, inner

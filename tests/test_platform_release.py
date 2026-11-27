@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -260,6 +261,34 @@ class PlatformReleaseTests(unittest.TestCase):
         protocol.portable_index(agent, self.source, 5678)
         self.assertEqual(set(agent['components']), {'maintenance-agent', 'development-agent'})
         self.assertEqual(agent['base_platform_sha256'], platform_sha)
+
+        staged = self.root / 'staged'
+        staged.mkdir()
+        ordinary_json = publisher.readonly_json
+        with (mock.patch.object(intake, 'ROOT', staged),
+              mock.patch.object(intake, 'protected', side_effect=lambda path, **_: path),
+              mock.patch.object(intake, 'file_hash', side_effect=lambda path, maximum, end, **_:
+                                protocol.file_hash(path, maximum, end, owner=os.getuid())),
+              mock.patch.object(publisher, 'readonly_json', side_effect=lambda path, _owner=None: ordinary_json(path)),
+              mock.patch.object(fedora_oci, 'DIFF', base)):
+            for identity, raw, value in ((platform_sha, platform_raw, platform), (agent_sha, agent_raw, agent)):
+                destination = staged / identity
+                destination.mkdir()
+                (destination / 'platform.json').write_bytes(raw)
+                receipt = {'schema': 2, 'platform_sha256': identity, 'source_sha': self.source,
+                           'publisher_run': value['publisher_run'], 'kind': value['kind']}
+                receipt_path = destination / 'intake.json'
+                receipt_path.write_bytes(protocol.canonical(receipt))
+                receipt_path.chmod(0o600)
+                for role, transfer in value['transports'].items():
+                    shutil.copytree(parts / transfer['name'], destination / role)
+                self.assertEqual(intake.previous_release(identity, self.end), value)
+                self.assertEqual(intake.retained_index(identity), (destination, value, publisher.digest(receipt_path.read_bytes())))
+                receipt_path.write_bytes(protocol.canonical(receipt) + b'\n')
+                with self.assertRaisesRegex(protocol.Blocked, 'exact prior trust receipt'):
+                    intake.retained_index(identity)
+                receipt_path.write_bytes(protocol.canonical(receipt))
+
         agent['components']['development-agent']['codex_sha256'] = '0' * 64
         with self.assertRaisesRegex(protocol.Blocked, 'different verified tooling'):
             protocol.portable_index(agent, self.source, 5678)

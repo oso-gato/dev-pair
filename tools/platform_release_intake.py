@@ -21,7 +21,7 @@ import platform_release as release
 from storage import GUEST_RESERVE
 from platform_release_protocol import (
     ARCHIVE_LIMIT, CONTROL_LIMIT, ROLES, COMPONENT,
-    Blocked, file_hash, hex_id, json_bytes, require, seconds, stream_exact, portable_index, portable_roles,
+    Blocked, canonical, file_hash, hex_id, json_bytes, require, seconds, stream_exact, portable_index, portable_roles,
 )
 
 GITHUB = '/usr/bin/gh'

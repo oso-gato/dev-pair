@@ -1,5 +1,6 @@
 import os
 from contextlib import ExitStack, contextmanager
+import errno
 from pathlib import Path
 import subprocess
 import sys
@@ -264,6 +265,7 @@ class NativeImportRecoveryTests(InstallerTestCase):
             stack.enter_context(mock.patch.object(install, 'protected_json', side_effect=self.protected_json))
             stack.enter_context(mock.patch.object(install, 'regular', side_effect=lambda path, limit, _owner: protocol.regular(path, limit)))
             stack.enter_context(mock.patch.object(install, 'current_boot', side_effect=lambda: self.booted))
+            stack.enter_context(mock.patch.object(install, 'volume_identity', return_value=self.capacity))
             stack.enter_context(mock.patch.object(install, 'bounded_volume', return_value=self.capacity))
             stack.enter_context(mock.patch.object(install, 'rootless_import_peak', return_value=1024))
             stack.enter_context(mock.patch.object(install, 'bounded', side_effect=self.command))
@@ -443,6 +445,44 @@ class NativeImportRecoveryTests(InstallerTestCase):
             self.observe()
             self.assertEqual(self.launches, ['info', 'exists', 'load', 'info', 'exists', 'inspect'])
             self.assert_clean()
+
+    def test_exhausted_retry_reclaims_only_owned_spool_before_fresh_capacity_check(self):
+        def interrupted(unit, description):
+            self.has_image = True
+            self.failed_unit(unit, description, active=True)
+            raise subprocess.TimeoutExpired('fixture launch', 1)
+
+        with self.native():
+            self.load_error = interrupted
+            with self.assertRaises(subprocess.TimeoutExpired):
+                self.observe()
+            path = self.managed / install.LEASE_NAME
+            record = protocol.json_bytes(path.read_bytes())
+            spool = self.managed / (install.SPOOL_PREFIX + record['nonce'])
+            unrelated = self.managed / 'unrelated'
+            unrelated.write_bytes(b'preserve')
+            volume_readback = []
+
+            def exhausted(graph, *, for_recovery=False):
+                volume_readback.append((for_recovery, spool.exists()))
+                return {**self.capacity, 'available_inodes': 0 if spool.exists() else 3,
+                        'available_bytes': 0 if spool.exists() else 3 * 4096}
+
+            with (mock.patch.object(install, 'volume_identity', side_effect=exhausted),
+                  mock.patch.object(install, 'bounded_volume', wraps=self.real_bounded_volume),
+                  mock.patch.object(install, 'replace_observation', side_effect=OSError(errno.ENOSPC, 'fixture full'))):
+                with self.assertRaisesRegex(protocol.Blocked, 'inode headroom'):
+                    self.observe()
+            self.assertEqual(volume_readback, [(True, True), (False, False)])
+            self.assertEqual(self.stops[-1], record['unit']['name'])
+            self.assertEqual(self.launches, ['info', 'exists', 'load'])
+            self.assertEqual(unrelated.read_bytes(), b'preserve')
+            self.assert_clean()
+            self.observe()
+            self.assertEqual(self.launches, ['info', 'exists', 'load', 'info', 'exists', 'inspect'])
+            self.assert_clean()
+
+    real_bounded_volume = staticmethod(install.bounded_volume)
 
     def test_reobserve_uses_approved_history_and_real_receipt_reader_without_loading_or_redeploying(self):
         with self.native(), ExitStack() as stack:
