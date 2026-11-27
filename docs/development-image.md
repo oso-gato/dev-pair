@@ -44,12 +44,15 @@ sudo python3 -B "$PROTECTED_STAGING/dev-pair/tools/gptbox.py" prepare-developmen
 The command runs the existing host prerequisites under the 600-second native
 preparation budget. When Git is absent it installs only the signed Fedora
 `git-core` prerequisite before verifying the exact source and upstream scripts.
-It publishes `/var/lib/dev-pair/bootstrap/host-ready.json` after successful
-convergence. Image assembly is a separate command. An interrupted preparation requires
-`--retry` with the same inputs and CIDRs. A retry reconciles recorded owned
-native units before host effects, with at most two preparation attempts. Use a
-fresh guest for a different target. The no-`--apply` preview checks the protected
-inputs and reports whether the Git-dependent checks are complete.
+An existing unowned bootstrap firewall table blocks a fresh attempt before
+package changes. After successful convergence, the command publishes
+`/var/lib/dev-pair/bootstrap/host-ready.json`, which binds the development
+target to the exact protected preparation intent. Image assembly requires both
+records. An interrupted preparation requires `--retry` with the same inputs
+and CIDRs. A retry reconciles recorded owned native units before host effects,
+with at most two preparation attempts. Use a fresh guest for a different
+target. The no-`--apply` preview checks the protected inputs and reports whether
+the Git-dependent checks are complete.
 
 ## Assemble and export
 
