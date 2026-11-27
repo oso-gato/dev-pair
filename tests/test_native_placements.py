@@ -225,10 +225,18 @@ class TestKernelOwnership(unittest.TestCase):
             stats[host].f_files = stats[host].f_favail = 0
             with self.assertRaisesRegex(db.Blocked, 'finite inode'):
                 n.devbox.storage_mount(build, 8 * db.GIB, info)
+            stats[enclosing].f_favail = stats[enclosing].f_bavail = stats[host].f_bavail = 0
+            recovery = n.devbox.managed_storage(info, for_recovery=True)
+            self.assertEqual((recovery['backing_inode'], recovery['available_inodes'], recovery['available_bytes']), (19, 0, 0))
+            with self.assertRaisesRegex(db.Blocked, 'inode ceiling'):
+                n.devbox.managed_storage(info)
+            stats[enclosing].f_favail = 10000
             stats[host].f_files, stats[host].f_favail = 100000, 4096
             framed[parent_backing].st_blocks -= 1
             with self.assertRaisesRegex(db.Blocked, 'sparse'):
                 n.devbox.storage_mount(build, 8 * db.GIB, info)
+            with self.assertRaisesRegex(db.Blocked, 'sparse'):
+                n.devbox.managed_storage(info, for_recovery=True)
 
     def test_inode_is_rebound_to_verified_new_minor_and_exchanged_leaf_is_rejected(self):
         scratch = Path(self.enterContext(TemporaryDirectory()))

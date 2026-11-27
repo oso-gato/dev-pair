@@ -50,8 +50,8 @@ def private_dir(path, account):
     return info
 
 
-def managed_storage(mountinfo):
-    """Independently prove the dedicated enclosing ext4 and reserve outside it."""
+def managed_storage(mountinfo, *, for_recovery=False):
+    """Prove the enclosing ext4 and require fresh-write reserves by default."""
     root = ROOT.parent
     entries = [line.split() for line in mountinfo.splitlines()]
     rows = [row for row in entries if row[4] == str(root)]
@@ -85,11 +85,13 @@ def managed_storage(mountinfo):
     guest = os.statvfs(root)
     host = os.statvfs(MANAGED_BACKING.parent)
     db.require(0 < guest.f_blocks * guest.f_frsize <= backing.st_size
-               and 0 < guest.f_files <= MANAGED_INODE_LIMIT and guest.f_favail > 0,
+               and 0 < guest.f_files <= MANAGED_INODE_LIMIT and 0 <= guest.f_favail <= guest.f_files,
                'managed ext4 byte or inode ceiling is unavailable')
-    db.require(host.f_bavail * host.f_frsize >= 8 * db.GIB
-               and host.f_files >= host.f_favail >= HOST_INODE_RESERVE,
-               'physical host byte and finite inode reserve required')
+    if not for_recovery:
+        db.require(guest.f_favail > 0, 'managed ext4 byte or inode ceiling is unavailable')
+        db.require(host.f_bavail * host.f_frsize >= 8 * db.GIB
+                   and host.f_files >= host.f_favail >= HOST_INODE_RESERVE,
+                   'physical host byte and finite inode reserve required')
     return {'device': row[2], 'source': source, 'bytes': guest.f_blocks * guest.f_frsize,
             'backing_bytes': backing.st_size, 'backing_inode': backing.st_ino,
             'available_bytes': guest.f_bavail * guest.f_frsize, 'inodes': guest.f_files,
