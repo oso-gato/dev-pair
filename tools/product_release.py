@@ -12,6 +12,7 @@ import stat
 import subprocess
 import time
 
+from bootstrap import Blocked, Commands
 import checklist_candidate as candidate
 import checklist_proposal as proposal
 from checklist_review_gate import main_protection, policy_identity
@@ -26,7 +27,9 @@ REGISTRY = 'ghcr.io/oso-gato/dev-pair/checklist'
 PUBLISHER = '.github/workflows/checklist-release.yml'
 MERGE_WORKFLOW = '.github/workflows/checklist-product-merge.yml'
 SCOPE = 'checklist-persistence'
-TERMINAL = {'confirmed', 'local-only', 'external-adapter-needed', 'no-changed-candidate', 'validation-blocked'}
+TERMINAL = product.PROMOTION_TERMINAL
+RETRYABLE = {'proposal-transport', 'github-observation', 'destination-observation'}
+RETRY_DELAYS = (180, 360, 720)
 
 
 class Wait(OSError):
@@ -173,12 +176,10 @@ def stage(job, request, bundle):
 
 class Live:
     def __init__(self, policy, job, binding, end):
-        from bootstrap import Commands
-        from destination_release import Destination, Blocked
+        from destination_release import Destination
         from release_trust import ReleaseTrust
 
         self.policy, self.job, self.binding, self.end = policy, job, binding, end
-        self.blocked = Blocked
         self.registry_auth = SITE / 'registry/config.json'
         if os.path.lexists(self.registry_auth):
             candidate.protected_file(self.registry_auth, 4096)
@@ -237,7 +238,16 @@ class Live:
             stage(self.job, request, bundle)
             args = candidate.as_role(proposal.DEVELOPER, product.PYTHON, '-EBs',
                                      product.KIT / 'tools/checklist_proposal.py', self.job)
-            proposal.capture(args, self.end, timeout=112)
+            try:
+                proposal.capture(args, self.end, timeout=112)
+            except proposal.CommandFailed as exc:
+                if exc.exit_status == os.EX_NOPERM:
+                    raise proposal.AuthorityDenied('the protected developer grant was denied') from exc
+                if exc.exit_status == os.EX_UNAVAILABLE:
+                    raise proposal.ObservationUnavailable('the protected developer read was unavailable') from exc
+                if exc.exit_status == 2:
+                    raise ValueError('the protected developer policy was rejected') from exc
+                raise
 
     def protection(self, request):
         trust = self.trust
@@ -348,6 +358,8 @@ def advance(state, binding, bundle, result, site, backend, save):
         transition('proposing', proposal=request)
         try:
             backend.propose(request, bundle)
+        except proposal.ObservationUnavailable:
+            raise
         except proposal.Unavailable as exc:
             # A timeout may follow either external write. Only exact readback authorizes another advance.
             pull = backend.find(request)
@@ -375,13 +387,18 @@ def advance(state, binding, bundle, result, site, backend, save):
         p.require(pull['merge_commit_sha'] == release['source_sha'] == state['merged_source'] and
                   pull['merged_by']['id'] == site['merge_actor_id'], 'previously attested publication changed')
     activation = backend.activation()
-    if not matches(activation['active'], release, binding) or activation['route_pending']:
+    active = activation['active']
+    if not matches(active, release, binding) or activation['route_pending']:
         pending = activation['pending']
         p.require(pending is None or pending['operation'] == 'deploy' and matches(pending['release'], release, binding),
                   'another deployment requires independent resolution')
-        p.require(not activation['active'] or matches(activation['active'], release, binding) or
-                  activation['confirmed'] == activation['active']['artifact_sha256'],
-                  'an earlier deployment requires independent confirmation')
+        if active and active.get('quarantined'):
+            p.require(active['artifact_sha256'] != release['artifact_sha256'],
+                      'correction requires an independently verified different digest')
+        else:
+            p.require(not active or matches(active, release, binding) or
+                      activation['confirmed'] == active['artifact_sha256'],
+                      'an earlier deployment requires independent confirmation')
         transition('deploying')
         backend.deploy(release)
         activation = backend.activation()
@@ -408,7 +425,27 @@ def record(root):
     return p.loads(read_private(path, p.MAX_MESSAGE)) if os.path.lexists(path) else None
 
 
-def run(job):
+def hold(state, reason, *, manual=False):
+    state['reason'] = reason
+    if reason in RETRYABLE:
+        previous = state.get('observation_retry', {})
+        failures = previous.get('failures', 0) + 1
+        if failures <= len(RETRY_DELAYS):
+            state['observation_retry'] = {'reason': reason, 'failures': failures,
+                                          'after_unix': int(time.time()) + RETRY_DELAYS[failures - 1]}
+            return
+        manual = True
+    state.pop('observation_retry', None)
+    if manual:
+        state['resume_required'] = True
+
+
+def automatic_due(state):
+    return not state or (not state.get('resume_required') and
+                         state.get('observation_retry', {}).get('after_unix', 0) <= int(time.time()))
+
+
+def run(job, *, resume_held=False):
     root = trusted_directory(product.job_path(job))
     value = product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
     p.require(value['job_id'] == job, 'protected release job changed')
@@ -419,6 +456,10 @@ def run(job):
                                  'phase': 'awaiting-validated-candidate', 'reason': None}
         p.require(saved['job_id'] == job and saved['plan_sha256'] == p.identity(value), 'durable promotion plan changed')
         if saved['phase'] in TERMINAL:
+            return saved
+        if resume_held and saved.pop('resume_required', False):
+            saved.pop('observation_retry', None)
+        if not automatic_due(saved):
             return saved
 
         def write(state):
@@ -451,22 +492,28 @@ def run(job):
                     if not 0 < authority_left <= 31 * 86400:
                         raise Wait('scoped-release-grant-expired')
                     backend = Live(site, job, binding, time.monotonic() + min(authority_left, 210))
-                    try:
-                        advance(saved, binding, bundle, result, site, backend, write)
-                    except backend.blocked as exc:
-                        if str(exc) == 'checklist release is frozen by renewal':
-                            raise Wait('destination-fenced') from exc
-                        raise ValueError('protected release or destination proof was rejected') from exc
+                    advance(saved, binding, bundle, result, site, backend, write)
+                    saved.pop('observation_retry', None)
                 except Wait as exc:
-                    saved['reason'] = exc.reason
+                    hold(saved, exc.reason)
+                except proposal.AuthorityDenied:
+                    hold(saved, 'github-authority-denied', manual=True)
+                except proposal.ObservationUnavailable:
+                    hold(saved, 'github-observation')
+                except Blocked as exc:
+                    if str(exc) == 'checklist release is frozen by renewal':
+                        hold(saved, 'destination-fenced')
+                    else:
+                        hold(saved, 'protected-release-policy-rejected', manual=True)
                 except proposal.Unavailable:
-                    saved['reason'] = 'github-observation' if saved['phase'] not in ('deploying', 'confirming-destination') else 'destination-observation'
+                    hold(saved, 'destination-observation' if saved['phase'] in ('deploying', 'confirming-destination')
+                         else 'github-observation')
                 except FileNotFoundError:
-                    saved['reason'] = 'protected-custody-or-evidence-missing'
+                    hold(saved, 'protected-custody-or-evidence-missing')
                 except (ConnectionError, TimeoutError, ssl.SSLEOFError):
-                    saved['reason'] = 'destination-observation'
+                    hold(saved, 'destination-observation')
                 except (OSError, ValueError, KeyError, TypeError, IndexError, ImportError, subprocess.SubprocessError):
-                    saved['reason'] = 'protected-scope-or-evidence-rejected'
+                    hold(saved, 'protected-scope-or-evidence-rejected', manual=True)
         write(saved)
         return saved
 
@@ -480,7 +527,7 @@ def scan():
             continue
         root = trusted_directory(product.job_path(path.name))
         prior = record(root)
-        if ((prior is None or prior['phase'] not in TERMINAL) and (root / 'state.json').is_file() and
+        if ((prior is None or prior['phase'] not in TERMINAL) and automatic_due(prior) and (root / 'state.json').is_file() and
                 product.read_state(root)['phase'] in product.TERMINAL):
             candidate.invoke([product.SYSTEMCTL, 'start', '--no-block', 'dev-pair-promotion@' + path.name + '.service'],
                              time.monotonic() + 8)
@@ -489,8 +536,10 @@ def scan():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    for command in ('advance', 'status'):
-        commands.add_parser(command).add_argument('job')
+    advance_command = commands.add_parser('advance')
+    advance_command.add_argument('job')
+    advance_command.add_argument('--resume-held', action='store_true')
+    commands.add_parser('status').add_argument('job')
     commands.add_parser('scan')
     args = parser.parse_args()
     os.umask(0o077)
@@ -499,7 +548,8 @@ def main():
         if args.command == 'scan':
             scan()
         else:
-            row = run(args.job) if args.command == 'advance' else record(trusted_directory(product.job_path(args.job)))
+            row = (run(args.job, resume_held=args.resume_held) if args.command == 'advance' else
+                   record(trusted_directory(product.job_path(args.job))))
             print(p.canonical(row))
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         parser.exit(2, 'Protected checklist promotion unavailable (' + type(exc).__name__ + ').\n')

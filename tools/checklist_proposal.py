@@ -35,13 +35,38 @@ OUTPUT_LIMIT = 1024 * 1024
 CHECKLIST_FILES = frozenset('examples/checklist/' + name for name in ('checklist.py', 'test_checklist.py', 'README.md'))
 FETCH = ['fetch', '--quiet', '--no-tags', '--no-auto-maintenance', '--no-recurse-submodules']
 MARKER = 'dev-pair-checklist-product-v1\n'
+DIAGNOSTIC_LIMIT = 16384
 
 
 class Unavailable(OSError):
     """A bounded external command can be retried after exact status is observed."""
 
 
-def capture(args, end, *, env=None, data=None, ceiling=OUTPUT_LIMIT, timeout=30):
+class CommandFailed(Unavailable):
+    def __init__(self, exit_status):
+        super().__init__('protected release command failed')
+        self.exit_status = exit_status
+
+
+class ObservationUnavailable(Unavailable):
+    """An external read could not establish the current state."""
+
+
+class AuthorityDenied(ValueError):
+    """The external service denied the approved operation."""
+
+
+def denied_http(diagnostic):
+    for line in diagnostic.splitlines():
+        match = re.fullmatch(rb'gh: (.*) \(HTTP (401|403)\)', line)
+        if match and not any(token in match[1].lower() for token in (b'rate limit', b'abuse detection')):
+            return True
+        if re.fullmatch(rb"fatal: unable to access '[^']+': The requested URL returned error: (401|403)", line):
+            return True
+    return False
+
+
+def capture(args, end, *, env=None, data=None, ceiling=OUTPUT_LIMIT, timeout=30, classify_http=False):
     end = min(end, time.monotonic() + timeout)
     p.require(time.monotonic() < end, 'protected release operation deadline expired')
     p.require(data is None or len(data) <= p.MAX_MESSAGE, 'bounded release command input required')
@@ -52,18 +77,25 @@ def capture(args, end, *, env=None, data=None, ceiling=OUTPUT_LIMIT, timeout=30)
             incoming.write(data)
             incoming.seek(0)
         with subprocess.Popen(tuple(map(str, args)), env=clean, stdin=incoming, stdout=subprocess.PIPE,
-                              stderr=subprocess.DEVNULL, start_new_session=True) as proc:
-            output = bytearray()
+                              stderr=subprocess.PIPE if classify_http else subprocess.DEVNULL,
+                              start_new_session=True) as proc:
+            output, diagnostic = bytearray(), bytearray()
             try:
-                selector.register(proc.stdout, selectors.EVENT_READ)
-                while selector.select(max(0, end - time.monotonic())):
-                    chunk = os.read(proc.stdout.fileno(), min(8192, ceiling + 1 - len(output)))
-                    if not chunk:
-                        break
-                    output.extend(chunk)
-                    p.require(len(output) <= ceiling, 'protected release command output exceeded its bound')
-                else:
-                    raise Unavailable('protected release transport timed out')
+                selector.register(proc.stdout, selectors.EVENT_READ, (output, ceiling))
+                if proc.stderr is not None:
+                    selector.register(proc.stderr, selectors.EVENT_READ, (diagnostic, DIAGNOSTIC_LIMIT))
+                while selector.get_map():
+                    ready = selector.select(max(0, end - time.monotonic()))
+                    if not ready:
+                        raise Unavailable('protected release transport timed out')
+                    for stream, _ in ready:
+                        buffer, limit = stream.data
+                        chunk = os.read(stream.fd, min(8192, limit + 1 - len(buffer)))
+                        if not chunk:
+                            selector.unregister(stream.fileobj)
+                            continue
+                        buffer.extend(chunk)
+                        p.require(len(buffer) <= limit, 'protected release command output exceeded its bound')
                 code = proc.wait(timeout=max(0, end - time.monotonic()))
             except BaseException as exc:
                 terminate(proc)
@@ -71,7 +103,9 @@ def capture(args, end, *, env=None, data=None, ceiling=OUTPUT_LIMIT, timeout=30)
                     raise Unavailable('protected release transport timed out') from exc
                 raise
         if code != 0:
-            raise Unavailable('protected release transport did not complete')
+            if classify_http and denied_http(diagnostic):
+                raise AuthorityDenied('GitHub credential or policy denied the operation')
+            raise CommandFailed(code)
         return bytes(output)
 
 
@@ -116,10 +150,14 @@ class Hub:
         env = {'GH_TOKEN': self.secret}
         if self.registry_auth is not None and args[1] == 'attestation':
             env.update(DOCKER_CONFIG=str(self.registry_auth.parent), REGISTRY_AUTH_FILE=str(self.registry_auth))
-        return capture(args, self.end, timeout=timeout, env=env)
+        try:
+            return capture(args, self.end, timeout=timeout, env=env, classify_http=api_read)
+        except Unavailable as exc:
+            raise ObservationUnavailable('GitHub observation is unavailable') from exc
 
     def get(self, endpoint):
-        p.require(endpoint == 'user' or re.fullmatch(r'repos/[A-Za-z0-9_./?=&:%+\-]+', endpoint),
+        p.require(re.fullmatch(r'user(?:/[1-9][0-9]*)?|repos/[A-Za-z0-9_./?=&:%+\-]+|'
+                               r'search/issues\?[A-Za-z0-9_./?=&:%+\-]+', endpoint),
                   'unsupported scoped GitHub read')
         return json_data(self.gh(GH, 'api', '--hostname', 'github.com', '-X', 'GET', endpoint))
 
@@ -127,9 +165,13 @@ class Hub:
         data = {'title': 'Checklist product job ' + request['job_id'], 'body': pull_body(request),
                 'head': request['fork'].split('/')[0] + ':' + request['branch'], 'base': 'main',
                 'draft': False, 'maintainer_can_modify': False}
-        return json_data(capture([GH, 'api', '--hostname', 'github.com', '-X', 'POST',
-                                  'repos/' + REPOSITORY + '/pulls', '--input', '-'], self.end,
-                                  env={'GH_TOKEN': self.secret}, data=p.canonical(data).encode()))
+        raw = capture([GH, 'api', '--hostname', 'github.com', '-X', 'POST',
+                       'repos/' + REPOSITORY + '/pulls', '--input', '-'], self.end,
+                      env={'GH_TOKEN': self.secret}, data=p.canonical(data).encode(), classify_http=True)
+        try:
+            return json_data(raw)
+        except (ValueError, RecursionError) as exc:
+            raise Unavailable('proposal response requires exact readback') from exc
 
 
 def branch(job, sha):
@@ -221,7 +263,7 @@ def git_call(repository, end, *args, secret=None, login=None, bundle=False):
                    GIT_CONFIG_VALUE_0='Authorization: Basic ' + credentials)
     if bundle:
         options += ('-c', 'protocol.file.allow=always')
-    return capture([GIT, *options, '-C', str(repository), *args], end, env=env)
+    return capture([GIT, *options, '-C', str(repository), *args], end, env=env, classify_http=secret is not None)
 
 
 def propose(request, staged, fork_secret, pull_secret, end):
@@ -303,6 +345,12 @@ def main(argv=None):
                          token(read_private(credentials / 'upstream-pr.token', 512)), time.monotonic() + 110)
         print(p.canonical(result))
         return 0
+    except AuthorityDenied:
+        parser.exit(os.EX_NOPERM, 'The scoped GitHub grant denied the proposal.\n')
+    except ObservationUnavailable:
+        parser.exit(os.EX_UNAVAILABLE, 'The scoped proposal could not observe GitHub.\n')
+    except Unavailable:
+        parser.exit(os.EX_TEMPFAIL, 'The scoped proposal did not receive a complete reply.\n')
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         parser.exit(2, 'Scoped checklist proposal withheld (' + type(exc).__name__ + ').\n')
 

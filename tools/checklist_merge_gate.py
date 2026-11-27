@@ -3,13 +3,17 @@
 import os
 import re
 import time
+from urllib.parse import urlencode
 
+from bootstrap import Blocked
 import checklist_proposal as proposal
 from checklist_review_gate import open_review, policy_identity
 import job_protocol as p
 from release_trust import ReleaseTrust
 
 WORKFLOW = '.github/workflows/checklist-product-merge.yml'
+PAGE_SIZE = 30
+PAGES = 4
 
 
 def load_policy(value):
@@ -42,43 +46,80 @@ class MergeHub(proposal.Hub):
             [proposal.GH, 'api', '--hostname', 'github.com', '-X', 'PUT',
              f'repos/{proposal.REPOSITORY}/pulls/{number}/merge', '--input', '-'],
             self.end, env={'GH_TOKEN': self.secret},
-            data=p.canonical({'sha': sha, 'merge_method': 'merge'}).encode()))
+            data=p.canonical({'sha': sha, 'merge_method': 'merge'}).encode(), classify_http=True))
+
+
+def proposals(hub, developer):
+    p.number(developer, 1, 2**63 - 1)
+    user = hub.get(f'user/{developer}')
+    login = user['login']
+    p.require(user['id'] == developer and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}', login),
+              'approved GitHub proposal actor is unavailable')
+    seen = set()
+    for page in range(1, PAGES + 1):
+        query = urlencode({'q': f'repo:{proposal.REPOSITORY} is:pr is:open base:main author:{login}',
+                           'sort': 'updated', 'order': 'desc', 'per_page': PAGE_SIZE, 'page': page})
+        response = hub.get('search/issues?' + query)
+        rows = response['items']
+        p.require(response['incomplete_results'] is False and type(rows) is list and len(rows) <= PAGE_SIZE,
+                  'approved proposal search is incomplete')
+        for row in rows:
+            number = row['number']
+            p.number(number, 1, 2**31 - 1)
+            if number not in seen:
+                seen.add(number)
+                yield number
+        if len(rows) < PAGE_SIZE:
+            break
+
+
+def inspected_request(trust, number, policy):
+    row = trust.api(f'pulls/{number}')
+    body = row.get('body') or ''
+    if row['user']['id'] != policy['developer_id'] or row['state'] != 'open' or not body.startswith(proposal.MARKER):
+        return None
+    req = proposal.request_shape(p.loads(body.removeprefix(proposal.MARKER).encode()))
+    p.require(req['developer_id'] == policy['developer_id'] and req['fork'] == policy['fork'] and
+              req['review_policy_sha256'] == policy_identity(policy), 'proposal is outside approved developer scope')
+    proposal.match_pull(row, req)
+    if trust.api('branches/main')['commit']['sha'] != req['base_sha'] or not open_review(trust, row, req, policy):
+        return None
+    row = trust.api(f'pulls/{number}')
+    proposal.match_pull(row, req)
+    p.require(row['state'] == 'open' and row['draft'] is False and row['base']['sha'] == req['base_sha'],
+              'proposal changed immediately before protected merge')
+    trust.main(req['base_sha'])
+    return req
 
 
 def act(hub, trust, policy):
     proposal.permissions(hub, proposal.REPOSITORY, policy['merge_actor_id'], push=True)
-    rows = trust.api('pulls?state=open&base=main&per_page=30')
-    p.require(type(rows) is list and len(rows) < 30, 'approved merge scan reached its open proposal limit')
-    for stub in rows:
-        body = stub.get('body') or ''
-        if stub['user']['id'] != policy['developer_id'] or not body.startswith(proposal.MARKER):
+    holds = []
+    for number in proposals(hub, policy['developer_id']):
+        try:
+            req = inspected_request(trust, number, policy)
+        except proposal.AuthorityDenied:
+            raise
+        except (Blocked, ValueError, KeyError, TypeError, AttributeError, IndexError):
+            holds.append({'pull_request': number, 'reason': 'proposal-shape-or-proof-rejected'})
             continue
-        req = proposal.request_shape(p.loads(body.removeprefix(proposal.MARKER).encode()))
-        p.require(req['developer_id'] == policy['developer_id'] and req['fork'] == policy['fork'] and
-                  req['review_policy_sha256'] == policy_identity(policy),
-                  'proposed pull request fell outside approved developer scope')
-        proposal.match_pull(stub, req)
-        branch = trust.api('branches/main')
-        if branch['commit']['sha'] != req['base_sha']:
-            # Stale work requires a new tested candidate. Another valid current-base job may proceed.
+        if req is None:
             continue
-        if not open_review(trust, stub, req, policy):
-            continue
-        # GitHub atomically compares the supplied exact head and enforces reviews and strict checks on main.
-        row = trust.api(f'pulls/{stub["number"]}')
-        proposal.match_pull(row, req)
-        p.require(row['state'] == 'open' and row['draft'] is False and row['base']['sha'] == req['base_sha'],
-                  'proposal changed immediately before protected merge')
-        trust.main(req['base_sha'])
-        reply = hub.merge(stub['number'], req['candidate_sha'])
+        # The service checks this exact head and applies protected branch rules to the merge.
+        reply = hub.merge(number, req['candidate_sha'])
         p.require(reply['merged'] is True, 'GitHub declined the protected current-head merge')
         p.digest(reply['sha'], 40)
-        observed = trust.api(f'pulls/{stub["number"]}')
+        observed = trust.api(f'pulls/{number}')
         proposal.match_pull(observed, req)
         p.require(observed['merged'] is True and observed['merge_commit_sha'] == reply['sha'] and
                   observed['merged_by']['id'] == policy['merge_actor_id'], 'exact merged outcome has yet to be observed')
-        return {'pull_request': stub['number'], 'merge_commit_sha': reply['sha']}
-    return {'phase': 'awaiting-independent-review-or-current-check'}
+        result = {'pull_request': number, 'merge_commit_sha': reply['sha']}
+        break
+    else:
+        result = {'phase': 'awaiting-independent-review-or-current-check'}
+    if holds:
+        result['holds'] = holds
+    return result
 
 
 def main():

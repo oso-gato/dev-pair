@@ -1,3 +1,4 @@
+import contextlib
 import os
 from pathlib import Path
 import subprocess
@@ -6,6 +7,7 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import checklist_merge_gate as merge
@@ -15,6 +17,7 @@ import job_protocol as p
 from ledger_recovery import read_private, write_private
 import product_job as product
 import product_release as delivery
+from bootstrap import Blocked
 
 A = 'a' * 40
 B = 'b' * 40
@@ -147,11 +150,15 @@ class TrustFixture:
         self.reviewer = 20
         self.merge_calls = []
         self.workflows = []
+        self.older_rows = {}
+        self.indexed = None
+        self.searches = []
 
     def api(self, path, *, pages=False):
         req = self.req
+        if path.startswith('pulls/') and path[6:].isdigit() and int(path[6:]) in self.older_rows:
+            return self.older_rows[int(path[6:])]
         return {
-            'pulls?state=open&base=main&per_page=30': [self.row] if not self.row['merged'] else [],
             'pulls/7': self.row,
             'branches/main': {'protected': True, 'commit': {'sha': req['base_sha']}},
             'branches/main/protection': {'enforce_admins': {'enabled': True}, 'allow_force_pushes': {'enabled': False},
@@ -176,6 +183,17 @@ class TrustFixture:
     def get(self, endpoint):
         if endpoint == 'user':
             return {'id': 30}
+        if endpoint == 'user/10':
+            return {'id': 10, 'login': 'release-dev'}
+        if endpoint.startswith('search/issues?'):
+            query = parse_qs(urlsplit(endpoint).query)
+            self.searches.append(query)
+            assert query['q'] == ['repo:' + REPO + ' is:pr is:open base:main author:release-dev']
+            assert query['sort'] == ['updated'] and query['order'] == ['desc']
+            size, page = int(query['per_page'][0]), int(query['page'][0])
+            numbers = self.indexed if self.indexed is not None else ([] if self.row['merged'] else [7])
+            return {'items': [{'number': n} for n in numbers[(page - 1) * size:page * size]],
+                    'total_count': len(numbers), 'incomplete_results': False}
         return {'full_name': REPO, 'permissions': {'admin': False, 'maintain': False, 'push': True, 'pull': True}}
 
     def main(self, sha):
@@ -218,9 +236,37 @@ class MergeGateTests(unittest.TestCase):
     def test_proposal_head_changed_after_lookup(self):
         trust = TrustFixture(request())
         trust.row['head']['sha'] = A
-        with self.assertRaisesRegex(ValueError, 'different actor, head or base'):
-            merge.act(trust, trust, dict(SITE, reviewer_ids=[20], check=CHECK))
+        result = merge.act(trust, trust, dict(SITE, reviewer_ids=[20], check=CHECK))
+        self.assertEqual(result['holds'], [{'pull_request': 7, 'reason': 'proposal-shape-or-proof-rejected'}])
         self.assertEqual(trust.merge_calls, [])
+
+    def test_malformed_marked_proposal_and_full_page_do_not_starve_later_eligible_head(self):
+        trust = TrustFixture(request())
+        trust.indexed = list(range(100, 130)) + [7]
+        trust.older_rows = {number: dict(pull(trust.req), number=number, body='Other work')
+                            for number in range(100, 130)}
+        trust.older_rows[100]['body'] = proposal.MARKER + '{'
+        result = merge.act(trust, trust, dict(SITE, reviewer_ids=[20], check=CHECK))
+        self.assertEqual(result['holds'], [{'pull_request': 100, 'reason': 'proposal-shape-or-proof-rejected'}])
+        self.assertEqual(result['pull_request'], 7)
+        self.assertEqual(trust.merge_calls, [(7, B)])
+        self.assertEqual([row['page'] for row in trust.searches], [['1'], ['2']])
+
+    def test_http_permission_response_is_distinct_from_rate_limit_and_read_loss(self):
+        def command(message, **kwargs):
+            argv = [sys.executable, '-c', 'import sys; sys.stderr.write(sys.argv[1]); sys.exit(1)', message]
+            return original(argv, time.monotonic() + 5, **kwargs)
+
+        original = proposal.capture
+        denied = 'gh: Resource not accessible by personal access token (HTTP 403)\n'
+        with self.assertRaisesRegex(proposal.AuthorityDenied, '^GitHub credential or policy'):
+            command(denied, classify_http=True)
+        with self.assertRaises(proposal.CommandFailed):
+            command('gh: You have exceeded a secondary rate limit (HTTP 403)\n', classify_http=True)
+        with mock.patch.object(proposal, 'capture', side_effect=lambda *args, **kw:
+                               command('gh: failed to reach external service\n', classify_http=True)):
+            with self.assertRaises(proposal.ObservationUnavailable):
+                proposal.Hub('irrelevant-private-fixture', time.monotonic() + 5).get('user')
 
 
 class PipelineFixture:
@@ -341,6 +387,33 @@ class PromotionPipelineTests(unittest.TestCase):
         self.assertEqual(self.advance()['phase'], 'confirmed')
         self.assertEqual(self.backend.calls.count('native deployment adapter'), 1)
 
+    def test_quarantined_first_digest_can_be_corrected_by_distinct_reviewed_publication(self):
+        current = self.advance()
+        self.backend.pull = pull(current['proposal'], merged=True)
+        self.backend.interrupted = False
+        self.backend.proof = True
+        self.backend.deployed['active'] = {'artifact_sha256': '3' * 64, 'quarantined': True}
+        with self.assertRaisesRegex(ValueError, 'independently verified different digest'):
+            self.advance()
+        self.assertNotIn('native deployment adapter', self.backend.calls)
+        self.backend.deployed['active']['artifact_sha256'] = '9' * 64
+        self.assertEqual(self.advance()['phase'], 'confirmed')
+        self.assertEqual(self.backend.calls.count('native deployment adapter'), 1)
+
+    def test_protected_host_recovers_typed_role_exit_without_reading_diagnostics(self):
+        live = object.__new__(delivery.Live)
+        live.job = JOB
+        live.end = time.monotonic() + 10
+        live.protection = mock.Mock()
+        for status, expected in ((os.EX_NOPERM, proposal.AuthorityDenied),
+                                 (os.EX_UNAVAILABLE, proposal.ObservationUnavailable),
+                                 (os.EX_TEMPFAIL, proposal.CommandFailed), (2, ValueError)):
+            with self.subTest(status=status), mock.patch.object(delivery, 'dispatch_gate', contextlib.nullcontext), \
+                    mock.patch.object(delivery, 'stage'), mock.patch.object(delivery.candidate, 'as_role',
+                    return_value=['/usr/bin/python3', '-c', f'raise SystemExit({status})']):
+                with self.assertRaises(expected):
+                    live.propose(request(), b'candidate')
+
 
 class ProtectedProductInputTests(unittest.TestCase):
     def setUp(self):
@@ -436,8 +509,49 @@ class ProtectedProductInputTests(unittest.TestCase):
         self.owner['preview']['product_agreement']['destination'] = 'https://other.example.ts.net/'
         product.durable_json(self.intake / (JOB + '.json'), self.owner)
         with mock.patch.object(delivery, 'Live') as backend:
-            self.assertEqual(delivery.run(JOB)['reason'], 'protected-scope-or-evidence-rejected')
+            self.assertEqual(delivery.run(JOB, resume_held=True)['reason'], 'protected-scope-or-evidence-rejected')
             backend.assert_not_called()
+
+    def test_authority_denial_and_constructor_policy_failure_persist_protected_holds(self):
+        backend = PipelineFixture()
+        original = backend.propose
+        backend.propose = mock.Mock(side_effect=proposal.AuthorityDenied('fixture HTTP 403'))
+        with mock.patch.object(delivery, 'Live', return_value=backend):
+            held = delivery.run(JOB)
+            self.assertTrue(held['resume_required'])
+            self.assertEqual(held['reason'], 'github-authority-denied')
+            self.assertEqual(delivery.run(JOB), held)
+            backend.propose.assert_called_once()
+            backend.propose = original
+            returned = delivery.run(JOB, resume_held=True)
+            self.assertEqual(returned['phase'], 'awaiting-independent-review-and-merge')
+            self.assertEqual(returned['proposal'], held['proposal'])
+        with mock.patch.object(delivery, 'Live', side_effect=Blocked('fixture release policy rejected')):
+            rejected = delivery.run(JOB)
+        self.assertEqual(rejected['reason'], 'protected-release-policy-rejected')
+        self.assertEqual(delivery.record(self.root), rejected)
+        self.assertTrue(rejected['resume_required'])
+
+    def test_reads_back_off_and_exhaust_without_an_unobserved_proposal_write(self):
+        backend = PipelineFixture()
+        backend.find = mock.Mock(side_effect=proposal.ObservationUnavailable('fixture GET failure'))
+        backend.propose = mock.Mock()
+        clock = int(time.time())
+        with mock.patch.object(delivery, 'Live', return_value=backend), mock.patch.object(delivery.time, 'time') as wall:
+            for attempt, delay in enumerate(delivery.RETRY_DELAYS, 1):
+                wall.return_value = clock
+                row = delivery.run(JOB)
+                self.assertEqual(row['reason'], 'github-observation')
+                self.assertEqual(row['observation_retry']['failures'], attempt)
+                self.assertEqual(delivery.run(JOB), row)
+                self.assertEqual(backend.find.call_count, attempt)
+                clock += delay
+            wall.return_value = clock
+            row = delivery.run(JOB)
+            self.assertTrue(row['resume_required'])
+            self.assertEqual(delivery.run(JOB), row)
+            self.assertEqual(backend.find.call_count, len(delivery.RETRY_DELAYS) + 1)
+            backend.propose.assert_not_called()
 
 
 if __name__ == '__main__':

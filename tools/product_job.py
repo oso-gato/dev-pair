@@ -34,6 +34,8 @@ CHECKLIST_ADAPTER = 'checklist-quadlet'
 LOCAL_ADAPTER = 'devbox-development'
 EXTERNAL_ADAPTER = 'devbox-development-needs-host'
 TERMINAL = {'passed', 'blocked', 'local-validation-recorded', 'awaiting-external-validation'}
+PROMOTION_TERMINAL = {'confirmed', 'local-only', 'external-adapter-needed', 'no-changed-candidate', 'validation-blocked'}
+PROMOTION_POLICY = Path('/etc/dev-pair/product-release/policy.json')
 LOCAL_HEAD_MARKER = 'dev-pair-local-head:'
 LOCAL_HEAD_COMMAND = (
     'test -z "$(/usr/bin/git -C /work/job status --porcelain=v1 --untracked-files=all)" && '
@@ -624,16 +626,34 @@ def read_progress(root):
     state = read_state(root)
     release = root / 'promotion.json'
     if os.path.lexists(release):
-        delivery = p.loads(read_private(release, p.MAX_MESSAGE))
-        value = plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
-        p.require(delivery['version'] == 1 and delivery['job_id'] == state['job_id'] == value['job_id'] and
-                  delivery['plan_sha256'] == p.identity(value), 'promotion evidence belongs to a different agreement')
-        summary = {key: delivery[key] for key in ('phase', 'reason', 'pull_url', 'merged_source',
-                                                  'destination', 'destination_receipt_sha256') if key in delivery}
-        if 'release' in delivery:
-            summary['image'] = delivery['release']['subject']
+        try:
+            delivery = p.loads(read_private(release, p.MAX_MESSAGE))
+            value = plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
+            p.require(delivery['version'] == 1 and delivery['job_id'] == state['job_id'] == value['job_id'] and
+                      delivery['plan_sha256'] == p.identity(value), 'promotion evidence belongs to a different agreement')
+            p.text(delivery['phase'], 100)
+            summary = {key: delivery[key] for key in ('phase', 'reason', 'pull_url', 'merged_source',
+                        'destination', 'destination_receipt_sha256', 'resume_required') if key in delivery}
+            if 'release' in delivery:
+                summary['image'] = delivery['release']['subject']
+        except (OSError, ValueError, KeyError, TypeError):
+            summary = {'phase': 'observation-held', 'reason': 'protected-release-record-unavailable',
+                       'resume_required': True}
         state['promotion'] = summary
+    elif state['phase'] == 'passed' and (state.get('materialized') or {}).get('bundle_sha256'):
+        enabled = PROMOTION_POLICY.is_file()
+        state['promotion'] = {'phase': 'awaiting-promotion',
+                              'reason': None if enabled else 'protected-promotion-custody-missing',
+                              'resume_required': not enabled}
     return state
+
+
+def progress_complete(state):
+    if state['phase'] not in TERMINAL:
+        return False
+    delivery = state.get('promotion')
+    return (state['phase'] != 'passed' or not delivery or delivery['phase'] in PROMOTION_TERMINAL or
+            delivery.get('resume_required') is True)
 
 
 def pause_reason(error):
@@ -745,7 +765,7 @@ def main(argv=None):
             end = time.monotonic() + 120
             while True:
                 result = read_progress(root)
-                if args.action == 'status' or result['phase'] in TERMINAL or time.monotonic() >= end:
+                if args.action == 'status' or progress_complete(result) or time.monotonic() >= end:
                     break
                 if result != previous:
                     print(p.canonical(result), flush=True)

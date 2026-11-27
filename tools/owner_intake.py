@@ -414,14 +414,14 @@ class Intake:
             self.schedule(job, saved, time.monotonic() + 10)
         return self.status(job)
 
-    def published(self, job, plan):
+    def published(self, job, plan, *, progress=False):
         root = self.catalogue / 'jobs' / job
         if not os.path.lexists(root):
             return None
         root = trusted_directory(root)
         p.require(product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE)) == plan,
                   'The published product plan differs from the confirmed agreement.')
-        state = product.read_state(root)
+        state = product.read_progress(root) if progress else product.read_state(root)
         p.require(state['job_id'] == job and state['agreement_sha256'] == product.agreement_sha(plan) and
                   state['repository'] == plan['agreement']['repository'] and state['startup_sha256'] == plan['startup_sha256'],
                   'The published product state differs from the confirmed agreement.')
@@ -496,7 +496,7 @@ class Intake:
     def observed(self, job, status=None):
         status = self.status(job) if status is None else status
         try:
-            downstream = self.published(job, status['preview']['plan'])
+            downstream = self.published(job, status['preview']['plan'], progress=True)
             p.require(downstream is not None or status['phase'] != 'submitted', 'Product state is unavailable.')
         except (OSError, ValueError, KeyError, TypeError):
             if status['phase'] == 'submitted':
@@ -507,7 +507,7 @@ class Intake:
                 status.update(downstream)
             else:
                 status['product_phase'] = downstream['phase']
-                for field in ('maintenance', 'development', 'first', 'final', 'local_validation'):
+                for field in ('maintenance', 'development', 'first', 'final', 'local_validation', 'promotion'):
                     if field in downstream:
                         status[field] = downstream[field]
         return status

@@ -340,6 +340,58 @@ class OwnerIntakeTests(unittest.TestCase):
                     if argv[0] == 'agreement':
                         self.assertIn('The same completed item appears once after restart.', output.getvalue())
 
+    def test_named_status_and_reattach_keep_validation_visible_through_confirmed_delivery(self):
+        client = public_client()
+        draft = self.intake.draft(self.request())
+        job, plan = draft['job_id'], draft['preview']['plan']
+        saved = self.intake.record(job)
+        self.intake.save(job, dict(saved, phase='submitted'))
+        root = product.job_path(job)
+        root.mkdir(mode=0o700)
+        state = {'job_id': job, 'agreement_sha256': product.agreement_sha(plan), 'phase': 'passed',
+                 'repository': plan['agreement']['repository'], 'startup_sha256': plan['startup_sha256'],
+                 'materialized': {'bundle_sha256': 'd' * 64}}
+        product.durable_json(root / 'plan.json', plan)
+        product.durable_json(root / 'state.json', state)
+        url = 'https://erebus.example.ts.net/'
+        image = 'ghcr.io/oso-gato/dev-pair/checklist@sha256:' + 'a' * 64
+        pending = {'version': 1, 'job_id': job, 'plan_sha256': p.identity(plan),
+                   'phase': 'awaiting-independent-destination', 'release': {'subject': image}, 'destination': url}
+        product.durable_json(root / 'promotion.json', pending)
+
+        def invoke(action):
+            data = p.canonical({'action': action, 'job': job}).encode()
+            with mock.patch.object(intake, 'Intake', return_value=self.intake), \
+                    mock.patch.object(intake.os, 'geteuid', return_value=0), \
+                    mock.patch.dict(intake.os.environ, {'SUDO_USER': 'core'}), \
+                    mock.patch.object(intake.sys, 'argv', [intake.__file__]), \
+                    mock.patch.object(intake.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(data))), \
+                    contextlib.redirect_stdout(io.StringIO()) as stream:
+                self.assertEqual(intake.main(), 0)
+            return [p.loads(line.encode()) for line in stream.getvalue().splitlines()]
+
+        rows = invoke('status')
+        self.assertEqual(rows[0]['phase'], 'passed')
+        self.assertEqual(rows[0]['promotion']['phase'], 'awaiting-independent-destination')
+        confirmed = dict(pending, phase='confirmed', destination_receipt_sha256='b' * 64)
+        with mock.patch.object(product.time, 'sleep',
+                               side_effect=lambda _: product.durable_json(root / 'promotion.json', confirmed)) as pause:
+            events = invoke('reattach')
+        pause.assert_called_once()
+        self.assertEqual([event['phase'] for event in events], ['passed', 'passed'])
+        self.assertEqual([event['promotion']['phase'] for event in events], ['awaiting-independent-destination', 'confirmed'])
+        final, = invoke('status')
+        with contextlib.redirect_stdout(io.StringIO()) as terminal:
+            client.show(final)
+        self.assertIn('Delivery confirmed', terminal.getvalue())
+        self.assertIn(url, terminal.getvalue())
+        self.assertIn(image, terminal.getvalue())
+        self.assertEqual(product.read_state(root), state)
+        product.durable_json(root / 'promotion.json', dict(confirmed, plan_sha256='c'*64))
+        held, = invoke('status')
+        self.assertEqual(held['phase'], 'passed')
+        self.assertEqual(held['promotion']['phase'], 'observation-held')
+
     def test_ambiguous_sharing_draft_asks_about_access_and_refuses_empty_acceptance(self):
         client = public_client()
         with mock.patch.object(client.sys, 'argv', ['dev-pair', 'start', REPOSITORIES[0]]), \
