@@ -2,24 +2,38 @@ name: Fedora 44 VM probe
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
-
-concurrency:
-  group: fedora-vm-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   fedora-vm:
     if: >-
       github.repository == 'oso-gato/dev-pair' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'labeled' || github.event.label.name == 'fedora-development-producer')
+    concurrency:
+      group: fedora-vm-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
+      - name: Select the exact pull request scenario
+        id: scenario
+        env:
+          DP_EVENT_ACTION: ${{ github.event.action }}
+          DP_EVENT_LABEL: ${{ github.event.label.name }}
+        run: |
+          case "$DP_EVENT_ACTION" in
+            opened|synchronize|reopened) printf '%s\n' 'value=maintenance' >> "$GITHUB_OUTPUT" ;;
+            labeled)
+              if [ "$DP_EVENT_LABEL" = fedora-development-producer ]; then
+                printf '%s\n' 'value=development' >> "$GITHUB_OUTPUT"
+              fi ;;
+          esac
       - name: Check out exact public candidate
+        if: steps.scenario.outputs.value != ''
         # Official actions/checkout v4.3.1, independently resolved from upstream.
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -29,9 +43,12 @@ jobs:
           submodules: false
           lfs: false
       - name: Check local code and protocol behavior
+        if: steps.scenario.outputs.value != ''
         run: python3 -m unittest discover -s tests -q
-      - name: Probe signed Fedora bootstrap and maintenance
+      - name: Probe the selected signed Fedora scenario
+        if: steps.scenario.outputs.value != ''
         env:
           DP_EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
           DP_MERGE_SOURCE: ${{ github.sha }}
-        run: python3 tools/fedora_ci.py --expected-source "$DP_EXPECTED_SOURCE"
+          DP_SCENARIO: ${{ steps.scenario.outputs.value }}
+        run: python3 tools/fedora_ci.py --expected-source "$DP_EXPECTED_SOURCE" --scenario "$DP_SCENARIO" --github-event "$GITHUB_EVENT_PATH"

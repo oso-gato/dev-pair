@@ -23,6 +23,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import time
 import termios
@@ -31,8 +32,15 @@ import tty
 SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 REPORT_LIMIT = 65536
 REPORT_VERSION = 5
+DEVELOPMENT_REPORT_VERSION = 6
 GUEST_PHASES = ('fedora-preflight', 'guest-inputs', 'bootstrap-inspect', 'bootstrap-status',
                 'bootstrap-prepare', 'maintenance-gptbox', 'bootstrap-post-inspect', 'bootstrap-post-status')
+DEVELOPMENT_PHASES = ('fedora-preflight', 'guest-inputs', 'development-host-prepare',
+                      'development-image', 'development-readback')
+DEVELOPMENT_PREPARE_SECONDS = 600
+DEVELOPMENT_BUILD_SECONDS = 120 + 2040
+DEVELOPMENT_BOOTSTRAP_SOURCE = '192.0.2.9/32'
+GUEST_ROOT_RESERVE = 8 * 1024 ** 3
 INPUT_LENGTHS = {'controller_sha256': 64, 'source_sha': 40, 'helper_sha256': 64, 'fedora_helper_sha256': 64, 'manifest_sha256': 64, 'payload_sha256': 64,
                  'context_sha256': 64, 'distrobox_sha': 40, 'standards_sha': 40,
                  'codex_sha256': 64, 'codex_source_sha': 40}
@@ -468,6 +476,88 @@ def validate_executor(value, expected, guest_sha):
     return value
 
 
+def development_target(expected):
+    return {key: expected[key] for key in ('source_sha', 'context_sha256', 'distrobox_sha', 'run_nonce')}
+
+
+def development_phase(status):
+    return {'status': status, 'detail': 'Verified' if status == 'pass' else 'Prerequisite or phase blocked'}
+
+
+def development_executor(value):
+    # The known unit/cgroup/mask paths are reconstructed by the controller.
+    return {**{key: field for key, field in value.items() if key not in ('unit', 'cgroup', 'mask')},
+            'mask': {key: field for key, field in value['mask'].items() if key != 'path'}}
+
+
+def validate_development_receipt(value, expected):
+    hashes = {'host_ready_sha256', 'intent_sha256', 'packages_sha256', 'attempt_sha256', 'publication_sha256', 'inner_sha256'}
+    require(type(value) is dict and set(value) == hashes | {'target', 'attempt', 'publication', 'inner'} and
+            value['target'] == development_target(expected) and type(value['attempt']) is int and value['attempt'] == 1 and
+            value['publication'] == 'ready' and
+            all(type(value[key]) is str and re.fullmatch('[0-9a-f]{64}', value[key]) for key in hashes),
+            'Invalid development producer receipt')
+    inner = value['inner']
+    digests = {'image_id', 'inputs_sha256', 'sealed_sha256', 'archive_sha256'}
+    require(type(inner) is dict and set(inner) == digests | {'source_sha', 'context_sha256', 'archive_bytes', 'diff_ids'} and
+            all(inner[key] == expected[key] for key in ('source_sha', 'context_sha256')) and
+            type(inner['archive_bytes']) is int and 0 < inner['archive_bytes'] <= 2 * 1024 ** 3 and
+            all(type(inner[key]) is str and re.fullmatch('[0-9a-f]{64}', inner[key]) for key in digests) and
+            type(inner['diff_ids']) is list and 1 <= len(inner['diff_ids']) <= 128 and
+            all(type(diff) is str and re.fullmatch('sha256:[0-9a-f]{64}', diff) for diff in inner['diff_ids']),
+            'Invalid development release identity')
+    require(hashlib.sha256(json.dumps(inner, sort_keys=True).encode() + b'\n').hexdigest() == value['inner_sha256'],
+            'Development inner receipt digest mismatch')
+    return value
+
+
+def validate_development_report(report, source, guest_sha, expected):
+    require(type(report) is dict and set(report) == {'version', 'scenario', 'source_sha', 'guest_sha256', 'inputs',
+                                                   'phases', 'identity', 'development', 'cleanup'} and
+            type(report['version']) is int and report['version'] == DEVELOPMENT_REPORT_VERSION and
+            report['scenario'] == 'development' and expected.get('scenario') == 'development' and
+            report['source_sha'] == source == expected['source_sha'] and report['guest_sha256'] == guest_sha and
+            validate_inputs(report['inputs']) == expected, 'Development guest report does not match expected scenario or inputs')
+    result, cleanup = report['development'], report['cleanup']
+    require(type(result) is dict and set(result) == {'stage', 'receipt', 'nested_placement_exercised', 'job_admission'} and
+            result['nested_placement_exercised'] is False and result['job_admission'] is False and
+            result['stage'] in (*DEVELOPMENT_PHASES, 'complete'), 'Invalid development outcome')
+    count = len(DEVELOPMENT_PHASES) if result['stage'] == 'complete' else DEVELOPMENT_PHASES.index(result['stage'])
+    require(report['phases'] == {name: development_phase('pass' if index < count else 'blocked')
+                                 for index, name in enumerate(DEVELOPMENT_PHASES)}, 'Invalid development phase progression')
+    require(type(cleanup) is dict and set(cleanup) == {'password_absent', 'remaining_resources'} and
+            type(cleanup['password_absent']) is bool and cleanup['remaining_resources'] == 'controller-teardown-required',
+            'Invalid development cleanup evidence')
+    if result['stage'] == 'complete':
+        require(cleanup['password_absent'], 'Development success lacks password cleanup')
+        validate_development_receipt(result['receipt'], expected)
+    else:
+        require(result['receipt'] is None, 'Incomplete development stage carries a success receipt')
+
+    identity = report['identity']
+    if count:
+        fields = {'os', 'architecture', 'pid1', 'selinux', 'cgroup', 'root_free_bytes', 'provisioning_executor'}
+        if result['stage'] == 'complete':
+            fields.add('final_root_free_bytes')
+        require(type(identity) is dict and set(identity) == fields and
+                tuple(identity[key] for key in ('os', 'architecture', 'pid1', 'selinux', 'cgroup')) ==
+                ('Fedora 44', 'x86_64', 'systemd', 'Enforcing', 'v2') and
+                all(type(identity[key]) is int and GUEST_ROOT_RESERVE <= identity[key] < 2 ** 63
+                    for key in fields & {'root_free_bytes', 'final_root_free_bytes'}),
+                'Invalid development Fedora identity')
+        executor = identity['provisioning_executor']
+        require(type(executor) is dict and 'unit' not in executor and 'cgroup' not in executor and
+                type(executor.get('mask')) is dict and 'path' not in executor['mask'], 'Invalid development executor projection')
+        checked = validate_executor({**executor, 'unit': SERVICE_NAME, 'cgroup': '0::/system.slice/' + SERVICE_NAME,
+                                     'mask': {**executor['mask'], 'path': str(SERVICE_MASK)}}, expected, guest_sha)
+        require(observed_context(checked['launcher_context']) == checked['launcher_context'] and
+                0 < checked['admission_deadline'] < 2 ** 63 and
+                all(checked['mask'][key] < 2 ** 64 for key in ('device', 'inode')), 'Invalid development executor limits')
+    else:
+        require(identity == {}, 'Unauthenticated development identity')
+    return report
+
+
 def encode_report(report):
     data = json.dumps(report, sort_keys=True, ensure_ascii=True).encode()
     if len(data)>REPORT_LIMIT:
@@ -550,7 +640,11 @@ def safe_text(value, limit=4000):
 
 
 def validate_inputs(value):
-    require(type(value) is dict and set(value) == set(INPUT_LENGTHS) | {'payload_bytes'}, 'invalid public input identity fields')
+    fields = set(INPUT_LENGTHS) | {'payload_bytes'}
+    require(type(value) is dict and (set(value) == fields or
+            set(value) == fields | {'scenario', 'run_nonce'} and value['scenario'] == 'development' and
+            type(value['run_nonce']) is str and re.fullmatch('[0-9a-f]{32}', value['run_nonce'])),
+            'invalid public input identity fields')
     for key, length in INPUT_LENGTHS.items():
         require(type(value[key]) is str and re.fullmatch('[0-9a-f]{%d}' % length, value[key]), 'invalid public input identity')
     require(type(value['payload_bytes']) is int and 0 < value['payload_bytes'] <= 192 * 1024 ** 2, 'invalid public payload size')
@@ -844,19 +938,21 @@ def diagnostics(end=None):
 
 
 def admit_inputs(payload, expected, destination, timeout=GUEST_ADMISSION_SECONDS):
+    role = validate_inputs(expected).get('scenario', 'maintenance')
     require(digest(payload / 'public_inputs.py') == expected['helper_sha256'], 'Public extractor implementation identity mismatch')
     require(digest(payload / 'fedora_oci.py') == expected['fedora_helper_sha256'], 'Fedora input verifier implementation identity mismatch')
+    manifest = read_json(payload / 'manifest.json', expected_sha=expected['manifest_sha256'])
+    require(manifest['kind'] == f'verified-public-{role}-inputs' and
+            manifest['payload'] == {'sha256': expected['payload_sha256'], 'bytes': expected['payload_bytes']} and
+            manifest['source_sha'] == expected['source_sha'] and manifest['context_sha256'] == expected['context_sha256'] and
+            manifest['distrobox_sha'] == expected['distrobox_sha'] and manifest['standards_sha'] == expected['standards_sha'],
+            'Authenticated input identities do not match controller handoff')
     result = json.loads(command(['/usr/bin/python3', str(payload / 'public_inputs.py'), 'extract',
-                         '--manifest', str(payload / 'manifest.json'), '--payload', str(payload / 'maintenance-inputs.tar.gz'),
+                         '--role', role, '--manifest', str(payload / 'manifest.json'), '--payload', str(payload / f'{role}-inputs.tar.gz'),
                          '--expected-manifest-sha256', expected['manifest_sha256'], '--output', str(destination)],
                          timeout=timeout), object_pairs_hook=unique_object)
     require(result['source_sha'] == expected['source_sha'] and result['context_sha256'] == expected['context_sha256'],
             'Extracted source/context differs from controller target')
-    manifest = read_json(payload / 'manifest.json', expected_sha=expected['manifest_sha256'])
-    require(manifest['payload'] == {'sha256': expected['payload_sha256'], 'bytes': expected['payload_bytes']} and
-            manifest['source_sha'] == expected['source_sha'] and manifest['context_sha256'] == expected['context_sha256'] and
-            manifest['distrobox_sha'] == expected['distrobox_sha'] and manifest['standards_sha'] == expected['standards_sha'],
-            'Authenticated input identities do not match controller handoff')
     receipt = read_json(destination / 'evidence/verification-receipt.json')
     require(receipt['helper_source_sha'] == expected['source_sha'] and receipt['exit_status'] == 0 and receipt['result'] == 'Verified OK' and
             receipt['codex_binary_sha256'] == expected['codex_sha256'] and receipt['codex_source_sha'] == expected['codex_source_sha'],
@@ -1433,6 +1529,135 @@ def public_diagnostics(state_root, expected, source=None):
     return selected
 
 
+def development_command(source, stage, target_args, end, maximum, extra=()):
+    remaining(end, maximum)
+    command_end = min(end, time.monotonic() + maximum)
+    # The child receives the work deadline. The supervisor waits slightly
+    # longer for the child's exact owned-unit cleanup after its phase expires.
+    argv = ['/usr/bin/python3', '-B', str(source / 'tools/gptbox.py'), stage, '--apply',
+            '--work-deadline-monotonic', repr(end), *target_args, *extra]
+    code, output = capture(argv, timeout=remaining(command_end + INITIALIZE_CLEANUP_SECONDS,
+                                                  maximum + INITIALIZE_CLEANUP_SECONDS), maximum=16384)
+    require(code == 0, 'Development command did not complete')
+    remaining(end, maximum)
+    return json.loads(output, object_pairs_hook=unique_object)
+
+
+def development_readback(source, expected, built, end):
+    # Import the production readback from the admitted, protected checkout.
+    # The producer already checked the archive graph; this pass rehashes the
+    # final filesystem bytes against its original publication without unpacking.
+    tools = source / 'tools'
+    spec = importlib.util.spec_from_file_location('dev_pair_development_readback', tools / 'gptbox.py')
+    module = importlib.util.module_from_spec(spec)
+    old_cache = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(tools))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+        sys.dont_write_bytecode = old_cache
+    return development_release_evidence(module, module.DevelopmentGptbox(), expected, built, end)
+
+
+def development_release_evidence(module, app, expected, built, end):
+    revision, context = expected['source_sha'], expected['context_sha256']
+    app.target = module.DEVELOPMENT_ROOT + '/' + context
+    artifact = app.path(app.artifact_root + '/' + context)
+    release = artifact / 'release'
+    require(type(built) is dict and set(built) == {'kind', 'archive', 'inner_record', 'inner', 'reused', 'job_admission'} and
+            built['kind'] == 'development-gptbox-release-candidate' and built['reused'] is False and built['job_admission'] is False and
+            built['archive'] == str(release / module.RELEASE_ARCHIVE) and built['inner_record'] == str(release / module.RELEASE_INNER),
+            'Build did not publish a fresh release at the exact target')
+    app.run.deadline = end
+    try:
+        with app.run.phase(remaining(end, INITIALIZE_SECONDS), 'dev-pair-ci-development-readback', native=False), app.lock():
+            app.verify_host_readiness(revision, context)
+            host_raw = app.protected_bytes(app.path(module.STATE + '/host-ready.json'), 16384, 0o600)
+            host = json.loads(host_raw, object_pairs_hook=unique_object)
+            require(host['kind'] == module.DEVELOPMENT_HOST_READY_KIND, 'Guest requires development-specific host readiness')
+            _, host_intent = app._read_development_host_intent({'source_sha': revision, 'context_sha256': context,
+                'distrobox_sha': expected['distrobox_sha'], 'bootstrap_sources': [DEVELOPMENT_BOOTSTRAP_SOURCE]})
+            require(len(host_intent['phase_prefixes']) == 1 and host_intent['native_units'], 'Invalid guest host preparation attempt')
+            attempt = app.read_attempt(context, revision)
+            require(attempt['count'] == 1 and attempt['distrobox_sha'] == expected['distrobox_sha'], 'Invalid guest development attempt')
+            publication = app.read_publication(attempt)
+            require(publication is not None and publication['phase'] == 'ready' and
+                    not os.path.lexists(artifact / 'release.pending'), 'Development release publication is incomplete')
+            inner = app.read_release(release, publication)
+            require(module.image_inputs_bytes(inner) == module.image_inputs_bytes(built['inner']),
+                    'Published release differs from the completed producer')
+            return validate_development_receipt({'target': development_target(expected), 'attempt': attempt['count'],
+                'publication': publication['phase'], 'inner': inner, 'inner_sha256': publication['inner_sha256'],
+                'host_ready_sha256': hashlib.sha256(host_raw).hexdigest(), 'intent_sha256': host['intent_sha256'],
+                'packages_sha256': host['packages_sha256'],
+                'attempt_sha256': hashlib.sha256(app.protected_bytes(app.path(app.target + '/attempt.json'), 4096, 0o600)).hexdigest(),
+                'publication_sha256': hashlib.sha256(app.protected_bytes(app.path(app.target + '/publication.json'), 16384, 0o600)).hexdigest()}, expected)
+    except module.Blocked:
+        raise ValueError('Development protected readback blocked') from None
+
+
+def development_service(expected, guest_sha):
+    active, receipt, identity = DEVELOPMENT_PHASES[0], None, {}
+    work_end = None
+    try:
+        require(digest(pathlib.Path(__file__)) == guest_sha, 'Executing development guest identity mismatch')
+        executor = native_executor_identity(expected, guest_sha)
+        admission_end = executor['admission_deadline']
+        observed = baseline(end=admission_end)
+        require(observed['root_free_bytes'] >= GUEST_ROOT_RESERVE, 'Guest capacity below unchanged 8 GiB reserve')
+        identity = {**{key: observed[key] for key in ('os', 'architecture', 'pid1', 'selinux', 'cgroup', 'root_free_bytes')},
+                    'provisioning_executor': development_executor(executor)}
+        active = 'guest-inputs'
+        source = admit_inputs(PAYLOAD_PATH, expected, INPUT_DESTINATION,
+                              timeout=remaining(admission_end, GUEST_ADMISSION_SECONDS))
+        remaining(admission_end, GUEST_ADMISSION_SECONDS)
+        work_end = time.monotonic() + INITIALIZE_SECONDS
+        target_args = ['--source-sha', expected['source_sha'], '--distrobox-source', str(INPUT_DESTINATION / 'distrobox'),
+                       '--context', str(INPUT_DESTINATION / 'context'), '--expected-context-sha256', expected['context_sha256']]
+        active = 'development-host-prepare'
+        with make_password(SECRET_DIRECTORY) as password:
+            prepared = development_command(source, 'prepare-development-host', target_args, work_end,
+                                           DEVELOPMENT_PREPARE_SECONDS,
+                                           ('--bootstrap-source', DEVELOPMENT_BOOTSTRAP_SOURCE, '--password-file', str(password)))
+        require(not os.path.lexists(password) and prepared == {'kind': 'development-host-prerequisites',
+                 'source_sha': expected['source_sha'], 'context_sha256': expected['context_sha256'],
+                 'host_prerequisites': 'complete', 'reused': False, 'job_admission': False} and
+                prepared['reused'] is False and prepared['job_admission'] is False,
+                'Development preparation did not complete on this fresh guest')
+        active = 'development-image'
+        built = development_command(source, 'build-development', target_args, work_end, DEVELOPMENT_BUILD_SECONDS)
+        active = 'development-readback'
+        receipt = development_readback(source, expected, built, work_end)
+        free = shutil.disk_usage('/').free
+        require(free >= GUEST_ROOT_RESERVE, 'Guest final capacity below unchanged 8 GiB reserve')
+        require(not os.path.lexists(password), 'Development password cleanup unverified')
+        remaining(work_end, INITIALIZE_SECONDS)
+        identity['final_root_free_bytes'] = free
+        active = 'complete'
+    except (OSError, ValueError, KeyError, TypeError, ImportError, RecursionError, subprocess.SubprocessError):
+        receipt = None  # The active stage is the only public failure detail.
+
+    password_absent = not os.path.lexists(SECRET_DIRECTORY / 'core-password')
+    count = len(DEVELOPMENT_PHASES) if active == 'complete' else DEVELOPMENT_PHASES.index(active)
+    report = {'version': DEVELOPMENT_REPORT_VERSION, 'scenario': 'development', 'source_sha': expected['source_sha'],
+              'guest_sha256': guest_sha, 'inputs': expected, 'identity': identity,
+              'phases': {name: development_phase('pass' if index < count else 'blocked')
+                         for index, name in enumerate(DEVELOPMENT_PHASES)},
+              'development': {'stage': active, 'receipt': receipt, 'nested_placement_exercised': False, 'job_admission': False},
+              'cleanup': {'password_absent': password_absent, 'remaining_resources': 'controller-teardown-required'}}
+    final_end = time.monotonic() + GUEST_FINAL_SECONDS
+    if work_end is not None:
+        final_end = min(final_end, work_end + INITIALIZE_CLEANUP_SECONDS + GUEST_FINAL_SECONDS)
+    try:
+        validate_development_report(report, expected['source_sha'], guest_sha, expected)
+        write_report(report, timeout=remaining(final_end - 5, REPORT_WRITE_SECONDS))
+    finally:
+        result = subprocess.run(['/usr/bin/systemctl', 'poweroff', '--no-block'], env=SAFE_ENV, timeout=remaining(final_end, 5))
+        require(result.returncode == 0, 'Guest poweroff request failed; controller/native deadline remains the final bound')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -1454,6 +1679,9 @@ def main():
                                    'requested_unit_sha256': hashlib.sha256(service_unit(expected, args.guest_sha256).encode()).hexdigest(),
                                    'startup_properties': error.startup if isinstance(error, ExecutorStagingError) else error.fields if isinstance(error, ExecutorStartupError) else {'availability': 'unavailable'},
                                    'staging': error.fields if isinstance(error, ExecutorStagingError) else {'step': 'observe-startup', 'kind': 'unavailable', 'errno': None, 'exit_status': None, 'elapsed_ms': 0, 'uid': os.getuid(), 'euid': os.geteuid()}})
+        return
+    if expected.get('scenario') == 'development':
+        development_service(expected, args.guest_sha256)
         return
     phases = {name: {'status': 'blocked', 'detail': 'Prerequisite not completed'} for name in GUEST_PHASES}
     report = {'version': REPORT_VERSION, 'source_sha': args.source, 'guest_sha256': args.guest_sha256,

@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1592,6 +1593,8 @@ class DevelopmentGptbox(Gptbox):
     def verify_archive(self, path, inner, labels):
         verifier = self.archive_verifier
         deadline = time.monotonic() + 240
+        if isinstance(self.run, Commands):
+            deadline = min(deadline, self.run.execution_deadline() or deadline)
         try:
             verifier.check_archive_image(path, inner, DEVELOPMENT_EXPANSION_LIMIT, deadline)
             # The shared check proved the unique config blob and its bounded raw digest.
@@ -1618,11 +1621,19 @@ def main():
     parser.add_argument('--source-sha', required=True)
     parser.add_argument('--bootstrap-source', action='append')
     parser.add_argument('--password-file')
+    parser.add_argument('--work-deadline-monotonic', type=float, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.stage == 'prepare-development-host' and not args.bootstrap_source:
         parser.error('prepare-development-host requires --bootstrap-source')
     try:
         app = DevelopmentGptbox() if args.stage in ('prepare-development-host', 'build-development') else Gptbox()
+        if args.work_deadline_monotonic is not None:
+            if (args.stage not in ('prepare-development-host', 'build-development') or not args.apply
+                    or not math.isfinite(args.work_deadline_monotonic) or args.work_deadline_monotonic <= time.monotonic()):
+                raise Blocked('invalid development work deadline')
+            # Existing phase, command and in-unit relay ceilings all consult this
+            # monotonic deadline. Each stage can only use the earlier bound.
+            app.run.deadline = args.work_deadline_monotonic
         if args.stage == 'initialize':
             result = app.initialize(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
                                     args.bootstrap_source, args.password_file, args.apply, args.retry)

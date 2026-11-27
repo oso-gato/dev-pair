@@ -2,7 +2,7 @@
 """Bounded secret-free Fedora Cloud VM probe on a public standard CI runner.
 
 This controller never installs packages into the runner or launches agents.
-Runs the shared first-bootstrap preparation/maintenance path with public verified inputs.
+Runs the maintenance or development producer path with public verified inputs.
 """
 import argparse
 import base64
@@ -13,6 +13,7 @@ import os
 import pathlib
 import re
 import resource
+import secrets
 import selectors
 import shutil
 import signal
@@ -23,8 +24,10 @@ import tempfile
 import time
 import urllib.request
 
-from fedora_ci_guest import (sealed_load_projection, REPORT_BEGIN, REPORT_END, REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS,
-                             REPORT_VERSION, GUEST_PHASES, validate_inputs, validate_initialization, unique_object, validate_executor, STARTUP_MARKER, validate_startup_witness, signed_load_projection)
+from fedora_ci_guest import (DEVELOPMENT_PHASES, validate_development_report, sealed_load_projection, REPORT_BEGIN, REPORT_END,
+                             REPORT_LIMIT, REPORT_FRAME_LIMIT, REPORT_WRITE_SECONDS, REPORT_VERSION, GUEST_PHASES,
+                             validate_inputs, validate_initialization, unique_object, validate_executor, STARTUP_MARKER,
+                             validate_startup_witness, signed_load_projection)
 import public_inputs as public
 import fedora_oci
 
@@ -55,6 +58,31 @@ SAFE_ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL'
 PHASES = ('runner-preflight', 'signed-cloud-image', 'tooling', 'source-payload',
           'fedora-boot', 'fedora-preflight', 'bootstrap-inspect', 'bootstrap-status',
           'guest-inputs', 'bootstrap-prepare', 'maintenance-gptbox', 'bootstrap-post-inspect', 'bootstrap-post-status', 'cleanup')
+SCENARIOS = ('maintenance', 'development')
+DEVELOPMENT_LABEL = 'fedora-development-producer'
+
+
+def select_pull_request(event, source):
+    if type(event) is not dict:
+        return None
+    repository, pull, action = (event.get(key) for key in ('repository', 'pull_request', 'action'))
+    if (type(repository) is not dict or repository.get('full_name') != 'oso-gato/dev-pair' or type(pull) is not dict):
+        return None
+    head = pull.get('head')
+    if type(head) is not dict or type(head.get('repo')) is not dict or head['repo'].get('full_name') != repository['full_name']:
+        return None
+    if action == 'labeled':
+        label = event.get('label')
+        if type(label) is not dict or label.get('name') != DEVELOPMENT_LABEL:
+            return None
+        scenario = 'development'
+    elif action in ('opened', 'synchronize', 'reopened'):
+        scenario = 'maintenance'
+    else:
+        return None
+    require(type(source) is str and re.fullmatch('[0-9a-f]{40}', source) and head.get('sha') == source,
+            'Exact pull request event head differs from the selected source')
+    return scenario
 
 
 def scratch_root(runner_temp):
@@ -571,6 +599,9 @@ def parse_serial(data, expected_source, expected_guest, expected_inputs):
             value[key] = item
         return value
     result = json.loads(body, object_pairs_hook=unique)
+    validate_inputs(expected_inputs)
+    if expected_inputs.get('scenario') == 'development':
+        return validate_development_report(result, expected_source, expected_guest, expected_inputs)
     require(type(result) is dict and set(result) == {'version', 'source_sha', 'guest_sha256', 'inputs', 'initialization', 'phases', 'identity', 'diagnostics'}, 'invalid guest result shape')
     require(type(result['version']) is int and result['version'] == REPORT_VERSION and
             result['source_sha'] == expected_source and result['guest_sha256'] == expected_guest,
@@ -622,16 +653,18 @@ def parse_serial(data, expected_source, expected_guest, expected_inputs):
     return result
 
 
-def report_witness(data, overflow=False):
+def report_witness(data, overflow=False, *, include_bytes=True):
     complete = (not overflow and 0 < len(data) - len(REPORT_BEGIN) - len(REPORT_END) <= REPORT_LIMIT and
                 data.startswith(REPORT_BEGIN) and data.endswith(REPORT_END) and
                 data.count(REPORT_BEGIN) == data.count(REPORT_END) == 1)
-    return {'retained_bytes': len(data), 'sha256': sha256(data), 'overflow': overflow,
+    evidence = {'retained_bytes': len(data), 'sha256': sha256(data), 'overflow': overflow,
             'framing_complete': complete,
             'frame_limit_bytes': REPORT_FRAME_LIMIT, 'begin_markers': data.count(REPORT_BEGIN),
             'end_markers': data.count(REPORT_END), 'starts_with_begin': data.startswith(REPORT_BEGIN),
-            'ends_with_end': data.endswith(REPORT_END), 'head_hex': data[:128].hex(), 'tail_hex': data[-128:].hex(),
-            'retained_base64': base64.b64encode(data).decode('ascii')}
+            'ends_with_end': data.endswith(REPORT_END)}
+    if include_bytes:
+        evidence.update(head_hex=data[:128].hex(), tail_hex=data[-128:].hex(), retained_base64=base64.b64encode(data).decode('ascii'))
+    return evidence
 
 
 class ReportPipe:
@@ -693,8 +726,10 @@ class ReportPipe:
 
 
 class Probe:
-    def __init__(self, source, root):
+    def __init__(self, source, root, scenario='maintenance'):
+        require(scenario in SCENARIOS, 'invalid requested Fedora scenario')
         self.source = source
+        self.scenario = scenario
         self.repo = pathlib.Path(__file__).resolve().parents[1]
         self.root = root
         info = root.lstat()
@@ -711,7 +746,8 @@ class Probe:
         self.report = {'version': REPORT_VERSION, 'source_sha': source, 'executor': 'public-standard-ubuntu-24.04/Fedora44-QEMU',
                        'controller_sha256': file_hash(pathlib.Path(__file__)),
                        'workflow_sha256': file_hash(self.repo / '.github/workflows/fedora-vm.yml'),
-                       'phases': {name: {'status': 'blocked', 'detail': 'Not reached'} for name in PHASES},
+                       'phases': {name: {'status': 'blocked', 'detail': 'Not reached'}
+                                  for name in (PHASES if scenario == 'maintenance' else (*PHASES[:5], *DEVELOPMENT_PHASES, 'cleanup'))},
                        'limits': {'overlay_bytes': OVERLAY_LIMIT, 'host_reserve_bytes': HOST_RESERVE,
                                   'overhead_bytes': OVERHEAD_LIMIT, 'log_bytes': LOG_LIMIT,
                                   'storage_diagnostic_bytes': DU_CAPTURE_LIMIT,
@@ -721,6 +757,8 @@ class Probe:
                                   'controller_seconds': CONTROLLER_SECONDS, 'public_seconds': PUBLIC_SECONDS, 'vm_seconds': VM_SECONDS, 'cleanup_seconds': CLEANUP_SECONDS,
                                   'cpus': 3, 'memory_bytes': 8 * GIB, 'guest_cpus': 2, 'guest_memory_bytes': 6 * GIB},
                        'hostinger_acceptance': False, 'job_admission': False}
+        if scenario == 'development':
+            self.report['scenario'] = scenario
         self.podman = ['sudo', '-n', '/usr/bin/podman', '--root=' + str(root / 'graph'),
                        '--runroot=' + str(root / 'runroot'), '--tmpdir=' + str(root / 'tmp'),
                        '--hooks-dir=' + str(root / 'empty-hooks'),
@@ -837,7 +875,8 @@ class Probe:
             except (ProcessLookupError, PermissionError):
                 pass
             process.wait(timeout=5)
-            emit_text('', bytes(log), 12000)
+            if report_pipe is None or self.scenario == 'maintenance':
+                emit_text('', bytes(log), 12000)
             raise
         finally:
             if tooling_stages:
@@ -846,8 +885,11 @@ class Probe:
             process.stdout.close()
             if report_pipe is not None:
                 report_pipe.release_keeper()
-                self.report['startup_failure_witness'] = startup_witness(bytes(log), self.handoff, self.guest_sha)
-                self.report['dedicated_report_witness'] = report_witness(bytes(report_pipe.data), report_pipe.overflow)
+                maintenance = self.scenario == 'maintenance'
+                if maintenance:
+                    self.report['startup_failure_witness'] = startup_witness(bytes(log), self.handoff, self.guest_sha)
+                self.report['dedicated_report_witness'] = report_witness(bytes(report_pipe.data), report_pipe.overflow,
+                                                                         include_bytes=maintenance)
                 self.report['dedicated_report_witness']['aggregate_limit_exceeded'] = self.log_used > LOG_LIMIT
                 self.report['dedicated_report_witness']['executor_exit_status'] = process.poll()
                 # Native container timeout/removal covers root conmon scopes;
@@ -984,6 +1026,7 @@ class Probe:
 
     def payload(self):
         payload = self.root / 'payload'
+        bundle_name = self.scenario + '-inputs.tar.gz'
         guest = self.repo / 'tools/fedora_ci_guest.py'
         shutil.copyfile(guest, payload / 'guest.py')
         self.guest_sha = file_hash(guest)
@@ -992,39 +1035,49 @@ class Probe:
         handoff = self.root / 'public-handoff'
         self.bounded([sys.executable, str(helper), 'fetch', '--fedora-cache', str(self.root/'signed-container-base'), '--output', str(cache)], PUBLIC_SECONDS, 'fixed public input download')
         try:
-            output = self.bounded([sys.executable, str(helper), 'build', '--cache', str(cache),
+            output = self.bounded([sys.executable, str(helper), 'build', '--role', self.scenario, '--cache', str(cache),
                                   '--distrobox-source', str(cache / 'distrobox'), '--output', str(handoff)], PUBLIC_SECONDS, 'strict public input verification/build')
         finally:
             if (handoff / 'verification/receipt.json').exists():
-                self.report['input_verification'] = verification_evidence(handoff / 'verification', self.source)
+                verification = verification_evidence(handoff / 'verification', self.source)
+                if self.scenario == 'development':
+                    verification = {k: v for k, v in verification.items() if not k.endswith('_base64')}
+                self.report['input_verification'] = verification
         produced = json.loads(output)
         manifest_data, manifest_sha = public.capture_regular(handoff / 'manifest.json', public.MANIFEST_LIMIT)
         record = public.parse_manifest(manifest_data, manifest_sha, produced['manifest_sha256'])
-        require(record['source_sha'] == self.source and produced['source_sha'] == self.source and
+        require(record['kind'] == f'verified-public-{self.scenario}-inputs' and
+                record['source_sha'] == self.source and produced['source_sha'] == self.source and
                 produced['context_sha256'] == record['context_sha256'] and produced['payload_sha256'] == record['payload']['sha256'],
                 'Public producer target differs from exact checked out candidate')
         self.handoff = {'controller_sha256': self.report['controller_sha256'], 'source_sha': self.source, 'helper_sha256': file_hash(helper), 'fedora_helper_sha256': file_hash(self.repo / 'tools/fedora_oci.py'), 'manifest_sha256': manifest_sha,
                         'payload_sha256': record['payload']['sha256'], 'payload_bytes': record['payload']['bytes'],
                         'context_sha256': record['context_sha256'], 'distrobox_sha': record['distrobox_sha'],
                         'standards_sha': record['standards_sha'], 'codex_sha256': public.CODEX_SHA, 'codex_source_sha': public.CODEX_SOURCE}
+        if self.scenario == 'development':
+            self.handoff.update(scenario='development', run_nonce=secrets.token_hex(16))
         validate_inputs(self.handoff)
-        for name in ('manifest.json', 'maintenance-inputs.tar.gz'):
+        for name in ('manifest.json', bundle_name):
             shutil.copyfile(handoff / name, payload / name)
             (payload / name).chmod(0o444)
         # Disposable public diagnostic recipient, bound to this exact source.
-        recipient=self.repo/'tools/ci/native35-diagnostic-recipient.asc'
-        require(file_hash(recipient)=='3a0f32ce78af805d4662d5eaaebeca79b39c2ef5d63e485838491f967336dfe5', 'Diagnostic recipient mismatch')
-        shutil.copyfile(recipient,payload/'native35-recipient.asc')
-        (payload/'native35-recipient.asc').chmod(0o444)
-        (payload/'native35-gpg-home').mkdir(mode=0o555)
-        (payload/'native35-gpg-home').chmod(0o555)
+        diagnostic_grafts = []
+        if self.scenario == 'maintenance':
+            recipient=self.repo/'tools/ci/native35-diagnostic-recipient.asc'
+            require(file_hash(recipient)=='3a0f32ce78af805d4662d5eaaebeca79b39c2ef5d63e485838491f967336dfe5', 'Diagnostic recipient mismatch')
+            shutil.copyfile(recipient,payload/'native35-recipient.asc')
+            (payload/'native35-recipient.asc').chmod(0o444)
+            (payload/'native35-gpg-home').mkdir(mode=0o555)
+            (payload/'native35-gpg-home').chmod(0o555)
+            diagnostic_grafts = ['native35-gpg-home=/payload/native35-gpg-home', 'native35-recipient.asc=/payload/native35-recipient.asc']
         shutil.copyfile(helper, payload / 'public_inputs.py')
         (payload / 'public_inputs.py').chmod(0o444)
         shutil.copyfile(self.repo / 'tools/fedora_oci.py', payload / 'fedora_oci.py')
         (payload / 'fedora_oci.py').chmod(0o444)
-        require(file_hash(payload / 'maintenance-inputs.tar.gz') == record['payload']['sha256'] and
-                (payload / 'maintenance-inputs.tar.gz').stat().st_size == record['payload']['bytes'], 'Payload copy identity mismatch')
-        receipt = json.loads((handoff / 'verification/receipt.json').read_text())
+        require(file_hash(payload / bundle_name) == record['payload']['sha256'] and
+                (payload / bundle_name).stat().st_size == record['payload']['bytes'], 'Payload copy identity mismatch')
+        require('input_verification' in self.report, 'Original public verification receipt missing')
+        receipt = self.report['input_verification']['receipt']
         self.report['public_inputs'] = {**self.handoff, 'verification_receipt': receipt}
         seed = self.root / 'seed'
         seed.mkdir()
@@ -1037,8 +1090,8 @@ class Probe:
         # Base disk is excluded from the source ISO to avoid duplication.
         self.helper(self.run_args('/usr/bin/genisoimage') + [self.image, '-quiet', '-output', '/disks/payload.iso',
                     '-volid', 'DPPAYLOAD', '-joliet', '-rock', '-uid', '0', '-gid', '0', '-graft-points',
-                    'native35-gpg-home=/payload/native35-gpg-home', 'native35-recipient.asc=/payload/native35-recipient.asc', 'guest.py=/payload/guest.py', 'public_inputs.py=/payload/public_inputs.py', 'fedora_oci.py=/payload/fedora_oci.py',
-                    'manifest.json=/payload/manifest.json', 'maintenance-inputs.tar.gz=/payload/maintenance-inputs.tar.gz'])
+                    *diagnostic_grafts, 'guest.py=/payload/guest.py', 'public_inputs.py=/payload/public_inputs.py', 'fedora_oci.py=/payload/fedora_oci.py',
+                    'manifest.json=/payload/manifest.json', bundle_name + '=/payload/' + bundle_name])
         base_info = json.loads(self.helper(self.run_args('/usr/bin/qemu-img') +
                                           [self.image, 'info', '--output=json', '/payload/base.qcow2']))
         require(base_info.get('format') == 'qcow2' and not base_info.get('backing-filename') and
@@ -1078,7 +1131,8 @@ class Probe:
                  '-drive', 'file=/disks/payload.iso,media=cdrom,readonly=on,format=raw']
         with ReportPipe(self.root / 'disks') as report_pipe:
             console, report_data = self.helper(args, timeout=VM_SECONDS, report_pipe=report_pipe, observe_network=True)
-        emit_text('DP_SERIAL_TAIL\n', console, 24000)
+        if self.scenario == 'maintenance':
+            emit_text('DP_SERIAL_TAIL\n', console, 24000)
         guest = parse_serial(report_data, self.source, self.guest_sha, self.handoff)
         self.report['guest'] = guest
         self.phase('fedora-boot', 'pass', 'Real signed Fedora Cloud image booted and emitted a complete candidate-bound serial result using ' + accel)
@@ -1144,9 +1198,11 @@ class Probe:
             self.phase_end = min(execution_started + CONTROLLER_SECONDS - CLEANUP_SECONDS, time.monotonic() + VM_SECONDS)
             with deadline(self.phase_end - time.monotonic()):
                 self.boot()
-        except (Blocked, OSError, ValueError, subprocess.SubprocessError) as exc:
+        except (Blocked, OSError, ValueError, RecursionError, subprocess.SubprocessError) as exc:
             primary = self.primary_image_failure if active == 'tooling' else None
-            self.report['blocker'] = evidence_tail('local image '+primary[0]+': '+primary[1] if primary else exc, 4000)
+            self.report['blocker'] = ('Development VM execution or authenticated report blocked'
+                                      if self.scenario == 'development' and active == 'fedora-boot' else
+                                      evidence_tail('local image '+primary[0]+': '+primary[1] if primary else exc, 4000))
             self.phase(active, 'blocked', self.report['blocker'])
             emit_text('DP_BLOCKED ', self.report['blocker'], 4000)
         finally:
@@ -1155,7 +1211,8 @@ class Probe:
                 with deadline(min(CLEANUP_SECONDS, max(.001, execution_started + CONTROLLER_SECONDS - time.monotonic()))):
                     self.cleanup()
             except (Blocked, OSError, subprocess.SubprocessError) as exc:
-                self.phase('cleanup', 'fail', str(exc))
+                self.phase('cleanup', 'fail', 'Owned development VM cleanup could not be verified'
+                           if self.scenario == 'development' else str(exc))
             emit_json('DP_REPORT', self.report)
             summary = os.environ.get('GITHUB_STEP_SUMMARY')
             if summary:
@@ -1172,9 +1229,22 @@ class Probe:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--expected-source', required=True)
+    parser.add_argument('--scenario', choices=SCENARIOS, default='maintenance')
+    parser.add_argument('--github-event', type=pathlib.Path)
     args = parser.parse_args()
+    if args.github_event is not None:
+        with args.github_event.open('rb') as stream:
+            data = stream.read(25 * MIB + 1)
+        require(len(data) <= 25 * MIB, 'GitHub event exceeds byte limit')
+        try:
+            selected = select_pull_request(json.loads(data, object_pairs_hook=unique_object), args.expected_source)
+        except (ValueError, UnicodeError, RecursionError):
+            raise Blocked('Invalid pull request event') from None
+        if selected is None:
+            return 0
+        require(args.scenario == selected, 'Fedora scenario differs from the pull request event')
     root = scratch_root(os.environ.get('RUNNER_TEMP'))
-    return Probe(args.expected_source, root).execute()
+    return Probe(args.expected_source, root, args.scenario).execute()
 
 
 if __name__ == '__main__':

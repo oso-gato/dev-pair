@@ -18,8 +18,10 @@ VM and exact source; it does not establish designated Hostinger or pair acceptan
 ## Workflow and authority
 
 Only same-repository PRs in `oso-gato/dev-pair` run on free standard
-`ubuntu-24.04`. The workflow supports opened/synchronize/reopened events, checks
-out exact PR head and uses official actions/checkout v4.3.1 commit
+`ubuntu-24.04`. Opened, synchronize and reopened events select maintenance.
+Adding the fixed `fedora-development-producer` label selects development for
+that event's exact PR head. Other label events are ignored. The workflow checks
+out the exact event head and uses official actions/checkout v4.3.1 commit
 `34e114876b0b11c390a56381ad16ebd13914f8d5`, with persisted credentials disabled.
 The controller requires exact clean HEAD. Token permissions are contents read;
 there are no secrets, OIDC, private repository/standards retrieval, registry push,
@@ -31,6 +33,43 @@ the trust boundary. JSON source/role/executor claims are identities, not remote
 authentication. No external transport/admission, agent job, account/model request,
 Tailscale enrollment, SSH cutover or nested placement is enabled. Public source
 contains adopted standards identities, never private standards text.
+
+## Development image producer
+
+Both scenarios use the same per-PR concurrency group and preserve its active
+run. GitHub can supersede an older pending run with a newer pending run. Treat
+a superseded run as blocked and keep the next dispatch under the existing
+reviewed authority. Apply the development label only when the applicable
+maintenance work is terminal and the exact head has been authorized. Keep one
+active scope per PR and avoid label or head changes while a run is active.
+
+The controller's `--scenario` accepts `maintenance` (the default) or
+`development`. The workflow independently checks the selected scenario against
+the original event and exact checked-out head. Development builds and ships one
+authenticated development bundle. The manifest kind must match at build and
+extraction. The scenario and a per-run nonce bind the NoCloud request, the
+effective native service and the dedicated serial report. The development
+report omits raw console/command output, paths and diagnostic ciphertext.
+
+After admission on enforcing Fedora 44, the guest runs
+`prepare-development-host --apply` once and deletes the disposable operator
+password file before it can run `build-development --apply`. Both commands
+share one absolute 2280-second work deadline. Preparation's 600 seconds and
+the producer's 120-second preflight plus 2040-second build are upper bounds
+clipped to the same deadline. Native launch startup/runtime and in-unit relay
+execution inherit the remaining budget. A failed command blocks its stage and
+does not automatically retry. The 45-second cleanup allowance, 60-second final
+report allowance, 2640-second VM cap and existing storage reserves remain.
+
+Success requires protected development host readiness and its exact intent,
+the first protected producer attempt, a ready publication and a readback of
+the actual `inner.json` and OCI archive against the sealed image identity and
+recorded digests and byte count. The guest reports password-file absence and
+requires controller teardown for remaining guest resources. The controller
+checks outer cleanup independently before the job can pass. This scenario
+reports producer evidence with jobs disabled. Nested DevBox placement and
+durable release delivery remain separate checks. The following maintenance
+protocol retains its existing preparation, assembly and report evidence.
 
 ## Authenticated public inputs and actual guest path
 
