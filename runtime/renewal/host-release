@@ -200,13 +200,17 @@ def selected_component(controller, control, action):
     desired = r.read_json(control / 'host-desired.json')
     p.fields(desired, 'operation release_sha256 component')
     _, journal = controller.transition()
-    r.require(journal is not None and journal['request']['scope'] == 'host' and
+    r.require(journal is not None and
               journal['request']['operation'] == desired['operation'] and
               journal['phase'] in ('applying', 'rolling-back'), 'host activation lacks an active scoped renewal')
     source = 'previous_sha256' if journal['phase'] == 'rolling-back' else 'target_sha256'
     r.require(desired['release_sha256'] == journal['request'][source] and
               desired['component'] == controller.release(desired['release_sha256'])['components']['host'],
               'host desired release differs from reviewed transition')
+    r.require(journal['request']['scope'] == 'host' or
+              (source == 'previous_sha256' and desired['component'] ==
+               controller.release(journal['request']['target_sha256'])['components']['host']),
+              'non-host recovery selected a different host bundle')
     return desired['component']
 
 

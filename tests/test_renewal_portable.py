@@ -1,8 +1,11 @@
 """Resolve protected local fixture records without a native import or remote API."""
 import copy
+from contextlib import contextmanager
 import importlib.util
+import os
 from pathlib import Path
 import runpy
+import stat
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -27,7 +30,7 @@ class PortableSiteTests(unittest.TestCase):
         self.boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
         self.controller = r.Renewal(self.root, None)
         self.resolve = site.Resolver(self.controller, self.root / 'platform-releases', self.root / 'site-configs',
-                                     self.root / 'host-releases', self.root / 'host-configs')
+                                     self.root / 'host-releases', self.root / 'host-configs', self.read_manifest)
         if importlib.util.find_spec('platform_release_protocol') is None:
             # The exact portable parser is supplied by F in combined validation.
             dependency = SimpleNamespace(canonical=self.canonical, portable_index=lambda value, source, run: value)
@@ -40,13 +43,51 @@ class PortableSiteTests(unittest.TestCase):
         (self.root / 'host-releases' / self.host_sha).mkdir(mode=0o700)
         (self.root / 'host-releases' / self.host_sha / 'manifest.json').write_bytes(self.host)
         self.geometry = {'schema': 1, 'hostname': 'erebus', 'host_config_sha256': self.host_config_sha,
-                         'jobs': {'job-one': {'storage_bytes': 2**30, 'categories': {'outer': [1, 2, 3], 'inner': [1, 2]}}}}
+                         'jobs': {'job-one': {'storage_bytes': 8 * 2**30, 'categories': {'outer': [1, 2, 3], 'inner': [1, 2]}}}}
         data = self.canonical(self.geometry)
         self.config_sha = r.sha(data)
         (self.root / 'site-configs' / (self.config_sha + '.json')).write_bytes(data)
 
     def canonical(self, value):
         return r.json_bytes(value) + b'\n'
+
+    def read_manifest(self, root, manifests, config):
+        def inode(node):
+            return [node.st_ino, node.st_uid, node.st_gid, node.st_mode]
+
+        @contextmanager
+        def private_child(parent, name, uid, gid, *, mode, create, label):
+            self.assertFalse(create)
+            fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                node = os.fstat(fd)
+                self.assertEqual((node.st_uid, node.st_gid, stat.S_IMODE(node.st_mode)), (uid, gid, mode))
+                yield fd, False
+            finally:
+                os.close(fd)
+
+        try:
+            from native_placements import private_child, volume_inode as inode
+        except ImportError:
+            pass  # The isolated U branch uses the exact G adapter during the combined check.
+        label = 'system_u:object_r:container_file_t:s0:c1,c2,c3'
+        db = SimpleNamespace(file_label=lambda manifest, scope: label, same_label=lambda seen, expected: seen == expected)
+        native = SimpleNamespace(volume_inode=inode, private_child=private_child, db=db)
+        for job, (reference, manifest) in manifests.items():
+            build = root / 'development/builds' / job
+            self.assertEqual(stat.S_IMODE(build.stat().st_mode), 0o700)
+            leaf = build / 'inputs' / reference
+            parsed = r.loads(manifest)
+            self.assertEqual(parsed['categories'], config['jobs'][job]['categories'])
+            claim = {'directory': inode(leaf.stat()), 'inner_sha256': r.sha(site.image_inputs_bytes(parsed['inner']))}
+            lease = {'manifests': {reference: claim}, 'volumes': {'build': {'inputs': inode(leaf.parent.stat())}}}
+            descriptor = os.open(build, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                with patch.object(os, 'getxattr', return_value=label.encode()):
+                    site.observe_development_files(native, descriptor, lease, reference, manifest, parsed,
+                                                   owner=(os.getuid(), os.getgid()))
+            finally:
+                os.close(descriptor)
 
     def stage(self, source_code, *, agent=False, older=None, base=None):
         source = source_code * 40
@@ -79,16 +120,9 @@ class PortableSiteTests(unittest.TestCase):
                 if role == 'development':
                     inner = {**{key: value for key, value in image.items() if key != 'role'},
                              'inputs_sha256': '5'*64, 'sealed_sha256': '6'*64}
+                capabilities = {'maintenance': {'result_sha256': '9'*64}, 'development': inner, 'devbox': {}}
                 filenames = {role + '.oci.tar': archive, 'part.json': self.canonical({'schema': 1, 'image': image,
-                              'oci_manifest_sha256': oci, 'producer': inner if role == 'development' else {}})}
-                if role == 'maintenance':
-                    result = {'source_sha': source, 'context_sha256': context, 'assembled_image_id': config,
-                              'runtime_container_removed': True, 'boundary_and_version_cycles': 2, 'job_admission': False}
-                    leaf = self.root / 'bootstrap' / 'gptbox-adapter' / context / 'result.json'
-                    leaf.parent.mkdir(mode=0o700, parents=True)
-                    content = self.canonical(result)
-                    leaf.write_bytes(content)
-                    role_evidence[role]['result_sha256'] = r.sha(content)
+                              'oci_manifest_sha256': oci, 'producer': capabilities[role]})}
             files[role] = filenames
             index['transports'][role] = {'name': f'platform-{role}-{source}',
                                          'files': {name: {'bytes': len(data), 'sha256': r.sha(data)} for name, data in filenames.items()}}
@@ -103,6 +137,20 @@ class PortableSiteTests(unittest.TestCase):
             (directory / role).mkdir(mode=0o700)
             for filename, data in contents.items():
                 (directory / role / filename).write_bytes(data)
+        claim = site.maintenance_claim(directory, index)
+        from gptbox import Gptbox
+        if hasattr(Gptbox, 'import_admission'):
+            observed = Gptbox.import_admission(portable, claim['context_sha256'], source, claim['image_id'],
+                                               claim['oci_manifest_sha256'], self.boot, claim['producer_result_sha256'])
+            self.assertEqual(observed, {**claim, 'boot_id': self.boot})
+        else:
+            observed = {**claim, 'boot_id': self.boot}
+        evidence = site.image_inputs_bytes(observed)
+        leaf = self.root / 'bootstrap/gptbox-adapter' / claim['context_sha256'] / 'imported-releases' / (claim['image_id'] + '.json')
+        leaf.parent.mkdir(mode=0o700, parents=True)
+        leaf.write_bytes(evidence)
+        leaf.chmod(0o600)
+        role_evidence['maintenance']['result_sha256'] = r.sha(evidence)
         if agent:
             _, retained, retained_evidence = self.initial_record
             for role in ('host', 'devbox'):
@@ -117,12 +165,17 @@ class PortableSiteTests(unittest.TestCase):
         manifest = self.canonical(body)
         checksum = r.sha(manifest)
         parent = self.root / 'development' / 'builds' / job / 'inputs' / checksum
-        parent.mkdir(mode=0o700, parents=True)
-        (parent / 'manifest.json').write_bytes(manifest)
+        parent.mkdir(mode=0o755, parents=True)
+        parent.chmod(0o755)
+        parent.parent.chmod(0o755)
+        parent.parent.parent.chmod(0o700)
+        path = parent / 'manifest.json'
+        path.write_bytes(manifest)
+        path.chmod(0o444)
         archive = parent / 'development.oci.tar'
         archive.write_bytes(files['development']['development.oci.tar'])
         archive.chmod(0o444)
-        role_evidence['development'].update(inner_sha256=r.sha(self.canonical(inner)), jobs={job: {'manifest_sha256': checksum}})
+        role_evidence['development'].update(inner_sha256=r.sha(site.image_inputs_bytes(inner)), jobs={job: {'manifest_sha256': checksum}})
         installed = {'schema': 1, 'platform_sha256': portable, 'base_platform_sha256': base if agent else portable,
                      'site_config_sha256': self.config_sha, 'boot_id': self.boot, 'source_sha': source, 'components': role_evidence}
         r.replace_json(directory / 'installed.json', installed)
@@ -142,6 +195,10 @@ class PortableSiteTests(unittest.TestCase):
         platform, _ = self.stage('a')
         initial = self.resolve_site(self.offer(platform))
         current = initial['release_sha256']
+        initial_release = self.controller.release(current)
+        component = initial_release['components']['maintenance-agent']
+        claim, boot, config = site.retained_maintenance(self.controller, component, component['config_sha256'])
+        self.assertEqual((claim['platform_sha256'], boot, config), (platform, self.boot, self.config_sha))
         self.assertFalse((self.controller.control / 'current.json').exists())
         r.replace_json(self.controller.control / 'current.json', current)
         r.replace_json(self.controller.control / 'site-current.json', current)
@@ -184,11 +241,15 @@ class PortableSiteTests(unittest.TestCase):
     def test_uninstalled_manifest_change_and_foreign_site_geometry_fail_before_admission(self):
         platform, parent = self.stage('a')
         expected = (parent / 'manifest.json').read_bytes()
+        (parent / 'manifest.json').chmod(0o600)
         (parent / 'manifest.json').write_bytes(expected + b' ')
-        with self.assertRaisesRegex(ValueError, 'DevBox manifest bytes differ'):
+        (parent / 'manifest.json').chmod(0o444)
+        with self.assertRaisesRegex(ValueError, 'input ownership, label or length differs'):
             self.resolve_site(self.offer(platform))
         self.assertFalse(list((self.controller.control / 'releases').iterdir()))
+        (parent / 'manifest.json').chmod(0o600)
         (parent / 'manifest.json').write_bytes(expected)
+        (parent / 'manifest.json').chmod(0o444)
         with self.assertRaisesRegex(ValueError, 'another host'):
             self.resolve.resolve(self.offer(platform), boot=self.boot, hostname='foreign')
         overlap = copy.deepcopy(self.geometry)

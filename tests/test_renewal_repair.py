@@ -36,11 +36,74 @@ class NativeRecoveryTests(unittest.TestCase):
 
     def test_grant_requires_enough_full_cost_requests_for_the_product_tool_and_result(self):
         verify = runpy.run_path(str(REPO / 'runtime' / 'renewal' / 'continuity-grant'))['check_request_capacity']
-        verify({'max_requests': 3, 'spend_microusd': 3264}, 1088, r.CONTINUITY_REQUESTS)
+        verify({'max_requests': 3, 'spend_microusd': 3264, 'max_request_bytes': 524288},
+               1088, r.CONTINUITY_REQUESTS, 200000, 524288)
         for bad in ({'max_requests': 3, 'spend_microusd': 1}, {'max_requests': 3, 'spend_microusd': 2176},
                     {'max_requests': 1, 'spend_microusd': 1088}):
             with self.assertRaisesRegex(ValueError, 'cannot fund'):
-                verify(bad, 1088, r.CONTINUITY_REQUESTS)
+                verify(bad, 1088, r.CONTINUITY_REQUESTS, 200000, 524288)
+
+    def test_fully_funded_small_grant_cannot_carry_both_roles_saved_context(self):
+        module = runpy.run_path(str(REPO / 'runtime' / 'renewal' / 'continuity-grant'))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch.object(r, 'DEFAULT_ROOT', root):
+                for role in r.ROLES:
+                    ident = str(uuid.uuid4())
+                    leaf = root / 'turn-inputs' / role / 'product' / 'resume'
+                    startup = leaf / 'turn/startup'
+                    for parent in (startup, leaf / 'requirements', leaf / 'loaders'):
+                        parent.mkdir(parents=True)
+                    doc = b'Approved deployment startup.\n' * 1024
+                    (startup / 'project.txt').write_bytes(doc)
+                    manifest = r.json_bytes({'documents': [{'id': 'project', 'bytes': len(doc), 'sha256': r.sha(doc)}]})
+                    (startup / 'manifest.json').write_bytes(manifest)
+                    data = {'requirements': (leaf / 'requirements/requirements.toml', b'policy requirements'),
+                            'config': (leaf / 'loaders/config.toml', b'role policy'),
+                            'prompt': (leaf / 'turn/prompt.txt', b'bounded continuation and observed tool result')}
+                    for path, contents in data.values():
+                        path.write_bytes(contents)
+                    relative = Path('codex/sessions') / f'rollout-{ident}.jsonl'
+                    rollout = root / role / 'state/product' / relative
+                    rollout.parent.mkdir(parents=True)
+                    raw = r.json_bytes({'type': 'response_item', 'payload': {'type': 'message', 'content': doc.decode()}}) + b'\n'
+                    rollout.write_bytes(raw)
+                    request = {'role': role, 'job': 'product', 'session_uuid': ident, 'startup_sha256': r.sha(manifest),
+                               **{key + '_sha256': r.sha(contents) for key, (_, contents) in data.items()}}
+                    retained = {'native_rollout': {'path': str(relative), 'bytes': len(raw), 'sha256': r.sha(raw)}}
+                    inputs = module['capacity_inputs'](request, retained, SimpleNamespace(pw_uid=os.getuid()), leaf,
+                                                       ('project',), 262144)
+                    floor = module['request_body_floor'](*inputs, 128)
+                    self.assertGreater(floor, len(raw))
+                    grant = {'max_requests': 3, 'spend_microusd': 3264, 'max_request_bytes': 4096}
+                    verify = module['check_request_capacity']
+                    with self.assertRaisesRegex(ValueError, 'cannot carry the saved startup'):
+                        verify(grant, 1088, r.CONTINUITY_REQUESTS, floor, 524288)
+                    verify({**grant, 'max_request_bytes': floor}, 1088, r.CONTINUITY_REQUESTS, floor, 524288)
+                    rollout.write_bytes(raw + b' ')
+                    with self.assertRaisesRegex(ValueError, 'saved continuity transcript differs'):
+                        module['capacity_inputs'](request, retained, SimpleNamespace(pw_uid=os.getuid()), leaf,
+                                                  ('project',), 262144)
+
+    def test_saved_checkpoint_baseline_executes_actual_healthy_and_failing_source(self):
+        module = runpy.run_path(str(SCRIPT))
+        source = (REPO / 'examples/checklist/checklist.py').read_bytes()
+        baseline = module['product_baseline']
+        original = subprocess.run
+
+        def fixture_run(command, **kwargs):
+            self.assertTrue({'--uid=dp-dev', '--property=PrivateNetwork=yes', '--property=ProtectSystem=strict',
+                             '--property=SystemCallFilter=~@network-io'} <= set(command))
+            return original(command[command.index('--') + 1:], **kwargs)
+
+        action = module['product_command']('development', 'checklist-backup-restore')
+        with patch.object(subprocess, 'run', side_effect=fixture_run):
+            self.assertEqual(baseline('dp-dev', action, source), module['product_result']('development', r.sha(source)))
+            failing = source.replace(b'"done": bool(done)', b'"done": not bool(done)')
+            self.assertNotEqual(failing, source)
+            result = baseline('dp-dev', action, failing)
+            self.assertFalse(result['restored']['done'])
+            self.assertNotEqual(result, module['product_result']('development', r.sha(failing)))
 
     def test_normal_driver_and_same_uuid_resume_keep_disjoint_operation_records(self):
         driver = runpy.run_path(str(SCRIPT))

@@ -21,6 +21,8 @@ def invoke(root, action, payload):
         return {'role': payload['role'], 'job': payload['job'],
                 'artifact_sha256': payload['release']['components'][payload['role'] + '-agent']['artifact_sha256']}
     if action == 'capture-work':
+        if (root / 'failed-product-baseline').exists() and payload['role'] == 'development':
+            raise SystemExit(7)
         return {'head': 'c' * 40, 'status_sha256': sha(b'dirty'), 'check_sha256': sha(b''), 'check_exit': 0,
                 'product_plan_sha256': sha(b'local only'), 'product_result': {'check': 'fixture-only'}}
     if action == 'verify-managed-probe':
@@ -31,7 +33,8 @@ def invoke(root, action, payload):
         if (root / 'deny-recovery-grant').exists() and payload['release_sha256'] == (root / 'deny-recovery-grant').read_text():
             raise SystemExit(4)
         return {'operation': payload['operation'], 'request_sha256': sha(payload['operation'].encode()),
-                'job': payload['job'], 'allowance_sha256': sha(b'fixture allowance'), 'spend_microusd': 1}
+                'job': payload['job'], 'allowance_sha256': sha(b'fixture allowance'), 'spend_microusd': 1,
+                'request_body_floor': 176000, 'max_request_bytes': 524288}
     if action == 'preflight-allowance':
         return {'job': payload['job'], 'allowance_sha256': payload['allowance_sha256'],
                 'remaining_microusd': payload['needed_microusd'] - int((root / 'insufficient-escrow').exists())}
@@ -46,26 +49,31 @@ def invoke(root, action, payload):
     trace = root / 'site-events.jsonl'
     current = json.loads(plan.read_text())
     release = payload['release_sha256']
-    if action in ('turn', 'resume-without-effects'):
+    if action in ('turn', 'resume-without-effects', 'observe-progress'):
         assert release == current['release_sha256']
         if (root / 'fail-resume').exists() and release == (root / 'fail-resume').read_text():
             raise SystemExit(3)
         role, job, logical, operation = (payload[key] for key in ('role', 'job', 'logical_session', 'operation'))
         state = root / role / 'state' / job
         history = state / (logical + '.txt')
-        if payload['session_uuid'] is None:
+        if action == 'observe-progress':
+            session = payload['session_uuid']
+            assert history.read_text().splitlines()[0] == session and history.read_text().splitlines().count(operation) == 1
+            events = (operation + '\n').encode()
+        elif payload['session_uuid'] is None:
             session = str(uuid.uuid5(uuid.NAMESPACE_DNS, role + '/' + job + '/' + logical))
             history.write_text(session + '\n')
         else:
             session = payload['session_uuid']
             assert history.read_text().splitlines()[0] == session
-        events = subprocess.check_output([sys.executable, '-c', 'import sys; print(sys.argv[1])', operation], timeout=4)
-        with history.open('a') as stream:
-            stream.write(operation + '\n')
+        if action != 'observe-progress':
+            events = subprocess.check_output([sys.executable, '-c', 'import sys; print(sys.argv[1])', operation], timeout=4)
+            with history.open('a') as stream:
+                stream.write(operation + '\n')
         if (root / 'duplicate-effect').exists() and action == 'resume-without-effects':
             raise AssertionError('verification has no host effect path')
         evidence = None
-        if action == 'resume-without-effects':
+        if action in ('resume-without-effects', 'observe-progress'):
             work = payload['work']
             evidence = {'schema': 1, 'operation': operation, 'checkpoint': payload['checkpoint'],
                         'plan_sha256': work['product_plan_sha256'], 'result': work['product_result'],
@@ -76,7 +84,7 @@ def invoke(root, action, payload):
             'request_sha256': payload.get('request_sha256', sha(operation.encode())),
             'provider_receipt_sha256': sha(b'local fixture ' + operation.encode()),
             'work_sha256': sha(json.dumps(payload['work'], sort_keys=True, separators=(',', ':')).encode())
-            if action == 'resume-without-effects' else None,
+            if evidence is not None else None,
             'events_sha256': sha(events), 'child_reaped': True,
             'product': evidence,
             'progress_sha256': sha(json.dumps(evidence, sort_keys=True, separators=(',', ':')).encode()) if evidence else None,

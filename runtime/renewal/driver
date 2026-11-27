@@ -19,12 +19,14 @@ sys.path.insert(0, str(INSTALL / 'tools'))
 import gptbox_runtime as gptbox
 import renewal as r
 from renewal import protocol as p
+from renewal_site import maintenance_readback, retained_maintenance
 
 ROOT = r.DEFAULT_ROOT
 CONTROL = ROOT / 'renewal'
 SYSTEMCTL = '/usr/bin/systemctl'
 PYTHON = '/usr/bin/python3'
 RUNUSER = '/usr/sbin/runuser'
+SYSTEMD_RUN = '/usr/bin/systemd-run'
 GIT = ('/usr/bin/git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null')
 STATUS = (*GIT, 'status', '--porcelain=v1', '--untracked-files=all')
 CHECK = (*GIT, 'diff', '--check', '--no-ext-diff', '--no-textconv', 'HEAD')
@@ -66,6 +68,25 @@ with tempfile.TemporaryDirectory(prefix="checklist-continuity-", dir="/tmp") as 
 print(json.dumps({"recipe": "checklist-backup-restore", "source_sha256": source_sha256,
                   "restored": app["item_object"](row)}, sort_keys=True))
 '''
+BASELINE_TASK = '''import os, subprocess, sys, tempfile
+from pathlib import Path
+data = sys.stdin.buffer.read(65537)
+assert 0 < len(data) <= 65536
+with tempfile.TemporaryDirectory(prefix="continuity-input-", dir="/tmp") as tmp:
+    os.chdir(tmp)
+    source = Path("examples/checklist/checklist.py")
+    source.parent.mkdir(parents=True)
+    source.write_bytes(data)
+    raise SystemExit(subprocess.call(sys.argv[1:], stdin=subprocess.DEVNULL))
+'''
+BASELINE_LIMITS = (
+    'PrivateNetwork=yes', 'PrivateIPC=yes', 'PrivateTmp=disconnected', 'PrivateDevices=yes',
+    'ProtectSystem=strict', 'ProtectHome=yes', 'ProtectProc=invisible', 'ProcSubset=pid',
+    'InaccessiblePaths=/var/lib /run /etc -/srv -/mnt -/media', 'NoNewPrivileges=yes',
+    'CapabilityBoundingSet=', 'SystemCallFilter=~@network-io', 'RestrictNamespaces=yes',
+    'RuntimeMaxSec=18s', 'TimeoutStopSec=2s', 'KillMode=control-group',
+    'MemoryMax=128M', 'TasksMax=8', 'LimitFSIZE=65536', 'UMask=0077',
+)
 
 
 def owned_file(path, limit, expected_uid=0):
@@ -103,11 +124,17 @@ def admit_release(reference):
     ctx = plan['maintenance_context_sha256']
     r.digest(ctx)
     maintenance = release['components']['maintenance-agent']
-    admission = r.loads(owned_file(ROOT / 'bootstrap' / 'gptbox-adapter' / ctx / 'result.json', 1 << 20))
-    r.require(all(admission.get(key) == value for key, value in {
-        'assembled_image_id': maintenance['artifact_sha256'], 'source_sha': maintenance['source_revision'],
-        'context_sha256': ctx, 'runtime_container_removed': True, 'boundary_and_version_cycles': 2,
-    }.items()), 'maintenance release admission changed')
+    imported = retained_maintenance(controller, maintenance, ctx)
+    binding = CONTROL / 'platform-bindings' / (reference + '.json')
+    if os.path.lexists(binding):
+        r.require(imported is not None and imported[0]['platform_sha256'] == r.read_json(binding)['platform_sha256'],
+                  'portable maintenance release lost its exact native admission')
+    if imported is None:
+        admission = r.loads(owned_file(ROOT / 'bootstrap' / 'gptbox-adapter' / ctx / 'result.json', 1 << 20))
+        r.require(all(admission.get(key) == value for key, value in {
+            'assembled_image_id': maintenance['artifact_sha256'], 'source_sha': maintenance['source_revision'],
+            'context_sha256': ctx, 'runtime_container_removed': True, 'boundary_and_version_cycles': 2,
+        }.items()), 'maintenance release admission changed')
     manifests = plan['development_manifests']
     r.require(type(manifests) is dict and 0 < len(manifests) <= r.MAX_JOBS, 'invalid development launch plan')
     for job, sha in manifests.items():
@@ -149,11 +176,24 @@ def observe_host(reference, component):
               'live handoff did not confirm the selected host release')
 
 
+def observe_maintenance_boot(component, context):
+    ready = retained_maintenance(r.Renewal(ROOT, None), component, context)
+    if ready is None:
+        return None
+    claim, observed_boot, site = ready
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if observed_boot != boot:
+        run([PYTHON, '-EBs', str(INSTALL / 'tools' / 'platform_release_install.py'), '--reobserve-maintenance',
+             '--platform-sha256', claim['platform_sha256'], '--site-config-sha256', site], timeout=400)
+    maintenance_readback(ROOT, claim, boot)
+    return claim['oci_manifest_sha256']
+
+
 def release_action(action, payload):
     operation = payload['operation']
     r.token(operation)
     reference = payload['release_sha256']
-    release, _ = admit_release(reference)
+    release, plan = admit_release(reference)
     r.require(payload['release'] == release and payload['scope'] in r.SCOPE_COMPONENTS,
               'external release payload differs from reviewed plan')
     selector = CONTROL / 'site-current.json'
@@ -164,7 +204,12 @@ def release_action(action, payload):
         try:
             observe_host(reference, release['components']['host'])
         except (OSError, ValueError, subprocess.SubprocessError):
-            r.require(payload['scope'] == 'host', 'host change outside approved scope')
+            controller = r.Renewal(ROOT, None)
+            _, journal = controller.transition()
+            r.require(payload['scope'] == 'host' or (journal is not None and journal['phase'] == 'rolling-back' and
+                      journal['request']['operation'] == operation and journal['request']['previous_sha256'] == reference and
+                      controller.release(journal['request']['target_sha256'])['components']['host'] ==
+                      release['components']['host']), 'host change outside approved scope')
             r.replace_json(CONTROL / 'host-desired.json', {'operation': operation, 'release_sha256': reference,
                                                             'component': release['components']['host']})
             unit('start', 'dev-pair-managed-host-release.service', timeout=105)
@@ -187,6 +232,7 @@ def release_action(action, payload):
     if action == 'observe':
         r.require(r.read_json(selector) == reference, 'selected release differs from live readback')
         observe_host(reference, release['components']['host'])
+        observe_maintenance_boot(release['components']['maintenance-agent'], plan['maintenance_context_sha256'])
     return {'release_sha256': reference, 'components': release['components']}
 
 
@@ -209,6 +255,9 @@ def preflight_runtime(payload):
             'host_artifact_sha256': release['components']['host']['artifact_sha256']}
     if role == 'maintenance':
         spec['context_sha256'] = plan['maintenance_context_sha256']
+        digest = observe_maintenance_boot(spec['component'], spec['context_sha256'])
+        if digest is not None:
+            spec['oci_manifest_sha256'] = digest
         command = [script]
     else:
         r.require(job in plan['development_manifests'], 'approved development launch map omits a registered job')
@@ -261,6 +310,25 @@ def product_plan(payload):
     return r.sha(raw)
 
 
+def baseline_command(account, action):
+    return [SYSTEMD_RUN, '--quiet', '--wait', '--pipe', '--collect', '--uid=' + account, '--gid=' + account,
+            *('--property=' + limit for limit in BASELINE_LIMITS), '--', PYTHON, '-IB', '-c', BASELINE_TASK, *action]
+
+
+def product_baseline(account, action, source):
+    with tempfile.TemporaryFile() as data, tempfile.TemporaryFile() as evidence:
+        data.write(source)
+        data.seek(0)
+        completed = subprocess.run(baseline_command(account, action), stdin=data, stdout=evidence,
+                                   stderr=subprocess.DEVNULL, timeout=25, check=False,
+                                   env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
+        evidence.seek(0)
+        raw = evidence.read(4097)
+    r.require(completed.returncode == 0 and 0 < len(raw) <= 4096,
+              'saved product checkpoint cannot complete the approved local continuation')
+    return r.loads(raw)
+
+
 def capture_work(payload):
     role, job = payload['role'], payload['job']
     r.token(job)
@@ -269,7 +337,11 @@ def capture_work(payload):
     uid = r.pwd.getpwnam(account).pw_uid
     owned_dir(directory, uid)
     approval = product_plan(payload)
-    source_sha = r.sha(owned_file(directory / APP, 65536, uid))
+    source = owned_file(directory / APP, 65536, uid)
+    expected = product_result(role, r.sha(source))
+    observed = product_baseline(account, product_command(role, expected['recipe']), source)
+    r.require(observed == expected and owned_file(directory / APP, 65536, uid) == source,
+              'saved product checkpoint is failing or changed during the baseline')
 
     def git(command, accepted):
         result = subprocess.run([RUNUSER, '--user', account, '--', *command], cwd=directory,
@@ -284,7 +356,7 @@ def capture_work(payload):
     code, check = git(CHECK, (0, 2))
     return {'head': head.decode().strip(), 'status_sha256': work_digest(status),
             'check_sha256': work_digest(check), 'check_exit': code, 'product_plan_sha256': approval,
-            'product_result': product_result(role, source_sha)}
+            'product_result': observed}
 
 
 def stage_verification(payload):
@@ -343,7 +415,12 @@ def preflight_resume(payload):
 
 def preflight_allowance(payload):
     release, _ = admit_release(payload['release_sha256'])
-    directory, _ = live_host(release['components']['host'])
+    component = release['components']['host']
+    directory = INSTALL / 'host-releases' / component['artifact_sha256']
+    manifest = owned_file(directory / 'manifest.json', 1 << 20)
+    r.require(r.sha(manifest) == component['artifact_sha256'] and
+              r.sha(owned_file(directory / 'tools' / 'provider_broker.py', 1 << 20)) ==
+              r.loads(manifest)['files']['tools/provider_broker.py'], 'fallback provider authority source differs')
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(directory / 'tools'))
     from provider_broker import remaining_allowance
@@ -486,6 +563,25 @@ def no_provider_attempt(owned):
         row.get('LoadState') == 'not-found' or row.get('LoadState') == 'loaded' and row.get('User') == 'root')
 
 
+def observed_progress(path, payload, uid):
+    record = r.read_json(path)
+    r.require(record['input_sha256'] == r.identity(payload), 'renewal progress replay is not settled')
+    proof = record['proof']
+    stored = ROOT / payload['role'] / 'state' / payload['job'] / 'turns' / payload['operation']
+    result = r.loads(owned_file(stored / 'result.json', 8192, uid))
+    events = owned_file(stored / 'events.jsonl', 4 * 1024 * 1024, uid)
+    r.require(result['schema'] == 2 and result['status'] == 'completed-turn' and result['owned_cleanup'] == 'reaped' and
+              result['runtime_admitted'] is True and result['request_sha256'] == proof['request_sha256'] and
+              result['session_uuid'] == payload['session_uuid'] and len(events) == result['events_bytes'] and
+              r.sha(events) == result['events_sha256'] == proof['events_sha256'] and
+              gptbox.completed_turn(events) == payload['session_uuid'], 'saved resumed progress no longer agrees with native evidence')
+    continued_rollout(payload, uid)
+    r.require(verify_progress(events, payload) == proof['product'] and
+              provider_receipt(payload, proof['request_sha256']) == proof['provider_receipt_sha256'],
+              'saved product progress or provider attempt changed')
+    return proof
+
+
 def turn(action, payload):
     role, job, operation = (payload[key] for key in ('role', 'job', 'operation'))
     reference = payload['release_sha256']
@@ -499,11 +595,13 @@ def turn(action, payload):
     key = r.role_operation_key(role, job, operation)
     receipt_path = CONTROL / 'turn-receipts' / key
     pending = CONTROL / 'owned-turns' / key
+    if action == 'observe-progress':
+        r.require(not os.path.lexists(pending), 'saved progress still has an owned runtime')
+        return observed_progress(receipt_path, payload, uid)
     if probe and os.path.lexists(receipt_path):
-        recorded = r.read_json(receipt_path)
-        r.require(recorded['input_sha256'] == r.identity(payload), 'renewal progress replay is not settled')
+        previous = observed_progress(receipt_path, payload, uid)
         close_owned(pending)
-        return recorded['proof']
+        return previous
     request_sha = stage_verification(payload) if probe else payload['request_sha256']
     request = gptbox.job_selection(owned_file(leaf / 'turn' / 'request.json', 4096), request_sha, role, job, operation)
     binding = payload['binding']
@@ -729,7 +827,7 @@ def main():
         r.require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), 'unsafe external driver lock')
         exclusive = action in ('activate', 'quiesce')
         fcntl.flock(stream, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        if action in ('turn', 'resume-without-effects'):
+        if action in ('turn', 'resume-without-effects', 'observe-progress'):
             result = turn(action, payload)
         elif action == 'preflight-resume':
             result = preflight_resume(payload)

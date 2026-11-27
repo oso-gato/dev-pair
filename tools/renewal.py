@@ -117,6 +117,7 @@ def checked_request(value, scope):
     require(type(value['schema']) is int and value['schema'] == 1 and value['scope'] == scope,
             'renewal request scope or schema mismatch')
     token(value['operation'])
+    require(value['operation'] != 'boot', 'renewal operation cannot use the boot fence identity')
     digest(value['previous_sha256'])
     digest(value['target_sha256'])
     protocol.text(value['reason'], 512)
@@ -143,9 +144,11 @@ class SiteDriver:
                     'untrusted renewal driver path')
         require(stat.S_ISREG(self.path.stat().st_mode), 'renewal driver is not a regular file')
         # Adapter output is bounded. A timed-out or broken adapter is never proof of cleanup.
+        native_observe = action == 'observe' or action == 'preflight-runtime' and payload['role'] == 'maintenance'
+        timeout = self.timeout + 400 if native_observe else self.timeout
         with tempfile.TemporaryFile() as output:
             completed = subprocess.run([str(self.path), action], input=json_bytes(payload), stdout=output,
-                                       stderr=subprocess.DEVNULL, timeout=self.timeout, check=False,
+                                       stderr=subprocess.DEVNULL, timeout=timeout, check=False,
                                        env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
             require(completed.returncode == 0, 'renewal driver failed: ' + action)
             require(output.tell() <= MAX_CONTROL, 'renewal driver output limit')
@@ -440,20 +443,29 @@ class Renewal:
 
     def boot_fence(self):
         with self.lock(), self.host_fence():
-            attempt, _ = self.transition()
+            attempt, state = self.transition()
             marker = self.root / 'renewal-fence' / 'frozen'
             if os.path.lexists(marker):
-                require(read_json(marker) == (attempt.name if attempt else 'boot'), 'foreign host boot fence')
+                allowed = {attempt.name} if attempt else {'boot'}
+                if state is None or state['phase'] in TERMINAL:
+                    allowed.add('boot')
+                require(read_json(marker) in allowed, 'foreign host boot fence')
             else:
-                self.mark_host_fence(attempt.name if attempt else 'boot', frozen=True)
+                pending = state is not None and state['phase'] not in TERMINAL
+                self.mark_host_fence(attempt.name if pending else 'boot', frozen=True)
+
+    def unfinished_thaw(self, attempt, state):
+        marker = self.root / 'renewal-fence' / 'frozen'
+        return (state is not None and state['phase'] in ('completed', 'rolled-back') and
+                os.path.lexists(marker) and read_json(marker) == attempt.name)
 
     def observe_then_clear_fence(self, attempt, state):
         marker = self.root / 'renewal-fence' / 'frozen'
         if not os.path.lexists(marker):
             return
         with self.host_fence():
-            operation = attempt.name if attempt else 'boot'
-            require(read_json(marker) == operation, 'foreign host boot fence')
+            operation = read_json(marker)
+            require(operation == 'boot' or attempt is not None and operation == attempt.name, 'foreign host boot fence')
             context = state or {'request': {'operation': 'boot', 'scope': 'host'}}
             self.verify_driver('observe', context, self.live_release())
             self.mark_host_fence(operation, frozen=False)
@@ -659,7 +671,7 @@ class Renewal:
         with self.lock():
             attempt, state = self.transition()
             if state is not None:
-                if state['phase'] not in TERMINAL:
+                if state['phase'] not in TERMINAL or self.unfinished_thaw(attempt, state):
                     return self.resume(attempt, state)
             self.observe_then_clear_fence(attempt, state)
             request = self.active_request(scope)
@@ -717,8 +729,8 @@ class Renewal:
 
     def refresh_agent_target(self):
         """Ask only the independently configured candidate service for an approval."""
-        _, state = self.transition()
-        if state is not None and state['phase'] not in TERMINAL:
+        attempt, state = self.transition()
+        if state is not None and (state['phase'] not in TERMINAL or self.unfinished_thaw(attempt, state)):
             return True
         try:
             process = subprocess.run(['/usr/bin/systemctl', 'start', 'dev-pair-approved-agent-candidate.service'],
@@ -866,10 +878,12 @@ class Renewal:
                     require(tree_copy.visit(path) == entry['trees'][kind], 'renewal lost durable tree data')
 
     def confirm_registries(self, attempt, inventory, stack):
+        saved = {}
         for key, entry in inventory['registries'].items():
             role, job = key.split('/')
             snapshot = read_json(attempt / 'backup' / (role + '--' + job) / 'registry.json')
             require(identity(snapshot) == entry['registry_sha256'], 'registry backup integrity mismatch')
+            saved[key] = snapshot
             path = self.registry_path(role, job)
             if not os.path.lexists(path):
                 with tempfile.TemporaryDirectory(dir=self.control / 'registry-staging') as temporary:
@@ -883,8 +897,8 @@ class Renewal:
         registries = self.registries(stack)
         require(set(registries) == set(inventory['registries']), 'restored role catalogue changed')
         for key, registry in registries.items():
-            snapshot = registry.inventory()['dispatch']['snapshot']
-            require(identity(snapshot) == inventory['registries'][key]['registry_sha256'], 'restored role identity changed')
+            require(registry.current_checkpoint() == inventory['registries'][key]['checkpoint'], 'restored role checkpoint changed')
+            registry.reestablish_sealed(saved[key])
         return registries
 
     def verify_pending(self, inventory):
@@ -940,6 +954,7 @@ class Renewal:
 
     def readiness(self, attempt, state, inventory, registries):
         prepared = {}
+        funds = {}
         required_funds = {}
         deadline = int(time.time()) + 360 * len(inventory['sessions']) + 240
         keys = ('target_sha256', 'previous_sha256')
@@ -967,15 +982,19 @@ class Renewal:
             reference = state['request'][key]
             for spec, payload in self.resume_payloads(state, reference, inventory, registries):
                 approved = self.driver.invoke('preflight-resume', {**payload, 'minimum_grant_valid_until': deadline})
-                protocol.fields(approved, 'operation request_sha256 job allowance_sha256 spend_microusd')
+                protocol.fields(approved, 'operation request_sha256 job allowance_sha256 spend_microusd '
+                                'request_body_floor max_request_bytes')
                 require(approved['operation'] == spec['operation'] and approved['job'] == spec['job'],
                         'continuity preflight identity changed')
                 digest(approved['request_sha256'])
                 digest(approved['allowance_sha256'])
                 protocol.number(approved['spend_microusd'], 1, 100000000)
+                protocol.number(approved['max_request_bytes'], 1, 512 * 1024)
+                protocol.number(approved['request_body_floor'], 1, approved['max_request_bytes'])
                 account = (approved['job'], approved['allowance_sha256'])
                 required_funds[account] = required_funds.get(account, 0) + approved['spend_microusd']
                 prepared[spec['operation']] = approved['request_sha256']
+                funds[spec['operation']] = approved
         require(len({job for job, _ in required_funds}) == len(required_funds), 'continuity allowances disagree within a job')
         allowance_proofs = []
         for (job, evidence), total in required_funds.items():
@@ -988,7 +1007,8 @@ class Renewal:
                     type(approval['remaining_microusd']) is int and approval['remaining_microusd'] >= total,
                     'authoritative continuity budget cannot cover recovery')
             allowance_proofs.append({**approval, 'required_microusd': total})
-        self.phase(attempt, state, 'backed-up', continuity_requests=prepared, allowance_proofs=allowance_proofs)
+        self.phase(attempt, state, 'backed-up', continuity_requests=prepared, continuity_funds=funds,
+                   allowance_proofs=allowance_proofs)
 
     def prove(self, attempt, state, reference, inventory, registries, recovery=False):
         phase = 'rollback-verifying' if recovery else 'verifying'
@@ -998,6 +1018,8 @@ class Renewal:
             proof = state['proofs'].get(operation)
             if proof is None:
                 proof = self.driver.invoke('resume-without-effects', payload)
+            else:
+                require(self.driver.invoke('observe-progress', payload) == proof, 'stored role progress changed')
             work = payload['work']
             action = {'schema': 1, 'operation': operation, 'checkpoint': payload['checkpoint'],
                       'plan_sha256': work['product_plan_sha256'], 'result': work['product_result'],
@@ -1010,6 +1032,14 @@ class Renewal:
         self.confirm_tree(inventory)
         self.verify_pending(inventory)
         self.verify_driver('observe', state, reference)
+
+    def observe_accepted_progress(self, attempt, state, reference, inventory):
+        with contextlib.ExitStack() as stack:
+            registries = self.confirm_registries(attempt, inventory, stack)
+            for spec, payload in self.resume_payloads(state, reference, inventory, registries):
+                stored = state['proofs'].get(spec['operation'])
+                require(stored is not None and self.driver.invoke('observe-progress', payload) == stored,
+                        'accepted role progress is unavailable on the selected runtime')
 
     def thaw(self, attempt, state, terminal, registries=None):
         with contextlib.ExitStack() as stack:
@@ -1094,20 +1124,37 @@ class Renewal:
 
     def recover(self, attempt, state):
         phase = state['phase']
+        if self.unfinished_thaw(attempt, state):
+            phase = 'accepted' if phase == 'completed' else 'rollback-accepted'
+            self.phase(attempt, state, phase)
         if phase == 'accepted':
-            self.verify_driver('observe', state, state['request']['target_sha256'])
-            self.verify_pending(self.checked_inventory(attempt, state))
-            replace_json(self.control / 'current.json', state['request']['target_sha256'])
-            return self.thaw(attempt, state, 'completed')
+            target = state['request']['target_sha256']
+            try:
+                self.verify_driver('observe', state, target)
+                inventory = self.checked_inventory(attempt, state)
+                self.confirm_tree(inventory)
+                self.verify_pending(inventory)
+                self.observe_accepted_progress(attempt, state, target, inventory)
+            except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+                self.phase(attempt, state, 'rolling-back', accepted_failure=diagnostic(error))
+                phase = 'rolling-back'
+            else:
+                replace_json(self.control / 'current.json', target)
+                return self.thaw(attempt, state, 'completed')
         if phase in ('prepared', 'freezing', 'backed-up'):
             self.verify_driver('observe', state, state['request']['previous_sha256'])
             terminal = 'rejected' if phase == 'prepared' and state.get('failure') else 'deferred'
             return self.thaw(attempt, state, terminal)
         if phase == 'rollback-accepted':
-            self.verify_driver('observe', state, state['request']['previous_sha256'])
-            self.verify_pending(self.checked_inventory(attempt, state))
+            previous = state['request']['previous_sha256']
+            self.verify_driver('observe', state, previous)
+            inventory = self.checked_inventory(attempt, state)
+            self.confirm_tree(inventory)
+            self.verify_pending(inventory)
+            self.observe_accepted_progress(attempt, state, previous, inventory)
+            replace_json(self.control / 'current.json', previous)
             return self.thaw(attempt, state, 'rolled-back')
-        if phase == 'blocked':
+        if phase in TERMINAL or phase == 'blocked':
             return state
         if phase == 'rollback-verifying':
             previous = state['request']['previous_sha256']
@@ -1119,6 +1166,7 @@ class Renewal:
                     self.prove(attempt, state, previous, inventory,
                                self.confirm_registries(attempt, inventory, stack), recovery=True)
                 self.phase(attempt, state, 'rollback-accepted')
+                replace_json(self.control / 'current.json', previous)
                 return self.thaw(attempt, state, 'rolled-back')
             except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
                 self.phase(attempt, state, 'blocked', rollback_failure=diagnostic(error))
@@ -1133,17 +1181,46 @@ class Renewal:
         self.phase(attempt, state, 'rolling-back', rollback_attempts=attempts + 1)
         try:
             self.verify_driver('quiesce', state, previous)
+            self.verify_driver('validate', state, previous)
             with contextlib.ExitStack() as stack:
                 registries = self.confirm_registries(attempt, inventory, stack)
+                self.rollback_readiness(state, previous, inventory, registries)
                 self.restore_trees(attempt, state, inventory)
                 self.verify_pending(inventory)
                 self.verify_driver('activate', state, previous)
                 self.prove(attempt, state, previous, inventory, registries, recovery=True)
             self.phase(attempt, state, 'rollback-accepted')
+            replace_json(self.control / 'current.json', previous)
             return self.thaw(attempt, state, 'rolled-back')
         except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
             self.phase(attempt, state, 'blocked', rollback_failure=diagnostic(error))
             return state
+
+    def rollback_readiness(self, state, previous, inventory, registries):
+        for key in registries:
+            role, job = key.split('/')
+            selected = self.release(previous)['components'][role + '-agent']
+            proof = self.driver.invoke('preflight-runtime', {**self.payload(state, previous), 'role': role, 'job': job})
+            require(proof == {'role': role, 'job': job, 'artifact_sha256': selected['artifact_sha256']},
+                    'fallback role artifact identity changed')
+        if 'continuity_funds' not in state:
+            return  # In-progress legacy journals already have their separately checked protected grants.
+        totals = {}
+        for spec, _ in self.resume_payloads(state, previous, inventory, registries):
+            operation = spec['operation']
+            grant = state['continuity_funds'][operation]
+            require(grant['job'] == spec['job'] and grant['request_sha256'] == state['continuity_requests'][operation],
+                    'fallback grant identity changed')
+            key = grant['job'], grant['allowance_sha256']
+            totals[key] = totals.get(key, 0) + grant['spend_microusd']
+        end = int(time.time()) + 180 * len(inventory['sessions']) + 120
+        for (job, allowance), total in totals.items():
+            approval = self.driver.invoke('preflight-allowance', {'job': job, 'allowance_sha256': allowance,
+                                                                  'needed_microusd': total, 'minimum_grant_valid_until': end,
+                                                                  'release_sha256': previous})
+            require(approval['job'] == job and approval['allowance_sha256'] == allowance and
+                    type(approval['remaining_microusd']) is int and approval['remaining_microusd'] >= total,
+                    'authoritative fallback budget cannot cover recovery')
 
 
 def main():
@@ -1181,7 +1258,7 @@ def main():
         elif args.command == 'recover':
             with controller.lock():
                 attempt, result = controller.transition()
-                if result and result['phase'] not in TERMINAL:
+                if result and (result['phase'] not in TERMINAL or controller.unfinished_thaw(attempt, result)):
                     result = controller.resume(attempt, result)
                 else:
                     controller.observe_then_clear_fence(attempt, result)

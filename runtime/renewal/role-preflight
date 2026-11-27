@@ -41,6 +41,8 @@ def maintenance(spec):
     r.require(gptbox.image_id(row['Id']) == component['artifact_sha256'] and
               (row['Os'], row['Architecture']) == ('linux', 'amd64') and
               all(labels.get(key) == value for key, value in expected.items()), 'maintenance artifact is unavailable or incompatible')
+    if 'oci_manifest_sha256' in spec:
+        r.require(row.get('Digest') == 'sha256:' + spec['oci_manifest_sha256'], 'maintenance OCI manifest readback changed')
 
 
 def development_inputs(inputs, device, archive_bytes, owner=0):

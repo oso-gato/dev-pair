@@ -324,6 +324,24 @@ class Registry:
                 value.update(state='open', snapshot=None)
                 self.store_dispatch(value)
             return value
+
+    def reestablish_sealed(self, snapshot):
+        """Re-fence an unchanged registry during an incomplete external thaw."""
+        require('role' in self.meta['binding'], 'role controller required')
+        with self.owner(), self.transaction():
+            current = self.inventory()
+            dispatch = self.freeze_match(snapshot['freeze'], snapshot['binding'])
+            require(current['operations'] == snapshot['operations'] and current['sessions'] == snapshot['sessions'],
+                    'registry operations changed after the saved freeze')
+            if dispatch['state'] == 'open':
+                require(current['generation'] > snapshot['registry_generation'], 'registry thaw generation is unverified')
+                resealed = {**snapshot, 'registry_generation': current['generation'] + 1}
+                self.store_dispatch({**dispatch, 'state': 'frozen', 'snapshot': resealed})
+            else:
+                retained = dispatch['snapshot']
+                require(retained is not None and retained['registry_generation'] >= snapshot['registry_generation'] and
+                        retained == {**snapshot, 'registry_generation': retained['registry_generation']},
+                        'registry lost its exact sealed history')
     @staticmethod
     def safe_drained(row):
         return row['state']=='deferred' and row['launch_handle_observed'] is False and row['cleanup']=='not-launched' or row['state'] in ('completed-turn','failed') and row['launch_handle_observed'] is True and row['cleanup']=='owned-child-reaped'

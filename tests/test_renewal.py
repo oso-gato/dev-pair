@@ -322,6 +322,20 @@ class RenewalTests(unittest.TestCase):
         self.assertEqual(self.renewal.live_release(), self.prior)
         self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
 
+    def test_failed_saved_product_baseline_defers_and_opens_original_dispatch(self):
+        self.request(self.release('b', self.prior))
+        (self.root / 'failed-product-baseline').touch()
+        result = self.renewal.apply('agent')
+        self.assertEqual(result['phase'], 'deferred', result)
+        self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+        with self.renewal.dispatch_gate() as live:
+            self.assertEqual(live, self.prior)
+        self.assertFalse(result['proofs'])
+        for role in r.ROLES:
+            with r.contextlib.closing(Registry(self.renewal.registry_path(role, 'product'))) as registry:
+                self.assertEqual(registry.inventory()['dispatch']['state'], 'open')
+        self.assertEqual(self.renewal.ledger.inventory()['requests']['recorded-effect']['attempt_id'], self.effect)
+
     def test_authoritative_provider_escrow_must_cover_every_resume_and_rollback(self):
         target = self.release('b', self.prior)
         self.request(target)
@@ -374,6 +388,89 @@ class RenewalTests(unittest.TestCase):
         unit = (TOOLS.parent / 'runtime/renewal/dev-pair-renewal-recovery.service').read_text()
         self.assertIn('Requires=dev-pair-renewal-boot-fence.service', unit)
         self.assertIn('Wants=network-online.target dev-pair-renewal-host-observe.service', unit)
+        result = self.renewal.apply('host')
+        self.assertEqual(result['phase'], 'rolled-back', result)
+        self.assert_sessions_preserved(result, self.prior)
+
+    def interrupt_at_cutover(self, checkpoint):
+        program = '''import pathlib, sys, time
+sys.path.insert(0, sys.argv[1])
+import renewal as r
+root = pathlib.Path(sys.argv[2])
+checkpoint = sys.argv[3]
+def interrupt():
+    (root / 'cutover-point').touch()
+    time.sleep(60)
+def phase(self, attempt, state, value, **fields):
+    original_phase(self, attempt, state, value, **fields)
+    if value == checkpoint:
+        interrupt()
+def abort(self, receipt, binding):
+    result = original_abort(self, receipt, binding)
+    if checkpoint == 'partial-thaw':
+        interrupt()
+    return result
+original_phase, original_abort = r.Renewal.phase, r.Registry.abort_freeze
+r.Renewal.phase, r.Registry.abort_freeze = phase, abort
+r.Renewal(root, r.SiteDriver(root/'driver', 8)).apply('host')
+'''
+        child = subprocess.Popen([sys.executable, '-c', program, str(TOOLS), str(self.root), checkpoint])
+        try:
+            deadline = time.monotonic() + 15
+            while not (self.root / 'cutover-point').exists():
+                self.assertIsNone(child.poll())
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.02)
+        finally:
+            child.kill()
+            child.wait(timeout=4)
+        self.assertTrue((self.effect_lock.parent / 'frozen').exists())
+        with self.assertRaisesRegex(ValueError, 'frozen'), self.renewal.dispatch_gate():
+            self.fail('an interrupted thaw admitted dispatch')
+        self.renewal.boot_fence()
+
+    def test_accepted_cutover_reobserves_and_commits_without_repeating_target_turn(self):
+        target = self.release('b', self.prior, scope='host')
+        self.request(target, scope='host')
+        self.interrupt_at_cutover('accepted')
+        self.assertEqual(self.renewal.live_release(), self.prior)
+        result = self.renewal.apply('host')
+        self.assertEqual(result['phase'], 'completed', result)
+        self.assertEqual((self.root / 'site-events.jsonl').read_text().count('activate'), 1)
+        self.assert_sessions_preserved(result, target)
+
+    def test_failed_accepted_cutover_refences_partially_open_registries_and_restores_prior(self):
+        target = self.release('b', self.prior, scope='host')
+        self.request(target, scope='host')
+        self.interrupt_at_cutover('partial-thaw')
+        self.assertEqual(self.renewal.live_release(), target)
+        opened = 0
+        for role in r.ROLES:
+            with r.contextlib.closing(Registry(self.renewal.registry_path(role, 'product'))) as registry:
+                opened += registry.inventory()['dispatch']['state'] == 'open'
+        self.assertEqual(opened, 1)
+        (self.root / 'failed-host-observation').write_text(target)
+        result = self.renewal.apply('host')
+        self.assertEqual(result['phase'], 'rolled-back', result)
+        self.assertEqual(result['rollback_attempts'], 1)
+        self.assert_sessions_preserved(result, self.prior)
+
+    def test_accepted_cutover_without_retained_target_progress_rolls_back(self):
+        target = self.release('b', self.prior, scope='host')
+        self.request(target, scope='host')
+        self.interrupt_at_cutover('accepted')
+        history = self.renewal.trees('development', 'product')['state'] / 'one.txt'
+        history.write_text(history.read_text().splitlines()[0] + '\n')
+        result = self.renewal.apply('host')
+        self.assertEqual(result['phase'], 'rolled-back', result)
+        self.assert_sessions_preserved(result, self.prior)
+
+    def test_terminal_journal_with_uncleared_cutover_marker_can_still_restore_prior(self):
+        target = self.release('b', self.prior, scope='host')
+        self.request(target, scope='host')
+        self.interrupt_at_cutover('completed')
+        self.assertEqual(self.renewal.transition()[1]['phase'], 'completed')
+        (self.root / 'failed-host-observation').write_text(target)
         result = self.renewal.apply('host')
         self.assertEqual(result['phase'], 'rolled-back', result)
         self.assert_sessions_preserved(result, self.prior)
