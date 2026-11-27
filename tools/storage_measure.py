@@ -70,7 +70,7 @@ def _mount_id(fd):
 def _mount_path(field):
     return Path(os.fsdecode(re.sub(rb'\\([0-7]{3})',lambda match:bytes([int(match[1],8)]),field)))
 
-def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound):
+def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound,*,filesystem=None):
     require(root_id!=mount_id,'mount-id-equal')
     mount_ids={root_id,mount_id}
     device_field=f'{os.major(device)}:{os.minor(device)}'.encode()
@@ -83,6 +83,8 @@ def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound):
                 if fields[0] in mount_ids:
                     require(len(fields)==6,'mountinfo-row-shape')
                     require(fields[2]==device_field,'mountinfo-device')
+                    if filesystem is not None:
+                        require(fields[5].partition(b' - ')[2].split(b' ',1)[0]==filesystem,'mount-boundary')
                     paths[fields[0]]=(_mount_path(fields[3]),_mount_path(fields[4]))
                     if paths.keys()==mount_ids:break
     except FileNotFoundError:
@@ -103,17 +105,70 @@ def _bind_source(root_fd,root_id,mounted_fd,mount_id,device,bound):
     try:return mounted_source.relative_to(owned_source)
     except ValueError:raise ScanError('bind-source-outside-root') from None
 
-def _verify_bind_source(root_fd,source,expected,*,after=False):
-    missing,identity_mismatch,resolve_exdev=(
+def _open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons):
+    missing,mismatch,exdev=reasons
+    parent_fd=None
+    try:
+        parent_fd=_node(root_fd,source.parent)
+        parent=os.fstat(parent_fd)
+        require(stat.S_ISDIR(parent.st_mode) and parent.st_dev==expected[0] and _mount_id(parent_fd)==root_id,exdev)
+        # The Linux x86_64 statfs buffer begins with a long f_type. Reserve
+        # room for the complete structure and accept only known inode semantics.
+        filesystem_stat=(ctypes.c_long*16)()
+        if LIBC.fstatfs(parent_fd,ctypes.byref(filesystem_stat))!=0:
+            raise OSError(ctypes.get_errno(),'parent filesystem check failed')
+        filesystem={0xEF53:b'ext4',0x01021994:b'tmpfs'}.get(filesystem_stat[0])
+        require(filesystem is not None,exdev)
+        leaf_fd=_node(parent_fd,source.name,same_mount=False)
+        try:
+            require(_node_identity(os.fstat(leaf_fd))==expected,mismatch)
+            leaf_mount=_mount_id(leaf_fd)
+            require(leaf_mount!=root_id,exdev)
+            # Read a fresh cursor for the covered directory entry. Stat or open
+            # on the name would resolve to the visible mount instead.
+            witness_fd=os.open('.',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent_fd)
+            try:
+                with os.scandir(witness_fd) as entries:
+                    while True:
+                        bound()
+                        try:entry=next(entries)
+                        except StopIteration:raise ScanError(missing) from None
+                        charge_entry()
+                        if entry.name==source.name:
+                            covered_inode=entry.inode()
+                            require(covered_inode>0 and covered_inode==expected[1],mismatch)
+                            break
+            finally:os.close(witness_fd)
+            require(_bind_source(root_fd,root_id,leaf_fd,leaf_mount,expected[0],bound,filesystem=filesystem)==source,mismatch)
+        except BaseException:
+            os.close(leaf_fd)
+            raise
+        return leaf_fd
+    except FileNotFoundError:raise ScanError(missing) from None
+    except OSError as error:
+        if error.errno==errno.EXDEV:raise ScanError(exdev) from None
+        raise
+    finally:
+        if parent_fd is not None:os.close(parent_fd)
+
+def _verify_bind_source(root_fd,root_id,source,expected,bound,charge_entry,*,after=False,source_pin=None):
+    reasons=(
         ('bind-source-after-missing','bind-source-after-identity','bind-source-after-exdev') if after else
         ('bind-source-before-missing','bind-source-before-identity','bind-source-before-exdev')
     )
+    missing,identity_mismatch,resolve_exdev=reasons
     try:source_fd=_node(root_fd,source)
     except FileNotFoundError:raise ScanError(missing) from None
     except OSError as error:
-        if error.errno==errno.EXDEV:raise ScanError(resolve_exdev) from None
-        raise
-    try:require(_node_identity(os.fstat(source_fd))==expected,identity_mismatch)
+        if error.errno!=errno.EXDEV:raise
+        if expected[2]!=stat.S_IFDIR or not source.name or (after and source_pin is None):
+            raise ScanError(resolve_exdev) from None
+        leaf_fd=_open_source_self_bind(root_fd,root_id,source,expected,bound,charge_entry,reasons)
+        if not after:return leaf_fd
+        try:require(_mount_id(leaf_fd)==_mount_id(source_pin),identity_mismatch)
+        finally:os.close(leaf_fd)
+        return None
+    try:require(source_pin is None and _node_identity(os.fstat(source_fd))==expected,identity_mismatch)
     finally:os.close(source_fd)
 
 def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPTH,end=None):
@@ -130,6 +185,9 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                 require(identity(os.fstat(current_fd))==expected and _mount_id(current_fd)==root_mount,'root-identity')
             finally:os.close(current_fd)
     def bound():require(time.monotonic()<end,'deadline')
+    def charge_entry():
+        counters['entries']+=1
+        require(counters['entries']<=entry_limit,'entry-limit')
     def account(node,through_bind):
         nonlocal total
         require(type(node.st_dev) is int and node.st_dev>=0 and type(node.st_ino) is int and node.st_ino>0,'unsupported')
@@ -151,6 +209,7 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
     def visit(directory,name,depth,through_bind):
         nonlocal root_mount
         node_fd,crossed=_open_entry(directory,name)
+        source_pin=None
         try:
             opened=os.fstat(node_fd)
             node_identity=_node_identity(opened)
@@ -166,7 +225,7 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
             if same_device:
                 if crossed:
                     source=_bind_source(fd,root_mount,node_fd,mount_id,opened.st_dev,bound)
-                    _verify_bind_source(fd,source,node_identity)
+                    source_pin=_verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry)
                 if directory_node:
                     # An ancestor bind is a cycle; a sibling alias is a separate
                     # visit. GNU du counts single-link files again on that visit.
@@ -194,9 +253,12 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                 try:
                     require(_node_identity(os.fstat(after))==node_identity,'identity-changed')
                     if crossed:require(_mount_id(after)==mount_id,'identity-changed')
-                    if source is not None:_verify_bind_source(fd,source,node_identity,after=True)
+                    if source is not None:
+                        _verify_bind_source(fd,root_mount,source,node_identity,bound,charge_entry,after=True,source_pin=source_pin)
                 finally:os.close(after)
-        finally:os.close(node_fd)
+        finally:
+            if source_pin is not None:os.close(source_pin)
+            os.close(node_fd)
     def walk(directory,node,depth,through_bind):
         bound();require(depth<=depth_limit,'depth-limit')
         key=account(node,through_bind)
@@ -208,7 +270,7 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                     try:entry=next(entries)
                     except StopIteration:break
                     except FileNotFoundError:raise NoTotal('enumeration-disappeared') from None
-                    counters['entries']+=1;require(counters['entries']<=entry_limit,'entry-limit')
+                    charge_entry()
                     if entry.name=='guest.qcow2':continue # Exact existing GNUdu basename exclusion.
                     try:visit(directory,entry.name,depth,through_bind)
                     except FileNotFoundError:counters['vanished']+=1
