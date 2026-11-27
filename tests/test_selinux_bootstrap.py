@@ -80,6 +80,29 @@ class SELinuxTests(unittest.TestCase):
         self.boot(BOOT1)
         self.app.relabel()
 
+    def test_installed_boot_actions_enter_from_unrelated_cwd_without_source_imports(self):
+        self.start()
+        installed = self.app.path(s.INSTALL)
+        self.assertEqual({path.name for path in installed.iterdir()}, set(s.BOOT_FILES))
+        self.assertEqual(s.code_digest(installed), s.code_digest())
+        outside = self.root / 'unrelated'
+        outside.mkdir(mode=0o755)
+        # The real installed entries must import and reach their protected host
+        # gates. Run them unprivileged so this fixture cannot touch the host.
+        credentials = {'user': 65534, 'group': 65534, 'extra_groups': []} if os.getuid() == 0 else {}
+        self.root.chmod(0o755)
+        for parent in installed.parents:
+            if parent == self.root:
+                break
+            parent.chmod(0o755)
+        for action, unit in (('_relabel', self.app.path(s.OVERRIDE)), ('_finalize', self.app.path(s.FINALIZER))):
+            raw = next(row for row in unit.read_text().splitlines() if row.endswith(f' {action} --apply'))
+            command = raw.removeprefix('ExecStart=').replace(s.HELPER, str(installed / 'selinux_bootstrap.py')).split()
+            result = subprocess.run(command, text=True, capture_output=True, cwd=outside, env={}, timeout=5, **credentials)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('SELinux transition blocked', result.stderr)
+            self.assertNotIn('ModuleNotFoundError', result.stderr)
+
     def test_preview_is_readonly_and_does_not_trust_permissive(self):
         self.run.mode = 'Permissive'
         result = self.app.converge()

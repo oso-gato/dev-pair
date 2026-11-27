@@ -83,6 +83,6 @@ No production deployment is established.
 **DR2.8** The [storage observation component](storage-observation.md) measures bounded filesystem usage and checks explicit peak-capacity arithmetic. Independent review verified sparse-growth accounting and reserve boundaries. Unknown measurements block; matching samples do not prove quiescence, reserve capacity or enforce quotas. Hard storage limits and safe cleanup remain required before jobs can run.
 
 <a id="dr2-9"></a>
-**DR2.9** The checklist is available as a local development specimen. Use it to add, list and complete items, reopen them after a server restart, and back up and restore the SQLite data. The pair's end-to-end build and deployment of the checklist remain pending. See [how to run the checklist locally](examples/checklist/README.md).
+**DR2.9** The checklist is available as a local development specimen. Use it to add, list and complete items, reopen them after a server restart, and back up and restore the SQLite data. The pair's end-to-end build and deployment of the checklist remain pending. See [how to run the checklist locally](../examples/checklist/README.md).
 
 <a id="platform-and-agents"></a>

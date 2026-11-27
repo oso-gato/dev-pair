@@ -18,13 +18,14 @@ INSTALL = '/usr/local/libexec/dev-pair-selinux'
 HELPER = INSTALL + '/selinux_bootstrap.py'
 OVERRIDE = '/etc/systemd/system/selinux-autorelabel.service.d/90-dev-pair-checked.conf'
 FINALIZER = '/etc/systemd/system/dev-pair-selinux-finalize.service'
+BOOT_FILES = ('bootstrap.py', 'selinux_bootstrap.py', 'native_io.py', 'native_relay.py', 'selected_payload.py')
 DROPIN = f'''# dev-pair checked Fedora 44 initial relabel
 [Unit]
 StartLimitIntervalSec=1h
 StartLimitBurst=2
 [Service]
 ExecStart=
-ExecStart=/usr/bin/python3 {HELPER} _relabel --apply
+ExecStart=/usr/bin/python3 -EBs {HELPER} _relabel --apply
 TimeoutStartSec=35min
 TimeoutStopSec=10s
 KillMode=control-group
@@ -37,7 +38,7 @@ After=local-fs.target
 ConditionPathExists={STATE}/intent.json
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 {HELPER} _finalize --apply
+ExecStart=/usr/bin/python3 -EBs {HELPER} _finalize --apply
 TimeoutStartSec=5min
 TimeoutStopSec=10s
 KillMode=control-group
@@ -49,7 +50,7 @@ WantedBy=multi-user.target
 def code_digest(directory=None):
     directory = Path(directory) if directory else Path(__file__).resolve().parent
     digest = hashlib.sha256()
-    for name in ('bootstrap.py', 'selinux_bootstrap.py'):
+    for name in BOOT_FILES:
         digest.update(name.encode() + b'\0' + (directory / name).read_bytes())
     return digest.hexdigest()
 
@@ -191,18 +192,18 @@ class SELinuxBootstrap(Bootstrap):
 
     def install(self, expected, source_sha):
         if not re.fullmatch(r'[0-9a-f]{64}', expected or '') or expected != code_digest():
-            raise Blocked('reviewed two-file code digest does not match this installer')
+            raise Blocked('reviewed transition code digest does not match this installer')
         if not re.fullmatch(r'[0-9a-f]{40}', source_sha or ''):
             raise Blocked('full reviewed source revision is required')
         source = Path(__file__).resolve().parent
         if self.root == Path('/'):
-            for name in ('bootstrap.py', 'selinux_bootstrap.py'):
+            for name in BOOT_FILES:
                 for entry in [source / name, *source.parents, source]:
                     info = entry.lstat()
                     if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
                         raise Blocked('reviewed installer source must be root-owned and protected')
         self.directory(INSTALL, mode=0o755)
-        for name in ('bootstrap.py', 'selinux_bootstrap.py'):
+        for name in BOOT_FILES:
             self.atomic(INSTALL + '/' + name, (source / name).read_text(), mode=0o555)
         self.atomic(OVERRIDE, DROPIN, mode=0o644)
         self.atomic(FINALIZER, UNIT, mode=0o644)
@@ -212,13 +213,19 @@ class SELinuxBootstrap(Bootstrap):
 
     def verify_installed(self, intent):
         self.vendor_configuration(require_vendor=True)
-        for name in ('bootstrap.py', 'selinux_bootstrap.py'):
+        for name in BOOT_FILES:
             path = self.protected(INSTALL + '/' + name)
             if not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o555:
                 raise Blocked('installed transition code is missing or mutable')
         if (code_digest(self.path(INSTALL)) != intent.get('code_sha256')
                 or code_digest() != intent.get('code_sha256')):
             raise Blocked('installed transition code provenance mismatch')
+        mode = self.run('/usr/sbin/getenforce').strip()
+        paths = [str(self.path(INSTALL + '/' + name)) for name in BOOT_FILES]
+        if mode == 'Permissive':
+            self.run('/usr/sbin/restorecon', '-F', *paths, timeout=30)
+        if mode in ('Permissive', 'Enforcing'):
+            self.run('/usr/sbin/matchpathcon', '-V', *paths, timeout=30)
         override_ok = self.text(OVERRIDE) == DROPIN or (not self.path(OVERRIDE).exists() and self.state_json('complete'))
         if not override_ok or self.text(FINALIZER) != UNIT:
             raise Blocked('managed transition unit configuration conflicts')

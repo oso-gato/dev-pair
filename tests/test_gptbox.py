@@ -248,6 +248,34 @@ class GptboxTests(unittest.TestCase):
         self.assertTrue(self.assemble()['reused_completed_evidence'])
         self.assertEqual(len([call for call, _ in self.engine.calls if 'build' in call]), prior_builds)
 
+    def test_prepared_host_cli_lane_builds_and_executes_both_probes_without_core_setup(self):
+        from contextlib import nullcontext
+
+        self.app.path(g.STATE + '/gptbox-image.json').unlink()
+        desired = self.app.text(g.STATE + '/prepared')
+        self.app.atomic(g.STATE + '/desired.json', desired)
+        self.app.atomic(g.STATE + '/packages.txt', 'fixture package readback\n')
+        ready = {'schema': 1, 'kind': 'host-prerequisites', 'source_sha': SOURCE, 'context_sha256': EXPECTED,
+                 'standards_sha': g.candidate.STANDARDS, 'bootstrap_sha256': g.sha((Path(g.__file__).with_name('bootstrap.py')).read_bytes()),
+                 'desired_sha256': g.sha(desired.encode()), 'packages_sha256': g.sha(b'fixture package readback\n')}
+        self.app.atomic(g.STATE + '/host-ready.json', json.dumps(ready) + '\n')
+        argv = ['gptbox.py', 'assemble-prepared-maintenance', '--apply', '--context', str(self.context),
+                '--expected-context-sha256', EXPECTED, '--distrobox-source', '/unused', '--source-sha', SOURCE]
+        from contextlib import redirect_stdout
+        from io import StringIO
+        output = StringIO()
+        with (patch.object(g, 'Gptbox', return_value=self.app),
+              patch.object(self.app, 'maintenance_host_readiness', return_value=ready),
+              patch.object(self.app.run, 'phase', return_value=nullcontext(), create=True),
+              patch.object(sys, 'argv', argv), redirect_stdout(output)):
+            self.assertEqual(g.main(), 0)
+        observed = json.loads(output.getvalue())
+        self.assertEqual(observed['boundary_and_version_cycles'], 2)
+        self.assertTrue(observed['runtime_container_removed'])
+        self.assertFalse(observed['job_admission'])
+        self.assertEqual([args[-1] for args in self.app.entry_calls], ['probe', 'version', 'probe', 'version'])
+        self.assertFalse(any('chpasswd' in args[0] for args, _ in self.engine.calls))
+
     def test_pre_change_local_completion_binds_the_actual_sealed_output(self):
         result = self.assemble()
         resources = self.app.target + '/resources.json'

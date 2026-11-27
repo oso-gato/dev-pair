@@ -1,13 +1,17 @@
 # dev-pair
 
-## Set up the Fedora host
+<a id="set-up-the-fedora-host"></a>
+<a id="dr11"></a>
+## DR11 — Set up the Fedora host
 
-Open the chosen VPS root terminal in hPanel. Keep an independent recovery
+<a id="dr11-1"></a>
+**DR11.1** Open the chosen VPS root terminal in hPanel. Keep an independent recovery
 session available. The setup checks Fedora 44 x86_64, the host identity, SELinux,
 storage and the live connection before it prepares the maintenance gateway.
 It asks for the named `core` password in the terminal with echo disabled.
 
-Use the full reviewed commit from your delivery handoff in place of
+<a id="dr11-2"></a>
+**DR11.2** Use the full reviewed commit from your delivery handoff in place of
 `REPLACE_WITH_REVIEWED_COMMIT`. Paste the block as a single action. Its last
 command opens the installer prompts. You can also start from the separately
 verified [offline source kit](docs/owner-day0.md).
@@ -51,7 +55,8 @@ verified [offline source kit](docs/owner-day0.md).
 )
 ```
 
-From that checkout, run `./day0.sh status` to inspect progress or `./day0.sh resume`
+<a id="dr11-3"></a>
+**DR11.3** From that checkout, run `./day0.sh status` to inspect progress or `./day0.sh resume`
 to continue after a reboot or an access review. On a disabled or unverified
 permissive host, setup performs a checked relabel before enforcing SELinux and
 holds workloads while the transition is incomplete. For Tailscale, press Enter
@@ -59,11 +64,13 @@ at the auth-key prompt to use browser sign-in. You can defer enrollment by
 leaving the network name blank. Keep the original access route until independent
 recovery and tailnet-only SSH have been verified.
 
-Host preparation can finish while independently approved workload artifacts,
-private service policy and provider access are pending. The installer displays
-the exact pending phase and keeps workload admission held. The source and local
-fixtures exercise the setup path. The selected VPS still needs its native setup
-and external recovery observations. [Day-zero operations](docs/owner-day0.md)
+<a id="dr11-4"></a>
+**DR11.4** The first bootstrap verifies the public build context, builds the
+confined maintenance gptbox, and verifies both offline probe cycles. It can finish
+while protected workload artifacts, site policy and independent access review
+remain pending. The installer displays the pending phase and retains the existing
+recovery route. Local fixtures exercise the setup path. The selected VPS still
+needs native setup and external observations. [Day-zero operations](docs/owner-day0.md)
 
 <a id="dr0"></a>
 ## DR0 — Overview

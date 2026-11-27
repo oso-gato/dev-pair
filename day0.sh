@@ -5,7 +5,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export GIT_OPTIONAL_LOCKS=0
 case "${1:-}" in
     start|status|resume) ;;
-    *) printf 'Usage: ./day0.sh {start|status|resume} [--source-sha SHA] [--confirm-recovery] [--commission-policy-sha SHA256]\n' >&2; exit 2 ;;
+    *) printf 'Usage: ./day0.sh {start|status|resume} [--source-sha SHA] [--confirm-recovery]\n' >&2; exit 2 ;;
 esac
 if (( EUID != 0 )); then
     printf 'Open the selected VPS root terminal in hPanel, then run this command there.\n' >&2

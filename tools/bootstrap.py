@@ -1294,19 +1294,23 @@ class Bootstrap:
             raise Blocked('destination machine or boot identity unavailable')
         return {'machine_id': machine, 'boot_id': str(uuid.UUID(boot))}
 
-    def destination_source(self, expected):
+    def destination_source(self, expected, *, checkout=None):
         if type(expected) is not str or not re.fullmatch(r'[0-9a-f]{40}', expected):
             raise Blocked('exact independently admitted full source SHA required')
         script = Path(__file__).absolute()
-        repo = script.parents[1]
-        for path in (script, *script.parents, repo / '.git'):
+        repo = script.parents[1] if checkout is None else Path(checkout)
+        recorded_script = repo / 'tools/bootstrap.py'
+        if not repo.is_absolute():
+            raise Blocked('owner recovery checkout must be absolute')
+        for path in (script, *script.parents, recorded_script, *recorded_script.parents, repo / '.git'):
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
                 raise Blocked('destination source path is not root protected')
         git = ('/usr/bin/git', '-C', str(repo))
         if (self.run(*git, 'rev-parse', '--verify', 'HEAD').strip() != expected
                 or self.run(*git, 'status', '--porcelain=v1', '--untracked-files=all').strip()
-                or self.run(*git, 'show', expected + ':tools/bootstrap.py') != Path(__file__).read_text()):
+                or self.run(*git, 'show', expected + ':tools/bootstrap.py') != script.read_text()
+                or recorded_script.read_bytes() != script.read_bytes()):
             raise Blocked('destination source checkout differs from independent admission')
         return expected
 
@@ -1334,7 +1338,7 @@ class Bootstrap:
                 or not data['issued_at'] < data['expires_at'] <= data['issued_at'] + lifetime
                 or data['expires_at'] <= time.time()):
             raise Blocked('destination evidence is stale or belongs to another machine/boot')
-        self.destination_source(data['source_sha'])
+        self.destination_source(data['source_sha'], checkout=data['owner_checkout'])
         return data
 
     def validate_bootstrap_access(self, sources, console_receipt=None):
@@ -1366,7 +1370,7 @@ class Bootstrap:
         path = checked_file(receipt, secret=True)
         data = json.loads(path.read_bytes(), object_pairs_hook=relay.unique)
         identity = self.destination_identity()
-        fields = {'schema', 'kind', 'source_sha', 'machine_id', 'boot_id', 'created_at', 'origin_session', 'confirmed_session'}
+        fields = {'schema', 'kind', 'source_sha', 'machine_id', 'boot_id', 'created_at', 'origin_session', 'confirmed_session', 'owner_checkout'}
         if (type(data) is not dict or set(data) != fields or type(data['schema']) is not int or data['schema'] != 1
                 or data['kind'] != ATTENDED_ACCESS or any(data[key] != value for key, value in identity.items())
                 or type(data['created_at']) is not int or not 0 <= time.time() - data['created_at'] <= 1800

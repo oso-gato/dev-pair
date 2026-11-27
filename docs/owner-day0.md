@@ -23,22 +23,19 @@ login is restricted to tailnet sources and destinations. An already available
 independently signed provider proof can instead authorize the zero-public-SSH
 setup route. The final access review still checks external reachability.
 
-After verified tailnet enrollment, use the independent provider recovery
-terminal and test `core` SSH from the intended tailnet. The installer writes
-`/var/lib/dev-pair-day0/cutover-request.json` for the independent access verifier.
-Use the separately signed result under `/etc/dev-pair/day0/cutover.json` with
-its adjacent signature. The existing cutover controller verifies the live node,
-keys, probes and recovery route before it restricts ingress. [Recovery and access
-verification](destination-release.md)
+After verified tailnet enrollment, keep the independent provider recovery
+terminal available and test `core` SSH from your tailnet. The final access
+controller requires independent authorized, denied, public and provider
+observations of the intended routes. This setup does not yet automate the
+pre-cutover role availability and evidence handoff. The initial SSH route stays
+available until the separate review succeeds. [Recovery and access verification](destination-release.md)
 
-Host preparation installs the restricted gateway from verified public inputs.
-An independent full platform release, its protected site configuration and
-provider grants are needed before the workload can be admitted. When the
-independently approved policy is delivered, stage it in the protected location
-`/etc/dev-pair/day0/commission-policy.json` and run
-`./day0.sh resume --commission-policy-sha` followed by its independently
-supplied full SHA-256. The commissioning controller verifies the staged portable
-release and approved host configuration before activating services. [Commissioning](host-commissioning.md)
+The first bootstrap builds and verifies the confined maintenance gptbox using
+public signed build inputs. Both offline probe cycles must pass before the host
+reports completion. Reapply checks the recorded result and immutable image. A
+separately approved full platform release, site policy, and provider access are
+needed for later authenticated workloads. They are consumed by the protected
+commissioning entry as available. [Commissioning](host-commissioning.md)
 
 ## Optional offline source kit
 
