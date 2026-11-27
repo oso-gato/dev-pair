@@ -59,6 +59,11 @@ class FixtureOwner:
 
 
 class NightlyComposition(TestCase):
+    def setUp(self):
+        # The intake and install commands both set this in their own process.
+        previous_umask = os.umask(0o077)
+        self.addCleanup(os.umask, previous_umask)
+
     def test_two_scheduled_packages_through_production_cli_transport_and_local_approval(self):
         self.run_composition(('schedule', 'schedule'))
 
@@ -196,9 +201,8 @@ class NightlyComposition(TestCase):
             output = io.StringIO()
             if argv[2] == str(installer.G_ENTRY):
                 # Projected native receipts live in this process. Keep the
-                # one-shot installer's process settings inside this call.
+                # one-shot installer's handlers and timer inside this call.
                 handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM)}
-                old_mask = os.umask(0o077)
                 started = time.monotonic()
                 delay, interval = signal.setitimer(signal.ITIMER_REAL, 0)
                 try:
@@ -208,7 +212,6 @@ class NightlyComposition(TestCase):
                     signal.setitimer(signal.ITIMER_REAL, 0)
                     for sig, handler in handlers.items():
                         signal.signal(sig, handler)
-                    os.umask(old_mask)
                     if delay:
                         signal.setitimer(signal.ITIMER_REAL, max(delay - (time.monotonic() - started), 0.000001), interval)
                 native['calls'].append(('placement', argv[5], argv[7]))
