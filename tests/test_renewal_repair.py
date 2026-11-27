@@ -226,6 +226,56 @@ class NativeRecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'length changed'):
                 verify(path, path.stat().st_dev, 4, owner=os.getuid())
 
+    def test_legacy_preflight_uses_normal_p_and_requires_actual_resource_record(self):
+        import gptbox
+        if not hasattr(gptbox.Gptbox, 'local_maintenance_completion'):
+            self.skipTest('complete P legacy admission required')
+        verify = runpy.run_path(str(REPO / 'runtime/renewal/role-preflight'))['maintenance']
+        with tempfile.TemporaryDirectory() as temp:
+            app = gptbox.Gptbox(root=Path(temp))
+            context, revision, image = 'a'*64, 'b'*40, 'c'*64
+            target = gptbox.ROOT + '/' + context
+            scope = {'source_sha': revision, 'context_sha256': context, 'distrobox_sha': gptbox.DBX_SHA}
+            labels = {'dev-pair.inputs': 'd'*64, 'dev-pair.runtime': 'e'*64, 'dev-pair.init': 'f'*64,
+                      'dev-pair.codex.sha256': '0'*64, 'dev-pair.codex.version': '0.169.0'}
+            build = {'kind': 'full-adapter-candidate', 'fedora_base': '1'*64, 'image_id': '2'*64,
+                     **{key: labels[label] for key, label in (('inputs_sha256', 'dev-pair.inputs'),
+                        ('runtime_sha256', 'dev-pair.runtime'), ('init_sha256', 'dev-pair.init'),
+                        ('codex_sha256', 'dev-pair.codex.sha256'))}}
+            names = {f'dp-gptbox-a-{context[:16]}-1': build['image_id'], f'dp-gptbox-r-{context[:16]}-1': image}
+            records = {gptbox.STATE + '/prepared': {}, gptbox.STATE + '/gptbox-image.json': build,
+                       target + '/candidate-image.json': build, target + '/attempt.json': {**scope, 'count': 1},
+                       target + '/resources.json': names,
+                       target + '/assembly-attestation.json': {'kind': 'genuine-distrobox-assembled', 'source_sha': revision,
+                           'uid': 1000, 'gid': 1000, 'inputs_sha256': build['inputs_sha256'], 'packages_sha256': '3'*64},
+                       target + '/result.json': {**scope, 'kind': 'maintenance-gptbox-probe-candidate',
+                           'assembled_image_id': image, 'fedora_base': build['fedora_base'], 'runtime_container_id': '4'*64,
+                           'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False,
+                           'authentication': 'not verified', 'model_access': 'not verified', 'nested_placement': 'not verified',
+                           'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}}
+            for path, row in records.items():
+                file = app.path(path)
+                file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                r.write_private(file, gptbox.image_inputs_bytes(row))
+            app.path('/var/lib/dev-pair').chmod(0o755)
+            engine = []
+            def observe_engine(*args, **options):
+                self.assertEqual((args[:2], options['ok']), (('container', 'exists'), (1,)))
+                engine.append(args[2])
+            calls = {'preflight': lambda: None, 'maintenance_gateway': lambda *_: None,
+                     'check_prepared_record': lambda *_: None, 'prepared_build_files': lambda *_: None,
+                     'maintenance_labels': lambda *_: labels, 'engine': observe_engine}
+            spec = {'context_sha256': context, 'component': {'artifact_sha256': image, 'source_revision': revision,
+                                                           'codex_version': '0.169.0'}}
+            with patch.multiple(app, **calls), patch.object(gptbox, 'Gptbox', return_value=app):
+                verify(spec)
+                self.assertEqual(len(engine), 3)
+                resources = app.path(target + '/resources.json')
+                resources.unlink()
+                with self.assertRaises((FileNotFoundError, gptbox.Blocked)):
+                    verify(spec)
+                self.assertEqual(len(engine), 3)
+
     def test_handoff_observation_requires_a_live_listener_owned_by_the_exact_process(self):
         inspect = runpy.run_path(str(REPO / 'runtime' / 'renewal' / 'host-release'))['listen_inode']
         child_code = ('import socket, time; s=socket.socket(); s.bind(("127.0.0.1", 0));'

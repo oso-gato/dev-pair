@@ -21,6 +21,8 @@ def invoke(root, action, payload):
         return {'role': payload['role'], 'job': payload['job'],
                 'artifact_sha256': payload['release']['components'][payload['role'] + '-agent']['artifact_sha256']}
     if action == 'capture-work':
+        if (root / 'unsettled-general-product-checkpoint').exists():
+            return {'deferred': 'unsettled-general-checkpoint'}
         if (root / 'failed-product-baseline').exists() and payload['role'] == 'development':
             raise SystemExit(7)
         return {'head': 'c' * 40, 'status_sha256': sha(b'dirty'), 'check_sha256': sha(b''), 'check_exit': 0,

@@ -336,6 +336,20 @@ class RenewalTests(unittest.TestCase):
                 self.assertEqual(registry.inventory()['dispatch']['state'], 'open')
         self.assertEqual(self.renewal.ledger.inventory()['requests']['recorded-effect']['attempt_id'], self.effect)
 
+    def test_unsettled_general_checkpoint_defers_and_original_uuid_can_continue(self):
+        self.request(self.release('b', self.prior))
+        (self.root / 'unsettled-general-product-checkpoint').touch()
+        result = self.renewal.apply('agent')
+        self.assertEqual(result['phase'], 'deferred', result)
+        self.assertEqual(result['failure']['reason'], 'product continuation deferred: unsettled-general-checkpoint')
+        self.assertNotIn('activate', (self.root / 'site-events.jsonl').read_text())
+        role, logical, operation = 'development', 'one', 'continue-original'
+        uuid = self.sessions[role, logical]
+        evidence = self.renewal.role_turn({'operation': operation, 'role': role, 'job': 'product', 'logical_session': logical,
+                                           'session_uuid': uuid, 'request_sha256': r.sha(operation.encode())}, 'Continue original work')
+        self.assertEqual((evidence['state'], evidence['uuid']), ('completed-turn', uuid))
+        self.assertEqual(self.renewal.live_release(), self.prior)
+
     def test_authoritative_provider_escrow_must_cover_every_resume_and_rollback(self):
         target = self.release('b', self.prior)
         self.request(target)

@@ -19,6 +19,7 @@ sys.path.insert(0, str(INSTALL / 'tools'))
 import gptbox_runtime as gptbox
 import renewal as r
 from renewal import protocol as p
+from renewal_product import EXTERNAL, LOCAL, RECIPE, general_command, saved_validation
 from renewal_site import maintenance_readback, retained_maintenance
 
 ROOT = r.DEFAULT_ROOT
@@ -87,6 +88,11 @@ BASELINE_LIMITS = (
     'RuntimeMaxSec=18s', 'TimeoutStopSec=2s', 'KillMode=control-group',
     'MemoryMax=128M', 'TasksMax=8', 'LimitFSIZE=65536', 'UMask=0077',
 )
+WORK_DEFERRAL_REASONS = {
+    'current general job has no settled validation for its preserved source': 'unsettled-general-checkpoint',
+    'no bounded renewal test adapter for the saved local command': 'unsupported-general-validation',
+    'saved product checkpoint cannot complete the approved local continuation': 'failed-product-baseline',
+}
 
 
 def owned_file(path, limit, expected_uid=0):
@@ -186,7 +192,6 @@ def observe_maintenance_boot(component, context):
         run([PYTHON, '-EBs', str(INSTALL / 'tools' / 'platform_release_install.py'), '--reobserve-maintenance',
              '--platform-sha256', claim['platform_sha256'], '--site-config-sha256', site], timeout=400)
     maintenance_readback(ROOT, claim, boot)
-    return claim['oci_manifest_sha256']
 
 
 def release_action(action, payload):
@@ -255,9 +260,7 @@ def preflight_runtime(payload):
             'host_artifact_sha256': release['components']['host']['artifact_sha256']}
     if role == 'maintenance':
         spec['context_sha256'] = plan['maintenance_context_sha256']
-        digest = observe_maintenance_boot(spec['component'], spec['context_sha256'])
-        if digest is not None:
-            spec['oci_manifest_sha256'] = digest
+        observe_maintenance_boot(spec['component'], spec['context_sha256'])
         command = [script]
     else:
         r.require(job in plan['development_manifests'], 'approved development launch map omits a registered job')
@@ -281,7 +284,9 @@ def work_digest(data):
     return r.sha(data.rstrip(b'\n'))
 
 
-def product_command(role, recipe):
+def product_command(role, recipe, result=None):
+    if recipe == RECIPE:
+        return general_command(role, result, owned_file)
     choices = {'maintenance': ('checklist-persistence-readiness', MAINTENANCE_TASK),
                'development': ('checklist-backup-restore', DEVELOPMENT_TASK)}
     r.require(role in choices and choices[role][0] == recipe, 'unapproved continuation recipe')
@@ -304,22 +309,28 @@ def product_plan(payload):
     r.token(job)
     raw = owned_file(ROOT / 'product-jobs' / 'jobs' / job / 'plan.json', r.MAX_CONTROL)
     approved = plan(raw)
-    r.require(approved['adapter'] == 'checklist-quadlet' and approved['job_id'] == job and
+    r.require(approved['adapter'] in ('checklist-quadlet', LOCAL, EXTERNAL) and approved['job_id'] == job and
               agreement_sha(approved) == payload['binding']['agreement_sha256'],
               'active product plan has no approved continuation adapter')
-    return r.sha(raw)
+    return approved, r.sha(raw)
 
 
-def baseline_command(account, action):
-    return [SYSTEMD_RUN, '--quiet', '--wait', '--pipe', '--collect', '--uid=' + account, '--gid=' + account,
-            *('--property=' + limit for limit in BASELINE_LIMITS), '--', PYTHON, '-IB', '-c', BASELINE_TASK, *action]
+def baseline_command(account, action, workspace=None):
+    command = [SYSTEMD_RUN, '--quiet', '--wait', '--pipe', '--collect', '--uid=' + account, '--gid=' + account,
+               *('--property=' + limit for limit in BASELINE_LIMITS)]
+    if workspace is None:
+        return [*command, '--', PYTHON, '-IB', '-c', BASELINE_TASK, *action]
+    return [*command, '--property=BindReadOnlyPaths=' + str(workspace) + ':/work/job',
+            '--property=WorkingDirectory=/work/job', '--', *action]
 
 
-def product_baseline(account, action, source):
+def product_baseline(account, action, source=None, *, workspace=None):
+    r.require((source is None) != (workspace is None), 'baseline requires one exact approved input')
     with tempfile.TemporaryFile() as data, tempfile.TemporaryFile() as evidence:
-        data.write(source)
-        data.seek(0)
-        completed = subprocess.run(baseline_command(account, action), stdin=data, stdout=evidence,
+        if source is not None:
+            data.write(source)
+            data.seek(0)
+        completed = subprocess.run(baseline_command(account, action, workspace), stdin=data, stdout=evidence,
                                    stderr=subprocess.DEVNULL, timeout=25, check=False,
                                    env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'})
         evidence.seek(0)
@@ -336,14 +347,9 @@ def capture_work(payload):
     directory = ROOT / role / 'workspaces' / job
     uid = r.pwd.getpwnam(account).pw_uid
     owned_dir(directory, uid)
-    approval = product_plan(payload)
-    source = owned_file(directory / APP, 65536, uid)
-    expected = product_result(role, r.sha(source))
-    observed = product_baseline(account, product_command(role, expected['recipe']), source)
-    r.require(observed == expected and owned_file(directory / APP, 65536, uid) == source,
-              'saved product checkpoint is failing or changed during the baseline')
+    plan, approval = product_plan(payload)
 
-    def git(command, accepted):
+    def read_as_role(command, accepted):
         result = subprocess.run([RUNUSER, '--user', account, '--', *command], cwd=directory,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10, check=False,
                                 env={'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'GIT_CONFIG_NOSYSTEM': '1', 'HOME': '/nonexistent'})
@@ -351,10 +357,26 @@ def capture_work(payload):
         result.stdout.decode('utf-8')
         return result.returncode, result.stdout
 
-    _, head = git((*GIT, 'rev-parse', '--verify', 'HEAD'), (0,))
-    _, status = git(STATUS, (0,))
-    code, check = git(CHECK, (0, 2))
-    return {'head': head.decode().strip(), 'status_sha256': work_digest(status),
+    _, head = read_as_role((*GIT, 'rev-parse', '--verify', 'HEAD'), (0,))
+    _, status = read_as_role(STATUS, (0,))
+    code, check = read_as_role(CHECK, (0, 2))
+    revision = head.decode().strip()
+    if plan['adapter'] == 'checklist-quadlet':
+        source = owned_file(directory / APP, 65536, uid)
+        expected = product_result(role, r.sha(source))
+        observed = product_baseline(account, product_command(role, expected['recipe']), source)
+        r.require(owned_file(directory / APP, 65536, uid) == source, 'saved product source changed during the baseline')
+    else:
+        expected = saved_validation(ROOT, payload, plan, revision, status, owned_file)
+        observed = product_baseline(account, product_command(role, RECIPE, expected), workspace=directory)
+        r.digest(observed['source_sha256'])
+        p.number(observed['test_count'], int(role == 'development'), 100000)
+        if not expected['dirty'] and expected['validated_snapshot_sha256'] is not None:
+            r.require(observed['source_sha256'] == expected['validated_snapshot_sha256'],
+                      'clean general source no longer matches the exact accepted local test')
+        expected.update(source_sha256=observed['source_sha256'], test_count=observed['test_count'])
+    r.require(observed == expected, 'saved product checkpoint is failing or changed during the baseline')
+    return {'head': revision, 'status_sha256': work_digest(status),
             'check_sha256': work_digest(check), 'check_exit': code, 'product_plan_sha256': approval,
             'product_result': observed}
 
@@ -370,8 +392,9 @@ def stage_verification(payload):
     checkpoint = payload['checkpoint']['checkpoint_id']
     r.require(payload['work']['head'] == payload['candidate_sha'], 'recorded checkpoint is not the saved workspace HEAD')
     recipe = payload['work']['product_result']['recipe']
-    command = product_command(role, recipe)
-    next_state = 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job'
+    result = payload['work']['product_result']
+    command = product_command(role, recipe, result)
+    next_state = r.next_product_state(result, payload['pending_host'])
     prompt = (f'Resume this product job at checkpoint {checkpoint}. Run exactly this one bounded local test in /work/job '
               'using the command tool. Keep the checkout unchanged. The test uses no network, host actions, or live app data.\n'
               f'{shlex.join(command)}\n'
@@ -438,7 +461,7 @@ def verify_progress(events, payload):
     observed = None
     work = payload['work']
     expected = work['product_result']
-    planned = product_command(payload['role'], expected['recipe'])
+    planned = product_command(payload['role'], expected['recipe'], expected)
     for line in events.splitlines():
         row = r.loads(line)
         item = row.get('item', {})
@@ -460,7 +483,7 @@ def verify_progress(events, payload):
     fenced = re.fullmatch(r'```(?:json)?\s*([^`]+)\s*```', final, re.DOTALL)
     progress = r.loads(fenced[1].strip() if fenced else final)
     required = {'operation': payload['operation'], 'checkpoint': payload['checkpoint']['checkpoint_id'],
-                'recipe': expected['recipe'], 'next_state': 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job'}
+                'recipe': expected['recipe'], 'next_state': r.next_product_state(expected, payload['pending_host'])}
     r.require(progress == required, 'resumed product progress is stale or changes the approved next step')
     return {'schema': 1, 'operation': required['operation'], 'checkpoint': payload['checkpoint'],
             'plan_sha256': work['product_plan_sha256'], 'result': observed, 'next_state': required['next_state'],
@@ -838,7 +861,12 @@ def main():
         elif action == 'preflight-runtime':
             result = preflight_runtime(payload)
         elif action == 'capture-work':
-            result = capture_work(payload)
+            try:
+                result = capture_work(payload)
+            except ValueError as error:
+                if str(error) not in WORK_DEFERRAL_REASONS:
+                    raise
+                result = {'deferred': WORK_DEFERRAL_REASONS[str(error)]}
         elif action == 'verify-sessions':
             result = verify_sessions(payload)
         elif action == 'verify-managed-probe':

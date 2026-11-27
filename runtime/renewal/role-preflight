@@ -27,22 +27,12 @@ def maintenance(spec):
     component = spec['component']
     app = gptbox.Gptbox(run=gptbox.Commands())
     app.preflight()
-    app.uid = str(r.pwd.getpwnam('dp-maint').pw_uid)
-    app.wrapper = str(app.protected(Path(gptbox.CONTROL) / 'bin' / 'podman'))
+    r.require(app.path(gptbox.STATE + '/prepared').exists(), 'protected maintenance host is not prepared')
     app.target = gptbox.ROOT + '/' + context
-    app.unit = 'dev-pair-gptbox-' + context + '.service'
-    app.configure_executor(app.uid, gptbox.CONTROL)
     with app.lock():
-        row, = r.loads(app.engine('image', 'inspect', component['artifact_sha256'], timeout=20))
-    labels = row.get('Labels') or row['Config']['Labels']
-    expected = {'dev-pair.role': 'maintenance', 'dev-pair.context': context, 'dev-pair.standards': r.STANDARDS,
-                'dev-pair.distrobox': gptbox.DBX_SHA, 'org.opencontainers.image.revision': component['source_revision'],
-                'dev-pair.codex.version': component['codex_version']}
-    r.require(gptbox.image_id(row['Id']) == component['artifact_sha256'] and
-              (row['Os'], row['Architecture']) == ('linux', 'amd64') and
-              all(labels.get(key) == value for key, value in expected.items()), 'maintenance artifact is unavailable or incompatible')
-    if 'oci_manifest_sha256' in spec:
-        r.require(row.get('Digest') == 'sha256:' + spec['oci_manifest_sha256'], 'maintenance OCI manifest readback changed')
+        version = app.admitted_maintenance_image(context, component['source_revision'], component['artifact_sha256'],
+                                                 component.get('platform_sha256'))
+    r.require(version == component['codex_version'], 'maintenance artifact has a different admitted Codex version')
 
 
 def development_inputs(inputs, device, archive_bytes, owner=0):

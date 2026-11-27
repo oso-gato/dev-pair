@@ -31,6 +31,7 @@ MAX_SESSIONS = 16
 MAX_ATTEMPTS = 32
 MIN_FREE_BYTES = 8 * 1024 ** 3
 CONTINUITY_REQUESTS = 2  # Model requests the one test tool and then consumes its result.
+WORK_DEFERRALS = {'unsettled-general-checkpoint', 'unsupported-general-validation', 'failed-product-baseline'}
 MAX_TARGET_ATTEMPTS = 3
 RETRY_DELAY = 30
 DEFAULT_ROOT = Path('/var/lib/dev-pair')
@@ -51,6 +52,14 @@ def role_operation_key(role, job, operation):
     token(job)
     token(operation)
     return 'turn-' + identity([role, job, operation])
+
+
+def next_product_state(result, pending):
+    if pending:
+        return 'retain-pending-host-check'
+    if result.get('recipe') == 'devbox-local-validation-inputs':
+        return result['validation_phase']
+    return 'continue-approved-job'
 
 
 def diagnostic(error):
@@ -964,16 +973,20 @@ class Renewal:
         deadline = int(time.time()) + 360 * len(inventory['sessions']) + 240
         keys = ('target_sha256', 'previous_sha256')
         work = {}
+        for selector in keys:
+            self.runtime_readiness(state, state['request'][selector], registries)
         for key in registries:
             role, job = key.split('/')
-            for selector in keys:
-                reference = state['request'][selector]
-                plan = self.driver.invoke('preflight-runtime', {**self.payload(state, reference), 'role': role, 'job': job})
-                require(plan == {'role': role, 'job': job, 'artifact_sha256':
-                                 self.release(reference)['components'][role + '-agent']['artifact_sha256']},
-                        'role artifact preflight identity changed')
             binding = registries[key].meta['binding']
-            proof = self.driver.invoke('capture-work', {'role': role, 'job': job, 'binding': binding})
+            _, _, checkpoint = self.ledger.checkpoint(job)
+            require(protocol.identity(checkpoint) == inventory['registries'][key]['checkpoint']['checkpoint_sha256'],
+                    'product checkpoint changed after backup')
+            sessions = [{'logical_session': item['logical_session'], 'uuid': item['provider_uuid']} for item in inventory['sessions']
+                        if item['role'] == role and item['job'] == job]
+            proof = self.driver.invoke('capture-work', {'role': role, 'job': job, 'binding': binding, 'checkpoint': checkpoint,
+                                                        'sessions': sessions})
+            if type(proof) is dict and set(proof) == {'deferred'} and proof['deferred'] in WORK_DEFERRALS:
+                raise ValueError('product continuation deferred: ' + proof['deferred'])
             protocol.fields(proof, 'head status_sha256 check_sha256 check_exit product_plan_sha256 product_result')
             protocol.digest(proof['head'], 40)
             for field in ('status_sha256', 'check_sha256', 'product_plan_sha256'):
@@ -1028,7 +1041,7 @@ class Renewal:
             work = payload['work']
             action = {'schema': 1, 'operation': operation, 'checkpoint': payload['checkpoint'],
                       'plan_sha256': work['product_plan_sha256'], 'result': work['product_result'],
-                      'next_state': 'retain-pending-host-check' if payload['pending_host'] else 'continue-approved-job',
+                      'next_state': next_product_state(work['product_result'], payload['pending_host']),
                       'pending_host': payload['pending_host']}
             self.check_proof(proof, {**spec, 'request_sha256': state['continuity_requests'][operation],
                                    'work_sha256': identity(work), 'product': action}, reference)
@@ -1202,12 +1215,7 @@ class Renewal:
             return state
 
     def rollback_readiness(self, state, previous, inventory, registries):
-        for key in registries:
-            role, job = key.split('/')
-            selected = self.release(previous)['components'][role + '-agent']
-            proof = self.driver.invoke('preflight-runtime', {**self.payload(state, previous), 'role': role, 'job': job})
-            require(proof == {'role': role, 'job': job, 'artifact_sha256': selected['artifact_sha256']},
-                    'fallback role artifact identity changed')
+        self.runtime_readiness(state, previous, registries)
         if 'continuity_funds' not in state:
             return  # In-progress legacy journals already have their separately checked protected grants.
         totals = {}
@@ -1226,6 +1234,16 @@ class Renewal:
             require(approval['job'] == job and approval['allowance_sha256'] == allowance and
                     type(approval['remaining_microusd']) is int and approval['remaining_microusd'] >= total,
                     'authoritative fallback budget cannot cover recovery')
+
+    def runtime_readiness(self, state, reference, registries):
+        payload = self.payload(state, reference)
+        jobs = [('maintenance', 'gptbox-probe')]
+        jobs.extend(('development', key.split('/')[1]) for key in registries if key.startswith('development/'))
+        for role, job in jobs:
+            selected = payload['release']['components'][role + '-agent']
+            proof = self.driver.invoke('preflight-runtime', {**payload, 'role': role, 'job': job})
+            require(proof == {'role': role, 'job': job, 'artifact_sha256': selected['artifact_sha256']},
+                    'role artifact preflight identity changed')
 
 
 def main():
