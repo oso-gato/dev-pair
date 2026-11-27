@@ -98,7 +98,15 @@ class OwnerIntakeTests(unittest.TestCase):
     @staticmethod
     def request(repo=REPOSITORIES[0]):
         return {'action': 'draft', 'repository': repo, 'brief': 'Repair persistence for returning checklist users.',
-                'acceptance': 'The same completed item appears once after restart.', 'constraints': 'Preserve existing data.'}
+                'acceptance': 'The same completed item appears once after restart.', 'constraints': 'Preserve existing data.',
+                'audience': 'Existing checklist users.', 'access': 'Keep current private permissions and item ownership.',
+                'workload': intake.CHECKLIST, 'external_validation': ''}
+
+    def next_recovery(self, worker, job):
+        saved = worker.record(job)
+        saved['recovery']['after'] = 0
+        worker.save(job, saved)
+        return worker.reconcile()
 
     def test_previews_actual_git_commit_and_uses_another_reviewed_slot_for_another_repo(self):
         with mock.patch.object(intake.candidate, 'invoke', wraps=intake.candidate.invoke) as invoke:
@@ -141,7 +149,10 @@ class OwnerIntakeTests(unittest.TestCase):
 
         def run_command(command, deadline, **options):
             if command[0] == intake.SYSTEMCTL:
-                starts.append(command[-1])
+                unit = command[-1]
+                starts.append(unit)
+                if starts.count(unit) == 1:
+                    raise OSError('Scheduling was temporarily unavailable.')
                 return b''
             if 'approve-job' in command:
                 args = dict(zip(command[4::2], command[5::2]))
@@ -164,8 +175,9 @@ class OwnerIntakeTests(unittest.TestCase):
             self.assertEqual(startup, draft['preview']['plan']['startup_sha256'])
             saved_profiles.append((role, profile))
 
-        def acquire(role, job_id, account, agreement, tree, bundle):
+        def acquire(role, job_id, account, agreement, tree, bundle, *, checklist):
             self.assertEqual(job_id, job)
+            self.assertTrue(checklist)
             self.assertEqual(agreement['initial_commit'], self.settings[REPOSITORIES[0]]['commit'])
             self.assertTrue(bundle.startswith(b'# v2 git bundle\n') or bundle.startswith(b'# v3 git bundle\n'))
             observed = self.root / (role + '.bundle')
@@ -188,7 +200,9 @@ class OwnerIntakeTests(unittest.TestCase):
                 mock.patch.object(product, 'source_approval',
                                   side_effect=lambda value: self.assertEqual(value, draft['preview']['plan'])), \
                 mock.patch.dict(sys.modules, {'provider_broker': SimpleNamespace(load_allowance=verify_allowance)}):
-            self.intake.confirm(job, draft['agreement_token'])
+            accepted = self.intake.confirm(job, draft['agreement_token'])
+            self.assertEqual(accepted['phase'], 'confirmed')
+            self.assertIn('Waiting to schedule', accepted['diagnostics'])
             # A fresh worker reads the saved agreement after the front-door
             # invocation has returned, and hands off to the real J submit path.
             with contextlib.ExitStack() as installed:
@@ -197,13 +211,33 @@ class OwnerIntakeTests(unittest.TestCase):
                 installed.enter_context(mock.patch.object(worker, 'slot', self.intake.slot))
                 installed.enter_context(mock.patch.object(worker, 'stage_role', side_effect=stage_seed))
                 installed.enter_context(mock.patch.object(worker, 'acquire_role', side_effect=acquire))
+                self.assertEqual(self.next_recovery(worker, job), 0)
+                self.assertEqual(worker.prepare(job), 75)
+                self.assertIn('Product plan is durable', worker.status(job)['diagnostics'])
+                published = product.job_path(job) / 'plan.json'
+                initial = published.read_bytes()
+                original_node = published.stat().st_ino
+                self.assertEqual(self.next_recovery(worker, job), 0)
                 outcome = worker.prepare(job)
                 self.assertEqual(outcome, 0, worker.status(job)['diagnostics'])
                 self.assertEqual(worker.status(job)['phase'], 'submitted')
                 self.assertEqual(worker.prepare(job), 0)
-        self.assertEqual(starts, ['dev-pair-intake@job-a.service', 'dev-pair-product@job-a.service'])
+                self.assertEqual(published.stat().st_ino, original_node)
+                self.assertEqual(published.read_bytes(), initial)
+                with mock.patch.object(intake, 'boot_id', return_value='00000000-0000-4000-8000-000000000001'):
+                    self.assertEqual(worker.reconcile(), 0)
+                    self.assertEqual(worker.prepare(job), 0)
+                terminal = product.read_state(product.job_path(job))
+                terminal['phase'] = 'blocked'
+                product.durable_json(product.job_path(job) / 'state.json', terminal)
+                with mock.patch.object(intake, 'boot_id', return_value='00000000-0000-4000-8000-000000000002'):
+                    self.assertEqual(worker.reconcile(), 0)
+        self.assertEqual(starts, ['dev-pair-intake@job-a.service', 'dev-pair-intake@job-a.service',
+                                  'dev-pair-product@job-a.service', 'dev-pair-intake@job-a.service',
+                                  'dev-pair-product@job-a.service', 'dev-pair-intake@job-a.service',
+                                  'dev-pair-product@job-a.service'])
         self.assertEqual([role for role, _ in saved_profiles], list(intake.ROLES))
-        self.assertEqual(product.read_state(product.job_path(job))['phase'], 'submitted')
+        self.assertEqual(product.read_state(product.job_path(job))['phase'], 'blocked')
         self.assertEqual(product.plan((product.job_path(job) / 'plan.json').read_bytes()), draft['preview']['plan'])
 
     def test_local_bundle_initializes_two_clean_role_checkouts_and_preserves_dirty_work(self):
@@ -245,12 +279,107 @@ class OwnerIntakeTests(unittest.TestCase):
         brief_path.write_text('Keep one completed item after a restart.')
         expected = {'job_id': 'job-a', 'phase': 'awaiting-confirmation', 'agreement_token': 'f' * 64,
                     'preview': self.intake.draft(self.request())['preview'], 'diagnostics': None}
-        with mock.patch.object(client.subprocess, 'run', return_value=SimpleNamespace(stdout=p.canonical(expected).encode())) as run, \
+        with mock.patch.object(client.subprocess, 'run', return_value=SimpleNamespace(
+                stdout=p.canonical(expected).encode(), returncode=0)) as run, \
              mock.patch.object(client.sys, 'argv', ['dev-pair', 'draft', REPOSITORIES[0], '--brief-file', str(brief_path),
-                                                    '--acceptance', 'One completed item']), \
+                                                    '--acceptance', 'One completed item', '--workload', intake.CHECKLIST,
+                                                    '--audience', 'Current users', '--access', 'Existing private access']), \
              mock.patch('sys.stdout', new_callable=io.StringIO) as output:
             self.assertEqual(client.main(), 0)
         self.assertEqual(run.call_args.args[0], client.COMMAND)
         self.assertEqual(p.loads(run.call_args.kwargs['input'])['brief'], brief_path.read_text())
         self.assertNotIn(str(brief_path), str(run.call_args))
         self.assertIn('Confirm when ready with dev-pair submit job-a', output.getvalue())
+
+    def test_slot_selection_skips_expired_authority_and_retained_job(self):
+        retained = product.job_path('job-b')
+        retained.mkdir()
+        sentinel = retained / 'retained.txt'
+        sentinel.write_text('Keep this previous job.')
+
+        def slot(job, manifest):
+            if job == 'job-a':
+                raise ValueError('The approved provider allowance expired.')
+            return self.slot(job, manifest)
+
+        self.intake.slot.side_effect = slot
+        draft = self.intake.draft(self.request())
+        self.assertEqual(draft['job_id'], 'job-c')
+        self.assertEqual([call.args[0] for call in self.intake.slot.call_args_list], ['job-a', 'job-c'])
+        self.assertEqual(sentinel.read_text(), 'Keep this previous job.')
+
+    def test_agreement_and_repeat_confirmation_render_the_protected_blocked_record(self):
+        client = public_client()
+        draft = self.intake.draft(self.request())
+        job, token = draft['job_id'], draft['agreement_token']
+        self.intake.block(job, self.intake.record(job), 'Selected role layout is unavailable.')
+
+        def protected(command, *, input, stdout, check):
+            result = io.StringIO()
+            previous_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(intake, 'Intake', return_value=self.intake), \
+                        mock.patch.object(intake.os, 'geteuid', return_value=0), \
+                        mock.patch.dict(intake.os.environ, {'SUDO_USER': 'core'}), \
+                        mock.patch.object(intake.sys, 'argv', [intake.__file__]), \
+                        mock.patch.object(intake.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(input))), \
+                        contextlib.redirect_stdout(result):
+                    code = intake.main()
+            finally:
+                os.umask(previous_umask)
+            self.assertEqual(command, client.COMMAND)
+            return SimpleNamespace(returncode=code, stdout=result.getvalue().encode())
+
+        with mock.patch.object(client.subprocess, 'run', side_effect=protected):
+            for argv, code in ((['agreement', job], 0), (['submit', job, token], 2)):
+                with self.subTest(action=argv[0]), mock.patch.object(client.sys, 'argv', ['dev-pair', *argv]), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(client.main(), code)
+                    self.assertIn('Job job-a · blocked', output.getvalue())
+                    self.assertIn('Selected role layout is unavailable.', output.getvalue())
+                    if argv[0] == 'agreement':
+                        self.assertIn('The same completed item appears once after restart.', output.getvalue())
+
+    def test_ambiguous_sharing_draft_asks_about_access_and_refuses_empty_acceptance(self):
+        client = public_client()
+        with mock.patch.object(client.sys, 'argv', ['dev-pair', 'start', REPOSITORIES[0]]), \
+                mock.patch.object(client.sys, 'stdin', SimpleNamespace(isatty=lambda: True)), \
+                mock.patch('builtins.input', side_effect=['Let the team share checklists.', 'Team members', 'Creators may share', '']) as answers, \
+                mock.patch.object(client, 'query') as query, contextlib.redirect_stderr(io.StringIO()) as error:
+            self.assertEqual(client.main(), 2)
+        query.assert_not_called()
+        self.assertIn('Who may share', answers.call_args_list[2].args[0])
+        self.assertIn('Describe acceptance', error.getvalue())
+        with self.assertRaisesRegex(ValueError, 'Owner input is missing'):
+            self.intake.draft(dict(self.request(), acceptance=''))
+
+    def test_general_authorized_git_draft_binds_requested_local_and_external_validation(self):
+        repo = REPOSITORIES[1]
+        acquired = self.site / 'repositories' / repo / 'acquired'
+        self.git(acquired, 'rm', 'examples/checklist/checklist.py')
+        (acquired / 'product.txt').write_text('Shared note fixture.\n')
+        self.git(acquired, 'add', 'product.txt')
+        self.git(acquired, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'note')
+        self.settings[repo].update(commit=self.git(acquired, 'rev-parse', 'HEAD').decode().strip(),
+                                   workloads=['general-development', intake.EXTERNAL_PENDING])
+        (self.site / 'repositories.json').write_text(p.canonical(
+            {'schema': 1, 'repositories': self.settings, 'slots': list(MANIFESTS)}))
+        stock_plan = product.plan
+
+        def installed_plan(raw):
+            value = p.loads(raw)
+            self.assertEqual(value['adapter'], 'devbox-development-needs-host')
+            # Exercise the optional adapter at the product boundary even on
+            # the baseline checkout where the generic J worker isn't merged.
+            return stock_plan(p.canonical(dict(value, adapter='checklist-quadlet'))) | {'adapter': value['adapter']}
+
+        with mock.patch.object(product, 'plan', side_effect=installed_plan):
+            draft = self.intake.draft(dict(self.request(repo), brief='Let the team share notes.',
+                workload=intake.EXTERNAL_PENDING, external_validation='Observe access through the private gateway.',
+                audience='Signed-in team members.', access='Only the author can publish. Members may view.',
+                acceptance='A second member can read one note shared by the author.'))
+        agreement = draft['preview']['product_agreement']
+        self.assertEqual(agreement['external_validation'], 'Observe access through the private gateway.')
+        self.assertIn('Only the author can publish.', draft['preview']['plan']['agreement']['brief'])
+        self.assertIn('A second member can read one note', draft['preview']['plan']['agreement']['brief'])
+        self.assertNotIn('Quadlet', draft['preview']['plan']['agreement']['brief'])

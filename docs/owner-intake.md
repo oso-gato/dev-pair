@@ -11,17 +11,31 @@ For a multiline brief, give the command a local file. Include a known
 acceptance criterion and data limits when they matter.
 
 ```sh
-dev-pair start owner/approved-repository --brief-file brief.txt --acceptance 'The same completed item appears once after restart.' --constraints 'Keep existing data and item IDs.'
+dev-pair start owner/approved-repository --brief-file brief.txt \
+  --audience 'People who already use the private checklist' \
+  --access 'Existing users retain current access and item ownership' \
+  --acceptance 'The same completed item appears once after restart' \
+  --constraints 'Keep existing data and item IDs' \
+  --workload checklist-persistence
 ```
 
-The entry asks for the brief when one is missing. If an additional acceptance
-criterion is missing in an interactive session, it offers the fixed checklist
-persistence criterion alongside the brief. The preview shows the exact
-repository and starting commit, destination, scope, criteria, data constraints,
-startup policy, time and provider limits. Answer yes once to confirm the
-displayed agreement. Use `dev-pair draft` to save the preview for later
-confirmation. The preview prints the exact confirmation command with the job
-ID and digest.
+The command asks for missing product decisions before it makes a draft. Give
+the intended users, who may act or access affected data, and a result those
+users should be able to observe. Include those answers in flags or use the
+lines `Users:`, `Access:` and `Acceptance:` in the brief. The preview shows
+those answers alongside the exact repository, starting commit, delivery
+destination, validation scope, startup policy and limits. Answer yes once
+to confirm the displayed agreement. Use `dev-pair draft` to save it for later
+confirmation. The preview prints its job ID and confirmation digest.
+
+Select the validation path that fits the outcome and is approved for the
+repository. `checklist-persistence` repairs restart persistence in the
+existing app with its access and sharing policy preserved.
+`general-development` runs authorized development and tests in the confined
+DevBox. Use `general-with-external-validation` and describe the additional
+check with `--external-validation` when full acceptance needs a boundary
+beyond DevBox. DevBox work can proceed, and the external check remains
+pending until that boundary has an admitted adapter.
 
 ```sh
 dev-pair submit JOB AGREEMENT_SHA256
@@ -31,17 +45,17 @@ dev-pair agreement JOB
 ```
 
 Save the job ID before disconnecting. Preparation and product work run in
-detached services and publish durable state. Reattach reads the same job,
-reports progress while preparation runs and follows the normal product
-conductor after submission. It shows recorded role session IDs and native
-attempt IDs when available. If a host reboot interrupted scheduling, the same
-confirmation can request a restart of the same job. Repeat confirmations keep
-the original agreement. Use a new draft for a materially different brief.
+detached services and publish durable state. Reattach reads the same job
+and shows recorded role session IDs and validation evidence as it becomes
+available. A confirmed job whose scheduling was interrupted is retried within
+fixed bounds, including after host restart. Recovery reuses the confirmed
+plan and original role inputs. The saved agreement and diagnostics remain
+readable when preparation stops. Use a new draft for a materially different
+brief.
 
-The current adapter exercises checklist restart persistence. Additional
-product criteria need their own evidence before delivery. The job uses the
-controlled private release process. The [product loop](product-job.md) owns
-the workspace changes, fixed host tests, candidate repair and role registrations.
+The [product loop](product-job.md) owns workspace changes, scoped tests,
+candidate repair and role registration. The controlled private release
+process remains the delivery path.
 
 ## Install the intake once
 
@@ -54,7 +68,16 @@ root ownership and protected ancestors.
 | [Protected entry](../tools/owner_intake.py) | `/usr/libexec/dev-pair/tools/owner_intake.py` mode 0755, alongside the existing trusted Python components |
 | [Scoped sudoers rule](../runtime/product-job/dev-pair-owner.sudoers) | `/etc/sudoers.d/60-dev-pair-owner` mode 0440, admitted by `visudo` |
 | [Preparation service](../runtime/product-job/dev-pair-intake@.service) | `/etc/systemd/system/dev-pair-intake@.service` mode 0644 |
+| [Scheduling recovery service](../runtime/product-job/dev-pair-intake-recovery.service) and [timer](../runtime/product-job/dev-pair-intake-recovery.timer) | Matching filenames under `/etc/systemd/system`, mode 0644 |
 | [Private directories](../runtime/product-job/dev-pair-intake.conf) | `/etc/tmpfiles.d/dev-pair-intake.conf` mode 0644 |
+
+Enable `dev-pair-intake-recovery.timer` as part of controlled installation
+after the configured role and product roots are present. The timer observes
+only confirmed jobs from the bounded intake catalogue. A job has up to eight
+schedule attempts and four preparation attempts. A confirmed job with an
+acknowledged product start can recover once per boot while its durable
+product state is eligible. Terminal jobs and jobs whose normal conductor
+has exhausted automatic retries stay available for inspection.
 
 The named operator rule invokes the fixed entry with zero command-line
 arguments. The entry accepts a bounded stdin request containing the
@@ -85,15 +108,19 @@ a freshly approved logical ID and manifest.
 Keep the following under `/etc/dev-pair/product-intake` in root custody. The
 catalogue `repositories.json` has schema 1 and the fields `schema`,
 `repositories` and `slots`. The repository map binds each allowed
-`owner/repository` to its exact Git `commit`, `startup_revision` and
-human-readable private `destination`. The slots list gives the allocation
-order for unused job IDs in the approved renewal plan.
+`owner/repository` to its exact Git `commit`, `startup_revision`,
+human-readable private `destination` and optional list of approved
+`workloads`. Existing entries without that list keep the checklist workload
+they were configured for. The slots list gives the allocation order for
+unused job IDs in the approved renewal plan. Intake skips slots with active
+or retained job data, missing layout authority or an expired allowance.
 
 For each repository, place protected Git checkouts at
 `repositories/OWNER/REPOSITORY/acquired` and
 `repositories/OWNER/REPOSITORY/startup`. The acquired checkout comes from the
-approved GitHub origin at the configured commit and contains the source used
-by the checklist adapter. The startup checkout supplies the repository's
+approved GitHub origin at the configured commit. Repositories approved for
+the checklist workload also contain that adapter's application source.
+The startup checkout supplies the repository's
 reviewed project documents at the configured revision. Place the verified
 private standards cache at `standards`. The existing startup loader verifies
 each repository's exact adoption and complete documents. At confirmation the

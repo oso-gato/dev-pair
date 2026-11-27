@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checklist_candidate as candidate
@@ -30,9 +31,22 @@ MODEL = 'gpt-6.2-sol'
 ROLES = {'maintenance': 'dp-maint', 'development': 'dp-dev'}
 MAX_INPUT = 8192
 MAX_SLOTS = 64
+QUEUE_ATTEMPTS = 8
+PREPARE_ATTEMPTS = 4
+RETRY_SECONDS = 30
+PREPARE_SECONDS = 300
 SEED_BYTES = 6 * 1024 * 1024
 SEED_ENTRIES = 10000
-STANDARD_CHECK = 'After a service restart, the same completed checklist item is present once with its original ID.'
+WORKLOADS = {'checklist-persistence': 'checklist-quadlet', 'general-development': 'devbox-development',
+             'general-with-external-validation': 'devbox-development-needs-host'}
+CHECKLIST = 'checklist-persistence'
+EXTERNAL_PENDING = 'general-with-external-validation'
+LEGACY_SCHEDULING_FAILURES = {
+    'Job preparation stopped. protected fixed command failed',
+    'Job preparation stopped. OSError',
+    'Job preparation stopped. TimeoutError',
+    'Job preparation stopped. FileNotFoundError',
+}
 REPOSITORY = re.compile(r'[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}')
 JOB = re.compile(r'[a-z0-9][a-z0-9-]{0,47}')
 
@@ -55,6 +69,14 @@ def owner_text(value, limit, *, optional=False):
     return value.strip()
 
 
+def boot_id():
+    return str(uuid.UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+
+
+class DispatchDeferred(Exception):
+    pass
+
+
 def checked_file(path, limit=p.MAX_MESSAGE):
     return candidate.protected_file(path, limit)
 
@@ -64,6 +86,20 @@ def fixed_git(checkout, *args, cap=8192, data=None):
                              'GIT_NO_LAZY_FETCH=1', 'GIT_NO_REPLACE_OBJECTS=1', 'GIT_TERMINAL_PROMPT=0',
                              *candidate.GIT, '-C', str(checkout), *args],
                             time.monotonic() + 15, cap=cap, data=data)
+
+
+def verify_acquired_git(git, checkout, approval, *, checklist):
+    repo, commit, tree = (approval[key] for key in ('repository', 'acquired_commit', 'acquired_tree'))
+    if checklist:
+        candidate.approved_source(git, checkout, approval, commit)
+        return
+    origin = git('config', '--local', '--no-includes', '--get-all', 'remote.origin.url').decode().removesuffix('\n')
+    p.require(origin in (f'https://github.com/{repo}', f'https://github.com/{repo}.git', f'git@github.com:{repo}.git'),
+              'The checkout origin differs from the approved repository.')
+    p.require(git('rev-parse', '--show-toplevel').decode().removesuffix('\n') == str(checkout) and
+              git('rev-parse', '--verify', 'HEAD').decode().strip() == commit and
+              git('rev-parse', '--verify', commit + '^{tree}').decode().strip() == tree,
+              'The checkout differs from the approved Git acquisition.')
 
 
 def exact_private(path, data):
@@ -159,13 +195,18 @@ class Intake:
         p.require(len(set(map(job_id, slots))) == len(slots), 'The site catalogue repeats a job ID.')
         for repo, entry in repositories.items():
             repository_id(repo)
-            p.fields(entry, 'commit startup_revision destination')
+            p.fields(entry, 'commit startup_revision destination workloads' if 'workloads' in entry
+                     else 'commit startup_revision destination')
             p.digest(entry['commit'], 40)
             p.digest(entry['startup_revision'], 40)
             owner_text(entry['destination'], 250)
+            workloads = entry.get('workloads', [CHECKLIST])
+            p.require(type(workloads) is list and 0 < len(workloads) <= len(WORKLOADS) and
+                      all(type(item) is str and item in WORKLOADS for item in workloads) and len(set(workloads)) == len(workloads),
+                      'The approved repository workload policy is invalid.')
         return repositories, slots
 
-    def source(self, repository, config):
+    def source(self, repository, config, *, checklist=True):
         base = self.site / 'repositories' / repository
         checkout = protect_directory(base / 'acquired')
         startup = protect_directory(base / 'startup')
@@ -173,8 +214,9 @@ class Intake:
         commit = config['commit']
         tree = fixed_git(checkout, 'rev-parse', '--verify', commit + '^{tree}').decode().strip()
         p.digest(tree, 40)
-        candidate.approved_source(lambda *args, **kw: fixed_git(checkout, *args, **kw), checkout,
-                                  {'repository': repository, 'acquired_commit': commit, 'acquired_tree': tree}, commit)
+        verify_acquired_git(lambda *args, **kw: fixed_git(checkout, *args, **kw), checkout,
+                            {'repository': repository, 'acquired_commit': commit, 'acquired_tree': tree},
+                            checklist=checklist)
         cache = protect_directory(self.site / 'standards')
         corpus = load_private(startup, cache, config['startup_revision'], time.monotonic() + 20)
         return checkout, startup, cache, tree, p.sha256(manifest_bytes(corpus.manifest))
@@ -270,6 +312,7 @@ class Intake:
 
     def slot_unused(self, job):
         occupied = [self.catalogue / 'jobs' / job, self.catalogue / 'profiles' / job,
+                    self.queue / (job + '.plan'),
                     self.root / 'repository-approvals' / (job + '.json'),
                     self.root / 'repository-approvals' / job,
                     self.root / 'provider-allowances' / job,
@@ -283,42 +326,70 @@ class Intake:
                     return False
         return True
 
+    def unused_slot(self, repo, slots, admitted):
+        drafts, free = [], []
+        for job in slots:
+            if job not in admitted or not self.slot_unused(job):
+                continue
+            try:
+                existing = self.record(job)
+            except FileNotFoundError:
+                free.append(job)
+                continue
+            if existing['phase'] == 'awaiting-confirmation' and existing['plan']['agreement']['repository'] == repo:
+                drafts.append(job)
+        reasons = []
+        for job in drafts + free:
+            try:
+                return job, self.slot(job, admitted[job])
+            except (ValueError, OSError, RuntimeError, KeyError, TypeError) as exc:
+                reasons.append(product.h.bounded_diagnostic(str(exc)) if type(exc) is ValueError else type(exc).__name__)
+        suffix = ' ' + reasons[0] if reasons else ''
+        raise ValueError('No unused reviewed job slot is available for this repository.' + suffix)
+
     def draft(self, request):
-        p.fields(request, 'action repository brief acceptance constraints')
+        p.fields(request, 'action repository workload brief audience access acceptance constraints external_validation')
         repo = repository_id(request['repository'])
-        brief = owner_text(request['brief'], 2500)
-        acceptance = owner_text(request['acceptance'], 1000, optional=True) or STANDARD_CHECK
-        constraints = owner_text(request['constraints'], 500, optional=True)
+        workload = request['workload']
+        p.require(type(workload) is str and workload in WORKLOADS, 'Choose how this outcome should be validated.')
+        agreement = {'brief': owner_text(request['brief'], 1800),
+                     'audience': owner_text(request['audience'], 350),
+                     'access': owner_text(request['access'], 600),
+                     'acceptance': owner_text(request['acceptance'], 900),
+                     'constraints': owner_text(request['constraints'], 300, optional=True),
+                     'external_validation': owner_text(request['external_validation'], 500,
+                                                       optional=workload != EXTERNAL_PENDING),
+                     'repository': repo, 'workload': workload}
+        p.require(workload == EXTERNAL_PENDING or not agreement['external_validation'],
+                  'Choose general development with an external validation request for that check.')
         repositories, slots = self.catalogue_settings()
         p.require(repo in repositories, 'This repository is outside the approved site catalogue.')
         config = repositories[repo]
+        p.require(workload in config.get('workloads', [CHECKLIST]), 'This workload is outside the repository approval.')
+        agreement['destination'] = config['destination']
         with self.lock():
             _, release, admitted = self.release_slots()
-            free = None
-            for job in slots:
-                if job not in admitted or not self.slot_unused(job):
-                    continue
-                try:
-                    existing = self.record(job)
-                except FileNotFoundError:
-                    free = free or job
-                    continue
-                if existing['phase'] == 'awaiting-confirmation' and existing['plan']['agreement']['repository'] == repo:
-                    free = job
-                    break
-            p.require(free is not None, 'No unused reviewed job slot is available for this repository.')
-            job = free
-            settings, roles, _, seeds = self.slot(job, admitted[job])
-            _, _, _, tree, startup = self.source(repo, config)
+            job, (settings, roles, _, seeds) = self.unused_slot(repo, slots, admitted)
+            _, _, _, tree, startup = self.source(repo, config, checklist=workload == CHECKLIST)
             # The existing conductor receives these confirmed answers as its bounded brief.
-            lines = ['Owner brief', brief, 'Product acceptance', acceptance, 'Private delivery destination',
-                     config['destination'], 'Owner constraints', constraints or 'Use the confirmed site scope below.',
-                     'Site scope', 'Edit and test the approved repository. Run the bounded disposable checklist host check. '
-                                   'Use the reviewed release process for delivery.']
-            plan = product.plan(p.canonical({'schema': 1, 'job_id': job, 'adapter': 'checklist-quadlet',
-                'startup_sha256': startup, 'agreement': dict(repository=repo, initial_commit=config['commit'],
-                    brief='\n\n'.join(lines), **{key: settings[key] for key in ('host_seconds', 'build_seconds', 'turn_seconds')})}))
-            preview = {'plan': plan, 'source_tree': tree, 'startup_revision': config['startup_revision'],
+            lines = ['Owner brief', agreement['brief'], 'Intended users', agreement['audience'],
+                     'Access and data boundary', agreement['access'], 'Product acceptance', agreement['acceptance'],
+                     'Private delivery destination', config['destination'], 'Owner constraints',
+                     agreement['constraints'] or 'Use the confirmed site scope below.', 'Site scope']
+            if workload == CHECKLIST:
+                lines.append('Repair restart persistence in the existing checklist and preserve its access and sharing policy. '
+                             'Use the bounded checklist Quadlet check and the reviewed private release process.')
+            else:
+                lines.append('Edit and test the approved repository in confined DevBox. '
+                             'Use the reviewed private release process. Host and external operations require their own admitted adapter.')
+            if agreement['external_validation']:
+                lines.extend(['Requested external validation pending an admitted adapter', agreement['external_validation']])
+            value = {'schema': 1, 'job_id': job, 'adapter': WORKLOADS[workload], 'startup_sha256': startup,
+                     'agreement': dict(repository=repo, initial_commit=config['commit'], brief='\n\n'.join(lines),
+                                       **{key: settings[key] for key in ('host_seconds', 'build_seconds', 'turn_seconds')})}
+            plan = product.plan(p.canonical(value))
+            preview = {'plan': plan, 'product_agreement': agreement, 'source_tree': tree,
+                       'startup_revision': config['startup_revision'],
                        'standards_sha': p.STANDARDS, 'release_sha256': release, 'dev_manifest_sha256': admitted[job],
                        'site_profile_sha256': p.identity([settings, roles, seeds, config]),
                        'provider_microusd': settings['spend_microusd'], 'expires_unix': settings['expires_unix'],
@@ -336,50 +407,160 @@ class Intake:
             p.require(saved['agreement_token'] == token and p.identity(saved['preview']) == token,
                       'The agreement draft has changed. Review its exact new digest.')
             if saved['phase'] == 'awaiting-confirmation':
+                p.require('product_agreement' in saved['preview'],
+                          'Review a new draft with the intended users, access and observable acceptance before confirming.')
                 saved['phase'] = 'confirmed'
                 self.save(job, saved)
-        if saved['phase'] in ('confirmed', 'preparing'):
-            candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
-                             time.monotonic() + 10)
-        elif saved['phase'] == 'submitted':
-            product.submit(self.queue / (job + '.plan'))
+            self.schedule(job, saved, time.monotonic() + 10)
         return self.status(job)
+
+    def published(self, job, plan):
+        root = self.catalogue / 'jobs' / job
+        if not os.path.lexists(root):
+            return None
+        root = trusted_directory(root)
+        p.require(product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE)) == plan,
+                  'The published product plan differs from the confirmed agreement.')
+        state = product.read_state(root)
+        p.require(state['job_id'] == job and state['agreement_sha256'] == product.agreement_sha(plan) and
+                  state['repository'] == plan['agreement']['repository'] and state['startup_sha256'] == plan['startup_sha256'],
+                  'The published product state differs from the confirmed agreement.')
+        return state
+
+    def recovery(self, saved):
+        current = boot_id()
+        entry = saved.setdefault('recovery', dict(boot=current, after=0, queue_attempts=0, prepare_attempts=0))
+        if entry['boot'] != current:
+            entry.update(boot=current, after=0)
+        return entry
+
+    def block(self, job, saved, reason):
+        saved.update(phase='blocked', diagnostics=reason)
+        self.save(job, saved)
+
+    def schedule(self, job, saved, deadline):
+        if saved['phase'] == 'blocked' and 'recovery' not in saved and saved['diagnostics'] in LEGACY_SCHEDULING_FAILURES:
+            state = self.published(job, saved['plan'])
+            if state is None or state['phase'] != 'submitted':
+                return
+            product.source_approval(saved['plan'])
+            saved['phase'] = 'confirmed'
+        if saved['phase'] == 'submitted':
+            if saved.get('scheduled_boot') == boot_id():
+                return
+            state = self.published(job, saved['plan'])
+            p.require(state is not None, 'The acknowledged product plan is unavailable.')
+            if state['phase'] in product.TERMINAL or (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic')):
+                return
+        elif saved['phase'] not in ('confirmed', 'preparing'):
+            return
+        entry = self.recovery(saved)
+        now = int(time.monotonic())
+        if now < entry['after']:
+            return
+        if entry['queue_attempts'] >= QUEUE_ATTEMPTS or entry['prepare_attempts'] >= PREPARE_ATTEMPTS:
+            self.block(job, saved, 'Automatic scheduling recovery reached its limit. The confirmed plan and job evidence are retained.')
+            return
+        entry['queue_attempts'] += 1
+        entry['after'] = now + RETRY_SECONDS
+        self.save(job, saved)
+        try:
+            candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
+                             min(deadline, time.monotonic() + 5))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            saved['diagnostics'] = 'The agreement is confirmed. Waiting to schedule the same preparation service.'
+            self.save(job, saved)
+
+    def reconcile(self):
+        end = time.monotonic() + 20
+        queue = trusted_directory(self.queue)
+        for count, path in enumerate(queue.glob('*.json'), 1):
+            p.require(count <= MAX_SLOTS, 'The retained intake catalogue exceeds its bound.')
+            if time.monotonic() >= end:
+                break
+            job = job_id(path.stem)
+            with self.lock():
+                saved = self.record(job)
+                try:
+                    self.schedule(job, saved, end)
+                except (ValueError, OSError, RuntimeError, KeyError, TypeError) as exc:
+                    self.block(job, saved, 'Scheduling recovery stopped. ' + (
+                        product.h.bounded_diagnostic(str(exc)) if type(exc) is ValueError else type(exc).__name__))
+        return 0
 
     def status(self, job):
         saved = self.record(job)
         return {'job_id': job, 'phase': saved['phase'], 'agreement_token': saved['agreement_token'],
                 'preview': saved['preview'], 'diagnostics': saved['diagnostics']}
 
+    def observed(self, job, status=None):
+        status = self.status(job) if status is None else status
+        try:
+            downstream = self.published(job, status['preview']['plan'])
+            p.require(downstream is not None or status['phase'] != 'submitted', 'Product state is unavailable.')
+        except (OSError, ValueError, KeyError, TypeError):
+            if status['phase'] == 'submitted':
+                status.update(phase='blocked', diagnostics='The saved agreement is available. Product state is unavailable.')
+            return status
+        if downstream is not None:
+            if status['phase'] == 'submitted' and not status['diagnostics']:
+                status.update(downstream)
+            else:
+                status['product_phase'] = downstream['phase']
+                for field in ('maintenance', 'development', 'first', 'final', 'local_validation'):
+                    if field in downstream:
+                        status[field] = downstream[field]
+        return status
+
     def prepare(self, job):
         # The root-owned unit continues if the caller leaves immediately after confirmation.
         with self.lock():
             record = self.record(job)
-            if record['phase'] == 'submitted':
+            if record['phase'] == 'submitted' and record.get('scheduled_boot') == boot_id():
                 return 0
-            p.require(record['phase'] in ('confirmed', 'preparing'), 'The owner has not confirmed this agreement.')
+            p.require(record['phase'] in ('confirmed', 'preparing', 'submitted'), 'The owner has not confirmed this agreement.')
+            entry = self.recovery(record)
+            if entry['prepare_attempts'] >= PREPARE_ATTEMPTS:
+                self.block(job, record, 'Automatic preparation reached its limit. The confirmed plan and job evidence are retained.')
+                return 2
+            entry['prepare_attempts'] += 1
+            entry['after'] = int(time.monotonic()) + PREPARE_SECONDS + RETRY_SECONDS
             record['phase'] = 'preparing'
             self.save(job, record)
         try:
             self.stage(job, record)
-        except BlockingIOError:
-            return 75
-        except (OSError, ValueError, RuntimeError, KeyError, ImportError, subprocess.SubprocessError) as exc:
-            if str(exc) in ('role dispatch frozen by renewal', 'role dispatch frozen pending host observation'):
-                return 75
+        except (OSError, ValueError, RuntimeError, KeyError, ImportError, subprocess.SubprocessError, DispatchDeferred) as exc:
+            deferred = isinstance(exc, (BlockingIOError, DispatchDeferred)) or str(exc) in (
+                'role dispatch frozen by renewal', 'role dispatch frozen pending host observation')
             with self.lock():
-                record['phase'] = 'blocked'
-                record['diagnostics'] = 'Job preparation stopped. ' + (
-                    product.h.bounded_diagnostic(str(exc)) if type(exc) is ValueError else type(exc).__name__)
-                self.save(job, record)
+                if deferred:
+                    entry['after'] = int(time.monotonic()) + RETRY_SECONDS
+                    record['diagnostics'] = str(exc) if isinstance(exc, DispatchDeferred) else 'Waiting to continue the same confirmed job.'
+                    self.save(job, record)
+                    return 75
+                self.block(job, record, 'Job preparation stopped. ' + (
+                    product.h.bounded_diagnostic(str(exc)) if type(exc) is ValueError else type(exc).__name__))
             return 2
         with self.lock():
-            record['phase'] = 'submitted'
+            record.update(phase='submitted', diagnostics=None, scheduled_boot=boot_id())
             self.save(job, record)
         return 0
 
-    def stage(self, job, record):
-        from provider_broker import load_allowance
+    def submit_product(self, path, job, plan):
+        state = self.published(job, plan)
+        if state is not None and (state['phase'] in product.TERMINAL or
+                                  (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic'))):
+            return
+        product.source_approval(plan)
+        try:
+            product.submit(path)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            if (not isinstance(exc, ValueError) or str(exc) == 'protected fixed command failed') and self.published(job, plan):
+                product.source_approval(plan)
+                raise DispatchDeferred('Product plan is durable. Waiting to schedule the same job.') from exc
+            raise
 
+    def stage(self, job, record):
         plan = record['plan']
         preview = record['preview']
         p.require(preview['plan'] == plan and preview['standards_sha'] == p.STANDARDS and
@@ -390,14 +571,19 @@ class Intake:
         if os.path.lexists(self.catalogue / 'jobs' / job):
             # A previous preparation got as far as J publication. The product
             # entry verifies the original plan and owns resumption from here.
-            product.submit(plan_path)
+            self.submit_product(plan_path, job, plan)
             return
+
+        from provider_broker import load_allowance
 
         agreement = plan['agreement']
         repository = agreement['repository']
         repositories, slots = self.catalogue_settings()
         p.require(repository in repositories and job in slots, 'The reviewed repository or slot was withdrawn.')
         config = repositories[repository]
+        workload = preview.get('product_agreement', {}).get('workload', CHECKLIST)
+        p.require(workload in config.get('workloads', [CHECKLIST]) and WORKLOADS.get(workload) == plan['adapter'],
+                  'The confirmed workload is outside the repository approval.')
         controller, _, _ = self.release_slots()
         with controller.dispatch_gate():
             _, release, admitted = self.release_slots()
@@ -406,7 +592,7 @@ class Intake:
             settings, roles, proofs, seeds = self.slot(job, admitted[job])
             p.require(p.identity([settings, roles, seeds, config]) == preview['site_profile_sha256'],
                       'The site scope or limits have changed. A new agreement is required.')
-            checkout, startup, cache, tree, startup_sha = self.source(repository, config)
+            checkout, startup, cache, tree, startup_sha = self.source(repository, config, checklist=workload == CHECKLIST)
             p.require((tree, startup_sha) == (preview['source_tree'], plan['startup_sha256']),
                       'The verified source or startup documents have changed.')
             approval = self.approve(plan, checkout, startup, cache, config['startup_revision'], tree)
@@ -420,8 +606,8 @@ class Intake:
                 load_allowance(job, allowance).validate_grant(selection, dict(profile['grant'],
                     schema=1, request_sha256='0' * 64, peer_uid=account.pw_uid, peer_gid=account.pw_gid))
                 self.stage_role(role, job, profile, seeds[role], approval, startup_sha)
-                self.acquire_role(role, job, account, agreement, tree, bundle)
-            product.submit(plan_path)
+                self.acquire_role(role, job, account, agreement, tree, bundle, checklist=workload == CHECKLIST)
+            self.submit_product(plan_path, job, plan)
 
     def approve(self, plan, checkout, startup, cache, revision, tree):
         job = plan['job_id']
@@ -492,7 +678,7 @@ class Intake:
             sync_directory(parent)
         protect_directory(turn_path)
 
-    def acquire_role(self, role, job, account, agreement, tree, bundle):
+    def acquire_role(self, role, job, account, agreement, tree, bundle, *, checklist=True):
         root = self.root / role
         template = self.site / 'slots' / job / role / 'seed'
         label = os.getxattr(template / 'turn', 'security.selinux').rstrip(b'\0')
@@ -537,7 +723,7 @@ class Intake:
             p.require((workspace / '.git').is_dir() and not (workspace / '.git').is_symlink(),
                       'Retained role acquisition metadata is unavailable.')
         elif contents:
-            candidate.approved_source(git, workspace, verification, commit)
+            verify_acquired_git(git, workspace, verification, checklist=checklist)
             p.require(not git('status', '--porcelain', '--untracked-files=all'), 'The retained role checkout has work.')
             return
         else:
@@ -557,7 +743,7 @@ class Intake:
             p.require(git('rev-parse', '--verify', 'FETCH_HEAD').decode().strip() == commit,
                       'The exported Git acquisition differs from its approved commit.')
             git('checkout', '--detach', '--no-recurse-submodules', commit)
-        candidate.approved_source(git, workspace, verification, commit)
+        verify_acquired_git(git, workspace, verification, checklist=checklist)
         p.require(not git('status', '--porcelain', '--untracked-files=all'), 'The approved role checkout is not clean.')
 
 
@@ -570,8 +756,9 @@ def follow(intake, job):
     end = time.monotonic() + 120
     while True:
         status = intake.status(job)
-        if status['phase'] == 'submitted':
+        if status['phase'] == 'submitted' and not status['diagnostics']:
             return product.main(['reattach', job])
+        status = intake.observed(job, status)
         if status != previous:
             respond(status)
             previous = status
@@ -585,6 +772,8 @@ def main():
     try:
         p.require(os.geteuid() == 0, 'The installed intake service requires its protected account.')
         intake = Intake()
+        if sys.argv[1:] == ['--reconcile'] and not os.environ.get('SUDO_USER'):
+            return intake.reconcile()
         if len(sys.argv) == 3 and sys.argv[1] == '--prepare' and not os.environ.get('SUDO_USER'):
             return intake.prepare(job_id(sys.argv[2]))
         p.require(len(sys.argv) == 1 and os.environ.get('SUDO_USER') == 'core',
@@ -606,10 +795,9 @@ def main():
             result = intake.confirm(job, request['agreement_token'])
         else:
             result = intake.status(job)
-        if action == 'status' and result['phase'] == 'submitted':
-            return product.main([action, job])
+        result = intake.observed(job, result)
         respond(result)
-        return 2 if result['phase'] == 'blocked' else 0
+        return 2 if action != 'agreement' and result['phase'] == 'blocked' else 0
     except FileNotFoundError:
         print('Dev-pair intake or the requested job is unavailable. Check the job ID and installed site profile.', file=sys.stderr)
     except BlockingIOError:
