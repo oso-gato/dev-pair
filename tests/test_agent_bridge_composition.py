@@ -130,7 +130,7 @@ class NightlyComposition(TestCase):
         developer.lock = nullcontext
         developer_protected = developer.protected
         developer.protected = lambda path: path if Path(path).is_relative_to(checkout) else developer_protected(path)
-        maint.preflight = lambda: None
+        maint.preflight = lambda *, managed_runtime: self.assertIs(managed_runtime, True)
         maint.maintenance_host_readiness = lambda context: None
         maint.live_boot_id = lambda: destination.boot
         maint.lock = nullcontext
