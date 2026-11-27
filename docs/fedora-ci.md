@@ -197,6 +197,11 @@ traversal, hardlink deduplication and the existing `guest.qcow2` basename
 exclusion. It skips other devices without enumerating them. Same-device bind
 mounts are traversed only after the worker verifies their source inside owned
 scratch, with GNU `du --one-file-system` accounting for aliases and cycles.
+If a strict source lookup crosses a mount at the final directory component on
+ext4 or tmpfs, the worker checks that the visible mount is a canonical self-bind
+and that the entry beneath it has the expected inode. It repeats the proof
+after traversal, keeps the scanned and canonical source mounts pinned, and
+charges the extra directory entries to the same scan limits.
 Unverified same-device mounts block. A descendant disappearance can yield a
 provisional sample or trigger another attempt without contributing a total.
 Across at most three attempts, the largest usable sample counts against the

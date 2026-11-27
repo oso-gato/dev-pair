@@ -38,10 +38,11 @@ class MeasurementTests(unittest.TestCase):
         result=worker.scan(self.root,self.expected());self.assertEqual(result['status'],'complete');self.assertEqual(result['allocated_bytes'],self.oracle())
         actual=ci.measure_storage(self.root,sudo=False);self.assertFalse(actual['provisional']);self.assertEqual(actual['bytes'],self.oracle())
 
-    def isolated_mount_scan(self, fixture, mounts, check):
+    def isolated_mount_scan(self, fixture, mounts, check, *, backing=None, remount=False):
         sandbox=shutil.which('bwrap')
         if sandbox is None:self.skipTest('bubblewrap is unavailable')
         base=[sandbox,'--unshare-user','--uid','0','--gid','0','--unshare-pid','--unshare-net','--ro-bind','/','/']
+        if remount:base.extend(('--cap-add','CAP_SYS_ADMIN'))
         probe=subprocess.run([*base,'--','/usr/bin/true'],capture_output=True,text=True,timeout=5)
         if probe.returncode and ('namespace' in probe.stderr or 'Operation not permitted' in probe.stderr):
             self.skipTest('private mount namespace is unavailable')
@@ -80,10 +81,18 @@ class MeasurementTests(unittest.TestCase):
                     assert projected['reason']==reason, projected
                 else:raise AssertionError('mount failure yielded a usable sample')
         ''')+textwrap.dedent(check)
-        argv=[*base,'--bind',str(fixture),str(fixture),*map(str,mounts),'--proc','/proc','--dev','/dev','--',
+        argv=[*base,'--bind',str(backing or fixture),str(fixture),*map(str,mounts),'--proc','/proc','--dev','/dev','--',
               sys.executable,'-I','-c',source,str(Path(worker.__file__).resolve().parent),str(self.root)]
         result=subprocess.run(argv,capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+
+    def tmpfs_backing(self):
+        if not Path('/dev/shm').is_dir():self.skipTest('tmpfs fixture is unavailable')
+        fs_type=subprocess.check_output(['/usr/bin/stat','-f','-c','%t','/dev/shm'],timeout=3).strip()
+        if fs_type!=b'1021994':self.skipTest('the fixture requires tmpfs at /dev/shm')
+        backing=tempfile.TemporaryDirectory(dir='/dev/shm',prefix='dp-storage-selfbind-')
+        self.addCleanup(backing.cleanup)
+        return Path(backing.name)
 
     def test_actual_mount_namespace_matches_gnu_du_for_owned_alias_cycle_and_foreign_mounts(self):
         # Include both kernel-escaped and literal mountinfo path characters.
@@ -140,6 +149,124 @@ class MeasurementTests(unittest.TestCase):
             with patch.object(worker.os,'scandir',side_effect=owned_only):
                 check_failure('bind-source-outside-root')
             ''')
+
+    def test_actual_tmpfs_self_bind_and_alias_match_gnu_du_with_bounded_witnesses(self):
+        backing=self.tmpfs_backing()
+        source=backing/'internal';source.mkdir()
+        (backing/'mounted').mkdir()
+        (source/'single').write_bytes(b'x'*8192)
+        hard=source/'hard';hard.write_bytes(b'x'*16384);os.link(hard,source/'hard-alias')
+        (source/'guest.qcow2').write_bytes(b'x'*32768)
+        self.isolated_mount_scan(self.root,
+            ['--bind',source,self.root/'internal','--bind',source,self.root/'mounted'],'''
+            from contextlib import contextmanager
+            import ctypes
+            import errno
+            from types import SimpleNamespace
+
+            root_fd=os.open(root,os.O_PATH)
+            try:
+                try:worker._node(root_fd,'internal')
+                except OSError as error:assert error.errno==errno.EXDEV, error
+                else:raise AssertionError('canonical source did not cross a mount')
+            finally:os.close(root_fd)
+
+            measured=worker.scan(root,expected)
+            native=subprocess.run(['/usr/bin/du','--summarize','--block-size=1','--one-file-system',
+                '--exclude=guest.qcow2',root],capture_output=True,check=True,timeout=3)
+            assert not native.stderr, native.stderr
+            assert measured['status']=='complete', measured
+            assert measured['allocated_bytes']==int(native.stdout.split()[0])>0, (measured,native.stdout)
+            sample=ci.measure_storage(root,sudo=False)
+            assert not sample['provisional'] and sample['bytes']==measured['allocated_bytes'], sample
+
+            try:worker.scan(root,expected,entry_limit=1)
+            except worker.ScanError as error:
+                assert str(error)=='entry-limit', error
+                assert error.scan_counters=={'entries':2,'unique_inodes':1,'vanished':0}, error.scan_counters
+            else:raise AssertionError('witness failed to consume an entry')
+
+            calls=0
+            def expire_on_witness(fd):
+                global calls
+                calls+=1
+                if calls==2:
+                    assert Path(os.readlink(f'/proc/self/fd/{fd}'))==root
+                return scandir(fd)
+            with patch.object(worker.os,'scandir',side_effect=expire_on_witness), \\
+                 patch.object(worker.time,'monotonic',side_effect=lambda: 10 if calls>=2 else 1):
+                try:worker.scan(root,expected,end=10)
+                except worker.ScanError as error:assert str(error)=='deadline', error
+                else:raise AssertionError('witness escaped the deadline')
+            assert calls==2, calls
+
+            @contextmanager
+            def wrong_covered_inode(fd):
+                with scandir(fd) as entries:
+                    yield (SimpleNamespace(name=entry.name,inode=lambda: expected['inode'])
+                           if entry.name=='internal' else entry for entry in entries)
+            with patch.object(worker.os,'scandir',side_effect=wrong_covered_inode):
+                check_failure('bind-source-before-identity')
+
+            def overlay_parent(fd,buffer):
+                assert Path(os.readlink(f'/proc/self/fd/{fd}'))==root
+                ctypes.cast(buffer,ctypes.POINTER(ctypes.c_long))[0]=0x794c7630
+                return 0
+            with patch.object(worker.LIBC,'fstatfs',side_effect=overlay_parent):
+                check_failure('bind-source-before-exdev')
+            ''',backing=backing)
+
+    def test_actual_canonical_source_overbind_and_parent_mount_are_rejected(self):
+        for overbind in (True,False):
+            with self.subTest(overbind=overbind):
+                backing=self.tmpfs_backing()
+                (backing/'parent').mkdir();(backing/'parent'/'internal').mkdir()
+                (backing/'mounted').mkdir();(backing/'replacement').mkdir()
+                mounts=['--bind',backing/'parent'/'internal',self.root/'mounted']
+                if overbind:
+                    mounts+=['--bind',backing/'replacement',self.root/'parent'/'internal']
+                    reason='bind-source-before-identity'
+                else:
+                    mounts+=['--bind',backing/'parent',self.root/'parent']
+                    reason='bind-source-before-exdev'
+                self.isolated_mount_scan(self.root,mounts,'''
+                    def never_enumerate_alias(fd):
+                        assert Path(os.readlink(f'/proc/self/fd/{fd}'))!=root/'mounted'
+                        return scandir(fd)
+                    with patch.object(worker.os,'scandir',side_effect=never_enumerate_alias):
+                        check_failure(REASON)
+                    '''.replace('REASON',repr(reason)),backing=backing)
+
+    def test_actual_canonical_self_bind_replaced_during_alias_enumeration_has_no_total(self):
+        backing=self.tmpfs_backing()
+        source=backing/'internal';source.mkdir();(source/'data').write_bytes(b'x'*8192)
+        (backing/'mounted').mkdir()
+        self.isolated_mount_scan(self.root,
+            ['--bind',source,self.root/'internal','--bind',source,self.root/'mounted'],'''
+            import ctypes
+
+            libc=ctypes.CDLL(None,use_errno=True)
+            exchanged=False
+            def remount_source(fd):
+                global exchanged
+                if not exchanged and Path(os.readlink(f'/proc/self/fd/{fd}'))==root/'mounted':
+                    source=root/'internal'
+                    old_fd=os.open(source,os.O_PATH)
+                    try:
+                        assert libc.umount2(bytes(source),2)==0, ctypes.get_errno()  # MNT_DETACH
+                        assert libc.mount(bytes(source),bytes(source),None,4096,None)==0, ctypes.get_errno()  # MS_BIND
+                        new_fd=os.open(source,os.O_PATH)
+                        try:
+                            assert os.fstat(old_fd).st_ino==os.fstat(new_fd).st_ino
+                            assert worker._mount_id(old_fd)!=worker._mount_id(new_fd)
+                        finally:os.close(new_fd)
+                    finally:os.close(old_fd)
+                    exchanged=True
+                return scandir(fd)
+            with patch.object(worker.os,'scandir',side_effect=remount_source):
+                check_failure('bind-source-after-identity')
+                assert exchanged
+            ''',backing=backing,remount=True)
 
     def test_bind_source_replacement_during_enumeration_invalidates_measurement(self):
         source=self.root/'internal';source.mkdir()
