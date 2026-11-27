@@ -115,8 +115,8 @@ class NightlyComposition(TestCase):
             if endpoint.startswith('actions/artifacts/') and endpoint.endswith('/zip'):
                 blob = native['blobs'][int(endpoint.split('/')[2])]
                 self.assertLessEqual(len(blob), limit)
-                with output.open('xb') as target:
-                    target.write(blob)
+                output.write(blob)
+                output.flush()
                 return None
             raise AssertionError(f'Unexpected endpoint {endpoint}')
 
@@ -237,6 +237,7 @@ class NightlyComposition(TestCase):
             stack.enter_context(patch.object(site, 'Resolver', return_value=fixture_resolver))
             stack.enter_context(patch.object(fixture_resolver, 'resolve', side_effect=resolve))
             stack.enter_context(patch.object(intake, 'ROOT', store))
+            stack.enter_context(patch.object(intake, 'portable_volume', return_value=(store.stat().st_dev, 42, 17, ('99',))))
             stack.enter_context(patch.object(intake, 'GITHUB', '/usr/bin/python3'))
             stack.enter_context(patch.object(intake, 'protected', side_effect=lambda path, **kwargs: path))
             stack.enter_context(patch.object(intake, 'read_api', side_effect=query))
