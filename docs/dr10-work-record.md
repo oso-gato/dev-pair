@@ -2,6 +2,29 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026 — owner handoff after offline maintenance
+
+The published [initial bootstrap](https://github.com/oso-gato/dev-pair/tree/11fbe9e0e0ff911fce13e33527c55020958a50a7)
+remains the first-run pin. The source kit reproduced byte for byte under
+SHA-256 `9cb448bb432d28b0eeb73f67bd835a3c9c84fea594d2854d9d2c0ba4ed9f9665`.
+The local Gitless terminal exercise reached the signed Git prerequisite and
+resumed with exact Git to the recovery confirmation checkpoint. The owner
+keeps this checkout and its completed maintenance state for the separate
+continuation. [Owner operations](owner-day0.md)
+
+The [reviewed post-bootstrap checkpoint](https://github.com/oso-gato/dev-pair/tree/2468adfd4a5df53d7e3545fc1bd3f3f2388ab67e)
+passed three focused local checks for scheduled and manual agent publication
+intake and the missing protected-branch denial. The local fixture log has
+SHA-256 `9af94986d86a1610086daf1257d5e8f9b08c9909a3f186d4840462e9246b2d70`.
+Prospective observation on an actual candidate placement remains separate
+from the local publication checks. The next source adds the attended first
+owner catalogue and binds its reviewed billing inputs. Review of that
+continuation is pending in this checkpoint. Real access observations,
+publisher and provider custody, an eligible signed full platform release,
+protected repository and startup provisioning, and issuance of normalized
+billing evidence remain prerequisites for the native owner journey.
+[Host commissioning](host-commissioning.md)
+
 ### November 27, 2026 — integrated owner entry and commissioning
 
 The owner starts from the [pinned public checkout or verified source kit](../README.md#set-up-the-fedora-host).

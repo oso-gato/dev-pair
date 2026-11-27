@@ -45,10 +45,13 @@ approved agent publisher and successful read access to protected main and its
 fixed workflow. An empty run list can qualify the schedule. The bridge
 verifies signed artifacts before it offers a compatible release to renewal.
 
-This stage consumes an already approved owner catalogue and slot profiles.
-There is no normal first-catalogue producer in this source. A missing
-catalogue is a setup integration gap. A missing or expired provider grant is
-a separate custody issue.
+This stage uses the approved owner catalogue and slot profiles to activate
+owner intake. The protected root terminal can run the first-catalogue wizard
+when the approved repository checkout, startup and private standards inputs,
+provider authority and reviewed billing evidence are available. A missing or
+expired grant requires the authorized provider custodian. A fresh site also
+needs controlled repository and startup provisioning and a source for the
+normalized billing evidence. [First owner setup](owner-day0.md#resume-and-recovery)
 
 A `pending` result names the specific prerequisite, such as available storage,
 protected release trust, GitHub read custody or an eligible attested

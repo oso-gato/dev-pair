@@ -11,10 +11,11 @@ storage and the live connection before it prepares the maintenance gateway.
 It asks for the named `core` password in the terminal with echo disabled.
 
 <a id="dr11-2"></a>
-**DR11.2** Use the full reviewed commit from your delivery handoff in place of
-`REPLACE_WITH_REVIEWED_COMMIT`. Paste the block as a single action. Its last
-command opens the installer prompts. You can also start from the separately
-verified [offline source kit](docs/owner-day0.md).
+**DR11.2** For the first run, paste the command supplied for the published
+offline maintenance bootstrap as a single action. The block below is the
+template for that command and takes the full reviewed commit in place of
+`REPLACE_WITH_REVIEWED_COMMIT`. Its last command opens the installer prompts.
+You can also start from the separately verified [offline source kit](docs/owner-day0.md#optional-offline-source-kit).
 
 ```sh
 (
@@ -57,7 +58,7 @@ verified [offline source kit](docs/owner-day0.md).
 
 <a id="dr11-3"></a>
 **DR11.3** From that checkout, run `./day0.sh status` to inspect progress or `./day0.sh resume`
-to continue after a reboot or an access review. On a disabled or unverified
+to continue initial maintenance setup after a pause or reboot. On a disabled or unverified
 permissive host, setup performs a checked relabel before enforcing SELinux and
 holds workloads while the transition is incomplete. For Tailscale, press Enter
 at the auth-key prompt to use browser sign-in. You can defer enrollment by
@@ -66,11 +67,13 @@ recovery and tailnet-only SSH have been verified.
 
 <a id="dr11-4"></a>
 **DR11.4** The first bootstrap verifies the public build context, builds the
-confined maintenance gptbox, and verifies both offline probe cycles. It can finish
-while protected workload artifacts, site policy and independent access review
-remain pending. The installer displays the pending phase and retains the existing
-recovery route. Local fixtures exercise the setup path. The selected VPS still
-needs native setup and external observations. [Day-zero operations](docs/owner-day0.md)
+confined maintenance gptbox and verifies both offline probe cycles. After that
+checkpoint, keep the original checkout and protected state. Use the separately
+reviewed continuation in its own `/root/dev-pair-day0-<commit>/dev-pair` checkout
+and run `./day0.sh resume` there. The continuation guides independent access
+review, protected commissioning and first owner setup as their prerequisites
+become available. Native setup and external observations on the selected VPS
+remain to be verified. [Day-zero operations](docs/owner-day0.md)
 
 <a id="dr0"></a>
 ## DR0 — Overview
