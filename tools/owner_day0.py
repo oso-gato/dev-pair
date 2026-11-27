@@ -630,16 +630,28 @@ class DayZero:
         if phase in ('pending', 'source-gap'):
             self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
         elif phase == 'ready':
-            terminal = observed.get('owner_terminal')
-            if terminal == '/usr/local/bin/dev-pair' and 'owner-intake' not in observed.get('held_features', []):
-                self.stage(identity, revision, 'owner-terminal-ready',
-                           'The named core tailnet terminal is available for approved jobs.')
+            labels = {'owner-intake': 'Owner intake', 'checklist-spool': 'Checklist cleanup', 'agent-renewal': 'Agent renewal'}
+            timer_labels = {'dev-pair-intake-recovery.timer': 'Owner intake recovery',
+                            'dev-pair-checklist-spool.timer': 'Checklist cleanup',
+                            'dev-pair-agent-bridge.timer': 'Agent publication checks', 'dev-pair-renewal-agent.timer': 'Agent renewal'}
+            lines = ['The managed checklist listener is ready.']
+            for name in sorted(observed.get('timers', {})):
+                lines.append(f'{timer_labels[name]} is scheduled.')
+            for name, reason in sorted(observed.get('pending_features', {}).items()):
+                lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
+            for units in observed.get('retained_services', {}).values():
+                for unit in units:
+                    lines.append(f'{unit} is still running from an earlier launch.')
+            if observed.get('agent_publication') == 'awaiting-signed-publication':
+                lines.append('Agent renewal is waiting for an eligible signed publication.')
+            if observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and 'owner-intake' not in observed.get('held_features', ()):
+                lines.append('The named core tailnet terminal is available for approved jobs.')
+                stage = 'owner-terminal-ready'
             else:
-                core_only = self.app.status().get('access_scope') == 'core'
-                self.stage(identity, revision, 'managed-listener-ready',
-                           'The managed checklist listener is ready. Export ./day0.sh access-request --workloads for independent role checks.'
-                           if core_only else
-                           'The managed checklist listener is ready. The owner terminal and workload activation remain held.')
+                if self.app.status().get('access_scope') == 'core':
+                    lines.append('Export ./day0.sh access-request --workloads for independent role checks.')
+                stage = 'managed-listener-ready'
+            self.stage(identity, revision, stage, ' '.join(lines))
         else:
             self.stage(identity, revision, 'commissioning-pending',
                        'The protected commissioning controller is still waiting. Run ./day0.sh resume.')

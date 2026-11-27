@@ -39,6 +39,24 @@ class DayZeroTests(unittest.TestCase):
         self.entry = day.DayZero(self.directory / 'dev-pair', Mock())
         self.identity = {'machine_id': MACHINE, 'boot_id': BOOT, 'host': 'erebus', 'selinux': '1'}
 
+    def test_commission_reports_each_admitted_and_held_feature(self):
+        tool = self.entry.repo / 'tools/commission_host.py'
+        tool.parent.mkdir(parents=True)
+        tool.touch()
+        self.entry.stage = Mock()
+        self.entry.app.status.return_value = {'access_scope': 'full'}
+        self.entry.call = Mock(return_value={'phase': 'ready', 'owner_terminal': None,
+            'timers': {'dev-pair-checklist-spool.timer': {'next': ['scheduled']}},
+            'held_features': ['agent-renewal', 'owner-intake'],
+            'pending_features': {'agent-renewal': 'release-read-custody', 'owner-intake': 'owner-catalogue'}})
+        self.entry.commission(self.identity, SOURCE)
+        _, _, stage, details = self.entry.stage.call_args.args
+        self.assertEqual(stage, 'managed-listener-ready')
+        self.assertIn('Checklist cleanup is scheduled.', details)
+        self.assertIn('Agent renewal is held pending release read custody.', details)
+        self.assertIn('Owner intake is held pending owner catalogue.', details)
+        self.assertNotIn('terminal is available', details)
+
     def test_gitless_kit_verification_and_signed_prerequisite(self):
         repo = self.entry.repo
         for name in ('day0.sh', 'tools/owner_day0.py', 'runtime/dev-pair-test@.service', '.git/HEAD', '.git/index'):

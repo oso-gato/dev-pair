@@ -40,8 +40,14 @@ after independent workload access has been admitted for the selected roles.
 Commissioning checks the protected authority for each feature and lists any
 remaining prerequisites. Owner intake needs the approved catalogue, startup
 material and a valid provider slot. Checklist cleanup needs the managed
-validation filesystem. Scheduled renewal needs protected read custody and an
-approved compatible agent offer.
+validation filesystem. Scheduled publication checks need the independently
+approved agent publisher and protected read custody. The bridge verifies the
+signed artifacts before it offers a compatible release to renewal.
+
+This stage consumes an already approved owner catalogue and slot profiles.
+There is no normal first-catalogue producer in this source. A missing
+catalogue is a setup integration gap. A missing or expired provider grant is
+a separate custody issue.
 
 A `pending` result names the specific prerequisite, such as available storage,
 protected release trust, GitHub read custody or an eligible attested

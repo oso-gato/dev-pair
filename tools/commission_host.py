@@ -37,8 +37,10 @@ TIMERS = {
     'checklist-spool': ('dev-pair-checklist-spool.timer', 'dev-pair-checklist-spool.service'),
     'owner-intake': ('dev-pair-intake-recovery.timer', 'dev-pair-intake-recovery.service'),
 }
+AGENT_BRIDGE = ('dev-pair-agent-bridge.timer', 'dev-pair-agent-bridge@poll.service')
+GITHUB_CONFIG = Path('/root/.config/gh')
 WORKLOAD_GUARDS = {
-    'agent-renewal': ('dev-pair-renewal@agent.service',),
+    'agent-renewal': ('dev-pair-renewal@agent.service', AGENT_BRIDGE[1]),
     'checklist-spool': ('dev-pair-checklist-spool.service',),
     'owner-intake': ('dev-pair-intake-recovery.service', 'dev-pair-intake@.service', 'dev-pair-product@.service'),
 }
@@ -178,9 +180,11 @@ def workload_guard_files(features):
 
 
 def validate_feature_grant(grant):
+    from owner_intake import job_id
+
     exact_fields(grant, ('subject', 'expires_unix', 'sha256'), 'invalid retained workload grant')
-    require(type(grant['subject']) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}', grant['subject']) and
-            (grant['expires_unix'] is None or type(grant['expires_unix']) is int and grant['expires_unix'] > 0),
+    job_id(grant['subject'])
+    require(grant['expires_unix'] is None or type(grant['expires_unix']) is int and grant['expires_unix'] > 0,
             'invalid retained workload grant scope')
     hex_id(grant['sha256'])
     return grant
@@ -340,7 +344,7 @@ class Commission:
         for row in manifest['files']:
             exact_fields(row, ('source', 'target', 'mode', 'feature'), 'invalid commissioning manifest entry')
             source, target = row['source'], install_target(row['target'])
-            require(target not in all_targets and row['feature'] in ('base', 'owner-entry', *TIMERS) and
+            require(target not in all_targets and row['feature'] in ('base', 'owner-entry', 'agent-bridge', *TIMERS) and
                     row['mode'] in ('0644', '0755', '0440'), 'ambiguous commissioning install entry')
             all_targets.add(target)
             contents = self.source_bytes(source, revision)
@@ -348,9 +352,12 @@ class Commission:
             # checkout. F's portable host manifest includes tools and runtime.
             if source != 'examples/checklist/Containerfile':
                 require(bundle.get(source) == digest(contents), 'reviewed host bundle bytes differ from commissioning kit')
-            if row['feature'] in features:
-                files[target] = (contents, int(row['mode'], 8), row['feature'])
-            elif row['feature'] in retained or (row['feature'] == 'owner-entry' and 'owner-intake' in retained):
+            feature = 'agent-renewal' if row['feature'] == 'agent-bridge' else row['feature']
+            legacy_agent_timer = target == UNIT_ROOT + '/' + TIMERS['agent-renewal'][0]
+            if (feature in features and (row['feature'] != 'agent-bridge' or activation) and
+                    not (activation and legacy_agent_timer)):
+                files[target] = (contents, int(row['mode'], 8), feature)
+            elif feature in retained or (feature == 'owner-entry' and 'owner-intake' in retained):
                 self.file(target, contents, int(row['mode'], 8), save=False)
             else:
                 require(not os.path.lexists(self.path(target)), 'disabled feature has installed commissioning files')
@@ -535,7 +542,7 @@ class Commission:
                     feature.update(phase='held', next=[])
                 self.save_activation(current)
 
-            timers, holds = {}, {}
+            timers, holds, retained_services = {}, {}, {}
             for feature in CORE_HELD_FEATURES:
                 try:
                     if proof is None:
@@ -544,7 +551,7 @@ class Commission:
                 except Pending as wait:
                     holds[feature] = wait.report['prerequisite']
                     if feature in features:
-                        self.hold_owned_workload(feature, policy, bundle, current)
+                        retained_services[feature] = self.hold_owned_workload(feature, policy, bundle, current)
                     continue
                 validate_feature_grant(grant)
                 selected_policy = {**policy, 'timers': [feature]}
@@ -557,12 +564,10 @@ class Commission:
                     self.save_activation(current)
                     self.install_workload(feature, selected_policy, site, files, selected)
                     try:
-                        if (self.services.workload_scope(self, policy, selected, boot) != proof or
-                                self.services.feature_authority(feature, selected, recorded=grant) != grant):
-                            raise Pending('workload-authorization-changed', 'Workload authorization changed before timer activation.')
+                        self.verify_feature_authority(feature, policy, selected, boot, proof, grant)
                     except Pending as wait:
                         holds[feature] = wait.report['prerequisite']
-                        self.hold_owned_workload(feature, policy, bundle, current)
+                        retained_services[feature] = self.hold_owned_workload(feature, policy, bundle, current)
                         continue
                     features[feature]['phase'] = 'active'
                     self.save_activation(current)
@@ -570,23 +575,51 @@ class Commission:
                     for target, (contents, mode, member) in files.items():
                         if member == feature:
                             require(self.read(target, mode, FILE_LIMIT) == contents, 'active workload file changed')
-                timer, readback = self.arm_timer(feature, files)
-                timers[timer] = readback
-                if feature == 'owner-intake':
-                    self.publish_owner_entry(files)
+                timer, readback = self.arm_timer(feature, files, activation=True)
+                try:
+                    self.verify_feature_authority(feature, policy, selected, boot, proof, grant)
+                    if feature == 'owner-intake':
+                        self.publish_owner_entry(files)
+                        self.verify_feature_authority(feature, policy, selected, boot, proof, grant)
+                except Pending as wait:
+                    holds[feature] = wait.report['prerequisite']
+                    retained_services[feature] = self.hold_owned_workload(feature, policy, bundle, current)
+                    continue
                 confirmed = {'phase': 'armed', 'grant': grant, 'next': readback['next']}
                 if features[feature] != confirmed:
                     features[feature] = confirmed
                     self.save_activation(current)
-            return {**core, 'timers': timers, 'held_features': sorted(holds), 'pending_features': holds,
-                    'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' not in holds else None}
+                timers[timer] = readback
+            report = {**core, 'timers': timers, 'held_features': sorted(holds), 'pending_features': holds,
+                      'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' not in holds else None}
+            still_running = {feature: units for feature, units in retained_services.items() if units}
+            if still_running:
+                report['retained_services'] = still_running
+            if AGENT_BRIDGE[0] in timers:
+                report['agent_publication'] = self.services.agent_publication_status(selected)
+            return report
+
+    def verify_feature_authority(self, feature, policy, selected, boot, proof, grant):
+        if (self.services.workload_scope(self, policy, selected, boot) != proof or
+                self.services.feature_authority(feature, selected, recorded=grant) != grant):
+            raise Pending('workload-authorization-changed', 'Workload authorization changed during activation.')
 
     def hold_owned_workload(self, feature, policy, bundle, current):
         features = current['features']
         if features[feature]['phase'] != 'held':
             features[feature].update(phase='held', next=[])
             self.save_activation(current)
-        self.disable_owned_timer(feature, policy, bundle, features)
+        files = self.package({**policy, 'timers': [feature]}, bundle, retained=features, activation=True)
+        if feature == 'owner-intake':
+            self.withdraw_owner_entry(files)
+        self.disable_owned_timer(feature, files)
+        lingering = []
+        units = WORKLOAD_GUARDS[feature] if feature == 'agent-renewal' else (TIMERS[feature][1],)
+        for unit in units:
+            fragment = UNIT_ROOT + '/' + re.sub(r'@[^.]+\.service$', '@.service', unit)
+            if os.path.lexists(self.path(fragment)) and self.unit(unit, files)['ActiveState'] != 'inactive':
+                lingering.append(unit)
+        return lingering
 
     def install_workload(self, feature, policy, site, files, selected):
         changed = []
@@ -600,11 +633,12 @@ class Commission:
         if feature == 'owner-intake':
             self.verify_owner_units(site, files)
         self.services.post_provision(policy, selected)
-        self.check_timer(feature, files)
+        if feature == 'agent-renewal':
+            self.unit(TIMERS[feature][1], files)
+        self.check_timer(feature, files, activation=True)
 
-    def disable_owned_timer(self, feature, policy, bundle, features):
-        timer, _ = TIMERS[feature]
-        files = self.package({**policy, 'timers': [feature]}, bundle, retained=features, activation=True)
+    def disable_owned_timer(self, feature, files):
+        timer, _ = AGENT_BRIDGE if feature == 'agent-renewal' else TIMERS[feature]
         target = UNIT_ROOT + '/' + timer
         if not os.path.lexists(self.path(target)):
             self.require_inactive(timer)
@@ -614,6 +648,19 @@ class Commission:
         if row['ActiveState'] != 'inactive' or row['UnitFileState'] == 'enabled':
             self.run(SYSTEMCTL, 'disable', '--now', timer, timeout=25)
         self.require_inactive(timer)
+
+    def withdraw_owner_entry(self, files):
+        # Remove the no-password authorization before the public launcher.
+        paths = ('/etc/sudoers.d/60-dev-pair-owner', '/usr/local/bin/dev-pair')
+        for target in paths:
+            if not os.path.lexists(self.path(target)):
+                continue
+            raw, mode, feature = files[target]
+            require(feature == 'owner-entry' and self.read(target, mode, FILE_LIMIT) == raw,
+                    'existing owner command or sudo rule is outside the owned activation')
+            path = self.path(target)
+            path.unlink()
+            self.sync(path.parent)
 
     def publish_owner_entry(self, files):
         for target, (contents, mode, feature) in files.items():
@@ -772,15 +819,15 @@ class Commission:
                     'systemd effective command differs for ' + unit)
         return row
 
-    def check_timer(self, feature, files):
-        timer, service = TIMERS[feature]
+    def check_timer(self, feature, files, *, activation=False):
+        timer, service = AGENT_BRIDGE if activation and feature == 'agent-renewal' else TIMERS[feature]
         self.unit(service, files)
         pending = self.unit(timer, files, timer=True)
         require(pending['Unit'] == service, 'timer is not linked to its approved service')
         return timer, service, pending
 
-    def arm_timer(self, feature, files):
-        timer, service, pending = self.check_timer(feature, files)
+    def arm_timer(self, feature, files, *, activation=False):
+        timer, service, pending = self.check_timer(feature, files, activation=activation)
         if pending['UnitFileState'] != 'enabled' or pending['ActiveState'] != 'active':
             self.run(SYSTEMCTL, 'enable', '--now', timer, timeout=25)
         active = self.unit(timer, files, timer=True)
@@ -825,6 +872,9 @@ class Commission:
             if feature not in policy['timers'] and feature not in retained:
                 for unit in units:
                     self.require_inactive(unit)
+        if 'agent-renewal' not in retained:
+            for unit in AGENT_BRIDGE:
+                self.require_inactive(unit)
         initial_file = PRIVATE + '/initial-release.json'
         intent = {'schema': 1, 'policy_sha256': policy_sha, 'source_sha': policy['source_sha'],
                   'platform_sha256': policy['platform_sha256'], 'site_config_sha256': policy['site_config_sha256'],
@@ -954,9 +1004,10 @@ class Live:
                     'initial publisher result does not bind the reviewed full release')
         return identity
 
-    def require_release_custody(self):
+    def require_release_custody(self, *, config=None):
         intake = self.installer.intake
-        config = Path(intake.native_env().get('GH_CONFIG_DIR', '/root/.config/gh'))
+        if config is None:
+            config = Path(intake.native_env().get('GH_CONFIG_DIR', str(GITHUB_CONFIG)))
         credential = config / 'hosts.yml'
         gh = Path(intake.GITHUB)
         message = 'The protected read-only GitHub intake identity or tool is unavailable.'
@@ -1447,6 +1498,9 @@ class Live:
         from owner_intake import CHECKLIST, Intake
 
         intake, end = Intake(), time.monotonic() + 45
+        if not os.path.lexists(intake.site / 'repositories.json'):
+            raise Pending('owner-catalogue-source-gap', 'The first approved owner catalogue has no automatic producer.',
+                          source_gap=True)
         failures = (Blocked, BootstrapBlocked, OSError, ValueError, RuntimeError, TypeError, KeyError, subprocess.SubprocessError)
         try:
             repositories, slots = intake.catalogue_settings()
@@ -1485,6 +1539,52 @@ class Live:
                 continue
         raise Pending('provider-slot-authority', 'No approved provider slot has valid current custody and bounded pricing.')
 
+    def verified_workload_bundle(self, selected):
+        controller = self.renewal()
+        host = controller.release(selected)['components']['host']
+        binding = self.renewal_module.read_json(controller.control / 'platform-bindings' / (selected + '.json'))
+        require(binding['release_sha256'] == selected, 'workload helper requires the selected protected host release')
+        _, index, _ = self.installer.intake.retained_index(hex_id(binding['base_platform_sha256']))
+        row = index['components']['host']
+        require((host['artifact_sha256'], host['source_revision']) == (row['bundle_manifest_sha256'], row['source_sha']),
+                'workload helper differs from the signed stable host bundle')
+        root = self.installer.HOST_RELEASES / hex_id(host['artifact_sha256'])
+        self.installer.check_host_bundle(root, row, time.monotonic() + 15)
+        return root
+
+    def agent_bridge_authority(self, selected):
+        from release_trust import POLICY, ReleaseTrust
+
+        self.require_release_custody(config=GITHUB_CONFIG)
+        trust = ReleaseTrust(self.run)
+        refresh = [trust.policy(role)['components'][role]['agent_refresh'] for role in ('maintenance', 'development')]
+        require(refresh[0] == refresh[1] and refresh[0]['workflow'] == '.github/workflows/agent-refresh.yml',
+                'independent nightly trust differs from the fixed publisher')
+        verified = self.verified_workload_bundle(selected)
+        bridge = 'tools/agent_release_bridge.py'
+        require(capture(self.bootstrap.path(INSTALL) / bridge, 0, mode=0o644) == capture(verified / bridge, 0),
+                'the installed agent bridge differs from the signed host bundle')
+        intake = self.installer.intake
+        intake.portable_volume()
+        intake.intake_limit(intake.ROOT, [intake.META_LIMIT, 2 * intake.CONTROL_LIMIT], intake.ZIP_OVERHEAD)
+        authority = [verified.name, digest(capture(Path(POLICY), 0, maximum=65536)),
+                     self.credential_stamp(GITHUB_CONFIG / 'hosts.yml')]
+        return {'subject': 'approved-publisher', 'expires_unix': None, 'sha256': digest(encoded(authority))}
+
+    def agent_publication_status(self, selected):
+        controller = self.renewal()
+        path = controller.control / 'offers/agent.json'
+        if not os.path.lexists(path):
+            return 'awaiting-signed-publication'
+        try:
+            offer = self.resolver.offer_record(parse(capture(path, 0, mode=0o600, maximum=65536)), 'agent')
+            _, index, _ = self.resolver.Resolver(controller).index(offer['platform_sha256'])
+            require(offer['previous_release_sha256'] == selected and index['kind'] == self.resolver.AGENT,
+                    'offer does not authorize a current agent release')
+        except (Blocked, OSError, ValueError, TypeError, KeyError):
+            return 'offer-unavailable'
+        return 'staged-approved-offer'
+
     def feature_authority(self, feature, selected, *, recorded=None):
         from bootstrap import Blocked as BootstrapBlocked
 
@@ -1496,28 +1596,13 @@ class Live:
                 from host_handoff import host_runtime
 
                 runtime = host_runtime()
+                helper = self.verified_workload_bundle(selected) / 'tools/checklist_candidate.py'
                 with runtime.dispatch_gate():
-                    device = checked_storage(runtime, time.monotonic() + 15)
+                    device = checked_storage(runtime, time.monotonic() + 10, witness=helper)
                     node = runtime.STORAGE.lstat()
                 return {'subject': 'managed-validation', 'expires_unix': None,
                         'sha256': digest(encoded([selected, device, node.st_ino]))}
-            from release_trust import POLICY, ReleaseTrust
-
-            self.require_release_custody()
-            trust = ReleaseTrust(self.run)
-            for role in ('maintenance', 'development'):
-                require('agent_refresh' in trust.policy(role)['components'][role], 'independent nightly trust is unavailable')
-            controller = self.renewal()
-            offer_path = controller.control / 'offers/agent.json'
-            raw = capture(offer_path, 0, mode=0o600, maximum=65536)
-            offer = self.resolver.offer_record(parse(raw), 'agent')
-            require(offer['previous_release_sha256'] == selected, 'nightly offer is outside the current release')
-            _, index, _ = self.resolver.Resolver(controller).index(offer['platform_sha256'])
-            require(index['kind'] == self.resolver.AGENT, 'nightly offer lacks a verified portable agent release')
-            config = self.installer.intake.native_env().get('GH_CONFIG_DIR', '/root/.config/gh')
-            authority = [digest(raw), digest(capture(Path(POLICY), 0, maximum=65536)),
-                         self.credential_stamp(Path(config) / 'hosts.yml')]
-            return {'subject': 'selected-offer', 'expires_unix': None, 'sha256': digest(encoded(authority))}
+            return self.agent_bridge_authority(selected)
         except (Blocked, BootstrapBlocked, OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
             prerequisite = {'owner-intake': 'provider-slot-authority', 'checklist-spool': 'checklist-validation-storage',
                             'agent-renewal': 'agent-release-authority'}[feature]

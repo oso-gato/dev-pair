@@ -138,9 +138,9 @@ def storage_witness(runtime):
             'evidence': evidence}
 
 
-def checked_storage(runtime, end):
-    runtime.protected(SELF, file=True)
-    observed = p.loads(invoke(as_role(runtime.ACCOUNT, '/usr/bin/python3', '-EBs', SELF, '__storage-witness'),
+def checked_storage(runtime, end, *, witness=None):
+    witness = runtime.protected(SELF if witness is None else witness, file=True)
+    observed = p.loads(invoke(as_role(runtime.ACCOUNT, '/usr/bin/python3', '-EBs', witness, '__storage-witness'),
                               min(end, time.monotonic() + 10), cap=4096))
     p.fields(observed, 'device inode uid gid evidence')
     current = runtime.STORAGE.lstat()

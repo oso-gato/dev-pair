@@ -85,7 +85,7 @@ class Systemd:
             command = '/usr/bin/false'
         user = 'dp-checklist' if unit.startswith('dev-pair-checklist-executor@') else 'root'
         active = unit in self.active
-        next_unit = next((short for timer, short in c.TIMERS.values() if timer == unit), '')
+        next_unit = next((short for timer, short in (*c.TIMERS.values(), c.AGENT_BRIDGE) if timer == unit), '')
         executable = command.split()[0] if command else ''
         row = {'LoadState': 'loaded' if exists else 'not-found',
                'FragmentPath': fragment if exists else '',
@@ -187,6 +187,7 @@ class HostCommissioning(unittest.TestCase):
             c.RECOVERY: '/usr/bin/python3 -I /usr/libexec/dev-pair/tools/renewal.py recover',
             'dev-pair-renewal-host-observe.service': c.INSTALL + '/renewal/host-release observe',
             'dev-pair-provider@.service': c.INSTALL + '/renewal/provider-run %i',
+            'dev-pair-renewal@.service': '/usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/task.py',
             'dev-pair-checklist-executor@.service': '/usr/bin/python3 fixture',
         }
         if 'owner-intake' in selected:
@@ -340,8 +341,18 @@ class HostCommissioning(unittest.TestCase):
             raise c.Pending('workload-access', 'Independent role proof is absent.')
 
         self.services.workload_scope = workload_scope
-        self.app.package = lambda policy, bundle, *, retained=(), activation=False: {
-            **self.files(policy['timers']), **(c.workload_guard_files(policy['timers']) if activation else {})}
+        def package(policy, bundle, *, retained=(), activation=False):
+            files = self.files(policy['timers'])
+            if activation:
+                files.update(c.workload_guard_files(policy['timers']))
+                if 'agent-renewal' in policy['timers']:
+                    repository = Path(__file__).resolve().parents[1]
+                    for name in (c.AGENT_BRIDGE[0], 'dev-pair-agent-bridge@.service'):
+                        files[c.UNIT_ROOT + '/' + name] = ((repository / 'runtime/renewal' / name).read_bytes(),
+                                                          0o644, 'agent-renewal')
+            return files
+
+        self.app.package = package
 
     def test_normal_automatic_policy_is_private_pinned_and_reused(self):
         self.automatic_services()
@@ -474,6 +485,52 @@ class HostCommissioning(unittest.TestCase):
             held = self.app.automatic('apply', SOURCE)
         self.assertIsNone(held['owner_terminal'])
         self.assertFalse(held['timers'])
+        self.assertFalse(self.app.path('/etc/sudoers.d/60-dev-pair-owner').exists())
+        self.assertFalse(self.app.path('/usr/local/bin/dev-pair').exists())
+
+    def test_late_owner_withdrawal_never_publishes_readiness_and_keeps_inflight_service_visible(self):
+        self.automatic_services()
+        self.app.automatic('apply', SOURCE)
+        self.services.workload_scope = lambda *args, **kwargs: 'a' * 64
+        authority = {'ready': True}
+        grant = {'subject': 'a' * 48, 'expires_unix': int(time.time()) + 500, 'sha256': 'c' * 64}
+
+        def feature_authority(feature, selected, *, recorded=None):
+            if feature == 'owner-intake' and authority['ready']:
+                return grant
+            raise c.Pending('withdrawn-owner-slot' if feature == 'owner-intake' else 'feature-unavailable', 'Held.')
+
+        self.services.feature_authority = feature_authority
+        timer, service = c.TIMERS['owner-intake']
+
+        def late_change(binary, verb, *args, **kwargs):
+            response = self.manager(binary, verb, *args, **kwargs)
+            if (binary, verb) == (c.SYSTEMCTL, 'enable') and args[-1] == timer:
+                authority['ready'] = False
+                self.manager.active.add(service)
+            return response
+
+        with patch.object(self.app, 'run', side_effect=late_change):
+            denied = self.app.automatic('apply', SOURCE)
+        self.assertIsNone(denied['owner_terminal'])
+        self.assertNotIn(timer, denied['timers'])
+        self.assertEqual(denied['pending_features']['owner-intake'], 'withdrawn-owner-slot')
+        self.assertEqual(denied['retained_services'], {'owner-intake': [service]})
+        self.assertNotIn(timer, self.manager.enabled)
+        self.assertFalse(self.app.path('/etc/sudoers.d/60-dev-pair-owner').exists())
+        self.assertFalse(self.app.path('/usr/local/bin/dev-pair').exists())
+        self.assertEqual(self.app.automatic('apply', SOURCE), denied)
+        self.assertEqual(c.validate_feature_grant(grant), grant)
+        with self.assertRaisesRegex(ValueError, 'Invalid job ID'):
+            c.validate_feature_grant({**grant, 'subject': 'a' * 49})
+
+    def test_withdrawal_preserves_unrelated_privileged_entry(self):
+        path = '/etc/sudoers.d/60-dev-pair-owner'
+        raw = b'# Separate administrator authority\n'
+        self.app.file(path, raw, 0o440)
+        with self.assertRaisesRegex(c.Blocked, 'outside the owned activation'):
+            self.app.withdraw_owner_entry(self.files(['owner-intake']))
+        self.assertEqual(self.app.read(path, 0o440), raw)
 
     def test_cli_auto_path_reports_source_gap_without_policy_arguments_writes_or_install(self):
         self.automatic_services()
