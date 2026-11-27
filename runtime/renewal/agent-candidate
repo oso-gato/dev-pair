@@ -17,21 +17,24 @@ LATEST = 'https://api.github.com/repos/openai/codex/releases/latest'
 
 
 def stable_version(raw):
-    row = r.loads(raw)
-    match = re.fullmatch(r'rust-v([0-9]+\.[0-9]+\.[0-9]+)', row['tag_name'])
-    r.require(row['draft'] is False and row['prerelease'] is False and match is not None and
-              row['html_url'] == 'https://github.com/openai/codex/releases/tag/' + row['tag_name'],
+    from platform_release_protocol import upstream_release_json
+
+    row = upstream_release_json(raw)
+    match = re.fullmatch(r'rust-v([0-9]+\.[0-9]+\.[0-9]+)', row.get('tag_name', ''))
+    r.require(row.get('draft') is False and row.get('prerelease') is False and match is not None and
+              row.get('html_url') == 'https://github.com/openai/codex/releases/tag/' + row['tag_name'],
               'latest official stable Codex release could not be identified')
     return match[1]
 
 
 def official_version():
+    from platform_release_protocol import UPSTREAM_RELEASE_LIMIT
+
     request = urllib.request.Request(LATEST, headers={'Accept': 'application/vnd.github+json',
                                                      'User-Agent': 'dev-pair-approved-agent-intake/1'})
     with urllib.request.urlopen(request, timeout=8) as response:
         r.require(response.geturl() == LATEST and response.status == 200, 'official stable release lookup changed')
-        data = response.read(262145)
-    r.require(len(data) <= 262144, 'official stable release response exceeds bound')
+        data = response.read(UPSTREAM_RELEASE_LIMIT + 1)
     return stable_version(data)
 
 

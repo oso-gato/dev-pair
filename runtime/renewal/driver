@@ -616,6 +616,8 @@ def turn(action, payload):
         context = plan['maintenance_context_sha256']
         command = [PYTHON, '-B', str(host_release / 'tools' / 'gptbox.py'), 'run-job', '--job', job,
                    '--image', image['artifact_sha256'], '--source-sha', image['source_revision'], '--context-sha256', context]
+        if 'platform_sha256' in image:
+            command += ['--platform-sha256', image['platform_sha256']]
     else:
         manifest_sha = plan['development_manifests'][job]
         command = [RUNUSER, '--user', role_account, '--', PYTHON, '-B', str(host_release / 'tools' / 'devbox.py'), 'run',

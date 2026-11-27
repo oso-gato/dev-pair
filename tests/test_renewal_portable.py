@@ -1,7 +1,9 @@
 """Resolve protected local fixture records without a native import or remote API."""
 import copy
 from contextlib import contextmanager
+import gzip
 import importlib.util
+from io import BytesIO
 import os
 from pathlib import Path
 import runpy
@@ -33,7 +35,8 @@ class PortableSiteTests(unittest.TestCase):
                                      self.root / 'host-releases', self.root / 'host-configs', self.read_manifest)
         if importlib.util.find_spec('platform_release_protocol') is None:
             # The exact portable parser is supplied by F in combined validation.
-            dependency = SimpleNamespace(canonical=self.canonical, portable_index=lambda value, source, run: value)
+            dependency = SimpleNamespace(canonical=self.canonical, portable_index=lambda value, source, run: value,
+                                         UPSTREAM_RELEASE_LIMIT=1024**2, upstream_release_json=r.loads)
             self.enterContext(patch.dict(sys.modules, {'platform_release_protocol': dependency}))
         self.config = self.canonical({'verified': 'immutable fixture host profile'})
         self.host_config_sha = r.sha(self.config)
@@ -89,7 +92,7 @@ class PortableSiteTests(unittest.TestCase):
             finally:
                 os.close(descriptor)
 
-    def stage(self, source_code, *, agent=False, older=None, base=None):
+    def stage(self, source_code, *, agent=False, older=None, base=None, stable=None):
         source = source_code * 40
         roles = ('maintenance', 'development') if agent else ('maintenance', 'development', 'devbox', 'host')
         index = {'schema': 2, 'kind': site.AGENT if agent else site.FULL, 'repository': 'oso-gato/dev-pair',
@@ -112,7 +115,7 @@ class PortableSiteTests(unittest.TestCase):
                        'oci_manifest_sha256': oci, 'archive_sha256': r.sha(archive), 'archive_bytes': len(archive)}
                 role_evidence[role] = {'oci_config_sha256': config, 'oci_manifest_sha256': oci}
                 if role != 'devbox':
-                    row.update(codex_version='2.0.0' if agent else '1.0.0', codex_source_sha=source, codex_sha256='f'*64)
+                    row.update(codex_version=stable or ('2.0.0' if agent else '1.0.0'), codex_source_sha=source, codex_sha256='f'*64)
                     role_evidence[role]['context_sha256'] = context
                 index['components'][role if role == 'devbox' else role + '-agent'] = row
                 image = {'role': role, 'source_sha': source, 'context_sha256': context, 'image_id': config,
@@ -146,7 +149,7 @@ class PortableSiteTests(unittest.TestCase):
         else:
             observed = {**claim, 'boot_id': self.boot}
         evidence = site.image_inputs_bytes(observed)
-        leaf = self.root / 'bootstrap/gptbox-adapter' / claim['context_sha256'] / 'imported-releases' / (claim['image_id'] + '.json')
+        leaf = site.maintenance_path(self.root, claim, self.boot)
         leaf.parent.mkdir(mode=0o700, parents=True)
         leaf.write_bytes(evidence)
         leaf.chmod(0o600)
@@ -257,6 +260,28 @@ class PortableSiteTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'incompatible SELinux categories'):
             site.closed_site(self.canonical(overlap))
 
+    def test_exact_platform_and_boot_maintain_separate_immutable_import_proofs(self):
+        current_boot = self.boot
+        initial_boot = '11111111-1111-1111-1111-111111111111'
+        self.boot = initial_boot
+        platform, _ = self.stage('a')
+        release = self.controller.release(self.resolve_site(self.offer(platform))['release_sha256'])
+        component = release['components']['maintenance-agent']
+        context = component['config_sha256']
+        claim, observed, _ = site.retained_maintenance(self.controller, component, context)
+        self.assertEqual((component['platform_sha256'], observed), (platform, initial_boot))
+        old_file = site.maintenance_path(self.root, claim, initial_boot)
+        old_raw = old_file.read_bytes()
+        new_file = site.maintenance_path(self.root, claim, current_boot)
+        self.assertNotEqual(old_file, new_file)
+        new_file.write_bytes(site.image_inputs_bytes({**claim, 'boot_id': current_boot, 'platform_sha256': 'f'*64}))
+        new_file.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'exact typed local import'):
+            site.retained_maintenance(self.controller, component, context)
+        new_file.write_bytes(site.image_inputs_bytes({**claim, 'boot_id': current_boot}))
+        self.assertEqual(site.retained_maintenance(self.controller, component, context)[1], current_boot)
+        self.assertEqual(old_file.read_bytes(), old_raw)
+
     def test_nightly_entry_derives_local_request_only_for_current_official_release(self):
         platform, _ = self.stage('a')
         current = self.resolve_site(self.offer(platform))['release_sha256']
@@ -282,6 +307,42 @@ class PortableSiteTests(unittest.TestCase):
             r.replace_json(self.controller.control / 'current.json', result['release_sha256'])
             self.assertEqual(qualify(self.controller)['status'], 'current')
             self.assertIsNone(self.controller.active_request('agent'))
+
+    def test_actual_sized_upstream_release_passes_normal_candidate_entry(self):
+        import platform_release_protocol as protocol
+
+        source = getattr(protocol, '__file__', None)
+        fixture = Path(source).resolve().parents[1] / 'tests/data/platform/codex-rust-v0.169.0-release.json.gz' if source else None
+        if fixture is not None and fixture.is_file():
+            upstream = gzip.decompress(fixture.read_bytes())
+            self.assertEqual(len(upstream), 413671)
+        else:
+            upstream = r.json_bytes({'tag_name': 'rust-v0.169.0', 'draft': False, 'prerelease': False,
+                                     'html_url': 'https://github.com/openai/codex/releases/tag/rust-v0.169.0',
+                                     'assets': [{'name': 'example', 'text': 'a'*2048} for _ in range(194)]})
+            self.assertGreater(len(upstream), 262144)
+        platform, _ = self.stage('a')
+        current = self.resolve_site(self.offer(platform))['release_sha256']
+        r.replace_json(self.controller.control / 'current.json', current)
+        r.replace_json(self.controller.control / 'site-current.json', current)
+        candidate, _ = self.stage('b', agent=True, older=platform, base=platform, stable='0.169.0')
+        r.replace_json(self.controller.control / 'offers' / 'agent.json', self.offer(candidate, current))
+        path = TOOLS.parent / 'runtime/renewal/agent-candidate'
+        qualify = runpy.run_path(str(path))['controller_offer']
+        adapter = SimpleNamespace(index=self.resolve.index, resolve=self.resolve_site)
+
+        class Response(BytesIO):
+            status = 200
+
+            def geturl(self):
+                return qualify.__globals__['LATEST']
+
+        with patch.dict(qualify.__globals__, {'CONTROL': self.controller.control, 'Resolver': lambda controller: adapter}), \
+                patch('urllib.request.urlopen', return_value=Response(upstream)) as transport:
+            result = qualify(self.controller)
+        self.assertEqual(result['version'], '0.169.0')
+        self.assertEqual(self.controller.active_request('agent')['target_sha256'], result['release_sha256'])
+        self.assertEqual(transport.call_args.args[0].full_url, 'https://api.github.com/repos/openai/codex/releases/latest')
 
 
 if __name__ == '__main__':

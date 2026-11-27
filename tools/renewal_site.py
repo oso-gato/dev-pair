@@ -138,8 +138,16 @@ def maintenance_claim(directory, index):
             'job_admission': False, 'producer_result_sha256': producer}
 
 
+def maintenance_path(root, claim, boot):
+    r.session(boot)
+    for key in ('platform_sha256', 'context_sha256', 'image_id'):
+        r.digest(claim[key])
+    return (root / 'bootstrap/gptbox-adapter' / claim['context_sha256'] / 'imported-releases' /
+            claim['platform_sha256'] / claim['image_id'] / (boot + '.json'))
+
+
 def maintenance_readback(root, claim, boot):
-    path = root / 'bootstrap/gptbox-adapter' / claim['context_sha256'] / 'imported-releases' / (claim['image_id'] + '.json')
+    path = maintenance_path(root, claim, boot)
     raw = protected_bytes(path, 65536)
     r.require(stat.S_IMODE(path.lstat().st_mode) == 0o600 and raw == image_inputs_bytes({**claim, 'boot_id': boot}),
               'maintenance lacks exact typed local import and boundary admission')
@@ -149,25 +157,29 @@ def maintenance_readback(root, claim, boot):
 def retained_maintenance(controller, component, context):
     """Read the exact per-image import proof already held for this local selection."""
     root = controller.root
-    proof = root / 'bootstrap/gptbox-adapter' / context / 'imported-releases' / (component['artifact_sha256'] + '.json')
-    if not os.path.lexists(proof):
+    platform = component.get('platform_sha256')
+    if platform is None:
         return None
-    observed = r.loads(protected_bytes(proof, 65536))
-    boot = r.session(observed['boot_id'])
-    directory, index, _ = Resolver(controller, portable=root / 'platform-releases').index(observed['platform_sha256'])
+    directory, index, _ = Resolver(controller, portable=root / 'platform-releases').index(platform)
     claim = maintenance_claim(directory, index)
     r.require((claim['context_sha256'], claim['source_sha'], claim['image_id']) ==
               (context, component['source_revision'], component['artifact_sha256']),
               'retained maintenance admission differs from selected launch plan')
-    maintenance_readback(root, claim, boot)
     installed = r.loads(protected_bytes(directory / 'installed.json', 65536))
     site = installed['site_config_sha256']
     p.digest(site)
     base = index['base_platform_sha256'] if index['kind'] == AGENT else directory.name
+    installed_boot = r.session(installed['boot_id'])
     components = installed_row(installed, index_sha=directory.name, index=index, base=base, site_sha=site,
-                               boot=r.session(installed['boot_id']))
+                               boot=installed_boot)
     check_component(components['maintenance'], index['components']['maintenance-agent'])
-    return claim, boot, site
+    r.require(maintenance_readback(root, claim, installed_boot) == components['maintenance']['result_sha256'],
+              'retained maintenance admission differs from the installed release receipt')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if boot != installed_boot and os.path.lexists(maintenance_path(root, claim, boot)):
+        maintenance_readback(root, claim, boot)
+        return claim, boot, site
+    return claim, installed_boot, site
 
 
 def observe_development_files(native, parent, lease, reference, manifest, parsed, *, owner=(0, 0)):
@@ -235,7 +247,7 @@ def observe_development(root, manifests, site):
                 r.require(n.identity(build.lstat()) == n.identity(node), 'DevBox build mount changed during readback')
 
 
-def build_selection(index, base, site, installed, inner, previous=None):
+def build_selection(index, base, site, installed, inner, platform, previous=None):
     """Pure derivation whose outputs are independently compared with installed leaves."""
     rows = artifact_rows(index, base)
     host, outer = rows['host'], rows['devbox']
@@ -264,6 +276,8 @@ def build_selection(index, base, site, installed, inner, previous=None):
                               'artifact_sha256': value['oci_config_sha256']}
             if name in r.SCOPE_COMPONENTS['agent']:
                 selected[name]['codex_version'] = value['codex_version']
+            if name == 'maintenance-agent':
+                selected[name]['platform_sha256'] = platform
     if previous is not None:
         r.require(all(selected[name] == previous['components'][name] for name in ('host', 'devbox')) and
                   previous['config_sha256'] == site['host_config_sha256'], 'agent selection changes the retained host or DevBox')
@@ -362,7 +376,7 @@ class Resolver:
         inner = bound_part(directory, index, 'development')['producer']
         r.require(r.sha(image_inputs_bytes(inner)) == installed['development']['inner_sha256'],
                   'installed inner receipt identifies different producer evidence')
-        selection, plan, manifests = build_selection(index, stable, site, installed, inner, previous)
+        selection, plan, manifests = build_selection(index, stable, site, installed, inner, platform, previous)
         reference = r.identity(selection)
         if previous is not None and current != predecessor:
             r.require(reference == current, 'already selected agent package derives different local bytes')

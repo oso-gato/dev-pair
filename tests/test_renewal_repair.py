@@ -120,7 +120,8 @@ class NativeRecoveryTests(unittest.TestCase):
             current = 'a' * 64
             r.replace_json(control / 'site-current.json', current)
             source = 'b' * 40
-            parts = {'maintenance-agent': {'artifact_sha256': 'c'*64, 'source_revision': source, 'codex_version': '1.2.3'},
+            parts = {'maintenance-agent': {'artifact_sha256': 'c'*64, 'source_revision': source, 'codex_version': '1.2.3',
+                                           'platform_sha256': '0'*64},
                      'development-agent': {'artifact_sha256': 'd'*64, 'source_revision': source, 'codex_version': '1.2.3'},
                      'devbox': {'artifact_sha256': 'e'*64}, 'host': {'artifact_sha256': 'f'*64}}
             plan = {'maintenance_context_sha256': '5'*64, 'development_manifests': {'product': '6'*64}}
@@ -192,8 +193,14 @@ class NativeRecoveryTests(unittest.TestCase):
                                         'source_sha': source})
                     binding = {**request, 'policy_sha256': request['config_sha256'], 'job_id': 'product', 'credential_ref': 'mock'}
                     spec = {**request, 'release_sha256': current, 'binding': binding, 'request_sha256': request_sha, **(proof or {})}
-                    with patch.object(subprocess, 'run', side_effect=lambda command, **kwargs:
-                                      real_run([sys.executable, '-c', 'import sys; print(sys.argv[1])', r.canonical(report)], **kwargs)):
+                    def launch(command, **kwargs):
+                        if role == 'maintenance':
+                            self.assertEqual(command[command.index('--platform-sha256') + 1], '0'*64)
+                        else:
+                            self.assertNotIn('--platform-sha256', command)
+                        return real_run([sys.executable, '-c', 'import sys; print(sys.argv[1])', r.canonical(report)], **kwargs)
+
+                    with patch.object(subprocess, 'run', side_effect=launch):
                         result = turn(action, spec)
                     self.assertEqual(result['session_uuid'], active)
                     self.assertFalse(list((control / 'owned-turns').iterdir()))

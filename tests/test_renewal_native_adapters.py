@@ -1,11 +1,13 @@
 """Exercise protected file and accounting contracts without provider or systemd effects."""
 import os
+import importlib.util
 from pathlib import Path
 import runpy
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import uuid
 
 REPO = Path(__file__).resolve().parents[1]
@@ -101,6 +103,9 @@ class NativeAdapterTests(unittest.TestCase):
                 claim(root, modified, 'c' * 64, turn, account, validate, 1)
 
     def test_governed_stable_release_requires_canonical_official_url_and_non_prerelease(self):
+        if importlib.util.find_spec('platform_release_protocol') is None:
+            protocol = SimpleNamespace(UPSTREAM_RELEASE_LIMIT=1024**2, upstream_release_json=r.loads)
+            self.enterContext(patch.dict(sys.modules, {'platform_release_protocol': protocol}))
         check = adapter('agent-candidate')['stable_version']
         release = {'tag_name': 'rust-v0.169.0', 'draft': False, 'prerelease': False,
                    'html_url': 'https://github.com/openai/codex/releases/tag/rust-v0.169.0'}

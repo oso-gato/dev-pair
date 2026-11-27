@@ -100,8 +100,13 @@ def checked_release(value):
     components = value['components']
     require(type(components) is dict and set(components) == COMPONENTS, 'incomplete release components')
     for name, component in components.items():
+        require(type(component) is dict, 'invalid release component')
         agent = name in SCOPE_COMPONENTS['agent']
-        protocol.fields(component, 'source_revision config_sha256 artifact_sha256' + (' codex_version' if agent else ''))
+        fields = 'source_revision config_sha256 artifact_sha256' + (' codex_version' if agent else '')
+        if name == 'maintenance-agent' and 'platform_sha256' in component:
+            fields += ' platform_sha256'
+            digest(component['platform_sha256'])
+        protocol.fields(component, fields)
         protocol.digest(component['source_revision'], 40)
         digest(component['config_sha256'])
         digest(component['artifact_sha256'])
