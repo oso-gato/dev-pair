@@ -146,19 +146,19 @@ class CapsuleTests(unittest.TestCase):
         ]
         self.assertEqual(len(payload_calls), 1)
         argv = payload_calls[0]
-        self.assertEqual(argv[0], 'run')
-        entrypoints = [arg for arg in argv if arg == '--entrypoint' or arg.startswith('--entrypoint=')]
+        self.assertEqual(argv.count(probe.image), 1)
+        image_index = argv.index(probe.image)
+        podman_args = argv[:image_index]
+        iso_args = argv[image_index + 1:]
+        self.assertEqual(podman_args[:1], ['run'])
+        entrypoints = [arg for arg in podman_args if arg == '--entrypoint' or arg.startswith('--entrypoint=')]
         self.assertEqual(entrypoints, ['--entrypoint=/usr/bin/genisoimage'])
-        for option, value in (
-            ('-output', '/disks/payload.iso'), ('-volid', 'DPPAYLOAD'), ('-uid', '0'), ('-gid', '0'),
-        ):
-            with self.subTest(option=option):
-                self.assertEqual(argv.count(option), 1)
-                index = argv.index(option)
-                self.assertEqual(argv[index:index + 2], [option, value])
-        self.assertEqual(argv.count('-graft-points'), 1)
-        grafts = argv[argv.index('-graft-points') + 1:]
-        self.assertCountEqual(grafts, [
+        iso_prefix = [
+            '-quiet', '-output', '/disks/payload.iso', '-volid', 'DPPAYLOAD',
+            '-joliet', '-rock', '-uid', '0', '-gid', '0', '-graft-points',
+        ]
+        self.assertEqual(iso_args[:len(iso_prefix)], iso_prefix)
+        self.assertCountEqual(iso_args[len(iso_prefix):], [
             'native35-recipient.asc=/payload/native35-recipient.asc',
             'native35-gpg-home=/payload/native35-gpg-home',
             'guest.py=/payload/guest.py',
