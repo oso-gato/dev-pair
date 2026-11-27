@@ -1197,6 +1197,10 @@ class Placement:
 
 
 def main():
+    if sys.argv[1:2] == ['install-release']:
+        from native_placement_release import install_cli
+
+        return install_cli(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation', choices=('run',))
     parser.add_argument('--source-sha', required=True)

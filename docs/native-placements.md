@@ -162,3 +162,63 @@ verification.
 The focused local tests exercise release custody, filesystem identity and the
 managed launch/retry contract. An actual enforcing Fedora run establishes
 kernel mounts, native rootless image builds and Distrobox confinement.
+
+## Stage the development placement from a protected release
+
+The native platform installer calls these two phases after protected portable
+intake and host readiness. The operator must have the frozen deployment site
+and a prepared enforcing Fedora role. Release staging is offline and uses the
+existing bounded `dp-dev` engine.
+
+```sh
+/usr/bin/python3 -B /usr/libexec/dev-pair/tools/native_placements.py install-release \
+  --phase preflight --platform-sha256 "$PLATFORM_SHA256" --job "$JOB"
+/usr/bin/python3 -B /usr/libexec/dev-pair/tools/native_placements.py install-release \
+  --phase stage --platform-sha256 "$PLATFORM_SHA256" --job "$JOB"
+```
+
+The release installer creates the protected `development-placement.json`
+handoff. The bridge compares it with the exact portable indexes, intake
+receipts, artifact part digests and selected site configuration. An agent-only
+release keeps the enrolled full platform's outer source and image while the
+new paired-agent release supplies the inner source. The approved site
+specifies the job's filesystem limit and SELinux categories. The bridge
+checks the current Fedora boot and matching host/site release selectors. A
+declared predecessor requires its protected installed receipt and exact
+retained placement. A previously used ordinary probe store can be reused
+after verifying its ownership and inactive state. Keep the ordinary probe
+job name distinct from a released job name.
+
+Preflight validates the outer and inner OCI archives and reads the effective
+inner `inputs.json`, `sealed.json` and package inventory without extracting
+an image to the host. It checks those bytes against the sealed producer
+evidence before preparing the bounded graph and job volumes. Successful
+preflight is bound to the exact source files and current boot. Its receipt
+leaves `manifest_sha256` null.
+
+Stage rechecks those preflight bindings, imports a missing outer image into
+the bounded `dp-dev` store, and reads back its config ID, OCI manifest digest,
+layers and source labels. It blocks if an existing same-ID image disagrees.
+It retains the verified old outer image and the predecessor's manifest and
+archive. The new exact inner archive and independent manifest digest are
+published under
+
+```text
+/var/lib/dev-pair/development/builds/<job>/inputs/<manifest-sha256>/manifest.json
+```
+
+The rootless job's separate `work` path also uses the bounded build volume.
+Its workspaces, state, and cache remain in their prior managed leaves. A
+candidate needs free space alongside retained rollback data and sufficient
+space in the one-GiB protected outer copy volume if the image is absent
+locally. Each phase has a 280-second wall ceiling inside the installer's
+300-second command bound. Up to three digest-addressed manifests per job stay
+retained. Reclamation beyond that limit requires scoped reconciliation.
+
+Only the platform installer publishes `installed.json` after its readback.
+Role dispatch and activation use the existing protected renewal and live job
+entry. The inner image is imported and inspected inside DevBox when that
+entry runs. Stage verifies the exact inner archive and seal, so stage evidence
+does not claim a nested process started. A blocked stage leaves the active
+site selectors unchanged. The protected placement lease and current failure
+stage are under `/var/lib/dev-pair/native-placements/release/records/`.
