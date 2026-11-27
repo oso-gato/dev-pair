@@ -1,0 +1,14 @@
+[Unit]
+Description=Prepare the confirmed dev-pair product job %i
+RequiresMountsFor=/var/lib/dev-pair/product-jobs
+
+[Service]
+Type=exec
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/owner_intake.py --prepare %i
+RuntimeMaxSec=300s
+TimeoutStopSec=15s
+MemoryMax=512M
+TasksMax=64
+CPUQuota=100%

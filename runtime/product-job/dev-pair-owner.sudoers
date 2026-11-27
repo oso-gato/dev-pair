@@ -1,0 +1,2 @@
+# The protected front door accepts only its bounded stdin protocol.
+core ALL=(root) NOPASSWD: /usr/libexec/dev-pair/tools/owner_intake.py ""

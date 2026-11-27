@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile confirmed dev-pair product job scheduling
+RequiresMountsFor=/var/lib/dev-pair/product-jobs
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/owner_intake.py --reconcile
+TimeoutStartSec=25s
+MemoryMax=128M
+TasksMax=32
