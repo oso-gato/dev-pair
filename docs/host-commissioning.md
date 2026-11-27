@@ -35,8 +35,13 @@ separate private keys and mutual pins. It publishes the two profiles under
 runs join an interrupted publication and verify the same pair. An expired or
 incomplete retained pair requires protected recovery before another apply.
 The controller measures the account, subordinate IDs and remaining storage
-before provisioning the core managed listener. Owner intake, spool and
-scheduled renewal stay held until their respective authorities settle.
+before provisioning the core managed listener. Resume the same Day 0 setup
+after independent workload access has been admitted for the selected roles.
+Commissioning checks the protected authority for each feature and lists any
+remaining prerequisites. Owner intake needs the approved catalogue, startup
+material and a valid provider slot. Checklist cleanup needs the managed
+validation filesystem. Scheduled renewal needs protected read custody and an
+approved compatible agent offer.
 
 A `pending` result names the specific prerequisite, such as available storage,
 protected release trust, GitHub read custody or an eligible attested
@@ -62,14 +67,14 @@ interrupted initial selector write can be completed only from its protected
 intent. Reapplication reads a compatible live successor and retains saved work.
 
 The ready response contains the selected local release, the admitted timer
-targets and their observed next firing. The root service for an omitted timer
-stays inactive. A selected timer is enabled only after the managed listener and
-boot recovery pass. The controller measures the effective service command
-and timeout settings. It verifies the Fedora systemd timeout drop-in against
-the trusted installed package and the pinned Fedora key. The entry publishes
-the named operator's constrained sudo
-rule after these checks when approved owner intake is enabled. On the verified
-tailnet route, the owner can then use the [normal terminal command](owner-intake.md).
+targets and their observed next firing. Automatic workload activation records
+its own readback and retains the initial commissioning policy. Each workload
+timer checks its current boot, role selection and grant before its service
+runs. A later resume disarms a timer whose authority was withdrawn and retains
+the job records. Commissioning verifies the effective command, workload guard
+and Fedora systemd timeout policy before arming a timer. It publishes the
+named operator's constrained sudo rule once owner intake is ready. On the
+verified tailnet route, the owner can use the [normal terminal command](owner-intake.md).
 
 ```sh
 dev-pair start owner/approved-repository

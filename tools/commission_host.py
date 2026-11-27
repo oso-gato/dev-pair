@@ -22,6 +22,7 @@ STATE = '/var/lib/dev-pair'
 PRIVATE = STATE + '/bootstrap/host-commissioning'
 AUTOMATIC_POLICY = PRIVATE + '/automatic-policy.json'
 INITIAL_SITE = PRIVATE + '/initial-site.json'
+ACTIVATION = PRIVATE + '/workload-activation.json'
 DAY0_PROGRESS = '/var/lib/dev-pair-day0/progress.json'
 CONTROL = STATE + '/renewal'
 FENCE = STATE + '/renewal-fence'
@@ -35,6 +36,11 @@ TIMERS = {
     'agent-renewal': ('dev-pair-renewal-agent.timer', 'dev-pair-renewal@agent.service'),
     'checklist-spool': ('dev-pair-checklist-spool.timer', 'dev-pair-checklist-spool.service'),
     'owner-intake': ('dev-pair-intake-recovery.timer', 'dev-pair-intake-recovery.service'),
+}
+WORKLOAD_GUARDS = {
+    'agent-renewal': ('dev-pair-renewal@agent.service',),
+    'checklist-spool': ('dev-pair-checklist-spool.service',),
+    'owner-intake': ('dev-pair-intake-recovery.service', 'dev-pair-intake@.service', 'dev-pair-product@.service'),
 }
 TLS_FILES = ('cert.pem', 'peer.pem', 'key.pem')
 CHECKLIST_SERVER = '/etc/dev-pair/checklist-server'
@@ -161,6 +167,25 @@ def install_target(target):
     return target
 
 
+def workload_guard_command(feature):
+    return f'{PYTHON} -IB {INSTALL}/tools/commission_host.py guard {feature}'
+
+
+def workload_guard_files(features):
+    return {f'{UNIT_ROOT}/{unit}.d/81-dev-pair-workload-guard.conf':
+            (('[Service]\nExecCondition=' + workload_guard_command(feature) + '\n').encode(), 0o644, feature)
+            for feature in features for unit in WORKLOAD_GUARDS[feature]}
+
+
+def validate_feature_grant(grant):
+    exact_fields(grant, ('subject', 'expires_unix', 'sha256'), 'invalid retained workload grant')
+    require(type(grant['subject']) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,31}', grant['subject']) and
+            (grant['expires_unix'] is None or type(grant['expires_unix']) is int and grant['expires_unix'] > 0),
+            'invalid retained workload grant scope')
+    hex_id(grant['sha256'])
+    return grant
+
+
 def verify_checkout(kit, revision, owner):
     # Establish the exact source before making any checkout module importable.
     protected(kit / '.git', owner, directory=True)
@@ -265,10 +290,9 @@ class Commission:
                 stream.flush()
                 os.fsync(stream.fileno())
             self.run('/usr/sbin/visudo', '-cf', name, timeout=12)
-            os.link(name, path)
         finally:
             os.unlink(name)
-        self.sync(path.parent)
+        self.publish_file(path, raw, mode)
 
     @staticmethod
     def sync(path):
@@ -300,7 +324,7 @@ class Commission:
         require(raw == committed.encode(), 'commissioning source differs from the exact reviewed checkout')
         return raw
 
-    def package(self, policy, bundle):
+    def package(self, policy, bundle, *, retained=(), activation=False):
         revision = policy['source_sha']
         raw = self.source_bytes(MANIFEST, revision)
         require(bundle.get(MANIFEST) == digest(raw), 'commissioning manifest is outside the approved host bundle')
@@ -326,8 +350,18 @@ class Commission:
                 require(bundle.get(source) == digest(contents), 'reviewed host bundle bytes differ from commissioning kit')
             if row['feature'] in features:
                 files[target] = (contents, int(row['mode'], 8), row['feature'])
+            elif row['feature'] in retained or (row['feature'] == 'owner-entry' and 'owner-intake' in retained):
+                self.file(target, contents, int(row['mode'], 8), save=False)
             else:
                 require(not os.path.lexists(self.path(target)), 'disabled feature has installed commissioning files')
+        for target, item in workload_guard_files(TIMERS).items():
+            contents, mode, feature = item
+            if activation and feature in features:
+                files[target] = item
+            elif feature in retained:
+                self.file(target, contents, mode, save=False)
+            else:
+                require(not os.path.lexists(self.path(target)), 'unowned workload guard was preserved')
         return files
 
     def inspect(self, policy):
@@ -383,9 +417,16 @@ class Commission:
                 recorded = parse(self.read(listener))
                 report['recorded_listener_phase'] = recorded['phase']
                 report['listener_observation_on_current_boot'] = recorded['boot'] == observed['boot_id']
+            if action == 'status' and prepared:
+                activation = self.activation_record(digest(raw), observed['machine_id'])
+                if activation is not None:
+                    report['recorded_activation'] = {'current_boot': activation['boot_id'] == observed['boot_id'],
+                                                     'features': {name: {'phase': row['phase'], 'next': row['next']}
+                                                                  for name, row in activation['features'].items()}}
             return report
         policy_sha = digest(raw)
         with self.lock():
+            activation = self.activation_record(policy_sha, observed['machine_id'])
             applying = os.path.lexists(self.path(PRIVATE + '/intent.json'))
             if applying:
                 prior = parse(self.read(PRIVATE + '/intent.json'))
@@ -408,14 +449,178 @@ class Commission:
                 # The native stage checks its own remaining allocation after an
                 # owned apply starts. Its existing backing must not be counted twice.
                 self.verify_prepared_checklist(policy, observed, site, placed=placed or applying)
-            files = self.package(policy, bundle)
+            owned = activation['features'] if activation else ()
+            files = self.package(policy, bundle, retained=owned)
             if action == 'prepare':
                 self.services.configuration(policy, site)
+            else:
+                self.restore_owned_guards(owned)
             self.file(AUTOMATIC_POLICY, raw, 0o600)
         if action == 'prepare':
             return {**report, 'phase': 'prepared'}
-        return {**self.apply(policy, policy_sha, observed['boot_id'], site, files),
-                'held_features': list(CORE_HELD_FEATURES)}
+        core = self.apply(policy, policy_sha, observed['boot_id'], site, files, retained=owned)
+        if core['phase'] != 'ready':
+            return {**core, 'held_features': list(CORE_HELD_FEATURES)}
+        return self.advance_workloads(policy, policy_sha, observed, site, bundle, core)
+
+    def activation_record(self, policy_sha, machine):
+        if not os.path.lexists(self.path(ACTIVATION)):
+            return None
+        value = parse(self.read(ACTIVATION))
+        exact_fields(value, ('schema', 'policy_sha256', 'machine_id', 'boot_id', 'release_sha256', 'proof_sha256', 'features'),
+                     'unknown automatic workload activation record')
+        require(type(value['schema']) is int and value['schema'] == 1 and value['policy_sha256'] == policy_sha and
+                value['machine_id'] == machine and type(value['features']) is dict and set(value['features']) <= set(TIMERS),
+                'workload activation belongs to another commissioning policy')
+        hex_id(value['release_sha256'])
+        hex_id(value['proof_sha256'])
+        require(type(value['boot_id']) is str and re.fullmatch(r'[0-9a-f-]{36}', value['boot_id']),
+                'invalid recorded workload boot identity')
+        for saved in value['features'].values():
+            exact_fields(saved, ('phase', 'grant', 'next'), 'invalid workload activation state')
+            require(saved['phase'] in ('staging', 'active', 'armed', 'held') and type(saved['next']) is list and
+                    len(saved['next']) <= 2 and all(type(value) is str and 0 < len(value) <= 128 for value in saved['next']) and
+                    (saved['phase'] == 'armed') == bool(saved['next']), 'invalid workload activation phase or timer readback')
+            validate_feature_grant(saved['grant'])
+        return value
+
+    def save_activation(self, value):
+        from renewal import replace_json
+
+        replace_json(self.path(ACTIVATION), value)
+
+    def restore_owned_guards(self, owned):
+        # Recreate the exact deny-by-default guard before any core daemon reload.
+        for target, (contents, mode, _) in workload_guard_files(owned).items():
+            if not os.path.lexists(self.path(target)):
+                self.file(target, contents, mode)
+                self.run('/usr/sbin/restorecon', '-F', target, timeout=10)
+
+    def require_runtime_feature(self, feature, *, owner_entry=False):
+        require(feature in TIMERS, 'unknown automatic workload feature')
+        raw = self.read(AUTOMATIC_POLICY)
+        decoded = parse(raw)
+        policy = read_policy(raw, hex_id(decoded['source_sha'], 40))
+        identity = self.services.identity()
+        saved = self.activation_record(digest(raw), identity['machine_id'])
+        require(saved is not None and saved['boot_id'] == identity['boot_id'],
+                'automatic workload activation is not current on this boot')
+        row = saved['features'].get(feature)
+        require(row is not None and (row['phase'] == 'armed' or row['phase'] == 'active' and not owner_entry),
+                'automatic workload feature is held')
+        require(row['grant']['expires_unix'] is None or row['grant']['expires_unix'] > time.time(),
+                'automatic workload grant expired')
+        release = saved['release_sha256']
+        require(self.services.workload_scope(self, policy, release, identity['boot_id'], ssh=False) == saved['proof_sha256'] and
+                self.services.feature_authority(feature, release, recorded=row['grant']) == row['grant'],
+                'automatic workload authorization changed')
+
+    def advance_workloads(self, policy, policy_sha, observed, site, bundle, core):
+        selected = core['selected_release']
+        machine, boot = observed['machine_id'], observed['boot_id']
+        with self.lock(), self.services.renewal().lock(shared=True):
+            saved = self.activation_record(policy_sha, machine)
+            features = saved['features'] if saved else {}
+            try:
+                proof = self.services.workload_scope(self, policy, selected, boot)
+            except Pending as wait:
+                proof, pending = None, wait.report['prerequisite']
+            if proof is None and not features:
+                return {**core, 'held_features': list(CORE_HELD_FEATURES),
+                        'pending_features': dict.fromkeys(TIMERS, pending)}
+            current = {'schema': 1, 'policy_sha256': policy_sha, 'machine_id': machine, 'boot_id': boot,
+                       'release_sha256': selected, 'proof_sha256': proof or saved['proof_sha256'], 'features': features}
+            if saved and any(saved[key] != current[key] for key in ('boot_id', 'release_sha256', 'proof_sha256')):
+                for feature in features.values():
+                    feature.update(phase='held', next=[])
+                self.save_activation(current)
+
+            timers, holds = {}, {}
+            for feature in CORE_HELD_FEATURES:
+                try:
+                    if proof is None:
+                        raise Pending(pending, 'Current independent workload access is pending.')
+                    grant = self.services.feature_authority(feature, selected)
+                except Pending as wait:
+                    holds[feature] = wait.report['prerequisite']
+                    if feature in features:
+                        self.hold_owned_workload(feature, policy, bundle, current)
+                    continue
+                validate_feature_grant(grant)
+                selected_policy = {**policy, 'timers': [feature]}
+                files = self.package(selected_policy, bundle, retained=features, activation=True)
+                previous = features.get(feature)
+                missing = any(member == feature and not os.path.lexists(self.path(target))
+                              for target, (_, _, member) in files.items())
+                if previous is None or previous['phase'] not in ('active', 'armed') or previous['grant'] != grant or missing:
+                    features[feature] = {'phase': 'staging', 'grant': grant, 'next': []}
+                    self.save_activation(current)
+                    self.install_workload(feature, selected_policy, site, files, selected)
+                    try:
+                        if (self.services.workload_scope(self, policy, selected, boot) != proof or
+                                self.services.feature_authority(feature, selected, recorded=grant) != grant):
+                            raise Pending('workload-authorization-changed', 'Workload authorization changed before timer activation.')
+                    except Pending as wait:
+                        holds[feature] = wait.report['prerequisite']
+                        self.hold_owned_workload(feature, policy, bundle, current)
+                        continue
+                    features[feature]['phase'] = 'active'
+                    self.save_activation(current)
+                else:
+                    for target, (contents, mode, member) in files.items():
+                        if member == feature:
+                            require(self.read(target, mode, FILE_LIMIT) == contents, 'active workload file changed')
+                timer, readback = self.arm_timer(feature, files)
+                timers[timer] = readback
+                if feature == 'owner-intake':
+                    self.publish_owner_entry(files)
+                confirmed = {'phase': 'armed', 'grant': grant, 'next': readback['next']}
+                if features[feature] != confirmed:
+                    features[feature] = confirmed
+                    self.save_activation(current)
+            return {**core, 'timers': timers, 'held_features': sorted(holds), 'pending_features': holds,
+                    'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' not in holds else None}
+
+    def hold_owned_workload(self, feature, policy, bundle, current):
+        features = current['features']
+        if features[feature]['phase'] != 'held':
+            features[feature].update(phase='held', next=[])
+            self.save_activation(current)
+        self.disable_owned_timer(feature, policy, bundle, features)
+
+    def install_workload(self, feature, policy, site, files, selected):
+        changed = []
+        # A partial first install cannot leave a loaded service without its fixed guard.
+        for target, (contents, mode, member) in sorted(files.items(), key=lambda row: not row[0].endswith('81-dev-pair-workload-guard.conf')):
+            if member == feature:
+                self.file(target, contents, mode)
+                changed.append(target)
+        self.run('/usr/sbin/restorecon', '-F', *changed, timeout=30)
+        self.run(SYSTEMCTL, 'daemon-reload', timeout=25)
+        if feature == 'owner-intake':
+            self.verify_owner_units(site, files)
+        self.services.post_provision(policy, selected)
+        self.check_timer(feature, files)
+
+    def disable_owned_timer(self, feature, policy, bundle, features):
+        timer, _ = TIMERS[feature]
+        files = self.package({**policy, 'timers': [feature]}, bundle, retained=features, activation=True)
+        target = UNIT_ROOT + '/' + timer
+        if not os.path.lexists(self.path(target)):
+            self.require_inactive(timer)
+            return
+        self.file(target, *files[target][:2], save=False)
+        row = self.unit(timer, files, timer=True)
+        if row['ActiveState'] != 'inactive' or row['UnitFileState'] == 'enabled':
+            self.run(SYSTEMCTL, 'disable', '--now', timer, timeout=25)
+        self.require_inactive(timer)
+
+    def publish_owner_entry(self, files):
+        for target, (contents, mode, feature) in files.items():
+            if feature == 'owner-entry':
+                self.file(target, contents, mode)
+                self.run('/usr/sbin/restorecon', '-F', target, timeout=10)
+        self.run('/usr/sbin/visudo', '-c', timeout=15)
 
     def automatic_site(self, observed, revision, *, persist):
         if not persist:
@@ -526,7 +731,8 @@ class Commission:
 
         template = re.sub(r'@[^.]+\.service$', '@.service', unit)
         fragment = UNIT_ROOT + '/' + template
-        drops = sorted(name for name in files if name.startswith(fragment + '.d/'))
+        instance = UNIT_ROOT + '/' + unit
+        drops = sorted(name for name in files if name.startswith((fragment + '.d/', instance + '.d/')))
         properties = 'LoadState,FragmentPath,DropInPaths,UnitFileState,ActiveState,SubState,' + (
             'Unit,NextElapseUSecRealtime,NextElapseUSecMonotonic' if timer else
             ','.join(('ExecStart', 'User', 'Group', *profile.PROPERTIES)))
@@ -541,7 +747,14 @@ class Commission:
             require(row['DropInPaths'].split() == drops, 'systemd loaded a different timer override for ' + unit)
         else:
             try:
-                profile.observe(row, drops, self.path, self.run, owner=self.owner)
+                service = row
+                guards = [files[name][0].decode().split('ExecCondition=', 1)[1].strip() for name in drops
+                          if name.endswith('/81-dev-pair-workload-guard.conf')]
+                if guards:
+                    require(len(guards) == 1 and profile.exec_start_matches(row['ExecCondition'], guards[0]),
+                            'systemd workload guard differs for ' + unit)
+                    service = {**row, 'ExecCondition': ''}
+                profile.observe(service, drops, self.path, self.run, owner=self.owner)
             except ValueError as error:
                 raise Blocked('unverified effective service profile for ' + unit + '. ' + str(error)) from None
             if uid is None:
@@ -559,26 +772,34 @@ class Commission:
                     'systemd effective command differs for ' + unit)
         return row
 
-    def timers(self, policy, files):
+    def check_timer(self, feature, files):
+        timer, service = TIMERS[feature]
+        self.unit(service, files)
+        pending = self.unit(timer, files, timer=True)
+        require(pending['Unit'] == service, 'timer is not linked to its approved service')
+        return timer, service, pending
+
+    def arm_timer(self, feature, files):
+        timer, service, pending = self.check_timer(feature, files)
+        if pending['UnitFileState'] != 'enabled' or pending['ActiveState'] != 'active':
+            self.run(SYSTEMCTL, 'enable', '--now', timer, timeout=25)
+        active = self.unit(timer, files, timer=True)
+        scheduled = [active[key] for key in ('NextElapseUSecRealtime', 'NextElapseUSecMonotonic')
+                     if active[key] not in ('', '0', 'n/a', 'infinity')]
+        require(active['Unit'] == service and active['UnitFileState'] == 'enabled' and
+                active['ActiveState'] == 'active' and scheduled,
+                'systemd timer lacks its exact active and scheduled readback: ' + timer)
+        return timer, {'service': service, 'next': scheduled}
+
+    def timers(self, policy, files, *, retained=()):
         results = {}
         for name, (timer, service) in TIMERS.items():
             if name not in policy['timers']:
-                for unit in (timer, service):
-                    self.require_inactive(unit)
+                if name not in retained:
+                    for unit in (timer, service):
+                        self.require_inactive(unit)
                 continue
-            # Check both root service argv and the timer's binding before any enable.
-            self.unit(service, files)
-            pending = self.unit(timer, files, timer=True)
-            require(pending['Unit'] == service, 'timer is not linked to its approved service')
-            if pending['UnitFileState'] != 'enabled' or pending['ActiveState'] != 'active':
-                self.run(SYSTEMCTL, 'enable', '--now', timer, timeout=25)
-            active = self.unit(timer, files, timer=True)
-            scheduled = [active[key] for key in ('NextElapseUSecRealtime', 'NextElapseUSecMonotonic')
-                         if active[key] not in ('', '0', 'n/a', 'infinity')]
-            require(active['Unit'] == service and active['UnitFileState'] == 'enabled' and
-                    active['ActiveState'] == 'active' and scheduled,
-                    'systemd timer lacks its exact active and scheduled readback: ' + timer)
-            results[timer] = {'service': service, 'next': scheduled}
+            _, results[timer] = self.arm_timer(name, files)
         return results
 
     def require_inactive(self, unit):
@@ -588,14 +809,20 @@ class Commission:
                 row['UnitFileState'] in ('', 'static', 'disabled', 'masked'),
                 'disabled feature has an active or enabled root unit: ' + unit)
 
-    def apply(self, policy, policy_sha, boot, site, files):
+    def verify_owner_units(self, site, files):
+        sample = sorted(site['jobs'])[0]
+        for unit in ('dev-pair-provider@' + '0' * 64 + '.service',
+                     f'dev-pair-intake@{sample}.service', f'dev-pair-product@{sample}.service'):
+            self.unit(unit, files)
+
+    def apply(self, policy, policy_sha, boot, site, files, *, retained=()):
         # Check targets, credentials and protected site policy before installing anything.
         self.require_first_site(policy['machine_id'], policy['site_config_sha256'])
         for target, (contents, mode, _) in files.items():
             self.file(target, contents, mode, save=False)
         self.services.configuration(policy, site)
         for feature, units in TIMERS.items():
-            if feature not in policy['timers']:
+            if feature not in policy['timers'] and feature not in retained:
                 for unit in units:
                     self.require_inactive(unit)
         initial_file = PRIVATE + '/initial-release.json'
@@ -621,10 +848,7 @@ class Commission:
             for unit in (BOOT_FENCE, RECOVERY, 'dev-pair-renewal-host-observe.service'):
                 self.unit(unit, files)
             if 'owner-intake' in policy['timers']:
-                sample = sorted(site['jobs'])[0]
-                for unit in ('dev-pair-provider@' + '0' * 64 + '.service',
-                             f'dev-pair-intake@{sample}.service', f'dev-pair-product@{sample}.service'):
-                    self.unit(unit, files)
+                self.verify_owner_units(site, files)
             if not any(existing):
                 self.services.prepare_host_bundle(policy)
                 self.services.stage(policy, boot)
@@ -645,13 +869,9 @@ class Commission:
                     recovery['UnitFileState'] == 'enabled' and not os.path.lexists(self.path(FENCE + '/frozen')),
                     'managed checklist listener or recovery gate is still pending')
             self.services.post_provision(policy, selected)
-            armed = self.timers(policy, files)
-            for target, (contents, mode, feature) in files.items():
-                if feature == 'owner-entry':
-                    self.file(target, contents, mode)
-                    self.run('/usr/sbin/restorecon', '-F', target, timeout=10)
+            armed = self.timers(policy, files, retained=retained)
             if 'owner-intake' in policy['timers']:
-                self.run('/usr/sbin/visudo', '-c', timeout=15)
+                self.publish_owner_entry(files)
             return {'phase': 'ready', 'selected_release': selected, 'timers': armed,
                     'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' in policy['timers'] else None}
 
@@ -1168,6 +1388,141 @@ class Live:
         record = self.renewal_module.read_json(controller.control / 'platform-observations' / (selected + '.json'))
         return binding['platform_sha256'] == policy['platform_sha256'] and record['boot_id'] == boot
 
+    def workload_scope(self, app, policy, selected, boot, *, ssh=True):
+        from bootstrap import Blocked as BootstrapBlocked
+        from destination_release import Destination, MANAGED_LISTENER
+
+        try:
+            if ssh:
+                self.bootstrap.verify_final_ssh()
+            proof = self.bootstrap.verify_workload_access()
+            listener = parse(app.read(MANAGED_LISTENER))
+            require(proof.get('role_artifacts', {}).get('release_sha256') == selected and proof.get('scope') is None and
+                    (listener['site'], listener['boot'], listener['phase']) == (selected, boot, 'ready') and
+                    self.identity() == {'machine_id': policy['machine_id'], 'boot_id': boot} and
+                    not os.path.lexists(app.path(FENCE + '/frozen')),
+                    'independent workload access or live checklist recovery differs')
+            if ssh:
+                destination = Destination()
+                destination.require_recovery_enabled()
+                destination.verify_managed_executor(selected, policy['checklist']['uid'])
+        except (AttributeError, Blocked, BootstrapBlocked, OSError, RuntimeError, ValueError, TypeError, KeyError,
+                subprocess.SubprocessError):
+            raise Pending('workload-access', 'The exact current role access and managed checklist probe is pending.') from None
+        return digest(encoded(proof))
+
+    @staticmethod
+    def credential_stamp(path):
+        protected(path, 0, mode=0o600)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            node = os.fstat(fd)
+            require(stat.S_ISREG(node.st_mode) and (node.st_uid, node.st_gid, node.st_nlink, stat.S_IMODE(node.st_mode)) ==
+                    (0, 0, 1, 0o600) and 0 < node.st_size <= 128 * 1024,
+                    'workload credential is outside its approved custody')
+            return [node.st_dev, node.st_ino, node.st_ctime_ns, node.st_size]
+        finally:
+            os.close(fd)
+
+    def owner_slot_grant(self, intake, job):
+        from owner_intake import CREDENTIALS, MODEL, ROLES, checked_file
+
+        root = intake.site / 'slots' / job
+        profile = checked_file(root / 'profile.json')
+        expires = parse(profile)['expires_unix']
+        require(type(expires) is int and expires > time.time(), 'owner provider approval expired')
+        inputs = {'catalogue': digest(checked_file(intake.site / 'repositories.json')), 'slot': digest(profile)}
+        for role in ROLES:
+            raw = checked_file(root / role / 'profile.json')
+            credential = parse(raw)['credential_ref']
+            require(type(credential) is str and re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,127}', credential) and
+                    credential not in ('.', '..'), 'invalid protected provider credential reference')
+            inputs[role] = [digest(raw), self.credential_stamp(CREDENTIALS / credential)]
+        for kind in ('context', 'tariff'):
+            inputs[kind] = digest(checked_file(root / (MODEL + '.' + kind), 1024 * 1024))
+        return {'subject': job, 'expires_unix': expires, 'sha256': digest(encoded(inputs))}
+
+    def owner_feature_authority(self, selected, recorded):
+        from bootstrap import Blocked as BootstrapBlocked
+        from owner_intake import CHECKLIST, Intake
+
+        intake, end = Intake(), time.monotonic() + 45
+        failures = (Blocked, BootstrapBlocked, OSError, ValueError, RuntimeError, TypeError, KeyError, subprocess.SubprocessError)
+        try:
+            repositories, slots = intake.catalogue_settings()
+            _, reference, manifests = intake.release_slots()
+            require(reference == selected and set(slots) <= set(manifests), 'owner slots differ from the current release')
+        except failures:
+            raise Pending('owner-catalogue', 'Protected repository and slot authority is unavailable.') from None
+        if recorded is not None:
+            require(recorded['subject'] in slots, 'the approved provider slot was withdrawn')
+            return self.owner_slot_grant(intake, recorded['subject'])
+
+        for repository, row in sorted(repositories.items()):
+            if time.monotonic() >= end:
+                break
+            try:
+                intake.source(repository, row, checklist=CHECKLIST in row.get('workloads', [CHECKLIST]))
+                break
+            except failures:
+                continue
+        else:
+            raise Pending('owner-repository-inputs', 'The exact approved repository and startup corpus are unavailable.')
+        if time.monotonic() >= end:
+            raise Pending('owner-repository-inputs', 'The bounded repository authority check did not finish.')
+        if any(CHECKLIST in row.get('workloads', [CHECKLIST]) for row in repositories.values()):
+            try:
+                self.checklist_builder(prepare=False)
+            except failures:
+                raise Pending('checklist-builder', 'The independently verified checklist base is not ready.') from None
+        for job in slots:
+            if time.monotonic() >= end:
+                break
+            try:
+                intake.slot(job, manifests[job])
+                return self.owner_slot_grant(intake, job)
+            except failures:
+                continue
+        raise Pending('provider-slot-authority', 'No approved provider slot has valid current custody and bounded pricing.')
+
+    def feature_authority(self, feature, selected, *, recorded=None):
+        from bootstrap import Blocked as BootstrapBlocked
+
+        try:
+            if feature == 'owner-intake':
+                return self.owner_feature_authority(selected, recorded)
+            if feature == 'checklist-spool':
+                from checklist_candidate import checked_storage
+                from host_handoff import host_runtime
+
+                runtime = host_runtime()
+                with runtime.dispatch_gate():
+                    device = checked_storage(runtime, time.monotonic() + 15)
+                    node = runtime.STORAGE.lstat()
+                return {'subject': 'managed-validation', 'expires_unix': None,
+                        'sha256': digest(encoded([selected, device, node.st_ino]))}
+            from release_trust import POLICY, ReleaseTrust
+
+            self.require_release_custody()
+            trust = ReleaseTrust(self.run)
+            for role in ('maintenance', 'development'):
+                require('agent_refresh' in trust.policy(role)['components'][role], 'independent nightly trust is unavailable')
+            controller = self.renewal()
+            offer_path = controller.control / 'offers/agent.json'
+            raw = capture(offer_path, 0, mode=0o600, maximum=65536)
+            offer = self.resolver.offer_record(parse(raw), 'agent')
+            require(offer['previous_release_sha256'] == selected, 'nightly offer is outside the current release')
+            _, index, _ = self.resolver.Resolver(controller).index(offer['platform_sha256'])
+            require(index['kind'] == self.resolver.AGENT, 'nightly offer lacks a verified portable agent release')
+            config = self.installer.intake.native_env().get('GH_CONFIG_DIR', '/root/.config/gh')
+            authority = [digest(raw), digest(capture(Path(POLICY), 0, maximum=65536)),
+                         self.credential_stamp(Path(config) / 'hosts.yml')]
+            return {'subject': 'selected-offer', 'expires_unix': None, 'sha256': digest(encoded(authority))}
+        except (Blocked, BootstrapBlocked, OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+            prerequisite = {'owner-intake': 'provider-slot-authority', 'checklist-spool': 'checklist-validation-storage',
+                            'agent-renewal': 'agent-release-authority'}[feature]
+            raise Pending(prerequisite, 'The protected runtime authority for this workload feature is unavailable.') from None
+
     def provision(self, policy):
         args = policy['checklist']
         argv = [PYTHON, '-EBs', str(self.kit / 'tools/destination_release.py'), 'provision', '--apply',
@@ -1205,7 +1560,7 @@ class Live:
                    for row in repositories.values()):
                 self.checklist_builder()
 
-    def checklist_builder(self):
+    def checklist_builder(self, *, prepare=True):
         from checklist_candidate import CONTAINERS, candidate_image
         from destination_release import Destination
 
@@ -1213,9 +1568,10 @@ class Live:
         app = Destination()
         uid = app.account()
         base = '/var/lib/dev-pair/checklist-validation/builder'
-        for path in (base, base + '/graph', base + '/tmp'):
-            self.role_directory(path, 'dp-checklist')
-        self.run('/usr/sbin/restorecon', '-RF', base, timeout=15)
+        if prepare:
+            for path in (base, base + '/graph', base + '/tmp'):
+                self.role_directory(path, 'dp-checklist')
+            self.run('/usr/sbin/restorecon', '-RF', base, timeout=15)
         # Match the conductor's store exactly. The digest and its independent
         # verification receipt are installed beforehand under site custody.
         raw = app.subprocess_role(uid, '/usr/bin/env', 'TMPDIR=' + base + '/tmp',
@@ -1226,7 +1582,34 @@ class Live:
         candidate_image(parse(raw), policy['image'])
 
 
+def require_installed_workload(feature, *, owner_entry=False):
+    path = Path(__file__).absolute()
+    require(os.getuid() == os.geteuid() == 0 and path == Path(INSTALL + '/tools/commission_host.py'),
+            'use the exact installed automatic workload guard')
+    protected(path, 0)
+    protected(path.parent, 0, directory=True)
+    sys.path.insert(0, str(path.parent))
+    from bootstrap import Bootstrap
+
+    bootstrap = Bootstrap()
+    live = Live(Path(INSTALL), bootstrap)
+    try:
+        Commission(Path(INSTALL), Path('/'), bootstrap.run, 0, live).require_runtime_feature(feature, owner_entry=owner_entry)
+    except Pending:
+        raise Blocked('current protected workload authorization is pending') from None
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['guard']:
+        try:
+            require(len(argv) == 2, 'provide one exact workload guard')
+            require_installed_workload(argv[1])
+            return 0
+        except (Blocked, OSError, RuntimeError, ValueError, TypeError, KeyError, ImportError, subprocess.SubprocessError):
+            # ExecCondition returns 1 for an intentionally withheld service.
+            print('The protected dev-pair workload feature is held.', file=sys.stderr)
+            return 1
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('operation', choices=('inspect', 'apply', 'discover', 'prepare', 'status'))
     parser.add_argument('--source-sha', required=True)

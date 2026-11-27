@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import patch
 
@@ -51,12 +52,15 @@ class Systemd:
         if binary != c.SYSTEMCTL:
             self.steps.append(command if binary.endswith('restorecon') else binary)
             return ''
-        if command in ('daemon-reload', 'enable'):
-            self.steps.append(command if command == 'daemon-reload' else 'enable:' + args[-1])
+        if command in ('daemon-reload', 'enable', 'disable'):
+            self.steps.append(command if command == 'daemon-reload' else command + ':' + args[-1])
             if command == 'enable':
                 self.enabled.add(args[-1])
                 if '--now' in args:
                     self.active.add(args[-1])
+            if command == 'disable':
+                self.enabled.discard(args[-1])
+                self.active.discard(args[-1])
             return ''
         if command != 'show':
             raise AssertionError('unexpected manager command')
@@ -65,15 +69,18 @@ class Systemd:
         template = re.sub(r'@[^.]+\.service$', '@.service', unit)
         fragment = c.UNIT_ROOT + '/' + template
         path = self.root / fragment.lstrip('/')
-        drops = sorted(path.with_name(path.name + '.d').glob('*.conf'))
+        instance = path.with_name(unit + '.d')
+        drops = sorted(set(path.with_name(path.name + '.d').glob('*.conf')) | set(instance.glob('*.conf')))
         vendor = self.root / profile.VENDOR.lstrip('/')
         if unit.endswith('.service') and vendor.exists():
             drops.insert(0, vendor)
         exists = path.exists()
         data = path.read_text() if exists else ''
         command = next((line[10:] for line in data.splitlines() if line.startswith('ExecStart=')), '')
+        guard = ''
         for drop in drops:
             command = next((line[10:] for line in drop.read_text().splitlines() if line.startswith('ExecStart=/')), command)
+            guard = next((line[14:] for line in drop.read_text().splitlines() if line.startswith('ExecCondition=')), guard)
         if unit == self.bad_exec:
             command = '/usr/bin/false'
         user = 'dp-checklist' if unit.startswith('dev-pair-checklist-executor@') else 'root'
@@ -93,6 +100,8 @@ class Systemd:
         row.update(dict.fromkeys(profile.PROPERTIES, ''), NeedDaemonReload='no', KillMode='control-group',
                    SendSIGKILL='yes', FinalKillSignal='9', TimeoutStartFailureMode='terminate',
                    TimeoutStopFailureMode='abort' if vendor.exists() else 'terminate')
+        if guard:
+            row['ExecCondition'] = '{ path=' + guard.split()[0] + ' ; argv[]=' + guard + ' ; }'
         row.update(self.vendor_facts)
         return ''.join(f'{key}={row[key]}\n' for key in fields if key not in self.missing_properties
                        and (key not in profile.COMMAND_HOOKS or row[key]))
@@ -112,7 +121,7 @@ class ExistingPaths:
     def renewal(self):
         return self
 
-    def lock(self):
+    def lock(self, *, shared=False):
         return nullcontext()
 
     def stage(self, policy, boot):
@@ -183,6 +192,9 @@ class HostCommissioning(unittest.TestCase):
         if 'owner-intake' in selected:
             units.update({'dev-pair-intake@.service': '/usr/bin/python3 intake %i',
                           'dev-pair-product@.service': '/usr/bin/python3 product %i'})
+        features = {'dev-pair-intake@.service': 'owner-intake', 'dev-pair-product@.service': 'owner-intake',
+                    'dev-pair-intake-recovery.service': 'owner-intake',
+                    'dev-pair-checklist-spool.service': 'checklist-spool'}
         files = {'/etc/tmpfiles.d/dev-pair-renewal.conf': (b'# fixture tmpfiles\n', 0o644, 'base')}
         for feature in selected:
             timer, service = c.TIMERS[feature]
@@ -190,7 +202,7 @@ class HostCommissioning(unittest.TestCase):
             units[service] = '/usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/task.py'
             files[c.UNIT_ROOT + '/' + timer] = (b'[Timer]\nOnCalendar=hourly\n', 0o644, feature)
         for unit, command in units.items():
-            files[c.UNIT_ROOT + '/' + unit] = (f'[Service]\nExecStart={command}\n'.encode(), 0o644, 'base')
+            files[c.UNIT_ROOT + '/' + unit] = (f'[Service]\nExecStart={command}\n'.encode(), 0o644, features.get(unit, 'base'))
         files[c.UNIT_ROOT + '/dev-pair-checklist-executor@.service.d/checklist-release.conf'] = (
             b'[Service]\nExecStart=\nExecStart=/usr/libexec/dev-pair/renewal/checklist-entry\n', 0o644, 'base')
         if 'owner-intake' in selected:
@@ -324,7 +336,12 @@ class HostCommissioning(unittest.TestCase):
         self.services.prepare_checklist_pair = lambda *args, **kwargs: None
         self.services.check_initial_capacity = lambda *args: None
         self.services.authority = lambda policy: (JOBS, {})
-        self.app.package = lambda policy, bundle: self.files([])
+        def workload_scope(*args, **kwargs):
+            raise c.Pending('workload-access', 'Independent role proof is absent.')
+
+        self.services.workload_scope = workload_scope
+        self.app.package = lambda policy, bundle, *, retained=(), activation=False: {
+            **self.files(policy['timers']), **(c.workload_guard_files(policy['timers']) if activation else {})}
 
     def test_normal_automatic_policy_is_private_pinned_and_reused(self):
         self.automatic_services()
@@ -378,6 +395,85 @@ class HostCommissioning(unittest.TestCase):
                 patch.object(self.services, 'initial_platform', side_effect=AssertionError('reselected platform')):
             with self.assertRaisesRegex(c.Blocked, 'different protected site authority'):
                 self.app.automatic('apply', SOURCE)
+
+    def test_normal_reapply_arms_only_qualified_feature_and_holds_stale_authority(self):
+        self.automatic_services()
+        self.app.automatic('apply', SOURCE)
+        self.assertEqual(self.app.automatic('apply', SOURCE)['pending_features'], dict.fromkeys(c.TIMERS, 'workload-access'))
+        initial = self.app.read(c.AUTOMATIC_POLICY)
+        intent = self.app.read(c.PRIVATE + '/intent.json')
+        history = '/var/lib/dev-pair/product-jobs/saved-work'
+        self.app.file(history, b'owned work\n', 0o600)
+        scope = 'a' * 64
+        self.services.workload_scope = lambda *args, **kwargs: scope
+        grant = {'subject': 'managed-validation', 'expires_unix': None, 'sha256': 'b' * 64}
+
+        def feature_authority(feature, selected, *, recorded=None):
+            if feature == 'checklist-spool':
+                return grant
+            reason = 'owner-catalogue' if feature == 'owner-intake' else 'agent-release-authority'
+            raise c.Pending(reason, 'This feature has no verified authority.')
+
+        self.services.feature_authority = feature_authority
+        result = self.app.automatic('apply', SOURCE)
+        timer, service = c.TIMERS['checklist-spool']
+        self.assertEqual(set(result['timers']), {timer})
+        self.assertEqual(result['timers'][timer]['service'], service)
+        self.assertEqual(result['pending_features'], {'agent-renewal': 'agent-release-authority', 'owner-intake': 'owner-catalogue'})
+        guard = self.app.path(next(iter(c.workload_guard_files(('checklist-spool',)))))
+        guarded = guard.read_bytes()
+        self.app.require_runtime_feature('checklist-spool')
+        guard.unlink()
+        self.assertEqual(self.app.automatic('apply', SOURCE), result)
+        self.assertEqual(guard.read_bytes(), guarded)
+        self.assertEqual(self.steps.count('enable:' + timer), 1)
+        with patch.object(self.services, 'identity', return_value={'machine_id': FIRST['machine_id'], 'boot_id': NEXT}):
+            with self.assertRaisesRegex(c.Blocked, 'not current on this boot'):
+                self.app.require_runtime_feature('checklist-spool')
+        with patch.object(self.services, 'workload_scope', side_effect=c.Pending('workload-access', 'retained access withdrawn')):
+            with self.assertRaises(c.Pending):
+                self.app.require_runtime_feature('checklist-spool')
+            held = self.app.automatic('apply', SOURCE)
+        self.assertFalse(held['timers'])
+        self.assertIn('disable:' + timer, self.steps)
+        self.assertEqual(self.app.read(history), b'owned work\n')
+        self.assertEqual((self.app.read(c.AUTOMATIC_POLICY), self.app.read(c.PRIVATE + '/intent.json')), (initial, intent))
+
+    def test_partial_owner_entry_retries_and_expired_provider_scope_blocks_mutation(self):
+        self.automatic_services()
+        self.app.automatic('apply', SOURCE)
+        self.services.workload_scope = lambda *args, **kwargs: 'a' * 64
+        expires = int(time.time()) + 500
+        grant = {'subject': 'checklist', 'expires_unix': expires, 'sha256': 'c' * 64}
+
+        def feature_authority(feature, selected, *, recorded=None):
+            if feature == 'owner-intake' and time.time() < expires:
+                return grant
+            raise c.Pending('feature-unavailable', 'Feature authority is missing.')
+
+        self.services.feature_authority = feature_authority
+        real_file = self.app.file
+
+        def interrupt_sudo(target, *args, **kwargs):
+            if target == '/etc/sudoers.d/60-dev-pair-owner' and kwargs.get('save', True):
+                raise InterruptedError('interrupted final sudo publication')
+            return real_file(target, *args, **kwargs)
+
+        with patch.object(self.app, 'file', side_effect=interrupt_sudo):
+            with self.assertRaisesRegex(InterruptedError, 'interrupted final sudo'):
+                self.app.automatic('apply', SOURCE)
+        self.app.require_runtime_feature('owner-intake')
+        with self.assertRaisesRegex(c.Blocked, 'feature is held'):
+            self.app.require_runtime_feature('owner-intake', owner_entry=True)
+        result = self.app.automatic('apply', SOURCE)
+        self.assertEqual(result['owner_terminal'], '/usr/local/bin/dev-pair')
+        self.app.require_runtime_feature('owner-intake', owner_entry=True)
+        with patch.object(c.time, 'time', return_value=expires + 1):
+            with self.assertRaisesRegex(c.Blocked, 'grant expired'):
+                self.app.require_runtime_feature('owner-intake', owner_entry=True)
+            held = self.app.automatic('apply', SOURCE)
+        self.assertIsNone(held['owner_terminal'])
+        self.assertFalse(held['timers'])
 
     def test_cli_auto_path_reports_source_gap_without_policy_arguments_writes_or_install(self):
         self.automatic_services()

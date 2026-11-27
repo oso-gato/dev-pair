@@ -50,6 +50,7 @@
     {"source": "tools/checklist_candidate.py", "target": "/usr/libexec/dev-pair/tools/checklist_candidate.py", "mode": "0644", "feature": "base"},
     {"source": "tools/codex_state.py", "target": "/usr/libexec/dev-pair/tools/codex_state.py", "mode": "0644", "feature": "base"},
     {"source": "tools/codex_tools.py", "target": "/usr/libexec/dev-pair/tools/codex_tools.py", "mode": "0644", "feature": "base"},
+    {"source": "tools/commission_host.py", "target": "/usr/libexec/dev-pair/tools/commission_host.py", "mode": "0644", "feature": "base"},
     {"source": "tools/destination_release.py", "target": "/usr/libexec/dev-pair/tools/destination_release.py", "mode": "0644", "feature": "base"},
     {"source": "tools/devbox.py", "target": "/usr/libexec/dev-pair/tools/devbox.py", "mode": "0644", "feature": "base"},
     {"source": "tools/fedora_oci.py", "target": "/usr/libexec/dev-pair/tools/fedora_oci.py", "mode": "0644", "feature": "base"},

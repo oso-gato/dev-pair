@@ -787,6 +787,14 @@ def main():
         request = p.loads(data)
         p.require(type(request) is dict and 'action' in request, 'The owner request is incomplete.')
         action = request['action']
+        if action in ('draft', 'submit'):
+            from commission_host import ACTIVATION, AUTOMATIC_POLICY, Blocked, require_installed_workload, workload_guard_files
+
+            if any(os.path.lexists(path) for path in (ACTIVATION, AUTOMATIC_POLICY, *workload_guard_files(('owner-intake',)))):
+                try:
+                    require_installed_workload('owner-intake', owner_entry=True)
+                except Blocked:
+                    raise ValueError('Current approved owner workload authority is held.') from None
         if action == 'draft':
             respond(intake.draft(request))
             return 0

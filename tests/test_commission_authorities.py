@@ -431,7 +431,7 @@ class Authorities(unittest.TestCase):
         self.live.prepare_checklist_pair = lambda *a, issue: checked.append(('tls', issue))
         self.live.initial_checklist = lambda *a, placed: checked.append(('capacity', placed)) or checklist
         self.live.configuration = lambda *a: checked.append('configuration')
-        app.package = lambda *a: {}
+        app.package = lambda *a, **kwargs: {}
         root = self.root / 'local-policy'
         with patch.object(c, 'PRIVATE', str(root)), patch.object(c, 'INITIAL_SITE', str(root / 'initial-site.json')), \
                 patch.object(c, 'AUTOMATIC_POLICY', str(root / 'automatic-policy.json')), \
@@ -441,7 +441,7 @@ class Authorities(unittest.TestCase):
             app.file(c.AUTOMATIC_POLICY, c.encoded(policy), 0o600)
             self.live.publish_first_site(app, record)
 
-            def apply(*args):
+            def apply(*args, **kwargs):
                 self.assertEqual((host_path.read_bytes(), site_path.read_bytes()), (c.encoded(host), c.encoded(site)))
                 checked.append('native-apply-entry')
                 return {'phase': 'native-apply-entry'}
