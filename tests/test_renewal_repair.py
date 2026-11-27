@@ -259,10 +259,11 @@ class NativeRecoveryTests(unittest.TestCase):
                 r.write_private(file, gptbox.image_inputs_bytes(row))
             app.path('/var/lib/dev-pair').chmod(0o755)
             engine = []
+            preflights = []
             def observe_engine(*args, **options):
                 self.assertEqual((args[:2], options['ok']), (('container', 'exists'), (1,)))
                 engine.append(args[2])
-            calls = {'preflight': lambda: None, 'maintenance_gateway': lambda *_: None,
+            calls = {'preflight': lambda *, managed_runtime: preflights.append(managed_runtime), 'maintenance_gateway': lambda *_: None,
                      'check_prepared_record': lambda *_: None, 'prepared_build_files': lambda *_: None,
                      'maintenance_labels': lambda *_: labels, 'engine': observe_engine}
             spec = {'context_sha256': context, 'component': {'artifact_sha256': image, 'source_revision': revision,
@@ -270,6 +271,7 @@ class NativeRecoveryTests(unittest.TestCase):
             with patch.multiple(app, **calls), patch.object(gptbox, 'Gptbox', return_value=app):
                 verify(spec)
                 self.assertEqual(len(engine), 3)
+                self.assertEqual(preflights, [True])
                 resources = app.path(target + '/resources.json')
                 resources.unlink()
                 with self.assertRaises((FileNotFoundError, gptbox.Blocked)):
