@@ -1,4 +1,4 @@
-"""Private fixed-turn owner and read-only observer; never production job admission.
+"""Private fixed-turn registry, dispatch control and read-only observer.
 
 The trusted same-UID controller supplies source-fixed adapters, not submitted argv.
 A persisted PID is diagnostic only. Owner loss never authorizes adoption or replay.
@@ -83,17 +83,27 @@ def validate_startup(value):
     return value
 
 BINDING_KEYS=set('controller_id job_id checkpoint_id checkpoint_sha256 source_sha256 runtime_sha256 binary_sha256 policy_sha256 layout_sha256 standards_sha agreement_sha256 job_sha256 source_revision provider model effort credential_ref startup_sha256'.split())
+ROLE_BINDING_KEYS = BINDING_KEYS | {'role'}
+ROLES = ('maintenance', 'development')
+
+
 def validate_binding(value):
-    require(type(value) is dict and set(value)==BINDING_KEYS,'invalid controller binding')
+    require(type(value) is dict and set(value) in (BINDING_KEYS, ROLE_BINDING_KEYS),'invalid controller binding')
     for key in ('controller_id','job_id','checkpoint_id','credential_ref'):token(value[key])
     for key in BINDING_KEYS-set(('controller_id','job_id','checkpoint_id','credential_ref','provider','model','effort','standards_sha','source_revision')):digest(value[key])
     require(type(value['source_revision']) is str and re.fullmatch('[0-9a-f]{40}',value['source_revision']),'invalid controller source revision')
-    require(value['standards_sha']==STANDARDS and value['provider']=='openai' and value['model']=='gpt-5.5' and value['effort']=='unconfigured-fixture','unsupported fixed fixture selection')
+    require(value['standards_sha']==STANDARDS,'controller standards pin mismatch')
+    if 'role' in value:
+        require(value['role'] in ROLES and value['provider'] == 'gptbox' and
+                type(value['model']) is str and re.fullmatch(r'gpt-[a-z0-9]+(?:[.-][a-z0-9]+)+', value['model']) and
+                value['effort'] in ('low', 'medium', 'high', 'xhigh'), 'invalid role selection')
+    else:
+        require(value['provider']=='openai' and value['model']=='gpt-5.5' and value['effort']=='unconfigured-fixture','unsupported fixed fixture selection')
     return value
 
 class Registry:
     def __init__(self,directory,binding=None,*,readonly=False):
-        self.db=None;self.fd=None;self.ledger=None;self.control_fds={};self.control_nodes=None;self.owner_active=False;self.owner_token=None
+        self.db=None;self.fd=None;self.ledger=None;self.role_checkpoint=None;self.control_fds={};self.control_nodes=None;self.owner_active=False;self.owner_token=None
         try:self._open(directory,binding,readonly=readonly)
         except BaseException:
             self.close();raise
@@ -226,10 +236,14 @@ class Registry:
     def validate_row(self,operation,body):
         require(type(body) is str and len(body.encode())<=4096,'controller row byte bound')
         value=loads(body);keys=set('operation request_sha256 logical_session mode expected_uuid uuid state sequence exit_code capture_complete owner_pid deadline reason checkpoint_id checkpoint_sha256 cleanup launch_handle_observed prompt_sha256 prompt_bytes owner_lease'.split())
+        if 'role' in self.meta['binding']:
+            keys.add('provider_request_sha256')
         require(type(value) is dict and set(value)==keys and value['operation']==operation and value['state'] in STATES,'invalid controller operation')
         digest(value['request_sha256']);token(value['logical_session']);token(value['checkpoint_id']);digest(value['checkpoint_sha256']);digest(value['prompt_sha256'])
+        if 'provider_request_sha256' in keys:
+            digest(value['provider_request_sha256'])
         require(type(value['prompt_bytes']) is int and 0<value['prompt_bytes']<=262144,'invalid stored prompt length')
-        expected=self.request_identity(value['logical_session'],value['prompt_sha256'],value['prompt_bytes'],value['expected_uuid'],{key:value[key] for key in ('checkpoint_id','checkpoint_sha256')})
+        expected=self.request_identity(value['logical_session'],value['prompt_sha256'],value['prompt_bytes'],value['expected_uuid'],{key:value[key] for key in ('checkpoint_id','checkpoint_sha256')},value.get('provider_request_sha256'))
         require(value['request_sha256']==expected,'stored operation request binding changed')
         require(value['cleanup'] in ('not-observed','owned-child-reaped','unresolved','not-launched') and (value['launch_handle_observed'] is None or type(value['launch_handle_observed']) is bool),'invalid controller cleanup observation')
         require(value['mode'] in ('start','resume') and type(value['sequence']) is int and 0<=value['sequence']<=2097152 and value['reason'] in ('none','rejected','owner-loss','cleanup-unresolved','freeze-before-launch'),'invalid controller state')
@@ -299,6 +313,35 @@ class Registry:
             self.inventory();value=self.freeze_match(receipt,binding);self.current_checkpoint()
             if value['state']=='open':return value
             value['state']='open';value['snapshot']=None;self.store_dispatch(value);return value
+
+    def cancel_unactivated(self, receipt, binding):
+        """Clear a role freeze after the external owner defers before disruption."""
+        require('role' in binding, 'role controller required')
+        with self.transaction():
+            self.inventory()
+            value = self.freeze_match(receipt, binding)
+            if value['state'] == 'frozen':
+                value.update(state='open', snapshot=None)
+                self.store_dispatch(value)
+            return value
+
+    def reestablish_sealed(self, snapshot):
+        """Re-fence an unchanged registry during an incomplete external thaw."""
+        require('role' in self.meta['binding'], 'role controller required')
+        with self.owner(), self.transaction():
+            current = self.inventory()
+            dispatch = self.freeze_match(snapshot['freeze'], snapshot['binding'])
+            require(current['operations'] == snapshot['operations'] and current['sessions'] == snapshot['sessions'],
+                    'registry operations changed after the saved freeze')
+            if dispatch['state'] == 'open':
+                require(current['generation'] > snapshot['registry_generation'], 'registry thaw generation is unverified')
+                resealed = {**snapshot, 'registry_generation': current['generation'] + 1}
+                self.store_dispatch({**dispatch, 'state': 'frozen', 'snapshot': resealed})
+            else:
+                retained = dispatch['snapshot']
+                require(retained is not None and retained['registry_generation'] >= snapshot['registry_generation'] and
+                        retained == {**snapshot, 'registry_generation': retained['registry_generation']},
+                        'registry lost its exact sealed history')
     @staticmethod
     def safe_drained(row):
         return row['state']=='deferred' and row['launch_handle_observed'] is False and row['cleanup']=='not-launched' or row['state'] in ('completed-turn','failed') and row['launch_handle_observed'] is True and row['cleanup']=='owned-child-reaped'
@@ -312,6 +355,31 @@ class Registry:
                 snapshot={'schema':1,'freeze':value['identity'],'binding':self.meta['binding'],'registry_generation':inventory['generation']+1,'operations':inventory['operations'],'sessions':inventory['sessions'],'unbound_operations':[r['operation'] for r in inventory['operations'] if r['uuid'] is None],'quiescent':True,'runtime_admitted':False}
                 require(len(canonical(snapshot).encode())<=BYTES,'freeze snapshot byte bound')
                 value['snapshot']=snapshot;self.store_dispatch(value);self.inventory();return snapshot
+
+    def restore_sealed(self, snapshot):
+        """Restore an exact sealed registry in a newly created, unused directory."""
+        original_id = self.meta['registry_id']
+        with self.owner():
+            try:
+                with self.transaction():
+                    require(self.inventory()['generation'] == 0, 'restore requires a pristine registry')
+                    require(snapshot['binding'] == self.meta['binding'], 'restore binding mismatch')
+                    restored_id = snapshot['freeze']['registry_id']
+                    token(restored_id)
+                    self.meta['registry_id'] = restored_id
+                    restored_dispatch = {'schema': 1, 'generation': snapshot['freeze']['generation'],
+                                         'state': 'frozen', 'identity': snapshot['freeze'], 'snapshot': snapshot}
+                    self.validate_dispatch(restored_dispatch)
+                    for key, value in (('registry_id', restored_id), ('dispatch', restored_dispatch),
+                                       ('generation', snapshot['registry_generation'])):
+                        self.db.execute('UPDATE metadata SET value=? WHERE key=?', (canonical(value), key))
+                    self.db.executemany('INSERT INTO operations VALUES (?,?)',
+                                        ((row['operation'], canonical(row)) for row in snapshot['operations']))
+                    self.inventory()
+            except BaseException:
+                self.meta['registry_id'] = original_id
+                raise
+
     def admit_launch(self,operation):
         require(self.owner_active and self.owner_token is not None,'launch requires current owner lease')
         deferred=False
@@ -325,14 +393,24 @@ class Registry:
         return row
     def current_checkpoint(self):
         import job_protocol as p
-        require(self.ledger is not None and self.ledger.controller_id==self.meta['binding']['controller_id'],'trusted ledger unavailable')
-        job=self.ledger.record('job',self.meta['binding']['job_id']);p.validate(job,'job')
         binding=self.meta['binding']
-        require(p.identity(job)==binding['job_sha256'] and job['standards_sha']==binding['standards_sha'] and job['agreement_sha256']==binding['agreement_sha256'] and job['selection']['model']==binding['model'] and job['selection']['runtime_sha256']==binding['runtime_sha256'],'job selection changed')
-        row=self.ledger.db.execute('SELECT checkpoint FROM jobs WHERE id=?',(binding['job_id'],)).fetchone()
-        require(row is not None and row['checkpoint'] is not None,'current checkpoint unavailable')
-        cp=self.ledger.record('checkpoint',row['checkpoint']);p.validate(cp,'checkpoint')
-        require(cp['job_id']==binding['job_id'] and cp['candidate']['artifact_sha256']==binding['binary_sha256'] and cp['candidate']['source_revision']==binding['source_revision'],'checkpoint target changed')
+        if self.role_checkpoint is not None:
+            require('role' in binding,'role checkpoint adapter requires a role registry')
+            controller_id, job, cp = self.role_checkpoint(binding['job_id'])
+            require(controller_id == binding['controller_id'], 'role ledger identity changed')
+        else:
+            require(self.ledger is not None and self.ledger.controller_id==binding['controller_id'],'trusted ledger unavailable')
+            job=self.ledger.record('job',binding['job_id']);p.validate(job,'job')
+            row=self.ledger.db.execute('SELECT checkpoint FROM jobs WHERE id=?',(binding['job_id'],)).fetchone()
+            require(row is not None and row['checkpoint'] is not None,'current checkpoint unavailable')
+            cp=self.ledger.record('checkpoint',row['checkpoint']);p.validate(cp,'checkpoint')
+        p.validate(job,'job');p.validate(cp,'checkpoint')
+        require(p.identity(job)==binding['job_sha256'] and job['standards_sha']==binding['standards_sha'] and job['agreement_sha256']==binding['agreement_sha256'],'job selection changed')
+        if 'role' not in binding:
+            require(job['selection']['model']==binding['model'] and job['selection']['runtime_sha256']==binding['runtime_sha256'],'fixture job selection changed')
+        require(cp['job_id']==binding['job_id'],'checkpoint job changed')
+        if 'role' not in binding:
+            require(cp['candidate']['artifact_sha256']==binding['binary_sha256'] and cp['candidate']['source_revision']==binding['source_revision'],'checkpoint target changed')
         return {'checkpoint_id':cp['checkpoint_id'],'checkpoint_sha256':p.identity(cp)}
     def inventory(self):
         self.check_files();owned=not self.db.in_transaction
@@ -369,16 +447,21 @@ class Registry:
         self.db.execute('INSERT OR REPLACE INTO operations VALUES (?,?)',(row['operation'],canonical(row)))
         self.db.execute("UPDATE metadata SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='generation'")
         self.inventory()
-    def request_identity(self,logical_session,prompt_sha256,prompt_bytes,resume,checkpoint):
-        return sha(canonical({'registry_id':self.meta['registry_id'],'binding':self.meta['binding'],'logical_session':logical_session,'prompt_sha256':prompt_sha256,'prompt_bytes':prompt_bytes,'resume':resume,**checkpoint}).encode())
-    def reserve(self,operation,logical_session,prompt,deadline,resume=None):
+    def request_identity(self,logical_session,prompt_sha256,prompt_bytes,resume,checkpoint,provider_request_sha256=None):
+        value={'registry_id':self.meta['registry_id'],'binding':self.meta['binding'],'logical_session':logical_session,'prompt_sha256':prompt_sha256,'prompt_bytes':prompt_bytes,'resume':resume,**checkpoint}
+        if provider_request_sha256 is not None:
+            value['provider_request_sha256']=provider_request_sha256
+        return sha(canonical(value).encode())
+    def reserve(self,operation,logical_session,prompt,deadline,resume=None,*,provider_request_sha256=None):
         token(operation);token(logical_session);require(type(prompt) is str and 0<len(prompt.encode())<=262144,'invalid fixed prompt')
         if resume is not None:session(resume)
+        require(('role' in self.meta['binding']) == (provider_request_sha256 is not None), 'role operation request identity missing')
+        if provider_request_sha256 is not None:digest(provider_request_sha256)
         with self.transaction():
             rows=self.inventory()['operations']
             prior=self.row(operation)
             checkpoint={key:prior[key] for key in ('checkpoint_id','checkpoint_sha256')} if prior is not None else self.current_checkpoint()
-            request=self.request_identity(logical_session,sha(prompt.encode()),len(prompt.encode()),resume,checkpoint)
+            request=self.request_identity(logical_session,sha(prompt.encode()),len(prompt.encode()),resume,checkpoint,provider_request_sha256)
             if prior is not None:require(prior['request_sha256']==request,'operation request collision');return prior,False
             require(self.dispatch()['state']=='open','controller dispatch frozen')
             require(type(deadline) in (int,float) and time.monotonic()<deadline<=time.monotonic()+180,'invalid original controller deadline')
@@ -387,6 +470,8 @@ class Registry:
             if resume is None:require(not any(r['logical_session']==logical_session for r in rows),'start identity already exists')
             else:require(any(r['logical_session']==logical_session and r['uuid']==resume and r['state']=='completed-turn' for r in rows),'resume not bound to completed owned session')
             row={'operation':operation,'request_sha256':request,'logical_session':logical_session,'mode':'resume' if resume else 'start','expected_uuid':resume,'uuid':None,'state':'reserved','sequence':0,'exit_code':None,'capture_complete':None,'owner_pid':os.getpid(),'deadline':deadline,'reason':'none','cleanup':'not-observed','launch_handle_observed':None,'prompt_sha256':sha(prompt.encode()),'prompt_bytes':len(prompt.encode()),'owner_lease':self.owner_token if self.owner_active else None,**checkpoint}
+            if provider_request_sha256 is not None:
+                row['provider_request_sha256']=provider_request_sha256
             self.write(row);return row,True
     def update(self,operation,**values):
         require(set(values)<= {'state','reason','exit_code','capture_complete','cleanup','launch_handle_observed','uuid'},'immutable controller operation binding')

@@ -1,0 +1,128 @@
+#!/usr/bin/python3 -IB
+"""Read-only preflight of the selected production launch artifacts."""
+import os
+from pathlib import Path
+import stat
+import sys
+import tarfile
+import time
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+import renewal as r
+
+
+def selected_tools(sha):
+    r.digest(sha)
+    root = INSTALL / 'host-releases' / sha
+    node = root.lstat()
+    r.require(root.resolve(strict=True) == root and stat.S_ISDIR(node.st_mode) and node.st_uid == 0 and
+              not node.st_mode & 0o222, 'unprotected launch tool bundle')
+    sys.path.insert(0, str(root / 'tools'))
+
+
+def maintenance(spec):
+    import gptbox
+    context = spec['context_sha256']
+    component = spec['component']
+    app = gptbox.Gptbox(run=gptbox.Commands())
+    app.preflight()
+    r.require(app.path(gptbox.STATE + '/prepared').exists(), 'protected maintenance host is not prepared')
+    app.target = gptbox.ROOT + '/' + context
+    with app.lock():
+        version = app.admitted_maintenance_image(context, component['source_revision'], component['artifact_sha256'],
+                                                 component.get('platform_sha256'))
+    r.require(version == component['codex_version'], 'maintenance artifact has a different admitted Codex version')
+
+
+def development_inputs(inputs, device, archive_bytes, owner=0):
+    r.require(inputs.resolve(strict=True) == inputs and inputs.stat().st_dev == device, 'DevBox inputs escape bounded storage')
+    paths = inputs / 'manifest.json', inputs / 'development.oci.tar'
+    for item in paths:
+        info = item.lstat()
+        r.require(stat.S_ISREG(info.st_mode) and info.st_dev == device and info.st_nlink == 1 and
+                  info.st_uid == owner and not info.st_mode & 0o222, 'DevBox launch inputs are mutable or unavailable')
+    r.require(paths[1].stat().st_size == archive_bytes, 'exact development archive length changed')
+    return paths
+
+
+def reserve_owner(spec):
+    import devbox
+    from devbox import db
+    end = time.monotonic() + 15
+    account = devbox.host_account()
+    devbox.enforcing(end)
+    job, reference = spec['job'], spec['manifest_sha256']
+    path = devbox.ROOT / 'builds' / job / 'inputs' / reference / 'manifest.json'
+    manifest = db.read_manifest(path, reference, end)
+    r.require(manifest['job'] == job, 'DevBox reservation selects a foreign job')
+    with devbox.ownership(account, job, reference, job_turn=True) as (owner, _):
+        return {'job': job, 'manifest_sha256': reference, 'owner': owner}
+
+
+def development(spec):
+    import devbox
+    from devbox import db
+    end = time.monotonic() + 150
+    account = devbox.host_account()
+    devbox.enforcing(end)
+    job, reference = spec['job'], spec['manifest_sha256']
+    build = devbox.ROOT / 'builds' / job
+    inputs = build / 'inputs' / reference
+    manifest = db.read_manifest(inputs / 'manifest.json', reference, end)
+    r.require(manifest['job'] == job, 'DevBox launch manifest selects a foreign job')
+    storage = devbox.private_dir(build, account)
+    devbox.storage_mount(build, manifest['storage_bytes'], Path('/proc/self/mountinfo').read_text())
+    path, archive = development_inputs(inputs, storage.st_dev, manifest['inner']['archive_bytes'])
+    for item in (path, archive):
+        devbox.check_label(item, db.file_label(manifest, 'outer'))
+    for name in ('graph', 'image-copy', 'work'):
+        leaf = build / name
+        r.require(devbox.private_dir(leaf, account).st_dev == storage.st_dev, 'DevBox managed leaf escapes bounded filesystem')
+        devbox.check_label(leaf, db.file_label(manifest, 'inner' if name == 'work' else 'outer'))
+    for name in db.JOB_TARGETS:
+        leaf = devbox.ROOT / name / job
+        devbox.private_dir(leaf, account)
+        devbox.check_label(leaf, db.file_label(manifest, 'inner'))
+    engine = db.Engine([db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd'],
+                       devbox.host_env(account), end)
+    db.immutable_image(engine, manifest, 'outer')
+    inner = manifest['inner']
+    r.require(db.file_hash(archive, inner['archive_bytes'], end)[:2] == (inner['archive_sha256'], inner['archive_bytes']),
+              'exact development archive is unavailable')
+    db.check_archive_image(archive, inner, manifest['storage_bytes'], end)
+    with tarfile.open(archive, 'r:') as image:
+        config = image.getmember('blobs/sha256/' + inner['image_id'])
+        r.require(0 < config.size <= (1 << 20), 'invalid inner OCI config size')
+        with image.extractfile(config) as stream:
+            labels = r.loads(stream.read(1 << 20))['config']['Labels']
+    expected = {'dev-pair.role': 'development', 'dev-pair.context': inner['context_sha256'],
+                'dev-pair.inputs': inner['inputs_sha256'], 'dev-pair.standards': r.STANDARDS,
+                'dev-pair.distrobox': db.DISTROBOX, 'org.opencontainers.image.revision': inner['source_sha'],
+                'dev-pair.codex.version': spec['component']['codex_version']}
+    r.require(all(labels.get(key) == value for key, value in expected.items()), 'development archive metadata is incompatible')
+
+
+def main():
+    raw = sys.stdin.buffer.read(65537)
+    r.require(len(raw) <= 65536, 'preflight input exceeds ceiling')
+    spec = r.loads(raw)
+    r.token(spec['job'])
+    selected_tools(spec['host_artifact_sha256'])
+    if spec['role'] == 'maintenance':
+        r.require(os.getuid() == 0, 'protected maintenance artifact preflight required')
+        r.digest(spec['context_sha256'])
+        maintenance(spec)
+    else:
+        r.require(spec['role'] == 'development' and r.pwd.getpwuid(os.getuid()).pw_name == 'dp-dev',
+                  'rootless development artifact preflight required')
+        r.digest(spec['manifest_sha256'])
+        if spec.get('mode') == 'reserve-owner':
+            print(r.canonical(reserve_owner(spec)))
+            return
+        development(spec)
+    print(r.canonical({'role': spec['role'], 'job': spec['job'], 'artifact_sha256': spec['component']['artifact_sha256']}))
+
+
+if __name__ == '__main__':
+    main()

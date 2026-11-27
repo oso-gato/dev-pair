@@ -1,0 +1,245 @@
+#!/usr/bin/python3 -I
+"""Select and measure the exact immutable host control-plane release."""
+import hashlib
+import os
+from pathlib import Path, PurePosixPath
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+import renewal as r
+from renewal import protocol as p
+
+CONTROL = r.DEFAULT_ROOT / 'renewal'
+STORE = INSTALL / 'host-releases'
+CONFIGS = Path('/etc/dev-pair/host-releases')
+FENCE = r.DEFAULT_ROOT / 'renewal-fence'
+SYSTEMCTL = '/usr/bin/systemctl'
+REQUIRED = {'tools/gptbox.py', 'tools/devbox.py', 'tools/provider_broker.py', 'tools/host_handoff.py',
+            'tools/job_protocol.py', 'tools/ledger_recovery.py', 'runtime/devbox/controller.py',
+            'runtime/checklist/checklist_quadlet.py', 'runtime/checklist/acceptance.container',
+            'tools/product_job.py', 'tools/checklist_candidate.py'}
+MAX_HOST_FILES = 256
+MAX_HOST_BYTES = 32 * 1024 * 1024
+
+
+def protected(path, *, directory, uid=0):
+    for item in (path, *path.parents):
+        node = item.lstat()
+        sticky = item != path and node.st_uid == 0 and node.st_mode & stat.S_ISVTX
+        r.require(node.st_uid in (0, uid) and (not node.st_mode & 0o022 or sticky) and not stat.S_ISLNK(node.st_mode),
+                  'host release path is not protected')
+        r.require((not directory and item == path and stat.S_ISREG(node.st_mode) and node.st_nlink == 1) or
+                  ((directory or item != path) and stat.S_ISDIR(node.st_mode)), 'unsafe host release path')
+    return path
+
+
+def release_bytes(path, ceiling, *, uid=0):
+    protected(path, directory=False, uid=uid)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        r.require(stat.S_ISREG(info.st_mode) and info.st_uid == uid and info.st_nlink == 1 and
+                  not info.st_mode & 0o222 and info.st_size <= ceiling, 'host release file is not immutable')
+        data = stream.read(ceiling + 1)
+    r.require(len(data) <= ceiling, 'host release file exceeds byte ceiling')
+    return data
+
+
+def release_dirs(root, component, config_store, *, uid=0):
+    p.fields(component, 'artifact_sha256 config_sha256 source_revision')
+    p.digest(component['source_revision'], 40)
+    for key in ('artifact_sha256', 'config_sha256'):
+        r.digest(component[key])
+    directory = protected(root / component['artifact_sha256'], directory=True, uid=uid)
+    raw = release_bytes(directory / 'manifest.json', 1 << 20, uid=uid)
+    r.require(r.sha(raw) == component['artifact_sha256'], 'host release manifest digest mismatch')
+    bundle = r.loads(raw)
+    p.fields(bundle, 'schema source_revision state_contract files')
+    r.require(bundle['schema'] == 1 and bundle['state_contract'] == 1 and
+              bundle['source_revision'] == component['source_revision'] and type(bundle['files']) is dict,
+              'incompatible host control plane')
+    files = bundle['files']
+    r.require(REQUIRED <= files.keys() and len(files) <= MAX_HOST_FILES, 'incomplete host control-plane bundle')
+    real_files = set()
+    dirs = [directory]
+    total = 0
+    while dirs:
+        leaf = dirs.pop()
+        r.require(not leaf.stat().st_mode & 0o222, 'host release directory is writable')
+        with os.scandir(leaf) as entries:
+            for item in entries:
+                member = Path(item.path)
+                name = member.relative_to(directory).as_posix()
+                if item.is_dir(follow_symlinks=False):
+                    r.require(any(key.startswith(name + '/') for key in files), 'unexpected host release directory')
+                    protected(member, directory=True, uid=uid)
+                    dirs.append(member)
+                    continue
+                if name == 'manifest.json':
+                    continue
+                r.require(name in files and PurePosixPath(name).parts[0] in ('tools', 'runtime'), 'unexpected host release file')
+                digest = files[name]
+                r.digest(digest)
+                data = release_bytes(member, min(4 << 20, MAX_HOST_BYTES - total), uid=uid)
+                total += len(data)
+                r.require(hashlib.sha256(data).hexdigest() == digest, 'host release member digest mismatch')
+                real_files.add(name)
+    r.require(files.keys() == real_files, 'host release member missing')
+    data = release_bytes(config_store / (component['config_sha256'] + '.json'), 4096, uid=uid)
+    r.require(r.sha(data) == component['config_sha256'], 'host configuration digest mismatch')
+    config = r.loads(data)
+    p.fields(config, 'schema hostname platform selinux launch_contract role_launch_seconds')
+    r.require(type(config['schema']) is int and config['schema'] == 1 and config['launch_contract'] == 1 and
+              config['platform'] == 'fedora-44' and config['selinux'] == 'enforcing', 'invalid platform profile')
+    p.token(config['hostname'])
+    p.number(config['role_launch_seconds'], 90, 169)
+    return directory, config
+
+
+def host_measurement():
+    lines = Path('/etc/os-release').read_text().splitlines()
+    facts = {key: value.strip('"') for key, value in (line.split('=', 1) for line in lines if '=' in line)}
+    state = subprocess.check_output(['/usr/sbin/getenforce'], text=True, timeout=5).strip()
+    r.require(Path('/proc/1/comm').read_text().strip() == 'systemd', 'managed host systemd unavailable')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    r.session(boot)
+    return {'hostname': os.uname().nodename, 'platform': facts['ID'] + '-' + facts['VERSION_ID'],
+            'selinux': state.lower(), 'boot_id': boot}
+
+
+def measure_release(component, release_dir, config, observed):
+    for key in ('hostname', 'platform', 'selinux'):
+        r.require(observed[key] == config[key], 'live host profile changed: ' + key)
+    return {'schema': 2, 'boot_id': observed['boot_id'], 'component': component,
+            'launch_root': str(release_dir), 'role_launch_seconds': config['role_launch_seconds'],
+            'hostname': observed['hostname'], 'platform': observed['platform'], 'selinux': observed['selinux']}
+
+
+def publish_selector(component):
+    fd, temporary = tempfile.mkstemp(prefix='.host-selector-', dir=FENCE)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(r.json_bytes({'schema': 1, 'artifact_sha256': component['artifact_sha256']}))
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o644)
+            os.fsync(stream.fileno())
+        os.replace(temporary, FENCE / 'selected-host.json')
+        r.sync_directory(FENCE)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
+def listen_inode(proc, port=19425):
+    inodes = set()
+    for path in (proc / 'fd').iterdir():
+        try:
+            target = os.readlink(path)
+        except FileNotFoundError:
+            continue
+        if target.startswith('socket:[') and target.endswith(']'):
+            inodes.add(target[8:-1])
+    for line in (proc / 'net' / 'tcp').read_text().splitlines()[1:]:
+        row = line.split()
+        if len(row) >= 10 and row[1] == f'0100007F:{port:04X}' and row[3] == '0A' and row[9] in inodes:
+            return row[9]
+    raise ValueError('selected handoff executor does not own its loopback listener')
+
+
+def inspect_handoff(unit, command, account):
+    fields = 'Id,ActiveState,MainPID,ControlGroup,User,Group,ExecMainStartTimestampMonotonic'
+    data = subprocess.check_output([SYSTEMCTL, 'show', '--all', '--property=' + fields, unit], text=True, timeout=5)
+    facts = dict(line.split('=', 1) for line in data.splitlines())
+    r.require(set(facts) == set(fields.split(',')) and facts['Id'] == unit and facts['ActiveState'] == 'active' and
+              facts['User'] == facts['Group'] == account.pw_name and facts['ControlGroup'].endswith('/' + unit) and
+              facts['MainPID'].isdigit() and int(facts['MainPID']) > 1 and facts['ExecMainStartTimestampMonotonic'].isdigit(),
+              'managed handoff service is unavailable')
+    proc = Path('/proc') / facts['MainPID']
+    observed = (proc / 'cmdline').read_bytes().rstrip(b'\0').decode().split('\0')
+    status = dict(line.split(':', 1) for line in (proc / 'status').read_text().splitlines() if ':' in line)
+    r.require(observed == command and (proc / 'exe').resolve() == Path(command[0]).resolve() and
+              status['Uid'].split() == [str(account.pw_uid)] * 4 and status['Gid'].split() == [str(account.pw_gid)] * 4 and
+              '0::' + facts['ControlGroup'] in (proc / 'cgroup').read_text().splitlines(),
+              'handoff service does not use the selected immutable launch profile')
+    listener = listen_inode(proc)
+    r.require((proc / 'cmdline').read_bytes().rstrip(b'\0').decode().split('\0') == observed, 'handoff PID changed while observing')
+    return {'unit': unit, 'pid': int(facts['MainPID']), 'started': int(facts['ExecMainStartTimestampMonotonic']),
+            'command_sha256': r.identity(command), 'socket_inode': listener}
+
+
+def handoff_runtime(directory, *, restart):
+    account = r.pwd.getpwnam('dp-checklist')
+    unit = f'dev-pair-checklist-executor@{account.pw_uid}.service'
+    raw = subprocess.check_output([str(INSTALL / 'renewal' / 'checklist-entry'), '--describe'], timeout=5)
+    command = r.loads(raw)
+    r.require(command[2] == str(directory / 'tools' / 'host_handoff.py'), 'handoff selector names a different release')
+    if restart:
+        subprocess.run([SYSTEMCTL, 'restart', unit], check=True, timeout=85)
+    deadline = time.monotonic() + 12
+    while True:
+        try:
+            return inspect_handoff(unit, command, account)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.1)
+
+
+def selected_component(controller, control, action):
+    path = control / 'host-selection.json'
+    if action == 'observe':
+        if not os.path.lexists(path):
+            reference = r.read_json(control / 'site-current.json')
+            return controller.release(reference)['components']['host']
+        return r.read_json(path)
+    desired = r.read_json(control / 'host-desired.json')
+    p.fields(desired, 'operation release_sha256 component')
+    _, journal = controller.transition()
+    r.require(journal is not None and
+              journal['request']['operation'] == desired['operation'] and
+              journal['phase'] in ('applying', 'rolling-back'), 'host activation lacks an active scoped renewal')
+    source = 'previous_sha256' if journal['phase'] == 'rolling-back' else 'target_sha256'
+    r.require(desired['release_sha256'] == journal['request'][source] and
+              desired['component'] == controller.release(desired['release_sha256'])['components']['host'],
+              'host desired release differs from reviewed transition')
+    r.require(journal['request']['scope'] == 'host' or
+              (source == 'previous_sha256' and desired['component'] ==
+               controller.release(journal['request']['target_sha256'])['components']['host']),
+              'non-host recovery selected a different host bundle')
+    return desired['component']
+
+
+def main():
+    r.require(os.getuid() == 0 and len(sys.argv) in (2, 3), 'protected host release entry required')
+    controller = r.Renewal(r.DEFAULT_ROOT, None)
+    if sys.argv[1] == 'validate' and len(sys.argv) == 3:
+        component = controller.release(sys.argv[2])['components']['host']
+        directory, config = release_dirs(STORE, component, CONFIGS)
+        measure_release(component, directory, config, host_measurement())
+        return
+    if sys.argv[1] == 'verify' and len(sys.argv) == 3:
+        component = controller.release(sys.argv[2])['components']['host']
+        r.require(component == r.read_json(CONTROL / 'host-selection.json'), 'observed host selector is stale')
+        directory, config = release_dirs(STORE, component, CONFIGS)
+        receipt = measure_release(component, directory, config, host_measurement())
+        receipt['handoff'] = handoff_runtime(directory, restart=False)
+        print(r.canonical(receipt))
+        return
+    r.require(len(sys.argv) == 2 and sys.argv[1] in ('apply', 'observe'), 'unsupported host release entry')
+    component = selected_component(controller, CONTROL, sys.argv[1])
+    directory, config = release_dirs(STORE, component, CONFIGS)
+    receipt = measure_release(component, directory, config, host_measurement())
+    publish_selector(component)
+    receipt['handoff'] = handoff_runtime(directory, restart=True)
+    r.replace_json(CONTROL / 'host-selection.json', component)
+    r.replace_json(CONTROL / 'host-observed.json', receipt)
+    print(r.canonical({'boot_id': receipt['boot_id'], 'artifact_sha256': component['artifact_sha256']}))
+
+
+if __name__ == '__main__':
+    main()

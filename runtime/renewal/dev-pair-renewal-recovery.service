@@ -1,0 +1,19 @@
+[Unit]
+Description=Recover an interrupted dev-pair renewal
+After=local-fs.target network-online.target dev-pair-renewal-boot-fence.service dev-pair-renewal-host-observe.service
+Wants=network-online.target dev-pair-renewal-host-observe.service
+Requires=dev-pair-renewal-boot-fence.service
+RequiresMountsFor=/var/lib/dev-pair
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/libexec/dev-pair/tools/renewal.py recover
+TimeoutStartSec=110min
+TimeoutStopSec=30s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

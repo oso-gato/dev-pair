@@ -1,0 +1,188 @@
+#!/usr/bin/python3 -I
+"""Reconcile only exact role resources listed by an interrupted external owner."""
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+import renewal as r
+from renewal import protocol as p
+
+ROOT = r.DEFAULT_ROOT
+CONTROL = ROOT / 'renewal'
+SYSCTL = '/usr/bin/systemctl'
+
+
+def systemctl(*args, allowed=(0,), seconds=25):
+    result = subprocess.run([SYSCTL, *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            timeout=seconds, check=False, env={'PATH': '/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'})
+    r.require(result.returncode in allowed and len(result.stdout) < 32768, 'owned manager reconciliation failed')
+    return result.stdout.decode('utf-8')
+
+
+def stopped_unit(unit, *, user, description=None):
+    fields = ('Id', 'LoadState', 'ActiveState', 'User', 'Description')
+    raw = systemctl('show', '--all', *('--property=' + field for field in fields), unit, allowed=(0, 1, 4))
+    facts = dict(line.split('=', 1) for line in raw.splitlines())
+    r.require(set(facts) == set(fields) and facts['Id'] == unit, 'unverified manager unit identity')
+    if facts['LoadState'] == 'not-found':
+        r.require(facts['ActiveState'] == 'inactive', 'unresolved removed manager unit')
+        return
+    r.require(facts['User'] == user and (description is None or facts['Description'] == description),
+              'refusing to stop a foreign manager unit')
+    if facts['ActiveState'] != 'inactive':
+        systemctl('stop', unit)
+    state = systemctl('show', '--property=ActiveState', '--value', unit, allowed=(0, 1, 4)).strip()
+    r.require(state == 'inactive', 'owned manager unit remains active')
+
+
+def in_release(component):
+    path = INSTALL / 'host-releases' / component['artifact_sha256']
+    r.digest(component['artifact_sha256'])
+    node = path.lstat()
+    r.require(path.resolve(strict=True) == path and path.is_dir() and node.st_uid == 0 and not node.st_mode & 0o222,
+              'recovery host control plane is not a protected artifact')
+    return path
+
+
+def stale_socket(record):
+    path = Path('/run/dev-pair/provider') / record['request_sha256'][:32] / 'responses.sock'
+    if not os.path.lexists(path):
+        return
+    account = r.pwd.getpwnam({'maintenance': 'dp-maint', 'development': 'dp-dev'}[record['role']])
+    info = path.lstat()
+    r.require(path.parent.resolve(strict=True) == path.parent and path.parent.stat().st_uid == 0 and
+              stat.S_ISSOCK(info.st_mode) and (info.st_uid, info.st_gid) == (0, account.pw_gid) and
+              stat.S_IMODE(info.st_mode) == 0o660, 'provider socket cleanup ownership changed')
+    path.unlink()
+    r.sync_directory(path.parent)
+
+
+def inspect_maintenance(app, name):
+    rows = r.loads(app.engine('ps', '--all', '--filter', 'name=^' + name + '$', '--format=json', timeout=15))
+    r.require(type(rows) is list and len(rows) <= 1, 'ambiguous maintenance container identity')
+    if not rows:
+        return None
+    row, = r.loads(app.engine('inspect', '--type=container', name, timeout=15))
+    r.require(row['Name'].lstrip('/') == name, 'maintenance inspection changed container')
+    return row
+
+
+def maintenance(record, directory, image):
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(directory / 'tools'))
+    import gptbox
+    context = record['maintenance_context_sha256']
+    r.digest(context)
+    app = gptbox.Gptbox(run=gptbox.Commands())
+    app.preflight()
+    app.uid = str(r.pwd.getpwnam('dp-maint').pw_uid)
+    app.gid = str(r.pwd.getpwnam('dp-maint').pw_gid)
+    app.wrapper = str(app.protected(Path(gptbox.CONTROL) / 'bin' / 'podman'))
+    app.target = gptbox.ROOT + '/' + context
+    app.unit = 'dev-pair-gptbox-' + context + '.service'
+    app.configure_executor(app.uid, gptbox.CONTROL)
+    name = 'dp-gptbox-job-' + r.sha((record['job'] + '\n' + record['request_sha256']).encode())[:24]
+    with app.lock():
+        stopped_unit(app.unit, user='dp-maint', description='dev-pair-owned-' + app.unit)
+        row = inspect_maintenance(app, name)
+        if row is not None:
+            labels = row['Config']['Labels']
+            r.require(gptbox.image_id(row['Image']) == image and labels.get('dev-pair.context') == context and
+                      labels.get('dev-pair.job-request') == record['request_sha256'], 'maintenance cleanup ownership changed')
+            identity = gptbox.image_id(row['Id'])
+            app.engine('rm', '--force', '--time=5', identity, timeout=20)
+            r.require(inspect_maintenance(app, name) is None, 'owned maintenance container remains')
+
+
+def development(record, directory, manifest_sha):
+    command = ['/usr/sbin/runuser', '--user', 'dp-dev', '--', '/usr/bin/python3', '-I', '-B',
+               str(INSTALL / 'renewal' / 'owned-cleanup'), '__development', str(directory), record['job'], manifest_sha,
+               record['development_owner']]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=50, check=False,
+                            env={'PATH': '/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'})
+    r.require(result.returncode == 0 and result.stdout == b'owned runtime absent\n', 'owned DevBox reconciliation failed')
+
+
+def development_child(directory, job, manifest_sha, expected_owner):
+    r.require(r.pwd.getpwuid(os.getuid()).pw_name == 'dp-dev', 'rootless development cleanup required')
+    r.token(job)
+    r.digest(manifest_sha)
+    r.digest(expected_owner)
+    absolute = Path(directory)
+    r.require(absolute == in_release({'artifact_sha256': absolute.name}), 'invalid development control plane')
+    sys.path.insert(0, str(absolute / 'tools'))
+    import devbox
+    from devbox import db
+    end = time.monotonic() + 43
+    account = devbox.host_account()
+    devbox.enforcing(end)
+    manifest = db.read_manifest(devbox.ROOT / 'builds' / job / 'inputs' / manifest_sha / 'manifest.json', manifest_sha, end)
+    r.require(manifest['job'] == job, 'owned DevBox cleanup job changed')
+    owner_path = devbox.ROOT / 'evidence' / job / ('owner-' + manifest_sha + '.json')
+    r.require(owner_path.is_file() and not owner_path.is_symlink(), 'owned DevBox identity is missing')
+    engine = db.Engine([db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd'],
+                       devbox.host_env(account), end)
+    with devbox.ownership(account, job, manifest_sha, job_turn=True) as (owner, _):
+        r.require(owner == expected_owner, 'DevBox pre-reserved owner changed')
+        db.remove_owned(engine, 'dp-devbox-' + owner[:24], owner, manifest['outer']['image_id'])
+    print('owned runtime absent')
+
+
+def cleanup(controller):
+    request = r.read_json(CONTROL / 'cleanup-request.json')
+    p.fields(request, 'operation nonce owned')
+    p.digest(request['nonce'], 32)
+    _, journal = controller.transition()
+    r.require(journal is not None and journal['phase'] == 'rolling-back' and
+              journal['request']['operation'] == request['operation'], 'cleanup lacks an active scoped recovery')
+    owned = request['owned']
+    r.require(type(owned) is dict and 0 < len(owned) <= r.MAX_JOBS, 'invalid owned cleanup inventory')
+    active_records = CONTROL / 'owned-turns'
+    r.require(set(owned) == {item.name for item in active_records.iterdir()}, 'owned cleanup inventory changed')
+    for key, record in owned.items():
+        p.fields(record, 'role job operation request_sha256 release_sha256 maintenance_context_sha256 development_manifest_sha256 development_owner')
+        role, job, operation = (record[field] for field in ('role', 'job', 'operation'))
+        r.token(job)
+        r.token(operation)
+        r.require(role in r.ROLES and key == r.role_operation_key(role, job, operation) and
+                  record == r.read_json(active_records / key), 'owned cleanup record changed')
+        r.digest(record['request_sha256'])
+        # Stop the exact broker before considering container removal. Its durable receipt survives.
+        broker = 'dev-pair-provider@' + record['request_sha256'] + '.service'
+        stopped_unit(broker, user='root')
+        stale_socket(record)
+        role_start = CONTROL / 'turn-launches' / key / 'role-started.json'
+        if not os.path.lexists(role_start):
+            stored = ROOT / role / 'state' / job / 'turns' / operation
+            r.require(not os.path.lexists(stored), 'role result exists without an authorized launch marker')
+            continue
+        r.require(r.read_json(role_start) == record, 'owned role launch identity changed')
+        release = controller.release(record['release_sha256'])
+        host = release['components']['host']
+        r.require(record['release_sha256'] in (journal['request']['target_sha256'], journal['request']['previous_sha256']),
+                  'owned operation does not belong to this renewal')
+        directory = in_release(host)
+        if role == 'maintenance':
+            maintenance(record, directory, release['components']['maintenance-agent']['artifact_sha256'])
+        else:
+            development(record, directory, record['development_manifest_sha256'])
+    value = {'operation': request['operation'], 'nonce': request['nonce'], 'owned_sha256': r.identity(owned), 'all_absent': True}
+    r.replace_json(CONTROL / 'cleanup-observed.json', value)
+
+
+def main():
+    if sys.argv[1:2] == ['__development']:
+        r.require(len(sys.argv) == 6, 'invalid development cleanup arguments')
+        development_child(*sys.argv[2:])
+        return
+    r.require(os.getuid() == 0 and len(sys.argv) == 1, 'protected owned cleanup required')
+    cleanup(r.Renewal(ROOT, None))
+
+
+if __name__ == '__main__':
+    main()
