@@ -217,6 +217,58 @@ class PlacementFixture(unittest.TestCase):
         self.assertEqual((directory / 'manifest.json').read_bytes(), old)
         self.assertEqual([path.parent for path in self.input_root.glob('*/manifest.json')], [directory])
 
+    def test_stage_reconciles_interrupted_archive_before_budgeting_replay(self):
+        first = self.stage()
+        old = self.input_root / first['manifest_sha256']
+        old_manifest = (old / 'manifest.json').read_bytes()
+        old_archive = (old / n.RELEASE_ARCHIVE).read_bytes()
+        self.stage_item('a' * 40, b'new authenticated image bytes')
+
+        def interrupt(source, expected, size, output):
+            output.write(source.read_bytes()[:-1])
+            raise InterruptedError('after partial copy')
+
+        def stage_writer(parent, name, writer, label):
+            temporary = Path(os.readlink(f'/proc/self/fd/{parent}')) / (name + '.new')
+            with temporary.open('xb') as output:
+                os.fchmod(output.fileno(), 0o600)
+                writer(output)
+
+        self.release.copy_verified = interrupt
+        with patch.object(self, 'write', stage_writer), self.assertRaises(InterruptedError):
+            self.stage()
+        pending, = self.input_root.glob(f'*/{n.RELEASE_ARCHIVE}.new')
+        free = g.STAGE_HEADROOM + self.release.item.inner['archive_bytes']
+        real_stat = os.stat
+
+        def local_stat(path, *args, **kwargs):
+            node = real_stat(path, *args, **kwargs)
+            if path == n.RELEASE_ARCHIVE + '.new':
+                return SimpleNamespace(st_uid=0, st_gid=0, st_mode=node.st_mode,
+                                       st_nlink=node.st_nlink, st_size=node.st_size)
+            return node
+
+        def capacity(fd):
+            return SimpleNamespace(f_bavail=free - pending.exists(), f_frsize=1, f_favail=4 - pending.exists())
+
+        self.release.copy_verified = Mock(wraps=self.fixture_copy)
+        with patch.object(os, 'stat', side_effect=local_stat), patch.object(os, 'fstatvfs', side_effect=capacity):
+            current = self.stage()
+            self.assertEqual(self.stage(), current)
+        self.release.copy_verified.assert_called_once()
+        self.assertFalse(pending.exists())
+        self.assertEqual((old / 'manifest.json').read_bytes(), old_manifest)
+        self.assertEqual((old / n.RELEASE_ARCHIVE).read_bytes(), old_archive)
+
+    def test_reconcile_preserves_ambiguous_stage_links(self):
+        source = self.release.item.inner_path
+        pending = self.input_root / (n.RELEASE_ARCHIVE + '.new')
+        pending.symlink_to(source)
+        with n.directory_fd(self.input_root) as fd, self.assertRaisesRegex(db.Blocked, 'ambiguous released'):
+            self.release.reconcile_inner_copy(fd, self.input_root)
+        self.assertTrue(pending.is_symlink())
+        self.assertEqual(source.read_bytes(), b'independent inner artifact')
+
 
 class TestCurrentSelection(unittest.TestCase):
     def setUp(self):

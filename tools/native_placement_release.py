@@ -615,6 +615,25 @@ class ReleasePlacement(n.Placement):
                       and old['oci_manifest_digest'] == 'sha256:' + prior['oci_manifest_sha256'],
                       'previous outer image is unavailable for exact restore')
 
+    def reconcile_inner_copy(self, fd, root):
+        stage = n.RELEASE_ARCHIVE + '.new'
+        try:
+            node = os.stat(stage, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        # The bound input directory is root-owned and the producer lock is held.
+        # Reap only the archive staging leaf, before counting its blocks and inode.
+        mode = stat.S_IMODE(node.st_mode)
+        size = self.item.inner['archive_bytes']
+        incomplete = mode == 0o600 and node.st_size <= size
+        ready_to_rename = mode == 0o444 and node.st_size == size
+        n.require(stat.S_ISREG(node.st_mode) and (node.st_uid, node.st_gid, node.st_nlink) == (0, 0, 1)
+                  and (incomplete or ready_to_rename)
+                  and not n.present(root / 'manifest.json') and not n.present(root / 'manifest.json.new'),
+                  'ambiguous released inner archive stage preserved')
+        os.unlink(stage, dir_fd=fd)
+        os.fsync(fd)
+
     def publish(self):
         image = self.item.outer['image']
         manifest = {'kind': 'dev-pair-development-nested-v1', 'standards_sha': db.STANDARDS, 'job': self.job,
@@ -637,6 +656,7 @@ class ReleasePlacement(n.Placement):
                 root = Path(f'/proc/self/fd/{fd}')
                 archive = root / n.RELEASE_ARCHIVE
                 if not n.present(archive):
+                    self.reconcile_inner_copy(fd, root)
                     space = os.fstatvfs(fd)
                     n.require(space.f_bavail * space.f_frsize >= self.item.inner['archive_bytes'] + STAGE_HEADROOM
                               and space.f_favail >= 4, 'nested placement lacks free rollback overlap capacity')
