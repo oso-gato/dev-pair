@@ -16,6 +16,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import pwd
 import re
 import selectors
 import signal
@@ -53,6 +54,16 @@ ACCESS_MODE = 'verified-provider-console'
 GUARD_PATH = '/etc/dev-pair/bootstrap.nft'
 CUTOVER = STATE + '/access-cutover.json'
 TRUST_SIGNERS = '/etc/dev-pair/trust/allowed_signers'
+CHECKLIST_OWNER = 'dp-checklist'
+CHECKLIST_HOME = '/var/lib/dev-pair/checklist-executor'
+CHECKLIST_CONTROL = '/var/lib/dev-pair/checklist-release'
+CHECKLIST_UNIT = 'dev-pair-checklist-executor@.service'
+CHECKLIST_OVERRIDE = '/etc/systemd/system/' + CHECKLIST_UNIT + '.d/checklist-release.conf'
+CHECKLIST_ENTRY = '/usr/libexec/dev-pair/renewal/checklist-entry'
+CHECKLIST_PORTS = {'19425', '18279', '443'}
+CHECKLIST_APP = 'dp-checklist-app'
+CHECKLIST_ARGS = ('serve-host', '--state', CHECKLIST_HOME + '/ledger', '--tls', CHECKLIST_HOME + '/tls',
+                  '--approval', '/etc/dev-pair/checklist/approval.json', '--port', '19425', '--lifetime', '600')
 SSH_CUTOVER = '/etc/ssh/sshd_config.d/00-dev-pair-cutover.conf'
 SSH_CUTOVER_CONFIG = '''# dev-pair tailnet administration
 PermitRootLogin no
@@ -1490,7 +1501,7 @@ class Bootstrap:
             if os.path.exists(name):
                 os.unlink(name)
 
-    def preflight(self, *, require_enforcing=True):
+    def preflight(self, *, require_enforcing=True, managed_runtime=False):
         if os.geteuid() != 0:
             raise Blocked('root is required')
         release = dict(re.findall(r'^([A-Z_]+)=["\']?([^\n"\']*)', self.text('/etc/os-release'), re.M))
@@ -1548,7 +1559,7 @@ class Bootstrap:
                 if batch is None:raise ValueError()
             except (Blocked,OSError,ValueError):
                 raise Blocked('unexpected listener: resolved identity unavailable') from None
-        # Reject application listeners before creating users, installing packages or changing rules.
+        owned_candidates = []
         for line in inventory:
             columns = line.split()
             if len(columns) < 5:
@@ -1564,12 +1575,21 @@ class Bootstrap:
             if (not allowed and proto in ('tcp', 'udp') and port == '5355'
                     and not self.path(f'{STATE}/prepared').exists()):
                 allowed = self.resolved_listener(line, batch)
-            if not allowed and proto == 'tcp':
+            if managed_runtime and proto == 'tcp' and port in CHECKLIST_PORTS:
+                owned_candidates.append(line)
+                continue
+            if not allowed and proto == 'tcp' and port not in CHECKLIST_PORTS:
                 allowed = self.peerapi_listener(line, host.strip('[]'))
             if not allowed and proto == 'udp' and port.isdigit() and 60000 <= int(port) <= 61000:
                 allowed = self.mosh_listener(line)
             if not allowed:
                 raise Blocked('unexpected listener: host is not vanilla; inspect inventory before proceeding')
+        checklist_ready = managed_runtime and any(os.path.lexists(self.path(CHECKLIST_CONTROL + '/' + name))
+                                                  for name in ('ready.json', 'managed-listener.json'))
+        if owned_candidates or checklist_ready:
+            if selinux != 'Enforcing':
+                raise Blocked('managed runtime listener requires enforcing SELinux')
+            self.managed_runtime_listeners(owned_candidates)
         if batch is not None:
             try:
                 if self.resolved_service(snapshot=True)!=batch:raise ValueError()
@@ -1577,6 +1597,327 @@ class Bootstrap:
                 raise Blocked('unexpected listener: resolved identity changed') from None
         return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': selinux,
                 'phase': 'bootstrap', 'ssh_cutover': 'independent evidence required'}
+
+    def runtime_record(self, path, *, optional=False, private=True):
+        try:
+            file = checked_file(self.path(path), secret=private)
+            if file.stat().st_nlink != 1:
+                raise ValueError('managed runtime record has ambiguous ownership')
+            raw = file.read_text()
+        except FileNotFoundError:
+            if optional and not os.path.lexists(self.path(path)):
+                return None
+            raise
+        return json.loads(raw, object_pairs_hook=relay.unique)
+
+    def runtime_account(self):
+        account = pwd.getpwnam(CHECKLIST_OWNER)
+        if (account.pw_uid != account.pw_gid or account.pw_uid < 1000
+                or account.pw_dir != CHECKLIST_HOME or account.pw_shell != '/usr/sbin/nologin'
+                or os.getgrouplist(CHECKLIST_OWNER, account.pw_gid) != [account.pw_gid]):
+            raise ValueError('checklist runtime account changed')
+        return account.pw_uid
+
+    def runtime_user_command(self, uid, *args):
+        run = f'/run/user/{uid}'
+        return self.run('/usr/sbin/runuser', '-u', CHECKLIST_OWNER, '--', '/usr/bin/env', '-i',
+                        'PATH=/usr/bin:/usr/sbin', 'HOME=' + CHECKLIST_HOME, 'LC_ALL=C.UTF-8',
+                        'XDG_RUNTIME_DIR=' + run, 'DBUS_SESSION_BUS_ADDRESS=unix:path=' + run + '/bus',
+                        *args, timeout=5)
+
+    def runtime_unit(self, unit, properties, *, uid=None):
+        from systemd_service_profile import manager_properties
+
+        args = ('show', '--all', '--property=' + ','.join(properties), unit)
+        command = ('/usr/bin/systemctl',)
+        raw = (self.run(*command, *args, timeout=5) if uid is None else
+               self.runtime_user_command(uid, *command, '--user', *args))
+        facts = manager_properties(raw, properties)
+        if (facts['Id'] != unit
+                or facts['ActiveState'] != 'active' or not re.fullmatch(r'[1-9][0-9]{0,9}', facts['MainPID'])
+                or int(facts['MainPID']) <= 1
+                or not re.fullmatch(r'/(?:[A-Za-z0-9_@./-]|\\x[0-9a-f]{2})+', facts['ControlGroup'])
+                or '..' in facts['ControlGroup'].split('/')):
+            raise ValueError('managed runtime service identity is unavailable')
+        return facts
+
+    def runtime_process(self, pid, uid):
+        start = self.resolved_process_start(pid)
+        proc = self.path('/proc/' + pid)
+        status = (proc / 'status').read_text()
+        for field in ('Uid', 'Gid'):
+            ids = [line.split()[1:] for line in status.splitlines() if line.startswith(field + ':')]
+            if ids != [[str(uid)] * 4]:
+                raise ValueError('managed socket process has a foreign identity')
+        cgroup = (proc / 'cgroup').read_text().splitlines()
+        exe = str((proc / 'exe').readlink())
+        if len(cgroup) != 1 or not cgroup[0].startswith('0::/') or self.resolved_process_start(pid) != start:
+            raise ValueError('managed socket process changed during observation')
+        return exe, cgroup[0][3:], start
+
+    def runtime_executable(self, actual, expected):
+        trusted = [self.path(path).resolve(strict=True) for path in expected if self.path(path).exists()]
+        observed = self.path(actual)
+        if not actual.startswith('/') or observed not in trusted:
+            raise ValueError('managed listener uses a foreign executable')
+        self.runtime_protected_file(observed)
+
+    @staticmethod
+    def runtime_protected_file(script):
+        for path in (script, *script.parents):
+            node = path.lstat()
+            if node.st_uid != 0 or node.st_mode & 0o022 or stat.S_ISLNK(node.st_mode):
+                raise ValueError('managed launch code is mutable')
+        node = script.lstat()
+        if not stat.S_ISREG(node.st_mode) or node.st_nlink != 1:
+            raise ValueError('managed launch file is ambiguous')
+
+    def runtime_socket(self, line):
+        fields = line.split(maxsplit=6)
+        if len(fields) != 7 or fields[:2] != ['tcp', 'LISTEN']:
+            raise ValueError('managed socket address is unavailable')
+        match = re.fullmatch(r'users:\(\("[^"\n]+",pid=([1-9][0-9]{0,9}),fd=([0-9]{1,7})\)\)', fields[6])
+        if match is None:
+            raise ValueError('managed socket has ambiguous ownership')
+        pid, fd = match.groups()
+        target = str(self.path(f'/proc/{pid}/fd/{fd}').readlink())
+        if not re.fullmatch(r'socket:\[[1-9][0-9]{0,19}\]', target):
+            raise ValueError('managed listener descriptor changed')
+        return fields[4], pid, fd, target
+
+    def runtime_handoff(self, socket, uid, boot, managed):
+        import systemd_service_profile as profile
+
+        endpoint, pid, _, descriptor = socket
+        unit = CHECKLIST_UNIT.replace('@.', f'@{uid}.')
+        fragment = '/etc/systemd/system/' + CHECKLIST_UNIT
+        profile.protected(self.path(fragment), 0, 8192, mode=0o644)
+        properties = ('Id', 'LoadState', 'MainPID', 'ActiveState', 'ControlGroup', 'User', 'Group', 'FragmentPath',
+                      'DropInPaths', 'ExecStart', 'ExecMainStartTimestampMonotonic', *profile.PROPERTIES)
+        facts = self.runtime_unit(unit, properties)
+        profile.observe(facts, (CHECKLIST_OVERRIDE,) if managed else (), self.path, self.run)
+        if (endpoint != '127.0.0.1:19425' or facts['LoadState'] != 'loaded'
+                or facts['MainPID'] != pid or facts['User'] != CHECKLIST_OWNER
+                or facts['Group'] != CHECKLIST_OWNER or facts['FragmentPath'] != fragment
+                or not facts['ControlGroup'].startswith('/system.slice/')
+                or not facts['ControlGroup'].endswith('/' + unit)
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', facts['ExecMainStartTimestampMonotonic'])):
+            raise ValueError('checklist handoff differs from its protected service')
+        if managed:
+            site, host, observed = self.runtime_selected_host(boot)
+            artifact = host['artifact_sha256']
+            profile.protected(self.path(CHECKLIST_OVERRIDE), 0, 8192, mode=0o644)
+            profile.protected(self.path(CHECKLIST_ENTRY), 0, 65536, mode=0o755)
+            command = json.loads(self.run(CHECKLIST_ENTRY, '--describe', timeout=5), object_pairs_hook=relay.unique)
+            expected = ['/usr/bin/python3', '-EBs',
+                        f'/usr/libexec/dev-pair/host-releases/{artifact}/tools/host_handoff.py', *CHECKLIST_ARGS]
+            if command != expected or not profile.exec_start_matches(facts['ExecStart'], CHECKLIST_ENTRY):
+                raise ValueError('managed handoff launch release changed')
+            command_hash = hashlib.sha256(json.dumps(command, sort_keys=True, separators=(',', ':'),
+                                                     ensure_ascii=False).encode()).hexdigest()
+            actual = {'unit': unit, 'pid': int(pid), 'started': int(facts['ExecMainStartTimestampMonotonic']),
+                      'command_sha256': command_hash, 'socket_inode': descriptor[8:-1]}
+        else:
+            command = ['/usr/bin/python3', '-EBs', '/usr/libexec/dev-pair/checklist/tools/host_handoff.py',
+                       *CHECKLIST_ARGS]
+            self.runtime_protected_file(self.path(command[2]))
+            if not profile.exec_start_matches(facts['ExecStart'], ' '.join(command)):
+                raise ValueError('direct handoff launch command changed')
+        exe, cgroup, start = self.runtime_process(pid, uid)
+        self.runtime_executable(exe, (command[0],))
+        with self.path('/proc/' + pid + '/cmdline').open('rb') as stream:
+            raw = stream.read(4097)
+        if cgroup != facts['ControlGroup'] or raw != b'\0'.join(x.encode() for x in command) + b'\0':
+            raise ValueError('checklist handoff listener differs from the selected process')
+        if managed:
+            self.runtime_handoff_observation(observed, actual, site)
+        if (self.resolved_process_start(pid) != start or self.runtime_unit(unit, properties) != facts
+                or managed and self.runtime_selected_host(boot) != (site, host, observed)):
+            raise ValueError('checklist handoff listener differs from the selected process')
+
+    def runtime_selected_host(self, boot):
+        import systemd_service_profile as profile
+
+        root = '/var/lib/dev-pair/renewal'
+        site = self.runtime_record(root + '/site-current.json')
+        if type(site) is not str or not re.fullmatch(r'[0-9a-f]{64}', site):
+            raise ValueError('managed handoff current site selection is invalid')
+        raw = profile.protected(self.path(root + '/releases/' + site + '.json'), 0, 65536, mode=0o600)
+        release = json.loads(raw, object_pairs_hook=relay.unique)
+        host = release['components']['host']
+        if (hashlib.sha256(raw).hexdigest() != site or type(release['schema']) is not int or release['schema'] != 1
+                or set(host) != {'source_revision', 'config_sha256', 'artifact_sha256'}
+                or not re.fullmatch(r'[0-9a-f]{40}', host['source_revision'])
+                or any(not re.fullmatch(r'[0-9a-f]{64}', host[key]) for key in ('config_sha256', 'artifact_sha256'))):
+            raise ValueError('managed handoff site release is not the reviewed host component')
+        selector_path = self.path('/var/lib/dev-pair/renewal-fence/selected-host.json')
+        selector = json.loads(profile.protected(selector_path, 0, 4096, mode=0o644), object_pairs_hook=relay.unique)
+        observed = self.runtime_record(root + '/host-observed.json')
+        launch = '/usr/libexec/dev-pair/host-releases/' + host['artifact_sha256']
+        if (selector != {'schema': 1, 'artifact_sha256': host['artifact_sha256']} or type(selector['schema']) is not int
+                or self.runtime_record(root + '/host-selection.json') != host
+                or set(observed) != {'schema', 'boot_id', 'component', 'launch_root', 'role_launch_seconds',
+                                     'hostname', 'platform', 'selinux', 'handoff'}
+                or type(observed['schema']) is not int or observed['schema'] != 2 or observed['boot_id'] != boot
+                or observed['component'] != host or observed['launch_root'] != launch
+                or observed['hostname'] != self.text('/proc/sys/kernel/hostname').strip()
+                or observed['platform'] != 'fedora-44' or observed['selinux'] != 'enforcing'
+                or type(observed['role_launch_seconds']) is not int or not 90 <= observed['role_launch_seconds'] <= 169):
+            raise ValueError('managed handoff release differs from current site or boot observation')
+        return site, host, observed
+
+    def runtime_handoff_observation(self, observed, actual, site):
+        import systemd_service_profile as profile
+
+        previous = observed['handoff']
+        if (type(previous) is not dict or set(previous) != set(actual)
+                or previous['unit'] != actual['unit'] or previous['command_sha256'] != actual['command_sha256']
+                or type(previous['pid']) is not int or previous['pid'] <= 1
+                or type(previous['started']) is not int or previous['started'] <= 0
+                or type(previous['socket_inode']) is not str
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', previous['socket_inode'])):
+            raise ValueError('managed handoff lacks its exact authorized process observation')
+        if previous == actual:
+            return
+        if actual['started'] <= previous['started']:
+            raise ValueError('managed handoff process or inode changed without a later start')
+        verifier = '/usr/libexec/dev-pair/renewal/host-release'
+        profile.protected(self.path(verifier), 0, 65536, mode=0o755)
+        # U measures the live endpoint again under its exact selected host. The
+        # verify entry is read-only and never restarts or reselects a unit.
+        fresh = json.loads(self.run(verifier, 'verify', site, timeout=20), object_pairs_hook=relay.unique)
+        if fresh != {**observed, 'handoff': actual}:
+            raise ValueError('new handoff process lacks a matching current site observation')
+
+    def runtime_app(self, socket, uid, dns):
+        state = self.runtime_record(CHECKLIST_CONTROL + '/release.json')
+        active = state['active']
+        subject = active['subject']
+        if (state['version'] != 2 or state['pending'] is not None or state['route_pending'] is not False
+                or active.get('quarantined') or active['compatibility'] != 'checklist-sqlite-v1'
+                or active['dns_name'] != dns or not re.fullmatch(r'[0-9a-f]{64}', active['image_id'])
+                or not re.fullmatch(r'ghcr\.io/oso-gato/dev-pair/checklist@sha256:[0-9a-f]{64}', subject)
+                or socket[0] != '127.0.0.1:18279'):
+            raise ValueError('checklist app lacks a settled authorized release')
+        unit = CHECKLIST_APP + '.service'
+        source = f'/etc/containers/systemd/users/{uid}/{CHECKLIST_APP}.container'
+        data = checked_file(self.path(source)).read_bytes()
+        if hashlib.sha256(data).hexdigest() != active['unit_sha256']:
+            raise ValueError('protected checklist Quadlet differs from selected release')
+        keys = ('Id', 'MainPID', 'ActiveState', 'ControlGroup', 'SourcePath', 'FragmentPath', 'DropInPaths', 'InvocationID')
+        facts = self.runtime_unit(unit, keys, uid=uid)
+        generators = {'generator', 'generator.early', 'generator.late'}
+        manager = f'/user.slice/user-{uid}.slice/user@{uid}.service/'
+        if (facts['SourcePath'] != source or facts['DropInPaths'] != ''
+                or facts['FragmentPath'] not in {f'/run/user/{uid}/systemd/{where}/{unit}' for where in generators}
+                or not re.fullmatch(r'[0-9a-f]{32}', facts['InvocationID'])
+                or not facts['ControlGroup'].startswith(manager) or not facts['ControlGroup'].endswith('/' + unit)):
+            raise ValueError('checklist app does not use the selected user-managed Quadlet')
+        conmon, supervisor, _ = self.runtime_process(facts['MainPID'], uid)
+        self.runtime_executable(conmon, ('/usr/bin/conmon',))
+        if supervisor != facts['ControlGroup']:
+            raise ValueError('checklist app supervisor is outside its named service')
+        graph = '/var/lib/dev-pair/checklist-live/graph'
+        runroot = f'/run/user/{uid}/dev-pair-checklist-live-runroot'
+        config = '/etc/dev-pair/checklist/live-containers.conf'
+        checked_file(self.path(config))
+
+        def podman(*argv):
+            return self.runtime_user_command(uid, '/usr/bin/env', 'CONTAINERS_CONF=' + config,
+                'TMPDIR=/var/lib/dev-pair/checklist-live/image-copy', '/usr/bin/podman', '--remote=false', '--root', graph,
+                '--runroot', runroot, *argv)
+
+        container, = json.loads(podman('container', 'inspect', CHECKLIST_APP), object_pairs_hook=relay.unique)
+        container_id = container['Id']
+        if (not re.fullmatch(r'[0-9a-f]{64}', container_id) or container['Name'].removeprefix('/') != CHECKLIST_APP
+                or container['Image'].removeprefix('sha256:') != active['image_id']
+                or container['State']['Running'] is not True
+                or podman('port', CHECKLIST_APP, '8000/tcp').strip() != socket[0]):
+            raise ValueError('checklist rootless image or published port differs')
+        exe, cgroup, start = self.runtime_process(socket[1], uid)
+        self.runtime_executable(exe, ('/usr/libexec/podman/rootlessport', '/usr/bin/pasta'))
+        path = cgroup.split('/')
+        if (cgroup != facts['ControlGroup'] and not (cgroup.startswith(manager) and
+                ({f'libpod-{container_id}.scope', f'libpod-conmon-{container_id}.scope'} & set(path)))):
+            raise ValueError('checklist proxy socket does not belong to the selected app')
+        route = json.loads(self.run('/usr/bin/tailscale', 'serve', 'status', '--json', timeout=5),
+                           object_pairs_hook=relay.unique)
+        if (route != {'TCP': {'443': {'HTTPS': True}}, 'Web': {f'{dns}:443': {
+                'Handlers': {'/': {'Proxy': 'http://127.0.0.1:18279'}}}}}
+                or self.resolved_process_start(socket[1]) != start):
+            raise ValueError('Tailscale Serve differs from the exact checklist route')
+
+    def runtime_serve(self, sockets):
+        guard = self.verify_final_guard()
+        live, dns = self.tailscale_state()
+        if guard['target']['dns_name'] != dns:
+            raise ValueError('checklist tailnet address differs from admitted cutover')
+        unit = 'tailscaled.service'
+        facts = self.runtime_unit(unit, ('Id', 'MainPID', 'ActiveState', 'ControlGroup'))
+        exe, cgroup, start = self.runtime_process(facts['MainPID'], 0)
+        self.runtime_executable(exe, ('/usr/sbin/tailscaled',))
+        if cgroup != '/system.slice/' + unit or facts['ControlGroup'] != cgroup:
+            raise ValueError('Serve does not use the managed tailscaled process')
+        for endpoint, pid, _, _ in sockets:
+            host = endpoint.rpartition(':')[0].strip('[]')
+            if pid != facts['MainPID'] or host not in live.get('TailscaleIPs', ()):
+                raise ValueError('Serve socket is outside the enrolled tailnet addresses')
+        if self.resolved_process_start(facts['MainPID']) != start:
+            raise ValueError('Serve process changed while observing')
+        return dns
+
+    def managed_runtime_listeners(self, lines):
+        """Read only the installed checklist and Serve proofs for opt-in runtime callers."""
+        try:
+            boot = self.destination_identity()
+            prepared = self.runtime_record(STATE + '/prepared')
+            if (prepared != self.runtime_record(STATE + '/desired.json') or prepared['schema'] != 1
+                    or prepared['standards_sha'] != STANDARDS or prepared['operator'] != 'core'
+                    or not re.fullmatch(r'[0-9a-f]{64}', prepared['bootstrap_sha256'])):
+                raise ValueError('protected host preparation is unavailable')
+            setup = self.runtime_record(CHECKLIST_CONTROL + '/provision.json')
+            uid = self.runtime_account()
+            if (setup['version'] != 1 or setup['machine_id'] != boot['machine_id'] or setup['uid'] != uid
+                    or not re.fullmatch(r'[0-9a-f]{40}', setup['platform_sha'])):
+                raise ValueError('checklist provisioning does not match this host')
+            ready = self.runtime_record(CHECKLIST_CONTROL + '/ready.json', optional=True)
+            managed = os.path.lexists(self.path(CHECKLIST_OVERRIDE))
+            commissioning = self.runtime_record(CHECKLIST_CONTROL + '/managed-listener.json', optional=True)
+            if managed:
+                checked_file(self.path(CHECKLIST_OVERRIDE))
+                site = self.runtime_record('/var/lib/dev-pair/renewal/site-current.json')
+                if commissioning['version'] != 2 or not re.fullmatch(r'[0-9a-f]{64}', site):
+                    raise ValueError('managed checklist commissioning is unavailable')
+            elif commissioning is not None:
+                raise ValueError('managed checklist service cannot return to commissioning')
+            if ready != setup or managed and commissioning['phase'] != 'ready':
+                if (not managed or ready not in (None, setup) or commissioning['phase'] not in ('observe', 'queue-recovery', 'recovery')
+                        or commissioning['boot'] != boot['boot_id'] or commissioning['site'] != site
+                        or self.runtime_record('/var/lib/dev-pair/renewal-fence/frozen', private=False) != 'boot'):
+                    raise ValueError('checklist runtime is outside protected commissioning')
+
+            sockets = [self.runtime_socket(line) for line in lines]
+            handoff = [row for row in sockets if row[0].endswith(':19425')]
+            app = [row for row in sockets if row[0].endswith(':18279')]
+            serve = [row for row in sockets if row[0].endswith(':443')]
+            if len(handoff) > 1 or len(app) > 1 or len(serve) > 2 or len({row[0] for row in sockets}) != len(sockets):
+                raise ValueError('multiple unexpected checklist listener addresses')
+            if not handoff and (ready is not None or commissioning is not None):
+                raise ValueError('the authorized checklist executor has no observed listener')
+            if handoff:
+                self.runtime_handoff(handoff[0], uid, boot['boot_id'], managed)
+            if app or serve:
+                if not managed or ready != setup or commissioning['phase'] != 'ready' or len(app) != 1:
+                    raise ValueError('public release proof is unavailable for checklist app')
+                dns = self.runtime_serve(serve)
+                self.runtime_app(app[0], uid, dns)
+            repeated = [line for line in self.run('/usr/bin/ss', '-H', '-lntup', timeout=5).splitlines()
+                        if len(line.split()) >= 5 and line.split()[0] == 'tcp'
+                        and line.split()[4].rpartition(':')[2] in CHECKLIST_PORTS]
+            if sorted(self.runtime_socket(line) for line in repeated) != sorted(sockets) or self.destination_identity() != boot:
+                raise ValueError('managed listener inventory changed during observation')
+        except (OSError, ValueError, TypeError, KeyError, IndexError, Blocked, subprocess.SubprocessError):
+            raise Blocked('unexpected listener: managed checklist or tailnet ownership is unverified') from None
 
     def resolved_process_start(self,pid):
         # Bounded Linux proc stat: comm may contain spaces and parentheses.
