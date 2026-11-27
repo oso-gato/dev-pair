@@ -118,14 +118,46 @@ binds the observation to the mount seen by the conductor. It extracts one
 bounded, regular Git blob and copies it with the trusted Containerfile to one
 root-owned context at `/run/dev-pair/checklist-build-inputs/active`. The
 checklist group can traverse the context and read both files. Only root can
-modify the context. The rootless builder writes its archive to a separate
-private spool on the bounded validation filesystem. The fixed build command
-disables networking and pulling.
+modify the context. The conductor streams the rootless export into one private
+root-owned transfer file on the same dedicated validation filesystem. The builder
+and importer use the protected `validation-containers.conf` and its bounded
+`image-copy` leaf. The fixed build command disables networking and pulling,
+verifies the resident exact base and rebuilds outputs from the authorized Git
+blob. Successive source revisions reuse the same compatible base without a
+download. The conductor records the base config and manifest, local base use,
+download count and measured transfer size in the product service journal.
+The protected input proof binds new receipts to the original source blob, exact
+base and recipe. A later input change blocks reuse under the same receipt ID.
+The prior receipt remains usable for the already authorized validation.
 It verifies the single-platform OCI manifest and configuration digests across
 archive export and load. The destination's `preload-validation --apply` checks
 the same image ID, digest and source in the owned validation graph before
 the conductor publishes its named root-owned receipt. The build never runs
 a command supplied by the repository.
+
+Install the [checklist spool service](../runtime/product-job/dev-pair-checklist-spool.service)
+and [timer](../runtime/product-job/dev-pair-checklist-spool.timer) with the product
+service. Enable `dev-pair-checklist-spool.timer` on the authorized Fedora host.
+The build requires 1 GiB and 4,096 available validation filesystem inodes after
+reconciliation. Space covers the 320 MiB archive, overlapping engine copy/import
+work and a 64 MiB margin. The dedicated filesystem enforces the hard bound.
+At this threshold the job pauses before a new archive or engine build begins.
+Completion removes the transfer and logs the filesystem's actual available
+bytes and inodes before and after. A new build reconciles an interrupted owned
+transfer before measuring its budget. The hourly timer also reclaims an owned
+transfer after seven inactive days, or earlier under byte or inode pressure.
+The timer takes the same exclusive transfer lock and the renewal dispatch gate.
+The engine also inherits a lock on its read-only archive descriptor. If the
+conductor exits while an engine helper still holds that descriptor, cleanup and
+the next build wait for the helper. Unlink alone is insufficient evidence of
+newly available capacity. Foreign objects are preserved. The same check is
+available through `checklist_candidate.py sweep-spool`.
+
+This cleanup is limited to the checklist OCI transfer. The verified base,
+validation and rollback images, job agreements, durable test results and both
+role workspaces are outside that transfer. Operator reconciliation is still
+required for an unowned legacy spool, ambiguous legacy context or Podman store
+object. The active release and prior job identities are retained.
 
 ## Job and role inputs
 
