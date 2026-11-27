@@ -1,0 +1,38 @@
+name: Release source eligibility
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  release-source-check:
+    if: github.repository == 'oso-gato/dev-pair' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Record tested tree and executed workflow revision
+        env:
+          REVIEW_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REVIEW_HEAD" =~ ^[0-9a-f]{40}$ && "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD^2)" = "$REVIEW_HEAD"
+          tree="$(git rev-parse HEAD^{tree})"
+          printf '::notice file=.github/workflows/release-check.yml,line=1,title=dev-pair-release-tree::%s:%s:%s:%s\n' "$REVIEW_HEAD" "$GITHUB_SHA" "$tree" "$GITHUB_WORKFLOW_SHA"
+      - name: Verify the merged candidate tree without release credentials
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s tests -q
+          python3 -B -m unittest discover -s examples/checklist -p test_checklist.py -q

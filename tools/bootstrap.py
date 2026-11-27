@@ -127,6 +127,7 @@ class Blocked(Exception):
 SUDO_PACKAGE_QUERY = ('/usr/bin/rpm', '-qf', '/usr/bin/sudo', '--queryformat',
                       '%{NAME}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\n')
 SUDO_ROLES = {'dp-maint': 'maintenance-sudo-denial', 'dp-dev': 'development-sudo-denial'}
+SUDO_DENIAL_ROLES = {**SUDO_ROLES, 'dp-checklist': 'checklist-sudo-denial'}
 ROLE_DIRECTORIES = {'dp-maint':'maintenance','dp-dev':'development'}
 ROLE_CHILDREN = ('workspaces','checkpoints','evidence','deliverables','builds','cache','state')
 
@@ -186,7 +187,7 @@ def sudo_package_projection(stdout, stderr, complete, status):
 
 def sudo_denial_projection(role, stdout, stderr, *, complete, status, native_status,
                            relay_verified, host_verified, package, execution_kind='native'):
-    if type(role) is not str or role not in SUDO_ROLES:
+    if type(role) is not str or role not in SUDO_DENIAL_ROLES:
         raise Blocked('unsupported sudo denial role')
     expected = ('User ' + role + ' is not allowed to run sudo on erebus.\n').encode('ascii')
     exact = stdout == expected
@@ -202,7 +203,7 @@ def sudo_denial_projection(role, stdout, stderr, *, complete, status, native_sta
                  (execution_kind == 'direct' and native_status is None and relay_verified is False))
     accepted = (complete is True and type(status) is int and status == 0 and transport and
                 host_verified is True and supported and exact and not stderr)
-    return {'operation_id': SUDO_ROLES[role], 'role': role, 'execution_kind': execution_kind,
+    return {'operation_id': SUDO_DENIAL_ROLES[role], 'role': role, 'execution_kind': execution_kind,
             'relay_applicability': 'required' if execution_kind == 'native' else 'not-applicable',
             'payload_exit': status if type(status) is int else None,
             'native_exit': native_status if type(native_status) is int else None,
@@ -541,8 +542,8 @@ class Commands:
         # IDs are fixed enums; never echo argv, paths or environment.
         if len(args) == 3 and args[0] == '/usr/bin/id' and args[1] in ('-u','-g') and args[2] in ROLE_DIRECTORIES:
             return ROLE_DIRECTORIES[args[2]]+'-owner-'+('uid' if args[1]=='-u' else 'gid')
-        if len(args) == 4 and args[:3] == ('/usr/bin/sudo', '-l', '-U') and args[3] in SUDO_ROLES:
-            return SUDO_ROLES[args[3]]
+        if len(args) == 4 and args[:3] == ('/usr/bin/sudo', '-l', '-U') and args[3] in SUDO_DENIAL_ROLES:
+            return SUDO_DENIAL_ROLES[args[3]]
         if args == SUDO_PACKAGE_QUERY:
             return 'sudo-package-provenance'
         if args == ('/usr/sbin/getenforce',):
@@ -678,7 +679,7 @@ class Commands:
               sudo_probe=None, sudo_package=False):
         if sudo_probe is not None:
             if (type(sudo_probe) is not dict or set(sudo_probe) != {'role', 'host_verified', 'package'} or
-                    type(sudo_probe['role']) is not str or sudo_probe['role'] not in SUDO_ROLES or
+                    type(sudo_probe['role']) is not str or sudo_probe['role'] not in SUDO_DENIAL_ROLES or
                     args != ('/usr/bin/sudo', '-l', '-U', sudo_probe['role']) or
                     ok != (0,) or input_text is not None or probe or sudo_package):
                 raise Blocked('unsupported sudo denial operation')
@@ -1336,7 +1337,12 @@ class Bootstrap:
 
     def validate_bootstrap_access(self, sources, console_receipt=None):
         if console_receipt is None:
-            return validate_sources(sources)
+            networks = validate_sources(sources)
+            if self.root == Path('/'):
+                peer = self.observed_ssh_peer()
+                if peer and not any(peer['remote'] in ipaddress.ip_network(network) for network in networks):
+                    raise Blocked('current live SSH source is outside declared bootstrap CIDRs')
+            return networks
         if sources or os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_CLIENT') or self.ssh_ancestor():
             raise Blocked('zero-public-SSH setup requires verified out-of-band provider transport')
         data = self.recent_destination_evidence(console_receipt, 'dev-pair-provider-console',
@@ -1349,31 +1355,80 @@ class Bootstrap:
             raise Blocked('verified Hostinger out-of-band root recovery is required')
         return []
 
-    def ssh_ancestor(self):
+    def ssh_ancestors(self):
         pid = os.getppid()
+        processes = []
         for _ in range(64):
             if pid < 2:
-                return False
+                return processes
             try:
                 name = self.text(f'/proc/{pid}/comm').strip()
                 if name.startswith(('sshd', 'dropbear')):
-                    return True
+                    processes.append(pid)
                 parent = re.search(r'^PPid:\s+([0-9]+)$', self.text(f'/proc/{pid}/status'), re.M)
                 if parent is None:
                     break
                 pid = int(parent[1])
             except OSError:
                 break
-        return True  # Unavailable ancestry cannot establish out-of-band transport.
+        return None
+
+    def ssh_ancestor(self):
+        return self.ssh_ancestors() != []  # Unavailable ancestry is unresolved.
+
+    def observed_ssh_peer(self):
+        connection = os.environ.get('SSH_CONNECTION')
+        legacy = os.environ.get('SSH_CLIENT')
+        if not connection:
+            if legacy or self.ssh_ancestor():
+                raise Blocked('SSH transport observed or unresolved; preserve full SSH_CONNECTION and retry')
+            return None
+        try:
+            remote, remote_port, local, local_port = connection.split()
+            remote, local = ipaddress.ip_address(remote), ipaddress.ip_address(local)
+            if not all(re.fullmatch(r'[1-9][0-9]{0,4}', port) and int(port) <= 65535 for port in (remote_port, local_port)):
+                raise ValueError()
+            if legacy and legacy.split() != [str(remote), remote_port, local_port]:
+                raise ValueError()
+        except ValueError:
+            raise Blocked('current SSH connection metadata is incomplete or inconsistent') from None
+        ancestors = self.ssh_ancestors()
+        if not ancestors:
+            raise Blocked('SSH connection is missing a verified live daemon ancestry')
+        found = False
+        for line in self.run('/usr/bin/ss', '-H', '-tnp', timeout=10).splitlines():
+            fields = line.split()
+            if len(fields) < 6 or fields[0] != 'ESTAB':
+                continue
+            left, _, lport = fields[3].rpartition(':')
+            right, _, rport = fields[4].rpartition(':')
+            try:
+                match = (ipaddress.ip_address(left.strip('[]')), lport, ipaddress.ip_address(right.strip('[]')), rport)
+            except ValueError:
+                continue
+            pids = {int(pid) for pid in re.findall(r'pid=([1-9][0-9]*),', line)}
+            if match == (local, local_port, remote, remote_port) and pids.intersection(ancestors):
+                found = True
+                break
+        if not found:
+            raise Blocked('current SSH metadata does not bind an established owned connection')
+        route = json.loads(self.run('/usr/sbin/ip', '-j', 'route', 'get', str(remote), 'from', str(local), timeout=10))
+        if len(route) != 1 or type(route[0].get('dev')) is not str or route[0]['dev'] == 'lo':
+            raise Blocked('live SSH peer route is unavailable')
+        authenticated_core = any(re.match(rb'^sshd(?:-session)?: core(?:[ @]|\x00)',
+                                          self.path(f'/proc/{pid}/cmdline').read_bytes()[:2048])
+                                 for pid in ancestors)
+        return {'remote': remote, 'local': str(local), 'device': route[0]['dev'], 'core': authenticated_core}
 
     def console_inspect(self, source=None):
         if os.geteuid() != 0:
             raise Blocked('open the selected VPS root terminal for inspection')
         peer = os.environ.get('SSH_CONNECTION', '').split()
+        ssh_observed = peer or os.environ.get('SSH_CLIENT') or self.ssh_ancestors()
         return {**self.destination_identity(), 'source_sha': self.destination_source(source) if source else None,
                 'host': self.text('/proc/sys/kernel/hostname').strip(), 'arch': platform.machine(),
                 'os_release': self.text('/etc/os-release'), 'pid1': self.text('/proc/1/comm').strip(),
-                'transport': 'ssh-observed' if peer or self.ssh_ancestor() else 'requires-provider-verification',
+                'transport': 'ssh-observed' if ssh_observed else 'requires-provider-verification',
                 'ssh_peer': str(ipaddress.ip_address(peer[0])) if peer else None,
                 'selinux': self.text('/sys/fs/selinux/enforce').strip() or 'not observed',
                 'selinux_config': self.text('/etc/selinux/config'), 'kernel_cmdline': self.text('/proc/cmdline'),
@@ -2362,12 +2417,14 @@ class Bootstrap:
 
     @staticmethod
     def guard_rules(sources, *, tailnet_only=False):
-        rules = '\n'.join(f'add rule inet dev_pair_bootstrap input {"ip6" if ":" in cidr else "ip"} saddr {cidr} tcp dport 22 accept' for cidr in sources)
-        guard = GUARD.replace('{bootstrap_rules}', rules)
-        if not sources:
-            before = 'add rule inet dev_pair_bootstrap input ct state established,related accept'
-            drop = 'add rule inet dev_pair_bootstrap input iifname != "lo" iifname != "tailscale0" tcp dport '
-            guard = guard.replace(before, drop + ('{ 22, 443 }' if tailnet_only else '22') + ' drop\n' + before)
+        if tailnet_only and sources:
+            raise Blocked('tailnet-only ingress cannot retain scoped temporary sources')
+        scoped = [f'add rule inet dev_pair_bootstrap input {"ip6" if ":" in cidr else "ip"} saddr {cidr} tcp dport 22 accept'
+                  for cidr in sources]
+        before = 'add rule inet dev_pair_bootstrap input ct state established,related accept'
+        drop = 'add rule inet dev_pair_bootstrap input iifname != "lo" iifname != "tailscale0" tcp dport '
+        drop += ('{ 22, 443 }' if tailnet_only else '22') + ' drop'
+        guard = GUARD.replace('{bootstrap_rules}\n', '').replace(before, '\n'.join([*scoped, drop, before]))
         if tailnet_only:
             guard = guard.replace('"tailscale0" tcp dport 22 accept', '"tailscale0" tcp dport { 22, 443 } accept')
         return guard
@@ -2540,16 +2597,78 @@ class Bootstrap:
                     or user == 'core' and 'authorizedkeysfile /etc/ssh/dev-pair-keys/core' not in effective):
                 raise Blocked('effective tailnet OpenSSH configuration conflicts')
 
+    def verify_access_probes(self, data, expected):
+        rows = data.get('probes')
+        if type(rows) is not list or len(rows) != len(expected):
+            raise Blocked('independent endpoint observations are incomplete')
+        actors = {name: set() for name in ('authorized', 'denied', 'public', 'provider')}
+        seen = set()
+        for row in rows:
+            if type(row) is not dict or set(row) != {'test', 'family', 'endpoint', 'vantage', 'client_id', 'outcome', 'observed_at', 'evidence_sha256'}:
+                raise Blocked('invalid independent endpoint observation')
+            key = (row['test'], row['family'])
+            if (key in seen or expected.get(key) != (row['endpoint'], row['vantage'], row['outcome'])
+                    or type(row['client_id']) is not str or not re.fullmatch(r'[A-Za-z0-9@._:+/-]{1,128}', row['client_id'])
+                    or type(row['evidence_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', row['evidence_sha256'])
+                    or type(row['observed_at']) is not int or not data['issued_at'] - 1800 <= row['observed_at'] <= data['issued_at']):
+                raise Blocked('endpoint observation does not bind its expected test and identity')
+            seen.add(key)
+            actors[row['vantage']].add(row['client_id'])
+        if any(actors[left] & actors[right] for left, right in (('authorized', 'denied'), ('authorized', 'public'), ('denied', 'public'))):
+            raise Blocked('independent endpoint observations reused client access identity')
+
+    @staticmethod
+    def public_probe_host(value, family, recovery):
+        if value is None:
+            return recovery + '/no-public-' + family
+        address = ipaddress.ip_address(value)
+        if (type(value) is not str or str(address) != value or address.version != (4 if family == 'ipv4' else 6)
+                or not address.is_global or address.is_multicast):
+            raise Blocked('public observation does not bind a verified provider address')
+        return value if family == 'ipv4' else f'[{value}]'
+
+    @classmethod
+    def access_probe_plan(cls, dns, recovery, public_addresses):
+        if type(public_addresses) is not dict or set(public_addresses) != {'ipv4', 'ipv6'}:
+            raise Blocked('both provider public address families must be recorded')
+        ssh, mosh = f'ssh://core@{dns}:22', f'udp://{dns}:60000-61000'
+        expected = {}
+        for family in ('ipv4', 'ipv6'):
+            public = cls.public_probe_host(public_addresses[family], family, recovery)
+            public_ssh = public if public_addresses[family] is None else f'ssh://core@{public}:22'
+            public_mosh = public if public_addresses[family] is None else f'udp://{public}:60000-61000'
+            for name, endpoint, vantage, outcome in (
+                ('named-key', ssh, 'authorized', 'allow'), ('invalid-key', ssh, 'authorized', 'deny'),
+                ('password-login', ssh, 'authorized', 'deny'),
+                ('password-gated-sudo', ssh, 'authorized', 'allow'), ('script-and-transfer', ssh, 'authorized', 'allow'),
+                ('mosh-tmux-reconnect', mosh, 'authorized', 'allow'), ('denied-ssh', ssh, 'denied', 'deny'),
+                ('denied-mosh', mosh, 'denied', 'deny'), ('public-ssh', public_ssh, 'public', 'deny'),
+                ('public-mosh', public_mosh, 'public', 'deny'), ('lost-ssh', ssh, 'authorized', 'deny'),
+                ('lost-mosh', mosh, 'authorized', 'deny'), ('restored-ssh', ssh, 'authorized', 'allow'),
+            ):
+                expected[name, family] = (endpoint, vantage, outcome)
+            for role in ('maintenance', 'development'):
+                endpoint = f'{ssh}/{role}'
+                for event, vantage, outcome in (('authorized', 'authorized', 'allow'), ('denied', 'denied', 'deny'),
+                                                ('public', 'public', 'deny'), ('lost', 'authorized', 'deny'),
+                                                ('restored', 'authorized', 'allow')):
+                    target = public_ssh + '/' + role if event == 'public' else endpoint
+                    expected[role + '-' + event, family] = (target, vantage, outcome)
+        for step in ('reopened-recovery', 'recovery-during-loss'):
+            expected[step, 'provider'] = (recovery, 'provider', 'allow')
+        return expected
+
     def finalize(self, evidence):
         if os.geteuid() != 0:
             raise Blocked('root required for destination cutover')
-        checks = {'named_key', 'password_denied', 'password_gated_sudo', 'mosh_tmux', 'scripted_ssh',
-                  'independent_recovery', 'unauthorized_tailnet_denied', 'public_ssh_denied'}
         data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
-                                                {'node_id', 'tailnet', 'dns_name', 'keys_sha256', 'acl_sha256', 'checks'},
+                                                {'node_id', 'tailnet', 'dns_name', 'keys_sha256', 'acl_sha256', 'probes',
+                                                 'execution_route', 'provider_recovery', 'public_addresses'},
                                                 lifetime=1800)
-        if (type(data['checks']) is not dict or set(data['checks']) != checks or any(value is not True for value in data['checks'].values())
-                or type(data['acl_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', data['acl_sha256'])):
+        if (type(data['acl_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', data['acl_sha256'])
+                or data['execution_route'] not in ('tailnet-core', 'provider-recovery')
+                or type(data['provider_recovery']) is not str
+                or not re.fullmatch(r'hostinger://[A-Za-z0-9_-]{1,100}/recovery', data['provider_recovery'])):
             raise Blocked('named access, independent recovery and ingress evidence is incomplete')
         with self.lock():
             if not self.path(f'{STATE}/prepared').exists():
@@ -2558,11 +2677,13 @@ class Bootstrap:
             if (self.identity_fields(live) != (data['tailnet'], data['node_id']) or dns != data['dns_name']
                     or hashlib.sha256(checked_file(self.path('/etc/ssh/dev-pair-keys/core')).read_bytes()).hexdigest() != data['keys_sha256']):
                 raise Blocked('cutover evidence does not bind current node and core keys')
-            if os.environ.get('SSH_CONNECTION') or self.ssh_ancestor():
-                remote, _, local, _ = os.environ.get('SSH_CONNECTION', '').split()
-                route = json.loads(self.run('/usr/sbin/ip', '-j', 'route', 'get', str(ipaddress.ip_address(remote))))
-                if local not in live.get('TailscaleIPs', []) or len(route) != 1 or route[0].get('dev') != 'tailscale0':
-                    raise Blocked('run cutover from independent console or named tailnet SSH, preserving SSH_CONNECTION')
+            self.verify_access_probes(data, self.access_probe_plan(dns, data['provider_recovery'], data['public_addresses']))
+            peer = self.observed_ssh_peer()
+            if data['execution_route'] == 'tailnet-core':
+                if not peer or peer['local'] not in live.get('TailscaleIPs', []) or peer['device'] != 'tailscale0' or not peer['core']:
+                    raise Blocked('cutover requires the live named tailnet SSH route')
+            elif peer:
+                raise Blocked('cutover requires the admitted independent provider recovery terminal')
             desired = json.loads(checked_file(self.path(f'{STATE}/desired.json')).read_text(), object_pairs_hook=relay.unique)
             sources = desired.get('bootstrap_sources')
             if sources != [] or desired.get('bootstrap_transport') != ACCESS_MODE:
@@ -2606,7 +2727,10 @@ class Bootstrap:
             self.run('/usr/sbin/nft', '-f', str(self.path(GUARD_PATH)))
             self.run('/usr/bin/systemctl', 'is-active', 'dev-pair-bootstrap-guard.service')
             record = {'phase': 'complete', 'target': target, 'guard_sha256': self.guard_hash(),
-                      'core_keys_sha256': data['keys_sha256'], 'acl_sha256': data['acl_sha256']}
+                      'core_keys_sha256': data['keys_sha256'], 'acl_sha256': data['acl_sha256'],
+                      'provider_recovery': data['provider_recovery'],
+                      'public_addresses': data['public_addresses'],
+                      'access_receipt_sha256': hashlib.sha256(checked_file(evidence).read_bytes()).hexdigest()}
             self.atomic(CUTOVER, json.dumps(record, sort_keys=True) + '\n', expected=pending)
             self.event('access-cutover', 'complete')
             return self.status()
@@ -2647,6 +2771,7 @@ def main():
         access = entry.add_mutually_exclusive_group(required=True)
         access.add_argument('--bootstrap-source', action='append', help='explicit IPv4/IPv6 CIDR; repeatable')
         access.add_argument('--console-receipt', help='protected signed Hostinger out-of-band receipt')
+        entry.add_argument('--provider-ssh', action='store_true', help='require the live SSH-backed hPanel transport')
     en = sub.add_parser('enroll')
     en.add_argument('--apply', action='store_true', help='enroll; absent means inspect only')
     en.add_argument('--auth-key-file', required=True)
@@ -2657,6 +2782,9 @@ def main():
     finalize.add_argument('--apply', action='store_true')
     args = p.parse_args()
     try:
+        if args.stage in ('prepare', 'initialize') and args.provider_ssh:
+            if not args.bootstrap_source or not Bootstrap().observed_ssh_peer():
+                raise Blocked('SSH-backed hPanel setup requires an observed SSH peer and scoped CIDRs')
         if args.stage == 'initialize':
             forwarded = [sys.executable, str(Path(__file__).with_name('gptbox.py')), 'initialize',
                          '--context', args.gptbox_context, '--expected-context-sha256', args.expected_context_sha256,

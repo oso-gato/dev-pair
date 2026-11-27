@@ -76,7 +76,7 @@ class ReleaseTrust:
 
     def policy(self, component):
         value = json.loads(checked_file(protect(POLICY)).read_bytes(), object_pairs_hook=relay.unique)
-        require(type(value) is dict and set(value) == {'version', 'reviewer_ids', 'check', 'components'}
+        require(type(value) is dict and set(value) == {'version', 'reviewer_ids', 'check', 'components', 'writer_app_id'}
                 and type(value.get('version')) is int and value['version'] == 1,
                 'unsupported independently provisioned release policy')
         reviewers, check = value['reviewer_ids'], value['check']
@@ -113,7 +113,7 @@ class ReleaseTrust:
         require(len(data) == value['size'] and hashlib.sha256(data).hexdigest() == expected_hash,
                 'workflow bytes differ from independently held release policy')
 
-    def checklist_environment(self):
+    def checklist_environment(self, writer_app_id):
         env = self.api('environments/checklist-release')
         policy = self.api('environments/checklist-release/deployment-branch-policies?per_page=100')
         branches = [(item['name'], item['type']) for item in policy['branch_policies']]
@@ -121,6 +121,16 @@ class ReleaseTrust:
                     'protected_branches': False, 'custom_branch_policies': True}
                 and policy['total_count'] == 1 and branches == [('main', 'branch')],
                 'checklist registry writer environment is not restricted to main')
+        rules = self.api('environments/checklist-release/deployment_protection_rules')
+        installed = rules['custom_deployment_protection_rules']
+        require(type(writer_app_id) is int and writer_app_id > 0 and rules['total_count'] == 1
+                and len(installed) == 1 and installed[0]['enabled'] is True and installed[0]['app']['id'] == writer_app_id,
+                'independently administered workflow-specific registry writer gate is unavailable')
+
+    def tree(self, revision):
+        info = self.api('git/commits/' + revision)
+        require(info['sha'] == revision and re.fullmatch(SHA, info['tree']['sha']), 'GitHub commit lacks exact tree identity')
+        return info
 
     def review(self, source, policy):
         check = policy['check']
@@ -159,7 +169,6 @@ class ReleaseTrust:
         accepted = [review['id'] for review in latest.values()
                     if review['commit_id'] == head and review['state'] == 'APPROVED']
         require(bool(accepted), 'no eligible independent approval of the current head')
-        self.workflow(check['workflow'], head, check['sha256'])
         checks = self.api(f'commits/{head}/check-runs?filter=latest&per_page=100')
         passed = [run for run in checks['check_runs']
                   if run['name'] == check['context'] and run['app']['id'] == check['app_id']
@@ -173,7 +182,21 @@ class ReleaseTrust:
                 and check_workflow['event'] == 'pull_request' and check_workflow['conclusion'] == 'success'
                 and check_workflow['repository']['full_name'] == REPOSITORY,
                 'required check was not produced by the independently pinned workflow')
-        return {'pull_request': number, 'review_head': head, 'reviews': sorted(accepted), 'check_run': passed[0]['id']}
+        annotations = self.api(f'check-runs/{passed[0]["id"]}/annotations?per_page=100', pages=True)
+        evidence = [entry for entry in annotations if entry.get('title') == 'dev-pair-release-tree']
+        require(len(evidence) == 1 and evidence[0]['annotation_level'] == 'notice'
+                and evidence[0]['path'] == check['workflow'], 'trusted check lacks a unique tested tree and workflow annotation')
+        match = re.fullmatch(f'({SHA}):({SHA}):({SHA}):({SHA})', evidence[0]['message'])
+        require(match and match[1] == head, 'trusted check annotation does not bind the reviewed head')
+        _, tested, tree, workflow_revision = match.groups()
+        tested_commit = self.tree(tested)
+        require([parent['sha'] for parent in tested_commit['parents']][1:] == [head]
+                and tested_commit['tree']['sha'] == self.tree(head)['tree']['sha'] == self.tree(source)['tree']['sha'] == tree,
+                'reviewed, tested merge and production source trees differ')
+        self.workflow(check['workflow'], workflow_revision, check['sha256'])
+        self.workflow(check['workflow'], tested, check['sha256'])
+        return {'pull_request': number, 'review_head': head, 'reviews': sorted(accepted), 'check_run': passed[0]['id'],
+                'tested_merge': tested, 'source_tree': tree, 'check_workflow_revision': workflow_revision}
 
     def verify(self, component, source, subject, run_id, *, artifact_sha256=None):
         require(component in COMPONENTS and type(source) is str and re.fullmatch(SHA, source)
@@ -192,7 +215,7 @@ class ReleaseTrust:
             attestation_subject = subject
         review = self.review(source, policy)
         if component == 'checklist':
-            self.checklist_environment()
+            self.checklist_environment(policy['writer_app_id'])
         run = self.api(f'actions/runs/{run_id}')
         attempt = run['run_attempt']
         workflow = publisher['workflow']
