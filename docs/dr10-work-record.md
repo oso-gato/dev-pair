@@ -2,6 +2,30 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026, 08:14 UTC — reviewed storage repair and CI recipient
+
+- Native 38 reached `bind-source-before-exdev` before Fedora started. Its exact
+  path and kernel cause remain unknown. Image-copy cleanup remained unresolved
+  and scratch was retained. [Run 38](https://github.com/oso-gato/dev-pair/actions/runs/45083206598)
+- The storage repair at `ef2201092fb6f67d7a8f61c494249dc2bfde5002` verifies a
+  canonical directory self-bind after the strict final-component lookup returns
+  EXDEV. The author passed 29 affected checks. Fresh GPT-6.2 Astra High review
+  passed five focused checks with no skips. On tmpfs, the controller matched
+  GNU `du` at 40,960 bytes, passed with an 87-entry cap, denied an 86-entry
+  cap, and leaked no file descriptors. A regular-file self-bind was denied.
+  The ext4 case received source review. Native Fedora validation remains pending.
+- The independently reviewed public recipient at
+  `f6957631802ae2b7480400ddd4d128e943cc1f20` expires at
+  07:55:01 UTC on November 28, 2026. The primary fingerprint is
+  `968C5A2925FBCDBEEEA6B11FF8A623703EFDDB03`. The author passed 21
+  focused checks and used GPG to encrypt a synthetic diagnostic to the new
+  public subkey.
+- GPT-6.2 Sol Medium integrated both reviewed changes. The existing workflow,
+  resource limits and diagnostic caps apply to the next maintenance attempt.
+  Native 39 had yet to start at this checkpoint. The provider host remained
+  untouched. Model and effort selections came from the agent API. Independent
+  backend attestation remains unavailable.
+
 ### November 23, 2026, 06:44 HKT — local checklist and restart handoff
 
 - The owner’s standing model policy applies to new and resumed work.
