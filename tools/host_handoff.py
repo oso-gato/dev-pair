@@ -14,6 +14,7 @@ import select
 import shutil
 import signal
 import socket
+import sqlite3
 import ssl
 import struct
 import subprocess
@@ -22,7 +23,7 @@ import tempfile
 import time
 
 import job_protocol as p
-from ledger_recovery import read_private, trusted_directory
+from ledger_recovery import HostHistory, read_private, trusted_directory
 
 RECIPE = 'app-state-after-restart'
 EXPECTED = 'The same item ID is present and completed after one service restart'
@@ -497,6 +498,7 @@ def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
     end = time.monotonic() + request['budgets']['seconds']
     deadline = end - runtime.CLEANUP_SECONDS
     time_left(deadline)
+    ledger.host_history.check_environment(runtime.execution_identity())
     ledger.arm_host_effect(request, attempt)
     try:
         verdict = observe_host_attempt(ledger, request, attempt, unit, authorization, runtime, deadline)
@@ -506,6 +508,7 @@ def run_host_attempt(ledger, request, attempt, unit, authorization, runtime):
             unit.cleanup(end)
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             raise ValueError('host effect remains in flight after unresolved Quadlet cleanup') from exc
+    ledger.host_history.check_environment(runtime.execution_identity())
     return ledger.close_host_effect(request, attempt, 'cleaned', ['owned-cleanup-completed'])
 
 
@@ -525,16 +528,22 @@ def dispatch_host(ledger, runtime, env, runtime_dir, approval, principals, packe
     p.fields(packet, 'operation request')
     operation, request = packet['operation'], packet['request']
     p.require(operation in HOST_OPERATIONS, 'unknown host handoff operation')
+    check_host_status_request(request, ledger.controller_id, principals)
+    history = ledger.host_history
+    p.require(history is not None, 'authoritative host execution history is unavailable')
+    history.check_environment(runtime.execution_identity())
     if operation == 'status':
-        check_host_status_request(request, ledger.controller_id, principals)
-        status = ledger.status(request['request_id'])
-        ledger.check_transport(status, request)
-        return status
-    check_request(request, ledger.controller_id, principals, host=True)
+        return ledger.host_status(request)
     request_id = request['request_id']
+    storage_fsid = history.environment['storage_fsid']
     with runtime.dispatch_gate():
+        tracked = history.lookup(request) is not None
+        if not tracked:
+            check_request(request, ledger.controller_id, principals, host=True)
+        ledger.host_admission(request)
         if operation == 'submit':
-            runtime.approval(approval, request)
+            if not tracked:
+                runtime.approval(approval, request)
             return ledger.submit(request, authenticated=True)
         if operation == 'consume':
             return ledger.consume(request_id, authenticated_request=request)
@@ -547,8 +556,10 @@ def dispatch_host(ledger, runtime, env, runtime_dir, approval, principals, packe
             attempt = status['attempt_id']
             armed, staged = ledger.host_effect_state(request, attempt)
             p.require(not armed or staged is not None, 'armed host effect lacks a durable observation; replay refused')
-            unit = runtime.Quadlet(runtime_dir, env, attempt, None, request['candidate'], request['budgets']['seconds'])
+            unit = runtime.Quadlet(runtime_dir, env, attempt, None, request['candidate'], request['budgets']['seconds'],
+                                  storage_fsid=storage_fsid)
             unit.verify_absent(time.monotonic() + runtime.CLEANUP_SECONDS, staged)
+            history.check_environment(runtime.execution_identity())
             return ledger.close_host_effect(request, attempt, 'recovered-result' if armed else 'zero-effect',
                                             p.HOST_ABSENCE_EVIDENCE)
         p.require(status['state'] == 'pending', 'unresolved in-flight effects require reconciliation; execution refused')
@@ -556,7 +567,8 @@ def dispatch_host(ledger, runtime, env, runtime_dir, approval, principals, packe
         attempt, previous = ledger.begin(request_id, authenticated_request=request)
         if previous is not None:
             return previous
-        unit = runtime.Quadlet(runtime_dir, env, attempt, image, request['candidate'], request['budgets']['seconds'])
+        unit = runtime.Quadlet(runtime_dir, env, attempt, image, request['candidate'], request['budgets']['seconds'],
+                              storage_fsid=storage_fsid)
         return run_host_attempt(ledger, request, attempt, unit, authorization, runtime)
 
 
@@ -579,18 +591,52 @@ def serve_connections(listener, lifetime, context, expected_peer, dispatch_packe
                         response = {'ok': True, 'data': data}
                     except ValueError as exc:
                         response = {'ok': False, 'data': bounded_diagnostic(str(exc))}
+                    except sqlite3.Error:
+                        response = {'ok': False, 'data': 'Durable executor state is unavailable; recovery required'}
                     send(stream, response, time.monotonic() + WIRE_SECONDS)
             except (OSError, ValueError):
                 # Lost clients do not roll back effects or committed history.
                 continue
 
 
+def protected_host_code(runtime):
+    for code in (SELF, JOB_PROTOCOL, HOST_RUNTIME, runtime.TEMPLATE, LEDGER_RECOVERY):
+        runtime.protected(code, file=True)
+
+
+@contextlib.contextmanager
+def host_executor_lock(directory):
+    lock_path = directory / 'dev-pair-checklist.lock'
+    with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), 'rb+') as lock:
+        p.private_file(lock_path)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError('checklist host executor is already active') from exc
+        yield
+
+
+def initialize_host_history():
+    runtime = host_runtime()
+    protected_host_code(runtime)
+    directory, _ = runtime.rootless_environment()
+    with host_executor_lock(directory), runtime.dispatch_gate(), contextlib.closing(p.Ledger(runtime.HOME / 'ledger')) as ledger:
+        initialize = not os.path.lexists(runtime.HISTORY)
+        if initialize:
+            p.require(not os.path.lexists(ledger.root / 'RECOVERY') and
+                      not any(p.loads(row['body'])['boundary'] == p.APP_QUADLET_BOUNDARY for row in
+                              ledger.db.execute("SELECT body FROM records WHERE kind='request'")),
+                      'fresh host execution history requires a local ledger with no Quadlet requests')
+        with contextlib.closing(HostHistory(runtime.HISTORY, ledger.controller_id, runtime.execution_identity(),
+                                            initialize=initialize)):
+            return {'controller_id': ledger.controller_id, 'execution_history': str(runtime.HISTORY)}
+
+
 def serve_host(args):
     p.number(args.lifetime, 1, 600)
     p.number(args.port, 0, 65535)
     runtime = host_runtime()
-    for code in (SELF, JOB_PROTOCOL, HOST_RUNTIME, runtime.TEMPLATE, LEDGER_RECOVERY):
-        runtime.protected(code, file=True)
+    protected_host_code(runtime)
     directory, env = runtime.rootless_environment()
     state = trusted_directory(args.state)
     tls = trusted_directory(args.tls)
@@ -600,14 +646,11 @@ def serve_host(args):
     p.require(approval == runtime.APPROVAL, 'host approval requires its fixed protected leaf')
     runtime.protected(approval.parent, file=False)
     context, expected_peer, principals = tls_principal(tls, maintenance=True)
-    lock_path = directory / 'dev-pair-checklist.lock'
-    with os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), 'rb+') as lock:
-        p.private_file(lock_path)
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ValueError('checklist host executor is already active') from exc
-        with contextlib.closing(p.Ledger(state)) as ledger, socket.socket(socket.AF_INET) as listener:
+    p.require(os.path.lexists(runtime.HISTORY), 'authoritative host execution history is not provisioned')
+    with host_executor_lock(directory), contextlib.closing(p.Ledger(state)) as ledger:
+        with contextlib.closing(HostHistory(runtime.HISTORY, ledger.controller_id, runtime.execution_identity())) as history, \
+                socket.socket(socket.AF_INET) as listener:
+            ledger.host_history = history
             listener.bind(('127.0.0.1', args.port))
             listener.listen(4)
             print(p.canonical({'port': listener.getsockname()[1], 'controller_id': ledger.controller_id}), flush=True)
@@ -689,6 +732,7 @@ def main(argv=None):
         host.add_argument('--' + name, required=True)
     host.add_argument('--lifetime', type=int, default=300)
     host.add_argument('--port', type=int, default=0)
+    commands.add_parser('initialize-host-history', help='provision independent history for a fresh checklist executor')
     approve = commands.add_parser('approve-host', help='issue one bounded grant from a protected candidate receipt')
     approve.add_argument('--candidate-receipt', required=True, type=pathlib.Path)
     approve.add_argument('--lifetime', type=int, default=300)
@@ -721,6 +765,9 @@ def main(argv=None):
     if args.command == 'serve-host':
         serve_host(args)
         return
+    if args.command == 'initialize-host-history':
+        print(p.canonical(initialize_host_history()))
+        return
     if args.command == 'approve-host':
         message = p.validate(p.loads(sys.stdin.buffer.read(p.MAX_MESSAGE + 1)), 'request')
         controller, *principals = p.app_transport(message)
@@ -742,7 +789,7 @@ def main(argv=None):
     else:
         p.require(args.host or args.operation in OPERATIONS, 'operation requires the protected host recipe')
         message = p.loads(sys.stdin.buffer.read(p.MAX_MESSAGE + 1))
-        if args.operation == 'status':
+        if args.host:
             check_host_status_request(message, args.controller_id, principals)
         else:
             check_request(message, args.controller_id, principals, host=args.host)
@@ -754,7 +801,7 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         main()
-    except OSError:
+    except (OSError, sqlite3.Error):
         print('Blocked: local handoff I/O or TLS failed', file=sys.stderr)
         sys.exit(2)
     except ValueError as exc:

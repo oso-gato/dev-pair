@@ -87,6 +87,11 @@ class QuadletHandoffTests(unittest.TestCase):
         self.ledger = p.Ledger(self.path / 'ledger')
         self.addCleanup(self.ledger.close)
         self.id = self.ledger.controller_id
+        self.environment = {'machine_sha256': 'a' * 64, 'storage_fsid': 123}
+        self.history_path = self.path / 'execution-history'
+        self.history = recovery.HostHistory(self.history_path, self.id, self.environment, initialize=True)
+        self.addCleanup(self.history.close)
+        self.ledger.host_history = self.history
         self.principals = ('d' * 64, 'e' * 64)
         self.budget = {'seconds': 30, 'artifact_bytes': 8192, 'spend_usd': 0}
         self.candidates = [{'source_revision': code * 40, 'artifact_sha256': code * 64} for code in ('a', 'b')]
@@ -108,7 +113,8 @@ class QuadletHandoffTests(unittest.TestCase):
 
     def approval(self, path, request):
         p.require(p.identity(request) == self.allowed, 'fixture approval does not match exact request')
-        return 'localhost/checklist@sha256:' + request['candidate']['artifact_sha256'], ['fixture-approval']
+        return ('localhost/checklist@sha256:' + request['candidate']['artifact_sha256'],
+                ['fixture-approval', 'executor-machine-sha256:' + self.environment['machine_sha256']])
 
     @contextlib.contextmanager
     def gate(self):
@@ -116,14 +122,15 @@ class QuadletHandoffTests(unittest.TestCase):
         yield
 
     def dispatch(self, action, request, *, forget=False, cleanup_lost=False):
-        def factory(runtime, env, attempt, image, candidate, budget):
+        def factory(runtime, env, attempt, image, candidate, budget, *, storage_fsid):
+            self.assertEqual(storage_fsid, 123)
             service = FixtureService(self.path / attempt, forget=forget, cleanup_lost=cleanup_lost)
             self.services.append(service)
             self.addCleanup(service.stop)
             return service
 
         with mock.patch.multiple(RUNTIME, Quadlet=factory, approval=self.approval, dispatch_gate=self.gate,
-                                 APP_AUTHORITY=None):
+                                 APP_AUTHORITY=None, execution_identity=lambda: self.environment):
             data = h.dispatch_host(self.ledger, RUNTIME, {}, self.path, self.path / 'approval', self.principals,
                                    {'operation': action, 'request': request})
         h.check_reply(action, data, request, self.id)
@@ -160,7 +167,7 @@ class QuadletHandoffTests(unittest.TestCase):
         self.assertFalse(any(service.path.exists() for service in self.services))
 
         self.ledger.close()
-        self.ledger = p.Ledger(self.path / 'ledger')
+        self.ledger = p.Ledger(self.path / 'ledger', host_history=self.history)
         self.addCleanup(self.ledger.close)
         self.assertEqual(self.dispatch('status', repaired)['result'], passed)
 
@@ -213,7 +220,7 @@ class QuadletHandoffTests(unittest.TestCase):
         backup, restored = (self.path / (part + '-' + name) for part in ('backup', 'restore'))
         recovery.backup(self.path / 'ledger', backup, end)
         recovery.restore(backup, restored, end)
-        return contextlib.closing(p.Ledger(restored))
+        return contextlib.closing(p.Ledger(restored, host_history=self.history))
 
     def test_controller_exit_before_arming_closes_original_zero_effect(self):
         request = self.request(0)
@@ -225,12 +232,15 @@ class QuadletHandoffTests(unittest.TestCase):
 import os, signal, sys
 sys.path.insert(0, sys.argv[1])
 import job_protocol as p
+import ledger_recovery as recovery
 request = p.loads(sys.stdin.buffer.read())
 ledger = p.Ledger(sys.argv[2])
+ledger.host_history = recovery.HostHistory(sys.argv[3], ledger.controller_id, p.loads(sys.argv[4]))
 ledger.begin(request['request_id'], authenticated_request=request)
 os.kill(os.getpid(), signal.SIGKILL)
 '''
-        exited = subprocess.run([PYTHON, '-IB', '-c', code, str(ROOT / 'tools'), str(self.path / 'ledger')],
+        exited = subprocess.run([PYTHON, '-IB', '-c', code, str(ROOT / 'tools'), str(self.path / 'ledger'),
+                                 str(self.history_path), p.canonical(self.environment)],
                                 input=p.canonical(request).encode(), timeout=4)
         self.assertEqual(exited.returncode, -signal.SIGKILL)
         before = self.dispatch('status', request)
@@ -259,7 +269,7 @@ os.kill(os.getpid(), signal.SIGKILL)
         before = self.dispatch('status', request)
         self.assertEqual(before['state'], 'in-flight')
         self.ledger.close()
-        self.ledger = p.Ledger(self.path / 'ledger')
+        self.ledger = p.Ledger(self.path / 'ledger', host_history=self.history)
         self.addCleanup(self.ledger.close)
         armed, stored = self.ledger.host_effect_state(request, before['attempt_id'])
         self.assertTrue(armed)
@@ -271,6 +281,108 @@ os.kill(os.getpid(), signal.SIGKILL)
         self.assertEqual([service.actions for service in self.services], [['start', 'restart'], []])
         with self.round_trip('recovered') as restored:
             self.assertEqual(restored.status(request['request_id'])['result'], stored)
+
+    def test_completed_attempt_survives_restore_of_job_snapshot(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        with self.round_trip('before-submit') as before_submit:
+            self.assertEqual(self.dispatch('submit', request)['state'], 'pending')
+            with self.round_trip('pending') as pending:
+                completed = self.dispatch('execute', request)
+                self.assertEqual(completed['status'], 'pass')
+                original = self.ledger
+                for recovered in (before_submit, pending):
+                    with self.subTest(snapshot=recovered.root.name):
+                        self.ledger = recovered
+                        self.assertEqual(self.dispatch('status', request)['result'], completed)
+                        self.assertEqual(self.dispatch('reconcile', request), completed)
+                        self.assertEqual(self.dispatch('execute', request), completed)
+                        self.assertEqual(self.dispatch('consume', request)['progress'], 'host-checks-passed')
+                        reserved = [entry['body'] for entry in recovered.events()
+                                    if entry['event'] == 'execution-reserved']
+                        self.assertEqual(reserved, [p.effect_identity(request, completed['attempt_id'])])
+                        recovery.validate_database(recovered.path, time.monotonic() + 5)
+                self.ledger = original
+        self.assertEqual([service.actions for service in self.services], [['start', 'restart']])
+
+    def test_completed_authority_survives_loss_of_the_job_ledger_commit(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        with mock.patch.object(self.ledger, '_store_result', side_effect=OSError('job ledger write interrupted')):
+            with self.assertRaisesRegex(OSError, 'job ledger write interrupted'):
+                self.dispatch('execute', request)
+        self.assertEqual(self.ledger.status(request['request_id'])['state'], 'in-flight')
+        projected = self.dispatch('status', request)['result']
+        self.assertEqual(projected['status'], 'pass')
+        self.assertEqual(self.dispatch('reconcile', request), projected)
+        self.assertEqual(self.ledger.status(request['request_id'])['result'], projected)
+        self.assertEqual([service.actions for service in self.services], [['start', 'restart']])
+
+    def test_restore_from_an_earlier_checkpoint_fences_the_job(self):
+        previous = self.request(0)
+        self.allowed = p.identity(previous)
+        self.dispatch('submit', previous)
+        with self.round_trip('earlier-checkpoint') as old:
+            request = self.request(1)
+            self.allowed = p.identity(request)
+            self.dispatch('submit', request)
+            self.assertEqual(self.dispatch('execute', request)['status'], 'pass')
+            self.ledger = old
+            self.allowed = p.identity(previous)
+            with self.assertRaisesRegex(ValueError, 'unknown checkpoint'):
+                self.dispatch('execute', previous)
+        self.assertEqual([service.actions for service in self.services], [['start', 'restart']])
+
+    def test_clean_host_restore_keeps_history_without_claiming_the_old_machine_effect(self):
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        completed = self.dispatch('execute', request)
+        with self.round_trip('clean-host') as restored:
+            self.assertEqual(restored.status(request['request_id'])['result'], completed)
+            self.ledger = restored
+            for changes in ({'machine_sha256': 'b' * 64}, {'storage_fsid': 456}):
+                with self.subTest(changes=changes):
+                    old = self.environment
+                    self.environment = dict(old, **changes)
+                    try:
+                        with self.assertRaisesRegex(ValueError, 'original executor machine and validation filesystem'):
+                            self.dispatch('reconcile', request)
+                        with self.assertRaisesRegex(ValueError, 'original controller, executor machine and validation filesystem'):
+                            recovery.HostHistory(self.history_path, self.id, self.environment)
+                    finally:
+                        self.environment = old
+            restored.host_history = None
+            with self.assertRaisesRegex(ValueError, 'history is unavailable'):
+                self.dispatch('execute', request)
+        self.assertEqual([service.actions for service in self.services], [['start', 'restart']])
+
+    def test_initializer_requires_pristine_history_and_supports_a_new_controller(self):
+        fresh, migrated = (self.path / leaf for leaf in ('fresh', 'migrated'))
+        for home in (fresh, migrated):
+            home.mkdir(mode=0o700)
+        request = self.request(0)
+        self.allowed = p.identity(request)
+        self.dispatch('submit', request)
+        self.dispatch('execute', request)
+        backup = self.path / 'migration-backup'
+        end = time.monotonic() + 5
+        recovery.backup(self.ledger.root, backup, end)
+        recovery.restore(backup, migrated / 'ledger', end)
+        new_environment = {'machine_sha256': 'b' * 64, 'storage_fsid': 456}
+        with mock.patch.object(h, 'host_runtime', return_value=RUNTIME), \
+                mock.patch.object(h, 'protected_host_code'), \
+                mock.patch.multiple(RUNTIME, rootless_environment=lambda: (self.path, {}),
+                                    execution_identity=lambda: new_environment, dispatch_gate=self.gate):
+            with mock.patch.multiple(RUNTIME, HOME=migrated, HISTORY=migrated / 'execution-history'):
+                with self.assertRaisesRegex(ValueError, 'fresh host execution history requires a local ledger'):
+                    h.initialize_host_history()
+            self.assertFalse((migrated / 'execution-history').exists())
+            with mock.patch.multiple(RUNTIME, HOME=fresh, HISTORY=fresh / 'execution-history'):
+                initial = h.initialize_host_history()
+                self.assertNotEqual(initial['controller_id'], self.id)
+                self.assertEqual(h.initialize_host_history(), initial)
 
     def test_arming_without_a_verdict_remains_unresolved_even_when_paths_are_empty(self):
         request = self.request(0)

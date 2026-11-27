@@ -25,6 +25,13 @@ SCHEMA = (
     'CREATE TABLE requests (id TEXT PRIMARY KEY, job TEXT NOT NULL, state TEXT NOT NULL, attempt TEXT, result TEXT)',
     'CREATE TABLE events (sequence INTEGER PRIMARY KEY, at REAL NOT NULL, event TEXT NOT NULL, body TEXT NOT NULL)',
 )
+HOST_HISTORY_SCHEMA = (
+    'CREATE TABLE binding (identity TEXT NOT NULL)',
+    'CREATE TABLE executions (id TEXT PRIMARY KEY, job TEXT NOT NULL, request TEXT NOT NULL,'
+    ' attempt TEXT NOT NULL, job_sha TEXT NOT NULL, checkpoint_sha TEXT NOT NULL,'
+    ' armed INTEGER NOT NULL DEFAULT 0, staged TEXT, closure TEXT, result TEXT)',
+    'CREATE INDEX executions_job ON executions (job)',
+)
 
 
 def trusted_directory(path, *, create=False):
@@ -72,6 +79,136 @@ def sync_directory(root):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+class HostHistory:
+    """Authoritative host effects, outside the portable job snapshot."""
+
+    def __init__(self, directory, controller, environment, *, initialize=False):
+        p.fields(environment, 'machine_sha256 storage_fsid')
+        self.environment = dict(environment)
+        self.identity = {'version': 1, 'controller_id': controller, **environment}
+        p.token(controller)
+        p.digest(environment['machine_sha256'])
+        p.number(environment['storage_fsid'], 1, 2**64 - 1)
+        root = trusted_directory(directory, create=initialize)
+        path = root / 'history.sqlite3'
+        if initialize:
+            write_private(path, b'')
+        for name in ('history.sqlite3', 'history.sqlite3-journal'):
+            candidate = root / name
+            if os.path.lexists(candidate):
+                p.private_file(candidate)
+        p.private_file(path)
+        self.db = sqlite3.connect(path.as_uri() + '?mode=rw', uri=True, timeout=0.1, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        try:
+            self.db.execute('PRAGMA trusted_schema=OFF')
+            self.db.execute('PRAGMA synchronous=FULL')
+            p.require(self.db.execute('PRAGMA journal_mode').fetchone()[0] == 'delete',
+                      'host history requires a durable delete journal')
+            pages = MAX_SNAPSHOT // self.db.execute('PRAGMA page_size').fetchone()[0]
+            p.require(self.db.execute('PRAGMA max_page_count=' + str(pages)).fetchone()[0] == pages,
+                      'host execution history exceeds its storage limit')
+            if initialize:
+                self.db.execute('BEGIN IMMEDIATE')
+                for sql in HOST_HISTORY_SCHEMA:
+                    self.db.execute(sql)
+                self.db.execute('INSERT INTO binding VALUES (?)', (p.canonical(self.identity),))
+                self.db.execute('COMMIT')
+                sync_directory(root)
+            schema = self.db.execute('SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY sql')
+            p.require([row[0] for row in schema] == sorted(HOST_HISTORY_SCHEMA),
+                      'unsupported host history schema')
+            actual = self.db.execute('SELECT identity FROM binding LIMIT 2').fetchall()
+            p.require([row[0] for row in actual] == [p.canonical(self.identity)],
+                      'host history requires the original controller, executor machine and validation filesystem')
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        self.db.close()
+
+    def check_environment(self, environment):
+        p.require(environment == self.environment,
+                  'host history requires the original executor machine and validation filesystem')
+
+    def _record(self, row):
+        entry = dict(row)
+        for key in ('request', 'staged', 'closure', 'result'):
+            if entry[key] is not None:
+                obj = p.loads(entry[key])
+                p.require(p.canonical(obj) == entry[key], 'noncanonical host execution record')
+                entry[key] = obj
+        request = p.validate(entry['request'], 'request')
+        p.require(p.host_effect_journal(request) and p.app_transport(request)[0] == self.identity['controller_id']
+                  and (entry['id'], entry['job']) == (request['request_id'], request['job_id']),
+                  'invalid authoritative host request identity')
+        p.require(str(uuid.UUID(entry['attempt'])) == entry['attempt'] and entry['armed'] in (0, 1),
+                  'invalid authoritative host attempt')
+        p.digest(entry['job_sha'])
+        p.digest(entry['checkpoint_sha'])
+        if entry['staged'] is not None:
+            p.require(entry['armed'], 'authoritative observation requires a prior arming')
+            self.check_staged(request, entry['staged'], entry['attempt'])
+        if entry['closure'] is None:
+            p.require(entry['result'] is None, 'authoritative result requires a closure')
+        else:
+            expected = p.closed_host_result(request, entry['attempt'], self.identity['controller_id'],
+                                            entry['armed'], entry['staged'], entry['closure'])
+            p.require(entry['result'] == expected, 'authoritative closure and exact result disagree')
+        return entry
+
+    def check_staged(self, request, staged, attempt):
+        p.validate_staged_host_result(request, staged, attempt, self.identity['controller_id'])
+        evidence = staged['evidence']
+        machine = 'executor-machine-sha256:' + self.identity['machine_sha256']
+        p.require([entry for entry in evidence if entry.startswith('executor-machine-sha256:')] == [machine],
+                  'host observation executor machine identity mismatch')
+        storage = [entry for entry in evidence if entry.startswith('storage-fsid:')]
+        expected = ['storage-fsid:' + str(self.identity['storage_fsid'])]
+        p.require(storage == expected or not storage and staged['cleanup']['status'] == 'not-needed',
+                  'host observation filesystem identity mismatch')
+
+    def lookup(self, request):
+        row = self.db.execute('SELECT * FROM executions WHERE id=?', (request['request_id'],)).fetchone()
+        if row is None:
+            return None
+        entry = self._record(row)
+        p.require(entry['request'] == request, 'ID collision: authoritative host request mismatch')
+        return entry
+
+    def for_job(self, job, limit):
+        rows = self.db.execute('SELECT * FROM executions WHERE job=? ORDER BY rowid LIMIT ?', (job, limit + 1))
+        entries = [self._record(row) for row in rows]
+        p.require(len(entries) <= limit, 'authoritative host request budget exceeded')
+        return entries
+
+    def reserve(self, request, attempt, job_sha, checkpoint_sha):
+        outcome = self.db.execute('INSERT OR IGNORE INTO executions (id,job,request,attempt,job_sha,checkpoint_sha)'
+                                  ' VALUES (?,?,?,?,?,?)', (request['request_id'], request['job_id'],
+                                  p.canonical(request), attempt, job_sha, checkpoint_sha))
+        p.require(outcome.rowcount == 1, 'authoritative host attempt already reserved')
+
+    def arm(self, request, attempt):
+        outcome = self.db.execute('UPDATE executions SET armed=1 WHERE id=? AND attempt=? AND armed=0 AND closure IS NULL',
+                                  (request['request_id'], attempt))
+        p.require(outcome.rowcount == 1, 'authoritative host effect already armed or closed')
+
+    def stage(self, request, result):
+        self.check_staged(request, result, result['attempt_id'])
+        outcome = self.db.execute('UPDATE executions SET staged=? WHERE id=? AND attempt=? AND armed=1'
+                                  ' AND staged IS NULL AND closure IS NULL',
+                                  (p.canonical(result), request['request_id'], result['attempt_id']))
+        p.require(outcome.rowcount == 1, 'authoritative host observation already staged or closed')
+
+    def close_effect(self, closure, result, *, armed, staged):
+        outcome = self.db.execute('UPDATE executions SET closure=?,result=? WHERE id=? AND attempt=?'
+                                  ' AND armed=? AND staged IS ? AND closure IS NULL',
+                                  (p.canonical(closure), p.canonical(result), closure['request_id'],
+                                   closure['attempt_id'], armed, None if staged is None else p.canonical(staged)))
+        p.require(outcome.rowcount == 1, 'authoritative host effect changed or already closed')
 
 
 def publish(root, value):

@@ -21,8 +21,11 @@ SOURCE = Path(__file__).resolve()
 TEMPLATE = SOURCE.with_name('acceptance.container')
 STORAGE = Path('/var/lib/dev-pair/checklist-validation')
 HOME = Path('/var/lib/dev-pair/checklist-executor')
+HISTORY = HOME / 'execution-history'
 FENCE = Path('/var/lib/dev-pair/renewal-fence')
 APPROVAL = Path('/etc/dev-pair/checklist/approval.json')
+CONTAINERS_CONF = APPROVAL.with_name('validation-containers.conf')
+MACHINE_ID = Path('/etc/machine-id')
 GETENFORCE = '/usr/bin/getenforce'
 ACCOUNT = 'dp-checklist'
 NETWORK = 'dev-pair-checklist-internal'
@@ -59,6 +62,12 @@ def protected(path, *, file):
     return path
 
 
+def machine_id():
+    machine = p.read_data(protected(MACHINE_ID, file=True), 33).decode('ascii').strip()
+    p.digest(machine, 32)
+    return machine
+
+
 def approval(path, request):
     try:
         data = p.read_data(protected(path, file=True), min(MAX_CAPTURE, request['budgets']['artifact_bytes']))
@@ -74,7 +83,7 @@ def approval(path, request):
     now = time.time()
     p.require(request['budgets']['seconds'] < record['expires_at'] - now <= 3600,
               'host approval must cover the operation budget and expire within one hour')
-    p.require(record['machine_id'] == Path('/etc/machine-id').read_text().strip(),
+    p.require(record['machine_id'] == machine_id(),
               'approval is for a different executor')
     p.require(record['request_sha256'] == p.identity(request), 'request lacks an exact host approval')
     image = candidate_image(record['image'], request)
@@ -99,8 +108,7 @@ def issue_approval(receipt, request, lifetime):
     p.number(record['version'], 1, 1)
     p.require(record['job_id'] == request['job_id'] and record['candidate'] == request['candidate'],
               'authorized candidate receipt differs from the requested job or candidate')
-    machine = Path('/etc/machine-id').read_text().strip()
-    p.digest(machine, 32)
+    machine = machine_id()
     return {'version': 1, 'request_sha256': p.identity(request), 'image': candidate_image(record['image'], request),
             'receipt_sha256': p.sha256(data), 'machine_id': machine, 'expires_at': int(time.time()) + lifetime}
 
@@ -167,10 +175,15 @@ def storage_identity(path):
     capacity = limits.f_blocks * limits.f_frsize
     p.require(0 < capacity <= MAX_STORAGE and 0 < limits.f_files <= MAX_INODES,
               'checklist filesystem exceeds its byte or inode limit')
-    for leaf in ('graph', 'attempts'):
+    for leaf in ('graph', 'attempts', 'image-copy'):
         p.require(trusted_directory(path / leaf).stat().st_dev == device,
                   'checklist writable leaf is outside the dedicated filesystem')
     return [f'storage-bytes:{capacity}', f'storage-inodes:{limits.f_files}', f'storage-fsid:{limits.f_fsid}']
+
+
+def execution_identity():
+    _, _, fsid = storage_identity(STORAGE)
+    return {'machine_sha256': p.sha256(machine_id().encode()), 'storage_fsid': int(fsid.split(':')[1])}
 
 
 def capture(argv, deadline, env):
@@ -255,6 +268,8 @@ def rootless_environment():
         verify_executable(command)
     env = {'HOME': account.pw_dir, 'USER': ACCOUNT, 'PATH': '/usr/bin:/usr/sbin',
            'XDG_RUNTIME_DIR': str(runtime), 'LC_ALL': 'C.UTF-8',
+           'CONTAINERS_CONF': str(protected(CONTAINERS_CONF, file=True)),
+           'TMPDIR': str(trusted_directory(STORAGE / 'image-copy')),
            'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(runtime / 'bus')}
     return runtime, env
 
@@ -283,7 +298,7 @@ def subordinate_ids(path, identity, live):
 
 
 class Quadlet:
-    def __init__(self, runtime, env, attempt, image, candidate, budget):
+    def __init__(self, runtime, env, attempt, image, candidate, budget, *, storage_fsid=None):
         p.require(str(uuid.UUID(attempt)) == attempt, 'invalid checklist effect identity')
         self.name = 'dp-checklist-' + attempt
         self.unit = self.name + '.service'
@@ -297,6 +312,7 @@ class Quadlet:
         self.image = image
         self.candidate = candidate
         self.budget = budget
+        self.storage_fsid = storage_fsid
         self.logs = []
         self.storage_evidence = []
         self.path_created = False
@@ -326,9 +342,16 @@ class Quadlet:
         text = self.command('selinux', [GETENFORCE], deadline)[1]
         p.require(text == 'Enforcing', 'checklist host requires enforcing SELinux')
 
+    def check_storage(self):
+        evidence = storage_identity(STORAGE)
+        if self.storage_fsid is not None:
+            p.require('storage-fsid:' + str(self.storage_fsid) in evidence,
+                      'checklist validation filesystem differs from the host execution record')
+        return evidence
+
     def prepare(self, deadline, request_sha):
         self.enforcing(deadline)
-        self.storage_evidence = storage_identity(STORAGE)
+        self.storage_evidence = self.check_storage()
         p.require(next((STORAGE / 'attempts').iterdir(), None) is None,
                   'unresolved checklist resources require operator reconciliation')
         for directory in (self.unit_path.parent.parent, self.unit_path.parent, self.runroot):
@@ -451,7 +474,7 @@ class Quadlet:
 
     def verify_absent(self, deadline, staged):
         self.enforcing(deadline)
-        storage = storage_identity(STORAGE)
+        storage = self.check_storage()
         if staged is not None and staged['cleanup']['status'] == 'complete':
             sampled = [entry for entry in staged['evidence'] if entry.startswith('storage-fsid:')]
             p.require(len(sampled) == 1 and sampled[0] in storage,

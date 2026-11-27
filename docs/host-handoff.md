@@ -112,9 +112,8 @@ The executor profile at `/var/lib/dev-pair/checklist-executor/tls` holds the
 maintenance key and pinned peer certificate. The account home and TLS
 directory are mode 0700, and the TLS files are mode 0600.
 
-Create the private ledger at `/var/lib/dev-pair/checklist-executor/ledger`
-with `jobs.py job` as its owner. Keep the ledger and TLS outside the mounted
-test data. Only protected controller processes can access either. Provision
+Keep the job ledger, execution history and TLS outside the mounted test
+data. Only protected controller processes can access them. Provision
 `/var/lib/dev-pair/renewal-fence/owner.lock` as a unique root-owned mode-0644
 file beneath a root-owned directory. The executor holds a shared advisory
 lock through each ledger mutation and its effects. Renewal takes the exclusive
@@ -124,8 +123,10 @@ Authenticated status remains available during the fence.
 Use a dedicated non-discarding ext4 or XFS filesystem mounted at
 `/var/lib/dev-pair/checklist-validation`, with up to 2 GiB and 65,536 inodes.
 Fully reserve the backing file if the mount uses a loop device. Give
-`dp-checklist` private mode-0700 access to its root and the `graph` and
-`attempts` leaves on the same filesystem. Place the Podman run root at
+`dp-checklist` private mode-0700 access to its root and the `graph`,
+`attempts` and `image-copy` leaves on the same filesystem. Install the
+root-owned `/etc/dev-pair/checklist/validation-containers.conf` with
+`engine.image_copy_tmp_dir` set to the exact `image-copy` leaf. Place the Podman run root at
 `/run/user/UID/dev-pair-checklist-runroot`, private to the account. Using that
 graph and run root, pre-provision the Podman bridge
 `dev-pair-checklist-internal` with `--internal`. Preload the candidate by its
@@ -133,6 +134,17 @@ exact OCI reference before validation. This requires Fedora 44 with SELinux
 enforcing and a user manager with cgroup v2 delegation. The container must
 have its own SELinux MCS categories and the `:Z` data mount must carry the
 matching file label. The executor checks both at start and restart.
+
+On initial provisioning, run the following as `dp-checklist` after the
+validation filesystem and user manager are ready and before starting the
+executor. Leave the initial `ledger` and `execution-history` leaves absent.
+This creates the job ledger and binds the separate execution history to its
+controller, the machine ID and the mounted validation filesystem. Use
+`jobs.py job` as the controller to create the first job afterward.
+
+```sh
+/usr/bin/python3 -EBs /usr/libexec/dev-pair/checklist/tools/host_handoff.py initialize-host-history
+```
 
 ### Request and result
 
@@ -218,26 +230,56 @@ same stored result and effect ID. A historical `status` can read its exact
 stored request and result after a new checkpoint.
 
 Loss of a client connection leaves execution and the durable result under
-host control. The ledger records an arming event before the executor starts
-the recipe and records the observed verdict before cleanup. It exposes the
-verdict as a result only after cleanup is confirmed. If the executor dies
-or cleanup is uncertain, status shows the original attempt in flight. The
-workspace contains `operation.json` and the executor writes
+host control. The independent host history records the reservation and
+arming before the executor starts the recipe, the verdict before cleanup
+and the exact result once cleanup is confirmed. The job ledger mirrors
+those transitions. If the executor dies or cleanup is uncertain, status
+shows the original attempt in flight. The workspace contains
+`operation.json` and the executor writes
 `restart-requested` before issuing that action.
 
 The trusted conductor can use `send reconcile --host` with the same exact
 request and TLS profile. The host inspects the matching systemd unit,
 rootless container and workspace within the cleanup time allowance. When
-all three are absent, a durable observation and matching storage identity
-allow the original result to be published. An unarmed reservation with
+all three are absent, a durable observation and matching storage and machine
+identities allow the original result to be published. An unarmed reservation with
 the same absence proof closes as blocked with the original attempt ID and
 zero effects. That closure allows a fresh request. The command makes no
 application writes and issues no lifecycle commands. If resources still
 exist, storage identity changed or an armed attempt lacks a durable
-observation, the attempt stays in flight for operator inspection. Snapshot
-backup and restore validate the same ledger transitions, including the
-host-specific evidence. The controller's generic reconciliation route
-continues to block authenticated host effects.
+observation, the attempt stays in flight for operator inspection.
+
+### Job snapshot recovery
+
+Retain `/var/lib/dev-pair/checklist-executor/execution-history` independently
+when backing up, replacing or restoring the job ledger during recovery or
+renewal. It is private to the executor and outside job snapshots. Preserve
+the history across upgrades and reboot. The history database has a 16 MiB
+limit and pauses new work if it cannot durably record another attempt.
+Retain the records that protect outstanding jobs and recoverable snapshots.
+
+With the original controller, machine and validation filesystem in place,
+stop the executor and restore a validated job snapshot using the normal
+clean-destination procedure before returning it to the fixed `ledger` path.
+Restart with the retained history. Read-only status can show the stored
+attempt and exact completed verdict for the matching request. The next
+authenticated operation restores missing job events under the dispatch gate
+when the exact job and checkpoint are present. An older ledger that omits
+the authoritative checkpoint stops that job before any host effect. Recover
+a job snapshot containing the matching checkpoint, then reconcile. An
+already closed attempt returns its exact outcome without another restart.
+An armed attempt without a verdict stays in flight.
+
+On a different machine or validation filesystem, restore the previous job
+backup into a separate destination for historical inspection. Keep the
+original controller and recorded outcomes with it. Fresh host execution
+requires a pristine active ledger, a new controller and new requests with
+the normal approval. A host replacement that preserves the original machine
+and validation filesystem identities can resume the original requests only
+with the independently retained authoritative history. If that history is
+unavailable or its provenance is unclear, keep the recovered job ledger
+offline and surface the unresolved attempts. The initializer rejects a
+restored ledger as the basis for fresh execution history.
 
 ### Tailnet release
 

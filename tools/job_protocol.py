@@ -323,8 +323,9 @@ class Ledger:
     Request JSON grants no authority. Same-UID controller/code compromise is
     outside this boundary; mode checks do not authenticate remote senders.
     """
-    def __init__(self, directory):
+    def __init__(self, directory, *, host_history=None):
         self.root = pathlib.Path(directory).absolute()
+        self.host_history = host_history
         # Never follow a symlink component. Ancestors are operator-managed;
         # private leaf prevents a different UID from replacing database paths.
         for part in [self.root, *self.root.parents]:
@@ -444,22 +445,26 @@ class Ledger:
         require(obj['boundary'] not in AUTHENTICATED_BOUNDARIES or authenticated,
                 'application request requires authenticated transport')
         with self.transaction():
-            old = self.db.execute('SELECT body FROM records WHERE kind=? AND id=?', ('request', obj['request_id'])).fetchone()
-            if old:
+            old = self.db.execute('SELECT body FROM records WHERE kind=? AND id=?',
+                                  ('request', obj['request_id'])).fetchone()
+            if old is None:
+                self._submit(obj)
+            else:
                 require(old['body'] == canonical(obj), 'ID collision: request mismatch')
                 if authenticated:
                     self.current(obj)
-                return self.status(obj['request_id'])
-            job = self.record('job', obj['job_id'])
-            self.current(obj)
-            self.no_inflight(obj['job_id'])
-            count = self.db.execute('SELECT count(*) FROM requests WHERE job=?', (obj['job_id'],)).fetchone()[0]
-            require(count < job['max_requests'], 'job request budget exhausted')
-            for name in ('seconds', 'artifact_bytes', 'spend_usd'):
-                require(obj['budgets'][name] <= job['budgets'][name], 'request exceeds job budget')
-            self.put(obj, obj['request_id'])
-            self.db.execute('INSERT INTO requests VALUES (?,?,?,NULL,NULL)', (obj['request_id'], obj['job_id'], 'pending'))
         return self.status(obj['request_id'])
+
+    def _submit(self, obj):
+        job = self.record('job', obj['job_id'])
+        self.current(obj)
+        self.no_inflight(obj['job_id'])
+        count = self.db.execute('SELECT count(*) FROM requests WHERE job=?', (obj['job_id'],)).fetchone()[0]
+        require(count < job['max_requests'], 'job request budget exhausted')
+        for name in ('seconds', 'artifact_bytes', 'spend_usd'):
+            require(obj['budgets'][name] <= job['budgets'][name], 'request exceeds job budget')
+        self.put(obj, obj['request_id'])
+        self.db.execute('INSERT INTO requests VALUES (?,?,?,NULL,NULL)', (obj['request_id'], obj['job_id'], 'pending'))
 
     def produce_request(self, job_id, request_id, expected_message, boundary, reason):
         """Produce, then submit using the identical schema as the consumer."""
@@ -488,20 +493,30 @@ class Ledger:
         return {'request': request, 'state': row['state'], 'attempt_id': row['attempt'], 'result': result,
                 'reconciliation_required': row['state'] == 'in-flight'}
 
+    def _reserve(self, request, attempt):
+        self.db.execute('UPDATE requests SET state=?,attempt=? WHERE id=?',
+                        ('in-flight', attempt, request['request_id']))
+        self.event('execution-reserved', effect_identity(request, attempt))
+
     def begin(self, request_id, *, authenticated_request=None):
         with self.transaction():
             status = self.status(request_id)
             self.check_transport(status, authenticated_request)
+            request = status['request']
             if status['state'] == 'completed':
                 if authenticated_request is not None:
                     self.current(authenticated_request)
                 return None, status['result']
             require(status['state'] == 'pending', 'unresolved in-flight effects require reconciliation; execution refused')
-            self.current(status['request'])
-            self.no_inflight(status['request']['job_id'])
+            self.current(request)
+            self.no_inflight(request['job_id'])
             attempt = str(uuid.uuid4())
-            self.db.execute('UPDATE requests SET state=?,attempt=? WHERE id=?', ('in-flight', attempt, request_id))
-            self.event('execution-reserved', effect_identity(status['request'], attempt))
+            if host_effect_journal(request):
+                # The external record must commit before this transaction can
+                # publish a reservation. A restored job can lag that record.
+                self._host_history().reserve(request, attempt, identity(self.record('job', request['job_id'])),
+                                             identity(self.record('checkpoint', request['checkpoint_id'])))
+            self._reserve(request, attempt)
         return attempt, None
 
     def check_transport(self, status, authenticated_request):
@@ -537,35 +552,107 @@ class Ledger:
                         ('completed', canonical(result), result['request_id']))
         self.event('result', result)
 
+    def _host_history(self):
+        require(self.host_history is not None and self.host_history.identity['controller_id'] == self.controller_id,
+                'authoritative host execution history is unavailable')
+        return self.host_history
+
+    def _host_events(self, request_id):
+        rows = self.db.execute("SELECT event,body FROM events WHERE event IN (?,?,?) AND "
+                               "json_extract(body,'$.request_id')=? ORDER BY sequence LIMIT 4",
+                               (HOST_EFFECT_ARMED, HOST_RESULT_STAGED, HOST_EFFECT_CLOSED, request_id))
+        return [(row['event'], loads(row['body'])) for row in rows]
+
+    def _host_prefix(self, request, events):
+        existing = self.db.execute('SELECT 1 FROM requests WHERE id=?', (request['request_id'],)).fetchone()
+        if existing is None:
+            require(not self._host_events(request['request_id']), 'missing request before host events')
+            return None, 0
+        stored = self.status(request['request_id'])
+        self.check_transport(stored, request)
+        observed = self._host_events(request['request_id'])
+        require(observed == events[:len(observed)], 'job snapshot conflicts with authoritative host event history')
+        require(stored['state'] != 'pending' or not observed, 'pending request contains host events')
+        return stored, len(observed)
+
+    def _project_host_history(self, entry, *, mirror=False):
+        request, attempt = entry['request'], entry['attempt']
+        require(entry['job_sha'] == identity(self.record('job', request['job_id'])) and
+                entry['checkpoint_sha'] == identity(self.record('checkpoint', request['checkpoint_id'])),
+                'job snapshot differs from the authoritative host job or checkpoint')
+        events = []
+        if entry['armed']:
+            events.append((HOST_EFFECT_ARMED, effect_identity(request, attempt)))
+        if entry['staged'] is not None:
+            events.append((HOST_RESULT_STAGED, entry['staged']))
+        if entry['closure'] is not None:
+            events.append((HOST_EFFECT_CLOSED, entry['closure']))
+        stored, observed = self._host_prefix(request, events)
+        result = entry['result']
+        if stored is not None:
+            require(stored['attempt_id'] in (None, attempt), 'job snapshot has a conflicting host attempt')
+            require(stored['result'] is None or (stored['result'] == result and observed == len(events)),
+                    'job snapshot conflicts with the authoritative host result')
+        if mirror and (stored is None or stored['state'] != 'completed'):
+            self.current(request)
+            if stored is None:
+                self._submit(request)
+            if stored is None or stored['state'] == 'pending':
+                self.no_inflight(request['job_id'])
+                self._reserve(request, attempt)
+            for event, value in events[observed:]:
+                self.event(event, value)
+            if result is not None:
+                self._store_result(result)
+        state = 'completed' if result is not None else 'in-flight'
+        return {'request': request, 'state': state, 'attempt_id': attempt, 'result': result,
+                'reconciliation_required': state == 'in-flight'}
+
+    def host_status(self, request):
+        entry = self._host_history().lookup(request)
+        if entry is not None:
+            return self._project_host_history(entry)
+        stored = self.status(request['request_id'])
+        self.check_transport(stored, request)
+        require(stored['state'] == 'pending', 'host attempt has no authoritative execution history; recovery required')
+        return stored
+
+    def host_admission(self, request):
+        history = self._host_history()
+        with self.transaction():
+            job = self.record('job', request['job_id'])
+            entries = history.for_job(request['job_id'], job['max_requests'])
+            attempts = {entry['id']: entry['attempt'] for entry in entries}
+            for row in self.db.execute('SELECT id,attempt FROM requests WHERE job=? AND attempt IS NOT NULL',
+                                       (request['job_id'],)):
+                stored = self.record('request', row['id'])
+                require(stored['boundary'] != APP_QUADLET_BOUNDARY or attempts.get(row['id']) == row['attempt'],
+                        'job snapshot has an unverified or conflicting host attempt')
+            for entry in entries:
+                self._project_host_history(entry, mirror=True)
+
     def host_effect_state(self, request, attempt):
         status = self.status(request['request_id'])
         self.check_transport(status, request)
         self.current(request)
-        require(host_effect_journal(request) and status['state'] == 'in-flight' and status['attempt_id'] == attempt,
+        entry = self._host_history().lookup(request)
+        require(entry is not None and status['state'] == 'in-flight' and
+                status['attempt_id'] == entry['attempt'] == attempt and entry['closure'] is None,
                 'host effect receipt does not match an active attempt')
-        rows = self.db.execute("SELECT event,body FROM events WHERE event IN (?,?) AND "
-                               "json_extract(body,'$.request_id')=? ORDER BY sequence LIMIT 3",
-                               (HOST_EFFECT_ARMED, HOST_RESULT_STAGED, request['request_id'])).fetchall()
-        require([row['event'] for row in rows] in ([], [HOST_EFFECT_ARMED], [HOST_EFFECT_ARMED, HOST_RESULT_STAGED]),
-                'invalid host effect journal transitions')
-        if rows:
-            require(loads(rows[0]['body']) == effect_identity(request, attempt), 'host arming identity mismatch')
-        staged = loads(rows[1]['body']) if len(rows) == 2 else None
-        if staged is not None:
-            validate_staged_host_result(request, staged, attempt, self.controller_id)
-        return bool(rows), staged
+        return bool(entry['armed']), entry['staged']
 
     def arm_host_effect(self, request, attempt):
         with self.transaction():
             armed, _ = self.host_effect_state(request, attempt)
             require(not armed, 'host effect already armed; replay refused')
+            self._host_history().arm(request, attempt)
             self.event(HOST_EFFECT_ARMED, effect_identity(request, attempt))
 
     def stage_host_result(self, request, result):
         with self.transaction():
             armed, staged = self.host_effect_state(request, result['attempt_id'])
             require(armed and staged is None, 'host effect cannot record another observation')
-            validate_staged_host_result(request, result, result['attempt_id'], self.controller_id)
+            self._host_history().stage(request, result)
             self.event(HOST_RESULT_STAGED, result)
 
     def close_host_effect(self, request, attempt, mode, evidence):
@@ -573,6 +660,7 @@ class Ledger:
             armed, staged = self.host_effect_state(request, attempt)
             closure = dict(effect_identity(request, attempt), mode=mode, evidence=evidence)
             result = closed_host_result(request, attempt, self.controller_id, armed, staged, closure)
+            self._host_history().close_effect(closure, result, armed=armed, staged=staged)
             self.event(HOST_EFFECT_CLOSED, closure)
             self._store_result(result)
         return result
