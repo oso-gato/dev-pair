@@ -27,11 +27,15 @@ Create the root-owned mode-0700 directory
 `jobs` and `profiles` directories. Install the trusted product sources and
 the reviewed runtime dependencies at `/usr/libexec/dev-pair`. Install
 [`dev-pair-product@.service`](../runtime/product-job/dev-pair-product@.service).
-The service limits each worker to 25 minutes and restarts transient failures
-at most five times in its 300-second start window. Status and reattach only
-read the protected job record. An identical submission can restart the
-worker after a host reboot. Protected registry reservations and the host
-effect ledger determine which steps can proceed.
+Install the companion [tmpfiles entry](../runtime/product-job/dev-pair-product.conf)
+after provisioning the checklist account. The service limits each worker to
+25 minutes. A temporary fence or lost host reply is saved as a waiting state.
+Automatic observations have a three-minute and 18-observation limit for
+each unfinished step. If the limit is reached, the same submission can
+continue when the environment is ready. Status and reattach read the protected
+job record. An identical submission can also restart the worker after a host
+reboot. Protected registry reservations and the host effect ledger determine
+which steps can proceed.
 
 Provision both role workspaces at the approved starting commit and canonical
 repository origin. The conductor uses the ordinary `dp-dev` account for
@@ -53,8 +57,14 @@ fixed reference and verification digest in the root-owned
 `/etc/dev-pair/checklist/build-base.json` with fields `version` (1),
 `image` (the exact OCI digest reference) and `verification_sha256`.
 The issuer checks the rootless storage roots and actual base manifest. It
-extracts one bounded, regular Git blob, copies the trusted Containerfile and
-runs the fixed build command with networking disabled and pulling disabled.
+runs the checklist filesystem verifier as the designated checklist UID and
+binds the observation to the mount seen by the conductor. It extracts one
+bounded, regular Git blob and copies it with the trusted Containerfile to one
+root-owned context at `/run/dev-pair/checklist-build-inputs/active`. The
+checklist group can traverse the context and read both files. Only root can
+modify the context. The rootless builder writes its archive to a separate
+private spool on the bounded validation filesystem. The fixed build command
+disables networking and pulling.
 It verifies the single-platform OCI manifest and configuration digests across
 archive export and load. The destination's `preload-validation --apply` checks
 the same image ID, digest and source in the owned validation graph before
@@ -123,11 +133,12 @@ sudo /usr/bin/python3 -EBs "$product" reattach checklist-first
 The detached service can continue when the client leaves. Reattach streams
 changed durable state for up to two minutes per connection. Its record carries
 the agreement, startup, candidate, role operation and session identities, plus
-both host receipts and their individual effect IDs. If the host connection is
-lost, a bounded worker retry consults the exact stored request before invoking
-any operation. The current host executor can reconcile proven interrupted
-effects. Unknown outcomes remain blocked. The same job ID always retains its
-original brief.
+both host receipts and their individual effect IDs. After a lost mutation
+reply, the conductor reads the exact authenticated request status. It can
+consume a completed result immediately. A bounded worker retry checks the
+same stored request before acting again. The host executor can reconcile
+proven interrupted effects. Unknown outcomes remain blocked. The same job ID
+always retains its original brief.
 
 The development turn receives the original brief and exact host verdict,
 including failure diagnostics. It must finish with a structured candidate SHA

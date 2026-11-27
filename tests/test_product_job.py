@@ -3,6 +3,8 @@ import io
 import os
 from pathlib import Path
 import pwd
+import socket
+import struct
 import subprocess
 import sys
 import tarfile
@@ -15,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import checklist_candidate as candidate
 import host_handoff as handoff
 import job_protocol as p
+import ledger_recovery as recovery
 import product_job as job
+from test_checklist_quadlet import FixtureService
 
 
 class ProductJobTests(unittest.TestCase):
@@ -232,11 +236,158 @@ class ProductJobTests(unittest.TestCase):
 
         with mock.patch.object(handoff, 'tls_principal', return_value=(None, None, ('a' * 64, 'b' * 64))), \
                 mock.patch.object(handoff, 'exchange', side_effect=transport):
-            with self.assertRaises(BlockingIOError):
-                adapter.host_test(1, checkpoint)
             self.assertEqual(adapter.host_test(1, checkpoint), {'progress': 'repair-required', 'result': result})
         self.assertEqual(operations, ['status', 'submit', 'execute', 'status', 'consume'])
         adapter.runtime.publish_approval.assert_called_once()
+
+    def test_post_commit_truncated_frame_recovers_real_checklist_attempt(self):
+        runtime = handoff.host_runtime()
+        ledger_dir = self.root / 'ledger'
+        ledger = p.Ledger(ledger_dir)
+        self.addCleanup(ledger.close)
+        controller = ledger.controller_id
+        environment = {'machine_sha256': 'c' * 64, 'storage_fsid': 123}
+        # The separately integrated Q history uses this ordinary fixture setup too.
+        history_type = getattr(recovery, 'HostHistory', None)
+        if history_type is not None:
+            history = history_type(self.root / 'execution-history', controller, environment, initialize=True)
+            self.addCleanup(history.close)
+            ledger.host_history = history
+        budgets = {'seconds': 35, 'artifact_bytes': 8192, 'spend_usd': 0}
+        registered = p.envelope('job', job_id='demo', standards_sha=p.STANDARDS, agreement_sha256='1' * 64,
+                                selection={'provider': 'gptbox', 'model': 'gpt-6.2-sol', 'effort': 'high',
+                                           'runtime_sha256': '2' * 64, 'verification': 'unverified-record-only'},
+                                budgets=budgets, max_requests=2)
+        checkpoint = p.envelope('checkpoint', job_id='demo', checkpoint_id='demo-c1',
+                                candidate={'source_revision': 'a' * 40, 'artifact_sha256': 'b' * 64},
+                                test=handoff.recipe_identity(host=True), summary='Approved first candidate', evidence=[])
+        ledger.create_job(registered)
+        ledger.checkpoint(checkpoint)
+        adapter = object.__new__(job.FedoraJob)
+        adapter.job = 'demo'
+        adapter.runtime = mock.Mock(dispatch_gate=contextlib.nullcontext)
+        adapter.controller = mock.Mock()
+        adapter.controller.ledger.checkpoint.return_value = [controller, registered, checkpoint]
+        principals = ('d' * 64, 'e' * 64)
+        operations, services = [], []
+        committed = None
+
+        def fixture(*args, **kwargs):
+            unit = FixtureService(self.root / args[2])
+            self.addCleanup(unit.stop)
+            services.append(unit)
+            return unit
+
+        def authorize(path, request):
+            p.require(adapter.runtime.publish_approval.called, 'fixture approval has not been published')
+            return 'localhost/checklist@sha256:' + 'b' * 64, ['executor-machine-sha256:' + environment['machine_sha256']]
+
+        def transport(port, context, peer, operation, request):
+            nonlocal ledger, committed
+            operations.append(operation)
+            packet = {'operation': operation, 'request': request}
+            result = handoff.dispatch_host(ledger, runtime, {}, self.root, self.root / 'approval', principals, packet)
+            if operation == 'execute':
+                committed = result
+                ledger.close()
+                ledger = p.Ledger(ledger_dir)
+                self.addCleanup(ledger.close)
+                if history_type is not None:
+                    ledger.host_history = history
+                with contextlib.ExitStack() as sockets:
+                    reader, writer = (sockets.enter_context(channel) for channel in socket.socketpair())
+                    writer.sendall(struct.pack('!I', 90) + b'{"ok":true,"data":')
+                    writer.shutdown(socket.SHUT_WR)
+                    handoff.receive(reader, time.monotonic() + 2)
+                    self.fail('partial authenticated payload was not rejected')
+            return result
+
+        with mock.patch.multiple(runtime, Quadlet=fixture, dispatch_gate=contextlib.nullcontext,
+                                 APP_AUTHORITY=None, approval=authorize), \
+                mock.patch.object(runtime, 'execution_identity', return_value=environment, create=True), \
+                mock.patch.object(handoff, 'tls_principal', return_value=(None, None, principals)), \
+                mock.patch.object(handoff, 'exchange', side_effect=transport):
+            outcome = adapter.host_test(1, checkpoint)
+        self.assertEqual(outcome, {'progress': 'host-checks-passed', 'result': committed})
+        self.assertEqual([unit.actions for unit in services], [['start', 'restart']])
+        self.assertEqual(operations, ['status', 'submit', 'execute', 'status', 'consume'])
+        self.assertEqual(ledger.status('demo-r1')['attempt_id'], committed['attempt_id'])
+
+    def product_slot(self):
+        catalogue = self.root / 'product-jobs'
+        path = catalogue / 'jobs/demo'
+        path.mkdir(parents=True, mode=0o700)
+        catalogue.chmod(0o700)
+        job.write_private(catalogue / 'owner.lock', b'')
+        job.write_private(path / 'plan.json', p.canonical(self.value).encode())
+        initial = {'candidate': {'source_revision': self.value['agreement']['initial_commit']}}
+        state = dict.fromkeys(('maintenance', 'first', 'development', 'repair', 'final'))
+        state.update(job_id='demo', phase='maintenance-turn', initial=initial)
+        job.write_private(path / 'state.json', p.canonical(state).encode())
+        return catalogue, path, initial
+
+    def test_boot_observation_pause_retains_job_and_auto_continues_same_operation(self):
+        catalogue, path, initial = self.product_slot()
+        marker = self.root / 'frozen'
+        marker.write_text('boot')
+        worker = mock.Mock()
+        effects = []
+
+        def role_turn(role, checkpoint, result=None):
+            p.require(not marker.exists(), 'role dispatch frozen pending host observation')
+            effects.append(role)
+            return {'candidate_sha': initial['candidate']['source_revision']}
+
+        worker.turn.side_effect = role_turn
+        worker.host_test.return_value = {'progress': 'host-checks-passed', 'result': {'attempt_id': 'stored'}}
+        with mock.patch.multiple(job, CATALOGUE=catalogue, JOBS=catalogue / 'jobs', registered_contract=lambda v: v), \
+                mock.patch.object(job, 'FedoraJob', return_value=worker):
+            first = job.work('demo')
+            self.assertEqual(first['phase'], 'waiting')
+            self.assertEqual(first['retry']['reason'], 'renewal-observation')
+            self.assertTrue(first['retry']['automatic'])
+            self.assertEqual(job.read_state(path), first)
+            self.assertEqual(effects, [])
+
+            def clear_during_wait(seconds):
+                paused = job.read_state(path)
+                self.assertEqual(paused['retry']['observations'], 2)
+                self.assertEqual(paused['retry']['until_unix'], first['retry']['until_unix'])
+                self.assertEqual(effects, [])
+                marker.unlink()
+
+            with mock.patch.object(job.os, 'geteuid', return_value=0), mock.patch.object(job.os, 'umask'), \
+                    mock.patch.object(job.time, 'sleep', side_effect=clear_during_wait) as wait, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(job.main(['work', 'demo']), 0)
+            wait.assert_called_once_with(job.RETRY_INTERVAL)
+            emitted = [p.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual([record['phase'] for record in emitted], ['waiting', 'passed'])
+            finished = job.read_state(path)
+            self.assertEqual(finished['phase'], 'passed')
+            self.assertNotIn('retry', finished)
+            self.assertEqual(job.work('demo'), finished)
+        self.assertEqual(effects, ['maintenance', 'development'])
+        worker.build.assert_not_called()
+        worker.host_test.assert_called_once()
+
+    def test_pause_has_bounded_budget_and_malformed_reply_is_terminal(self):
+        catalogue, path, _ = self.product_slot()
+        worker = mock.Mock()
+        worker.turn.side_effect = job.HostReplyLost('execute')
+        with mock.patch.multiple(job, CATALOGUE=catalogue, JOBS=catalogue / 'jobs', registered_contract=lambda v: v), \
+                mock.patch.object(job, 'FedoraJob', return_value=worker), mock.patch.object(job, 'RETRY_OBSERVATIONS', 2):
+            first = job.work('demo')
+            second = job.work('demo')
+            self.assertTrue(first['retry']['automatic'])
+            self.assertEqual(second['phase'], 'waiting')
+            self.assertFalse(second['retry']['automatic'])
+            self.assertEqual(first['retry']['until_unix'], second['retry']['until_unix'])
+            worker.turn.side_effect = ValueError('invalid transport response')
+            failed = job.work('demo')
+        self.assertEqual(failed['phase'], 'blocked')
+        self.assertEqual(failed['diagnostics'], 'invalid transport response')
+        self.assertNotIn('retry', job.read_state(path))
 
 
 if __name__ == '__main__':

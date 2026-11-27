@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import ssl
 import stat
 import subprocess
 import tempfile
@@ -27,6 +28,17 @@ SYSTEMCTL = '/usr/bin/systemctl'
 PYTHON = '/usr/bin/python3'
 HOST_PORT = 19425
 TERMINAL = {'passed', 'blocked'}
+RENEWAL_PAUSES = {'checklist dispatch is frozen by renewal', 'role dispatch frozen by renewal',
+                  'role dispatch frozen pending host observation'}
+RETRY_SECONDS = 180
+RETRY_OBSERVATIONS = 18
+RETRY_INTERVAL = 10
+
+
+class HostReplyLost(BlockingIOError):
+    def __init__(self, operation):
+        super().__init__('checklist result transport was interrupted')
+        self.operation = operation
 
 
 def plan(raw):
@@ -304,30 +316,45 @@ class FedoraJob:
         def exchange(operation):
             try:
                 result = h.exchange(HOST_PORT, context, peer, operation, request)
-            except OSError as exc:
-                # The next bounded worker attempt consults the same durable request first.
-                raise BlockingIOError('checklist result transport was interrupted') from exc
+            except (ConnectionError, TimeoutError, ssl.SSLEOFError) as exc:
+                raise HostReplyLost(operation) from exc
+            except ValueError as exc:
+                if str(exc) == 'truncated transport frame':
+                    raise HostReplyLost(operation) from exc
+                raise
             h.check_reply(operation, result, request, controller)
             return result
 
+        def read_status():
+            try:
+                return exchange('status')
+            except ValueError as exc:
+                if str(exc) != 'unknown request':
+                    raise
+                return None
+
         try:
-            status = exchange('status')
-        except ValueError as exc:
-            if str(exc) != 'unknown request':
-                raise
-            status = None
-        if status is None or status['state'] == 'pending':
-            with self.runtime.dispatch_gate():
-                source = checkpoint['candidate']['source_revision']
-                receipt = candidate.envelope_path(self.job, source)
-                record = self.runtime.issue_approval(receipt, request, 300)
-                self.runtime.publish_approval(record)
-                if status is None:
-                    exchange('submit')
-                exchange('execute')
-        elif status['state'] == 'in-flight':
-            exchange('reconcile')
-        return exchange('consume')
+            status = read_status()
+            if status is None or status['state'] == 'pending':
+                with self.runtime.dispatch_gate():
+                    source = checkpoint['candidate']['source_revision']
+                    receipt = candidate.envelope_path(self.job, source)
+                    record = self.runtime.issue_approval(receipt, request, 300)
+                    self.runtime.publish_approval(record)
+                    if status is None:
+                        exchange('submit')
+                    exchange('execute')
+            elif status['state'] == 'in-flight':
+                exchange('reconcile')
+            return exchange('consume')
+        except HostReplyLost as exc:
+            # After a lost mutation reply, the only immediate follow-up is the
+            # same authenticated status. A completed result can be consumed as-is.
+            if exc.operation != 'status':
+                saved = read_status()
+                if saved is not None and saved['state'] == 'completed':
+                    return exchange('consume')
+            raise
 
 
 def execute(value, state, backend, save):
@@ -336,6 +363,7 @@ def execute(value, state, backend, save):
             state['phase'] = phase
             save(state)
             state[key] = action(*args)
+            state.pop('retry', None)
             save(state)
         return state[key]
 
@@ -353,11 +381,34 @@ def execute(value, state, backend, save):
         result = step('final', 'host-retest', backend.host_test, 2, repaired)
         p.require(result['progress'] == 'host-checks-passed', 'the reviewed retest budget ended without a pass')
     state['phase'] = 'passed'
+    state.pop('retry', None)
     save(state)
 
 
 def read_state(root):
     return p.loads(read_private(root / 'state.json', p.MAX_MESSAGE))
+
+
+def pause_reason(error):
+    if isinstance(error, HostReplyLost):
+        return 'host-reply-interrupted'
+    if isinstance(error, BlockingIOError):
+        return 'dispatch-lease-busy'
+    if isinstance(error, ValueError) and str(error) in RENEWAL_PAUSES:
+        return 'renewal-observation'
+    return None
+
+
+def record_pause(state, reason, now):
+    previous = state.get('retry', {})
+    phase = state['phase']
+    if previous.get('phase') == phase:
+        cutoff, observations = previous['until_unix'], previous['observations'] + 1
+    else:
+        cutoff, observations = now + RETRY_SECONDS, 1
+    state['phase'] = 'waiting'
+    state['retry'] = {'phase': phase, 'reason': reason, 'until_unix': cutoff, 'observations': observations,
+                      'automatic': now < cutoff and observations < RETRY_OBSERVATIONS}
 
 
 def work(job):
@@ -372,19 +423,22 @@ def work(job):
         state = read_state(root)
         if state['phase'] in TERMINAL:
             return state
+        if state['phase'] == 'waiting':
+            state['phase'] = state['retry']['phase']
         try:
             backend = FedoraJob(value)
             backend.ledger('job', registered_contract(value))
             execute(value, state, backend, lambda item: durable_json(root / 'state.json', item))
-        except BlockingIOError:
-            raise
         except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError) as exc:
-            if str(exc) in ('checklist dispatch is frozen by renewal', 'role dispatch frozen by renewal'):
-                raise BlockingIOError('renewal owns dispatch') from exc
-            state['failed_stage'] = state['phase']
-            state['phase'] = 'blocked'
-            reason = str(exc) if type(exc) is ValueError else type(exc).__name__
-            state['diagnostics'] = h.bounded_diagnostic(reason)
+            retry = pause_reason(exc)
+            if retry is not None:
+                record_pause(state, retry, int(time.time()))
+            else:
+                state['failed_stage'] = state['phase']
+                state['phase'] = 'blocked'
+                state.pop('retry', None)
+                reason = str(exc) if type(exc) is ValueError else type(exc).__name__
+                state['diagnostics'] = h.bounded_diagnostic(reason)
             durable_json(root / 'state.json', state)
         return state
 
@@ -434,6 +488,10 @@ def main(argv=None):
             result = submit(args.approved_plan)
         elif args.action == 'work':
             result = work(args.job)
+            while result['phase'] == 'waiting' and result['retry']['automatic']:
+                print(p.canonical(result), flush=True)
+                time.sleep(RETRY_INTERVAL)
+                result = work(args.job)
         else:
             root = trusted_directory(job_path(args.job))
             previous = None
@@ -447,6 +505,8 @@ def main(argv=None):
                     previous = result
                 time.sleep(1)
         print(p.canonical(result), flush=True)
+        if args.action == 'work' and result['phase'] == 'waiting':
+            return 76
         return 2 if result['phase'] == 'blocked' else 0
     except BlockingIOError:
         return 75

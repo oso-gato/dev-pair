@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Build and admit one authorized checklist Git object through the fixed OCI recipe."""
+import contextlib
 import hashlib
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -21,12 +23,14 @@ ROOT = Path('/var/lib/dev-pair')
 KIT = Path('/usr/libexec/dev-pair')
 RECEIPTS = ROOT / 'checklist-receipts'
 BASE = Path('/etc/dev-pair/checklist/build-base.json')
-RECIPE = Path(__file__).resolve().parent.parent / 'examples/checklist/Containerfile'
+SELF = Path(__file__).resolve()
+RECIPE = SELF.parent.parent / 'examples/checklist/Containerfile'
+BUILD_INPUTS = Path('/run/dev-pair/checklist-build-inputs')
 APP = 'examples/checklist/checklist.py'
 MAX_SOURCE = 64 * 1024
 MAX_ARCHIVE = 320 * 1024 * 1024
 MAX_BUNDLE = 16 * 1024 * 1024
-RUNUSER = '/usr/bin/runuser'
+RUNUSER = Path('/usr/sbin/runuser')
 GIT = ['/usr/bin/git', '--no-optional-locks', '--no-replace-objects', '--no-lazy-fetch',
        '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.allow=never']
 ENV = {'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C.UTF-8'}
@@ -102,8 +106,87 @@ def checkout_approval(job, repository, agreement_sha):
 def as_role(role, *argv, environment=None):
     account = pwd.getpwnam(role)
     values = {**ENV, 'HOME': account.pw_dir, 'USER': role, 'LOGNAME': role, **(environment or {})}
-    return [RUNUSER, '--user', role, '--', '/usr/bin/env', '-i',
+    runuser = RUNUSER.resolve(strict=True)
+    h.host_runtime().protected(runuser.parent, file=False)
+    node = runuser.stat()
+    p.require(stat.S_ISREG(node.st_mode) and node.st_uid == 0 and not node.st_mode & 0o022 and os.access(runuser, os.X_OK),
+              'trusted account switching executable required')
+    return [str(runuser), '--user', role, '--', '/usr/bin/env', '-i',
             *(key + '=' + value for key, value in values.items()), *map(str, argv)]
+
+
+def storage_witness(runtime):
+    account = pwd.getpwnam(runtime.ACCOUNT)
+    p.require(os.getuid() == os.geteuid() == account.pw_uid >= 1000 and
+              os.getgid() == os.getegid() == account.pw_gid, 'managed checklist storage identity required')
+    path = runtime.STORAGE
+    before = path.lstat()
+    evidence = runtime.storage_identity(path)
+    after = path.lstat()
+    p.require((before.st_dev, before.st_ino, before.st_uid, before.st_gid) ==
+              (after.st_dev, after.st_ino, after.st_uid, after.st_gid), 'checklist storage root changed during verification')
+    return {'device': after.st_dev, 'inode': after.st_ino, 'uid': after.st_uid, 'gid': after.st_gid,
+            'evidence': evidence}
+
+
+def checked_storage(runtime, end):
+    runtime.protected(SELF, file=True)
+    observed = p.loads(invoke(as_role(runtime.ACCOUNT, '/usr/bin/python3', '-EBs', SELF, '__storage-witness'),
+                              min(end, time.monotonic() + 10), cap=4096))
+    p.fields(observed, 'device inode uid gid evidence')
+    current = runtime.STORAGE.lstat()
+    account = pwd.getpwnam(runtime.ACCOUNT)
+    p.require(all(type(observed[key]) is int for key in ('device', 'inode', 'uid', 'gid')) and
+              (observed['device'], observed['inode'], observed['uid'], observed['gid']) ==
+              (current.st_dev, current.st_ino, account.pw_uid, account.pw_gid) and
+              (current.st_uid, current.st_gid) == (account.pw_uid, account.pw_gid) and
+              stat.S_ISDIR(current.st_mode) and stat.S_IMODE(current.st_mode) == 0o700,
+              'managed storage witness differs from the build mount')
+    limits = os.statvfs(runtime.STORAGE)
+    expected = [f'storage-bytes:{limits.f_blocks * limits.f_frsize}', f'storage-inodes:{limits.f_files}',
+                f'storage-fsid:{limits.f_fsid}']
+    p.require(observed['evidence'] == expected,
+              'managed storage witness lacks the matching capacity and filesystem identity')
+    return current.st_dev
+
+
+@contextlib.contextmanager
+def build_context(runtime, gid, recipe, source, end):
+    parent = runtime.protected(BUILD_INPUTS, file=False)
+    p.require(parent.stat().st_gid == gid and stat.S_IMODE(parent.stat().st_mode) == 0o750,
+              'protected builder inputs require the checklist group and mode 0750')
+    context = parent / 'active'
+    contents = {'Containerfile': recipe, 'checklist.py': source}
+    # One fixed bounded context under root custody. An exact retained context
+    # can be used after interruption; a partial or foreign one is preserved.
+    if not os.path.lexists(context):
+        remaining(end)
+        context.mkdir(mode=0o700)
+        for name, data in contents.items():
+            remaining(end)
+            destination = context / name
+            write_private(destination, data)
+            os.chown(destination, 0, gid)
+            destination.chmod(0o440)
+        os.chown(context, 0, gid)
+        context.chmod(0o550)
+        sync_directory(context)
+        sync_directory(parent)
+    runtime.protected(context, file=False)
+    p.require(context.stat().st_gid == gid and stat.S_IMODE(context.stat().st_mode) == 0o550 and
+              {item.name for item in context.iterdir()} == set(contents), 'incomplete or foreign builder context')
+    for name, data in contents.items():
+        path = runtime.protected(context / name, file=True)
+        p.require(path.stat().st_gid == gid and stat.S_IMODE(path.stat().st_mode) == 0o440 and
+                  p.read_data(path, len(data)) == data, 'retained builder input differs from the exact candidate')
+    try:
+        yield context
+    finally:
+        context.chmod(0o750)
+        for name in contents:
+            (context / name).unlink()
+        context.rmdir()
+        sync_directory(parent)
 
 
 def git_runner(workspace, role, end, *, allow_bundle=False):
@@ -245,14 +328,14 @@ def build(job, repository, agreement_sha, revision, end):
     p.digest(base['verification_sha256'])
     p.require(re.fullmatch(runtime.IMAGE, base['image']), 'approved build base must be an exact OCI reference')
     recipe = protected_file(RECIPE, 8192)
-    runtime.storage_identity(runtime.STORAGE)
+    storage_dev = checked_storage(runtime, end)
     account = pwd.getpwnam(runtime.ACCOUNT)
     build = runtime.STORAGE / 'builder'
     for leaf in (build, build / 'graph', build / 'tmp'):
         info = leaf.lstat()
         p.require(stat.S_ISDIR(info.st_mode) and leaf.resolve(strict=True) == leaf and
                   info.st_uid == account.pw_uid and stat.S_IMODE(info.st_mode) == 0o700 and
-                  info.st_dev == runtime.STORAGE.stat().st_dev, 'builder storage must be private and bounded')
+                  info.st_dev == storage_dev, 'builder storage must be private and bounded')
     run = Path('/run/user') / str(account.pw_uid)
 
     def podman(graph, runroot, *args, cap=p.MAX_MESSAGE):
@@ -268,18 +351,10 @@ def build(job, repository, agreement_sha, revision, end):
         p.require(info == f'true true {graph} {runroot}', 'Podman build or import storage identity changed')
     _, _, checked_base = candidate_image(p.loads(podman(*store, 'image', 'inspect', base['image'])), base['image'])
     tag = 'localhost/dev-pair-checklist:' + revision
-    with tempfile.TemporaryDirectory(prefix='stage-', dir=build / 'tmp') as temporary:
-        work = Path(temporary)
-        # Root owns the build context and hands only a separate spool to Podman.
-        work.chmod(0o755)
-        context, spool = work / 'input', work / 'output'
-        context.mkdir(mode=0o755)
-        spool.mkdir(mode=0o700)
+    with tempfile.TemporaryDirectory(prefix='spool-', dir=build / 'tmp') as temporary, \
+            build_context(runtime, account.pw_gid, recipe, source, end) as context:
+        spool = Path(temporary)
         os.chown(spool, account.pw_uid, account.pw_gid)
-        for filename, contents in (('Containerfile', recipe), ('checklist.py', source)):
-            file = context / filename
-            write_private(file, contents)
-            file.chmod(0o444)
         podman(*store, 'build', '--quiet', '--platform', 'linux/amd64', '--format', 'oci', '--pull=never',
                '--network=none', '--timestamp=0', '--tag', tag, '--build-arg', 'CHECKLIST_BASE=' + checked_base,
                '--build-arg', 'CHECKLIST_SOURCE=' + revision, '--file', context / 'Containerfile', context)
@@ -317,3 +392,11 @@ def preload(path, receipt, end, *, expected_id=None):
     p.digest(result['image_id'])
     p.require(expected_id is None or result['image_id'] == expected_id, 'destination observed a different image ID')
     return path, receipt
+
+
+if __name__ == '__main__':
+    try:
+        p.require(sys.argv[1:] == ['__storage-witness'], 'fixed checklist storage witness required')
+        print(p.canonical(storage_witness(h.host_runtime())))
+    except (OSError, ValueError):
+        raise SystemExit('managed checklist storage verification failed') from None
