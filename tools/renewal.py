@@ -613,9 +613,31 @@ class Renewal:
             if not os.path.lexists(offer):
                 return None
             raw = read_private(offer, MAX_CONTROL)
-            require(sha(raw) == value['offer_sha256'] and loads(raw)['request'] == value['request'],
-                    'verified agent offer was changed or revoked')
-            value = value['request']
+            selected = loads(raw)
+            require(type(selected) is dict and type(selected.get('schema')) is int and selected['schema'] in (1, 2) and
+                    sha(raw) == value['offer_sha256'], 'verified agent offer was changed or revoked')
+            value = checked_request(value['request'], scope)
+            if selected['schema'] == 2:
+                from renewal_site import Resolver, offer_record, protected_bytes
+                offer_record(selected, scope)
+                require(all(value[key] == selected[key] for key in ('scope', 'operation', 'affected_jobs', 'reason')) and
+                        value['previous_sha256'] == selected['previous_release_sha256'], 'portable approval scope changed')
+                reference = value['target_sha256']
+                release = self.release(reference)
+                binding = read_json(self.control / 'platform-bindings' / (reference + '.json'))
+                observation = read_json(self.control / 'platform-observations' / (reference + '.json'))
+                boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+                directory, _, intake = Resolver(self, portable=self.root / 'platform-releases').index(selected['platform_sha256'])
+                require(binding['release_sha256'] == reference and binding['platform_sha256'] == selected['platform_sha256'] and
+                        binding['site_config_sha256'] == selected['site_config_sha256'] and binding['plan_sha256'] == release['plan_sha256'] and
+                        all(observation[key] == part for key, part in binding.items()) and observation['boot_id'] == boot and
+                        binding['intake_sha256'] == intake and
+                        observation['installed_sha256'] == sha(protected_bytes(directory / 'installed.json', 65536)),
+                        'portable site approval or installed boot readback did not match')
+            else:
+                binding = self.control / 'platform-bindings' / (self.live_release() + '.json')
+                require(not os.path.lexists(binding) and selected['request'] == value,
+                        'verified agent offer was changed or revoked')
         return checked_request(value, scope)
 
     def attempts_for(self, request):
