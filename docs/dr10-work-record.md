@@ -2,6 +2,16 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026, 08:58 UTC — storage ownership proof reviewed
+
+- Fresh GPT-6.2 Astra High review passed the storage proof at
+  `ac1b3fb8aa5e2221fc00cf563d342f34adb432cd`, including all 25 affected
+  storage tests. In an independent tmpfs fixture, GNU `du` and the worker
+  counted 28,672 live bytes. The covered backing tree measured 81,920 bytes.
+  Local integration preserves the reviewed storage proof and development host
+  entry. The combined source awaits its exact hosted suite and a single
+  maintenance probe. Native development image validation remains pending.
+
 ### November 27, 2026, 08:56 UTC — native results and local candidates
 
 - The development host entry at `ad0654a779a9c3466264b68106bee1c36a77497e`
