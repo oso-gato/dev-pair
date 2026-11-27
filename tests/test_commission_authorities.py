@@ -290,6 +290,10 @@ class Authorities(unittest.TestCase):
             client.rmdir()
             previous = os.umask(0o077)
             try:
+                with patch.object(self.live, 'run', side_effect=BootstrapBlocked('local crypto configuration')):
+                    with self.assertRaisesRegex(c.Pending, 'checklist-local-crypto'):
+                        self.live.prepare_checklist_pair(app, observed, source)
+                self.assertFalse(server.exists() or client.exists())
                 with patch.object(c.os, 'rename', side_effect=interrupt):
                     with self.assertRaisesRegex(InterruptedError, 'paused publishing'):
                         self.live.prepare_checklist_pair(app, observed, source)

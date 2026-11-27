@@ -787,6 +787,7 @@ class Live:
         return hashes
 
     def prepare_checklist_pair(self, app, observed, revision, *, issue=True):
+        from bootstrap import Blocked as BootstrapBlocked
         from destination_release import PROVISION
 
         targets = {'server': Path(CHECKLIST_SERVER), 'client': Path(CHECKLIST_CLIENT)}
@@ -824,11 +825,14 @@ class Live:
                     node = protected(leaf, 0, mode=0o600).lstat()
                     require(node.st_uid == node.st_gid == 0, 'local checklist TLS staging lost private ownership')
                     leaf.unlink()
-                self.openssl('req', '-new', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
-                             '-noenc', '-days', 365, '-subj', '/CN=dev-pair-checklist-' + role,
-                             '-addext', 'basicConstraints=critical,CA:FALSE', '-addext', 'keyUsage=critical,digitalSignature',
-                             '-addext', 'extendedKeyUsage=' + ('serverAuth' if role == 'server' else 'clientAuth'),
-                             '-keyout', path / 'key.pem', '-out', path / 'cert.pem')
+                try:
+                    self.openssl('req', '-new', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+                                 '-noenc', '-days', 365, '-subj', '/CN=dev-pair-checklist-' + role,
+                                 '-addext', 'basicConstraints=critical,CA:FALSE', '-addext', 'keyUsage=critical,digitalSignature',
+                                 '-addext', 'extendedKeyUsage=' + ('serverAuth' if role == 'server' else 'clientAuth'),
+                                 '-keyout', path / 'key.pem', '-out', path / 'cert.pem')
+                except BootstrapBlocked:
+                    raise Pending('checklist-local-crypto', 'The local checklist certificate issuance could not finish.') from None
                 for name in ('key.pem', 'cert.pem'):
                     with protected(path / name, 0, mode=0o600).open('rb') as stream:
                         os.fsync(stream.fileno())
