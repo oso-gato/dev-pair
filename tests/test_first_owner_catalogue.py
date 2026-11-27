@@ -12,6 +12,7 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import zipfile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / 'tools'))
@@ -185,8 +186,18 @@ class FirstCatalogueTests(unittest.TestCase):
         (leaf / 'manifest.json').chmod(0o444)
         portable = self.path / 'portable'
         (portable / 'development').mkdir(mode=0o700, parents=True)
-        archive.rename(portable / 'development' / archive.name)
-        (portable / 'development' / archive.name).chmod(0o444)
+        payloads = {archive.name: archive.read_bytes(), 'part.json': b'{"fixture":true}\n'}
+        shipping = io.BytesIO()
+        with zipfile.ZipFile(shipping, 'w') as release_zip:
+            for name, raw in payloads.items():
+                release_zip.writestr(name, raw)
+        old_umask = os.umask(0o077)
+        try:
+            platform_release_intake.extract_zip(shipping, portable / 'development',
+                {name: (sha256(data), len(data)) for name, data in payloads.items()}, time.monotonic() + 10)
+        finally:
+            os.umask(old_umask)
+        self.portable_archive = portable / 'development' / archive.name
         components = {role + '-agent': {'source_revision': BOOTSTRAP, 'config_sha256': 'e' * 64,
                                       'artifact_sha256': artifact if role == 'development' else '8' * 64}
                       for role in owner.ROLES}
@@ -415,6 +426,22 @@ class FirstCatalogueTests(unittest.TestCase):
         self.assertEqual(plan['roles']['development']['binary_sha256'], CODEX)
         self.portable_authority['components']['development-agent']['archive_sha256'] = 'e' * 64
         with self.assertRaisesRegex(ValueError, 'differs from its signed release'):
+            self.preview()
+        self.assertFalse(self.first.catalogue.exists())
+
+    def test_consumes_f_private_extraction_and_checks_its_exact_bytes_and_custody(self):
+        archive = self.portable_archive
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        self.preview()
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o600)
+        archive.chmod(0o620)
+        with self.assertRaisesRegex(ValueError, 'outside protected custody'):
+            self.preview()
+        archive.chmod(0o600)
+        with archive.open('r+b') as stream:
+            stream.seek(-1, os.SEEK_END)
+            stream.write(b'x')
+        with self.assertRaisesRegex(ValueError, 'archive digest differs'):
             self.preview()
         self.assertFalse(self.first.catalogue.exists())
 

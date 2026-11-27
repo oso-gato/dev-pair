@@ -792,19 +792,26 @@ def selected_site(intake):
     return controller, selected, manifests, site, binding, 'https://' + name + '/'
 
 
-def development_labels(path, component, expected_bytes, deadline):
+def development_labels(path, component, signed, deadline):
     from devbox import db
+    from native_placements import directory_fd
+    from platform_release_protocol import stream_exact
 
     config_sha = component['artifact_sha256']
     p.digest(config_sha)
-    protect_directory(path.parent)
-    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-    with os.fdopen(os.open(path, flags), 'rb') as stream:
-        node = os.fstat(stream.fileno())
-        p.require(stat.S_ISREG(node.st_mode) and node.st_uid == 0 and node.st_nlink == 1 and
-                  not node.st_mode & 0o222 and 0 < node.st_size == expected_bytes <= 16 * 1024**3,
-                  'Approved DevBox OCI archive is not a protected bounded file.')
-        db.check_archive_headers(path, node.st_size, deadline)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    with directory_fd(protect_directory(path.parent)) as parent, \
+            os.fdopen(os.open(path.name, flags, dir_fd=parent), 'rb') as stream:
+        directory, node = os.fstat(parent), os.fstat(stream.fileno())
+        p.require(directory.st_uid == node.st_uid == 0 and not directory.st_mode & 0o022 and
+                  stat.S_ISREG(node.st_mode) and node.st_nlink == 1 and
+                  stat.S_IMODE(node.st_mode) in (0o400, 0o440, 0o444, 0o600) and
+                  0 < node.st_size == signed['archive_bytes'] <= 16 * 1024**3,
+                  'Approved DevBox OCI archive is outside protected custody or its signed bound.')
+        p.require(stream_exact(stream, node.st_size, deadline) == signed['archive_sha256'] and not stream.read(1),
+                  'DevBox OCI archive digest differs from the selected signed transport.')
+        stream.seek(0)
+        db.check_archive_headers(Path('/proc/self/fd') / str(stream.fileno()), node.st_size, deadline)
         with tarfile.open(fileobj=stream, mode='r:') as archive:
             selected = None
             for index, entry in enumerate(archive):
@@ -818,9 +825,12 @@ def development_labels(path, component, expected_bytes, deadline):
                 p.require(p.sha256(raw) == config_sha, 'DevBox OCI config digest changed.')
                 selected = db.json_data(raw)['config']['Labels']
         p.require(selected is not None, 'The selected DevBox archive lacks the exact OCI config.')
-        seen = path.lstat()
+        seen = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        placed = path.parent.lstat()
         p.require((seen.st_dev, seen.st_ino, seen.st_size, seen.st_ctime_ns) ==
-                  (node.st_dev, node.st_ino, node.st_size, node.st_ctime_ns), 'DevBox OCI archive changed during selection.')
+                  (node.st_dev, node.st_ino, node.st_size, node.st_ctime_ns) and
+                  (placed.st_dev, placed.st_ino) == (directory.st_dev, directory.st_ino),
+                  'DevBox OCI archive changed during selection.')
         return selected
 
 
@@ -863,7 +873,7 @@ def role_site_profiles(intake, controller, selected, binding, job, manifest_sha,
     # The installed manifest is selected by digest beneath the dp-dev placement.
     # Read config bytes from the separately protected signed portable part.
     observed['development'] = development_labels(portable / 'development/development.oci.tar', development,
-                                                 signed['archive_bytes'], time.monotonic() + 15)
+                                                 signed, time.monotonic() + 45)
     roles = {}
     for role, name in ROLES.items():
         account = pwd.getpwnam(name)
