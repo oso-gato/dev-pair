@@ -51,6 +51,8 @@ SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
 DEVELOPMENT_HOST_INTENT = STATE + '/prepare-development-host.json'
 ACCESS_MODE = 'verified-provider-console'
+ATTENDED_ACCESS = 'attended-local-recovery'
+ATTENDED_RECEIPT = '/run/dev-pair-day0/recovery.json'
 GUARD_PATH = '/etc/dev-pair/bootstrap.nft'
 CUTOVER = STATE + '/access-cutover.json'
 TRUST_SIGNERS = '/etc/dev-pair/trust/allowed_signers'
@@ -1303,19 +1305,23 @@ class Bootstrap:
             raise Blocked('destination machine or boot identity unavailable')
         return {'machine_id': machine, 'boot_id': str(uuid.UUID(boot))}
 
-    def destination_source(self, expected):
+    def destination_source(self, expected, *, checkout=None):
         if type(expected) is not str or not re.fullmatch(r'[0-9a-f]{40}', expected):
             raise Blocked('exact independently admitted full source SHA required')
         script = Path(__file__).absolute()
-        repo = script.parents[1]
-        for path in (script, *script.parents, repo / '.git'):
+        repo = script.parents[1] if checkout is None else Path(checkout)
+        recorded_script = repo / 'tools/bootstrap.py'
+        if not repo.is_absolute():
+            raise Blocked('owner recovery checkout must be absolute')
+        for path in (script, *script.parents, recorded_script, *recorded_script.parents, repo / '.git'):
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
                 raise Blocked('destination source path is not root protected')
         git = ('/usr/bin/git', '-C', str(repo))
         if (self.run(*git, 'rev-parse', '--verify', 'HEAD').strip() != expected
                 or self.run(*git, 'status', '--porcelain=v1', '--untracked-files=all').strip()
-                or self.run(*git, 'show', expected + ':tools/bootstrap.py') != Path(__file__).read_text()):
+                or self.run(*git, 'show', expected + ':tools/bootstrap.py') != script.read_text()
+                or recorded_script.read_bytes() != script.read_bytes()):
             raise Blocked('destination source checkout differs from independent admission')
         return expected
 
@@ -1347,6 +1353,7 @@ class Bootstrap:
         return data
 
     def validate_bootstrap_access(self, sources, console_receipt=None):
+        self.attended_access = False
         if console_receipt is None:
             networks = validate_sources(sources)
             if self.root == Path('/'):
@@ -1355,7 +1362,11 @@ class Bootstrap:
                     raise Blocked('current live SSH source is outside declared bootstrap CIDRs')
             return networks
         if sources or os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_CLIENT') or self.ssh_ancestor():
-            raise Blocked('zero-public-SSH setup requires verified out-of-band provider transport')
+            raise Blocked('console-based setup requires a separate out-of-band recovery route')
+        if console_receipt == ATTENDED_RECEIPT:
+            self.verify_attended_recovery(console_receipt)
+            self.attended_access = True
+            return []
         data = self.recent_destination_evidence(console_receipt, 'dev-pair-provider-console',
                                                 {'provider', 'provider_vps_id', 'transport', 'reopened_root', 'public_ssh_denied'},
                                                 lifetime=7200)
@@ -1365,6 +1376,20 @@ class Bootstrap:
                 or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', data['provider_vps_id'])):
             raise Blocked('verified Hostinger out-of-band root recovery is required')
         return []
+
+    def verify_attended_recovery(self, receipt):
+        path = checked_file(receipt, secret=True)
+        data = json.loads(path.read_bytes(), object_pairs_hook=relay.unique)
+        identity = self.destination_identity()
+        fields = {'schema', 'kind', 'source_sha', 'machine_id', 'boot_id', 'created_at', 'origin_session', 'confirmed_session', 'owner_checkout'}
+        if (type(data) is not dict or set(data) != fields or type(data['schema']) is not int or data['schema'] != 1
+                or data['kind'] != ATTENDED_ACCESS or any(data[key] != value for key, value in identity.items())
+                or type(data['created_at']) is not int or not 0 <= time.time() - data['created_at'] <= 1800
+                or any(type(data[key]) is not int or data[key] < 2 for key in ('origin_session', 'confirmed_session'))
+                or data['origin_session'] == data['confirmed_session']):
+            raise Blocked('separate current-boot attended recovery confirmation is required')
+        self.destination_source(data['source_sha'], checkout=data['owner_checkout'])
+        return data
 
     def ssh_ancestors(self):
         pid = os.getppid()
@@ -2416,17 +2441,37 @@ class Bootstrap:
                f'Match User {name}\n    AuthorizedKeysFile /etc/ssh/dev-pair-keys/{name}\n'
                '    AuthenticationMethods publickey\n    PasswordAuthentication no\n'
                '    KbdInteractiveAuthentication no\n    PubkeyAuthentication yes\nMatch all\n')
+        attended = getattr(self, 'attended_access', False)
+        if attended:
+            outside = '*,!100.64.0.0/10,!fd7a:115c:a1e0::/48'
+            ssh += (f'Match User {name} Address {outside}\n    DenyUsers {name}\nMatch all\n'
+                    f'Match User {name} LocalAddress {outside}\n    DenyUsers {name}\nMatch all\n')
         target = '/etc/ssh/sshd_config.d/00-dev-pair-operator.conf'
         created = not self.path(target).exists()
         self.atomic(target, ssh, mode=0o600)
         try:
             self.run('/usr/sbin/sshd', '-t')
-            effective = self.run('/usr/sbin/sshd', '-T', '-C', f'user={name},host=bootstrap,addr=100.64.0.1')
+            probe = f'user={name},host=bootstrap,addr=100.64.0.1'
+            if attended:
+                probe += ',laddr=100.64.0.2'
+            effective = self.run('/usr/sbin/sshd', '-T', '-C', probe)
             required = ('authenticationmethods publickey', 'passwordauthentication no',
                         'kbdinteractiveauthentication no', 'pubkeyauthentication yes',
                         f'authorizedkeysfile /etc/ssh/dev-pair-keys/{name}')
             if not all(x in effective.splitlines() for x in required):
                 raise Blocked('effective operator SSH settings conflict')
+            if attended:
+                def denied(config):
+                    return any(line.split()[0] == 'denyusers' and name in line.split()[1:]
+                               for line in config.splitlines() if line.strip())
+                if denied(effective):
+                    raise Blocked('attended core route is denied on the tailnet')
+                for conditions in ('addr=192.0.2.1,laddr=100.64.0.2', 'addr=100.64.0.1,laddr=192.0.2.2',
+                                   'addr=2001:db8::1,laddr=fd7a:115c:a1e0::2',
+                                   'addr=fd7a:115c:a1e0::1,laddr=2001:db8::2'):
+                    outside_config = self.run('/usr/sbin/sshd', '-T', '-C', f'user={name},host=bootstrap,{conditions}')
+                    if not denied(outside_config):
+                        raise Blocked('attended core account has an SSH route outside the tailnet')
             self.run('/usr/bin/systemctl', 'reload', 'sshd.service')
         except BaseException:
             # Never leave a newly introduced invalid fragment active after a failed validation.
@@ -2451,7 +2496,7 @@ class Bootstrap:
                            'gptbox_context_sha256': expected_context, 'operator': name,
                            'keys_source': KEYS_URL, 'bootstrap_sources': sources}
         if not sources:
-            desired['bootstrap_transport'] = ACCESS_MODE
+            desired['bootstrap_transport'] = ATTENDED_ACCESS if getattr(self, 'attended_access', False) else ACCESS_MODE
         return json.dumps(desired, sort_keys=True) + '\n'
 
     def _reject_development_host_intent(self):
@@ -2780,15 +2825,16 @@ class Bootstrap:
             raise Blocked('existing bootstrap nft table has no managed configuration')
 
     @staticmethod
-    def guard_rules(sources, *, tailnet_only=False):
-        if tailnet_only and sources:
+    def guard_rules(sources, *, tailnet_only=False, retain_ssh=False):
+        if tailnet_only and (sources or retain_ssh):
             raise Blocked('tailnet-only ingress cannot retain scoped temporary sources')
         scoped = [f'add rule inet dev_pair_bootstrap input {"ip6" if ":" in cidr else "ip"} saddr {cidr} tcp dport 22 accept'
                   for cidr in sources]
         before = 'add rule inet dev_pair_bootstrap input ct state established,related accept'
         drop = 'add rule inet dev_pair_bootstrap input iifname != "lo" iifname != "tailscale0" tcp dport '
         drop += ('{ 22, 443 }' if tailnet_only else '22') + ' drop'
-        guard = GUARD.replace('{bootstrap_rules}\n', '').replace(before, '\n'.join([*scoped, drop, before]))
+        access = (['add rule inet dev_pair_bootstrap input tcp dport 22 accept'] if retain_ssh else [*scoped, drop])
+        guard = GUARD.replace('{bootstrap_rules}\n', '').replace(before, '\n'.join([*access, before]))
         if tailnet_only:
             guard = guard.replace('"tailscale0" tcp dport 22 accept', '"tailscale0" tcp dport { 22, 443 } accept')
         return guard
@@ -2799,7 +2845,8 @@ class Bootstrap:
         state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
         if state and state.get('phase') != 'complete':
             raise Blocked('access cutover interrupted; finish cutover before preparing the host again')
-        guard = self.guard_rules([], tailnet_only=True) if state else self.guard_rules(sources)
+        guard = (self.guard_rules([], tailnet_only=True) if state else
+                 self.guard_rules(sources, retain_ssh=getattr(self, 'attended_access', False)))
         self.atomic(GUARD_PATH, guard, mode=0o600)
         self.atomic('/etc/systemd/system/dev-pair-bootstrap-guard.service', UNIT, mode=0o644)
         self.run('/usr/sbin/nft', '--check', '-f', str(self.path(GUARD_PATH)))
@@ -2809,9 +2856,12 @@ class Bootstrap:
         self.run('/usr/sbin/nft', '-f', str(self.path(GUARD_PATH)))
         self.run('/usr/bin/systemctl', 'start', 'dev-pair-bootstrap-guard.service')
 
-    def enroll(self, secret, tailnet):
+    def enroll(self, secret, tailnet, *, browser=None):
         self.preflight()
-        secret = checked_file(secret, secret=True)
+        if (secret is None) == (browser is None) or browser is not None and not callable(browser):
+            raise Blocked('choose exactly one protected key or interactive browser enrollment')
+        if secret is not None:
+            secret = checked_file(secret, secret=True)
         if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.@-]{0,252}', tailnet):
             raise Blocked('invalid expected tailnet name')
         with self.lock():
@@ -2851,9 +2901,12 @@ class Bootstrap:
                     raise Blocked('stopped enrollment tailnet mismatch; explicit recovery/new credentials required')
                 self.atomic(intent, expected)
                 if state != 'Running':
-                    self.step('enroll', lambda: self.run('/usr/bin/tailscale', 'up', '--auth-key=file:' + str(secret),
-                             '--accept-routes=false', '--accept-dns=false', '--ssh=false',
-                             '--advertise-exit-node=false', '--netfilter-mode=off', '--timeout=60s'))
+                    command = ('/usr/bin/tailscale', 'up', '--accept-routes=false', '--accept-dns=false', '--ssh=false',
+                               '--advertise-exit-node=false', '--netfilter-mode=off')
+                    if browser is None:
+                        self.step('enroll', lambda: self.run(*command, '--auth-key=file:' + str(secret), '--timeout=60s'))
+                    else:
+                        self.step('enroll', lambda: browser((*command, '--timeout=10m')))
                 live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json'))
                 if not isinstance(live, dict) or live.get('BackendState') != 'Running':
                     raise Blocked('enrollment did not reach Running; bootstrap access retained')
@@ -2955,8 +3008,15 @@ class Bootstrap:
         self.run('/usr/sbin/sshd', '-t')
         required = {'permitrootlogin no', 'allowusers core', 'authenticationmethods publickey',
                     'passwordauthentication no', 'kbdinteractiveauthentication no'}
+        transport = json.loads(self.text(STATE + '/desired.json', '{}'), object_pairs_hook=relay.unique).get('bootstrap_transport')
         for user in ('root', 'core', 'dp-maint', 'dp-dev', 'dp-checklist'):
-            effective = self.run('/usr/sbin/sshd', '-T', '-C', f'user={user},host=erebus,addr=100.64.0.1').splitlines()
+            probe = f'user={user},host=erebus,addr=100.64.0.1'
+            if transport == ATTENDED_ACCESS:
+                probe += ',laddr=100.64.0.2'
+            effective = self.run('/usr/sbin/sshd', '-T', '-C', probe).splitlines()
+            if transport == ATTENDED_ACCESS and user == 'core' and any(
+                    row.startswith('denyusers ') and 'core' in row.split()[1:] for row in effective):
+                raise Blocked('effective tailnet OpenSSH denies the named core account')
             if (not required.issubset(effective) or [line for line in effective if line.startswith('allowusers ')] != ['allowusers core']
                     or user == 'core' and 'authorizedkeysfile /etc/ssh/dev-pair-keys/core' not in effective):
                 raise Blocked('effective tailnet OpenSSH configuration conflicts')
@@ -3050,9 +3110,11 @@ class Bootstrap:
                 raise Blocked('cutover requires the admitted independent provider recovery terminal')
             desired = json.loads(checked_file(self.path(f'{STATE}/desired.json')).read_text(), object_pairs_hook=relay.unique)
             sources = desired.get('bootstrap_sources')
-            if sources != [] or desired.get('bootstrap_transport') != ACCESS_MODE:
+            transport = desired.get('bootstrap_transport')
+            if sources != [] or transport not in (ACCESS_MODE, ATTENDED_ACCESS):
                 sources = validate_sources(sources)
-            temporary, permanent = self.guard_rules(sources), self.guard_rules([], tailnet_only=True)
+            temporary = self.guard_rules(sources, retain_ssh=transport == ATTENDED_ACCESS)
+            permanent = self.guard_rules([], tailnet_only=True)
             current = checked_file(self.path(GUARD_PATH)).read_text()
             prior_raw = self.text(CUTOVER)
             prior = json.loads(prior_raw or '{}', object_pairs_hook=relay.unique)
@@ -3109,7 +3171,8 @@ class Bootstrap:
                 'enrollment_recorded': self.path(f'{STATE}/node.json').exists(),
                 'phase': 'tailnet-only' if cutover == 'complete' else 'temporary-bootstrap',
                 'access_cutover': cutover or 'independent evidence required',
-                'root_and_initial_ssh_retained': cutover is None and access.get('bootstrap_sources') != [],
+                'root_and_initial_ssh_retained': cutover is None and (access.get('bootstrap_sources') != [] or
+                                                                    access.get('bootstrap_transport') == ATTENDED_ACCESS),
                 'runtime_acceptance': 'not verified', 'state': STATE,
                 'note': 'Recorded state only; not proof of current external reachability or recovery'}
 

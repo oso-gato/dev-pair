@@ -20,7 +20,7 @@ import time
 from types import ModuleType
 
 from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Commands, PrepareCost, KEYS_URL, PACKAGES, SOURCE_BASELINE,
-                       ACCESS_MODE, SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
+                       ACCESS_MODE, ATTENDED_ACCESS, SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
 from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPROVALS, TURN_READONLY_MOUNTS,
@@ -1122,7 +1122,7 @@ class Gptbox(Bootstrap):
             if sha(self.protected_bytes(build / name, 65536, 0o444)) != record[key]:
                 raise Blocked('prepared recipe/input hash mismatch')
 
-    def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
+    def assemble(self, context, expected, upstream, revision, apply=False, retry=False, *, prepared_host=False):
         self.preflight()
         manifest, self.scripts = self.inputs(context, expected, upstream, revision)
         self.failure_diagnostic_identity={'source_sha':revision,'context_sha256':expected,'phase':'maintenance-gptbox'}
@@ -1131,6 +1131,11 @@ class Gptbox(Bootstrap):
                     'operation': 'genuine Distrobox assembly, seal, boundary/version entry and restart probes'}
         if not self.path(STATE + '/prepared').exists():
             raise Blocked('normal host preparation must complete first')
+        if prepared_host:
+            with self.run.phase(ADAPTER_EXECUTION, 'dev-pair-initialize-adapter'), self.lock():
+                ready = self.maintenance_host_readiness(expected)
+                self._validate_host_ready(ready, revision, expected)
+                return self._assemble_locked(context, expected, upstream, revision, manifest, retry=retry, fresh=True)
         with self.lock():
             return self._assemble_locked(context,expected,upstream,revision,manifest,retry=retry)
 
@@ -1507,6 +1512,8 @@ class Gptbox(Bootstrap):
         target = {'source_sha': revision, 'context_sha256': expected, 'standards_sha': candidate.STANDARDS,
                   'distrobox_sha': DBX_SHA, 'bootstrap_sources': sources, 'verified_console': console_receipt is not None,
                   'provider_ssh': provider_ssh}
+        if getattr(self, 'attended_access', False):
+            target['attended_console'] = True
         with self.run.phase(PREPARE_EXECUTION + 120, 'dev-pair-maintenance-host', native=False):
             self.preflight()
             self.context_inputs(context, expected, revision)
@@ -1552,6 +1559,8 @@ class Gptbox(Bootstrap):
                 raise Blocked('partial maintenance host preparation requires its bounded exact-target retry')
             raw, record = data.decode(), prior
         preparation = self.preparation()
+        if target.get('attended_console'):
+            preparation.attended_access = True
         if os.path.lexists(self.path(STATE + '/desired.json')):
             desired = self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600)
             if desired != preparation._host_desired('core', target['bootstrap_sources'], expected).encode():
@@ -1616,7 +1625,7 @@ class Gptbox(Bootstrap):
         fields = {'schema', 'source_baseline', 'standards_sha', 'bootstrap_sha256', 'gptbox_context_sha256',
                   'operator', 'keys_source', 'bootstrap_sources'}
         sources = desired.get('bootstrap_sources')
-        if sources == [] and desired.get('bootstrap_transport') == 'verified-provider-console':
+        if sources == [] and desired.get('bootstrap_transport') in (ACCESS_MODE, ATTENDED_ACCESS):
             fields.add('bootstrap_transport')
         elif type(sources) is not list or validate_sources(sources) != sources:
             raise Blocked('protected maintenance host ingress identity differs')
@@ -1692,7 +1701,7 @@ class Gptbox(Bootstrap):
         target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
                   'bootstrap_sources': sources}
         if console_receipt:
-            target['bootstrap_transport'] = ACCESS_MODE
+            target['bootstrap_transport'] = ATTENDED_ACCESS if self.attended_access else ACCESS_MODE
         path = STATE + '/initialize.json'
         # The journey lock and existing global bootstrap lock span the private
         # host handoff and image/assembly; public entry points take that lock separately.
@@ -2004,7 +2013,7 @@ class DevelopmentGptbox(Gptbox):
         desired = json.loads(desired_raw, object_pairs_hook=fedora_oci.unique)
         fields = {'schema', 'standards_sha', 'source_baseline', 'bootstrap_sha256',
                   'gptbox_context_sha256', 'operator', 'keys_source', 'bootstrap_sources'}
-        console = (type(desired) is dict and desired.get('bootstrap_transport') == ACCESS_MODE
+        console = (type(desired) is dict and desired.get('bootstrap_transport') in (ACCESS_MODE, ATTENDED_ACCESS)
                    and desired.get('bootstrap_sources') == [])
         if console:
             fields.add('bootstrap_transport')
@@ -2480,7 +2489,7 @@ def main():
     if sys.argv[1:2] and sys.argv[1] in ('prepare-maintenance-host', 'verify-installed-maintenance'):
         return maintenance_install_cli(sys.argv[1], sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('assemble', 'initialize', 'prepare-development-host', 'build-development'))
+    parser.add_argument('stage', choices=('assemble', 'assemble-prepared-maintenance', 'initialize', 'prepare-development-host', 'build-development'))
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--retry', action='store_true', help='reconcile and retry one incomplete exact target; at most two attempts')
     parser.add_argument('--context', required=True)
@@ -2520,6 +2529,9 @@ def main():
                 result = app.prepare_development_host(args.context, args.expected_context_sha256, args.distrobox_source,
                                                       args.source_sha, args.bootstrap_source, args.password_file,
                                                       args.apply, args.retry)
+            elif args.stage == 'assemble-prepared-maintenance':
+                result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
+                                      args.apply, args.retry, prepared_host=True)
             else:
                 result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
             print(json.dumps(result, indent=2))

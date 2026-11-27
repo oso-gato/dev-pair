@@ -248,6 +248,78 @@ class GptboxTests(unittest.TestCase):
         self.assertTrue(self.assemble()['reused_completed_evidence'])
         self.assertEqual(len([call for call, _ in self.engine.calls if 'build' in call]), prior_builds)
 
+    def test_prepared_host_cli_lane_builds_and_executes_both_probes_without_core_setup(self):
+        from contextlib import nullcontext
+
+        self.app.path(g.STATE + '/gptbox-image.json').unlink()
+        desired = self.app.text(g.STATE + '/prepared')
+        self.app.atomic(g.STATE + '/desired.json', desired)
+        self.app.atomic(g.STATE + '/packages.txt', 'fixture package readback\n')
+        ready = {'schema': 1, 'kind': 'host-prerequisites', 'source_sha': SOURCE, 'context_sha256': EXPECTED,
+                 'standards_sha': g.candidate.STANDARDS, 'bootstrap_sha256': g.sha((Path(g.__file__).with_name('bootstrap.py')).read_bytes()),
+                 'desired_sha256': g.sha(desired.encode()), 'packages_sha256': g.sha(b'fixture package readback\n')}
+        self.app.atomic(g.STATE + '/host-ready.json', json.dumps(ready) + '\n')
+        argv = ['gptbox.py', 'assemble-prepared-maintenance', '--apply', '--context', str(self.context),
+                '--expected-context-sha256', EXPECTED, '--distrobox-source', '/unused', '--source-sha', SOURCE]
+        from contextlib import redirect_stdout
+        from io import StringIO
+        output = StringIO()
+        with (patch.object(g, 'Gptbox', return_value=self.app),
+              patch.object(self.app, 'maintenance_host_readiness', return_value=ready),
+              patch.object(self.app.run, 'phase', return_value=nullcontext(), create=True),
+              patch.object(sys, 'argv', argv), redirect_stdout(output)):
+            self.assertEqual(g.main(), 0)
+        observed = json.loads(output.getvalue())
+        self.assertEqual(observed['boundary_and_version_cycles'], 2)
+        self.assertTrue(observed['runtime_container_removed'])
+        self.assertFalse(observed['job_admission'])
+        self.assertEqual([args[-1] for args in self.app.entry_calls], ['probe', 'version', 'probe', 'version'])
+        self.assertFalse(any('chpasswd' in args[0] for args, _ in self.engine.calls))
+
+    def test_combined_initialize_retry_reconciles_native_inventory_and_completes_receipt(self):
+        from contextlib import nullcontext
+
+        self.app.path(g.STATE + '/gptbox-image.json').unlink()
+        desired = self.app.text(g.STATE + '/prepared')
+        self.app.atomic(g.STATE + '/desired.json', desired)
+        self.app.atomic(g.STATE + '/packages.txt', 'fixture package readback\n')
+        ready = {'schema': 1, 'kind': 'host-prerequisites', 'source_sha': SOURCE, 'context_sha256': EXPECTED,
+                 'standards_sha': g.candidate.STANDARDS, 'bootstrap_sha256': g.sha((Path(g.__file__).with_name('bootstrap.py')).read_bytes()),
+                 'desired_sha256': g.sha(desired.encode()), 'packages_sha256': g.sha(b'fixture package readback\n')}
+        self.app.atomic(g.STATE + '/host-ready.json', json.dumps(ready) + '\n')
+        self.app.atomic(g.STATE + '/operator-password-set', 'password configured; value remains external\n')
+        access = ['192.0.2.44/32']
+        target = {'source_sha': SOURCE, 'context_sha256': EXPECTED, 'distrobox_sha': g.DBX_SHA,
+                  'bootstrap_sources': access}
+        unit = 'dev-pair-initialize-adapter-1234abcd-5678efab'
+        stale = {'schema': 2, 'target': target, 'phase': 'maintenance-gptbox', 'prepare': 'complete',
+                 'maintenance_gptbox': 'blocked', 'native_units': [unit]}
+        self.app.atomic(g.STATE + '/initialize.json', json.dumps(stale) + '\n')
+        self.app.run.metadata_diagnostic = None
+        preparation = SimpleNamespace(run=self.app.run, _host_prerequisites=lambda *args, **kwargs: ready)
+        argv = ['gptbox.py', 'initialize', '--apply', '--retry', '--context', str(self.context),
+                '--expected-context-sha256', EXPECTED, '--distrobox-source', '/unused', '--source-sha', SOURCE,
+                '--bootstrap-source', access[0]]
+        from contextlib import redirect_stdout
+        from io import StringIO
+        output = StringIO()
+        with (patch.object(g, 'Gptbox', return_value=self.app), patch.object(g, 'github_keys', return_value='fixture'),
+              patch.object(self.app, 'preparation', return_value=preparation),
+              patch.object(self.app, 'protected', side_effect=lambda path: Path(path)),
+              patch.object(self.app, 'check_gptbox_inputs', return_value=(None, None, {'source_sha': SOURCE})),
+              patch.object(self.app.run, 'phase', return_value=nullcontext(), create=True),
+              patch.object(self.app.run, 'reconcile_native', create=True) as reconcile,
+              patch.object(sys, 'argv', argv), redirect_stdout(output)):
+            self.assertEqual(g.main(), 0)
+        observed = json.loads(output.getvalue())
+        self.assertEqual(observed['phase'], 'complete')
+        self.assertEqual(observed['result']['boundary_and_version_cycles'], 2)
+        self.assertEqual(observed['native_units'], [unit])
+        self.assertEqual(reconcile.call_args_list[0].args[0], ('--unit=' + unit, '--description=dev-pair-owned-' + unit))
+        self.assertEqual(json.loads(self.app.text(g.STATE + '/initialize.json')), observed)
+        self.assertEqual(len(self.app.entry_calls), 4)
+        self.assertFalse(any('chpasswd' in args[0] for args, _ in self.engine.calls))
+
     def test_pre_change_local_completion_binds_the_actual_sealed_output(self):
         result = self.assemble()
         resources = self.app.target + '/resources.json'
