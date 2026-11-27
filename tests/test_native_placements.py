@@ -4,10 +4,13 @@ from contextlib import contextmanager
 import hashlib
 import os
 from pathlib import Path
+import stat
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
+import tomllib
 from unittest.mock import Mock, patch
 
 from test_devbox import manifest, oci_archive
@@ -131,9 +134,11 @@ class TestKernelOwnership(unittest.TestCase):
 
     def test_reserve_is_charged_before_allocating_a_new_volume(self):
         with TemporaryDirectory() as scratch:
-            placement = SimpleNamespace(record=Path(scratch) / 'lease.json', state={'volumes': {}}, save=Mock())
+            placement = SimpleNamespace(record=Path(scratch) / 'lease.json', backings=Path(scratch),
+                                        state={'volumes': {}}, save=Mock())
             volume = n.Volume(placement, 'build', Path('/native/build'), 16 * db.GIB)
-            with patch.object(n, 'free_space', return_value=23 * db.GIB), self.assertRaisesRegex(db.Blocked, 'reserve'):
+            stats = SimpleNamespace(f_bavail=23 * db.GIB, f_frsize=1, f_files=100000, f_favail=80000)
+            with patch.object(n.os, 'statvfs', return_value=stats), self.assertRaisesRegex(db.Blocked, 'reserve'):
                 volume.backing_file()
             self.assertFalse(volume.backing.exists())
             placement.save.assert_not_called()
@@ -146,6 +151,148 @@ class TestKernelOwnership(unittest.TestCase):
         with self.assertRaisesRegex(db.Blocked, 'three exclusive'):
             n.allocate_categories(set(range(1022)))
 
+    def test_real_retained_store_counts_against_aggregate_before_allocation(self):
+        scratch = Path(self.enterContext(TemporaryDirectory()))
+        maintenance = scratch / 'maintenance'
+        producer = scratch / 'producer'
+        for directory in (maintenance, producer):
+            directory.mkdir()
+            (directory / 'reserved-image').write_bytes(os.urandom(1024 * 1024))
+        allocated = n.retained_usage((maintenance, producer), set())
+        self.assertGreaterEqual(allocated, 2 * 1024 * 1024)
+        fitting = SimpleNamespace(allocated=lambda: 0, capacity=n.MANAGED_CEILING - n.HOST_METADATA_BYTES - allocated)
+        self.assertEqual(n.check_aggregate(allocated, (fitting,))['aggregate_peak_bytes'], n.MANAGED_CEILING)
+        fitting.capacity += 1
+        with self.assertRaisesRegex(db.Blocked, 'managed storage'):
+            n.check_aggregate(allocated, (fitting,))
+
+    def test_existing_allocated_backing_is_counted_once_and_headroom_is_retained(self):
+        reserved = SimpleNamespace(allocated=lambda: 2 * db.GIB, capacity=4 * db.GIB)
+        result = n.check_aggregate(3 * db.GIB, (reserved,))
+        self.assertEqual(result['retained_bytes'], db.GIB)
+        self.assertEqual(result['aggregate_peak_bytes'], 5 * db.GIB + n.HOST_METADATA_BYTES)
+
+    def test_inode_is_rebound_to_verified_new_minor_and_exchanged_leaf_is_rejected(self):
+        scratch = Path(self.enterContext(TemporaryDirectory()))
+        path = scratch / 'inputs'
+        path.mkdir()
+        node = path.stat()
+        earlier_loop = SimpleNamespace(**{field: getattr(node, field) for field in
+                                          ('st_ino', 'st_uid', 'st_gid', 'st_mode')}, st_dev=node.st_dev + 1)
+        self.assertNotEqual(n.identity(earlier_loop), n.identity(node))
+        volume = SimpleNamespace(info={'inputs': n.volume_inode(earlier_loop)},
+                                 device=SimpleNamespace(stat=lambda: SimpleNamespace(st_rdev=node.st_dev)))
+        placement = n.Placement.__new__(n.Placement)
+        placement.build_path = scratch
+        placement.outer_label = 'fixture'
+        placement.existing_volume = Mock(return_value=volume)
+
+        @contextmanager
+        def opened(parent, name, *owners, **options):
+            fd = os.open(name, os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                yield fd, False
+            finally:
+                os.close(fd)
+
+        with patch.object(n, 'private_child', opened):
+            with placement.build_inputs() as fd:
+                self.assertEqual(os.fstat(fd).st_ino, node.st_ino)
+            path.rename(scratch / 'preserved')
+            path.mkdir()
+            with self.assertRaisesRegex(db.Blocked, 'input directory was exchanged'), placement.build_inputs():
+                self.fail('accepted a replacement inode')
+
+
+class TestStagedAccess(unittest.TestCase):
+    def test_ordinary_storage_check_stats_backing_with_execute_only_ancestors(self):
+        root = Path(self.enterContext(TemporaryDirectory()))
+        backings = root / 'backings'
+        job = backings / 'fixture'
+        for directory in (backings, job):
+            directory.mkdir(mode=0o711)
+            directory.chmod(0o711)
+        image = job / 'build.ext4'
+        image.write_bytes(os.urandom(8192))
+        image.chmod(0o000)  # Simulate the role's lack of access to root's mode-0600 bytes.
+        payload = f"""import os, sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+sys.path.insert(0, {str(n.SOURCE / 'tools')!r})
+import devbox
+volume = Path('/dev/shm')
+node = volume.stat()
+device = f'{{os.major(node.st_dev)}}:{{os.minor(node.st_dev)}}'
+sysfs = Path('/sys/dev/block') / device / 'loop/backing_file'
+real_exists, real_read, real_statvfs = Path.exists, Path.read_text, os.statvfs
+def mount_space(path):
+    if path == volume.parent:
+        return SimpleNamespace(f_bavail=8 * devbox.db.GIB, f_frsize=1)
+    return real_statvfs(path)
+with patch.object(Path, 'exists', lambda path: path == sysfs or real_exists(path)), \
+     patch.object(Path, 'read_text', lambda path: {str(image)!r} if path == sysfs else real_read(path)), \
+     patch.object(os, 'statvfs', mount_space):
+    info = f'10 1 {{device}} / /dev/shm rw - ext4 /dev/loop5 rw'
+    capacity = real_statvfs(volume)
+    assert devbox.storage_mount(volume, capacity.f_blocks * capacity.f_frsize, info)['device'] == device
+"""
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', payload], check=False, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        if os.geteuid() != 0:
+            backings.chmod(0)
+            denied = subprocess.run([sys.executable, '-I', '-B', '-c', payload],
+                                    check=False, capture_output=True, timeout=5)
+            backings.chmod(0o711)
+            self.assertNotEqual(denied.returncode, 0)
+            self.assertIn(b'PermissionError', denied.stderr)
+
+    def test_real_launcher_stage_is_traversable_under_private_umask(self):
+        root = Path(self.enterContext(TemporaryDirectory()))
+        root.chmod(0o755)
+
+        class Relocated(DevelopmentGptbox):
+            def directory(self, name, mode=0o700, owner=None):
+                return super().directory('/' + str(Path(name).relative_to(self.root)), mode, owner)
+
+        placement = n.Placement.__new__(n.Placement)
+        placement.producer = Relocated(root)
+        placement.recipes = root / 'recipes'
+        placement.entry = placement.recipes / 'entry'
+        placement.entry_files = {name: (n.SOURCE / name).read_bytes() for name in n.ENTRY_FILES}
+        previous = os.umask(0o077)
+        try:
+            n.protected_directories(placement.producer, placement.recipes)
+            placement.stage_entry()
+        finally:
+            os.umask(previous)
+        for leaf in (*n.ENTRY_FILES, 'tools/placement_check.py'):
+            path = placement.entry / leaf
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o444)
+            for ancestor in path.parents:
+                if ancestor == root:
+                    break
+                self.assertEqual(stat.S_IMODE(ancestor.stat().st_mode), 0o755)
+        probe = """import sys, tomllib
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import devbox
+with (devbox.RUNTIME / 'host-containers.conf').open('rb') as stream:
+    assert tomllib.load(stream)['containers']['default_capabilities'] == ['CAP_SETUID', 'CAP_SETGID']
+print(devbox.__file__)
+"""
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', probe, str(placement.entry / 'tools')],
+                                check=True, capture_output=True, timeout=5)
+        self.assertEqual(Path(result.stdout.decode().strip()), placement.entry / 'tools/devbox.py')
+
+    def test_build_profile_has_filecap_without_runtime_sysadmin_and_removes_inherited_sudo(self):
+        caps = tomllib.loads(n.BUILD_CONF.decode())['containers']['default_capabilities']
+        self.assertIn('CAP_SETFCAP', caps)
+        self.assertIn('CAP_CHOWN', caps)
+        self.assertNotIn('CAP_SYS_ADMIN', caps)
+        self.assertIn('remove sudo', n.TOOLING_RECIPE.decode())
+        self.assertIn('test ! -e /usr/bin/sudo', n.TOOLING_RECIPE.decode())
+
 
 class TestManagedEntry(unittest.TestCase):
     def placement(self):
@@ -154,6 +301,7 @@ class TestManagedEntry(unittest.TestCase):
         candidate.state = n.new_record({'source_sha': manifest()['outer']['source_sha']}, set())
         candidate.account = SimpleNamespace(pw_uid=1234, pw_dir='/home/dp-dev')
         candidate.entry = Path('/protected/entry')
+        candidate.recipes = candidate.entry.parent
         candidate.copy_path = Path('/bounded/host-copy')
         candidate.save = Mock()
         return candidate
@@ -206,7 +354,8 @@ class TestManagedEntry(unittest.TestCase):
     def test_uncertain_signed_base_import_keeps_its_spool_on_bounded_storage(self):
         candidate = self.placement()
         candidate.cache = Path('/protected/cache')
-        candidate.inputs_path = Path(self.enterContext(TemporaryDirectory()))
+        candidate.scratch_path = Path(self.enterContext(TemporaryDirectory()))
+        candidate.validate_scratch = Mock()
         failure = db.Blocked('owned systemd cleanup unresolved')
 
         @contextmanager
@@ -221,22 +370,53 @@ class TestManagedEntry(unittest.TestCase):
             self.assertEqual(uid, candidate.account.pw_uid)
             return engine('load', str(archive), timeout=5)
 
+        def interrupted(*argv, **options):
+            candidate.state['activity'] = {'unit': 'fixture-pending'}
+            raise failure
+
         with patch.object(n.fedora_oci, 'verified', verified), \
                 patch.object(n.fedora_oci, 'import_image', import_image), \
-                patch.object(candidate, 'managed', side_effect=failure):
+                patch.object(n, 'private_child', side_effect=self.local_child), \
+                patch.object(candidate, 'managed', side_effect=interrupted):
             with self.assertRaisesRegex(db.Blocked, 'cleanup unresolved'):
                 candidate.import_fedora_base()
-        records = list(candidate.inputs_path.glob('dev-pair-fedora-*/base.oci.tar'))
+        records = list(candidate.scratch_path.glob('verification/dev-pair-fedora-*/base.oci.tar'))
         self.assertEqual([record.read_bytes() for record in records], [b'signed archive fixture'])
+        self.assertIsNotNone(candidate.state['verification'])
+        candidate.state['activity'] = None
+        candidate.cleanup_verification()
+        self.assertFalse(records[0].exists())
+
+    @contextmanager
+    def local_child(self, parent, name, uid, gid, **options):
+        os.mkdir(name, 0o755, dir_fd=parent)
+        fd = os.open(name, os.O_DIRECTORY, dir_fd=parent)
+        try:
+            yield fd, True
+        finally:
+            os.close(fd)
 
     def test_signed_base_save_limits_file_size_within_bounded_copy_path(self):
         candidate = self.placement()
         candidate.managed = Mock(return_value=(0, b''))
+        candidate.validate_scratch = Mock()
         candidate.engine('save', '--output', '/bounded/archive.oci.tar', timeout=5)
         argv = candidate.managed.call_args.args
         limit = n.fedora_oci.SAVE_FILE_LIMIT
         self.assertEqual(argv[:3], ('/usr/bin/prlimit', f'--fsize={limit}:{limit}', '--'))
-        self.assertEqual(candidate.managed.call_args.kwargs, {'copy': True, 'seconds': 5})
+        self.assertEqual(candidate.managed.call_args.kwargs, {'copy': True, 'build': False, 'seconds': 5})
+
+    def test_build_uses_separate_capability_profile_and_exact_copy_root(self):
+        candidate = self.placement()
+        missing = (4, b'LoadState=not-found\nActiveState=inactive\n')
+        with patch.object(n, 'command', side_effect=[missing, (0, b'image-id'), missing]) as calls, \
+                patch.object(candidate, 'validate_scratch') as scratch, patch.object(n, 'verify_inactive_cgroup'):
+            self.assertEqual(candidate.engine('build', '--network=none'), b'image-id')
+        scratch.assert_called_once()
+        launch = calls.call_args_list[1].args
+        self.assertIn('CONTAINERS_CONF=/protected/build-containers.conf', launch)
+        self.assertIn('TMPDIR=/bounded/host-copy', launch)
+        self.assertNotIn('CONTAINERS_CONF=/protected/entry/runtime/devbox/host-containers.conf', launch)
 
     def test_foreign_unit_is_never_stopped(self):
         candidate = self.placement()
@@ -267,6 +447,7 @@ class TestManagedEntry(unittest.TestCase):
         candidate.establish_storage = Mock(return_value={'build': {'inodes': 8}})
         candidate.verify_archive = Mock()
         candidate.stage_entry = Mock()
+        candidate.verify_role_access = Mock()
         candidate.prepare_images = Mock(return_value={'graphroot': '/bounded/outer'})
         digest = 'd' * 64
         candidate.write_manifest = Mock(return_value=(Path('/bounded/manifest.json'), digest))
