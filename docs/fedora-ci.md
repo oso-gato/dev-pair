@@ -315,15 +315,14 @@ No time/resource/admission/cleanup ceiling is raised or reset.
 
 ### Disposable selected-load diagnostic
 
-The source-only native34 follow-up supplies one fixed public diagnostic recipient
-on the existing authenticated public payload ISO. Its exact SHA256 is
-`020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c`;
-the 40-hex primary fingerprint is
-`59CD9CD708EEB010F4A1BB6B83B33B576391877E`. It is a one-day disposable CI input,
-not a release key or production logging interface. The private key stays outside
-source, CI, images, reports and artifacts. Public ISO entries now have explicit
-root UID/GID metadata; their source/context bytes and existing protection checks
-remain unchanged. No host ownership change occurs.
+The native34 follow-up introduced a fixed public diagnostic recipient on the
+authenticated public payload ISO. The recipient rotated on November 27, 2026.
+Its SHA256 is `3a0f32ce78af805d4662d5eaaebeca79b39c2ef5d63e485838491f967336dfe5`
+and its 40-hex primary fingerprint is
+`968C5A2925FBCDBEEEA6B11FF8A623703EFDDB03`. Its one-day validity ends at
+07:55:01 UTC on November 28, 2026. Its use is limited to disposable CI
+diagnostics. The private key stays outside source, CI, images, reports and
+artifacts. Public ISO entries have explicit root UID/GID metadata.
 
 Only the existing exact signed-load selector, observed owned launch, complete
 verified relay, matching maintenance UID and nonzero payload status can seal a

@@ -1230,7 +1230,7 @@ def sealed_load_projection(value,expected,payload=None):
         identity=value['identity']
         if not identity=={'source_sha':expected['source_sha'],'context_sha256':expected['context_sha256'],'phase':'maintenance-gptbox'}:raise ValueError('identity')
         if not (type(payload) is dict and payload.get('availability')=='observed' and payload.get('context_sha256')==expected['context_sha256'] and payload.get('suboperation')=='load' and payload.get('launch_handle_observed') is True and payload.get('control_verified') is True and type(payload.get('uid')) is int and type(payload.get('status')) is int and payload['uid']==value['uid'] and payload['status']==value['status'] and all(row.get('complete') is True for row in payload['streams'].values())):raise ValueError('payload binding')
-        if not (value['recipient_sha256']=='020ad2bbd6c1f6ce7f2867b722f429fac7685351e362d6e24203ef3d7376962c' and value['fingerprint']=='59CD9CD708EEB010F4A1BB6B83B33B576391877E'):raise ValueError("sealed schema")
+        if not (value['recipient_sha256']=='3a0f32ce78af805d4662d5eaaebeca79b39c2ef5d63e485838491f967336dfe5' and value['fingerprint']=='968C5A2925FBCDBEEEA6B11FF8A623703EFDDB03'):raise ValueError("sealed schema")
         if not (type(value['uid']) is int and 1000<=value['uid']<2**32 and type(value['status']) is int and 1<=value['status']<=255):raise ValueError("sealed schema")
         if not (type(value['ciphertext_base64']) is str and len(value['ciphertext_base64'])<=21848):raise ValueError("sealed schema")
         cipher=base64.b64decode(value['ciphertext_base64'],validate=True)
