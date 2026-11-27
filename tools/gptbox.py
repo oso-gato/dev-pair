@@ -34,6 +34,12 @@ BASE = '/usr/lib/dev-pair/gptbox'
 RUNTIME = BASE + '/runtime.py'
 CONTROL = '/usr/local/libexec/dev-pair-gptbox'
 ROOT = STATE + '/gptbox-adapter'
+MAINTENANCE_STORE = '/var/lib/dev-pair/maintenance/images'
+MAINTENANCE_HOST_INTENT = STATE + '/prepare-maintenance-host.json'
+PLATFORM_RELEASES = '/var/lib/dev-pair/platform-releases'
+IMPORTED_KIND = 'maintenance-imported-release-admission'
+ENTER_SHA256 = '75359e1965dcb9897a221db7818be098138154ee11c2eb2de34989a37c4b8bb8'
+CONTAINERS_CONF = '[containers]\nnetns="private"\n[engine]\nevents_logger="file"\n'
 ARTIFACTS = '/var/lib/dev-pair/artifacts/gptbox-adapter'
 DEVELOPMENT_ROOT = STATE + '/gptbox-development'
 DEVELOPMENT_ARTIFACTS = '/var/lib/dev-pair/artifacts/gptbox-development'
@@ -82,6 +88,18 @@ def image_inputs_bytes(inputs):
 
 def exact_oci_timeout(observed, expected, ceiling):
     return type(observed) is type(expected) is int and 0 < observed == expected <= ceiling
+
+
+def raw_digest(value, size=64):
+    if type(value) is not str or not re.fullmatch(r'[0-9a-f]{' + str(size) + '}', value):
+        raise Blocked('reviewed release identity must be a complete lowercase digest')
+    return value
+
+
+def podman_wrapper_tail(engine):
+    limit = fedora_oci.SAVE_FILE_LIMIT
+    return (f'if [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n'
+            f'exec {engine} "$@"\n')
 
 
 def image_id(value):
@@ -171,6 +189,92 @@ class Gptbox(Bootstrap):
             if item == self.root:
                 break
         return path
+
+    def protect_host_sources(self, upstream, revision):
+        def regular(path):
+            node = self.protected(path).lstat()
+            if not stat.S_ISREG(node.st_mode) or node.st_nlink != 1:
+                raise Blocked('development host source requires protected regular files')
+
+        repo = Path(__file__).parents[1]
+        upstream = Path(upstream)
+        for name in ADAPTER_SOURCE_FILES:
+            regular(repo / 'tools' / name)
+        regular(Path(fedora_oci._public_inputs().__file__))
+        regular(repo / 'runtime/devbox/controller.py')
+        for name in ('distrobox-init', 'distrobox-enter'):
+            regular(upstream / name)
+        # Only sanitized, digest-verified public-input extraction is admitted.
+        # Protect the Git inputs too, including configuration and object paths.
+        for checkout, head in ((repo, revision), (upstream, DBX_SHA)):
+            metadata = checkout / '.git'
+            for relative, names in (('', {'HEAD', 'config', 'shallow', 'refs', 'objects'}),
+                                    ('refs', {'heads'}), ('refs/heads', {'public-input'}),
+                                    ('objects', {'pack'})):
+                directory = self.protected(metadata / relative)
+                if {p.name for p in directory.iterdir()} != names:
+                    raise Blocked('development host requires the extracted public-input Git layout')
+            for relative, value in {
+                'HEAD': 'ref: refs/heads/public-input\n',
+                'config': '[core]\nrepositoryformatversion=0\nbare=false\nfilemode=true\n',
+                'shallow': head + '\n', 'refs/heads/public-input': head + '\n',
+            }.items():
+                data = self.protected_bytes(metadata / relative, 4096)
+                if data != value.encode():
+                    raise Blocked('development host Git metadata differs from the extracted target')
+            pack = self.protected(metadata / 'objects/pack')
+            names = {p.name for p in pack.iterdir()}
+            if len(names) not in (2, 3) or any(not re.fullmatch(r'pack-[0-9a-f]{40}\.(pack|idx|rev)', name) for name in names):
+                raise Blocked('unexpected development host Git object layout')
+            prefix = next(iter(names)).rsplit('.', 1)[0]
+            if names not in ({prefix + '.pack', prefix + '.idx'}, {prefix + '.pack', prefix + '.idx', prefix + '.rev'}):
+                raise Blocked('development host Git object pack and index do not match')
+            for name in names:
+                regular(pack / name)
+
+    def protected_bytes(self, path, maximum, mode=None):
+        try:
+            self.protected(path)
+            if mode is not None and stat.S_IMODE(path.lstat().st_mode) != mode:
+                raise Blocked('protected development input permissions conflict')
+            return capture_release_file(path, maximum, os.getuid(), contents=True)[2]
+        except FileNotFoundError:
+            raise Blocked(f'required protected development evidence is missing: {path.name}') from None
+
+    def verify_builder(self):
+        name, shell, start = 'dp-maint', '/usr/sbin/nologin', 1000000
+        marker = self.protected_bytes(self.path(STATE + '/identity-' + name + '.json'), 4096, 0o600)
+        if marker != image_inputs_bytes({'name': name, 'shell': shell, 'substart': start}):
+            raise Blocked('managed builder identity marker does not match the bootstrap role')
+        passwd = self.run('/usr/bin/getent', 'passwd', name, timeout=10).strip().split(':')
+        if len(passwd) != 7 or passwd[0] != name or passwd[5:] != ['/home/' + name, shell]:
+            raise Blocked('live builder account differs from the managed nologin role')
+        uid, gid = (_canonical_role_id(value + '\n') for value in passwd[2:4])
+        if (uid != _canonical_role_id(self.run('/usr/bin/id', '-u', name, timeout=10))
+                or gid != _canonical_role_id(self.run('/usr/bin/id', '-g', name, timeout=10))
+                or self.run('/usr/bin/id', '-nG', name, timeout=10).split() != [name]):
+            raise Blocked('live builder UID, GID or private group differs from the managed account')
+        role_root = self.path('/var/lib/dev-pair/maintenance')
+        self.protected(role_root.parent)
+        node = role_root.lstat()
+        if (not stat.S_ISDIR(node.st_mode) or stat.S_IMODE(node.st_mode) != 0o700
+                or (node.st_uid, node.st_gid) != (uid, gid)):
+            raise Blocked('live builder account differs from the provisioned maintenance directory owner')
+        status = self.run('/usr/bin/passwd', '-S', name, timeout=10).split()
+        if len(status) < 2 or status[0] != name or status[1] not in ('L', 'LK'):
+            raise Blocked('managed builder password must remain locked')
+        for location in ('/etc/subuid', '/etc/subgid'):
+            content = self.protected_bytes(self.path(location), 65536).decode('ascii')
+            if not role_subordinate_range(content, name, str(uid), start):
+                raise Blocked('live builder subordinate ID allocation is missing')
+        if self.run('/usr/bin/hostnamectl', '--static', timeout=10).strip() != 'erebus':
+            raise Blocked('managed builder requires the verified bootstrap host identity')
+        package = self.run(*SUDO_PACKAGE_QUERY, timeout=10, sudo_package=True)
+        proof = self.run('/usr/bin/sudo', '-l', '-U', name, timeout=10,
+                         sudo_probe={'role': name, 'host_verified': True, 'package': package})
+        if type(proof) is not dict or proof.get('outcome') != 'denied':
+            raise Blocked('live builder sudo denial was not verified')
+        return _RoleIdentity(name, uid, gid)
 
     def source(self, revision):
         if not re.fullmatch(r'[0-9a-f]{40}', revision or ''):
@@ -295,14 +399,14 @@ class Gptbox(Bootstrap):
         self.directory(control + '/empty-hooks', mode=0o755)
         if any(self.path(control + '/empty-hooks').iterdir()) or any(self.path(control + '/home').iterdir()) or any(self.path(control + '/xdg-config').iterdir()):
             raise Blocked('controller home/hooks contain undeclared parent integration')
-        config = '[containers]\nnetns="private"\n[engine]\nevents_logger="file"\n'
+        config = CONTAINERS_CONF
         self.atomic(control + '/containers.conf', config, mode=0o444)
         context = self.target.rsplit('/', 1)[-1]
         if self.role == 'development':
             storage = self.artifact_root + '/' + context + '/image-store'
             self._directory_as(storage, 0o700, verified.uid, verified.gid, change_owner=True, check_gid=True)
         else:
-            storage = '/var/lib/dev-pair/maintenance/images'
+            storage = MAINTENANCE_STORE
             self.directory(storage, owner='dp-maint')
         runroot = f'/run/user/{uid}/dev-pair-gptbox'
         script = '#!/bin/sh\n'
@@ -318,9 +422,7 @@ class Gptbox(Bootstrap):
                        f'exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n')
         else:
             engine = f'/usr/bin/podman --root {self.path(storage)} --runroot {runroot} --storage-driver=vfs --events-backend=file'
-        limit = fedora_oci.SAVE_FILE_LIMIT
-        script += (f'if [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n'
-                   f'exec {engine} "$@"\n')
+        script += podman_wrapper_tail(engine)
         self.wrapper = str(self.path(control + '/bin/podman'))
         self.atomic(control + '/bin/podman', script, mode=0o555)
         if self.role == 'maintenance':
@@ -352,6 +454,34 @@ class Gptbox(Bootstrap):
                          'XDG_RUNTIME_DIR=/run/user/' + uid, 'XDG_CONFIG_HOME=' + str(self.path(control + '/xdg-config')),
                          'CONTAINERS_CONF=' + str(self.path(control + '/containers.conf')),
                          'DBX_CONTAINER_MANAGER=podman']
+
+    def maintenance_gateway(self, context, identity=None):
+        if identity is None:
+            uid = self.run('/usr/bin/id', '-u', 'dp-maint').strip()
+            gid = self.run('/usr/bin/id', '-g', 'dp-maint').strip()
+            if not all(value.isdigit() and int(value) >= 1000 for value in (uid, gid)):
+                raise Blocked('managed maintenance account required')
+        else:
+            uid, gid = str(identity.uid), str(identity.gid)
+        self.uid, self.gid = uid, gid
+        engine = (f'/usr/bin/podman --root {self.path(MAINTENANCE_STORE)} --runroot /run/user/{uid}/dev-pair-gptbox'
+                  ' --storage-driver=vfs --events-backend=file')
+        files = {
+            'bin/podman': (0o555, sha(('#!/bin/sh\n' + podman_wrapper_tail(engine)).encode())),
+            'distrobox-enter': (0o555, ENTER_SHA256),
+            'job-bin/podman': (0o555, sha(JOB_ENTER_WRAPPER.encode())),
+            'containers.conf': (0o444, sha(CONTAINERS_CONF.encode())),
+        }
+        for name, (mode, expected) in files.items():
+            if sha(self.protected_bytes(self.path(CONTROL + '/' + name), 65536, mode)) != expected:
+                raise Blocked('fixed maintenance control executable or configuration changed')
+        for name in ('home', 'xdg-config', 'empty-hooks'):
+            if next(self.protected(self.path(CONTROL + '/' + name)).iterdir(), None) is not None:
+                raise Blocked('maintenance control directory is not empty')
+        self.wrapper = str(self.path(CONTROL + '/bin/podman'))
+        self.unit = 'dev-pair-gptbox-' + context + '.service'
+        self.configure_executor(uid, CONTROL)
+        self.protected_job_entry = True
 
     def record(self, name, value):
         path = self.target + '/' + name + '.json'
@@ -474,39 +604,8 @@ class Gptbox(Bootstrap):
             return self.run_job_locked(job, operation, request_sha, sealed, context, revision)
 
     def run_job_locked(self, job, operation, request_sha, sealed, context, revision):
-        uid = self.run('/usr/bin/id', '-u', 'dp-maint').strip()
-        gid = self.run('/usr/bin/id', '-g', 'dp-maint').strip()
-        if not all(value.isdigit() and int(value) >= 1000 for value in (uid, gid)):
-            raise Blocked('managed maintenance account required')
-        self.uid, self.gid = uid, gid
-        # Use the established protected controlling artifacts from the assembly.
-        self.wrapper = str(self.protected(self.path(CONTROL + '/bin/podman')))
-        enter = self.protected(self.path(CONTROL + '/distrobox-enter'))
-        if sha(enter.read_bytes()) != '75359e1965dcb9897a221db7818be098138154ee11c2eb2de34989a37c4b8bb8':
-            raise Blocked('pinned maintenance Distrobox entry bytes changed')
-        if self.protected(self.path(CONTROL + '/job-bin/podman')).read_text() != JOB_ENTER_WRAPPER:
-            raise Blocked('maintenance Distrobox job gateway changed')
-        self.protected(self.path(CONTROL + '/containers.conf'))
-        for directory in ('home', 'xdg-config', 'empty-hooks'):
-            if next(self.protected(self.path(CONTROL + '/' + directory)).iterdir(), None) is not None:
-                raise Blocked('maintenance control directory is not empty')
-        self.unit = 'dev-pair-gptbox-' + context + '.service'
-        self.configure_executor(uid, CONTROL)
-        self.protected_job_entry = True
-        outcome = json.loads(self.protected(self.path(self.target + '/result.json')).read_bytes())
-        if any(outcome.get(name) != expected for name, expected in (
-                ('assembled_image_id', sealed), ('source_sha', revision), ('context_sha256', context),
-                ('distrobox_sha', DBX_SHA), ('boundary_and_version_cycles', 2), ('runtime_container_removed', True))):
-            raise Blocked('maintenance image was not admitted by the exact completed assembly')
-        rows = json.loads(self.engine('image', 'inspect', sealed))
-        row, = rows
-        labels = row.get('Labels') or row['Config']['Labels']
-        codex_version = labels.get('dev-pair.codex.version')
-        if image_id(row['Id']) != sealed or any(labels.get(name) != expected for name, expected in (
-                ('dev-pair.role', 'maintenance'), ('dev-pair.context', context), ('dev-pair.distrobox', DBX_SHA),
-                ('org.opencontainers.image.revision', revision), ('dev-pair.standards', candidate.STANDARDS))) or (
-                type(codex_version) is not str or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', codex_version)):
-            raise Blocked('maintenance image identity mismatch')
+        codex_version = self.admitted_maintenance_image(context, revision, sealed)
+        uid, gid = self.uid, self.gid
         self.mounts, request = host_job_inputs('maintenance', job, operation, request_sha, int(gid))
         label = None
         for branch, destination in (('workspaces', '/work/job'), ('state', '/state'), ('cache', '/cache/job')):
@@ -566,6 +665,270 @@ class Gptbox(Bootstrap):
                 'source_sha': revision, 'codex_version': codex_version,
                 'runtime_container_id': identity, 'runtime_container_removed': True,
                 'turn': report}
+
+    def read_config_record(self, path, *, mode=0o600):
+        raw = self.protected_bytes(self.path(path), 65536, mode)
+        record = json.loads(raw, object_pairs_hook=fedora_oci.unique)
+        if type(record) is not dict:
+            raise Blocked('invalid protected maintenance evidence')
+        return raw, record
+
+    def live_boot_id(self):
+        value = self.text('/proc/sys/kernel/random/boot_id').strip()
+        if not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', value):
+            raise Blocked('maintenance admission lacks the current host boot identity')
+        return value
+
+    def import_receipt_path(self, context, sealed):
+        return ROOT + '/' + context + '/imported-releases/' + sealed + '.json'
+
+    def import_authority(self, platform_sha, context, revision, sealed, manifest_sha):
+        from platform_release import publication_evidence
+        from platform_release_protocol import canonical, fields, image_record, portable_index
+
+        root = PLATFORM_RELEASES + '/' + platform_sha
+        raw, index = self.read_config_record(root + '/platform.json', mode=None)
+        if sha(raw) != platform_sha or raw != canonical(index):
+            raise Blocked('protected portable platform digest mismatch')
+        portable_index(index, revision, index['publisher_run'])
+        _, intake = self.read_config_record(root + '/intake.json')
+        if intake != {'schema': 2, 'platform_sha256': platform_sha, 'source_sha': revision,
+                      'kind': index['kind'], 'publisher_run': index['publisher_run']} or type(intake['schema']) is not int:
+            raise Blocked('portable platform lacks exact protected intake authority')
+        row = index['components']['maintenance-agent']
+        if (row['context_sha256'], row['oci_config_sha256'], row['oci_manifest_sha256']) != (context, sealed, manifest_sha):
+            raise Blocked('selected maintenance artifact differs from signed portable index')
+        part_raw, part = self.read_config_record(root + '/maintenance/part.json', mode=None)
+        transports = index['transports']['maintenance']['files']
+        if (transports['part.json'] != {'sha256': sha(part_raw), 'bytes': len(part_raw)}
+                or transports['maintenance.oci.tar'] != {'sha256': row['archive_sha256'], 'bytes': row['archive_bytes']}):
+            raise Blocked('maintenance transport differs from signed index')
+        fields(part, 'schema image oci_manifest_sha256 producer')
+        image = image_record(part['image'])
+        expected = {'role': 'maintenance', 'source_sha': revision, 'context_sha256': context,
+                    'image_id': sealed, 'archive_sha256': row['archive_sha256'], 'archive_bytes': row['archive_bytes']}
+        if (type(part['schema']) is not int or part['schema'] != 1 or part['oci_manifest_sha256'] != manifest_sha
+                or any(image[key] != value for key, value in expected.items())):
+            raise Blocked('portable maintenance producer binding differs')
+        publication_evidence(image, part['producer'])
+        return root, row, image['diff_ids'], part['producer']['result_sha256']
+
+    def maintenance_labels(self, context, revision, sealed, row=None, diffs=None):
+        rows = json.loads(self.engine('image', 'inspect', 'sha256:' + sealed), object_pairs_hook=fedora_oci.unique)
+        if not isinstance(rows, list) or len(rows) != 1 or type(rows[0]) is not dict:
+            raise Blocked('maintenance image inspection is ambiguous')
+        actual = rows[0]
+        labels = actual.get('Labels') or actual['Config']['Labels']
+        wanted = {'dev-pair.role': 'maintenance', 'dev-pair.context': context, 'dev-pair.distrobox': DBX_SHA,
+                  'org.opencontainers.image.revision': revision, 'dev-pair.standards': candidate.STANDARDS}
+        if row is not None:
+            wanted.update({'dev-pair.codex.version': row['codex_version'], 'dev-pair.codex.sha256': row['codex_sha256']})
+            if (actual.get('Digest') != 'sha256:' + row['oci_manifest_sha256'] or actual.get('Os') != 'linux'
+                    or actual.get('Architecture') != 'amd64' or image_diff_ids(actual['RootFS']['Layers']) != diffs):
+                raise Blocked('installed maintenance OCI manifest, architecture or layers differ')
+        version = labels.get('dev-pair.codex.version')
+        if (image_id(actual['Id']) != sealed or any(labels.get(key) != value for key, value in wanted.items())
+                or type(version) is not str or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version)):
+            raise Blocked('maintenance image identity mismatch')
+        return labels
+
+    @staticmethod
+    def import_admission(platform_sha, context, revision, sealed, manifest_sha, boot, producer):
+        return {'schema': 1, 'kind': IMPORTED_KIND, 'platform_sha256': platform_sha,
+                'source_sha': revision, 'context_sha256': context, 'image_id': sealed, 'oci_manifest_sha256': manifest_sha,
+                'boot_id': boot, 'distrobox_sha': DBX_SHA, 'boundary_and_version_cycles': 2,
+                'runtime_container_removed': True, 'job_admission': False, 'producer_result_sha256': producer}
+
+    def admitted_maintenance_image(self, context, revision, sealed):
+        path = self.import_receipt_path(context, sealed)
+        if os.path.lexists(self.path(path)):
+            self.maintenance_host_readiness(context)
+            raw, proof = self.read_config_record(path)
+            platform_sha = raw_digest(proof.get('platform_sha256'))
+            manifest_sha = raw_digest(proof.get('oci_manifest_sha256'))
+            _, row, diffs, producer = self.import_authority(platform_sha, context, revision, sealed, manifest_sha)
+            expected = self.import_admission(platform_sha, context, revision, sealed, manifest_sha,
+                                             self.live_boot_id(), producer)
+            if raw != image_inputs_bytes(expected):
+                raise Blocked('imported maintenance proof differs from the selected release or boot')
+            return self.maintenance_labels(context, revision, sealed, row, diffs)['dev-pair.codex.version']
+        self.maintenance_gateway(context)
+        _, legacy = self.read_config_record(self.target + '/result.json')
+        if any(legacy.get(name) != expected for name, expected in (
+                ('kind', 'maintenance-gptbox-probe-candidate'), ('assembled_image_id', sealed),
+                ('source_sha', revision), ('context_sha256', context),
+                ('distrobox_sha', DBX_SHA), ('boundary_and_version_cycles', 2), ('runtime_container_removed', True))):
+            raise Blocked('maintenance image was not admitted by the exact completed assembly')
+        _, prepared = self.read_config_record(STATE + '/gptbox-image.json')
+        _, assembly = self.read_config_record(self.target + '/assembly-attestation.json')
+        labels = self.maintenance_labels(context, revision, sealed)
+        if ((prepared.get('source_sha'), prepared.get('context_sha256')) != (revision, context)
+                or (assembly.get('kind'), assembly.get('source_sha'), assembly.get('uid'), assembly.get('gid')) !=
+                   ('genuine-distrobox-assembled', revision, 1000, 1000)
+                or raw_digest(assembly.get('inputs_sha256')) != labels.get('dev-pair.inputs')):
+            raise Blocked('complete local maintenance preparation and assembly evidence is required')
+        return labels['dev-pair.codex.version']
+
+    def create_maintenance_probe(self, name, context, sealed, *, imported=False):
+        self.mounts, arguments = {}, []
+        self.import_probe_leaves = {}
+        leaf = name if imported else 'gptbox-probe'
+        for branch, destination in (('workspaces', '/work/job'), ('state', '/state'), ('cache', '/cache/job')):
+            source = '/var/lib/dev-pair/maintenance/' + branch + '/' + leaf
+            self.directory(source, owner='dp-maint')
+            path = self.path(source)
+            if imported:
+                node = path.lstat()
+                if (path.resolve(strict=True) != path or (node.st_uid, node.st_gid) != (int(self.uid), int(self.gid))
+                        or next(path.iterdir(), None) is not None):
+                    raise Blocked('imported maintenance probe requires clean private leaves')
+                self.import_probe_leaves[path] = (node.st_dev, node.st_ino, node.st_uid, node.st_gid, node.st_mode)
+            self.mounts[destination] = (str(path), True)
+            opts = 'rw,Z,nosuid,nodev,noexec,rprivate' if imported else 'rw,Z'
+            arguments.extend(('--volume', f'{path}:{destination}:{opts}'))
+        isolation = ('--pull=never', '--http-proxy=false', '--image-volume=ignore', '--cgroupns=private',
+                     '--systemd=false', '--label=dev-pair.imported-probe=' + sealed) if imported else ()
+        return image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + context,
+                        '--timeout=' + str(RUNTIME_LIFETIME), '--restart=no', '--read-only', '--read-only-tmpfs=false',
+                        '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL',
+                        '--security-opt=no-new-privileges', '--network=none', '--pid=private', '--ipc=private',
+                        '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1', '--no-hosts', '--no-hostname', '--dns=none',
+                        '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
+                        '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
+                        '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox',
+                        '--label=distrobox.unshare_groups=0', *isolation, *arguments,
+                        '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
+
+    def maintenance_probe_cycles(self, identity, sealed, version, *, check_seal=None):
+        self.inspect_container(identity, sealed)
+        previous = None
+        for _ in range(2):
+            self.engine('start', identity)
+            previous = self.ready(identity, sealed, previous)
+            observed = json.loads(self.enter(identity, sealed, 'probe'), object_pairs_hook=fedora_oci.unique)
+            if observed.get('boundary_probe') != 'passed':
+                raise Blocked('runtime boundary probe did not pass')
+            if self.enter(identity, sealed, 'version').strip() != f'codex-cli {version}':
+                raise Blocked('actual Distrobox entry returned unexpected Codex identity')
+            if check_seal is not None:
+                running = self.inspect_container(identity, sealed)
+                if (running['State']['Status'] != 'running' or running['State']['StartedAt'] != previous
+                        or observed.get('uid') != 1000
+                        or observed.get('selinux_label', '').rstrip('\0') != running['ProcessLabel']):
+                    raise Blocked('imported maintenance probe did not prove the exact confined process')
+                check_seal(identity)
+            self.engine('stop', '--time=10', identity)
+
+    def inspect_imported_seal(self, identity, labels, context, revision):
+        def read(name):
+            raw = self.engine('exec', '--user=1000:1000', identity, '/usr/bin/cat', f'{BASE}/{name}', timeout=10).encode()
+            if not 0 < len(raw) <= 16384:
+                raise Blocked('imported maintenance evidence file is unbounded')
+            return raw, json.loads(raw, object_pairs_hook=fedora_oci.unique)
+
+        inputs_raw, inputs = read('inputs.json')
+        inputs_sha = sha(inputs_raw)
+        files = {'/opt/dev-pair/bin/codex': raw_digest(labels['dev-pair.codex.sha256']),
+                 '/usr/bin/distrobox-init': raw_digest(labels['dev-pair.init']),
+                 RUNTIME: raw_digest(labels['dev-pair.runtime'])}
+        expected = {'source_sha': revision, 'context_sha256': context, 'distrobox_sha': DBX_SHA,
+                    'role': 'maintenance', 'files': files}
+        if inputs != expected or inputs_sha != labels['dev-pair.inputs']:
+            raise Blocked('imported maintenance sealed input identity differs')
+        _, seal = read('sealed.json')
+        if (type(seal) is not dict or set(seal) != {'kind', 'inputs_sha256', 'source_sha', 'uid', 'gid', 'packages_sha256'}
+                or seal['kind'] != 'genuine-distrobox-assembled' or seal['inputs_sha256'] != inputs_sha
+                or seal['source_sha'] != revision or any(type(seal[key]) is not int or seal[key] != 1000 for key in ('uid', 'gid'))):
+            raise Blocked('imported maintenance Distrobox seal differs from the actual artifact')
+        raw_digest(seal['packages_sha256'])
+
+    def remove_import_probe(self, name, context, sealed, identity=None):
+        raw = self.engine('inspect', '--type=container', name, ok=(0, 125), timeout=8)
+        rows = json.loads(raw, object_pairs_hook=fedora_oci.unique) if raw.strip() else []
+        if rows:
+            if type(rows) is not list or len(rows) != 1:
+                raise Blocked('imported probe ownership is ambiguous')
+            row = rows[0]
+            observed = image_id(row['Id'])
+            labels = row['Config']['Labels']
+            if (row['Name'].lstrip('/') != name or image_id(row['Image']) != sealed or identity not in (None, observed)
+                    or labels.get('dev-pair.context') != context or labels.get('dev-pair.imported-probe') != sealed):
+                raise Blocked('foreign imported probe collision preserved')
+            self.engine('rm', '--force', '--time=5', observed, timeout=20)
+            self.engine('container', 'exists', observed, ok=(1,), timeout=8)
+        elif identity is not None:
+            self.engine('container', 'exists', identity, ok=(1,), timeout=8)
+        self.engine('container', 'exists', name, ok=(1,), timeout=8)
+
+    def remove_import_probe_leaves(self):
+        for path, owned in self.import_probe_leaves.items():
+            node = path.lstat()
+            if ((node.st_dev, node.st_ino, node.st_uid, node.st_gid, node.st_mode) != owned
+                    or path.resolve(strict=True) != path):
+                raise Blocked('imported maintenance probe leaf identity changed')
+            path.rmdir()
+
+    def verify_installed_maintenance(self, phase, platform_sha, context, revision, sealed, manifest_sha):
+        for value in (platform_sha, context, sealed, manifest_sha):
+            raw_digest(value)
+        raw_digest(revision, 40)
+        if phase not in ('preflight', 'verify'):
+            raise Blocked('unsupported installed maintenance verification phase')
+        self.preflight()
+        self.target = ROOT + '/' + context
+        with self.lock():
+            with self.run.phase(270 if phase == 'verify' else 45, 'dev-pair-maintenance-import', native=False):
+                root, part, diffs, producer = self.import_authority(platform_sha, context, revision, sealed, manifest_sha)
+                self.maintenance_host_readiness(context)
+                binding = {'schema': 1, 'platform_sha256': platform_sha, 'source_sha': revision, 'context_sha256': context,
+                           'image_id': sealed, 'oci_manifest_sha256': manifest_sha, 'boot_id': self.live_boot_id()}
+                if phase == 'preflight':
+                    return {**binding, 'phase': 'preflight'}
+                proof, previous = self.prove_installed_maintenance(root, binding, part, diffs, producer)
+            destination = self.import_receipt_path(context, sealed)
+            self.atomic(destination, image_inputs_bytes(proof).decode(), expected=previous)
+            return proof
+
+    def prove_installed_maintenance(self, root, binding, part, diffs, producer):
+        sealed, context, revision = (binding[key] for key in ('image_id', 'context_sha256', 'source_sha'))
+        wanted = {**binding, 'kind': 'maintenance-native-oci-import', 'archive_sha256': part['archive_sha256'],
+                  'graphroot': MAINTENANCE_STORE, 'runroot': f'/run/user/{self.uid}/dev-pair-gptbox'}
+        _, import_record = self.read_config_record(root + '/maintenance-import.json')
+        if import_record != wanted or type(import_record['schema']) is not int:
+            raise Blocked('native maintenance import receipt differs from this boot, release or store')
+        store = json.loads(self.engine('info', '--format=json', timeout=15), object_pairs_hook=fedora_oci.unique)
+        if (store['host']['security']['rootless'] is not True or store['host']['security']['selinuxEnabled'] is not True
+                or (store['store']['graphRoot'], store['store']['runRoot'], store['store']['graphDriverName']) !=
+                   (wanted['graphroot'], wanted['runroot'], 'vfs')):
+            raise Blocked('installed maintenance engine is outside the admitted rootless store')
+        labels = self.maintenance_labels(context, revision, sealed, part, diffs)
+        proof = self.import_admission(binding['platform_sha256'], context, revision, sealed,
+                                      binding['oci_manifest_sha256'], binding['boot_id'], producer)
+        previous = None
+        destination = self.import_receipt_path(context, sealed)
+        if os.path.lexists(self.path(destination)):
+            existing, data = self.read_config_record(destination)
+            previous_boot = data.get('boot_id')
+            if (type(previous_boot) is not str or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', previous_boot)
+                    or existing != image_inputs_bytes({**proof, 'boot_id': previous_boot})):
+                raise Blocked('conflicting imported maintenance admission preserved')
+            previous = existing.decode()
+        self.directory(self.target, mode=0o755)
+        self.target = self.target + '/import-probes/' + sealed
+        self.directory(self.target, mode=0o700)
+        name = 'dp-gptbox-import-' + sealed[:24]
+        self.remove_import_probe(name, context, sealed)
+        identity = None
+        try:
+            identity = self.create_maintenance_probe(name, context, sealed, imported=True)
+            self.maintenance_probe_cycles(identity, sealed, part['codex_version'],
+                                          check_seal=lambda active: self.inspect_imported_seal(active, labels, context, revision))
+        finally:
+            self.remove_import_probe(name, context, sealed, identity)
+            self.remove_import_probe_leaves()
+        if self.live_boot_id() != binding['boot_id'] or self.run('/usr/sbin/getenforce').strip() != 'Enforcing':
+            raise Blocked('host boot or SELinux enforcement changed during imported maintenance test')
+        return proof, previous
 
     def ready(self, identity, sealed, previous_start=None):
         deadline = time.monotonic() + 30
@@ -736,31 +1099,9 @@ class Gptbox(Bootstrap):
             sealed, _ = self.seal_assembly_stage(stage, base, revision, inputs)
             self.record('resources', {stage_name: base, runtime_name: sealed})
             # A separate immutable runtime, never the writable assembly container.
-            self.mounts = {}
-            mount_args = []
-            for directory, destination in (('workspaces', '/work/job'), ('state', '/state'), ('cache', '/cache/job')):
-                source = '/var/lib/dev-pair/maintenance/' + directory + '/gptbox-probe'
-                self.directory(source, owner='dp-maint')
-                self.mounts[destination] = (str(self.path(source)), True)
-                mount_args += ['--volume', str(self.path(source)) + ':' + destination + ':rw,Z']
             self.image_stage('runtime',revision,expected)
-            runtime_id = image_id(self.engine('create', '--name=' + runtime_name, '--label=dev-pair.context=' + expected, '--timeout=' + str(RUNTIME_LIFETIME), '--restart=no', '--read-only', '--read-only-tmpfs=false', '--user=1000:1000',
-                '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                '--network=none', '--pid=private', '--ipc=private', '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1',
-                '--no-hosts', '--no-hostname', '--dns=none', '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
-                '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
-                *mount_args, '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
-            self.inspect_container(runtime_id, sealed)
-            previous_start = None
-            for cycle in range(2):
-                self.engine('start', runtime_id)
-                previous_start = self.ready(runtime_id, sealed, previous_start)
-                observed = json.loads(self.enter(runtime_id, sealed, 'probe'))
-                if observed.get('boundary_probe') != 'passed':
-                    raise Blocked('runtime boundary probe did not pass')
-                if self.enter(runtime_id, sealed, 'version').strip() != 'codex-cli 0.169.0':
-                    raise Blocked('actual Distrobox entry returned unexpected Codex identity')
-                self.engine('stop', '--time=10', runtime_id)
+            runtime_id = self.create_maintenance_probe(runtime_name, expected, sealed)
+            self.maintenance_probe_cycles(runtime_id, sealed, '0.169.0')
             result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
                       'distrobox_sha': DBX_SHA, 'fedora_base': imported, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
                       'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
@@ -1047,6 +1388,163 @@ class Gptbox(Bootstrap):
     def preparation(self):
         return Bootstrap(self.root, Commands())
 
+    def prepare_maintenance_host(self, context, expected, upstream, revision, sources, password_file=None,
+                                 apply=False, retry=False, console_receipt=None, provider_ssh=False):
+        validate_access = getattr(self, 'validate_bootstrap_access', None)
+        if validate_access is not None:
+            sources = validate_access(sources or [], console_receipt)
+        elif console_receipt is None:
+            sources = validate_sources(sources or [])
+        else:
+            raise Blocked('verified provider-console bootstrap support is unavailable')
+        if provider_ssh and (not sources or not getattr(self, 'observed_ssh_peer', lambda: None)()):
+            raise Blocked('SSH-backed hPanel setup requires an observed SSH peer and scoped CIDRs')
+        target = {'source_sha': revision, 'context_sha256': expected, 'standards_sha': candidate.STANDARDS,
+                  'distrobox_sha': DBX_SHA, 'bootstrap_sources': sources, 'verified_console': console_receipt is not None,
+                  'provider_ssh': provider_ssh}
+        with self.run.phase(PREPARE_EXECUTION + 120, 'dev-pair-maintenance-host', native=False):
+            self.preflight()
+            self.context_inputs(context, expected, revision)
+            self.protect_host_sources(upstream, revision)
+            self.protected(Path(__file__).with_name('devbox.py'))
+            available = self.path('/usr/bin/git').exists()
+            if available:
+                self.inputs(context, expected, upstream, revision)
+            if not apply:
+                return {**target, 'preview': 'prepare-maintenance-host', 'changes': False, 'job_admission': False,
+                        'source_verification': 'complete' if available else 'pending signed Git prerequisite'}
+            self.maintenance_storage()
+            with self.lock():
+                self._reject_development_host_intent()
+                return self._prepare_maintenance_host_locked(target, context, upstream, password_file, retry, console_receipt)
+
+    def _prepare_maintenance_host_locked(self, target, context, upstream, password_file, retry, console_receipt):
+        revision, expected = target['source_sha'], target['context_sha256']
+        self.target = ROOT + '/' + expected
+        raw = None
+        record = {'schema': 1, 'target': target, 'phase': 'preparing', 'phase_prefixes': [], 'native_units': []}
+        if os.path.lexists(self.path(MAINTENANCE_HOST_INTENT)):
+            data, prior = self.read_config_record(MAINTENANCE_HOST_INTENT)
+            phases, units = prior.get('phase_prefixes'), prior.get('native_units')
+            if (set(prior) != set(record) or type(prior['schema']) is not int or prior['schema'] != 1
+                    or prior['target'] != target or prior['phase'] not in ('preparing', 'complete')
+                    or type(phases) is not list or not 1 <= len(phases) <= 2
+                    or any(type(prefix) is not str or not re.fullmatch(r'dev-pair-maint-host-[0-9a-f]{8}', prefix) for prefix in phases)
+                    or len(set(phases)) != len(phases) or type(units) is not list or len(units) > 512
+                    or any(type(unit) is not str or unit.rsplit('-', 1)[0] not in phases
+                           or not re.fullmatch(r'dev-pair-maint-host-[0-9a-f]{8}-[0-9a-f]{8}', unit) for unit in units)
+                    or len(set(units)) != len(units)):
+                raise Blocked('protected maintenance host preparation target or native ownership differs')
+            if prior['phase'] == 'complete':
+                if not self.path('/usr/bin/git').exists():
+                    raise Blocked('completed maintenance host lacks its verified Git prerequisite')
+                self.maintenance_host_readiness(expected)
+                return {**target, 'kind': 'maintenance-host-prerequisites', 'reused': True, 'job_admission': False}
+            if not retry or len(phases) == 2:
+                raise Blocked('partial maintenance host preparation requires its bounded exact-target retry')
+            raw, record = data.decode(), prior
+        preparation = self.preparation()
+        if os.path.lexists(self.path(STATE + '/desired.json')):
+            desired = self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600)
+            if desired != preparation._host_desired('core', target['bootstrap_sources'], expected).encode():
+                raise Blocked('maintenance host request conflicts with protected existing bootstrap intent')
+            if raw is None and os.path.lexists(self.path(STATE + '/prepared')):
+                self.maintenance_host_readiness(expected)
+                return {**target, 'kind': 'maintenance-host-prerequisites', 'reused': True, 'job_admission': False}
+        for unit in record['native_units']:
+            preparation.run.reconcile_native(('--unit=' + unit, '--description=dev-pair-owned-' + unit), {})
+        password = operator_password(password_file) if password_file else None
+        if password is None and not self.path(STATE + '/operator-password-set').exists():
+            raise Blocked('first maintenance host preparation requires a protected core password file')
+
+        def save():
+            nonlocal raw
+            updated = image_inputs_bytes(record).decode()
+            self.atomic(MAINTENANCE_HOST_INTENT, updated, expected=raw)
+            raw = updated
+
+        def prove_source():
+            _, self.scripts = self.inputs(context, expected, upstream, revision)
+
+        with preparation.run.phase(PREPARE_EXECUTION, 'dev-pair-maint-host'):
+            prefix = preparation.run.native_prefix
+            if not re.fullmatch(r'dev-pair-maint-host-[0-9a-f]{8}', prefix or '') or prefix in record['phase_prefixes']:
+                raise Blocked('maintenance host native phase identity collision')
+            record['phase_prefixes'].append(prefix)
+            save()
+
+            def register(unit):
+                if (not re.fullmatch(re.escape(prefix) + r'-[0-9a-f]{8}', unit)
+                        or unit in record['native_units'] or len(record['native_units']) >= 512):
+                    raise Blocked('maintenance host native ownership limit or conflict')
+                record['native_units'].append(unit)
+                save()
+
+            preparation.run.native_register = register
+            arguments = {'password': password, 'source_check': prove_source}
+            if console_receipt is not None:
+                arguments['console_receipt'] = console_receipt
+            try:
+                ready = preparation._host_prerequisites('core', github_keys(), target['bootstrap_sources'],
+                                                        context, expected, **arguments)
+            finally:
+                preparation.run.native_register = None
+        self._validate_host_ready(ready, revision, expected)
+        self.directory(self.target, mode=0o755)
+        self.setup_executor()
+        self.maintenance_gateway(expected, self.verify_builder())
+        desired = self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600)
+        self.atomic(STATE + '/prepared', desired.decode())
+        record['phase'] = 'complete'
+        save()
+        self.event('prepare-maintenance-host', 'complete')
+        return {**target, 'kind': 'maintenance-host-prerequisites', 'reused': False, 'job_admission': False}
+
+    def maintenance_host_readiness(self, context):
+        raw, desired = self.read_config_record(STATE + '/desired.json')
+        prepared = self.protected_bytes(self.path(STATE + '/prepared'), 65536, 0o600)
+        packages = self.protected_bytes(self.path(STATE + '/packages.txt'), 16384, 0o600)
+        _, ready = self.read_config_record(STATE + '/host-ready.json')
+        fields = {'schema', 'source_baseline', 'standards_sha', 'bootstrap_sha256', 'gptbox_context_sha256',
+                  'operator', 'keys_source', 'bootstrap_sources'}
+        sources = desired.get('bootstrap_sources')
+        if sources == [] and desired.get('bootstrap_transport') == 'verified-provider-console':
+            fields.add('bootstrap_transport')
+        elif type(sources) is not list or validate_sources(sources) != sources:
+            raise Blocked('protected maintenance host ingress identity differs')
+        if (set(desired) != fields or type(desired.get('schema')) is not int or desired['schema'] != 1
+                or desired['source_baseline'] != SOURCE_BASELINE or desired['keys_source'] != KEYS_URL):
+            raise Blocked('protected maintenance host configuration shape differs')
+        raw_digest(ready.get('source_sha'), 40)
+        base_context = raw_digest(desired.get('gptbox_context_sha256'))
+        expected = {'schema': 1, 'kind': 'host-prerequisites', 'source_sha': ready['source_sha'],
+                    'context_sha256': base_context, 'standards_sha': candidate.STANDARDS,
+                    'bootstrap_sha256': raw_digest(desired.get('bootstrap_sha256')),
+                    'desired_sha256': sha(raw), 'packages_sha256': sha(packages)}
+        if (raw != prepared or ready != expected or type(ready['schema']) is not int
+                or desired.get('standards_sha') != candidate.STANDARDS or desired.get('operator') != 'core'
+                or self.run('/usr/bin/rpm', '-q', *PACKAGES, 'tailscale', timeout=15).encode() != packages):
+            raise Blocked('live maintenance host differs from its protected host preparation')
+        account = self.verify_builder()
+        self.maintenance_gateway(context, account)
+        device = self.maintenance_storage()
+        graph = self.path(MAINTENANCE_STORE)
+        node = graph.lstat()
+        if (graph.resolve(strict=True) != graph or not stat.S_ISDIR(node.st_mode)
+                or (node.st_uid, node.st_gid, stat.S_IMODE(node.st_mode)) != (account.uid, account.gid, 0o700)
+                or f'{os.major(node.st_dev)}:{os.minor(node.st_dev)}' != device):
+            raise Blocked('maintenance image store is outside the bounded host allocation')
+        return ready
+
+    def maintenance_storage(self):
+        from devbox import managed_storage
+
+        with self.path('/proc/self/mountinfo').open('rb') as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        if not 0 < len(raw) <= 1024 * 1024:
+            raise Blocked('maintenance managed storage mount inventory is unbounded')
+        return managed_storage(raw.decode())['device']
+
     def initialize(self, context, expected, upstream, revision, sources, password_file=None, apply=False, retry=False):
         # The outer ceiling includes admission/fetch and a finite cleanup reserve.
         # Read-only admission uses no native unit; ordinary effects have their
@@ -1237,48 +1735,6 @@ class DevelopmentGptbox(Gptbox):
     role = 'development'
     artifact_root = DEVELOPMENT_ARTIFACTS
 
-    def protect_host_sources(self, upstream, revision):
-        def regular(path):
-            node = self.protected(path).lstat()
-            if not stat.S_ISREG(node.st_mode) or node.st_nlink != 1:
-                raise Blocked('development host source requires protected regular files')
-
-        repo = Path(__file__).parents[1]
-        upstream = Path(upstream)
-        for name in ADAPTER_SOURCE_FILES:
-            regular(repo / 'tools' / name)
-        regular(Path(fedora_oci._public_inputs().__file__))
-        regular(repo / 'runtime/devbox/controller.py')
-        for name in ('distrobox-init', 'distrobox-enter'):
-            regular(upstream / name)
-        # Only sanitized, digest-verified public-input extraction is admitted.
-        # Protect the Git inputs too, including configuration and object paths.
-        for checkout, head in ((repo, revision), (upstream, DBX_SHA)):
-            metadata = checkout / '.git'
-            for relative, names in (('', {'HEAD', 'config', 'shallow', 'refs', 'objects'}),
-                                    ('refs', {'heads'}), ('refs/heads', {'public-input'}),
-                                    ('objects', {'pack'})):
-                directory = self.protected(metadata / relative)
-                if {p.name for p in directory.iterdir()} != names:
-                    raise Blocked('development host requires the extracted public-input Git layout')
-            for relative, value in {
-                'HEAD': 'ref: refs/heads/public-input\n',
-                'config': '[core]\nrepositoryformatversion=0\nbare=false\nfilemode=true\n',
-                'shallow': head + '\n', 'refs/heads/public-input': head + '\n',
-            }.items():
-                data = self.protected_bytes(metadata / relative, 4096)
-                if data != value.encode():
-                    raise Blocked('development host Git metadata differs from the extracted target')
-            pack = self.protected(metadata / 'objects/pack')
-            names = {p.name for p in pack.iterdir()}
-            if len(names) not in (2, 3) or any(not re.fullmatch(r'pack-[0-9a-f]{40}\.(pack|idx|rev)', name) for name in names):
-                raise Blocked('unexpected development host Git object layout')
-            prefix = next(iter(names)).rsplit('.', 1)[0]
-            if names not in ({prefix + '.pack', prefix + '.idx'}, {prefix + '.pack', prefix + '.idx', prefix + '.rev'}):
-                raise Blocked('development host Git object pack and index do not match')
-            for name in names:
-                regular(pack / name)
-
     def prepare_development_host(self, context, expected, upstream, revision, sources, password_file=None,
                                  apply=False, retry=False):
         sources = validate_sources(sources)
@@ -1426,15 +1882,6 @@ class DevelopmentGptbox(Gptbox):
         self.archive_verifier = ModuleType('dev_pair_development_archive_verifier')
         exec(compile(data, str(path), 'exec'), self.archive_verifier.__dict__)
 
-    def protected_bytes(self, path, maximum, mode=None):
-        try:
-            self.protected(path)
-            if mode is not None and stat.S_IMODE(path.lstat().st_mode) != mode:
-                raise Blocked('protected development input permissions conflict')
-            return capture_release_file(path, maximum, os.getuid(), contents=True)[2]
-        except FileNotFoundError:
-            raise Blocked(f'required protected development evidence is missing: {path.name}') from None
-
     def verify_host_readiness(self, revision=None, expected=None):
         desired_raw = self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600)
         desired = json.loads(desired_raw, object_pairs_hook=fedora_oci.unique)
@@ -1478,41 +1925,6 @@ class DevelopmentGptbox(Gptbox):
             raise Blocked('protected prepared marker does not match authorized host desired state')
         if self.run('/usr/bin/rpm', '-q', *PACKAGES, 'tailscale', timeout=15).encode() != packages:
             raise Blocked('live host package inventory differs from protected readiness evidence')
-
-    def verify_builder(self):
-        name, shell, start = 'dp-maint', '/usr/sbin/nologin', 1000000
-        marker = self.protected_bytes(self.path(STATE + '/identity-' + name + '.json'), 4096, 0o600)
-        if marker != image_inputs_bytes({'name': name, 'shell': shell, 'substart': start}):
-            raise Blocked('managed builder identity marker does not match the bootstrap role')
-        passwd = self.run('/usr/bin/getent', 'passwd', name, timeout=10).strip().split(':')
-        if len(passwd) != 7 or passwd[0] != name or passwd[5:] != ['/home/' + name, shell]:
-            raise Blocked('live builder account differs from the managed nologin role')
-        uid, gid = (_canonical_role_id(value + '\n') for value in passwd[2:4])
-        if (uid != _canonical_role_id(self.run('/usr/bin/id', '-u', name, timeout=10))
-                or gid != _canonical_role_id(self.run('/usr/bin/id', '-g', name, timeout=10))
-                or self.run('/usr/bin/id', '-nG', name, timeout=10).split() != [name]):
-            raise Blocked('live builder UID, GID or private group differs from the managed account')
-        role_root = self.path('/var/lib/dev-pair/maintenance')
-        self.protected(role_root.parent)
-        node = role_root.lstat()
-        if (not stat.S_ISDIR(node.st_mode) or stat.S_IMODE(node.st_mode) != 0o700
-                or (node.st_uid, node.st_gid) != (uid, gid)):
-            raise Blocked('live builder account differs from the provisioned maintenance directory owner')
-        status = self.run('/usr/bin/passwd', '-S', name, timeout=10).split()
-        if len(status) < 2 or status[0] != name or status[1] not in ('L', 'LK'):
-            raise Blocked('managed builder password must remain locked')
-        for location in ('/etc/subuid', '/etc/subgid'):
-            content = self.protected_bytes(self.path(location), 65536).decode('ascii')
-            if not role_subordinate_range(content, name, str(uid), start):
-                raise Blocked('live builder subordinate ID allocation is missing')
-        if self.run('/usr/bin/hostnamectl', '--static', timeout=10).strip() != 'erebus':
-            raise Blocked('managed builder requires the verified bootstrap host identity')
-        package = self.run(*SUDO_PACKAGE_QUERY, timeout=10, sudo_package=True)
-        proof = self.run('/usr/bin/sudo', '-l', '-U', name, timeout=10,
-                         sudo_probe={'role': name, 'host_verified': True, 'package': package})
-        if type(proof) is not dict or proof.get('outcome') != 'denied':
-            raise Blocked('live builder sudo denial was not verified')
-        return _RoleIdentity(name, uid, gid)
 
     def assemble(self, context, expected, upstream, revision, apply=False, retry=False):
         def phase(seconds):
@@ -1851,8 +2263,42 @@ def run_job_cli(argv):
                                   args.context_sha256, args.source_sha)
         print(json.dumps(report, sort_keys=True))
         return 0 if report['turn']['status'] == 'completed-turn' else 2
-    except (RuntimeError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+    except (Blocked, RuntimeError, ImportError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
         print('Maintenance role blocked; inspect protected evidence locally', file=sys.stderr)
+        return 2
+
+
+def maintenance_install_cli(stage, argv):
+    parser = argparse.ArgumentParser(prog='gptbox.py ' + stage)
+    app = Gptbox()
+    if stage == 'prepare-maintenance-host':
+        for option in ('context', 'expected-context-sha256', 'distrobox-source'):
+            parser.add_argument('--' + option, type=Path if option != 'expected-context-sha256' else str, required=True)
+        source = parser.add_mutually_exclusive_group(required=True)
+        source.add_argument('--bootstrap-source', action='append')
+        source.add_argument('--console-receipt')
+        parser.add_argument('--provider-ssh', action='store_true')
+        parser.add_argument('--password-file')
+        parser.add_argument('--apply', action='store_true')
+        parser.add_argument('--retry', action='store_true')
+    else:
+        parser.add_argument('--phase', choices=('preflight', 'verify'), required=True)
+        for option in ('platform-sha256', 'context-sha256', 'image', 'oci-manifest-sha256'):
+            parser.add_argument('--' + option, required=True)
+    parser.add_argument('--source-sha', required=True)
+    args = parser.parse_args(argv)
+    try:
+        if stage == 'prepare-maintenance-host':
+            result = app.prepare_maintenance_host(args.context, args.expected_context_sha256, args.distrobox_source,
+                                                  args.source_sha, args.bootstrap_source, args.password_file,
+                                                  args.apply, args.retry, args.console_receipt, args.provider_ssh)
+        else:
+            result = app.verify_installed_maintenance(args.phase, args.platform_sha256, args.context_sha256,
+                                                      args.source_sha, args.image, args.oci_manifest_sha256)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (Blocked, RuntimeError, ImportError, OSError, ValueError, KeyError, TypeError, IndexError, subprocess.SubprocessError):
+        print('Maintenance installation blocked; inspect protected evidence locally', file=sys.stderr)
         return 2
 
 
@@ -1907,6 +2353,8 @@ def main():
         return run_job_cli(sys.argv[2:])
     if sys.argv[1:2] == ['approve-job']:
         return approve_job(sys.argv[2:])
+    if sys.argv[1:2] and sys.argv[1] in ('prepare-maintenance-host', 'verify-installed-maintenance'):
+        return maintenance_install_cli(sys.argv[1], sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', choices=('assemble', 'initialize', 'prepare-development-host', 'build-development'))
     parser.add_argument('--apply', action='store_true')
