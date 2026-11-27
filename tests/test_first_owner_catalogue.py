@@ -1,4 +1,5 @@
 import contextlib
+from datetime import datetime, timezone
 import io
 import os
 from pathlib import Path
@@ -54,8 +55,13 @@ class FirstCatalogueTests(unittest.TestCase):
         self.first = owner.FirstCatalogue(self.intake)
         owner.write_private(self.intake.catalogue / 'intake.lock', b'')
         owner.write_private(self.credential, b'not-a-live-key')
-        for name in ('context', 'tariff'):
-            owner.write_private(self.billing / (owner.MODEL + '.' + name), ('fixture approval ' + name).encode())
+        self.bill = {
+            'context': {'model': owner.MODEL, 'max_context_tokens': 2000},
+            'tariff': {'model': owner.MODEL, 'input_microusd_per_million': 500000,
+                       'output_microusd_per_million': 2000000, 'observed_models': [owner.MODEL]},
+        }
+        for name, value in self.bill.items():
+            owner.write_private(self.billing / (owner.MODEL + '.' + name), canonical(value).encode())
         self.source = self.site / 'repositories' / REPOSITORY / 'acquired'
         self.startup = self.site / 'repositories' / REPOSITORY / 'startup'
         for repository in (self.source, self.startup):
@@ -177,8 +183,10 @@ class FirstCatalogueTests(unittest.TestCase):
         leaf.mkdir(mode=0o700, parents=True)
         owner.write_private(leaf / 'manifest.json', canonical(manifest).encode())
         (leaf / 'manifest.json').chmod(0o444)
-        archive.rename(leaf / archive.name)
-        (leaf / archive.name).chmod(0o444)
+        portable = self.path / 'portable'
+        (portable / 'development').mkdir(mode=0o700, parents=True)
+        archive.rename(portable / 'development' / archive.name)
+        (portable / 'development' / archive.name).chmod(0o444)
         components = {role + '-agent': {'source_revision': BOOTSTRAP, 'config_sha256': 'e' * 64,
                                       'artifact_sha256': artifact if role == 'development' else '8' * 64}
                       for role in owner.ROLES}
@@ -190,8 +198,13 @@ class FirstCatalogueTests(unittest.TestCase):
         self.engine = SimpleNamespace(preflight=mock.Mock(), admitted_maintenance_image=mock.Mock(),
                                       lock=contextlib.nullcontext, maintenance_labels=lambda *args: labels('maintenance'))
         self.use(mock.patch.object(gptbox, 'Gptbox', return_value=self.engine))
-        portable = {'components': {role + '-agent': {'codex_version': '1.2.3', 'codex_sha256': CODEX} for role in owner.ROLES}}
-        self.use(mock.patch.object(platform_release_intake, 'retained_index', return_value=(None, portable, '9' * 64)))
+        self.portable_authority = {'components': {
+            role + '-agent': {'codex_version': '1.2.3', 'codex_sha256': CODEX} for role in owner.ROLES}}
+        self.portable_authority['components']['development-agent'].update(
+            oci_config_sha256=artifact, source_sha=BOOTSTRAP, context_sha256='e' * 64,
+            **{key: manifest['inner'][key] for key in ('archive_sha256', 'archive_bytes')})
+        self.use(mock.patch.object(platform_release_intake, 'retained_index',
+                                   return_value=(portable, self.portable_authority, '9' * 64)))
 
     def preview(self):
         plan, _ = self.first.preview(self.options)
@@ -324,13 +337,54 @@ class FirstCatalogueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'both requested'):
             self.first.preview(SimpleNamespace(**(vars(self.options) | {'spend_microusd': 1})))
         self.preview()
-        (self.billing / (owner.MODEL + '.tariff')).write_text('changed fixture proof')
+        (self.billing / (owner.MODEL + '.tariff')).write_text(canonical(dict(self.bill['tariff'], review='changed receipt')))
         with self.assertRaisesRegex(ValueError, 'selection changed'):
             self.first.initialize(self.options)
         occupied = self.intake.queue / (JOB + '.json')
         owner.write_private(occupied, b'prior owned history')
         pending('owner-slot-capacity')
         self.assertEqual(occupied.read_bytes(), b'prior owned history')
+        self.assertFalse(self.first.catalogue.exists())
+
+    def test_command_line_billing_values_can_only_assert_the_protected_facts(self):
+        self.preview()
+        wrong = {'context_tokens': 1024, 'input_rate': 1, 'output_rate': 1, 'observed_model': ['gpt-unlisted']}
+        for key, value in wrong.items():
+            with self.subTest(field=key), self.assertRaisesRegex(ValueError, 'independently reviewed evidence'):
+                self.first.preview(SimpleNamespace(**(vars(self.options) | {key: value})))
+        self.assertFalse(self.first.catalogue.exists())
+
+    def test_attended_setup_derives_billing_and_commits_after_one_confirmation(self):
+        expires = datetime.fromtimestamp(self.options.expires_unix, timezone.utc).strftime('%Y-%m-%d %H:%M')
+        given = '\n'.join((REPOSITORY, '1', '0.09', expires, 'yes', ''))
+        with mock.patch.object(owner.getpass, 'getpass', return_value=self.credential.name) as hidden:
+            printed = io.StringIO()
+            owner.setup_site(self.first, io.StringIO(given), printed)
+        hidden.assert_called_once()
+        self.assertEqual(printed.getvalue().count('Confirm this exact owner setup?'), 1)
+        self.assertIn(DESTINATION, printed.getvalue())
+        self.assertIn('USD 0.090000', printed.getvalue())
+        self.assertNotIn(self.credential.name, printed.getvalue())
+        self.assertNotIn('tariff (', printed.getvalue())
+        self.assertEqual(self.first.configured()['phase'], 'configured')
+        settings, _, _, _ = self.intake.slot(JOB, self.manifest)
+        self.assertEqual(settings['pricing']['max_context_tokens'], self.bill['context']['max_context_tokens'])
+        self.assertEqual(settings['pricing']['input_microusd_per_million'], self.bill['tariff']['input_microusd_per_million'])
+        self.assertFalse((self.root / 'provider-allowances' / JOB).exists())
+
+    def test_declined_or_opaque_attended_setup_stays_held(self):
+        expires = datetime.fromtimestamp(self.options.expires_unix, timezone.utc).strftime('%Y-%m-%d %H:%M')
+        given = '\n'.join((REPOSITORY, '1', '0.09', expires, 'no', ''))
+        with mock.patch.object(owner.getpass, 'getpass', return_value=self.credential.name):
+            printed = io.StringIO()
+            owner.setup_site(self.first, io.StringIO(given), printed)
+            self.assertIn('Setup remains pending.', printed.getvalue())
+            (self.billing / (owner.MODEL + '.tariff')).write_text('Previously reviewed opaque notes')
+            printed = io.StringIO()
+            owner.setup_site(self.first, io.StringIO(REPOSITORY + '\n1\n'), printed)
+        self.assertIn('provider custodian must supply', printed.getvalue())
+        self.assertNotIn('Approved total job budget', printed.getvalue())
+        self.assertNotIn('Confirm this exact owner setup?', printed.getvalue())
         self.assertFalse(self.first.catalogue.exists())
         self.assertFalse((self.site / 'slots').exists())
 
@@ -342,6 +396,25 @@ class FirstCatalogueTests(unittest.TestCase):
         observed = self.engine.maintenance_labels()
         self.engine.maintenance_labels = lambda *args: {**observed, 'dev-pair.runtime': 'c' * 64}
         with self.assertRaisesRegex(ValueError, 'matching verified host seed-policy'):
+            self.preview()
+        self.assertFalse(self.first.catalogue.exists())
+
+    def test_portable_config_is_bound_to_the_selected_placement_under_dp_dev_ancestry(self):
+        development = self.root / 'development'
+        builds = development / 'builds'
+        for folder in (development, builds):
+            folder.chmod(0o700)
+        try:
+            os.chown(development, 1001, 1001)
+        except OSError as exc:
+            self.skipTest(f'The mapped fixture cannot assign the separate role UID ({exc.errno}).')
+        os.chown(builds, 1001, 1001)
+        for folder in (development, builds):
+            self.assertEqual((folder.stat().st_uid, stat.S_IMODE(folder.stat().st_mode)), (1001, 0o700))
+        plan = self.preview()
+        self.assertEqual(plan['roles']['development']['binary_sha256'], CODEX)
+        self.portable_authority['components']['development-agent']['archive_sha256'] = 'e' * 64
+        with self.assertRaisesRegex(ValueError, 'differs from its signed release'):
             self.preview()
         self.assertFalse(self.first.catalogue.exists())
 

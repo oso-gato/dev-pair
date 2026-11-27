@@ -55,7 +55,7 @@ class DayZeroTests(unittest.TestCase):
         self.assertIn('Checklist cleanup is scheduled.', details)
         self.assertIn('Agent renewal is held pending release read custody.', details)
         self.assertIn('Owner intake is held pending owner catalogue selection.', details)
-        self.assertIn('/usr/libexec/dev-pair/tools/owner_intake.py --inspect-site.', details)
+        self.assertIn('/usr/libexec/dev-pair/tools/owner_intake.py --setup-site.', details)
         self.assertNotIn('terminal is available', details)
 
     def test_gitless_kit_verification_and_signed_prerequisite(self):

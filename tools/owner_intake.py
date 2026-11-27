@@ -3,7 +3,11 @@
 
 import argparse
 import contextlib
+from datetime import datetime, timezone
+from decimal import Decimal
+import errno
 import fcntl
+import getpass
 import os
 from pathlib import Path
 import pwd
@@ -15,6 +19,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+import warnings
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checklist_candidate as candidate
@@ -828,7 +833,7 @@ def role_site_profiles(intake, controller, selected, binding, job, manifest_sha,
 
     policy_runtime = p.sha256(Path(gptbox_runtime.__file__).read_bytes())
     release = controller.release(selected)
-    selected_index = retained_index(binding['platform_sha256'])[1]
+    portable, selected_index, _ = retained_index(binding['platform_sha256'])
     path = intake.root / 'development/builds' / job / 'inputs' / manifest_sha / 'manifest.json'
     manifest = db.read_manifest(path, manifest_sha, time.monotonic() + 10)
     p.require(manifest['job'] == job and manifest['categories'] == geometry['categories'] and
@@ -848,10 +853,17 @@ def role_site_profiles(intake, controller, selected, binding, job, manifest_sha,
         engine.admitted_maintenance_image(context, revision, artifact, binding['platform_sha256'])
         observed = {'maintenance': engine.maintenance_labels(context, revision, artifact)}
     development = release['components']['development-agent']
-    p.require((manifest['inner']['image_id'], manifest['inner']['source_sha']) ==
-              (development['artifact_sha256'], development['source_revision']), 'Selected DevBox role differs from its signed release.')
-    observed['development'] = development_labels(path.with_name('development.oci.tar'), development,
-                                                 manifest['inner']['archive_bytes'], time.monotonic() + 15)
+    signed = selected_index['components']['development-agent']
+    inner = manifest['inner']
+    p.require((inner['image_id'], inner['source_sha'], inner['context_sha256']) ==
+              (development['artifact_sha256'], development['source_revision'], development['config_sha256']) ==
+              (signed['oci_config_sha256'], signed['source_sha'], signed['context_sha256']) and
+              all(inner[key] == signed[key] for key in ('archive_sha256', 'archive_bytes')),
+              'Selected DevBox role differs from its signed release.')
+    # The installed manifest is selected by digest beneath the dp-dev placement.
+    # Read config bytes from the separately protected signed portable part.
+    observed['development'] = development_labels(portable / 'development/development.oci.tar', development,
+                                                 signed['archive_bytes'], time.monotonic() + 15)
     roles = {}
     for role, name in ROLES.items():
         account = pwd.getpwnam(name)
@@ -882,46 +894,80 @@ def role_site_profiles(intake, controller, selected, binding, job, manifest_sha,
     return roles
 
 
-def owner_provider(options):
+def provider_custody(reference):
     from commission_host import Blocked, Live
+
+    if not reference:
+        raise SitePending('provider-credential', 'Select a protected scoped credential reference. Keep its value out of the terminal.')
+    p.token(reference)
+    try:
+        stamp = Live.credential_stamp(CREDENTIALS / reference)
+    except FileNotFoundError as exc:
+        raise SitePending('provider-credential', 'The selected root-private API credential file is absent.') from exc
+    except (Blocked, OSError) as exc:
+        raise SitePending('provider-credential-custody', 'Verify root ownership and private mode for the selected API credential.') from exc
+    p.require(stamp[-1] <= MAX_INPUT, 'The protected provider credential exceeds the admitted size.')
+    return stamp
+
+
+def billing_documents(reference):
+    proofs = {}
+    for kind in ('context', 'tariff'):
+        try:
+            raw = checked_file(BILLING_EVIDENCE / reference / (MODEL + '.' + kind), 1024 * 1024)
+        except FileNotFoundError as exc:
+            raise SitePending('provider-billing-evidence',
+                              'Install the reviewed full billable context and worst applicable tariff evidence.') from exc
+        p.require(bool(raw), 'Provider billing evidence is empty.')
+        proofs[kind] = raw
+    return proofs
+
+
+def billing_authority(reference):
+    proofs = billing_documents(reference)
+    try:
+        context, tariff = (p.loads(proofs[kind]) for kind in ('context', 'tariff'))
+        p.require(context['model'] == tariff['model'] == MODEL, 'Reviewed billing evidence must name the selected model.')
+        pricing = {'max_context_tokens': context['max_context_tokens']}
+        for key in ('input_microusd_per_million', 'output_microusd_per_million', 'observed_models'):
+            pricing[key] = tariff[key]
+        p.number(pricing['max_context_tokens'], 1024, 2000000)
+        for key in ('input_microusd_per_million', 'output_microusd_per_million'):
+            p.number(pricing[key], 1, 10**9)
+        aliases = pricing['observed_models']
+        p.require(type(aliases) is list and 0 < len(aliases) <= 8 and
+                  all(type(model) is str and re.fullmatch(r'gpt-[a-z0-9][a-z0-9.-]{1,95}', model) for model in aliases) and
+                  len(set(aliases)) == len(aliases), 'Reviewed evidence lacks exact authorized response models.')
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SitePending('provider-billing-authority',
+                          'The provider custodian must supply reviewed machine-readable context, tariff and response-model evidence for this account.') from exc
+    return pricing, proofs
+
+
+def owner_provider(options):
     from provider_broker import PROFILE, reserved_cost
 
     if options.profile is None:
         raise SitePending('provider-profile', 'Select the independently authorized direct API profile for the first owner slot.')
     if options.profile != PROFILE:
         raise SitePending('unsupported-provider-profile', 'The installed broker needs a direct OpenAI API key and bounded allowance.')
-    if options.credential_ref is None:
-        raise SitePending('provider-credential', 'Select a protected scoped credential reference. Keep its value out of the terminal.')
-    p.token(options.credential_ref)
-    try:
-        stamp = Live.credential_stamp(CREDENTIALS / options.credential_ref)
-    except FileNotFoundError as exc:
-        raise SitePending('provider-credential', 'The selected root-private API credential file is absent.') from exc
-    except (Blocked, OSError) as exc:
-        raise SitePending('provider-credential-custody', 'Verify root ownership and private mode for the selected API credential.') from exc
-    p.require(stamp[-1] <= MAX_INPUT, 'The protected provider credential exceeds the admitted size.')
-    pricing = {'max_context_tokens': options.context_tokens, 'input_microusd_per_million': options.input_rate,
-               'output_microusd_per_million': options.output_rate, 'observed_models': options.observed_model}
+    stamp = provider_custody(options.credential_ref)
+    pricing, proofs = billing_authority(options.credential_ref)
+    asserted = {'max_context_tokens': options.context_tokens, 'input_microusd_per_million': options.input_rate,
+                'output_microusd_per_million': options.output_rate, 'observed_models': options.observed_model}
+    p.require(all(value is None or value == pricing[key] for key, value in asserted.items()),
+              'Requested billing values differ from the independently reviewed evidence.')
     limits = {'max_requests': options.requests, 'max_request_bytes': options.request_bytes,
               'max_output_tokens': options.output_tokens, 'seconds': options.turn_seconds}
-    if (None in pricing.values() or None in limits.values() or options.spend_microusd is None or options.expires_unix is None):
-        raise SitePending('provider-allowance', 'Supply the actual approved cap, expiry, response bounds and model tariff from your provider authority.')
+    if None in limits.values() or options.spend_microusd is None or options.expires_unix is None:
+        raise SitePending('provider-allowance', 'Supply the actual approved cap, expiry and request bounds from your provider authority.')
     for value, low, high in ((options.host_seconds, 25, 60), (options.build_seconds, 20, 240),
                              (options.turn_seconds, 10, 120), (options.expires_unix, 1, 2**63 - 1),
-                             (pricing['max_context_tokens'], 1024, 2000000), (pricing['input_microusd_per_million'], 1, 10**9),
-                             (pricing['output_microusd_per_million'], 1, 10**9),
                              (limits['max_output_tokens'], 16, 65536)):
         p.number(value, low, high)
     if options.expires_unix <= time.time() + 2 * (options.host_seconds + options.build_seconds + options.turn_seconds) + 60:
         raise SitePending('provider-allowance-expired', 'The approved API allowance must cover the full bounded first job.')
-    proofs = {}
-    for kind in ('context', 'tariff'):
-        try:
-            raw = checked_file(BILLING_EVIDENCE / options.credential_ref / (MODEL + '.' + kind), 1024 * 1024)
-        except FileNotFoundError as exc:
-            raise SitePending('provider-billing-evidence', 'Install the reviewed full billable context and worst applicable tariff evidence.') from exc
-        p.require(bool(raw), 'Provider billing evidence is empty.')
-        proofs[kind] = raw
+    for kind, raw in proofs.items():
         pricing[kind + '_evidence_sha256'] = p.sha256(raw)
     p.number(limits['max_requests'], 1, 32)
     p.number(options.spend_microusd, 1, 100000000)
@@ -1123,9 +1169,93 @@ class FirstCatalogue:
         return self.configured(approval)
 
 
+def setup_site(first, incoming, outgoing):
+    from gptbox_runtime import PROVIDER_BODY_MAX
+    from provider_broker import PROFILE, reserved_cost
+
+    def say(message):
+        print(message, file=outgoing, flush=True)
+
+    def ask(prompt):
+        outgoing.write(prompt + ' ')
+        outgoing.flush()
+        value = incoming.readline(1025)
+        p.require(value.endswith('\n') and len(value) <= 1024, 'The setup answer was interrupted or too long.')
+        return value.strip()
+
+    if first.configured() is not None:
+        say('An owner catalogue is already configured. Run ./day0.sh resume.')
+        return
+    try:
+        say('Choose the approved repository and workload for the first owner job.')
+        repository = repository_id(ask('Repository (owner/name)'))
+        say('1 Checklist persistence   2 General development   3 General development with an external check')
+        choice = ask('Workload [1/2/3]')
+        p.require(choice in ('1', '2', '3'), 'Choose one of the listed workloads.')
+        workload = tuple(WORKLOADS)[int(choice) - 1]
+        if not os.path.lexists(first.site / 'repositories' / repository / 'acquired'):
+            raise SitePending('owner-repository-inputs', 'Install the approved Git acquisition and startup inputs for this repository.')
+        say('Setup requires an approved direct OpenAI API account. Enter only its credential reference.')
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', getpass.GetPassWarning)
+            try:
+                reference = getpass.getpass('Protected credential reference: ', stream=outgoing).strip()
+            except getpass.GetPassWarning as exc:
+                raise ValueError('Credential reference input requires a private controlling terminal.') from exc
+        provider_custody(reference)
+        values, proofs = billing_authority(reference)
+        text = ask('Approved total job budget in USD')
+        p.require(re.fullmatch(r'(?:0|[1-9][0-9]{0,2})(?:\.[0-9]{1,6})?', text),
+                  'Enter the approved USD amount with at most six decimals.')
+        spend = int(Decimal(text) * 1000000)
+        try:
+            expiry = datetime.strptime(ask('Approved expiry in UTC (YYYY-MM-DD HH:MM)'), '%Y-%m-%d %H:%M')
+        except ValueError as exc:
+            raise ValueError('Enter the approved expiry in UTC as YYYY-MM-DD HH:MM.') from exc
+        output_tokens = 4096
+        cost = reserved_cost(dict(values, max_output_tokens=output_tokens))
+        requests = min(4, spend // (2 * cost))
+        p.require(requests >= 2, 'The approved total does not cover two bounded requests per role.')
+        options = argparse.Namespace(repository=repository, workload=workload, destination=None, profile=PROFILE,
+            credential_ref=reference, spend_microusd=spend, expires_unix=int(expiry.replace(tzinfo=timezone.utc).timestamp()),
+            context_tokens=None, input_rate=None, output_rate=None, observed_model=None,
+            requests=requests, request_bytes=PROVIDER_BODY_MAX, output_tokens=output_tokens,
+            host_seconds=45, build_seconds=120, turn_seconds=90, confirm_sha256=None)
+        plan, selected_proofs = first.preview(options)
+        p.require(proofs == selected_proofs, 'The protected billing evidence changed. Start setup again.')
+        config = plan['catalogue']['repositories'][repository]
+        say(f"{repository} at {config['commit']}")
+        say(f"Workload {workload}. Slot {plan['catalogue']['slots'][0]}. Destination {config['destination']}")
+        say(f"Startup revision {config['startup_revision']}. GPT-6.2 Sol High for both roles.")
+        say(f"Shared API ceiling USD {Decimal(spend) / 1000000:.6f} until {expiry:%Y-%m-%d %H:%M} UTC.")
+        say(f"Up to {requests} requests per role, {output_tokens} output tokens each and {options.turn_seconds}s per turn.")
+        if ask('Confirm this exact owner setup? [y/N]').lower() not in ('y', 'yes'):
+            say('Setup remains pending.')
+            return
+        options.confirm_sha256 = p.identity(plan)
+        first.initialize(options)
+        say('Owner catalogue configured. Run ./day0.sh resume for the existing activation checks.')
+    except SitePending as wait:
+        say(wait.observation['message'])
+    except (EOFError, KeyboardInterrupt):
+        say('Setup was interrupted. Run the same setup command to inspect the retained state.')
+
+
 def catalogue_command(intake, argv):
     p.require(os.getuid() == os.geteuid() == 0 and not os.environ.get('SUDO_USER'),
               'Use the protected root commissioning terminal for first owner setup.')
+    first = FirstCatalogue(intake)
+    if argv[:1] == ['--setup-site']:
+        p.require(argv == ['--setup-site'], 'Run the attended setup command without arguments.')
+        try:
+            with open('/dev/tty', encoding='utf-8') as incoming, open('/dev/tty', 'w', encoding='utf-8') as outgoing:
+                p.require(incoming.isatty() and outgoing.isatty(), 'First owner setup requires the controlling terminal.')
+                setup_site(first, incoming, outgoing)
+        except OSError as exc:
+            if exc.errno in (errno.ENXIO, errno.ENOTTY):
+                raise ValueError('Open the protected root terminal to run first owner setup.') from exc
+            raise
+        return 0
     parser = argparse.ArgumentParser(prog='owner_intake.py', description='Inspect and confirm the exact first owner site.')
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument('--inspect-site', action='store_true')
@@ -1149,7 +1279,6 @@ def catalogue_command(intake, argv):
     parser.add_argument('--turn-seconds', type=int, default=90)
     parser.add_argument('--confirm-sha256')
     options = parser.parse_args(argv)
-    first = FirstCatalogue(intake)
     p.require(options.initialize_site == (options.confirm_sha256 is not None), 'Initialize requires the exact inspected confirmation SHA-256.')
     try:
         if options.initialize_site:
@@ -1191,7 +1320,7 @@ def main():
     try:
         p.require(os.geteuid() == 0, 'The installed intake service requires its protected account.')
         intake = Intake()
-        if sys.argv[1:2] in (['--inspect-site'], ['--initialize-site']):
+        if sys.argv[1:2] and sys.argv[1] in ('--setup-site', '--inspect-site', '--initialize-site'):
             return catalogue_command(intake, sys.argv[1:])
         if sys.argv[1:] == ['--reconcile'] and not os.environ.get('SUDO_USER'):
             return intake.reconcile()

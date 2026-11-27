@@ -641,8 +641,8 @@ class DayZero:
             for name, reason in sorted(pending.items()):
                 lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
                 if name == 'owner-intake' and reason == 'owner-catalogue-selection':
-                    lines.append('Inspect the first owner setup with /usr/bin/python3 -IB '
-                                 '/usr/libexec/dev-pair/tools/owner_intake.py --inspect-site.')
+                    lines.append('Set up the first owner slot with /usr/bin/python3 -IB '
+                                 '/usr/libexec/dev-pair/tools/owner_intake.py --setup-site.')
             if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
                 lines.append('Owner jobs remain held.')
             for units in observed.get('retained_services', {}).values():

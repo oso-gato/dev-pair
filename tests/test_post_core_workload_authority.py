@@ -202,7 +202,7 @@ class SignedWorkloadAuthority(unittest.TestCase):
             result = cli()
             self.assertEqual(set(result['timers']), {c.TIMERS['checklist-spool'][0]}, result)
             self.assertEqual(result['pending_features'], {'agent-renewal': 'release-read-custody',
-                                                         'owner-intake': 'owner-catalogue-source-gap'})
+                                                         'owner-intake': 'owner-catalogue-selection'})
             app.require_runtime_feature('checklist-spool')
             if with_grants:
                 self.approved_owner(app, catalogue, credentials, job, dev_sha, dev_manifest)
