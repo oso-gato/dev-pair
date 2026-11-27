@@ -126,7 +126,7 @@ class AgentBridgeTests(unittest.TestCase):
         checked = []
         branch = {'name': 'main', 'protected': True, 'commit': {'sha': SOURCE}}
 
-        def observe(responses):
+        def observe(responses, *, poll=False):
             lookup = iter(responses)
 
             def read(endpoint, deadline):
@@ -135,6 +135,10 @@ class AgentBridgeTests(unittest.TestCase):
                 return next(lookup)
 
             scope = SimpleNamespace(ROOT=Path('/approved'), read_api=read, protected=lambda *a, **k: None)
+            if poll:
+                site = SimpleNamespace(intake=scope, protocol=protocol)
+                window = (timestamp(27, 17), timestamp(27, 18), 'schedule')
+                return bridge.Site.publisher(site, window, end)
             bridge.confirm_publisher_read(scope, protocol, end)
 
         empty = {'total_count': 0, 'workflow_runs': []}
@@ -152,8 +156,41 @@ class AgentBridgeTests(unittest.TestCase):
         ):
             with self.subTest(problem=problem), self.assertRaises(bridge.BridgeError):
                 observe([branch, problem, empty])
-        with self.assertRaises(bridge.BridgeError):
-            observe([{**branch, 'protected': False}, empty, empty])
+        for invalid_branch in ({**branch, 'protected': False}, {**branch, 'name': 'other'},
+                               {key: value for key, value in branch.items() if key != 'name'}):
+            for poll in (False, True):
+                with self.subTest(branch=invalid_branch, poll=poll), self.assertRaisesRegex(bridge.BridgeError, 'protected main'):
+                    observe([invalid_branch, empty, empty], poll=poll)
+
+    def test_matching_run_parser_is_shared_without_requiring_publication_eligibility(self):
+        start, end = timestamp(27, 17), timestamp(27, 18)
+        window = (start, end, 'schedule')
+        branch = {'name': 'main', 'protected': True, 'commit': {'sha': SOURCE}}
+        empty = {'total_count': 0, 'workflow_runs': []}
+
+        def confirm(rows):
+            values = iter((branch, rows, empty))
+            scope = SimpleNamespace(ROOT=Path('/approved'), read_api=lambda *_: next(values), protected=lambda *a, **k: None)
+            bridge.confirm_publisher_read(scope, protocol, time.monotonic() + 10)
+
+        for row in (run_row(42, timestamp(27, 16)), run_row(43, timestamp(27, 19)),
+                    run_row(44, start, conclusion='failure'), run_row(45, start, run_attempt=2),
+                    run_row(46, start, status='queued', conclusion=None)):
+            with self.subTest(run=row['id']):
+                rows = {'total_count': 1, 'workflow_runs': [row]}
+                confirm(rows)
+                self.assertEqual(bridge.publisher_runs(rows, SOURCE, window), [])
+
+        valid = run_row(1, start)
+        for change in ({**valid, 'created_at': 'invalid'}, {**valid, 'created_at': '2026-02-30T17:00:00Z'},
+                       {key: val for key, val in valid.items() if key != 'status'},
+                       {key: val for key, val in valid.items() if key != 'conclusion'}, {**valid, 'run_attempt': 0}):
+            with self.subTest(run=change):
+                rows = {'total_count': 1, 'workflow_runs': [change]}
+                with self.assertRaises(bridge.BridgeError):
+                    confirm(rows)
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.matching_runs(rows, SOURCE, window)
 
     def test_nightly_window_and_later_readback(self):
         self.assertIsNone(bridge.selection_window(timestamp(26, 18, 59), False))

@@ -66,29 +66,42 @@ def selection_window(now, on_demand):
     return (start, now, 'schedule') if now <= cutoff else None
 
 
+def publisher_run_in_scope(row, source, event):
+    require(type(row) is dict, 'invalid protected publisher run')
+    return (row.get('event') == event and row.get('head_sha') == source and row.get('head_branch') == 'main'
+            and row.get('path') == '.github/workflows/' + WORKFLOW
+            and all(type(row.get(key)) is dict and row[key].get('full_name') == REPOSITORY
+                    for key in ('repository', 'head_repository')))
+
+
+def publisher_run(row):
+    run, attempt = row.get('id'), row.get('run_attempt')
+    require(type(run) is int and 0 < run < 2**63 and type(attempt) is int and 0 < attempt < 2**63,
+            'invalid protected publisher run or attempt ID')
+    stamp = row.get('created_at')
+    require(type(stamp) is str and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', stamp),
+            'invalid protected publisher creation time')
+    try:
+        created = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+    except ValueError:
+        raise BridgeError('invalid protected publisher creation time') from None
+    status, conclusion = row.get('status'), row.get('conclusion')
+    require(type(status) is str and bool(status.strip()) and 'conclusion' in row and
+            (conclusion is None or type(conclusion) is str and bool(conclusion.strip())),
+            'invalid protected publisher state')
+    return created, run, status, conclusion
+
+
 def matching_runs(values, source, window):
     start, end, event = window
-    rows = values.get('workflow_runs')
+    rows = values.get('workflow_runs') if type(values) is dict else None
     require(type(rows) is list and len(rows) <= 8, 'unexpected publisher run inventory')
     runs = []
     for row in rows:
-        run = row.get('id')
-        if (row.get('event') != event or row.get('head_sha') != source or row.get('head_branch') != 'main'
-                or row.get('run_attempt') != 1 or row.get('path') != '.github/workflows/' + WORKFLOW
-                or row.get('repository', {}).get('full_name') != REPOSITORY
-                or row.get('head_repository', {}).get('full_name') != REPOSITORY):
-            continue
-        require(type(run) is int and 0 < run < 2**63, 'invalid protected publisher run ID')
-        stamp = row.get('created_at')
-        require(type(stamp) is str and re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ', stamp),
-                'invalid protected publisher creation time')
-        created = datetime.fromisoformat(stamp.replace('Z', '+00:00'))
-        if start <= created <= end:
-            status = row.get('status')
-            conclusion = row.get('conclusion')
-            require(type(status) is str and (conclusion is None or type(conclusion) is str),
-                    'invalid protected publisher state')
-            runs.append((created, run, status, conclusion))
+        if publisher_run_in_scope(row, source, event):
+            parsed = publisher_run(row)
+            if row['run_attempt'] == 1 and start <= parsed[0] <= end:
+                runs.append(parsed)
     require(len({run for _, run, _, _ in runs}) == len(runs), 'ambiguous publisher run ID')
     return sorted(runs, reverse=True)
 
@@ -101,9 +114,10 @@ def publisher_runs(values, source, window):
 def protected_main(intake, protocol, end):
     intake.protected(intake.ROOT, directory=True)
     branch = intake.read_api('branches/main', end)
-    require(type(branch) is dict and branch.get('protected') is True and branch.get('name', 'main') == 'main',
+    require(type(branch) is dict and branch.get('protected') is True and branch.get('name') == 'main' and
+            type(branch.get('commit')) is dict,
             'agent publisher requires independently protected main')
-    return protocol.hex_id(branch.get('commit', {}).get('sha'), 40)
+    return protocol.hex_id(branch['commit'].get('sha'), 40)
 
 
 def confirm_publisher_read(intake, protocol, end):
@@ -118,13 +132,9 @@ def confirm_publisher_read(intake, protocol, end):
                 'invalid protected publisher read inventory')
         if rows:
             row, = rows
-            require(type(row) is dict and row.get('head_sha') == source and row.get('head_branch') == 'main' and
-                    row.get('event') == event and row.get('path') == '.github/workflows/' + WORKFLOW and
-                    type(row.get('repository')) is dict and type(row.get('head_repository')) is dict and
-                    row.get('repository', {}).get('full_name') == REPOSITORY and
-                    row.get('head_repository', {}).get('full_name') == REPOSITORY and
-                    type(row.get('id')) is int and 0 < row['id'] < 2**63,
+            require(publisher_run_in_scope(row, source, event),
                     'protected publisher read returned a foreign or stale run')
+            publisher_run(row)
 
 
 def stable_version(version):
