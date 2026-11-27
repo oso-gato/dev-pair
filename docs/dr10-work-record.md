@@ -45,6 +45,16 @@ foreign objects, byte and inode pressure, malformed lease preservation, and
 surviving export and import helpers. All six passed separately in the detached
 mapped-root commissioning projection.
 
+The independently reviewed registry repair at
+`a0debbeda8179bda51ee13a48fc33402b9b25603` treats the expected rollback journal
+as optional during a concurrent commit. Its protected directory descriptor
+still anchors the database and lease identities, exact member names and total
+bytes. The reviewer observed a real SQLite commit removing the journal during
+the normal observer read. Both the independent run and the detached
+commissioning composition passed all 48 affected registry and dispatch checks.
+The independent receipt SHA-256 is
+`2c5749a2f7368f99d98e613cf9769923c7762791328378509f8fad87ae755277`.
+
 These checks are local source and fixture evidence. Owner portal execution,
 native Fedora role validation, protected CI publication and deployment remain
 pending. This checkpoint used no destination credentials or provider calls.
