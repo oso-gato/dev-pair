@@ -20,7 +20,7 @@ import time
 from types import ModuleType
 
 from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Commands, PrepareCost, KEYS_URL, PACKAGES, SOURCE_BASELINE,
-                       SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
+                       ACCESS_MODE, SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
 from gptbox_runtime import TURN_READONLY_MOUNTS
@@ -931,16 +931,19 @@ class Gptbox(Bootstrap):
     def preparation(self):
         return Bootstrap(self.root, Commands())
 
-    def initialize(self, context, expected, upstream, revision, sources, password_file=None, apply=False, retry=False):
+    def initialize(self, context, expected, upstream, revision, sources, password_file=None, apply=False, retry=False,
+                   console_receipt=None):
         # The outer ceiling includes admission/fetch and a finite cleanup reserve.
         # Read-only admission uses no native unit; ordinary effects have their
         # own registered native cgroups and tighter phase ceilings below.
         with self.run.phase(INITIALIZE_EXECUTION, 'dev-pair-initialize', native=False):
-            return self._initialize(context, expected, upstream, revision, sources, password_file, apply, retry)
+            return self._initialize(context, expected, upstream, revision, sources, password_file, apply, retry,
+                                    console_receipt=console_receipt)
 
-    def _initialize(self, context, expected, upstream, revision, sources, password_file=None, apply=False, retry=False):
+    def _initialize(self, context, expected, upstream, revision, sources, password_file=None, apply=False, retry=False,
+                    console_receipt=None):
         self.preflight()
-        validate_sources(sources)
+        sources = self.validate_bootstrap_access(sources, console_receipt)
         _, _, manifest = self.check_gptbox_inputs(context, expected)
         if manifest['source_sha'] != revision or not re.fullmatch(r'[0-9a-f]{40}', revision or ''):
             raise Blocked('initialize context/source target mismatch')
@@ -962,7 +965,9 @@ class Gptbox(Bootstrap):
                     'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'job_admission': False,
                     'source_verification': 'complete' if self.path('/usr/bin/git').exists() else 'pending signed Git prerequisite'}
         target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
-                  'bootstrap_sources': validate_sources(sources)}
+                  'bootstrap_sources': sources}
+        if console_receipt:
+            target['bootstrap_transport'] = ACCESS_MODE
         path = STATE + '/initialize.json'
         # The journey lock and existing global bootstrap lock span the private
         # host handoff and image/assembly; public entry points take that lock separately.
@@ -1057,7 +1062,8 @@ class Gptbox(Bootstrap):
                         unit = 'dev-pair-gptbox-' + expected + '.service'
                         preparation.run.reconcile_native(('--unit=' + unit, '--description=dev-pair-owned-' + unit, '--uid=dp-maint'),
                                                          {'PATH': '/usr/bin:/usr/sbin', 'LANG': 'C', 'LC_ALL': 'C'})
-                    ready=preparation._host_prerequisites('core',keys,sources,context,expected,password=password,source_check=source_check)
+                    access = {'console_receipt': console_receipt} if console_receipt else {}
+                    ready=preparation._host_prerequisites('core',keys,sources,context,expected,password=password,source_check=source_check,**access)
                     cost.mark('finalization')
                 cost.finish(True)
                 snapshot_prepare_observations()
@@ -1324,11 +1330,15 @@ class DevelopmentGptbox(Gptbox):
         desired = json.loads(desired_raw, object_pairs_hook=fedora_oci.unique)
         fields = {'schema', 'standards_sha', 'source_baseline', 'bootstrap_sha256',
                   'gptbox_context_sha256', 'operator', 'keys_source', 'bootstrap_sources'}
+        console = (type(desired) is dict and desired.get('bootstrap_transport') == ACCESS_MODE
+                   and desired.get('bootstrap_sources') == [])
+        if console:
+            fields.add('bootstrap_transport')
         if (type(desired) is not dict or set(desired) != fields or type(desired['schema']) is not int
                 or desired['schema'] != 1 or desired['standards_sha'] != candidate.STANDARDS
                 or desired['source_baseline'] != SOURCE_BASELINE or desired['operator'] != 'core'
                 or desired['keys_source'] != KEYS_URL or type(desired['bootstrap_sources']) is not list
-                or validate_sources(desired['bootstrap_sources']) != desired['bootstrap_sources']
+                or (not console and validate_sources(desired['bootstrap_sources']) != desired['bootstrap_sources'])
                 or any(type(desired[key]) is not str or not re.fullmatch('[0-9a-f]{64}', desired[key])
                        for key in ('bootstrap_sha256', 'gptbox_context_sha256'))):
             raise Blocked('existing authorized host desired state is invalid')
@@ -1346,6 +1356,8 @@ class DevelopmentGptbox(Gptbox):
                     'bootstrap_sha256': desired['bootstrap_sha256'], 'desired_sha256': sha(desired_raw),
                     'packages_sha256': sha(packages)}
             if record.get('kind') == DEVELOPMENT_HOST_READY_KIND:
+                if console:
+                    raise Blocked('standalone development host requires its scoped SSH preparation')
                 if (pins['source_sha'], pins['context_sha256']) != (revision, expected):
                     raise Blocked('build target differs from the prepared development host')
                 target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
@@ -1734,12 +1746,16 @@ def main():
     parser.add_argument('--expected-context-sha256', required=True)
     parser.add_argument('--distrobox-source', required=True)
     parser.add_argument('--source-sha', required=True)
-    parser.add_argument('--bootstrap-source', action='append')
+    access = parser.add_mutually_exclusive_group()
+    access.add_argument('--bootstrap-source', action='append')
+    access.add_argument('--console-receipt')
     parser.add_argument('--password-file')
     parser.add_argument('--work-deadline-monotonic', type=float, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.stage == 'prepare-development-host' and not args.bootstrap_source:
         parser.error('prepare-development-host requires --bootstrap-source')
+    if args.console_receipt and args.stage != 'initialize':
+        parser.error('--console-receipt is supported only for maintenance initialize')
     try:
         app = DevelopmentGptbox() if args.stage in ('prepare-development-host', 'build-development') else Gptbox()
         budget = contextlib.nullcontext()
@@ -1754,7 +1770,8 @@ def main():
         with budget:
             if args.stage == 'initialize':
                 result = app.initialize(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha,
-                                        args.bootstrap_source, args.password_file, args.apply, args.retry)
+                                        args.bootstrap_source, args.password_file, args.apply, args.retry,
+                                        console_receipt=args.console_receipt)
             elif args.stage == 'prepare-development-host':
                 result = app.prepare_development_host(args.context, args.expected_context_sha256, args.distrobox_source,
                                                       args.source_sha, args.bootstrap_source, args.password_file,

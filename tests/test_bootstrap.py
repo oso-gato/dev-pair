@@ -1166,10 +1166,10 @@ class BootstrapTests(unittest.TestCase):
         with self.assertRaisesRegex(b.Blocked, 'unexpected listener'):
             self.app.preflight()
 
-    def test_finalize_always_blocks_without_reading_fake_evidence(self):
+    def test_finalize_blocks_without_independent_evidence(self):
         proc = subprocess.run([sys.executable, str(ROOT / 'tools/bootstrap.py'), 'finalize'], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn('not implemented', proc.stderr)
+        self.assertIn('independent recovery evidence', proc.stderr)
 
 class OperatorInputTests(unittest.TestCase):
     def test_password_input_constraints_and_real_command_stdin(self):

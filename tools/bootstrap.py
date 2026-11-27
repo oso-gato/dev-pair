@@ -49,6 +49,18 @@ STANDARDS = 'b9d4da5d442ac48dba2e8be62d81b5bdc83690b8'
 SOURCE_BASELINE = '4dcf92e256a49770ddd89e4420b105319885910f'
 STATE = '/var/lib/dev-pair/bootstrap'
 DEVELOPMENT_HOST_INTENT = STATE + '/prepare-development-host.json'
+ACCESS_MODE = 'verified-provider-console'
+GUARD_PATH = '/etc/dev-pair/bootstrap.nft'
+CUTOVER = STATE + '/access-cutover.json'
+TRUST_SIGNERS = '/etc/dev-pair/trust/allowed_signers'
+SSH_CUTOVER = '/etc/ssh/sshd_config.d/00-dev-pair-cutover.conf'
+SSH_CUTOVER_CONFIG = '''# dev-pair tailnet administration
+PermitRootLogin no
+AllowUsers core
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+'''
 PACKAGES = ('podman', 'distrobox', 'passt', 'fuse-overlayfs', 'container-selinux',
             'policycoreutils', 'shadow-utils', 'sudo', 'openssh-server', 'nftables', 'git-core', 'util-linux',
             'mosh', 'tmux', 'chrony', 'slirp4netns', 'gnupg2')
@@ -1250,8 +1262,8 @@ def operator_password(path):
 
 def validate_sources(sources):
     try:
-        networks = sorted({str(ipaddress.ip_network(x, strict=True)) for x in sources})
-    except ValueError:
+        networks = sorted({str(ipaddress.ip_network(x, strict=True)) for x in (sources or [])})
+    except (TypeError, ValueError):
         raise Blocked('bootstrap sources must be explicit canonical CIDRs') from None
     if not networks or any(ipaddress.ip_network(x).prefixlen == 0 for x in networks):
         raise Blocked('unrestricted bootstrap sources are not allowed')
@@ -1271,6 +1283,107 @@ class Bootstrap:
     def text(self, value, default=''):
         p = self.path(value)
         return p.read_text() if p.exists() else default
+
+    def destination_identity(self):
+        machine = self.text('/etc/machine-id').strip()
+        boot = self.text('/proc/sys/kernel/random/boot_id').strip()
+        if not re.fullmatch(r'[0-9a-f]{32}', machine) or not re.fullmatch(r'[0-9a-f-]{36}', boot):
+            raise Blocked('destination machine or boot identity unavailable')
+        return {'machine_id': machine, 'boot_id': str(uuid.UUID(boot))}
+
+    def destination_source(self, expected):
+        if type(expected) is not str or not re.fullmatch(r'[0-9a-f]{40}', expected):
+            raise Blocked('exact independently admitted full source SHA required')
+        script = Path(__file__).absolute()
+        repo = script.parents[1]
+        for path in (script, *script.parents, repo / '.git'):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise Blocked('destination source path is not root protected')
+        git = ('/usr/bin/git', '-C', str(repo))
+        if (self.run(*git, 'rev-parse', '--verify', 'HEAD').strip() != expected
+                or self.run(*git, 'status', '--porcelain=v1', '--untracked-files=all').strip()
+                or self.run(*git, 'show', expected + ':tools/bootstrap.py') != Path(__file__).read_text()):
+            raise Blocked('destination source checkout differs from independent admission')
+        return expected
+
+    def signed_evidence(self, path, principal, namespace):
+        if not path:
+            raise Blocked('independently signed evidence is required')
+        document = checked_file(path)
+        signature = checked_file(document.with_name(document.name + '.sig'))
+        signers = checked_file(self.path(TRUST_SIGNERS))
+        raw = document.read_text(encoding='utf-8')
+        self.run('/usr/bin/ssh-keygen', '-Y', 'verify', '-f', str(signers), '-I', principal,
+                 '-n', namespace, '-s', str(signature), input_text=raw, timeout=10)
+        data = json.loads(raw, object_pairs_hook=relay.unique)
+        if type(data) is not dict or type(data.get('version')) is not int or data['version'] != 1:
+            raise Blocked('unsupported signed evidence')
+        return data
+
+    def recent_destination_evidence(self, path, principal, keys, *, lifetime):
+        data = self.signed_evidence(path, principal, 'dev-pair-destination')
+        identity = self.destination_identity()
+        if (set(data) != {'version', 'source_sha', 'issued_at', 'expires_at', *identity, *keys}
+                or any(data.get(key) != value for key, value in identity.items())
+                or type(data.get('issued_at')) is not int or type(data.get('expires_at')) is not int
+                or not 0 <= time.time() - data['issued_at'] <= lifetime
+                or not data['issued_at'] < data['expires_at'] <= data['issued_at'] + lifetime
+                or data['expires_at'] <= time.time()):
+            raise Blocked('destination evidence is stale or belongs to another machine/boot')
+        self.destination_source(data['source_sha'])
+        return data
+
+    def validate_bootstrap_access(self, sources, console_receipt=None):
+        if console_receipt is None:
+            return validate_sources(sources)
+        if sources or os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_CLIENT') or self.ssh_ancestor():
+            raise Blocked('zero-public-SSH setup requires verified out-of-band provider transport')
+        data = self.recent_destination_evidence(console_receipt, 'dev-pair-provider-console',
+                                                {'provider', 'provider_vps_id', 'transport', 'reopened_root', 'public_ssh_denied'},
+                                                lifetime=7200)
+        if (data['provider'] != 'hostinger' or data['transport'] != 'out-of-band'
+                or data['reopened_root'] is not True or data['public_ssh_denied'] is not True
+                or type(data['provider_vps_id']) is not str
+                or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', data['provider_vps_id'])):
+            raise Blocked('verified Hostinger out-of-band root recovery is required')
+        return []
+
+    def ssh_ancestor(self):
+        pid = os.getppid()
+        for _ in range(64):
+            if pid < 2:
+                return False
+            try:
+                name = self.text(f'/proc/{pid}/comm').strip()
+                if name.startswith(('sshd', 'dropbear')):
+                    return True
+                parent = re.search(r'^PPid:\s+([0-9]+)$', self.text(f'/proc/{pid}/status'), re.M)
+                if parent is None:
+                    break
+                pid = int(parent[1])
+            except OSError:
+                break
+        return True  # Unavailable ancestry cannot establish out-of-band transport.
+
+    def console_inspect(self, source=None):
+        if os.geteuid() != 0:
+            raise Blocked('open the selected VPS root terminal for inspection')
+        peer = os.environ.get('SSH_CONNECTION', '').split()
+        return {**self.destination_identity(), 'source_sha': self.destination_source(source) if source else None,
+                'host': self.text('/proc/sys/kernel/hostname').strip(), 'arch': platform.machine(),
+                'os_release': self.text('/etc/os-release'), 'pid1': self.text('/proc/1/comm').strip(),
+                'transport': 'ssh-observed' if peer or self.ssh_ancestor() else 'requires-provider-verification',
+                'ssh_peer': str(ipaddress.ip_address(peer[0])) if peer else None,
+                'selinux': self.text('/sys/fs/selinux/enforce').strip() or 'not observed',
+                'selinux_config': self.text('/etc/selinux/config'), 'kernel_cmdline': self.text('/proc/cmdline'),
+                'block_devices': self.run('/usr/bin/lsblk', '--json', '-o', 'NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS'),
+                'capacity': self.run('/usr/bin/df', '-hT', '/', '/var'),
+                'inodes': self.run('/usr/bin/df', '-i', '/', '/var'),
+                'addresses': self.run('/usr/sbin/ip', '-brief', 'address'),
+                'listeners': self.run('/usr/bin/ss', '-lntu'),
+                'failed_services': (self.run('/usr/bin/systemctl', 'list-units', '--state=failed', '--no-legend', '--no-pager')
+                                    if self.text('/proc/1/comm').strip() == 'systemd' else None)}
 
     def atomic(self, path, content, mode=0o600, expected=None):
         p = self.path(path)
@@ -1386,7 +1499,7 @@ class Bootstrap:
             except (Blocked,OSError,ValueError):
                 raise Blocked('unexpected listener: resolved identity changed') from None
         return {'os': 'Fedora 44', 'arch': platform.machine(), 'selinux': 'Enforcing',
-                'phase': 'temporary-bootstrap', 'ssh_cutover': 'not implemented'}
+                'phase': 'bootstrap', 'ssh_cutover': 'independent evidence required'}
 
     def resolved_process_start(self,pid):
         # Bounded Linux proc stat: comm may contain spaces and parentheses.
@@ -1902,20 +2015,25 @@ class Bootstrap:
                 self.path(target).unlink(missing_ok=True)
             raise
 
-    def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None, source_check=None):
-        return self._converge_host(name,key,sources,gptbox_context,expected_context,password=password,source_check=source_check)
+    def prepare(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None,
+                source_check=None, console_receipt=None):
+        return self._converge_host(name,key,sources,gptbox_context,expected_context,password=password,
+                                   source_check=source_check,console_receipt=console_receipt)
 
     def _host_prerequisites(self, name, key, sources, context, expected, *, password=None, source_check=None,
-                            development_host=False):
+                            development_host=False, console_receipt=None):
         # The caller holds the global bootstrap lock through readiness publication.
         return self._converge_host(name,key,sources,context,expected,password=password,source_check=source_check,
-                                   host_only=True,locked=True,development_host=development_host)
+                                   host_only=True,locked=True,development_host=development_host,console_receipt=console_receipt)
 
     def _host_desired(self, name, sources, expected_context):
-        return json.dumps({'schema': 1, 'standards_sha': STANDARDS, 'source_baseline': SOURCE_BASELINE,
+        desired = {'schema': 1, 'standards_sha': STANDARDS, 'source_baseline': SOURCE_BASELINE,
                            'bootstrap_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                            'gptbox_context_sha256': expected_context, 'operator': name,
-                           'keys_source': KEYS_URL, 'bootstrap_sources': sources}, sort_keys=True) + '\n'
+                           'keys_source': KEYS_URL, 'bootstrap_sources': sources}
+        if not sources:
+            desired['bootstrap_transport'] = ACCESS_MODE
+        return json.dumps(desired, sort_keys=True) + '\n'
 
     def _reject_development_host_intent(self):
         path = self.path(DEVELOPMENT_HOST_INTENT)
@@ -1923,19 +2041,19 @@ class Bootstrap:
             raise Blocked('bootstrap state belongs to the development host preparation')
 
     def _converge_host(self, name, key, sources, gptbox_context=None, expected_context=None, *, password=None,
-                       source_check=None,host_only=False,locked=False,development_host=False):
+                       source_check=None,host_only=False,locked=False,development_host=False,console_receipt=None):
         self.mark_prepare_step('input-admission')
         if development_host and (not host_only or not locked or gptbox_context is None
                                  or not callable(source_check) or not callable(key)):
             raise Blocked('development host prerequisites require locked exact-source admission')
         if gptbox_context is not None and (not isinstance(expected_context, str) or not re.fullmatch(r'[0-9a-f]{64}', expected_context)):
             raise Blocked('a separately trusted context SHA256 is required before preparation')
-        sources = validate_sources(sources)
+        sources = self.validate_bootstrap_access(sources, console_receipt)
         connection = os.environ.get('SSH_CONNECTION')
         if connection:
             try:
                 remote = ipaddress.ip_address(connection.split()[0])
-            except ValueError:
+            except (IndexError, ValueError):
                 raise Blocked('invalid current SSH source') from None
             if not any(remote in ipaddress.ip_network(c) for c in sources):
                 raise Blocked('current SSH source is outside declared bootstrap CIDRs')
@@ -1955,6 +2073,8 @@ class Bootstrap:
         with contextlib.nullcontext() if locked else self.lock():
             if not development_host:
                 self._reject_development_host_intent()
+            if json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique).get('phase') == 'applying':
+                raise Blocked('access cutover interrupted; finish cutover before preparing the host again')
             if gptbox_context is not None:
                 if not self.path('/usr/bin/git').exists():
                     self.step('git-prerequisite', lambda: self.run('/usr/bin/dnf', '-y',
@@ -2240,19 +2360,32 @@ class Bootstrap:
         if 'dev_pair_bootstrap' in tables:
             raise Blocked('existing bootstrap nft table has no managed configuration')
 
-    def guard(self, sources):
+    @staticmethod
+    def guard_rules(sources, *, tailnet_only=False):
         rules = '\n'.join(f'add rule inet dev_pair_bootstrap input {"ip6" if ":" in cidr else "ip"} saddr {cidr} tcp dport 22 accept' for cidr in sources)
         guard = GUARD.replace('{bootstrap_rules}', rules)
-        config = '/etc/dev-pair/bootstrap.nft'
-        if not self.path(config).exists():
+        if not sources:
+            before = 'add rule inet dev_pair_bootstrap input ct state established,related accept'
+            drop = 'add rule inet dev_pair_bootstrap input iifname != "lo" iifname != "tailscale0" tcp dport '
+            guard = guard.replace(before, drop + ('{ 22, 443 }' if tailnet_only else '22') + ' drop\n' + before)
+        if tailnet_only:
+            guard = guard.replace('"tailscale0" tcp dport 22 accept', '"tailscale0" tcp dport { 22, 443 } accept')
+        return guard
+
+    def guard(self, sources):
+        if not self.path(GUARD_PATH).exists():
             self._reject_unowned_bootstrap_table()
-        self.atomic(config, guard, mode=0o600)
+        state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
+        if state and state.get('phase') != 'complete':
+            raise Blocked('access cutover interrupted; finish cutover before preparing the host again')
+        guard = self.guard_rules([], tailnet_only=True) if state else self.guard_rules(sources)
+        self.atomic(GUARD_PATH, guard, mode=0o600)
         self.atomic('/etc/systemd/system/dev-pair-bootstrap-guard.service', UNIT, mode=0o644)
-        self.run('/usr/sbin/nft', '--check', '-f', str(self.path(config)))
+        self.run('/usr/sbin/nft', '--check', '-f', str(self.path(GUARD_PATH)))
         self.run('/usr/bin/systemctl', 'daemon-reload')
         self.run('/usr/bin/systemctl', 'enable', 'dev-pair-bootstrap-guard.service')
         # nft -f commits its own table transaction atomically. Reapply on resume to reconcile live drift.
-        self.run('/usr/sbin/nft', '-f', str(self.path(config)))
+        self.run('/usr/sbin/nft', '-f', str(self.path(GUARD_PATH)))
         self.run('/usr/bin/systemctl', 'start', 'dev-pair-bootstrap-guard.service')
 
     def enroll(self, secret, tailnet):
@@ -2365,14 +2498,130 @@ class Bootstrap:
             raise Blocked('tailnet identity mismatch: unverified node taken down; initial SSH retained, revoke key externally')
         self.atomic(f'{STATE}/node.json', node)
 
+    def tailscale_state(self):
+        accepted = json.loads(checked_file(self.path(f'{STATE}/node.json')).read_text(), object_pairs_hook=relay.unique)
+        live = json.loads(self.run('/usr/bin/tailscale', 'status', '--json'), object_pairs_hook=relay.unique)
+        tailnet, node = self.identity_fields(live)
+        own = live.get('Self') or {}
+        dns = own.get('DNSName', '')
+        if (accepted != {'tailnet': tailnet, 'node_id': node} or not tailnet or not node
+                or live.get('BackendState') != 'Running' or own.get('Online') is not True
+                or type(dns) is not str or not re.fullmatch(r'erebus\.[a-z0-9-]+\.ts\.net\.?', dns)):
+            raise Blocked('live Tailscale identity differs from admitted erebus node')
+        return live, dns.rstrip('.')
+
+    def guard_hash(self):
+        table = json.loads(self.run('/usr/sbin/nft', '-j', '-s', 'list', 'table', 'inet', 'dev_pair_bootstrap'),
+                           object_pairs_hook=relay.unique)['nftables']
+        normalized = []
+        for entry in table:
+            if 'metainfo' not in entry:
+                normalized.append({kind: {key: value for key, value in data.items() if key != 'handle'}
+                                   for kind, data in entry.items()})
+        if not normalized:
+            raise Blocked('live ingress guard unavailable')
+        return hashlib.sha256(json.dumps(normalized, sort_keys=True).encode()).hexdigest()
+
+    def verify_final_guard(self):
+        state = json.loads(checked_file(self.path(CUTOVER)).read_text(), object_pairs_hook=relay.unique)
+        if (state.get('phase') != 'complete' or state.get('guard_sha256') != self.guard_hash()
+                or checked_file(self.path(GUARD_PATH)).read_text() != self.guard_rules([], tailnet_only=True)
+                or checked_file(self.path(SSH_CUTOVER)).read_text() != SSH_CUTOVER_CONFIG):
+            raise Blocked('tailnet-only destination firewall and SSH cutover are unverified')
+        return state
+
+    def verify_final_ssh(self):
+        self.run('/usr/sbin/sshd', '-t')
+        required = {'permitrootlogin no', 'allowusers core', 'authenticationmethods publickey',
+                    'passwordauthentication no', 'kbdinteractiveauthentication no'}
+        for user in ('root', 'core', 'dp-maint', 'dp-dev', 'dp-checklist'):
+            effective = self.run('/usr/sbin/sshd', '-T', '-C', f'user={user},host=erebus,addr=100.64.0.1').splitlines()
+            if (not required.issubset(effective) or [line for line in effective if line.startswith('allowusers ')] != ['allowusers core']
+                    or user == 'core' and 'authorizedkeysfile /etc/ssh/dev-pair-keys/core' not in effective):
+                raise Blocked('effective tailnet OpenSSH configuration conflicts')
+
+    def finalize(self, evidence):
+        if os.geteuid() != 0:
+            raise Blocked('root required for destination cutover')
+        checks = {'named_key', 'password_denied', 'password_gated_sudo', 'mosh_tmux', 'scripted_ssh',
+                  'independent_recovery', 'unauthorized_tailnet_denied', 'public_ssh_denied'}
+        data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
+                                                {'node_id', 'tailnet', 'dns_name', 'keys_sha256', 'acl_sha256', 'checks'},
+                                                lifetime=1800)
+        if (type(data['checks']) is not dict or set(data['checks']) != checks or any(value is not True for value in data['checks'].values())
+                or type(data['acl_sha256']) is not str or not re.fullmatch(r'[0-9a-f]{64}', data['acl_sha256'])):
+            raise Blocked('named access, independent recovery and ingress evidence is incomplete')
+        with self.lock():
+            if not self.path(f'{STATE}/prepared').exists():
+                raise Blocked('prepare must complete before cutover')
+            live, dns = self.tailscale_state()
+            if (self.identity_fields(live) != (data['tailnet'], data['node_id']) or dns != data['dns_name']
+                    or hashlib.sha256(checked_file(self.path('/etc/ssh/dev-pair-keys/core')).read_bytes()).hexdigest() != data['keys_sha256']):
+                raise Blocked('cutover evidence does not bind current node and core keys')
+            if os.environ.get('SSH_CONNECTION') or self.ssh_ancestor():
+                remote, _, local, _ = os.environ.get('SSH_CONNECTION', '').split()
+                route = json.loads(self.run('/usr/sbin/ip', '-j', 'route', 'get', str(ipaddress.ip_address(remote))))
+                if local not in live.get('TailscaleIPs', []) or len(route) != 1 or route[0].get('dev') != 'tailscale0':
+                    raise Blocked('run cutover from independent console or named tailnet SSH, preserving SSH_CONNECTION')
+            desired = json.loads(checked_file(self.path(f'{STATE}/desired.json')).read_text(), object_pairs_hook=relay.unique)
+            sources = desired.get('bootstrap_sources')
+            if sources != [] or desired.get('bootstrap_transport') != ACCESS_MODE:
+                sources = validate_sources(sources)
+            temporary, permanent = self.guard_rules(sources), self.guard_rules([], tailnet_only=True)
+            current = checked_file(self.path(GUARD_PATH)).read_text()
+            prior_raw = self.text(CUTOVER)
+            prior = json.loads(prior_raw or '{}', object_pairs_hook=relay.unique)
+            target = {key: data[key] for key in ('source_sha', 'machine_id', 'tailnet', 'node_id', 'dns_name')}
+            if prior and (prior.get('target') != target or prior.get('phase') not in ('applying', 'complete')):
+                raise Blocked('cutover target conflict')
+            if prior.get('phase') == 'complete':
+                self.verify_final_guard()
+                self.verify_final_ssh()
+                return self.status()
+            if current not in (temporary, permanent) or (not prior and current != temporary):
+                raise Blocked('bootstrap ingress configuration differs from protected intent')
+            if not prior and (self.path(SSH_CUTOVER).exists() or self.path(SSH_CUTOVER).is_symlink()):
+                raise Blocked('unowned OpenSSH cutover configuration')
+            pending = json.dumps({'phase': 'applying', 'target': target}, sort_keys=True) + '\n'
+            self.atomic(CUTOVER, pending)
+            # On retry only roll forward. The root-owned marker and external recovery permit
+            # finishing after a crash without re-enabling temporary public SSH.
+            ssh_file = self.path(SSH_CUTOVER)
+            created = not ssh_file.exists()
+            self.atomic(SSH_CUTOVER, SSH_CUTOVER_CONFIG)
+            try:
+                self.verify_final_ssh()
+            except BaseException:
+                if created:
+                    ssh_file.unlink(missing_ok=True)
+                raise
+            for unit in ('sshd.service', 'sshd.socket'):
+                self.atomic('/etc/systemd/system/' + unit + '.d/50-dev-pair-guard.conf', TAILSCALE_UNIT, mode=0o644)
+            self.run('/usr/bin/systemctl', 'daemon-reload')
+            self.run('/usr/bin/systemctl', 'reload', 'sshd.service')
+            proposed = STATE + '/tailnet-only.nft'
+            self.atomic(proposed, permanent)
+            self.run('/usr/sbin/nft', '--check', '-f', str(self.path(proposed)))
+            self.atomic(GUARD_PATH, permanent, expected=temporary)
+            self.run('/usr/sbin/nft', '-f', str(self.path(GUARD_PATH)))
+            self.run('/usr/bin/systemctl', 'is-active', 'dev-pair-bootstrap-guard.service')
+            record = {'phase': 'complete', 'target': target, 'guard_sha256': self.guard_hash(),
+                      'core_keys_sha256': data['keys_sha256'], 'acl_sha256': data['acl_sha256']}
+            self.atomic(CUTOVER, json.dumps(record, sort_keys=True) + '\n', expected=pending)
+            self.event('access-cutover', 'complete')
+            return self.status()
+
     def status(self):
+        cutover = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique).get('phase')
+        access = json.loads(self.text(f'{STATE}/desired.json', '{}'), object_pairs_hook=relay.unique)
         return {'prepared': self.path(f'{STATE}/prepared').exists(),
                 'initialization': json.loads(self.text(f'{STATE}/initialize.json', '"not requested"')),
                 'maintenance_gptbox': (json.loads(self.text(f'{STATE}/gptbox-image.json'))
                                        if self.path(f'{STATE}/gptbox-image.json').exists() else 'not built'),
                 'enrollment_recorded': self.path(f'{STATE}/node.json').exists(),
-                'phase': 'temporary-bootstrap', 'applications_started': False,
-                'root_and_initial_ssh_retained': True, 'access_cutover': 'blocked pending external evidence',
+                'phase': 'tailnet-only' if cutover == 'complete' else 'temporary-bootstrap',
+                'access_cutover': cutover or 'independent evidence required',
+                'root_and_initial_ssh_retained': cutover is None and access.get('bootstrap_sources') != [],
                 'runtime_acceptance': 'not verified', 'state': STATE,
                 'note': 'Recorded state only; not proof of current external reachability or recovery'}
 
@@ -2381,6 +2630,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest='stage', required=True)
     sub.add_parser('inspect')
+    console = sub.add_parser('console-inspect', help='read-only hPanel terminal inventory before setup')
+    console.add_argument('--source-sha', help='verify the independently admitted staged Git checkout')
     sub.add_parser('_fetch-github-keys', help=argparse.SUPPRESS)
     init = sub.add_parser('initialize', help='prepare then genuine maintenance assembly; no jobs/authentication')
     init.add_argument('--source-sha', required=True)
@@ -2393,21 +2644,27 @@ def main():
         entry.add_argument('--expected-context-sha256', required=True, help='trusted handoff digest outside context')
         entry.add_argument('--operator', choices=('core',), default='core')
         entry.add_argument('--password-file', help='protected root-owned core console/sudo password file; never an argv value')
-        entry.add_argument('--bootstrap-source', action='append', required=True, help='explicit IPv4/IPv6 CIDR; repeatable')
+        access = entry.add_mutually_exclusive_group(required=True)
+        access.add_argument('--bootstrap-source', action='append', help='explicit IPv4/IPv6 CIDR; repeatable')
+        access.add_argument('--console-receipt', help='protected signed Hostinger out-of-band receipt')
     en = sub.add_parser('enroll')
     en.add_argument('--apply', action='store_true', help='enroll; absent means inspect only')
     en.add_argument('--auth-key-file', required=True)
     en.add_argument('--tailnet', required=True, help='exact expected CurrentTailnet.Name')
     sub.add_parser('status')
-    sub.add_parser('finalize')
+    finalize = sub.add_parser('finalize', help='apply tailnet-only SSH after independent access/recovery checks')
+    finalize.add_argument('--evidence', help='protected signed current access evidence')
+    finalize.add_argument('--apply', action='store_true')
     args = p.parse_args()
     try:
         if args.stage == 'initialize':
             forwarded = [sys.executable, str(Path(__file__).with_name('gptbox.py')), 'initialize',
                          '--context', args.gptbox_context, '--expected-context-sha256', args.expected_context_sha256,
                          '--source-sha', args.source_sha, '--distrobox-source', args.distrobox_source]
-            for source in args.bootstrap_source:
+            for source in args.bootstrap_source or []:
                 forwarded.extend(['--bootstrap-source', source])
+            if args.console_receipt:
+                forwarded.extend(['--console-receipt', args.console_receipt])
             if args.password_file:
                 forwarded.extend(['--password-file', args.password_file])
             if args.apply:
@@ -2421,14 +2678,18 @@ def main():
         b = Bootstrap()
         if args.stage == 'inspect':
             result = b.preflight()
+        elif args.stage == 'console-inspect':
+            result = b.console_inspect(args.source_sha)
         elif args.stage == 'prepare':
             if args.apply:
                 password = operator_password(args.password_file) if args.password_file else None
                 keys = github_keys()
                 result = b.prepare(args.operator, keys, args.bootstrap_source,
-                                   args.gptbox_context, args.expected_context_sha256, password=password)
+                                   args.gptbox_context, args.expected_context_sha256, password=password,
+                                   console_receipt=args.console_receipt)
             else:
-                result = {**b.preflight(), 'preview': 'prepare', 'sources': validate_sources(args.bootstrap_source)}
+                result = {**b.preflight(), 'preview': 'prepare',
+                          'sources': b.validate_bootstrap_access(args.bootstrap_source, args.console_receipt)}
                 b.check_gptbox_inputs(args.gptbox_context, args.expected_context_sha256)
                 if args.password_file:
                     operator_password(args.password_file)
@@ -2444,12 +2705,14 @@ def main():
         elif args.stage == 'enroll':
             result = b.enroll(args.auth_key_file, args.tailnet) if args.apply else {**b.preflight(), 'preview': 'enroll'}
         elif args.stage == 'finalize':
-            raise Blocked('cutover is not implemented: preserve initial SSH/root until external named-admin tailnet access and independent recovery are proven')
+            if not args.apply or not args.evidence:
+                raise Blocked('cutover requires --apply and signed named-admin and independent recovery evidence')
+            result = b.finalize(args.evidence)
         else:
             result = b.status()
         print(json.dumps(result, indent=2))
         return 0
-    except (Blocked, OSError, ValueError) as e:
+    except (Blocked, OSError, ValueError, TypeError, KeyError) as e:
         # JSON/OS exceptions may contain external payloads/paths: do not echo them.
         print('bootstrap blocked: ' + (str(e) if isinstance(e, Blocked) else 'invalid input or local filesystem state'), file=sys.stderr)
         return 2

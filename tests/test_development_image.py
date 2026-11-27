@@ -192,6 +192,26 @@ class DevelopmentImageTests(unittest.TestCase):
     def assemble(self, retry=False, apply=True):
         return self.app.assemble(self.context, EXPECTED, '/', SOURCE, apply=apply, retry=retry)
 
+    def test_same_host_readiness_admits_only_marked_zero_public_ssh(self):
+        path = g.STATE + '/desired.json'
+        desired = json.loads(self.app.text(path))
+        ready = json.loads(self.host_ready.read_text())
+        desired['bootstrap_sources'] = []
+        desired['bootstrap_transport'] = g.ACCESS_MODE
+        for admit in (True, False):
+            if not admit:
+                del desired['bootstrap_transport']
+            raw = g.image_inputs_bytes(desired)
+            self.app.atomic(path, raw.decode(), expected=self.app.text(path))
+            ready['desired_sha256'] = g.sha(raw)
+            self.app.atomic(g.STATE + '/host-ready.json', g.image_inputs_bytes(ready).decode(),
+                            expected=self.host_ready.read_text())
+            if admit:
+                self.app.verify_host_readiness(SOURCE, EXPECTED)
+            else:
+                with self.assertRaises(g.Blocked):
+                    self.app.verify_host_readiness(SOURCE, EXPECTED)
+
     def bounded_engine(self, seconds):
         engine = self.engine
 
