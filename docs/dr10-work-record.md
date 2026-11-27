@@ -2,6 +2,30 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026, 10:16 UTC — development guest preservation
+
+- The development guest at `7dfd42a10c9732eb172d4979f9a858a6fc2c331a`
+  closed the production findings. Fresh test-only review accepted
+  `ee5c2e1a714ea72058f610ae3ca49b7c4e6ffd81` after four focused passes and
+  argument mutation checks. The production files match the reviewed guest.
+  This checkpoint is for the separate `codex/development-guest-62` preservation
+  branch.
+- One local full-suite execution reported 801 passes, zero skips and 112.696
+  seconds. The checkout moved from `4d9272b` to `04c8397` during the run.
+  Only `tests/test_selected_payload.py` changed. Module identity was not
+  recorded, so exact frozen full-suite evidence remains unverified. Focused
+  checks and mutation coverage verified the final test separately.
+- Draft PR 13 remains at `0d0427333a0c9320992f82ff4075e3d892415ebd`.
+  Native 41 passed the signed-base phase and later stopped in the outer
+  tooling build at `identity-changed`, before Fedora boot. Image-copy cleanup
+  remained unresolved and scratch was retained.
+  [Run 41](https://github.com/oso-gato/dev-pair/actions/runs/45969926027)
+- The final review withheld storage candidate `602c077`. In an independent
+  fixture, the controller reported 16,384 bytes as complete while GNU `du`
+  measured 4,096 bytes on the settled tree. The bounded storage unit exhausted
+  its review budget. Native 42, VPS and provider work, main merge, and
+  deployment did not occur in this checkpoint.
+
 ### November 27, 2026, 08:58 UTC — storage ownership proof reviewed
 
 - Fresh GPT-6.2 Astra High review passed the storage proof at
