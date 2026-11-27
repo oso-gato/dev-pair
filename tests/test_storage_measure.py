@@ -531,19 +531,19 @@ class MeasurementTests(unittest.TestCase):
     def test_actual_atomic_file_replacement_discards_one_scan_and_recovers_via_controller(self):
         target=self.root/'entry';target.write_bytes(b'x'*8192)
         pending=self.root/'pending';pending.write_bytes(b'y'*12288)
-        original_stat=os.stat
+        original_named=worker._named_file
         original_capture=ci.capture_du
         discarded=[]
 
-        def replace(name,*args,**kwargs):
-            if name=='entry' and kwargs.get('dir_fd') is not None and pending.exists():pending.replace(target)
-            return original_stat(name,*args,**kwargs)
+        def replace(fd,name):
+            if name=='entry' and pending.exists():pending.replace(target)
+            return original_named(fd,name)
 
         def capture(root,argv,*,end=None):
             if discarded:return original_capture(root,argv,end=end)
             output=StringIO()
             worker_argv=argv[argv.index(str(Path(worker.__file__))):]
-            with patch.object(worker.os,'stat',side_effect=replace),patch.object(sys,'argv',worker_argv),redirect_stdout(output):
+            with patch.object(worker,'_named_file',side_effect=replace),patch.object(sys,'argv',worker_argv),redirect_stdout(output):
                 code=worker.main()
             value=json.loads(output.getvalue())
             self.assertEqual((code,value['status'],value['allocated_bytes'],value['reason']),
@@ -599,8 +599,30 @@ class MeasurementTests(unittest.TestCase):
         with patch.object(worker.os,'scandir',side_effect=link),self.assertRaisesRegex(worker.ScanError,'^identity-changed$'):
             worker.scan(self.root,self.expected())
 
+    def test_actual_repeated_hardlink_requires_consistent_named_count(self):
+        root=self.root/'scratch';root.mkdir()
+        (root/'left').mkdir();(root/'right').mkdir()
+        with os.scandir(root) as entries:first,second=(Path(entry.path) for entry in entries)
+        name='linked';(first/name).write_bytes(b'x'*8192)
+        extra=self.root/'outside-scratch-hardlink'
+        os.link(first/name,second/name);os.link(first/name,extra)
+        original_named=worker._named_file
+
+        def unlink_before_named(fd,named):
+            if named==name and Path(os.readlink(f'/proc/self/fd/{fd}'))==second:extra.unlink()
+            return original_named(fd,named)
+
+        expected=worker.identity(root.stat())
+        with (patch.object(worker,'_named_file',side_effect=unlink_before_named),
+              self.assertRaisesRegex(worker.ScanError,'^identity-changed$')):
+            worker.scan(root,expected)
+        self.assertFalse(extra.exists())
+        settled=worker.scan(root,expected)
+        oracle=int(subprocess.check_output(['/usr/bin/du','-sxB1',root],timeout=3).split()[0])
+        self.assertEqual((settled['status'],settled['allocated_bytes']),('complete',oracle))
+
     def test_actual_named_hardlink_disagreement_on_either_sighting_never_retries(self):
-        for timing in ('first','second'):
+        for timing in ('first','second','first-then-replace'):
             with self.subTest(timing=timing),tempfile.TemporaryDirectory(dir=self.root) as path:
                 fixture=Path(path)
                 root=fixture/'scratch';root.mkdir()
@@ -609,8 +631,8 @@ class MeasurementTests(unittest.TestCase):
                 name='moving';(first/name).write_bytes(b'x'*8192)
                 extra=fixture/'outside-scratch-hardlink'
                 second_inode=second.stat().st_ino
-                changed_parent=first if timing=='first' else second
-                original_stat,scandir=os.stat,os.scandir
+                changed_parent=second if timing=='second' else first
+                original_named,scandir=worker._named_file,os.scandir
                 original_capture=ci.capture_du
                 inspected=[]
                 moved=False
@@ -618,26 +640,30 @@ class MeasurementTests(unittest.TestCase):
                 def move(fd):
                     nonlocal moved
                     if not moved and os.fstat(fd).st_ino==second_inode:
-                        if timing=='first':extra.unlink()
+                        if timing!='second':extra.unlink()
                         (first/name).rename(second/name)
                         moved=True
                     return scandir(fd)
 
-                def add_link(named,*args,**kwargs):
-                    parent_fd=kwargs.get('dir_fd')
-                    if named==name and parent_fd is not None and Path(os.readlink(f'/proc/self/fd/{parent_fd}'))==changed_parent:
-                        self.assertEqual(original_stat(named,*args,**kwargs).st_nlink,1)
+                def add_link(parent_fd,named):
+                    parent=Path(os.readlink(f'/proc/self/fd/{parent_fd}'))
+                    if named==name and parent==changed_parent:
+                        self.assertEqual(original_named(parent_fd,named).st_nlink,1)
                         os.link(changed_parent/name,extra)
-                        result=original_stat(named,*args,**kwargs)
+                        result=original_named(parent_fd,named)
                         self.assertEqual(result.st_nlink,2)
                         return result
-                    return original_stat(named,*args,**kwargs)
+                    if named==name and parent==second and timing=='first-then-replace':
+                        pending=fixture/'replacement'
+                        pending.write_bytes(b'y'*12288)
+                        pending.replace(second/name)
+                    return original_named(parent_fd,named)
 
                 def capture(root,argv,*,end=None):
                     if inspected:return original_capture(root,argv,end=end)
                     output=StringIO()
                     worker_argv=argv[argv.index(str(Path(worker.__file__))):]
-                    with (patch.object(worker.os,'stat',side_effect=add_link),patch.object(worker.os,'scandir',side_effect=move),
+                    with (patch.object(worker,'_named_file',side_effect=add_link),patch.object(worker.os,'scandir',side_effect=move),
                           patch.object(sys,'argv',worker_argv),redirect_stdout(output)):
                         code=worker.main()
                     inspected.append(json.loads(output.getvalue()))
@@ -646,6 +672,7 @@ class MeasurementTests(unittest.TestCase):
                 with patch.object(ci,'capture_du',side_effect=capture) as calls,self.assertRaises(ci.StorageMeasurementBlocked) as failure:
                     ci.measure_storage(root,live=True,sudo=False)
                 self.assertTrue(moved)
+                if timing=='first-then-replace':self.assertEqual((second/name).read_bytes(),b'y'*12288)
                 self.assertEqual(calls.call_count,1)
                 observed=inspected[0]
                 self.assertEqual((observed['status'],observed['allocated_bytes'],observed['reason']),
@@ -653,7 +680,7 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual(failure.exception.diagnostics['attempts'],1)
 
     def test_actual_same_inode_mount_after_open_invalidates_either_sighting(self):
-        for timing in ('first','second'):
+        for timing in ('first','second','transient-first','transient-second'):
             with self.subTest(timing=timing),tempfile.TemporaryDirectory(dir=self.root) as path:
                 fixture=Path(path)
                 (fixture/'left').mkdir();(fixture/'right').mkdir()
@@ -668,35 +695,41 @@ class MeasurementTests(unittest.TestCase):
                     filename='moving'
                     (first/filename).write_bytes(b'x'*8192)
                     second_inode=second.stat().st_ino
-                    changed_parent=first if timing=='first' else second
-                    original_stat=os.stat
+                    on_first=timing.endswith('first')
+                    changed_parent=first if on_first else second
+                    original_named=worker._named_file
                     mounted=moved=False
 
                     def move(fd):
                         global moved
                         if not moved and os.fstat(fd).st_ino==second_inode:
-                            if timing=='first':assert libc.umount2(os.fsencode(first/filename),2)==0, ctypes.get_errno()
                             (first/filename).rename(second/filename)
                             moved=True
                         return scandir(fd)
 
-                    def mount_after_open(name,*args,**kwargs):
+                    def mount_after_open(fd,name):
                         global mounted
-                        fd=kwargs.get('dir_fd')
-                        if name==filename and fd is not None and Path(os.readlink(f'/proc/self/fd/{fd}'))==changed_parent and not mounted:
-                            previous=original_stat(name,*args,**kwargs)
+                        if name==filename and Path(os.readlink(f'/proc/self/fd/{fd}'))==changed_parent and not mounted:
+                            previous=os.stat(name,dir_fd=fd,follow_symlinks=False)
                             target=os.fsencode(changed_parent/filename)
                             assert libc.mount(target,target,None,4096,None)==0, ctypes.get_errno()
-                            current=original_stat(name,*args,**kwargs)
+                            current=os.stat(name,dir_fd=fd,follow_symlinks=False)
                             assert worker._node_identity(previous)==worker._node_identity(current)
                             assert previous.st_nlink==current.st_nlink==1
+                            mount_fd=os.open(target,os.O_PATH)
+                            try:assert worker._mount_id(mount_fd)!=worker._mount_id(fd)
+                            finally:os.close(mount_fd)
                             mounted=True
-                        return original_stat(name,*args,**kwargs)
+                            try:return original_named(fd,name)
+                            finally:
+                                if timing.startswith('transient'):
+                                    assert libc.umount2(target,2)==0, ctypes.get_errno()
+                        return original_named(fd,name)
 
-                    with patch.object(worker.os,'stat',side_effect=mount_after_open), \\
+                    with patch.object(worker,'_named_file',side_effect=mount_after_open), \\
                          patch.object(worker.os,'scandir',side_effect=move):
                         result=check_failure('identity-changed')
-                    assert mounted and moved
+                    assert mounted and moved!=on_first
                     with patch.object(ci,'capture_du',return_value=result) as capture:
                         try:ci.measure_storage(root,live=True,sudo=False)
                         except ci.StorageMeasurementBlocked as error:assert error.diagnostics['attempts']==1
@@ -706,46 +739,65 @@ class MeasurementTests(unittest.TestCase):
                 finally:self.root=original_root
 
     def test_actual_repeated_name_loss_during_strict_proof_is_terminal(self):
-        (self.root/'left').mkdir();(self.root/'right').mkdir()
-        with os.scandir(self.root) as entries:first,second=(Path(entry.path) for entry in entries)
-        (first/'moving').write_bytes(b'x'*8192)
+        root=self.tmpfs_backing()
+        (root/'left').mkdir();(root/'right').mkdir()
+        with os.scandir(root) as entries:first,second=(Path(entry.path) for entry in entries)
+        (first/'moving').write_bytes(b'x'*12288);(first/'steady').write_bytes(b'y'*12288)
+        du=lambda: int(subprocess.check_output(['/usr/bin/du','-sxB1',root],timeout=3).split()[0])
+        self.assertEqual(du(),24576)
         second_inode=second.stat().st_ino
-        original_stat,scandir=os.stat,os.scandir
+        original_named,scandir=worker._named_file,os.scandir
+        original_capture=ci.capture_du
         removed=False
+        first_sample=[]
 
         def move(fd):
             if os.fstat(fd).st_ino==second_inode:(first/'moving').rename(second/'moving')
             return scandir(fd)
 
-        def lose_after_named_stat(name,*args,**kwargs):
+        def lose_before_named_stat(fd,name):
             nonlocal removed
-            current=original_stat(name,*args,**kwargs)
-            fd=kwargs.get('dir_fd')
-            if name=='moving' and fd is not None and Path(os.readlink(f'/proc/self/fd/{fd}'))==second:
+            if name=='moving' and Path(os.readlink(f'/proc/self/fd/{fd}'))==second:
                 (second/'moving').unlink()
                 removed=True
-            return current
+            return original_named(fd,name)
 
-        with (patch.object(worker.os,'scandir',side_effect=move),patch.object(worker.os,'stat',side_effect=lose_after_named_stat),
-              self.assertRaisesRegex(worker.ScanError,'^identity-changed$')):
-            worker.scan(self.root,self.expected())
+        def capture(root,argv,*,end=None):
+            if first_sample:return original_capture(root,argv,end=end)
+            output=StringIO()
+            worker_argv=argv[argv.index(str(Path(worker.__file__))):]
+            with (patch.object(worker.os,'scandir',side_effect=move),patch.object(worker,'_named_file',side_effect=lose_before_named_stat),
+                  patch.object(sys,'argv',worker_argv),redirect_stdout(output)):
+                code=worker.main()
+            first_sample.append(json.loads(output.getvalue()))
+            return subprocess.CompletedProcess(argv,code,output.getvalue().encode(),b'')
+
+        with patch.object(ci,'capture_du',side_effect=capture) as calls,self.assertRaises(ci.StorageMeasurementBlocked) as failure:
+            ci.measure_storage(root,live=True,sudo=False)
         self.assertTrue(removed)
+        self.assertEqual(calls.call_count,1)
+        self.assertEqual((first_sample[0]['reason'],first_sample[0]['allocated_bytes']),('identity-changed',None))
+        self.assertEqual(failure.exception.diagnostics['attempts'],1)
+        self.assertEqual(ci.measure_storage(root,sudo=False)['bytes'],du())
+        self.assertEqual(du(),12288)
 
     def test_replacement_type_disagreement_and_loss_on_strict_confirmation_are_terminal(self):
         for replacement in ('directory','vanished','again'):
             with self.subTest(replacement=replacement),tempfile.TemporaryDirectory(dir=self.root) as path:
                 root=Path(path);entry=root/'entry';entry.touch();pending=root/'pending';pending.touch()
                 second=root/'again';second.touch()
-                original_stat=os.stat;open_node=worker._node
+                original_named=worker._named_file;open_node=worker._node
                 seen=False
 
-                def replace(name,*args,**kwargs):
+                def replace(fd,name):
                     nonlocal seen
-                    if name=='entry' and kwargs.get('dir_fd') is not None and not seen:
-                        seen=True
+                    if name=='entry' and not seen:
                         if replacement=='directory':entry.unlink();entry.mkdir()
                         else:pending.replace(entry)
-                    return original_stat(name,*args,**kwargs)
+                        current=original_named(fd,name)
+                        seen=True
+                        return current
+                    return original_named(fd,name)
 
                 def confirm(fd,name,*,same_mount=True):
                     if name=='entry' and seen:
@@ -754,7 +806,7 @@ class MeasurementTests(unittest.TestCase):
                     return open_node(fd,name,same_mount=same_mount)
 
                 expected=worker.identity(root.stat())
-                with (patch.object(worker.os,'stat',side_effect=replace),patch.object(worker,'_node',side_effect=confirm),
+                with (patch.object(worker,'_named_file',side_effect=replace),patch.object(worker,'_node',side_effect=confirm),
                       self.assertRaisesRegex(worker.ScanError,'^identity-changed$')):
                     worker.scan(root,expected)
 
@@ -764,14 +816,14 @@ class MeasurementTests(unittest.TestCase):
             import ctypes
 
             libc=ctypes.CDLL(None,use_errno=True)
-            original_stat=os.stat
-            def replace(name,*args,**kwargs):
-                if name=='entry' and kwargs.get('dir_fd') is not None and (root/'next').exists():
+            original_named=worker._named_file
+            def replace(fd,name):
+                if name=='entry' and (root/'next').exists():
                     (root/'next').replace(root/'entry')
                     path=os.fsencode(root)
                     assert libc.mount(path,path,None,4096,None)==0, ctypes.get_errno()
-                return original_stat(name,*args,**kwargs)
-            with patch.object(worker.os,'stat',side_effect=replace):
+                return original_named(fd,name)
+            with patch.object(worker,'_named_file',side_effect=replace):
                 check_failure('root-identity')
             ''',remount=True)
 
@@ -790,14 +842,13 @@ class MeasurementTests(unittest.TestCase):
 
                     event=EVENT
                     libc=ctypes.CDLL(None,use_errno=True)
-                    original_stat=os.stat
+                    original_named=worker._named_file
                     replaced=False
                     alias=root/'alias'
                     subdir=alias/'subdir'
-                    def replace(name,*args,**kwargs):
+                    def replace(fd,name):
                         global replaced
-                        fd=kwargs.get('dir_fd')
-                        if name=='entry' and fd is not None and Path(os.readlink(f'/proc/self/fd/{fd}'))==subdir and not replaced:
+                        if name=='entry' and Path(os.readlink(f'/proc/self/fd/{fd}'))==subdir and not replaced:
                             (subdir/'next').replace(subdir/'entry')
                             replaced=True
                             if event=='source':
@@ -808,8 +859,8 @@ class MeasurementTests(unittest.TestCase):
                                 assert libc.umount2(path,2)==0, ctypes.get_errno()
                                 assert libc.mount(os.fsencode(root/'source'),path,None,4096,None)==0, ctypes.get_errno()
                             if event=='missing':subdir.rename(alias/'renamed-subdir')
-                        return original_stat(name,*args,**kwargs)
-                    with patch.object(worker.os,'stat',side_effect=replace):
+                        return original_named(fd,name)
+                    with patch.object(worker,'_named_file',side_effect=replace):
                         check_failure(REASON)
                     assert replaced
                     if event=='stable':
@@ -829,21 +880,20 @@ class MeasurementTests(unittest.TestCase):
 
                     remount=REMOUNT
                     libc=ctypes.CDLL(None,use_errno=True)
-                    original_stat=os.stat
+                    original_named=worker._named_file
                     alias=root/'alias'
                     replaced=False
-                    def replace(name,*args,**kwargs):
+                    def replace(fd,name):
                         global replaced
-                        fd=kwargs.get('dir_fd')
-                        if name=='data' and fd is not None and Path(os.readlink(f'/proc/self/fd/{fd}'))==alias and not replaced:
+                        if name=='data' and Path(os.readlink(f'/proc/self/fd/{fd}'))==alias and not replaced:
                             (alias/'next').replace(alias/'data')
                             replaced=True
                             if remount:
                                 path=os.fsencode(root/'parent')
                                 assert libc.umount2(path,2)==0, ctypes.get_errno()
                                 assert libc.mount(path,path,None,4096,None)==0, ctypes.get_errno()
-                        return original_stat(name,*args,**kwargs)
-                    with patch.object(worker.os,'stat',side_effect=replace):
+                        return original_named(fd,name)
+                    with patch.object(worker,'_named_file',side_effect=replace):
                         check_failure('bind-source-after-identity' if remount else 'ordinary-entry-changed')
                     assert replaced
                     '''.replace('REMOUNT',repr(remount)),backing=backing,proof=True)
@@ -1019,9 +1069,9 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(list(self.root.iterdir()),[])
     def test_no_read_of_fifo_and_file_symlink_swap_never_follows_target(self):
         os.mkfifo(self.root/'fifo');self.assertEqual(worker.scan(self.root,self.expected())['allocated_bytes'],self.oracle())
-        file=self.root/'regular';file.write_bytes(b'x'*4096);original=worker.os.stat;changed=False
-        def swapped(name,*args,**kwargs):
+        file=self.root/'regular';file.write_bytes(b'x'*4096);original=worker._named_file;changed=False
+        def swapped(fd,name):
             nonlocal changed
-            if name=='regular' and kwargs.get('dir_fd') is not None and not changed:changed=True;file.unlink();file.symlink_to('/dev/shm')
-            return original(name,*args,**kwargs)
-        with patch.object(worker.os,'stat',side_effect=swapped),self.assertRaisesRegex(worker.ScanError,'identity-changed'):worker.scan(self.root,self.expected())
+            if name=='regular' and not changed:changed=True;file.unlink();file.symlink_to('/dev/shm')
+            return original(fd,name)
+        with patch.object(worker,'_named_file',side_effect=swapped),self.assertRaisesRegex(worker.ScanError,'identity-changed'):worker.scan(self.root,self.expected())

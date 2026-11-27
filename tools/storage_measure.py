@@ -57,6 +57,12 @@ def _node(parent,name,*,same_mount=True):
     if result<0:raise OSError(ctypes.get_errno(),'node open rejected')
     return result
 
+def _named_file(parent,name):
+    # Bind the observation to a strict lookup, including its mount provenance.
+    named=_node(parent,name)
+    try:return os.fstat(named)
+    finally:os.close(named)
+
 def _open_entry(parent,name):
     try:return _node(parent,name),False
     except OSError as error:
@@ -395,21 +401,7 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         except OSError as error:
             if error.errno==errno.EXDEV:raise ScanError(rejection) from None
             raise
-    def single_link_witness(node,entry):
-        directory,name,named=entry
-        if node.st_nlink!=1 or named.st_nlink!=1:return False
-        bound()
-        # The named stat alone cannot distinguish a same-inode bind mount.
-        try:
-            confirmed=_node(directory,name)
-            try:
-                reopened=os.fstat(confirmed)
-                return reopened.st_nlink==1 and _node_identity(reopened)==_node_identity(node)
-            finally:os.close(confirmed)
-        except OSError as error:
-            if error.errno in (errno.ENOENT,errno.EXDEV):return False
-            raise
-    def account(node,through_bind,*,entry=None):
+    def account(node,through_bind,*,link_witness=False):
         nonlocal total
         require(type(node.st_dev) is int and node.st_dev>=0 and type(node.st_ino) is int and node.st_ino>0,'unsupported')
         key=(node.st_dev,node.st_ino)
@@ -417,19 +409,20 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         if key in seen:
             prior_kind,prior_links,ordinary_seen,bind_seen,first_witness=seen[key]
             require(kind==prior_kind,'identity-changed')
+            if kind==stat.S_IFREG and not through_bind:
+                require(link_witness and (not ordinary_seen or first_witness),'identity-changed')
             if kind!=stat.S_IFDIR and prior_links>1 and node.st_nlink>1:return key
             if (kind==stat.S_IFREG and node.st_dev==expected['device'] and prior_links==node.st_nlink==1 and
                     ordinary_seen and not (through_bind or bind_seen)):
-                require(first_witness and single_link_witness(node,entry),'identity-changed')
                 raise OrdinaryChange('ordinary-entry-changed')
             require((through_bind or not ordinary_seen) and (prior_links>1)==(node.st_nlink>1),'identity-changed')
-            seen[key]=(kind,prior_links,ordinary_seen or not through_bind,bind_seen or through_bind,first_witness)
+            witness=first_witness if ordinary_seen else link_witness
+            seen[key]=(kind,prior_links,ordinary_seen or not through_bind,bind_seen or through_bind,witness)
         else:
             require(len(seen)<inode_limit,'inode-limit')
             # The first name can be gone by a repeated sighting. Keep the
             # proof from that encounter, including a failed confirmation.
-            first_witness=kind==stat.S_IFREG and not through_bind and single_link_witness(node,entry)
-            seen[key]=(kind,node.st_nlink,not through_bind,through_bind,first_witness)
+            seen[key]=(kind,node.st_nlink,not through_bind,through_bind,link_witness)
             counters['unique_inodes']+=1
         require(type(node.st_blocks) is int and 0<=node.st_blocks<2**54,'unsupported')
         total+=node.st_blocks*512;require(total<2**63,'unsupported')
@@ -442,9 +435,24 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
         try:
             opened=os.fstat(node_fd)
             node_identity=_node_identity(opened)
-            current=os.stat(name,dir_fd=directory,follow_symlinks=False)
+            same_device=opened.st_dev==expected['device']
+            ordinary_file=same_device and not crossed and stat.S_ISREG(opened.st_mode)
+            repeated_file=ordinary_file and not through_bind and (opened.st_dev,opened.st_ino) in seen
+            if ordinary_file:
+                # Read named metadata from the strict descriptor itself. A
+                # pathname stat could have crossed a transient same-inode bind.
+                bound()
+                try:current=_named_file(directory,name)
+                except FileNotFoundError:
+                    if repeated_file:raise ScanError('identity-changed') from None
+                    raise
+                except OSError as error:
+                    if error.errno==errno.EXDEV:raise ScanError('identity-changed') from None
+                    raise
+            else:current=os.stat(name,dir_fd=directory,follow_symlinks=False)
             current_identity=_node_identity(current)
             if current_identity!=node_identity:
+                require(not repeated_file,'identity-changed')
                 require_ordinary_replacement(node_identity,current_identity,crossed)
                 # The name must still resolve to the replacement under the
                 # ordinary lookup restrictions. Loss during this proof is fatal.
@@ -460,7 +468,6 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                 raise OrdinaryChange('ordinary-entry-changed')
             # GNU du -x excludes both files and directories on other devices,
             # including their mount roots. It never enumerates those trees.
-            same_device=opened.st_dev==expected['device']
             directory_node=same_device and stat.S_ISDIR(opened.st_mode)
             mount_id=_mount_id(node_fd) if crossed else None
             if crossed and root_mount is None:root_mount=_mount_id(fd)
@@ -481,7 +488,9 @@ def scan(root,expected,*,entry_limit=ENTRIES,inode_limit=INODES,depth_limit=DEPT
                             try:walk(child,child_node,depth+1,through_bind or crossed)
                             except OrdinaryChange as error:change=error
                         finally:os.close(child)
-                else:account(opened,through_bind or crossed,entry=(directory,name,current))
+                else:
+                    link_witness=ordinary_file and not through_bind and opened.st_nlink==current.st_nlink>0
+                    account(opened,through_bind or crossed,link_witness=link_witness)
             if directory_node or crossed:
                 # Reopen via the original parent and check the mounted identity
                 # again, even if a descendant already invalidated the total.
