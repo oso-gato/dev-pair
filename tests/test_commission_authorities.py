@@ -1,8 +1,13 @@
 """Commissioning discovery against the ordinary protected F and U input schemas."""
 from pathlib import Path
+from contextlib import nullcontext
 from types import SimpleNamespace
 import os
+import shutil
+import socket
+import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +35,8 @@ class Authorities(unittest.TestCase):
         self.enterContext(patch.object(installer, 'HOST_CONFIGS', self.hosts))
         self.live = object.__new__(c.Live)
         self.live.installer = installer
+        import renewal_site
+        self.live.resolver = renewal_site
         self.live.bootstrap = SimpleNamespace(destination_identity=lambda: {'machine_id': MACHINE, 'boot_id': BOOT})
 
     def approved_full(self):
@@ -121,8 +128,9 @@ class Authorities(unittest.TestCase):
                 patch.object(installer.intake, 'native_env', return_value={'GH_CONFIG_DIR': str(self.root)}), \
                 patch.object(installer.intake, 'GITHUB', str(gh)):
             self.live.run = lambda *args, **kwargs: self.fail('read-only discovery tried to contact a remote')
+            selection_phase = 'pending' if hasattr(installer.intake, 'acquire_initial') else 'source-gap'
             for expected, phase in [('release-trust', 'pending'), ('release-read-custody', 'pending'),
-                                    ('initial-full-release-selection', 'source-gap')]:
+                                    ('initial-full-release-selection', selection_phase)]:
                 with self.assertRaisesRegex(c.Pending, expected) as pending:
                     self.live.initial_platform('a' * 40)
                 self.assertEqual(pending.exception.report['phase'], phase)
@@ -192,3 +200,150 @@ class Authorities(unittest.TestCase):
             observed.subid = lambda *args: True
             with self.assertRaisesRegex(c.Pending, 'checklist-account-allocation'):
                 self.live.initial_checklist({'machine_id': MACHINE}, site, 'a' * 40)
+
+    def test_first_day0_site_publishes_observed_exclusive_default_and_preserves_it_on_resume(self):
+        import gptbox
+        import native_placements as native
+
+        source, origin, image, context = 'b' * 40, 'e' * 40, 'c' * 64, 'd' * 64
+        observed = {'host': 'erebus', 'machine_id': MACHINE, 'boot_id': BOOT, 'arch': 'x86_64',
+                    'pid1': 'systemd', 'selinux': '1', 'os_release': 'ID=fedora\nVERSION_ID=44\n'}
+        day0 = self.root / 'day0-progress.json'
+        self.write(day0, c.encoded({'schema': 1, 'source_sha': origin, 'machine_id': MACHINE,
+                                  'phase': 'host-bootstrap-complete', 'next': 'fixture verified host'}))
+        checked = []
+        self.live.bootstrap.status = lambda: {'prepared': True, 'phase': 'tailnet-only'}
+        self.live.bootstrap.verify_final_guard = lambda: checked.append('guard')
+        self.live.bootstrap.verify_final_ssh = lambda: checked.append('ssh')
+        self.live.identity = lambda: {key: observed[key] for key in ('boot_id', 'machine_id')}
+        self.live.inventory = lambda revision: observed
+        self.live.check_initial_capacity = lambda identity, site: checked.append('native-capacity')
+        probe = SimpleNamespace(lock=nullcontext, maintenance_host_readiness=lambda candidate: checked.append(candidate)
+                                or {'source_sha': origin, 'context_sha256': context},
+                                read_config_record=lambda path: (b'', {'gptbox_context_sha256': context,
+                                                                        'assembled_image_id': image}),
+                                admitted_maintenance_image=lambda *ids: checked.append(ids))
+        app = c.Commission(self.root, Path('/'), None, 0, self.live)
+        path = str(self.root / 'initial')
+        cache = str(self.root / 'auto.json')
+        with patch.object(c, 'DAY0_PROGRESS', str(day0)), patch.object(c, 'PRIVATE', path), \
+                patch.object(c, 'INITIAL_SITE', path + '/initial-site.json'), patch.object(c, 'AUTOMATIC_POLICY', cache), \
+                patch.object(gptbox, 'Gptbox', return_value=probe), patch.object(native, 'role_account', return_value=None), \
+                patch.object(native, 'used_categories', return_value={1021, 1023}), patch.object(native, 'ROOT', self.root / 'placement'), \
+                patch.object(self.live, 'initial_platform', side_effect=c.Pending('release-trust', 'first external inlet')):
+            with self.assertRaisesRegex(c.Pending, 'initial-site-config'):
+                app.automatic('status', source)
+            self.assertFalse(Path(path).exists())
+            with self.assertRaisesRegex(c.Pending, 'release-trust'):
+                app.automatic('apply', source)
+            self.assertFalse(Path(cache).exists())
+            site_sha, site = self.live.initial_site('erebus')
+            self.assertEqual(site['jobs'], {c.DEFAULT_SITE_SLOT:
+                {'storage_bytes': c.DEFAULT_SITE_BYTES, 'categories': {'outer': [1019, 1020, 1022], 'inner': [1019, 1020]}}})
+            intent = Path(c.INITIAL_SITE)
+            before = intent.read_bytes()
+            self.assertEqual((c.parse(before)['source_sha'], c.parse(before)['bootstrap_source_sha']), (source, origin))
+            expected = ('guard', 'ssh', context, (context, origin, image), 'native-capacity')
+            self.assertEqual(tuple(checked), expected)
+            (self.site / (site_sha + '.json')).unlink()
+            with self.assertRaisesRegex(c.Pending, 'release-trust'):
+                app.automatic('apply', source)
+            self.assertEqual(self.live.initial_site('erebus'), (site_sha, site))
+            self.assertEqual(intent.read_bytes(), before)
+            self.assertEqual(checked.count('native-capacity'), 1)
+
+    def test_first_local_checklist_pair_joins_interrupted_publish_and_authenticates(self):
+        from bootstrap import Blocked as BootstrapBlocked
+        import destination_release as destination
+        from host_handoff import tls_principal
+
+        source = 'b' * 40
+        observed = {'machine_id': MACHINE}
+        openssl = self.root / 'openssl'
+        shutil.copyfile('/usr/bin/openssl', openssl)
+        openssl.chmod(0o700)
+        private, server, client, stage = (self.root / name for name in ('commission', 'server', 'client', 'stage'))
+        self.live.first_site_authority = lambda *args: 'e' * 40
+        app = c.Commission(self.root, Path('/'), None, 0, self.live)
+
+        def run(*args, timeout):
+            result = subprocess.run(args, capture_output=True, timeout=timeout)
+            if result.returncode:
+                raise BootstrapBlocked(result.stderr.decode())
+            return result.stdout
+
+        self.live.run = run
+        real_rename = os.rename
+
+        def interrupt(source, target):
+            if Path(target) == client:
+                raise InterruptedError('paused publishing distinct client')
+            real_rename(source, target)
+
+        with patch.object(c, 'PRIVATE', str(private)), patch.object(c, 'CHECKLIST_SERVER', str(server)), \
+                patch.object(c, 'CHECKLIST_CLIENT', str(client)), patch.object(c, 'OPENSSL', str(openssl)), \
+                patch.object(c, 'LOCAL_CHECKLIST_TLS', str(stage)), patch.object(destination, 'PROVISION', self.root / 'provision'):
+            client.mkdir(mode=0o700)
+            with self.assertRaisesRegex(c.Pending, 'checklist-peer-custody'):
+                self.live.prepare_checklist_pair(app, observed, source)
+            self.assertFalse(stage.exists())
+            client.rmdir()
+            previous = os.umask(0o077)
+            try:
+                with patch.object(c.os, 'rename', side_effect=interrupt):
+                    with self.assertRaisesRegex(InterruptedError, 'paused publishing'):
+                        self.live.prepare_checklist_pair(app, observed, source)
+                saved_server = (server / 'cert.pem').read_bytes()
+                self.assertFalse(client.exists())
+                self.live.prepare_checklist_pair(app, observed, source)
+                self.live.prepare_checklist_pair(app, observed, source, issue=False)
+            finally:
+                os.umask(previous)
+            self.assertEqual((server / 'cert.pem').read_bytes(), saved_server)
+            self.assertNotEqual((server / 'key.pem').read_bytes(), (client / 'key.pem').read_bytes())
+            for path in (server, client):
+                self.assertEqual({p.name for p in path.iterdir()}, set(c.TLS_FILES))
+                self.assertEqual((path / 'key.pem').stat().st_mode & 0o777, 0o600)
+            left, _, pins = tls_principal(server, maintenance=True)
+            right, _, _ = tls_principal(client, maintenance=False)
+            server_socket, client_socket = socket.socketpair()
+
+            def answer():
+                with left.wrap_socket(server_socket, server_side=True) as stream:
+                    self.assertEqual(stream.recv(4), b'ping')
+                    stream.sendall(b'pong')
+                    return c.digest(stream.getpeercert(binary_form=True))
+
+            with server_socket, client_socket, ThreadPoolExecutor(max_workers=1) as worker:
+                server_socket.settimeout(3)
+                client_socket.settimeout(3)
+                response = worker.submit(answer)
+                with right.wrap_socket(client_socket) as stream:
+                    self.assertEqual(c.digest(stream.getpeercert(binary_form=True)), pins[1])
+                    stream.sendall(b'ping')
+                    self.assertEqual(stream.recv(4), b'pong')
+                self.assertEqual(response.result(timeout=3), pins[0])
+            saved = (stage / 'pair.json').read_bytes()
+            invalid = c.parse(saved)
+            invalid['profiles']['server']['cert.pem'] = '0' * 64
+            self.write(stage / 'pair.json', c.encoded(invalid))
+            with self.assertRaisesRegex(c.Blocked, 'differ from the recorded local issuance'):
+                self.live.prepare_checklist_pair(app, observed, source, issue=False)
+
+    def test_approved_initial_release_acquisition_uses_existing_locked_f_entry(self):
+        import native_placements as native
+
+        platform, revision = self.approved_full()
+        calls = []
+        class Waiting(Exception):
+            phase = 'initial-source-not-published'
+        intake = SimpleNamespace(ROOT=self.portable, CONTROL_SECONDS=900,
+            intake_lock=nullcontext, retained_index=installer.intake.retained_index,
+            InitialReleaseUnavailable=Waiting,
+            acquire_initial=lambda source, end: calls.append(source) or {'platform_sha256': platform})
+        with patch.object(native, 'managed_snapshot', return_value={'device': 'fixture'}):
+            self.assertEqual(self.live.acquire_initial_platform(intake, revision), platform)
+            self.assertEqual(calls, [revision])
+            with patch.object(intake, 'acquire_initial', side_effect=Waiting('reviewed source is unpublished')):
+                with self.assertRaisesRegex(c.Pending, 'initial-source-not-published'):
+                    self.live.acquire_initial_platform(intake, revision)

@@ -316,11 +316,13 @@ class HostCommissioning(unittest.TestCase):
         self.services.inventory = lambda revision: {
             **machine, 'host': 'erebus', 'arch': 'x86_64', 'pid1': 'systemd',
             'selinux': '1', 'os_release': 'ID=fedora\nVERSION_ID=44\n'}
-        self.services.initial_platform = lambda revision: PLATFORM
+        self.services.initial_platform = lambda revision, **kwargs: PLATFORM
         self.services.initial_site = lambda hostname: (SITE, JOBS)
         self.services.initial_host_profile = lambda site, observed: None
         self.services.initial_checklist = lambda identity, site, revision, **kwargs: FIRST['checklist']
         self.services.verify_initial_parts = lambda platform: self.steps.append('verified-full-parts')
+        self.services.prepare_checklist_pair = lambda *args, **kwargs: None
+        self.services.check_initial_capacity = lambda *args: None
         self.services.authority = lambda policy: (JOBS, {})
         self.app.package = lambda policy, bundle: self.files([])
 
@@ -368,6 +370,14 @@ class HostCommissioning(unittest.TestCase):
         self.assertFalse(self.app.path(c.AUTOMATIC_POLICY).exists())
         self.assertFalse(self.app.path(c.INSTALL + '/host-releases').exists())
         self.assertNotIn('F-stage', self.steps)
+
+    def test_existing_manual_authority_stops_initial_derivation_and_acquisition(self):
+        self.automatic_services()
+        self.app.file(c.PRIVATE + '/intent.json', c.encoded({'policy_sha256': 'b' * 64}), 0o600)
+        with patch.object(self.services, 'initial_site', side_effect=AssertionError('rederived owner configuration')), \
+                patch.object(self.services, 'initial_platform', side_effect=AssertionError('reselected platform')):
+            with self.assertRaisesRegex(c.Blocked, 'different protected site authority'):
+                self.app.automatic('apply', SOURCE)
 
     def test_cli_auto_path_reports_source_gap_without_policy_arguments_writes_or_install(self):
         self.automatic_services()

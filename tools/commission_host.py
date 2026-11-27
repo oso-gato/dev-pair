@@ -21,6 +21,8 @@ INSTALL = '/usr/libexec/dev-pair'
 STATE = '/var/lib/dev-pair'
 PRIVATE = STATE + '/bootstrap/host-commissioning'
 AUTOMATIC_POLICY = PRIVATE + '/automatic-policy.json'
+INITIAL_SITE = PRIVATE + '/initial-site.json'
+DAY0_PROGRESS = '/var/lib/dev-pair-day0/progress.json'
 CONTROL = STATE + '/renewal'
 FENCE = STATE + '/renewal-fence'
 MANIFEST = 'runtime/commissioning/manifest.json'
@@ -36,6 +38,11 @@ TIMERS = {
 }
 TLS_FILES = ('cert.pem', 'peer.pem', 'key.pem')
 CHECKLIST_SERVER = '/etc/dev-pair/checklist-server'
+CHECKLIST_CLIENT = '/etc/dev-pair/checklist-client'
+LOCAL_CHECKLIST_TLS = '/etc/dev-pair/.checklist-local-tls'
+OPENSSL = '/usr/bin/openssl'
+DEFAULT_SITE_SLOT = 'job-1'
+DEFAULT_SITE_BYTES = 8 * 1024**3
 CORE_HELD_FEATURES = tuple(sorted(TIMERS))
 DEFAULT_CHECKLIST = {'uid': 2200, 'subid_start': 2000000, 'validation_mib': 1536, 'validation_inodes': 32768,
                      'live_mib': 1024, 'live_inodes': 16384, 'reserve_mib': 1024, 'reserve_inodes': 1024}
@@ -307,6 +314,7 @@ class Commission:
         observed = self.inspect({'source_sha': revision, 'machine_id': identity['machine_id']})
         require(observed['boot_id'] == identity['boot_id'], 'destination boot changed during commissioning observation')
         prepared = os.path.lexists(self.path(AUTOMATIC_POLICY))
+        checked_parts = False
         if prepared:
             raw = self.read(AUTOMATIC_POLICY)
             policy = read_policy(raw, revision)
@@ -315,9 +323,20 @@ class Commission:
                     'automatic commissioning policy belongs to another machine or admission scope')
             host_profile = None
         else:
-            platform = self.services.initial_platform(revision)
-            site_sha, site = self.services.initial_site(observed['host'])
+            acquire = action in ('prepare', 'apply')
+            if acquire and os.path.lexists(self.path(PRIVATE + '/intent.json')):
+                raise Blocked('existing commissioning uses a different protected site authority')
+            site_sha, site = self.automatic_site(observed, revision, persist=acquire)
+            platform = self.services.initial_platform(revision, acquire=acquire)
             host_profile = self.services.initial_host_profile(site, observed)
+            if acquire:
+                with self.lock():
+                    require(not os.path.lexists(self.path(PRIVATE + '/intent.json')),
+                            'existing commissioning uses a different protected site authority')
+                    self.services.verify_initial_parts(platform)
+                    checked_parts = True
+                    self.services.check_initial_capacity(identity, site)
+                    self.services.prepare_checklist_pair(self, observed, revision)
             policy = read_policy(encoded({'schema': 1, 'source_sha': revision, 'machine_id': observed['machine_id'],
                                          'platform_sha256': platform, 'site_config_sha256': site_sha, 'timers': [],
                                          'checklist': self.services.initial_checklist(identity, site, revision)}), revision)
@@ -335,19 +354,23 @@ class Commission:
             return report
         policy_sha = digest(raw)
         with self.lock():
-            if os.path.lexists(self.path(PRIVATE + '/intent.json')):
+            applying = os.path.lexists(self.path(PRIVATE + '/intent.json'))
+            if applying:
                 prior = parse(self.read(PRIVATE + '/intent.json'))
                 require(prior.get('policy_sha256') == policy_sha,
                         'existing commissioning uses a different protected site authority')
             placed = all(os.path.lexists(self.path(CONTROL + '/' + name + '.json')) for name in ('current', 'site-current'))
-            if not placed:
+            if not placed and not checked_parts:
                 self.services.verify_initial_parts(policy['platform_sha256'])
             if host_profile is not None:
                 target, contents = host_profile
                 self.file(target, contents, 0o600)
             site, bundle = self.services.authority(policy)
             if prepared:
-                require(self.services.initial_checklist(identity, site, revision, placed=placed) == policy['checklist'],
+                self.services.prepare_checklist_pair(self, observed, revision, issue=False)
+                # The native stage checks its own remaining allocation after an
+                # owned apply starts. Its existing backing must not be counted twice.
+                require(self.services.initial_checklist(identity, site, revision, placed=placed or applying) == policy['checklist'],
                         'observed checklist geometry differs from the protected commissioning policy')
             files = self.package(policy, bundle)
             if action == 'prepare':
@@ -357,6 +380,42 @@ class Commission:
             return {**report, 'phase': 'prepared'}
         return {**self.apply(policy, policy_sha, observed['boot_id'], site, files),
                 'held_features': list(CORE_HELD_FEATURES)}
+
+    def automatic_site(self, observed, revision, *, persist):
+        try:
+            return self.services.initial_site(observed['host'])
+        except Pending as waiting:
+            if waiting.report['prerequisite'] != 'initial-site-config':
+                raise
+            if not persist:
+                raise Pending('initial-site-config', 'The first site profile will be derived when the verified Day 0 installation resumes.') from None
+        with self.lock():
+            # Another exact first-site preparation may have completed while
+            # this caller was establishing the commissioning lock.
+            try:
+                return self.services.initial_site(observed['host'])
+            except Pending as waiting:
+                if waiting.report['prerequisite'] != 'initial-site-config':
+                    raise
+            require(not os.path.lexists(self.path(PRIVATE + '/intent.json')),
+                    'existing commissioning uses a different protected site authority')
+            origin = self.services.first_site_authority(observed, revision)
+            identity = {'schema': 1, 'machine_id': observed['machine_id'], 'source_sha': revision,
+                        'bootstrap_source_sha': origin}
+            if os.path.lexists(self.path(INITIAL_SITE)):
+                record = parse(self.read(INITIAL_SITE))
+                exact_fields(record, (*identity, 'site', 'host'), 'invalid protected first-site intent')
+                require(all(record[key] == value for key, value in identity.items()),
+                        'protected first-site intent belongs to another installation')
+            else:
+                host, site = self.services.derive_first_site(observed)
+                record = {**identity, 'host': host, 'site': site}
+                self.file(INITIAL_SITE, encoded(record), 0o600)
+            require(record['site']['hostname'] == observed['host'], 'protected first site names a different destination')
+            site_sha = self.services.publish_first_site(self, record)
+            validated_sha, site = self.services.initial_site(observed['host'])
+            require(validated_sha == site_sha, 'published first site differs from its approved identity')
+            return validated_sha, site
 
     def selectors(self, policy, boot, site, intent):
         controller = self.services.renewal()
@@ -543,32 +602,56 @@ class Live:
                 paths.append(Path(entry.path))
         return sorted(paths)
 
-    def initial_platform(self, revision):
+    def initial_platform(self, revision, *, acquire=False):
         from release_trust import POLICY, ReleaseTrust
 
         intake = self.installer.intake
         candidates = []
+        transfer_pending = False
         for path in self.initial_inputs(intake.ROOT):
             identity = path.name
             if identity == '.intake.lock':
                 continue
             if identity == intake.TRANSFER_LEASE or identity.startswith(intake.TRANSFER_PREFIX):
-                raise Pending('initial-platform-transfer', 'The protected platform intake still owns an interrupted transfer.')
+                transfer_pending = True
+                continue
             _, index, _ = intake.retained_index(hex_id(identity))
             if (index['kind'] == 'dev-pair-platform-release' and index['source_sha'] == revision
                     and index['previous_platform_sha256'] is None and not os.path.lexists(path / intake.RETIREMENT)):
                 candidates.append(identity)
-        if not candidates:
+        require(len(candidates) <= 1, 'more than one protected full release is eligible for this exact source')
+        if not candidates or transfer_pending:
             if not os.path.lexists(POLICY):
                 raise Pending('release-trust', 'Independent protected release trust has not been provisioned.')
             for role in ('host', 'devbox', 'maintenance', 'development'):
                 ReleaseTrust(self.run).policy(role)
             self.require_release_custody()
-            raise Pending('initial-full-release-selection',
-                          'No eligible full release has reached protected intake. The initial publisher selection has no automated producer.',
-                          source_gap=True)
-        require(len(candidates) == 1, 'more than one protected full release is eligible for this exact source')
+            if not hasattr(intake, 'acquire_initial'):
+                raise Pending('initial-full-release-selection', 'The trusted initial publisher selector is unavailable in this kit.',
+                              source_gap=True)
+            if not acquire:
+                prerequisite = 'initial-platform-transfer' if transfer_pending else 'initial-full-release-selection'
+                raise Pending(prerequisite, 'The initial full release has yet to finish protected intake.')
+            return self.acquire_initial_platform(intake, revision)
         return candidates[0]
+
+    def acquire_initial_platform(self, intake, revision):
+        from native_placements import managed_snapshot
+
+        managed_snapshot()
+        if not os.path.lexists(intake.ROOT):
+            self.bootstrap.directory(str(intake.ROOT), mode=0o700)
+        with intake.intake_lock():
+            try:
+                receipt = intake.acquire_initial(revision, time.monotonic() + intake.CONTROL_SECONDS)
+            except intake.InitialReleaseUnavailable as waiting:
+                raise Pending(waiting.phase, str(waiting)) from None
+            identity = hex_id(receipt['platform_sha256'])
+            _, index, _ = intake.retained_index(identity)
+            require(index['kind'] == 'dev-pair-platform-release' and index['source_sha'] == revision and
+                    index['previous_platform_sha256'] is None,
+                    'initial publisher result does not bind the reviewed full release')
+        return identity
 
     def require_release_custody(self):
         intake = self.installer.intake
@@ -608,14 +691,174 @@ class Live:
         require(len(candidates) == 1, 'more than one protected site profile matches the selected host')
         return candidates[0]
 
+    def first_site_authority(self, observed, revision):
+        from gptbox import Gptbox, ROOT as MAINTENANCE_ROOT, STATE as BOOTSTRAP
+
+        if not os.path.lexists(DAY0_PROGRESS):
+            raise Pending('day0-host-confirmation', 'The protected Day 0 host confirmation and offline maintenance probe are pending.')
+        progress = parse(capture(Path(DAY0_PROGRESS), 0, mode=0o600, maximum=8192))
+        exact_fields(progress, ('schema', 'source_sha', 'machine_id', 'phase', 'next'), 'unknown protected Day 0 state')
+        require(type(progress['schema']) is int and progress['schema'] == 1 and
+                progress['machine_id'] == observed['machine_id'], 'Day 0 confirmation belongs to a different machine')
+        status = self.bootstrap.status()
+        if (progress['phase'] not in ('host-bootstrap-complete', 'commissioning-pending', 'commissioned')
+                or status['prepared'] is not True or status['phase'] != 'tailnet-only'):
+            raise Pending('day0-host-confirmation', 'Complete the observed Day 0 maintenance and access checks before deriving the initial site.')
+        self.bootstrap.verify_final_guard()
+        self.bootstrap.verify_final_ssh()
+        app = Gptbox()
+        _, desired = app.read_config_record(BOOTSTRAP + '/desired.json')
+        context = hex_id(desired['gptbox_context_sha256'])
+        app.target = MAINTENANCE_ROOT + '/' + context
+        with app.lock():
+            ready = app.maintenance_host_readiness(context)
+            origin = hex_id(ready['source_sha'], 40)
+            require(ready['context_sha256'] == context and progress['source_sha'] in (origin, revision),
+                    'Day 0 confirmation does not match the original bootstrap or reviewed controller')
+            _, result = app.read_config_record(app.target + '/result.json')
+            app.admitted_maintenance_image(context, origin, hex_id(result['assembled_image_id']))
+        return origin
+
+    def derive_first_site(self, observed):
+        from gptbox import DevelopmentGptbox
+        from native_placements import ROOT as PLACEMENT, allocate_categories, role_account, used_categories
+
+        # A fresh capacity slot grants no repository, workload or credential.
+        # Preserve existing development allocations for the selected site owner.
+        existing = PLACEMENT / 'release/records/placement.json'
+        if os.path.lexists(existing) or self.initial_inputs(PLACEMENT / 'records'):
+            raise Pending('existing-placement-ownership', 'Retained DevBox allocations already belong to an earlier deployment.')
+        role_account(DevelopmentGptbox())
+        host = self.default_host_profile(observed['host'])
+        categories = allocate_categories(used_categories())
+        site = {'schema': 1, 'hostname': observed['host'], 'host_config_sha256': digest(encoded(host)),
+                'jobs': {DEFAULT_SITE_SLOT: {'storage_bytes': DEFAULT_SITE_BYTES, 'categories': categories}}}
+        self.check_initial_capacity(observed, site)
+        return host, site
+
+    def publish_first_site(self, app, record):
+        host, site = record['host'], record['site']
+        host_bytes, site_bytes = encoded(host), encoded(site)
+        site_sha, host_sha = digest(site_bytes), digest(host_bytes)
+        self.resolver.closed_site(site_bytes)
+        require(host == self.default_host_profile(site['hostname']) and site['host_config_sha256'] == host_sha and
+                set(site['jobs']) == {DEFAULT_SITE_SLOT} and site['jobs'][DEFAULT_SITE_SLOT]['storage_bytes'] == DEFAULT_SITE_BYTES,
+                'protected first-site host profile differs from the reviewed default')
+        app.file(str(self.installer.HOST_CONFIGS / (host_sha + '.json')), host_bytes, 0o600)
+        app.file(str(self.installer.SITE_CONFIGS / (site_sha + '.json')), site_bytes, 0o600)
+        return site_sha
+
+    @staticmethod
+    def default_host_profile(hostname):
+        return {'schema': 1, 'hostname': hostname, 'platform': 'fedora-44', 'selinux': 'enforcing',
+                'launch_contract': 1, 'role_launch_seconds': 145}
+
+    def openssl(self, *args):
+        tool = Path(OPENSSL)
+        if not tool.is_file() or not os.access(tool, os.X_OK):
+            raise Pending('checklist-local-crypto', 'The signed Fedora OpenSSL tool for the local checklist pair is unavailable.')
+        protected(tool, 0)
+        return self.run(str(tool), *map(str, args), timeout=15)
+
+    def verify_checklist_pair(self, server, client):
+        from bootstrap import Blocked as BootstrapBlocked
+        from host_handoff import tls_principal
+
+        hashes = {}
+        if any(not os.path.lexists(path / name) for path in (server, client) for name in TLS_FILES):
+            raise Pending('checklist-peer-custody', 'Both complete protected checklist TLS profiles are required.')
+        for role, path in (('server', server), ('client', client)):
+            protected(path, 0, directory=True, mode=0o700)
+            hashes[role] = {name: digest(capture(path / name, 0, mode=0o600, maximum=8192)) for name in TLS_FILES}
+        require(hashes['server']['key.pem'] != hashes['client']['key.pem'],
+                'checklist server and conductor need distinct private keys')
+        for role, path in (('server', server), ('client', client)):
+            _, _, principals = tls_principal(path, maintenance=role == 'server')
+            if role == 'server':
+                pair = principals
+            else:
+                require(principals == pair, 'checklist TLS peers do not pin each other')
+            try:
+                self.openssl('verify', '-no-CAfile', '-no-CApath', '-no-CAstore',
+                             '-trusted', path / 'peer.pem', '-purpose',
+                             'sslclient' if role == 'server' else 'sslserver', path / 'peer.pem')
+            except BootstrapBlocked:
+                raise Pending('checklist-peer-custody', 'The dedicated checklist TLS peer is expired or cannot be verified.') from None
+        return hashes
+
+    def prepare_checklist_pair(self, app, observed, revision, *, issue=True):
+        from destination_release import PROVISION
+
+        targets = {'server': Path(CHECKLIST_SERVER), 'client': Path(CHECKLIST_CLIENT)}
+        working = Path(LOCAL_CHECKLIST_TLS)
+        recorded = working / 'pair.json'
+        intent = Path(PRIVATE + '/checklist-tls-intent.json')
+        scope = {'schema': 1, 'machine_id': observed['machine_id'], 'source_sha': revision}
+        staged = {role: working / role for role in targets}
+        if not os.path.lexists(intent):
+            if all(os.path.lexists(path) for path in targets.values()):
+                self.verify_checklist_pair(*targets.values())
+                return
+            if not issue or any(os.path.lexists(path) for path in targets.values()) or os.path.lexists(PROVISION):
+                raise Pending('checklist-peer-custody', 'An independently supplied checklist TLS profile is incomplete.')
+            require(not os.path.lexists(working), 'unowned checklist TLS staging area is preserved')
+            scope['bootstrap_source_sha'] = self.first_site_authority(observed, revision)
+            app.file(str(intent), encoded(scope), 0o600)
+        else:
+            prior = parse(capture(intent, 0, mode=0o600, maximum=4096))
+            scope['bootstrap_source_sha'] = hex_id(prior['bootstrap_source_sha'], 40)
+            require(prior == scope, 'local checklist TLS issuance belongs to a different installation')
+        if not issue:
+            hashes = self.verify_checklist_pair(*targets.values())
+            require(parse(capture(recorded, 0, mode=0o600, maximum=4096)) == {**scope, 'profiles': hashes},
+                    'checklist TLS inputs differ from the recorded local issuance')
+            return
+        app.directory(str(working), 0o700)
+        if not os.path.lexists(recorded):
+            require(not any(os.path.lexists(path) for path in targets.values()),
+                    'existing checklist TLS custody cannot be replaced by a local issuance')
+            for role, path in staged.items():
+                app.directory(str(path), 0o700)
+                for leaf in self.initial_inputs(path):
+                    require(leaf.name in TLS_FILES, 'unrecognized file in the owned local TLS staging area')
+                    node = protected(leaf, 0, mode=0o600).lstat()
+                    require(node.st_uid == node.st_gid == 0, 'local checklist TLS staging lost private ownership')
+                    leaf.unlink()
+                self.openssl('req', '-new', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+                             '-noenc', '-days', 365, '-subj', '/CN=dev-pair-checklist-' + role,
+                             '-addext', 'basicConstraints=critical,CA:FALSE', '-addext', 'keyUsage=critical,digitalSignature',
+                             '-addext', 'extendedKeyUsage=' + ('serverAuth' if role == 'server' else 'clientAuth'),
+                             '-keyout', path / 'key.pem', '-out', path / 'cert.pem')
+                for name in ('key.pem', 'cert.pem'):
+                    with protected(path / name, 0, mode=0o600).open('rb') as stream:
+                        os.fsync(stream.fileno())
+            for role, other in (('server', 'client'), ('client', 'server')):
+                certificate = capture(staged[other] / 'cert.pem', 0, mode=0o600, maximum=8192)
+                app.file(str(staged[role] / 'peer.pem'), certificate, 0o600)
+            hashes = self.verify_checklist_pair(*staged.values())
+            app.file(str(recorded), encoded({**scope, 'profiles': hashes}), 0o600)
+        binding = parse(capture(recorded, 0, mode=0o600, maximum=4096))
+        current = {}
+        for role, target in targets.items():
+            source = staged[role]
+            require(os.path.lexists(target) != os.path.lexists(source), 'checklist TLS issuance has ambiguous or missing custody')
+            current[role] = target if os.path.lexists(target) else source
+        hashes = self.verify_checklist_pair(*current.values())
+        require(binding == {**scope, 'profiles': hashes}, 'checklist TLS inputs differ from the recorded local issuance')
+        for role, target in targets.items():
+            if current[role] != target:
+                require(not os.path.lexists(target), 'checklist TLS destination appeared during custody transfer')
+                os.rename(current[role], target)
+                app.sync(target.parent)
+                app.sync(working)
+
     def initial_host_profile(self, site, observed):
         reference = hex_id(site['host_config_sha256'])
         path = self.installer.HOST_CONFIGS / (reference + '.json')
         if os.path.lexists(path):
             self.installer.protected_json(path, reference)
             return None
-        body = encoded({'schema': 1, 'hostname': observed['host'], 'platform': 'fedora-44', 'selinux': 'enforcing',
-                        'launch_contract': 1, 'role_launch_seconds': 145})
+        body = encoded(self.default_host_profile(observed['host']))
         if digest(body) != reference:
             raise Pending('initial-host-config',
                           'The approved site references a host configuration that has not been delivered.',
@@ -624,9 +867,7 @@ class Live:
 
     def initial_checklist(self, identity, site, revision, *, placed=False):
         from bootstrap import Blocked as BootstrapBlocked, checked_file
-        from destination_release import Destination, MANAGED_INTENT, MANAGED_INODES, MANAGED_READY, PROVISION
-        from native_placement_release import OUTER_BYTES
-        from native_placements import HOST_INODE_HEADROOM, HOST_METADATA_BYTES, SCRATCH_BYTES
+        from destination_release import Destination, PROVISION
         from host_handoff import tls_principal
 
         root = Path(CHECKLIST_SERVER)
@@ -649,12 +890,6 @@ class Live:
                 for key in ('mib', 'inodes'):
                     settings[f'{role}_{key}'] = prior['mounts'][role][key]
             return {'tls_profile': CHECKLIST_SERVER, **settings}
-        if not os.path.lexists(MANAGED_INTENT) or not os.path.lexists(MANAGED_READY):
-            raise Pending('managed-storage', 'The measured bounded Fedora allocation has not finished preparation.')
-        managed = destination.record(MANAGED_INTENT)
-        require(managed == destination.record(MANAGED_READY) and managed['machine_id'] == identity['machine_id'],
-                'managed storage readiness belongs to a different machine or allocation')
-        destination.mount_observation(STATE, managed['filesystem'], max_inodes=MANAGED_INODES)
         users, groups = pwd.getpwall(), grp.getgrall()
         uid, start = DEFAULT_CHECKLIST['uid'], DEFAULT_CHECKLIST['subid_start']
         if any(row.pw_uid == uid or row.pw_name == 'dp-checklist' for row in users) or any(
@@ -666,6 +901,21 @@ class Live:
                     raise Pending('checklist-account-allocation', 'A previous checklist identity allocation needs protected reconciliation.')
         except BootstrapBlocked:
             raise Pending('checklist-account-allocation', 'The proposed checklist subordinate IDs conflict with existing allocations.') from None
+        self.check_initial_capacity(identity, site, placed=placed)
+        return {'tls_profile': CHECKLIST_SERVER, **DEFAULT_CHECKLIST}
+
+    def check_initial_capacity(self, identity, site, *, placed=False):
+        from destination_release import Destination, MANAGED_INTENT, MANAGED_INODES, MANAGED_READY
+        from native_placement_release import OUTER_BYTES
+        from native_placements import HOST_INODE_HEADROOM, HOST_METADATA_BYTES, SCRATCH_BYTES
+
+        if not os.path.lexists(MANAGED_INTENT) or not os.path.lexists(MANAGED_READY):
+            raise Pending('managed-storage', 'The measured bounded Fedora allocation has not finished preparation.')
+        destination = Destination()
+        managed = destination.record(MANAGED_INTENT)
+        require(managed == destination.record(MANAGED_READY) and managed['machine_id'] == identity['machine_id'],
+                'managed storage readiness belongs to a different machine or allocation')
+        destination.mount_observation(STATE, managed['filesystem'], max_inodes=MANAGED_INODES)
         capacity = os.statvfs(STATE)
         checklist = sum(DEFAULT_CHECKLIST[key] for key in ('validation_mib', 'live_mib', 'reserve_mib')) * 1024**2
         bytes_needed = checklist
@@ -677,7 +927,6 @@ class Live:
         inodes_needed = max(HOST_INODE_HEADROOM, DEFAULT_CHECKLIST['reserve_inodes']) + 2 * 2
         if capacity.f_bavail * capacity.f_frsize < bytes_needed or capacity.f_favail < inodes_needed:
             raise Pending('checklist-storage-capacity', 'The approved placement and checklist storage do not fit the observed allocation.')
-        return {'tls_profile': CHECKLIST_SERVER, **DEFAULT_CHECKLIST}
 
     def authority(self, policy):
         from platform_release import readonly_json, validate_host
