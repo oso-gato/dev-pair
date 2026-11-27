@@ -98,6 +98,35 @@ def publisher_runs(values, source, window):
             if status == 'completed' and conclusion == 'success']
 
 
+def protected_main(intake, protocol, end):
+    intake.protected(intake.ROOT, directory=True)
+    branch = intake.read_api('branches/main', end)
+    require(type(branch) is dict and branch.get('protected') is True and branch.get('name', 'main') == 'main',
+            'agent publisher requires independently protected main')
+    return protocol.hex_id(branch.get('commit', {}).get('sha'), 40)
+
+
+def confirm_publisher_read(intake, protocol, end):
+    """Check both reads used by the fixed poll, without looking for an offer."""
+    source = protected_main(intake, protocol, end)
+    for event in ('schedule', 'workflow_dispatch'):
+        endpoint = f'actions/workflows/{WORKFLOW}/runs?branch=main&event={event}&head_sha={source}&per_page=1'
+        value = intake.read_api(endpoint, end)
+        require(type(value) is dict, 'invalid protected publisher read inventory')
+        count, rows = value.get('total_count'), value.get('workflow_runs')
+        require(type(count) is int and 0 <= count < 2**63 and type(rows) is list and len(rows) == min(count, 1),
+                'invalid protected publisher read inventory')
+        if rows:
+            row, = rows
+            require(type(row) is dict and row.get('head_sha') == source and row.get('head_branch') == 'main' and
+                    row.get('event') == event and row.get('path') == '.github/workflows/' + WORKFLOW and
+                    type(row.get('repository')) is dict and type(row.get('head_repository')) is dict and
+                    row.get('repository', {}).get('full_name') == REPOSITORY and
+                    row.get('head_repository', {}).get('full_name') == REPOSITORY and
+                    type(row.get('id')) is int and 0 < row['id'] < 2**63,
+                    'protected publisher read returned a foreign or stale run')
+
+
 def stable_version(version):
     require(type(version) is str and re.fullmatch(r'(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})\.(0|[1-9][0-9]{0,5})', version),
             'invalid stable tooling identity')
@@ -200,11 +229,8 @@ class Site:
             reset()
 
     def publisher(self, window, end):
-        f, p = self.intake, self.protocol
-        f.protected(f.ROOT, directory=True)
-        branch = f.read_api('branches/main', end)
-        require(branch.get('protected') is True, 'agent publisher requires independently protected main')
-        source = p.hex_id(branch.get('commit', {}).get('sha'), 40)
+        f = self.intake
+        source = protected_main(f, self.protocol, end)
         event = window[2]
         rows = f.read_api(f'actions/workflows/{WORKFLOW}/runs?branch=main&event={event}&per_page=8', end)
         return source, matching_runs(rows, source, window)

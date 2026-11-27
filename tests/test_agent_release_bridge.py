@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import agent_release_bridge as bridge
+import platform_release_protocol as protocol
 
 SOURCE = '1' * 40
 BASE = '2' * 64
@@ -119,6 +121,40 @@ class LocalSite(bridge.Site):
 
 
 class AgentBridgeTests(unittest.TestCase):
+    def test_preflight_requires_current_read_shape_and_accepts_empty_workflow_lists(self):
+        end = time.monotonic() + 10
+        checked = []
+        branch = {'name': 'main', 'protected': True, 'commit': {'sha': SOURCE}}
+
+        def observe(responses):
+            lookup = iter(responses)
+
+            def read(endpoint, deadline):
+                self.assertEqual(deadline, end)
+                checked.append(endpoint)
+                return next(lookup)
+
+            scope = SimpleNamespace(ROOT=Path('/approved'), read_api=read, protected=lambda *a, **k: None)
+            bridge.confirm_publisher_read(scope, protocol, end)
+
+        empty = {'total_count': 0, 'workflow_runs': []}
+        observe([branch, empty, empty])
+        self.assertEqual(checked, ['branches/main', *(
+            f'actions/workflows/agent-refresh.yml/runs?branch=main&event={event}&head_sha={SOURCE}&per_page=1'
+            for event in ('schedule', 'workflow_dispatch'))])
+        date = timestamp(27, 17)
+        valid = {'total_count': 1, 'workflow_runs': [run_row(42, date)]}
+        observe([branch, valid, empty])
+        for problem in (
+            {'total_count': 1, 'workflow_runs': []},
+            {'total_count': 1, 'workflow_runs': [run_row(42, date, head_sha='2' * 40)]},
+            {'total_count': 1, 'workflow_runs': [run_row(42, date, repository={'full_name': 'other/repo'})]},
+        ):
+            with self.subTest(problem=problem), self.assertRaises(bridge.BridgeError):
+                observe([branch, problem, empty])
+        with self.assertRaises(bridge.BridgeError):
+            observe([{**branch, 'protected': False}, empty, empty])
+
     def test_nightly_window_and_later_readback(self):
         self.assertIsNone(bridge.selection_window(timestamp(26, 18, 59), False))
         begin = timestamp(26, 19)

@@ -1552,7 +1552,9 @@ class Live:
         self.installer.check_host_bundle(root, row, time.monotonic() + 15)
         return root
 
-    def agent_bridge_authority(self, selected):
+    def agent_bridge_authority(self, selected, *, confirm_read):
+        from agent_release_bridge import confirm_publisher_read
+        import platform_release_protocol
         from release_trust import POLICY, ReleaseTrust
 
         self.require_release_custody(config=GITHUB_CONFIG)
@@ -1569,6 +1571,13 @@ class Live:
         intake.intake_limit(intake.ROOT, [intake.META_LIMIT, 2 * intake.CONTROL_LIMIT], intake.ZIP_OVERHEAD)
         authority = [verified.name, digest(capture(Path(POLICY), 0, maximum=65536)),
                      self.credential_stamp(GITHUB_CONFIG / 'hosts.yml')]
+        if confirm_read:
+            try:
+                config = intake.native_env().get('GH_CONFIG_DIR', str(GITHUB_CONFIG))
+                require(Path(config) == GITHUB_CONFIG, 'agent publisher read custody differs from the installed service')
+                confirm_publisher_read(intake, platform_release_protocol, time.monotonic() + 10)
+            except (AttributeError, Blocked, OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
+                raise Pending('agent-publication-read', 'The approved GitHub identity cannot verify current agent publication access.') from None
         return {'subject': 'approved-publisher', 'expires_unix': None, 'sha256': digest(encoded(authority))}
 
     def agent_publication_status(self, selected):
@@ -1602,7 +1611,10 @@ class Live:
                     node = runtime.STORAGE.lstat()
                 return {'subject': 'managed-validation', 'expires_unix': None,
                         'sha256': digest(encoded([selected, device, node.st_ino]))}
-            return self.agent_bridge_authority(selected)
+            # A normal apply measures remote scope once. Subsequent checks in
+            # the same attempt bind the immutable local authority. The poll
+            # itself authenticates its own reads before any publication effect.
+            return self.agent_bridge_authority(selected, confirm_read=recorded is None)
         except (Blocked, BootstrapBlocked, OSError, RuntimeError, ValueError, TypeError, KeyError, subprocess.SubprocessError):
             prerequisite = {'owner-intake': 'provider-slot-authority', 'checklist-spool': 'checklist-validation-storage',
                             'agent-renewal': 'agent-release-authority'}[feature]

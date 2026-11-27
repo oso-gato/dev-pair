@@ -154,6 +154,20 @@ class SignedWorkloadAuthority(unittest.TestCase):
         release_policy = root / 'release-trust.json'
         intake = owner_intake.Intake(root=app.path(c.STATE), site=catalogue)
         stable = {'components': {'host': {'bundle_manifest_sha256': bundle_sha, 'source_sha': fixture.SOURCE}}}
+        expected_reads = ['branches/main', *(f'actions/workflows/agent-refresh.yml/runs?branch=main&event={event}'
+                                            f'&head_sha={fixture.SOURCE}&per_page=1'
+                                            for event in ('schedule', 'workflow_dispatch'))]
+        reads, permission = [], {'allowed': False}
+
+        def publication_read(endpoint, end):
+            self.assertIn(endpoint, expected_reads)
+            self.assertGreater(end, time.monotonic())
+            reads.append(endpoint)
+            if not permission['allowed']:
+                raise subprocess.CalledProcessError(1, 'fixture gh read', output=b'local response must be withheld')
+            if endpoint == 'branches/main':
+                return {'name': 'main', 'protected': True, 'commit': {'sha': fixture.SOURCE}}
+            return {'total_count': 0, 'workflow_runs': []}
 
         def storage_probe(runtime, end, *, witness):
             self.assertEqual(witness, bundle / 'tools/checklist_candidate.py')
@@ -167,6 +181,7 @@ class SignedWorkloadAuthority(unittest.TestCase):
               patch.object(platform_release_install, 'HOST_RELEASES', host_bundles),
               patch.object(platform_release_intake, 'retained_index', return_value=(root, stable, '1' * 64)),
               patch.object(platform_release_intake, 'ROOT', root), patch.object(platform_release_intake, 'portable_volume'),
+              patch.object(platform_release_intake, 'read_api', side_effect=publication_read),
               patch.object(release_trust, 'POLICY', release_policy),
               patch.object(host_handoff, 'host_runtime', return_value=cleanup),
               patch.object(checklist_candidate, 'checked_storage', side_effect=storage_probe)):
@@ -201,13 +216,32 @@ class SignedWorkloadAuthority(unittest.TestCase):
                     'components': {role: role_policy for role in ('maintenance', 'development')}}))
                 release_policy.chmod(0o600)
                 with patch.object(owner_intake.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=2200, pw_gid=2200)):
+                    refused = cli()
+                    self.assertEqual(refused['pending_features'], {'agent-renewal': 'agent-publication-read'})
+                    self.assertNotIn(c.AGENT_BRIDGE[0], refused['timers'])
+                    self.assertNotIn('agent_publication', refused)
+                    self.assertEqual(reads, [expected_reads[0]])
+                    permission['allowed'] = True
                     result = cli()
+                self.assertEqual(reads, [expected_reads[0], *expected_reads])
                 self.assertEqual(result['owner_terminal'], '/usr/local/bin/dev-pair')
                 self.assertEqual(set(result['timers']), {c.AGENT_BRIDGE[0], c.TIMERS['owner-intake'][0], c.TIMERS['checklist-spool'][0]})
                 self.assertEqual(result['agent_publication'], 'awaiting-signed-publication')
                 self.assertFalse(app.path(c.CONTROL + '/offers/agent.json').exists())
                 app.require_runtime_feature('agent-renewal')
                 app.require_runtime_feature('owner-intake', owner_entry=True)
+                self.assertEqual(reads, [expected_reads[0], *expected_reads])
+                saved_custody = (archive / 'hosts.yml').stat()
+                permission['allowed'] = False
+                with patch.object(owner_intake.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=2200, pw_gid=2200)):
+                    lost = cli()
+                    self.assertEqual(lost['pending_features'], {'agent-renewal': 'agent-publication-read'})
+                    self.assertNotIn(c.AGENT_BRIDGE[0], lost['timers'])
+                    self.assertNotIn(c.AGENT_BRIDGE[0], setup.manager.active)
+                    self.assertEqual((archive / 'hosts.yml').stat().st_ino, saved_custody.st_ino)
+                    permission['allowed'] = True
+                    self.assertIn(c.AGENT_BRIDGE[0], cli()['timers'])
+                self.assertEqual(reads, [expected_reads[0], *expected_reads, expected_reads[0], *expected_reads])
                 self.assertFalse(app.path(c.STATE + '/provider-allowances/' + job).exists())
                 (credentials / 'maintenance').unlink()
                 with self.assertRaisesRegex(c.Pending, 'provider-slot-authority'):

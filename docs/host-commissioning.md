@@ -41,8 +41,9 @@ Commissioning checks the protected authority for each feature and lists any
 remaining prerequisites. Owner intake needs the approved catalogue, startup
 material and a valid provider slot. Checklist cleanup needs the managed
 validation filesystem. Scheduled publication checks need the independently
-approved agent publisher and protected read custody. The bridge verifies the
-signed artifacts before it offers a compatible release to renewal.
+approved agent publisher and successful read access to protected main and its
+fixed workflow. An empty run list can qualify the schedule. The bridge
+verifies signed artifacts before it offers a compatible release to renewal.
 
 This stage consumes an already approved owner catalogue and slot profiles.
 There is no normal first-catalogue producer in this source. A missing
