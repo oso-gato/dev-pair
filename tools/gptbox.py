@@ -594,7 +594,7 @@ class Gptbox(Bootstrap):
         return output
 
     def run_job(self, job, operation, request_sha, sealed, context, revision, platform_sha=None):
-        self.preflight()
+        self.preflight(managed_runtime=True)
         if (not JOB.fullmatch(job) or not OPERATION.fullmatch(operation) or not re.fullmatch(r'[0-9a-f]{64}', context)
                 or not re.fullmatch(r'[0-9a-f]{40}', revision) or not self.path(STATE + '/prepared').exists()):
             raise Blocked('maintenance job requires exact reviewed input, target and host readiness')
@@ -910,7 +910,7 @@ class Gptbox(Bootstrap):
         raw_digest(revision, 40)
         if phase not in ('preflight', 'verify'):
             raise Blocked('unsupported installed maintenance verification phase')
-        self.preflight()
+        self.preflight(managed_runtime=True)
         self.target = ROOT + '/' + context
         with self.lock():
             with self.run.phase(270 if phase == 'verify' else 45, 'dev-pair-maintenance-import', native=False):
