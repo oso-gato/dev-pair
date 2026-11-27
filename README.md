@@ -117,6 +117,7 @@ needs native setup and external observations. [Day-zero operations](docs/owner-d
 **DR2.2–DR2.9** The [component and diagnostic history](docs/status-history.md) preserves the earlier validation results, receipts and known gaps.
 
 <a id="dr3"></a>
+<a id="platform-and-agents"></a>
 ## DR3 — Platform and agents
 
 <a id="dr3-1"></a>

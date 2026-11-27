@@ -1,5 +1,8 @@
 """Exercise commissioning's actual durable filesystem and bounded manager boundary."""
 from contextlib import nullcontext
+from contextlib import redirect_stdout
+import io
+import json
 import os
 from pathlib import Path
 import re
@@ -306,6 +309,79 @@ class HostCommissioning(unittest.TestCase):
                         {'checklist': {**FIRST['checklist'], 'tls_profile': '/tmp/../root'}}):
             with self.subTest(changed=changed), self.assertRaises(c.Blocked):
                 c.read_policy(c.encoded({**FIRST, **changed}), SOURCE)
+
+    def automatic_services(self):
+        machine = {'machine_id': FIRST['machine_id'], 'boot_id': BOOT}
+        self.services.identity = lambda: machine
+        self.services.inventory = lambda revision: {
+            **machine, 'host': 'erebus', 'arch': 'x86_64', 'pid1': 'systemd',
+            'selinux': '1', 'os_release': 'ID=fedora\nVERSION_ID=44\n'}
+        self.services.initial_platform = lambda revision: PLATFORM
+        self.services.initial_site = lambda hostname: (SITE, JOBS)
+        self.services.initial_host_profile = lambda site, observed: None
+        self.services.initial_checklist = lambda identity, site, revision, **kwargs: FIRST['checklist']
+        self.services.verify_initial_parts = lambda platform: self.steps.append('verified-full-parts')
+        self.services.authority = lambda policy: (JOBS, {})
+        self.app.package = lambda policy, bundle: self.files([])
+
+    def test_normal_automatic_policy_is_private_pinned_and_reused(self):
+        self.automatic_services()
+        self.assertEqual(self.app.automatic('discover', SOURCE)['phase'], 'discovered')
+        leaf = self.app.path(c.AUTOMATIC_POLICY)
+        self.assertFalse(leaf.exists())
+        self.assertEqual(self.app.automatic('prepare', SOURCE)['phase'], 'prepared')
+        self.assertEqual(leaf.stat().st_mode & 0o777, 0o600)
+        saved = leaf.read_bytes()
+        self.assertEqual(c.read_policy(saved, SOURCE)['platform_sha256'], PLATFORM)
+        self.assertFalse(self.app.path(c.CONTROL + '/current.json').exists())
+        with patch.object(self.services, 'initial_platform', side_effect=AssertionError('reselected platform')):
+            self.assertEqual(self.app.automatic('apply', SOURCE)['phase'], 'host-observation-queued')
+            ready = self.app.automatic('apply', SOURCE)
+        self.assertEqual(ready['phase'], 'ready')
+        self.assertEqual(set(ready['held_features']), set(c.TIMERS))
+        self.assertEqual(leaf.read_bytes(), saved)
+        self.assertEqual(self.steps.count('F-stage'), 1)
+        self.assertEqual(self.steps.count('verified-full-parts'), 2)
+
+    def test_cached_prepare_and_apply_reverify_peer_and_geometry_before_stage(self):
+        self.automatic_services()
+        self.app.automatic('prepare', SOURCE)
+        saved = self.app.read(c.AUTOMATIC_POLICY)
+        for action in ('prepare', 'apply'):
+            with self.subTest(action=action), patch.object(self.services, 'initial_checklist',
+                    side_effect=c.Blocked('changed private TLS peer')):
+                with self.assertRaisesRegex(c.Blocked, 'changed private TLS peer'):
+                    self.app.automatic(action, SOURCE)
+        with patch.object(self.services, 'initial_checklist', return_value={**FIRST['checklist'], 'uid': 2001}):
+            with self.assertRaisesRegex(c.Blocked, 'observed checklist geometry'):
+                self.app.automatic('apply', SOURCE)
+        self.assertEqual(self.app.read(c.AUTOMATIC_POLICY), saved)
+        self.assertNotIn('F-stage', self.steps)
+        self.assertFalse(self.app.path(c.UNIT_ROOT + '/' + c.BOOT_FENCE).exists())
+
+    def test_incomplete_full_parts_block_before_policy_or_host_effects(self):
+        self.automatic_services()
+        with patch.object(self.services, 'verify_initial_parts', side_effect=FileNotFoundError('missing devbox archive')):
+            for action in ('prepare', 'apply'):
+                with self.subTest(action=action), self.assertRaisesRegex(FileNotFoundError, 'missing devbox archive'):
+                    self.app.automatic(action, SOURCE)
+        self.assertFalse(self.app.path(c.AUTOMATIC_POLICY).exists())
+        self.assertFalse(self.app.path(c.INSTALL + '/host-releases').exists())
+        self.assertNotIn('F-stage', self.steps)
+
+    def test_cli_auto_path_reports_source_gap_without_policy_arguments_writes_or_install(self):
+        self.automatic_services()
+        with patch.object(c, 'protected'), patch.object(c, 'verify_checkout'), \
+                patch.object(c.os, 'getuid', return_value=0), patch.object(c.os, 'geteuid', return_value=0), \
+                patch.object(c, 'Commission', return_value=self.app), patch.object(c, 'Live', return_value=self.services), \
+                patch.object(self.services, 'initial_platform', side_effect=c.Pending(
+                    'initial-full-release-selection', 'No eligible full release.', source_gap=True)), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(c.main(['apply', '--source-sha', SOURCE]), 0)
+        self.assertEqual(json.loads(output.getvalue()), {'phase': 'source-gap',
+            'prerequisite': 'initial-full-release-selection', 'message': 'No eligible full release.'})
+        self.assertFalse(self.app.path(c.AUTOMATIC_POLICY).exists())
+        self.assertNotIn('F-stage', self.steps)
 
 
 if __name__ == '__main__':

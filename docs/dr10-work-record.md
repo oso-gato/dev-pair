@@ -2,6 +2,43 @@
 
 ## Latest continuation checkpoint
 
+### November 27, 2026 — integrated owner entry and commissioning
+
+The owner starts from the [pinned public checkout or verified source kit](../README.md#set-up-the-fedora-host).
+The first-run path at `6420e84f35de7219541ecec047bd5402a00bbbf0` uses the
+verified public input bundle's sanitized source to build the first local
+maintenance gptbox. It requires both offline probe cycles and the protected
+completion record before it reports that milestone. The same source and
+prepared host can resume after interruption. Existing access stays available
+through setup and the independent recovery and cutover checks.
+[Owner operations](owner-day0.md)
+
+The commissioning composition includes `3ffd5f4ec45f5e29e7af7afd2a44a64f0e44d3eb`.
+It reads existing protected publication and site authority, and reports
+unavailable authority before applying the dependent steps. The independently
+reviewed service checks from `d8b3c47c5318989437ef07b4bcc47256282bd5ef` and
+`df85493904860d3557e9f37f3ed2bb1acfbb0db1` share one service profile. Stock
+systemd manager evidence distinguished an omitted empty command array from a
+nonempty command. Twenty focused checks passed in that review.
+[Host commissioning](host-commissioning.md)
+
+The reviewed nightly and archive-retention changes are individual source
+patches with their original commit references. They retain the signed active
+and rollback inputs through bounded transfers. Checklist promotion and its
+independent observer remain opt-in paths that require their own protected
+release and observation custody.
+[Agent refresh](agent-release-bridge.md) · [Checklist promotion](product-release.md) · [Independent observation](destination-observation.md)
+
+The implementation comes from independently developed dev-pair source.
+The older Fedora bootstrap and Claudebox repositories served as references
+for setup UX and the SELinux lifecycle only.
+
+Local fixtures exercise the owner and commissioning paths. The owner's
+selected VPS setup, native Fedora execution, authenticated provider use,
+protected publisher custody and independent access observations still require
+their respective environments and approvals. The first local offline gptbox
+milestone is separate from workload activation and final access cutover.
+
 ### November 27, 2026 — owner bootstrap integration baseline
 
 The owner-run delivery branch starts at

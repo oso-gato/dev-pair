@@ -8,53 +8,40 @@ maintenance gateway. Keep the independent recovery path available throughout
 commissioning. The commissioning command reads these prerequisites through the
 existing controllers.
 
-Transfer the exact clean reviewed checkout to the protected bootstrap source
-directory. Independently verify the full commit before executing it. Stage the
-attested full portable release with the protected platform intake. Provision the
-digest-addressed [site plan and host profile](renewal.md), checklist server TLS
-profile and any protected product inputs before applying their corresponding
-features. The full package must identify the same source as the transferred
-checkout. The commissioning manifest fixes the installed scripts, services,
-timer files and permissions. The signed host bundle binds those script and
-runtime bytes. The fixed checklist recipe comes from the independently pinned
-checkout.
+The attended bootstrap calls the commissioning controller after it verifies the
+checkout, maintenance gateway and destination. It passes the verified source
+identity programmatically. The owner uses the same front-door resume command
+when the protected installation settles.
 
-The root-owned commissioning policy is mode 0600. Provide its exact SHA-256 from
-the separately approved site plan. It has schema 1 and these fields.
+The controller selects the single eligible full platform in protected intake
+for that source, along with the approved site profile for the inspected host.
+It derives and retains the commissioning policy privately. The site profile
+binds the permitted slots, storage and exclusive SELinux categories. Its
+referenced host profile can be reconstructed only when the known canonical
+bytes match the already approved digest. The signed host bundle binds the
+fixed installation manifest. The authenticated source checkout binds the fixed
+checklist recipe.
 
-| Field | Value |
-| --- | --- |
-| `source_sha` | Independently selected reviewed checkout commit |
-| `machine_id` | The inspected target's machine ID |
-| `platform_sha256` | Full attested platform index digest |
-| `site_config_sha256` | Approved physical site profile digest |
-| `timers` | Sorted enabled features from `agent-renewal`, `checklist-spool`, `owner-intake` |
-| `checklist` | Exact D provision options `tls_profile`, `uid`, `subid_start`, `validation_mib`, `validation_inodes`, `live_mib`, `live_inodes`, `reserve_mib` and `reserve_inodes` |
+The controller reads the independently provisioned server TLS profile from
+its protected inlet under `/etc/dev-pair/checklist-server`. It reuses recorded
+checklist geometry. On a clean managed allocation it checks the proposed
+account, subordinate IDs and storage against the actual host and approved
+placements. The automatic initial path provisions the core managed listener.
+Additional owner intake, spool and scheduled renewal authority remains held
+and is reported in the response.
 
-Use the already admitted repository, role templates, provider custody and
-allowances for `owner-intake`. The existing intake materializes the job-scoped
-grants after the owner confirms an agreement. A checklist workload additionally
-requires the trusted client certificate profile and independently verified
-checklist builder base in the actual bounded builder store. The standard
-[workload prerequisites](product-job.md) describe those inputs. Choose only
-features covered by the live site policy. A site can commission the managed
-checklist executor with an empty timer list.
+A `pending` result identifies a missing independent input or custody grant.
+A `source-gap` result identifies a missing initial release or site producer.
+The current protected intake consumes an attested full publication, and the
+current site selector consumes a protected approved profile. These results
+leave the completed local maintenance probe available. The commissioning
+controller reads them again on the next resume. Independent authorities supply attestations, credentials, job slot approvals
+and access evidence.
 
-Run the read-only inspection before applying the exact same policy.
-
-```sh
-cd /root/dev-pair-bootstrap-source
-/usr/bin/python3 -IB tools/commission_host.py inspect \
-  --source-sha "$source_sha" --policy "$commission_policy" --policy-sha256 "$policy_sha"
-```
-
-Compare the reported boot, hostname, transport, listeners and free capacity with
-the independently opened destination. Apply after that inspection.
-
-```sh
-/usr/bin/python3 -IB tools/commission_host.py apply \
-  --source-sha "$source_sha" --policy "$commission_policy" --policy-sha256 "$policy_sha"
-```
+For diagnostics, the internal controller supports `discover` and `status` on
+the verified checkout. `prepare` verifies and retains the policy without
+activating workloads. `apply` also prepares the policy when needed and resumes
+the managed installation.
 
 The entry verifies the protected package and installs its fixed service
 closure. It prepares the root-owned host release store and reads back the
@@ -75,8 +62,8 @@ boot recovery pass. The controller measures the effective service command
 and timeout settings. It verifies the Fedora systemd timeout drop-in against
 the trusted installed package and the pinned Fedora key. The entry publishes
 the named operator's constrained sudo
-rule after these checks. On the verified tailnet route, the owner can then run
-the [normal terminal command](owner-intake.md).
+rule after these checks when approved owner intake is enabled. On the verified
+tailnet route, the owner can then use the [normal terminal command](owner-intake.md).
 
 ```sh
 dev-pair start owner/approved-repository
