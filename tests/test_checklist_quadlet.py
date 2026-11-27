@@ -23,6 +23,7 @@ import job_protocol as p
 import ledger_recovery as recovery
 
 RUNTIME = h.host_runtime()
+CHECK_WORKLOAD_ACCESS = p.require_workload_access
 APP = ROOT / 'examples/checklist/checklist.py'
 PYTHON = '/usr/bin/python3'
 
@@ -114,6 +115,7 @@ class DelayedFixtureService(FixtureService):
 
 class QuadletHandoffTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(p, 'require_workload_access'))
         workspace = tempfile.TemporaryDirectory()
         self.addCleanup(workspace.cleanup)
         self.path = pathlib.Path(workspace.name)
@@ -172,9 +174,7 @@ class QuadletHandoffTests(unittest.TestCase):
     def test_managed_access_gate_preserves_readback_and_blocks_real_effect_until_admitted(self):
         flag = self.path / p.WORKLOAD_ACCESS
         fence = self.path / 'renewal-fence'
-        fence.mkdir(exist_ok=True)
-        (fence / 'selected-host.json').touch()
-        original_check = p.require_workload_access
+        original_check = CHECK_WORKLOAD_ACCESS
         real_lstat, real_fstat = pathlib.Path.lstat, os.fstat
         ancestry = {self.path, *self.path.parents}
 
@@ -185,7 +185,8 @@ class QuadletHandoffTests(unittest.TestCase):
         def projected_fstat(fd):
             node = real_fstat(fd)
             if flag.exists() and node.st_ino == flag.stat().st_ino and node.st_dev == flag.stat().st_dev:
-                return SimpleNamespace(st_uid=0, st_mode=node.st_mode, st_nlink=node.st_nlink, st_size=node.st_size)
+                return SimpleNamespace(st_uid=0, st_mode=node.st_mode, st_nlink=node.st_nlink, st_size=node.st_size,
+                                       st_ino=node.st_ino, st_dev=node.st_dev)
             return node
 
         def write_gate(phase):
@@ -199,6 +200,15 @@ class QuadletHandoffTests(unittest.TestCase):
         self.allowed = p.identity(request)
         with (mock.patch.object(p, 'require_workload_access', side_effect=lambda: original_check(self.path)),
               mock.patch.object(pathlib.Path, 'lstat', projected_lstat), mock.patch.object(os, 'fstat', projected_fstat)):
+            with self.assertRaisesRegex(ValueError, 'managed workload access observation is unavailable'):
+                self.dispatch('submit', request)
+            write_gate('legacy')
+            original_check(self.path)
+            fence.mkdir(exist_ok=True)
+            (fence / 'selected-host.json').touch()
+            with self.assertRaisesRegex(ValueError, 'standalone access review has no verified managed workload selection'):
+                self.dispatch('submit', request)
+            flag.unlink()
             with self.assertRaisesRegex(ValueError, 'managed workload access observation is unavailable'):
                 self.dispatch('submit', request)
             write_gate('held')
@@ -218,6 +228,19 @@ class QuadletHandoffTests(unittest.TestCase):
             write_gate('admitted')
             self.assertEqual(self.dispatch('execute', request)['status'], 'pass')
             self.assertEqual(len(self.services), 1)
+            replacement = self.path / 'replacement-workload-access'
+            replacement.write_text(json.dumps({'schema': 1, 'phase': 'held', 'release_sha256': None, 'images': None}))
+            replacement.chmod(0o644)
+
+            def stale_reader(fd):
+                node = projected_fstat(fd)
+                if replacement.exists() and (node.st_dev, node.st_ino) == (flag.stat().st_dev, flag.stat().st_ino):
+                    os.replace(replacement, flag)
+                return node
+
+            with mock.patch.object(os, 'fstat', stale_reader):
+                with self.assertRaisesRegex(ValueError, 'workload access observation changed'):
+                    original_check(self.path)
 
     def test_restart_failure_repair_and_exact_replay(self):
         failing = self.request(0)

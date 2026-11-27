@@ -96,10 +96,11 @@ class BootstrapAccessTests(unittest.TestCase):
             app.atomic(b.STATE + '/desired.json', desired)
             temporary_guard = app.guard_rules(access)
             app.atomic(b.GUARD_PATH, temporary_guard)
+            read_selection = app.access_workload_selection
             with (patch.object(b, 'checked_file', side_effect=Path), patch.object(b, 'TRUST_SIGNERS', '/' + signers.name),
                   patch.object(b.os, 'geteuid', return_value=0),
                   patch.object(app, 'destination_source'),
-                  patch.object(app, 'destination_identity', return_value={key: data[key] for key in ('machine_id', 'boot_id')}),
+                  patch.object(app, 'destination_identity', return_value={key: data[key] for key in ('machine_id', 'boot_id')}) as identity,
                   patch.object(app, 'tailscale_state', return_value=({'TailscaleIPs': list(data['tailnet_addresses'].values())}, DNS)),
                   patch.object(app, 'identity_fields', return_value=(data['tailnet'], data['node_id'])),
                   patch.object(app, 'access_keys_digest', return_value=data['keys_sha256']),
@@ -114,6 +115,40 @@ class BootstrapAccessTests(unittest.TestCase):
                 self.assertEqual(app.text(b.GUARD_PATH), temporary_guard)
                 self.assertFalse(app.path(b.SSH_CUTOVER).exists())
                 fail_check = False
+                write = app.atomic
+
+                def interrupt_after_guard(path, content, *args, **kwargs):
+                    if path == b.CUTOVER and json.loads(content)['phase'] == 'complete':
+                        raise RuntimeError('simulated interruption after applying guard')
+                    return write(path, content, *args, **kwargs)
+
+                with patch.object(app, 'atomic', side_effect=interrupt_after_guard):
+                    with self.assertRaisesRegex(RuntimeError, 'after applying guard'):
+                        app.finalize(str(receipt))
+                pending = app.path(b.CUTOVER)
+                original = pending.read_bytes()
+                intent = json.loads(original)['intent']
+                self.assertEqual(intent['kind'], b.CORE_ACCESS_CUTOVER)
+                self.assertEqual(intent['claims']['boot_id'], data['boot_id'])
+                self.assertEqual(app.text(b.GUARD_PATH), app.guard_rules([], tailnet_only=True))
+                sign(False, legacy=True)
+                with self.assertRaisesRegex(b.Blocked, 'requires matching scoped evidence'):
+                    app.finalize(str(receipt))
+                self.assertEqual(pending.read_bytes(), original)
+                previous_boot = data['boot_id']
+                data['boot_id'] = '01234567-1234-5678-abcd-0123456789ac'
+                identity.return_value = {key: data[key] for key in ('machine_id', 'boot_id')}
+                sign(True)
+                with self.assertRaisesRegex(b.Blocked, 'requires matching scoped evidence'):
+                    app.finalize(str(receipt))
+                self.assertEqual(pending.read_bytes(), original)
+                self.assertEqual(app.finalize(str(receipt), recover=True)['access_scope'], 'core')
+                archived = json.loads(pending.read_bytes())['recovery_predecessor_sha256']
+                self.assertEqual(app.path(b.STATE + '/cutover-recovery/' + archived + '.json').read_bytes(), original)
+                app.atomic(b.CUTOVER, original.decode(), expected=pending.read_text())
+                data['boot_id'] = previous_boot
+                identity.return_value = {key: data[key] for key in ('machine_id', 'boot_id')}
+                sign(True, issued_at=data['issued_at'] + 1)
                 self.assertEqual(app.finalize(str(receipt))['access_scope'], 'core')
                 with self.assertRaisesRegex(b.Blocked, 'workload access'):
                     app.verify_workload_access()
@@ -129,6 +164,13 @@ class BootstrapAccessTests(unittest.TestCase):
                 self.assertEqual(app.verify_workload_access()['role_artifacts'], role_selection)
                 marker = app.path('/var/lib/dev-pair/' + jobs.WORKLOAD_ACCESS)
                 self.assertEqual(json.loads(marker.read_text())['release_sha256'], role_selection['release_sha256'])
+                app.atomic('/var/lib/dev-pair/renewal/current.json', json.dumps(role_selection['release_sha256']))
+                app.atomic('/var/lib/dev-pair/renewal/site-current.json', json.dumps('1' * 64))
+                current.side_effect = read_selection
+                with self.assertRaisesRegex(b.Blocked, 'not settled'):
+                    app.refresh_workload_gate()
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+                current.side_effect = None
                 updated = {**role_selection, 'release_sha256': '7' * 64, 'development_image': '8' * 64}
                 current.return_value = updated
                 with self.assertRaisesRegex(b.Blocked, 'required for the current role placement'):
@@ -148,7 +190,22 @@ class BootstrapAccessTests(unittest.TestCase):
                     rollback.return_value = True
                     app.restore_retained_workload_gate(updated['release_sha256'])
                     self.assertEqual(json.loads(marker.read_text())['phase'], 'admitted')
-                self.assertEqual(len([call for call in nft_commands if '--check' not in call]), 1)
+                self.assertEqual(len([call for call in nft_commands if '--check' not in call]), 3)
+
+                # The historical full first ceremony still works. Its known
+                # managed baseline is retained and cannot follow a later selector.
+                app.path(b.CUTOVER).unlink()
+                app.path(b.SSH_CUTOVER).unlink()
+                app.atomic(b.GUARD_PATH, temporary_guard, expected=app.text(b.GUARD_PATH))
+                current.return_value = role_selection
+                sign(False, legacy=True)
+                self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
+                self.assertEqual(json.loads(pending.read_bytes())['legacy_role_artifacts'], role_selection)
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'legacy')
+                app.hold_changed_workload_access(updated['release_sha256'])
+                current.return_value = updated
+                app.refresh_workload_gate()
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
 
     def test_stripped_ssh_binding_denies_existing_scoped_path(self):
         app = b.Bootstrap()

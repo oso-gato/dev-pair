@@ -27,6 +27,7 @@ from test_checklist_quadlet import FixtureService
 
 class ProductJobTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(p, 'require_workload_access'))
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)

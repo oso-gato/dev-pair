@@ -35,6 +35,13 @@ root terminal. The installer verifies the bundle against the live machine, boot,
 tailnet node and keys before closing the initial SSH route. Run `./day0.sh resume`
 to continue. [Independent access verification](destination-observation.md)
 
+If cutover stopped partway through, return a fresh bundle for the same pending
+scope, boot and route. After a reboot or when the earlier scope cannot be
+established, use a fresh administrator-only bundle verified from the independent
+provider terminal. Run `./day0.sh access-response --recover-cutover < ../signed-access.bundle`
+there. The installer keeps the previous journal, preserves the current ingress
+restrictions and holds workloads until their separate access review is complete.
+
 The first bootstrap builds and verifies the confined maintenance gptbox using
 public signed build inputs. Both offline probe cycles must pass before the host
 reports completion. Reapply checks the recorded result and immutable image. A
@@ -55,6 +62,10 @@ for its exact previous placement. An unattended replacement also needs a
 prospective observation route to test the candidate before changing the live
 selection. Optional owner and provider activation needs its own supported
 policy transition and approved grants.
+
+On a previously reviewed legacy host, resume verifies the stored full cutover
+and can retain its unchanged managed release. A changed or unavailable release
+requires a fresh workload review. The installer reports which review is pending.
 
 If you ran a reviewed offline-only bootstrap, retain its checkout, journals and
 local gptbox. Stage the separately reviewed continuation checkout in its own

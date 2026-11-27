@@ -3017,10 +3017,11 @@ class Bootstrap:
         state = self.verify_final_guard()
         if state.get('scope') is not None:
             raise Blocked('independent workload access checks have not been admitted')
+        roles = state.get('role_artifacts') or state.get('legacy_role_artifacts')
         recovering = recovery_release is not None and self.own_workload_rollback(recovery_release)
-        if 'role_artifacts' in state and self.access_workload_selection(allow_fenced=recovering) != state['role_artifacts']:
+        if roles and self.access_workload_selection(allow_fenced=recovering) != roles:
             raise Blocked('independent workload access checks are required for the current role placement')
-        reference = state.get('role_artifacts', {}).get('release_sha256')
+        reference = roles['release_sha256'] if roles else None
         require_workload_access(self.path('/var/lib/dev-pair'), release=reference)
         return state
 
@@ -3040,23 +3041,62 @@ class Bootstrap:
         with self.lock():
             state = self.verify_final_guard()
             self.verify_final_ssh()
-            roles = state.get('role_artifacts')
+            roles = state.get('role_artifacts') or state.get('legacy_role_artifacts')
             if state.get('scope') == 'core':
                 self.publish_workload_gate('held')
             elif roles is None:
-                self.publish_workload_gate('legacy')
+                self.publish_legacy_workload_gate(state)
             else:
                 with renewal.Renewal(self.path('/var/lib/dev-pair'), None).lock(shared=True):
-                    if self.access_workload_selection() == roles:
-                        self.publish_workload_gate('admitted', roles)
+                    try:
+                        live = self.access_workload_selection()
+                    except (Blocked, OSError, ValueError, KeyError, TypeError):
+                        self.publish_workload_gate('held')
+                        raise
+                    if live == roles:
+                        self.publish_workload_gate('admitted' if 'role_artifacts' in state else 'legacy', roles)
                     else:
                         self.publish_workload_gate('held')
 
     def hold_changed_workload_access(self, release):
-        data = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
-        roles = data.get('role_artifacts')
-        if data.get('scope') == 'core' or roles is not None and roles['release_sha256'] != release:
+        path = self.path(CUTOVER)
+        data = json.loads(checked_file(path).read_text(), object_pairs_hook=relay.unique) if os.path.lexists(path) else {}
+        roles = data.get('role_artifacts') or data.get('legacy_role_artifacts')
+        if data.get('scope') == 'core' or not roles or roles['release_sha256'] != release:
             self.publish_workload_gate('held')
+
+    def publish_legacy_workload_gate(self, state):
+        import renewal
+
+        control = self.path('/var/lib/dev-pair/renewal')
+        markers = (control / 'current.json', control / 'site-current.json',
+                   self.path('/var/lib/dev-pair/renewal-fence/selected-host.json'))
+        if not any(os.path.lexists(path) for path in markers):
+            if 'legacy_role_artifacts' in state:
+                self.publish_workload_gate('held')
+                raise Blocked('the retained managed baseline is unavailable; request a fresh workload review')
+            self.publish_workload_gate('legacy')
+            return
+        controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
+        with controller.lock(shared=True):
+            _, journal = controller.transition()
+            roles = state.get('legacy_role_artifacts')
+            if journal is not None and roles is None:
+                self.publish_workload_gate('held')
+                raise Blocked('the earlier access review has no retained managed baseline; request a fresh workload review')
+            try:
+                current = self.access_workload_selection()
+            except (Blocked, OSError, ValueError, KeyError, TypeError):
+                self.publish_workload_gate('held')
+                raise
+            if roles is not None and roles != current:
+                self.publish_workload_gate('held')
+                raise Blocked('the retained legacy baseline changed; request a fresh workload review')
+            if roles is None:
+                prior = checked_file(self.path(CUTOVER)).read_text()
+                updated = {**state, 'legacy_role_artifacts': current}
+                self.atomic(CUTOVER, json.dumps(updated, sort_keys=True) + '\n', expected=prior)
+            self.publish_workload_gate('legacy', current)
 
     def own_workload_rollback(self, release):
         import renewal
@@ -3069,11 +3109,11 @@ class Bootstrap:
 
     def restore_retained_workload_gate(self, reference):
         state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
-        roles = state.get('role_artifacts')
+        roles = state.get('role_artifacts') or state.get('legacy_role_artifacts')
         if (roles is not None and roles['release_sha256'] == reference and self.own_workload_rollback(reference)
                 and self.access_workload_selection(allow_fenced=True) == roles):
             self.verify_final_ssh()
-            self.publish_workload_gate('admitted', roles)
+            self.publish_workload_gate('admitted' if 'role_artifacts' in state else 'legacy', roles)
 
     def verify_final_ssh(self):
         self.run('/usr/sbin/sshd', '-t')
@@ -3233,7 +3273,51 @@ class Bootstrap:
         if not peer or peer['local'] not in live.get('TailscaleIPs', []) or peer['device'] != 'tailscale0' or not peer['core']:
             raise Blocked('operation requires the live named core tailnet SSH route')
 
-    def finalize(self, evidence):
+    def initial_cutover_journal(self, data, target, prior, prior_raw, temporary, permanent, transport,
+                                *, recover, previous_source, receipt_sha):
+        claims = {field: data[field] for field in ('boot_id', 'execution_route', 'keys_sha256', 'acl_sha256',
+                                                   'provider_recovery', 'public_addresses')}
+        if 'tailnet_addresses' in data:
+            claims['tailnet_addresses'] = data['tailnet_addresses']
+        intent = {'schema': 1, 'kind': data.get('kind', 'legacy-full'), 'bootstrap_transport': transport,
+                  'temporary_guard_sha256': hashlib.sha256(temporary.encode()).hexdigest(),
+                  'final_guard_sha256': hashlib.sha256(permanent.encode()).hexdigest(), 'claims': claims}
+        pending = {'phase': 'applying', 'target': target, 'intent': intent, 'first_receipt_sha256': receipt_sha}
+        if not prior:
+            if recover:
+                raise Blocked('there is no interrupted access cutover to recover')
+        elif prior.get('intent') == intent and prior['target'] == target and not recover:
+            if not re.fullmatch(r'[0-9a-f]{64}', prior.get('first_receipt_sha256', '')):
+                raise Blocked('saved access cutover receipt identity is invalid')
+            return prior_raw
+        else:
+            prior_intent = prior.get('intent')
+            earlier = {**target, 'source_sha': previous_source} if previous_source else target
+            same_target = prior['target'] in (target, earlier)
+            if prior_intent is None:
+                compatible = data.get('kind') == CORE_ACCESS_CUTOVER and set(prior) == {'phase', 'target'}
+            elif type(prior_intent) is dict and type(prior_intent.get('claims')) is dict:
+                stable_claims = {key: value for key, value in claims.items() if key not in ('boot_id', 'execution_route')}
+                recorded = prior_intent['claims']
+                old = {**intent, 'claims': {**stable_claims, 'boot_id': recorded.get('boot_id'),
+                                             'execution_route': recorded.get('execution_route')}}
+                if prior_intent.get('kind') == 'legacy-full' and intent['kind'] == CORE_ACCESS_CUTOVER:
+                    old['kind'] = 'legacy-full'
+                    old['claims'].pop('tailnet_addresses', None)
+                compatible = prior_intent == old
+            else:
+                compatible = False
+            if not (recover and same_target and compatible and data['execution_route'] == 'provider-recovery'):
+                raise Blocked('interrupted access cutover requires matching scoped evidence for its original boot and '
+                              'route, or explicit recovery through a separately verified provider terminal')
+            if os.path.lexists(self.path(SSH_CUTOVER)) and checked_file(self.path(SSH_CUTOVER)).read_text() != SSH_CUTOVER_CONFIG:
+                raise Blocked('interrupted cutover has an unverified SSH configuration')
+            predecessor = hashlib.sha256(prior_raw.encode()).hexdigest()
+            self.atomic(STATE + '/cutover-recovery/' + predecessor + '.json', prior_raw)
+            pending['recovery_predecessor_sha256'] = predecessor
+        return json.dumps(pending, sort_keys=True) + '\n'
+
+    def finalize(self, evidence, *, recover=False, previous_source=None):
         if os.geteuid() != 0:
             raise Blocked('root required for destination cutover')
         with contextlib.ExitStack() as operations:
@@ -3260,12 +3344,18 @@ class Bootstrap:
             temporary = self.guard_rules(sources, retain_ssh=transport == ATTENDED_ACCESS)
             permanent = self.guard_rules([], tailnet_only=True)
             current = checked_file(self.path(GUARD_PATH)).read_text()
-            prior_raw = self.text(CUTOVER)
+            cutover_path = self.path(CUTOVER)
+            prior_raw = checked_file(cutover_path).read_text() if os.path.lexists(cutover_path) else ''
             prior = json.loads(prior_raw or '{}', object_pairs_hook=relay.unique)
+            if type(prior) is not dict:
+                raise Blocked('protected access cutover history is invalid')
             target = {key: data[key] for key in ('source_sha', 'machine_id', 'tailnet', 'node_id', 'dns_name')}
-            if prior and (prior.get('target') != target or prior.get('phase') not in ('applying', 'complete')):
+            earlier = {**target, 'source_sha': previous_source} if recover and previous_source else target
+            if prior and (prior.get('target') not in (target, earlier) or prior.get('phase') not in ('applying', 'complete')):
                 raise Blocked('cutover target conflict')
             if prior.get('phase') == 'complete':
+                if recover:
+                    raise Blocked('access cutover is already complete')
                 self.verify_final_guard()
                 self.verify_final_ssh()
                 scoped_workload = data.get('kind') == WORKLOAD_ACCESS_CUTOVER
@@ -3284,7 +3374,7 @@ class Bootstrap:
                 elif prior.get('scope') == 'core':
                     self.publish_workload_gate('held')
                 elif 'role_artifacts' not in prior:
-                    self.publish_workload_gate('legacy')
+                    self.publish_legacy_workload_gate(prior)
                 return self.status()
             if current not in (temporary, permanent) or (not prior and current != temporary):
                 raise Blocked('bootstrap ingress configuration differs from protected intent')
@@ -3296,10 +3386,11 @@ class Bootstrap:
             self.run('/usr/bin/systemctl', 'is-active', 'dev-pair-bootstrap-guard.service')
             if data['expires_at'] <= time.time():
                 raise Blocked('fresh independent access observations required before cutover')
-            if core_only:
-                self.publish_workload_gate('held')
-            pending = json.dumps({'phase': 'applying', 'target': target}, sort_keys=True) + '\n'
-            self.atomic(CUTOVER, pending)
+            receipt_sha = hashlib.sha256(checked_file(evidence).read_bytes()).hexdigest()
+            pending = self.initial_cutover_journal(data, target, prior, prior_raw, temporary, permanent, transport,
+                                                  recover=recover, previous_source=previous_source, receipt_sha=receipt_sha)
+            self.atomic(CUTOVER, pending, expected=prior_raw)
+            self.publish_workload_gate('held')
             # On retry only roll forward. The root-owned marker and external recovery permit
             # finishing after a crash without re-enabling temporary public SSH.
             ssh_file = self.path(SSH_CUTOVER)
@@ -3322,12 +3413,16 @@ class Bootstrap:
                       'core_keys_sha256': data['keys_sha256'], 'acl_sha256': data['acl_sha256'],
                       'provider_recovery': data['provider_recovery'],
                       'public_addresses': data['public_addresses'],
-                      'access_receipt_sha256': hashlib.sha256(checked_file(evidence).read_bytes()).hexdigest()}
+                      'access_receipt_sha256': receipt_sha}
+            finished_intent = json.loads(pending, object_pairs_hook=relay.unique)
+            for field in ('first_receipt_sha256', 'recovery_predecessor_sha256'):
+                if field in finished_intent:
+                    record[field] = finished_intent[field]
             if core_only:
                 record['scope'] = 'core'
             self.atomic(CUTOVER, json.dumps(record, sort_keys=True) + '\n', expected=pending)
             if not core_only:
-                self.publish_workload_gate('legacy')
+                self.publish_legacy_workload_gate(record)
             self.event('access-cutover', 'complete')
             return self.status()
 

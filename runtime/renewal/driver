@@ -207,6 +207,10 @@ def release_action(action, payload):
         run([str(INSTALL / 'renewal' / 'host-release'), 'validate', reference], timeout=35)
     if action == 'activate':
         r.require(not any((CONTROL / 'owned-turns').iterdir()), 'role cleanup evidence required before activation')
+        from bootstrap import Bootstrap
+
+        bootstrap = Bootstrap()
+        bootstrap.hold_changed_workload_access(reference)
         try:
             observe_host(reference, release['components']['host'])
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -220,9 +224,6 @@ def release_action(action, payload):
                                                             'component': release['components']['host']})
             unit('start', 'dev-pair-managed-host-release.service', timeout=105)
         observe_host(reference, release['components']['host'])
-        from bootstrap import Bootstrap
-        bootstrap = Bootstrap()
-        bootstrap.hold_changed_workload_access(reference)
         r.replace_json(selector, reference)
         bootstrap.restore_retained_workload_gate(reference)
     if action == 'quiesce':

@@ -49,10 +49,6 @@ def require_workload_access(root=pathlib.Path('/var/lib/dev-pair'), *, release=N
     try:
         fd = os.open(flag, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
-        try:
-            (root / 'renewal-fence' / 'selected-host.json').lstat()
-        except FileNotFoundError:
-            return  # No newly managed host selection in the legacy/local path.
         raise ValueError('managed workload access observation is unavailable') from None
     with os.fdopen(fd, 'rb') as stream:
         for parent in (root, *root.parents):
@@ -63,12 +59,14 @@ def require_workload_access(root=pathlib.Path('/var/lib/dev-pair'), *, release=N
         require(stat.S_ISREG(node.st_mode) and (node.st_uid, node.st_nlink, stat.S_IMODE(node.st_mode)) == (0, 1, 0o644)
                 and 0 < node.st_size <= 512, 'unprotected workload access observation')
         raw = stream.read(513)
+        current = flag.lstat()
+        require((current.st_dev, current.st_ino) == (node.st_dev, node.st_ino), 'workload access observation changed')
     require(len(raw) <= 512, 'workload access observation changed')
     gate = loads(raw)
     fields(gate, 'schema phase release_sha256 images')
     require(type(gate['schema']) is int and gate['schema'] == 1 and gate['phase'] in ('legacy', 'held', 'admitted'),
             'invalid workload access observation')
-    if gate['phase'] == 'admitted':
+    if gate['phase'] in ('admitted', 'legacy') and gate['release_sha256'] is not None:
         digest(gate['release_sha256'])
         fields(gate['images'], 'maintenance development devbox')
         for value in gate['images'].values():
@@ -79,6 +77,13 @@ def require_workload_access(root=pathlib.Path('/var/lib/dev-pair'), *, release=N
     else:
         require(gate['phase'] == 'legacy' and gate['release_sha256'] is None and gate['images'] is None,
                 'independent workload access review is pending')
+        require(release is None, 'standalone access review has no verified managed workload selection')
+        try:
+            (root / 'renewal-fence' / 'selected-host.json').lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError('standalone access review has no verified managed workload selection')
 
 
 def canonical(value):

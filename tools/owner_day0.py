@@ -582,7 +582,7 @@ class DayZero:
         self.progress = STATE / 'continuation-progress.json'
         return historical, image
 
-    def access_exchange(self, source, response=None, *, workload=False, role=None):
+    def access_exchange(self, source, response=None, *, workload=False, role=None, recover=False):
         from destination_observation import encoding, read_access_envelope
 
         revision, archive = kit_source(self.repo, source)
@@ -614,7 +614,8 @@ class DayZero:
                 document = Path(temporary) / 'receipt.json'
                 document.write_bytes(payload)
                 document.with_name('receipt.json.sig').write_bytes(signature)
-                completed = self.app.finalize(str(document))
+                completed = self.app.finalize(str(document), recover=recover,
+                                              previous_source=historical if historical != revision else None)
             message = ('Named core access is tailnet-only. Independent workload access remains held.'
                        if completed['access_scope'] == 'core' else 'The independent access review is accepted.')
             self.stage(identity, revision, 'access-cutover-complete', message + ' Run ./day0.sh resume to continue.')
@@ -702,6 +703,7 @@ def main():
     parser.add_argument('--source-sha')
     parser.add_argument('--confirm-recovery', action='store_true')
     parser.add_argument('--workloads', action='store_true')
+    parser.add_argument('--recover-cutover', action='store_true')
     args = parser.parse_args()
 
     def interrupted(_signal, _frame):
@@ -711,7 +713,9 @@ def main():
     try:
         require(os.getuid() == os.geteuid() == 0, 'Open the selected VPS root terminal in hPanel.')
         require((args.role is not None) == (args.stage == 'access-probe') and
-                (not args.workloads or args.stage == 'access-request'), 'Select the exact access request or fixed role probe.')
+                (not args.workloads or args.stage == 'access-request') and
+                (not args.recover_cutover or args.stage == 'access-response'),
+                'Select the exact access request, response or fixed role probe.')
         os.umask(0o077)
         day0 = DayZero()
         if args.confirm_recovery:
@@ -722,7 +726,7 @@ def main():
             day0.status(args.source_sha)
         elif args.stage in ('access-request', 'access-response', 'access-probe'):
             day0.access_exchange(args.source_sha, sys.stdin.buffer if args.stage == 'access-response' else None,
-                                 workload=args.workloads, role=args.role)
+                                 workload=args.workloads, role=args.role, recover=args.recover_cutover)
         else:
             with tty_open() as tty:
                 day0.start(args.source_sha, tty)

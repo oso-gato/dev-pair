@@ -24,6 +24,38 @@ import bootstrap as b
 
 
 class NativeRecoveryTests(unittest.TestCase):
+    def test_activation_holds_prior_public_grant_before_host_selector_or_service(self):
+        activate = runpy.run_path(str(SCRIPT))['release_action']
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            control = root / 'renewal'
+            (control / 'owned-turns').mkdir(parents=True, mode=0o700)
+            host = b.Bootstrap(root)
+            roles = {'release_sha256': '1' * 64, 'maintenance_image': '2' * 64,
+                     'development_image': '3' * 64, 'devbox_image': '4' * 64}
+            host.atomic(b.CUTOVER, json.dumps({'phase': 'complete', 'role_artifacts': roles}))
+            host.publish_workload_gate('admitted', roles)
+            marker = host.path('/var/lib/dev-pair/' + r.protocol.WORKLOAD_ACCESS)
+            release = {'components': {'host': {'artifact_sha256': '5' * 64}}}
+            target = '6' * 64
+            payload = {'operation': 'approved-change', 'scope': 'host', 'release_sha256': target, 'release': release}
+
+            def interrupted(_action, _name, **_):
+                self.assertEqual(r.read_json(control / 'host-desired.json')['release_sha256'], target)
+                self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+                raise RuntimeError('interrupted during native host activation')
+
+            with (patch.dict(activate.__globals__, {'CONTROL': control, 'ROOT': root,
+                                                        'admit_release': lambda _: (release, {}), 'unit': interrupted,
+                                                        'observe_host': Mock(side_effect=ValueError('new host'))}),
+                  patch.object(b, 'Bootstrap', return_value=host),
+                  patch.object(b, 'checked_file', side_effect=Path),
+                  patch.object(r, 'Renewal', return_value=SimpleNamespace(transition=lambda: (None, None)))):
+                with self.assertRaisesRegex(RuntimeError, 'interrupted during native host activation'):
+                    activate('activate', payload)
+            self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
+            self.assertFalse((control / 'site-current.json').exists())
+
     def test_private_role_probe_checks_real_named_route_then_dispatches_exact_offline_adapters(self):
         probe = runpy.run_path(str(SCRIPT))['access_probe']
         source = 'a' * 40

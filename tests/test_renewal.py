@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 sys.path.insert(0, str(TOOLS))
@@ -22,6 +23,7 @@ FILE = Path(__file__).with_name('renewal_driver_fixture.py')
 
 class RenewalTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(p, 'require_workload_access'))
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
@@ -376,6 +378,7 @@ class RenewalTests(unittest.TestCase):
         self.request(target, scope='host')
         (self.root / 'interrupt-release').write_text(target)
         program = ('import pathlib, sys;sys.path.insert(0,sys.argv[1]);import renewal as r;'
+                   'r.protocol.require_workload_access=lambda *args, **kwargs:None;'
                    'root=pathlib.Path(sys.argv[2]);r.Renewal(root,r.SiteDriver(root/"driver",8)).apply("host")')
         child = subprocess.Popen([sys.executable, '-c', program, str(TOOLS), str(self.root)], stdout=subprocess.DEVNULL)
         try:
@@ -410,6 +413,7 @@ class RenewalTests(unittest.TestCase):
         program = '''import pathlib, sys, time
 sys.path.insert(0, sys.argv[1])
 import renewal as r
+r.protocol.require_workload_access = lambda *args, **kwargs: None
 root = pathlib.Path(sys.argv[2])
 checkpoint = sys.argv[3]
 def interrupt():

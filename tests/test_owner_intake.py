@@ -33,6 +33,7 @@ def public_client():
 
 class OwnerIntakeTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(p, 'require_workload_access'))
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
