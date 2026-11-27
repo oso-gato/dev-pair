@@ -431,25 +431,11 @@ ingress guard as a generic fix. Do not delete account homes, state directories,
 subordinate mappings or package data to force a rerun. Taking Tailscale down does
 not remove the initial SSH route or guard. An operator can recover via the
 provider console even with the pair/tailnet absent; this must be exercised live.
-There is no automatic destructive uninstall or automatic SSH cutover in this slice.
-
-`finalize` always exits2 with an explicit blocker. It accepts no fake evidence
-flags/files. Before a subsequent cutover implementation can disable direct root
-and public SSH, the authorized executor must return candidate-bound evidence:
-
-1. Actual new named-admin SSH login from a separate authorized tailnet client,
-   using only the admitted key; working sudo and password/root rejection tests.
-2. Actual provider-console recovery login and named-admin recovery while the
-   tailnet and pair are unavailable, under scoped authority with no app ingress.
-3. Full effective SSH configuration for applicable Match cases, authorized and
-   unauthorized/public connection tests, route/listener/firewall inventory and
-   tailnet-loss denial. Include IPv4 and IPv6.
-4. A staged, timed automatic rollback tested through failed validation, interrupted
-   cutover and reboot, preserving the independent recovery route; only then commit
-   final root/public-SSH retirement.
-
-These are executor tasks owned by the development workflow, not owner code-review
-or worker-coordination tasks. No live evidence or production readiness is claimed.
+The [destination procedure](destination-release.md) covers hPanel transport,
+independent access evidence, the `finalize --apply --evidence` entry and recovery.
+Finalization requires both the separately tested named tailnet path and the
+independent provider path. An interruption preserves the exact cutover intent
+for recovery. Real target authentication, denial and reboot evidence remain open.
 
 ## Local verification and official references
 
