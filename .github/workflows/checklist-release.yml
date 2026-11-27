@@ -1,0 +1,102 @@
+name: Checklist release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checklist-release-main
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'oso-gato/dev-pair' && github.ref_protected && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      archive-sha256: ${{ steps.image.outputs.archive-sha256 }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Verify source and build the checklist
+        id: image
+        env:
+          CHECKLIST_BASE: ${{ vars.CHECKLIST_BASE }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          [[ "$CHECKLIST_BASE" =~ ^[a-z0-9.-]+/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]
+          python3 -B -m unittest discover -s examples/checklist -p test_checklist.py -v
+          podman pull --platform linux/amd64 "$CHECKLIST_BASE"
+          podman build --platform linux/amd64 --network=none --pull=never --format=oci \
+            --build-arg "CHECKLIST_BASE=$CHECKLIST_BASE" --build-arg "CHECKLIST_SOURCE=$GITHUB_SHA" \
+            --label dev-pair.data-compatibility=checklist-sqlite-v1 \
+            --label "dev-pair.checklist.base=$CHECKLIST_BASE" --tag "localhost/checklist:$GITHUB_SHA" \
+            --file examples/checklist/Containerfile examples/checklist
+          mkdir release
+          podman save --format oci-archive -o release/checklist.oci "localhost/checklist:$GITHUB_SHA"
+          test "$(stat -c %s release/checklist.oci)" -le 1073741824
+          read -r digest _ < <(sha256sum release/checklist.oci)
+          printf 'archive-sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: checklist-oci-${{ github.sha }}
+          path: release/checklist.oci
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    if: github.repository == 'oso-gato/dev-pair' && github.ref_protected && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: checklist-release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      IMAGE: ghcr.io/oso-gato/dev-pair/checklist
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: checklist-oci-${{ github.sha }}
+          path: release
+      - name: Publish one exact registry manifest
+        id: publish
+        env:
+          EXPECTED: ${{ needs.build.outputs.archive-sha256 }}
+          GHCR_TOKEN: ${{ secrets.CHECKLIST_GHCR_TOKEN }}
+          GHCR_WRITER: ${{ vars.CHECKLIST_GHCR_WRITER }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$GHCR_WRITER" =~ ^[A-Za-z0-9-]{1,39}$ && -n "$GHCR_TOKEN" ]]
+          printf '%s  release/checklist.oci\n' "$EXPECTED" | sha256sum --check --strict
+          podman load -i release/checklist.oci
+          local_image="localhost/checklist:$GITHUB_SHA"
+          test "$(podman image inspect --format '{{index .Labels "org.opencontainers.image.revision"}}' "$local_image")" = "$GITHUB_SHA"
+          work="$(mktemp -d "$RUNNER_TEMP/checklist.XXXXXXXX")"
+          trap 'rm -rf -- "$work"' EXIT
+          umask 077
+          printf '%s\n' "$GHCR_TOKEN" | podman login --authfile "$work/auth.json" --username "$GHCR_WRITER" --password-stdin ghcr.io
+          podman push --authfile "$work/auth.json" --format oci --digestfile "$work/digest" "$local_image" "docker://$IMAGE:$GITHUB_SHA"
+          digest="$(cat "$work/digest")"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+      - name: Record deployment coordinates
+        env:
+          DIGEST: ${{ steps.publish.outputs.digest }}
+        run: printf 'Source `%s`\n\nImage `%s@%s`\n\nPublisher run `%s`\n' "$GITHUB_SHA" "$IMAGE" "$DIGEST" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
