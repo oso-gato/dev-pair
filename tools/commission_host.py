@@ -209,12 +209,15 @@ class Commission:
             protected(path.parent, self.owner, directory=True)
             path.mkdir(mode=mode)
             path.chmod(mode)
+            self.sync(path.parent)
         return protected(path, self.owner, directory=True, mode=mode)
 
     def file(self, target, raw, mode, *, save=True):
         path = self.path(target)
         if os.path.lexists(path):
             require(self.read(target, mode, FILE_LIMIT) == raw, 'existing commissioning file conflicts: ' + target)
+            if save:
+                self.sync(path.parent)
             return
         if not save:
             # The nearest existing ancestor must be protected before any install.
@@ -224,6 +227,36 @@ class Commission:
         if not path.parent.exists():
             self.directory('/' + str(path.parent.relative_to(self.root)))
         protected(path.parent, self.owner, directory=True)
+        if target == '/etc/sudoers.d/60-dev-pair-owner':
+            self.publish_sudoers(path, raw, mode)
+        else:
+            self.publish_file(path, raw, mode)
+        require(self.read(target, mode, FILE_LIMIT) == raw, 'installed commissioning bytes changed')
+
+    @staticmethod
+    def publish_file(path, raw, mode):
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            descriptor = os.open('.', os.O_WRONLY | os.O_TMPFILE | os.O_CLOEXEC, mode, dir_fd=parent)
+            with os.fdopen(descriptor, 'wb') as stream:
+                os.fchmod(stream.fileno(), mode)
+                stream.write(raw)
+                stream.flush()
+                os.fsync(stream.fileno())
+                descriptors = os.open('/proc/self/fd', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                try:
+                    # Anonymous staging leaves at most one name even if the
+                    # operator dies before cleanup. The final link cannot replace a peer.
+                    os.link(str(stream.fileno()), path.name, src_dir_fd=descriptors, dst_dir_fd=parent, follow_symlinks=True)
+                except FileExistsError:
+                    pass  # The caller verifies the exact protected bytes after publication.
+                finally:
+                    os.close(descriptors)
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+
+    def publish_sudoers(self, path, raw, mode):
         file_descriptor, name = tempfile.mkstemp(dir=path.parent, prefix='.dev-pair-commission-')
         try:
             with os.fdopen(file_descriptor, 'wb') as stream:
@@ -231,13 +264,11 @@ class Commission:
                 stream.write(raw)
                 stream.flush()
                 os.fsync(stream.fileno())
-            if target == '/etc/sudoers.d/60-dev-pair-owner':
-                self.run('/usr/sbin/visudo', '-cf', name, timeout=12)
+            self.run('/usr/sbin/visudo', '-cf', name, timeout=12)
             os.link(name, path)
         finally:
             os.unlink(name)
         self.sync(path.parent)
-        require(self.read(target, mode, FILE_LIMIT) == raw, 'installed commissioning bytes changed')
 
     @staticmethod
     def sync(path):
@@ -345,6 +376,7 @@ class Commission:
                   'site_config_sha256': policy['site_config_sha256'], 'held_features': list(CORE_HELD_FEATURES)}
         if action in ('status', 'discover'):
             if prepared:
+                self.require_first_site(observed['machine_id'], policy['site_config_sha256'])
                 self.services.authority(policy)
             listener = '/var/lib/dev-pair/checklist-release/managed-listener.json'
             if action == 'status' and prepared and os.path.lexists(self.path(listener)):
@@ -354,6 +386,7 @@ class Commission:
             return report
         policy_sha = digest(raw)
         with self.lock():
+            self.require_first_site(observed['machine_id'], policy['site_config_sha256'])
             applying = os.path.lexists(self.path(PRIVATE + '/intent.json'))
             if applying:
                 prior = parse(self.read(PRIVATE + '/intent.json'))
@@ -382,29 +415,25 @@ class Commission:
                 'held_features': list(CORE_HELD_FEATURES)}
 
     def automatic_site(self, observed, revision, *, persist):
-        try:
-            return self.services.initial_site(observed['host'])
-        except Pending as waiting:
-            if waiting.report['prerequisite'] != 'initial-site-config':
-                raise
-            if not persist:
-                raise Pending('initial-site-config', 'The first site profile will be derived when the verified Day 0 installation resumes.') from None
+        if not persist:
+            candidate = self.initial_site_candidate(observed)
+            if candidate is not None:
+                return candidate
+            raise Pending('initial-site-config', 'The first site profile will be derived when the verified Day 0 installation resumes.')
         with self.lock():
-            # Another exact first-site preparation may have completed while
-            # this caller was establishing the commissioning lock.
-            try:
-                return self.services.initial_site(observed['host'])
-            except Pending as waiting:
-                if waiting.report['prerequisite'] != 'initial-site-config':
-                    raise
+            candidate = self.initial_site_candidate(observed, restore=True)
+            record = self.first_site_intent(observed['machine_id'])
+            if candidate is not None:
+                if record is not None:
+                    # A prior process may have linked the site before syncing its directory.
+                    self.services.publish_first_site(self, record)
+                return candidate
             require(not os.path.lexists(self.path(PRIVATE + '/intent.json')),
                     'existing commissioning uses a different protected site authority')
             origin = self.services.first_site_authority(observed, revision)
             identity = {'schema': 1, 'machine_id': observed['machine_id'], 'source_sha': revision,
                         'bootstrap_source_sha': origin}
-            if os.path.lexists(self.path(INITIAL_SITE)):
-                record = parse(self.read(INITIAL_SITE))
-                exact_fields(record, (*identity, 'site', 'host'), 'invalid protected first-site intent')
+            if record is not None:
                 require(all(record[key] == value for key, value in identity.items()),
                         'protected first-site intent belongs to another installation')
             else:
@@ -416,6 +445,35 @@ class Commission:
             validated_sha, site = self.services.initial_site(observed['host'])
             require(validated_sha == site_sha, 'published first site differs from its approved identity')
             return validated_sha, site
+
+    def initial_site_candidate(self, observed, *, restore=False):
+        try:
+            selected = self.services.initial_site(observed['host'])
+        except Pending as waiting:
+            if waiting.report['prerequisite'] != 'initial-site-config':
+                raise
+            return None
+        self.require_first_site(observed['machine_id'], selected[0], restore=restore)
+        return selected
+
+    def first_site_intent(self, machine):
+        if not os.path.lexists(self.path(INITIAL_SITE)):
+            return None
+        record = parse(self.read(INITIAL_SITE))
+        exact_fields(record, ('schema', 'machine_id', 'source_sha', 'bootstrap_source_sha', 'site', 'host'),
+                     'invalid protected first-site intent')
+        require(type(record['schema']) is int and record['schema'] == 1 and record['machine_id'] == machine and
+                type(record['site']) is dict and type(record['host']) is dict,
+                'protected first-site intent belongs to another installation')
+        hex_id(record['source_sha'], 40)
+        hex_id(record['bootstrap_source_sha'], 40)
+        return record
+
+    def require_first_site(self, machine, selected, *, restore=False):
+        record = self.first_site_intent(machine)
+        if record is not None:
+            require(selected == digest(encoded(record['site'])), 'selected site differs from the protected first-site intent')
+            self.services.verify_first_site_host(record, restore=restore)
 
     def selectors(self, policy, boot, site, intent):
         controller = self.services.renewal()
@@ -511,6 +569,7 @@ class Commission:
 
     def apply(self, policy, policy_sha, boot, site, files):
         # Check targets, credentials and protected site policy before installing anything.
+        self.require_first_site(policy['machine_id'], policy['site_config_sha256'])
         for target, (contents, mode, _) in files.items():
             self.file(target, contents, mode, save=False)
         self.services.configuration(policy, site)
@@ -523,6 +582,7 @@ class Commission:
                   'platform_sha256': policy['platform_sha256'], 'site_config_sha256': policy['site_config_sha256'],
                   'machine_id': policy['machine_id']}
         with self.lock():
+            self.require_first_site(policy['machine_id'], policy['site_config_sha256'])
             existing = [os.path.lexists(self.path(CONTROL + '/' + name + '.json')) for name in ('current', 'site-current')]
             initial = hex_id(parse(self.read(initial_file))) if os.path.lexists(self.path(initial_file)) else None
             if any(existing) and not all(existing):
@@ -736,7 +796,7 @@ class Live:
         self.check_initial_capacity(observed, site)
         return host, site
 
-    def publish_first_site(self, app, record):
+    def first_site_profiles(self, record):
         host, site = record['host'], record['site']
         host_bytes, site_bytes = encoded(host), encoded(site)
         site_sha, host_sha = digest(site_bytes), digest(host_bytes)
@@ -744,7 +804,20 @@ class Live:
         require(host == self.default_host_profile(site['hostname']) and site['host_config_sha256'] == host_sha and
                 set(site['jobs']) == {DEFAULT_SITE_SLOT} and site['jobs'][DEFAULT_SITE_SLOT]['storage_bytes'] == DEFAULT_SITE_BYTES,
                 'protected first-site host profile differs from the reviewed default')
-        app.file(str(self.installer.HOST_CONFIGS / (host_sha + '.json')), host_bytes, 0o600)
+        return self.installer.HOST_CONFIGS / (host_sha + '.json'), host_bytes, site_sha, site_bytes
+
+    def verify_first_site_host(self, record, *, restore):
+        host_path, host_bytes, _, _ = self.first_site_profiles(record)
+        if not os.path.lexists(host_path):
+            if restore:
+                return
+            raise Pending('initial-host-config', 'The recorded first host profile will be restored when commissioning resumes.')
+        require(capture(host_path, 0, mode=0o600, maximum=65536) == host_bytes,
+                'host profile differs from the protected first-site intent')
+
+    def publish_first_site(self, app, record):
+        host_path, host_bytes, site_sha, site_bytes = self.first_site_profiles(record)
+        app.file(str(host_path), host_bytes, 0o600)
         app.file(str(self.installer.SITE_CONFIGS / (site_sha + '.json')), site_bytes, 0o600)
         return site_sha
 

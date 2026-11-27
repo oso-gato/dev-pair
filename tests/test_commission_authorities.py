@@ -165,6 +165,47 @@ class Authorities(unittest.TestCase):
             with self.assertRaisesRegex(c.Blocked, 'ancestry or inode'):
                 self.live.initial_checklist({'machine_id': MACHINE}, {}, 'a' * 40)
 
+    def test_atomic_publication_recovers_process_death_and_preserves_concurrent_owner(self):
+        app = c.Commission(self.root, Path('/'), None, 0, self.live)
+        real_link = os.link
+        raw = b'protected fixture\n'
+        for after in (False, True):
+            target = self.site / ('after.json' if after else 'before.json')
+            child = os.fork()
+            if child == 0:
+                def interrupted_link(*args, **kwargs):
+                    if after:
+                        real_link(*args, **kwargs)
+                    os._exit(71)
+
+                with patch.object(c.os, 'link', side_effect=interrupted_link):
+                    app.file(str(target), raw, 0o600)
+                os._exit(72)
+            self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(child, 0)[1]), 71)
+            self.assertEqual(list(self.site.iterdir()), [target] if after else [])
+            if after:
+                self.assertEqual(target.stat().st_nlink, 1)
+                with patch.object(app, 'sync', wraps=app.sync) as sync:
+                    app.file(str(target), raw, 0o600)
+                sync.assert_called_once_with(self.site)
+            else:
+                app.file(str(target), raw, 0o600)
+            self.assertEqual((target.read_bytes(), target.stat().st_nlink), (raw, 1))
+            target.unlink()
+
+        target = self.site / 'contested.json'
+        different = b'other exact owner\n'
+
+        def concurrent(*args, **kwargs):
+            self.write(target, different)
+            real_link(*args, **kwargs)
+
+        with patch.object(c.os, 'link', side_effect=concurrent):
+            with self.assertRaisesRegex(c.Blocked, 'installed commissioning bytes changed'):
+                app.file(str(target), raw, 0o600)
+        self.assertEqual((target.read_bytes(), target.stat().st_nlink), (different, 1))
+        self.assertEqual(list(self.site.iterdir()), [target])
+
     def test_first_checklist_geometry_depends_on_managed_capacity_and_id_checks(self):
         import destination_release as destination
         import host_handoff
@@ -246,11 +287,37 @@ class Authorities(unittest.TestCase):
             expected = ('guard', 'ssh', context, (context, origin, image), 'native-capacity')
             self.assertEqual(tuple(checked), expected)
             (self.site / (site_sha + '.json')).unlink()
+            substituted = {**site, 'jobs': {'job-2': site['jobs'][c.DEFAULT_SITE_SLOT]}}
+            substitution = c.encoded(substituted)
+            competing = self.site / (c.digest(substitution) + '.json')
+            self.write(competing, substitution)
+            self.assertEqual(self.live.initial_site('erebus')[1], substituted)
+            for action in ('discover', 'prepare', 'apply'):
+                with self.subTest(action=action):
+                    with self.assertRaisesRegex(c.Blocked, 'selected site differs from the protected first-site intent'):
+                        app.automatic(action, source)
+            with self.assertRaisesRegex(c.Blocked, 'selected site differs from the protected first-site intent'):
+                app.apply({'machine_id': MACHINE, 'site_config_sha256': competing.stem}, None, BOOT, substituted, {})
+            self.assertEqual(competing.read_bytes(), substitution)
+            competing.unlink()
             with self.assertRaisesRegex(c.Pending, 'release-trust'):
                 app.automatic('apply', source)
             self.assertEqual(self.live.initial_site('erebus'), (site_sha, site))
             self.assertEqual(intent.read_bytes(), before)
             self.assertEqual(checked.count('native-capacity'), 1)
+            host_path = self.hosts / (site['host_config_sha256'] + '.json')
+            host_bytes = host_path.read_bytes()
+            host_path.unlink()
+            with self.assertRaisesRegex(c.Pending, 'initial-host-config'):
+                app.automatic('discover', source)
+            with self.assertRaisesRegex(c.Pending, 'release-trust'):
+                app.automatic('prepare', source)
+            self.assertEqual(host_path.read_bytes(), host_bytes)
+            wrong_host = c.encoded({**c.parse(host_bytes), 'role_launch_seconds': 100})
+            self.write(host_path, wrong_host)
+            with self.assertRaisesRegex(c.Blocked, 'host profile differs from the protected first-site intent'):
+                app.automatic('prepare', source)
+            self.assertEqual(host_path.read_bytes(), wrong_host)
 
     def test_first_local_checklist_pair_joins_interrupted_publish_and_authenticates(self):
         from bootstrap import Blocked as BootstrapBlocked
@@ -308,6 +375,12 @@ class Authorities(unittest.TestCase):
             for path in (server, client):
                 self.assertEqual({p.name for p in path.iterdir()}, set(c.TLS_FILES))
                 self.assertEqual((path / 'key.pem').stat().st_mode & 0o777, 0o600)
+            external_stage = self.root / 'external-stage'
+            with patch.object(c, 'PRIVATE', str(self.root / 'external')), \
+                    patch.object(c, 'LOCAL_CHECKLIST_TLS', str(external_stage)), \
+                    patch.object(self.live, 'first_site_authority', side_effect=AssertionError('replaced external TLS')):
+                self.live.prepare_checklist_pair(app, observed, source)
+                self.assertFalse(external_stage.exists())
             left, _, pins = tls_principal(server, maintenance=True)
             right, _, _ = tls_principal(client, maintenance=False)
             server_socket, client_socket = socket.socketpair()
