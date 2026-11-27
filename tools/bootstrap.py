@@ -1584,7 +1584,9 @@ class Bootstrap:
                 allowed = self.mosh_listener(line)
             if not allowed:
                 raise Blocked('unexpected listener: host is not vanilla; inspect inventory before proceeding')
-        if owned_candidates:
+        checklist_ready = managed_runtime and any(os.path.lexists(self.path(CHECKLIST_CONTROL + '/' + name))
+                                                  for name in ('ready.json', 'managed-listener.json'))
+        if owned_candidates or checklist_ready:
             if selinux != 'Enforcing':
                 raise Blocked('managed runtime listener requires enforcing SELinux')
             self.managed_runtime_listeners(owned_candidates)
@@ -1683,46 +1685,107 @@ class Bootstrap:
         return fields[4], pid, fd, target
 
     def runtime_handoff(self, socket, uid, boot, managed):
-        endpoint, pid, _, _ = socket
+        import systemd_service_profile as profile
+
+        endpoint, pid, _, descriptor = socket
         unit = CHECKLIST_UNIT.replace('@.', f'@{uid}.')
         fragment = '/etc/systemd/system/' + CHECKLIST_UNIT
-        checked_file(self.path(fragment))
-        facts = self.runtime_unit(unit, ('Id', 'MainPID', 'ActiveState', 'ControlGroup', 'User', 'Group',
-                                        'FragmentPath', 'DropInPaths', 'ExecMainStartTimestampMonotonic'))
+        profile.protected(self.path(fragment), 0, 8192, mode=0o644)
+        properties = ('Id', 'MainPID', 'ActiveState', 'ControlGroup', 'User', 'Group', 'FragmentPath',
+                      'DropInPaths', 'ExecStart', 'ExecMainStartTimestampMonotonic', *profile.PROPERTIES)
+        facts = self.runtime_unit(unit, properties)
+        profile.observe(facts, (CHECKLIST_OVERRIDE,) if managed else (), self.path, self.run)
         if (endpoint != '127.0.0.1:19425' or facts['MainPID'] != pid or facts['User'] != CHECKLIST_OWNER
                 or facts['Group'] != CHECKLIST_OWNER or facts['FragmentPath'] != fragment
-                or facts['DropInPaths'] != (CHECKLIST_OVERRIDE if managed else '')
+                or not facts['ControlGroup'].startswith('/system.slice/')
                 or not facts['ControlGroup'].endswith('/' + unit)
                 or not re.fullmatch(r'[1-9][0-9]{0,19}', facts['ExecMainStartTimestampMonotonic'])):
             raise ValueError('checklist handoff differs from its protected service')
         if managed:
-            selected = self.runtime_record('/var/lib/dev-pair/renewal-fence/selected-host.json', private=False)
-            observed = self.runtime_record('/var/lib/dev-pair/renewal/host-observed.json')
-            artifact = selected['artifact_sha256']
-            if (set(selected) != {'schema', 'artifact_sha256'} or selected['schema'] != 1
-                    or not re.fullmatch(r'[0-9a-f]{64}', artifact) or observed['schema'] != 2
-                    or observed['boot_id'] != boot or observed['component']['artifact_sha256'] != artifact
-                    or observed['handoff']['unit'] != unit):
-                raise ValueError('managed handoff release lacks current boot observation')
-            checked_file(self.path(CHECKLIST_ENTRY))
-            command = json.loads(self.run(CHECKLIST_ENTRY, '--describe', timeout=5))
+            site, host, observed = self.runtime_selected_host(boot)
+            artifact = host['artifact_sha256']
+            profile.protected(self.path(CHECKLIST_OVERRIDE), 0, 8192, mode=0o644)
+            profile.protected(self.path(CHECKLIST_ENTRY), 0, 65536, mode=0o755)
+            command = json.loads(self.run(CHECKLIST_ENTRY, '--describe', timeout=5), object_pairs_hook=relay.unique)
             expected = ['/usr/bin/python3', '-EBs',
                         f'/usr/libexec/dev-pair/host-releases/{artifact}/tools/host_handoff.py', *CHECKLIST_ARGS]
+            if command != expected or not profile.exec_start_matches(facts['ExecStart'], CHECKLIST_ENTRY):
+                raise ValueError('managed handoff launch release changed')
             command_hash = hashlib.sha256(json.dumps(command, sort_keys=True, separators=(',', ':'),
                                                      ensure_ascii=False).encode()).hexdigest()
-            if command != expected or observed['handoff']['command_sha256'] != command_hash:
-                raise ValueError('managed handoff launch release changed')
+            actual = {'unit': unit, 'pid': int(pid), 'started': int(facts['ExecMainStartTimestampMonotonic']),
+                      'command_sha256': command_hash, 'socket_inode': descriptor[8:-1]}
         else:
             command = ['/usr/bin/python3', '-EBs', '/usr/libexec/dev-pair/checklist/tools/host_handoff.py',
                        *CHECKLIST_ARGS]
             self.runtime_protected_file(self.path(command[2]))
+            if not profile.exec_start_matches(facts['ExecStart'], ' '.join(command)):
+                raise ValueError('direct handoff launch command changed')
         exe, cgroup, start = self.runtime_process(pid, uid)
         self.runtime_executable(exe, (command[0],))
         with self.path('/proc/' + pid + '/cmdline').open('rb') as stream:
             raw = stream.read(4097)
-        if (cgroup != facts['ControlGroup'] or raw != b'\0'.join(x.encode() for x in command) + b'\0'
-                or self.resolved_process_start(pid) != start):
+        if cgroup != facts['ControlGroup'] or raw != b'\0'.join(x.encode() for x in command) + b'\0':
             raise ValueError('checklist handoff listener differs from the selected process')
+        if managed:
+            self.runtime_handoff_observation(observed, actual, site)
+        if (self.resolved_process_start(pid) != start or self.runtime_unit(unit, properties) != facts
+                or managed and self.runtime_selected_host(boot) != (site, host, observed)):
+            raise ValueError('checklist handoff listener differs from the selected process')
+
+    def runtime_selected_host(self, boot):
+        import systemd_service_profile as profile
+
+        root = '/var/lib/dev-pair/renewal'
+        site = self.runtime_record(root + '/site-current.json')
+        if type(site) is not str or not re.fullmatch(r'[0-9a-f]{64}', site):
+            raise ValueError('managed handoff current site selection is invalid')
+        raw = profile.protected(self.path(root + '/releases/' + site + '.json'), 0, 65536, mode=0o600)
+        release = json.loads(raw, object_pairs_hook=relay.unique)
+        host = release['components']['host']
+        if (hashlib.sha256(raw).hexdigest() != site or type(release['schema']) is not int or release['schema'] != 1
+                or set(host) != {'source_revision', 'config_sha256', 'artifact_sha256'}
+                or not re.fullmatch(r'[0-9a-f]{40}', host['source_revision'])
+                or any(not re.fullmatch(r'[0-9a-f]{64}', host[key]) for key in ('config_sha256', 'artifact_sha256'))):
+            raise ValueError('managed handoff site release is not the reviewed host component')
+        selector_path = self.path('/var/lib/dev-pair/renewal-fence/selected-host.json')
+        selector = json.loads(profile.protected(selector_path, 0, 4096, mode=0o644), object_pairs_hook=relay.unique)
+        observed = self.runtime_record(root + '/host-observed.json')
+        launch = '/usr/libexec/dev-pair/host-releases/' + host['artifact_sha256']
+        if (selector != {'schema': 1, 'artifact_sha256': host['artifact_sha256']} or type(selector['schema']) is not int
+                or self.runtime_record(root + '/host-selection.json') != host
+                or set(observed) != {'schema', 'boot_id', 'component', 'launch_root', 'role_launch_seconds',
+                                     'hostname', 'platform', 'selinux', 'handoff'}
+                or type(observed['schema']) is not int or observed['schema'] != 2 or observed['boot_id'] != boot
+                or observed['component'] != host or observed['launch_root'] != launch
+                or observed['hostname'] != self.text('/proc/sys/kernel/hostname').strip()
+                or observed['platform'] != 'fedora-44' or observed['selinux'] != 'enforcing'
+                or type(observed['role_launch_seconds']) is not int or not 90 <= observed['role_launch_seconds'] <= 169):
+            raise ValueError('managed handoff release differs from current site or boot observation')
+        return site, host, observed
+
+    def runtime_handoff_observation(self, observed, actual, site):
+        import systemd_service_profile as profile
+
+        previous = observed['handoff']
+        if (type(previous) is not dict or set(previous) != set(actual)
+                or previous['unit'] != actual['unit'] or previous['command_sha256'] != actual['command_sha256']
+                or type(previous['pid']) is not int or previous['pid'] <= 1
+                or type(previous['started']) is not int or previous['started'] <= 0
+                or type(previous['socket_inode']) is not str
+                or not re.fullmatch(r'[1-9][0-9]{0,19}', previous['socket_inode'])):
+            raise ValueError('managed handoff lacks its exact authorized process observation')
+        if previous == actual:
+            return
+        if actual['started'] <= previous['started']:
+            raise ValueError('managed handoff process or inode changed without a later start')
+        verifier = '/usr/libexec/dev-pair/renewal/host-release'
+        profile.protected(self.path(verifier), 0, 65536, mode=0o755)
+        # U measures the live endpoint again under its exact selected host. The
+        # verify entry is read-only and never restarts or reselects a unit.
+        fresh = json.loads(self.run(verifier, 'verify', site, timeout=20), object_pairs_hook=relay.unique)
+        if fresh != {**observed, 'handoff': actual}:
+            raise ValueError('new handoff process lacks a matching current site observation')
 
     def runtime_app(self, socket, uid, dns):
         state = self.runtime_record(CHECKLIST_CONTROL + '/release.json')
@@ -1837,6 +1900,8 @@ class Bootstrap:
             serve = [row for row in sockets if row[0].endswith(':443')]
             if len(handoff) > 1 or len(app) > 1 or len(serve) > 2 or len({row[0] for row in sockets}) != len(sockets):
                 raise ValueError('multiple unexpected checklist listener addresses')
+            if not handoff and (ready is not None or commissioning is not None):
+                raise ValueError('the authorized checklist executor has no observed listener')
             if handoff:
                 self.runtime_handoff(handoff[0], uid, boot['boot_id'], managed)
             if app or serve:

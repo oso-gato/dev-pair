@@ -10,12 +10,12 @@ import unittest
 from unittest.mock import patch
 
 import bootstrap as b
+import systemd_service_profile as profile
 
 UID = 2110
 BOOT = '12345678-1234-1234-1234-123456789abc'
 MACHINE = '2' * 32
 HOST = '3' * 64
-SITE = '4' * 64
 APP_ID = '5' * 64
 CONTAINER = '6' * 64
 DNS = 'erebus.example.ts.net'
@@ -50,13 +50,16 @@ class RuntimeListeners(unittest.TestCase):
         self.put('/etc/machine-id', MACHINE)
         self.put('/proc/sys/kernel/random/boot_id', BOOT)
         self.put('/usr/sbin/nft', '')
-        self.put('/etc/systemd/system/' + b.CHECKLIST_UNIT, 'fixed independently installed unit')
+        self.put('/proc/sys/kernel/hostname', 'erebus')
+        self.put('/etc/systemd/system/' + b.CHECKLIST_UNIT, 'fixed independently installed unit', mode=0o644)
         self.base = {'version': 1, 'machine_id': MACHINE, 'platform_sha': '0' * 40, 'uid': UID}
         self.app_row = {'Name': 'dp-checklist-app', 'Id': CONTAINER, 'Image': 'sha256:' + APP_ID,
                         'State': {'Running': True}}
         self.tailscale = {'CurrentTailnet': {'Name': 'trusted'}, 'Self': {'ID': 'node-id', 'DNSName': DNS + '.',
                          'Online': True}, 'BackendState': 'Running', 'TailscaleIPs': ['100.64.8.9', 'fd7a:115c:a1e0::9']}
         self.rule = {'chain': {'table': 'dev_pair_bootstrap', 'family': 'inet', 'name': 'input', 'policy': 'drop'}}
+        self.verifier = '/usr/libexec/dev-pair/renewal/host-release'
+        self.fresh = None
 
     def put(self, path, value, *, mode=0o600):
         target = self.root / path.lstrip('/')
@@ -84,6 +87,14 @@ class RuntimeListeners(unittest.TestCase):
             return self.command(*args[offset:], **kwargs)
         if args[:2] == (b.CHECKLIST_ENTRY, '--describe'):
             return json.dumps(self.q_command)
+        if args[:2] == (self.verifier, 'verify'):
+            self.assertEqual(args[2], self.site)
+            return json.dumps(self.fresh)
+        if args[0] == '/usr/bin/rpm':
+            if args[-1] == '--info':
+                return 'Signature   : RSA/SHA256, Thu 01 Jan 1970, Key ID ' + profile.FINGERPRINT[-16:] + '\n'
+            return ('systemd\t1.fc44\tx86_64\t8\n' + profile.VENDOR + '\t' + self.vendor_digest +
+                    '\t-rw-r--r--\troot\troot\n')
         if args[0] == '/usr/bin/ss':
             return '\n'.join(self.listeners) + '\n'
         if args[:2] == ('/usr/bin/systemctl', 'is-active'):
@@ -125,23 +136,44 @@ class RuntimeListeners(unittest.TestCase):
         self.q_command = ['/usr/bin/python3', '-EBs', artifact + '/tools/host_handoff.py', *b.CHECKLIST_ARGS]
         self.put(self.q_command[2], 'exact admitted controller code')
         if managed:
-            self.put(b.CHECKLIST_OVERRIDE, 'pinned managed override')
-            self.put(b.CHECKLIST_ENTRY, 'independently protected launch selector')
+            self.put(b.CHECKLIST_OVERRIDE, 'pinned managed override', mode=0o644)
+            self.put(b.CHECKLIST_ENTRY, 'independently protected launch selector', mode=0o755)
+            self.put(self.verifier, 'independently protected read-only verifier', mode=0o755)
+            component = {'source_revision': 'f' * 40, 'config_sha256': 'e' * 64, 'artifact_sha256': HOST}
+            self.site = self.select_site(component)
             self.put(b.CHECKLIST_CONTROL + '/managed-listener.json',
-                     {'version': 2, 'boot': BOOT, 'site': SITE, 'phase': 'recovery' if first_recovery else 'ready'})
-            self.put('/var/lib/dev-pair/renewal/site-current.json', json.dumps(SITE))
+                     {'version': 2, 'boot': BOOT, 'site': self.site, 'phase': 'recovery' if first_recovery else 'ready'})
+            self.put('/var/lib/dev-pair/renewal/host-selection.json', component)
             self.put('/var/lib/dev-pair/renewal-fence/selected-host.json', {'schema': 1, 'artifact_sha256': HOST}, mode=0o644)
             digest = hashlib.sha256(json.dumps(self.q_command, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-            self.put('/var/lib/dev-pair/renewal/host-observed.json', {'schema': 2, 'boot_id': BOOT,
-                     'component': {'artifact_sha256': HOST}, 'handoff': {'unit': Q_UNIT, 'command_sha256': digest}})
+            self.observed = {'schema': 2, 'boot_id': BOOT, 'component': component, 'launch_root': artifact,
+                             'role_launch_seconds': 145, 'hostname': 'erebus', 'platform': 'fedora-44', 'selinux': 'enforcing',
+                             'handoff': {'unit': Q_UNIT, 'pid': int(Q_PROC), 'started': 1729,
+                                         'command_sha256': digest, 'socket_inode': Q_PROC + '42'}}
+            self.put('/var/lib/dev-pair/renewal/host-observed.json', self.observed)
             if first_recovery:
                 self.put('/var/lib/dev-pair/renewal-fence/frozen', json.dumps('boot'))
-        self.units[Q_UNIT] = {'Id': Q_UNIT, 'MainPID': Q_PROC, 'ActiveState': 'active', 'ControlGroup': Q_GROUP,
-                             'User': 'dp-checklist', 'Group': 'dp-checklist',
-                             'FragmentPath': '/etc/systemd/system/' + b.CHECKLIST_UNIT,
-                             'DropInPaths': b.CHECKLIST_OVERRIDE if managed else '', 'ExecMainStartTimestampMonotonic': '1729'}
+        command = b.CHECKLIST_ENTRY if managed else ' '.join(self.q_command)
+        self.units[Q_UNIT] = {
+            **dict.fromkeys(profile.PROPERTIES, ''), 'Id': Q_UNIT, 'MainPID': Q_PROC, 'ActiveState': 'active',
+            'ControlGroup': Q_GROUP, 'User': 'dp-checklist', 'Group': 'dp-checklist',
+            'FragmentPath': '/etc/systemd/system/' + b.CHECKLIST_UNIT,
+            'DropInPaths': b.CHECKLIST_OVERRIDE if managed else '', 'ExecMainStartTimestampMonotonic': '1729',
+            'ExecStart': '{ path=' + command.split()[0] + ' ; argv[]=' + command + ' ; }',
+            'NeedDaemonReload': 'no', 'TimeoutStartFailureMode': 'terminate', 'TimeoutStopFailureMode': 'terminate',
+            'KillMode': 'control-group', 'SendSIGKILL': 'yes', 'FinalKillSignal': '9',
+        }
         self.process(Q_PROC, UID, Q_GROUP, '/usr/bin/python3', self.q_command)
         self.listeners.append(line('127.0.0.1:19425', Q_PROC, 'python3'))
+
+    def select_site(self, component, role_generation=1):
+        release = json.dumps({'schema': 1, 'components': {'host': component}, 'role_generation': role_generation},
+                             sort_keys=True, separators=(',', ':'))
+        site = hashlib.sha256(release.encode()).hexdigest()
+        self.put('/var/lib/dev-pair/renewal/releases/' + site + '.json', release)
+        self.put('/var/lib/dev-pair/renewal/site-current.json', json.dumps(site))
+        self.site = site
+        return site
 
     def publish(self):
         quadlet = f'/etc/containers/systemd/users/{UID}/dp-checklist-app.container'
@@ -199,6 +231,52 @@ class RuntimeListeners(unittest.TestCase):
         self.listeners.pop()
         self.listeners.append(line('127.0.0.1:19999', Q_PROC))
         self.assert_blocks('not vanilla')
+
+    def test_fedora_vendor_and_managed_handoff_effective_policy(self):
+        self.handoff(managed=True)
+        vendor = '[Service]\nTimeoutStopFailureMode=abort\n'
+        self.vendor_digest = hashlib.sha256(vendor.encode()).hexdigest()
+        key = self.put(profile.VENDOR_KEY, 'pinned Fedora key fixture', mode=0o644)
+        self.put(profile.VENDOR, vendor, mode=0o644)
+        self.units[Q_UNIT].update(DropInPaths=profile.VENDOR + ' ' + b.CHECKLIST_OVERRIDE,
+                                  TimeoutStopFailureMode='abort')
+        with patch.object(profile, 'KEY_SHA', hashlib.sha256(key.read_bytes()).hexdigest()):
+            self.runtime()
+            self.units[Q_UNIT]['ExecStartPre'] = '{ path=/usr/bin/false ; }'
+            self.assert_blocks()
+            self.units[Q_UNIT]['ExecStartPre'] = ''
+            self.put(profile.VENDOR, vendor + 'ExecStartPre=/usr/bin/false\n', mode=0o644)
+            self.assert_blocks()
+
+    def test_settled_site_requires_matching_component_and_live_handoff(self):
+        self.handoff(managed=True)
+        self.runtime()
+        self.select_site(self.observed['component'], role_generation=2)
+        self.runtime()
+        self.select_site({**self.observed['component'], 'config_sha256': '0' * 64}, role_generation=3)
+        self.assert_blocks()
+        self.select_site(self.observed['component'])
+        self.listeners.pop()
+        self.assert_blocks()
+
+    def test_restarted_endpoint_requires_fresh_authorized_readback(self):
+        self.handoff(managed=True)
+        socket = self.root / f'proc/{Q_PROC}/fd/3'
+        socket.unlink()
+        socket.symlink_to('socket:[13999]')
+        self.assert_blocks()
+        self.assertFalse(any(call[:2] == (self.verifier, 'verify') for call in self.calls))
+        later = '121'
+        self.process(later, UID, Q_GROUP, '/usr/bin/python3', self.q_command)
+        self.listeners[-1] = line('127.0.0.1:19425', later, 'python3')
+        self.units[Q_UNIT].update(MainPID=later, ExecMainStartTimestampMonotonic='1829')
+        self.assert_blocks()
+        actual = {**self.observed['handoff'], 'pid': int(later), 'started': 1829, 'socket_inode': later + '42'}
+        self.fresh = {**self.observed, 'handoff': actual}
+        self.runtime()
+        self.assertEqual(self.calls.count((self.verifier, 'verify', self.site)), 2)
+        self.fresh = {**self.observed, 'handoff': {**actual, 'socket_inode': '1'}}
+        self.assert_blocks()
 
     def test_published_loopback_and_exact_tailnet_serve_from_live_supervisors(self):
         self.handoff(managed=True)

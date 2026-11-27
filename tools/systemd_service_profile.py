@@ -12,9 +12,11 @@ from fedora_oci import FINGERPRINT, KEY_SHA
 VENDOR = '/usr/lib/systemd/system/service.d/10-timeout-abort.conf'
 VENDOR_KEY = '/etc/pki/rpm-gpg/RPM-GPG-KEY-fedora-44-primary'
 FORMAT = ('%{NAME}\t%{RELEASE}\t%{ARCH}\t%{FILEDIGESTALGO}\n'
-          '[%{FILENAMES}\t%{FILEDIGESTS}\t%{FILEMODES:octal}\t%{FILEUSERNAME}\t%{FILEGROUPNAME}\n]')
+          '[%{FILENAMES}\t%{FILEDIGESTS}\t%{FILEMODES:perms}\t%{FILEUSERNAME}\t%{FILEGROUPNAME}\n]')
+COMMAND_HOOKS = ('ExecCondition', 'ExecStartPre', 'ExecStartPost', 'ExecStop', 'ExecStopPost')
 PROPERTIES = ('NeedDaemonReload', 'RootDirectory', 'RootImage', 'SELinuxContext',
-              'TimeoutStartFailureMode', 'TimeoutStopFailureMode', 'KillMode', 'SendSIGKILL', 'FinalKillSignal')
+              'TimeoutStartFailureMode', 'TimeoutStopFailureMode', 'KillMode', 'SendSIGKILL', 'FinalKillSignal',
+              *COMMAND_HOOKS)
 TIMEOUT_FIELDS = ('TimeoutStartFailureMode', 'TimeoutStopFailureMode')
 
 
@@ -50,7 +52,7 @@ def fedora_vendor_profile(path, run, owner):
     if not rows or len(rows) > 4096 or not re.fullmatch(r'systemd\t[0-9A-Za-z._+~-]+\.fc44\t(?:x86_64|aarch64)\t8', rows[0]):
         raise ValueError('service policy is outside the installed Fedora 44 systemd RPM')
     exact = [row for row in rows[1:] if row.startswith(VENDOR + '\t')]
-    want = f'{VENDOR}\t{hashlib.sha256(raw).hexdigest()}\t100644\troot\troot'
+    want = f'{VENDOR}\t{hashlib.sha256(raw).hexdigest()}\t-rw-r--r--\troot\troot'
     if exact != [want]:
         raise ValueError('vendor service drop-in differs from the installed RPM payload')
     info = run(*query, '--info', timeout=8)
@@ -90,7 +92,8 @@ def observe(row, owned, path, run, *, owner=0):
             raise ValueError('system service effective timeout mode differs')
     exact = {'NeedDaemonReload': 'no', 'RootDirectory': '', 'RootImage': '', 'SELinuxContext': '',
              'KillMode': 'control-group', 'SendSIGKILL': 'yes'}
-    if any(row[key] != value for key, value in exact.items()) or row['FinalKillSignal'] not in ('9', 'SIGKILL'):
+    if (any(row[key] != value for key, value in exact.items()) or row['FinalKillSignal'] not in ('9', 'SIGKILL')
+            or any(row[key] for key in COMMAND_HOOKS)):
         raise ValueError('system service effective process profile differs')
 
 
