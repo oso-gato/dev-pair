@@ -91,14 +91,64 @@ under one lock and preserves the 8GiB host reserve. Retiring a retained digest
 requires the authorized activation and recovery procedure.
 
 The subjects and physical bytes are under
-`/var/lib/dev-pair/platform-releases/<platform-sha256>/`. Each role has its own
-subdirectory with `<role>.oci.tar` and `part.json`. The host subdirectory contains
-`host.tar` and `host-manifest.json`. The site installer supplies the actual
-rootless image, digest-addressed host bundle and per-job G manifest readback.
-That installer and G's prebuilt release path are the remaining native source
-connections. The release transport has its own protected receipt
-`intake.json`; local installed readback and selection follow under the
-authorized destination controller.
+`/var/lib/dev-pair/platform-releases/<platform-sha256>/`. Each role has a
+subdirectory with `<role>.oci.tar` and `part.json`. The host has `host.tar`
+and `host-manifest.json`. The stage receipt is `intake.json`.
+
+## Native installation and local derivation
+
+D provisions the exact Fedora 44 site, independently verified host
+configuration, managed role accounts and bounded storage. P's
+`prepare-maintenance-host` establishes the host-only prerequisites and fixed
+gateway from authenticated source and inputs. Provision G's reviewed
+prebuilt entry, P's reviewed imported-image admission entry and the approved
+site policy at `/etc/dev-pair/renewal/site-configs/<sha256>.json`. The policy
+has `schema=1`, `hostname`, `host_config_sha256`, and the approved job map.
+Each job entry supplies `storage_bytes` and disjoint `categories` for the
+outer and inner roles. U owns live activation.
+
+On the authorized enforcing host, stage the exact package and observe it.
+
+```sh
+/usr/bin/python3 -B /usr/libexec/dev-pair/tools/platform_release_install.py   --platform-sha256 "$PLATFORM_SHA" --site-config-sha256 "$SITE_CONFIG_SHA"
+```
+
+The installer validates the protected package and actual boot, scope and
+control-plane file identities before invoking G and P. It checks the shared
+20GiB managed allocation, including portable archives and rollback. A
+separate archive filesystem counts its actual block device size. The native
+maintenance import checks the rootless VFS graph, runroot, bounded copy
+space, OCI expansion and live config/manifest identities. P then runs the
+normal confined offline entry twice and records local cleanup under
+`bootstrap/gptbox-adapter/<context>/imported-releases/<image>.json`.
+The guest producer record remains in the signed artifact package.
+
+G preflights and stages each job through its bounded role store. A
+root-protected `development-placement.json` selects the exact site, inner
+archive and stable base. G loads and observes the exact outer OCI bytes and
+publishes its actual
+`development/builds/<job>/inputs/<manifest-sha256>/manifest.json`. The
+installer rechecks the actual manifest and archive, exact role/source
+identities, protected mode, label and mounted capacity. For an agent-only
+refresh, the stable host bundle and DevBox come from the retained full
+platform index. Earlier compatible installed versions remain available for
+rollback.
+
+The site installer writes a protected `installed.json` only after both native
+placement paths and the immutable installed host bundle read back. It binds
+`platform_sha256`, `base_platform_sha256`, `site_config_sha256`,
+`source_sha`, the current `boot_id`, and these exact component proofs.
+
+| Component key | Readback fields |
+| --- | --- |
+| `host` | `manifest_sha256` |
+| `maintenance` | `context_sha256`, `oci_config_sha256`, `oci_manifest_sha256`, `result_sha256` of P's local admission record |
+| `devbox` | `oci_config_sha256`, `oci_manifest_sha256` |
+| `development` | `context_sha256`, `oci_config_sha256`, `oci_manifest_sha256`, `inner_sha256` of the canonical producer record, and `jobs` mapping each job to `manifest_sha256` |
+
+U independently derives the local launch plan and release from the portable
+index, protected site configuration and actual native scopes. Activation
+uses its separately authorized staging and rollback path.
 
 ## Nightly and on-demand agent refresh
 

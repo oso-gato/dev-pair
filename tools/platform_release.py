@@ -136,6 +136,7 @@ def admit(source):
     admitted_push(source, os.environ)
     source_checkout(SOURCE, source)
     for requirement in ('tools/native_placements.py', 'tools/release_trust.py', 'tools/renewal.py',
+                        'tools/renewal_site.py', 'tools/platform_release_protocol.py', 'tools/platform_release_install.py',
                         'runtime/renewal/driver', 'runtime/renewal/host-release'):
         require((SOURCE / requirement).is_file(), 'protected platform integration lacks ' + requirement)
     previous = os.environ.get('PREVIOUS')
