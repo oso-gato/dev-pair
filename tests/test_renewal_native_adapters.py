@@ -3,6 +3,7 @@ import os
 import importlib.util
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -20,6 +21,73 @@ def adapter(name):
 
 
 class NativeAdapterTests(unittest.TestCase):
+    def test_checkpoint_git_diff_reports_whitespace_without_refreshing_the_dirty_index(self):
+        from product_job import agreement_sha
+
+        source = adapter('driver')
+        capture = source['capture_work']
+        git = source['GIT'][0]
+        run = subprocess.run
+
+        def scoped(command, **options):
+            if command[0] == source['SYSTEMD_RUN']:
+                self.assertIn('--property=ProtectSystem=strict', command)
+                return run(command[command.index('--') + 1:], **options)
+            self.assertEqual(command[:4], [source['RUNUSER'], '--user', 'dp-maint', '--'])
+            return run(command[4:], **options)
+
+        for whitespace in (False, True):
+            with self.subTest(whitespace=whitespace), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                workspace = root / 'maintenance/workspaces/product'
+                workspace.mkdir(parents=True)
+
+                def observe_git(*args):
+                    return subprocess.check_output([git, '-C', str(workspace), *args], timeout=5)
+
+                observe_git('init', '-q', '--template=')
+                observe_git('config', 'diff.autoRefreshIndex', 'true')
+                clean = workspace / 'stat-witness.txt'
+                dirty = workspace / 'edit.txt'
+                clean.write_bytes(b'unchanged\n')
+                dirty.write_bytes(b'old\n')
+                app = workspace / source['APP']
+                app.parent.mkdir(parents=True)
+                app.write_bytes((REPO / source['APP']).read_bytes())
+                observe_git('add', '.')
+                observe_git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline')
+                head = observe_git('rev-parse', 'HEAD').decode().strip()
+                # Make one unchanged file need a stat refresh while the other retains a user edit.
+                stamp = clean.stat().st_mtime_ns - 10_000_000_000
+                os.utime(clean, ns=(stamp, stamp))
+                edit = b'new \n' if whitespace else b'new\n'
+                dirty.write_bytes(edit)
+                index = workspace / '.git/index'
+                before = index.stat().st_ino, index.read_bytes()
+
+                plan = {'schema': 1, 'job_id': 'product', 'adapter': 'checklist-quadlet', 'startup_sha256': '9' * 64,
+                        'agreement': {'repository': 'fixture/product', 'initial_commit': head,
+                                      'brief': 'Check retained dirty work.', 'host_seconds': 60,
+                                      'build_seconds': 60, 'turn_seconds': 60}}
+                folder = root / 'product-jobs/jobs/product'
+                folder.mkdir(parents=True)
+                r.replace_json(folder / 'plan.json', plan)
+                payload = {'role': 'maintenance', 'job': 'product', 'binding': {'agreement_sha256': agreement_sha(plan)}}
+
+                def fixture_owned_file(path, limit, expected_uid=os.getuid()):
+                    return source['owned_file'](path, limit, expected_uid)
+
+                with (patch.dict(capture.__globals__, ROOT=root, owned_file=fixture_owned_file),
+                      patch.object(r.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=os.getuid())),
+                      patch.object(subprocess, 'run', side_effect=scoped)):
+                    work = capture(payload)
+                expected = b'edit.txt:1: trailing whitespace.\n+new ' if whitespace else b''
+                self.assertEqual(work['head'], head)
+                self.assertEqual(work['status_sha256'], r.sha(b' M edit.txt'))
+                self.assertEqual((work['check_exit'], work['check_sha256']), (2 if whitespace else 0, r.sha(expected)))
+                self.assertEqual(dirty.read_bytes(), edit)
+                self.assertEqual((index.stat().st_ino, index.read_bytes()), before)
+
     def test_host_release_requires_immutable_complete_artifact_and_matching_live_config(self):
         source = adapter('host-release')
         with tempfile.TemporaryDirectory() as tmp:
