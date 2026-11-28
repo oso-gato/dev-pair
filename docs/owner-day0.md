@@ -87,6 +87,25 @@ Check the displayed revisions, destination, role settings, budget cap and UTC
 expiry before confirming. Resume to finish activation, then connect as `core`
 over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
 
+## Independent access station setup
+
+The verifier station operator uses a separate, authorized Tailnet device and
+keeps the signing material with the independent verifier. Install the reviewed
+`tools/day0_access_exchange.py` and its imports on that station from the exact
+source. Give the request transport account a private mailbox (mode 0700) and
+admit only the VPS public transport key, with SSH forwarding and TTY disabled
+and a forced `receive` command. From the station's protected installation the
+fixed command is `/usr/bin/python3 -EBs /usr/libexec/dev-pair-observer/tools/day0_access_exchange.py --mailbox`
+followed by the approved absolute mailbox path and `receive`.
+
+Use that tool with `--mailbox` and `pending` to locate a request. The independent
+verifier conducts the named checks and signs the exact request's observation
+bundle. Under the approved mailbox account, use `publish` with the request
+identifier (its filename without `.request`) and the signed bundle on standard
+input. `./day0.sh resume` retrieves and verifies it from the pinned station.
+The verifier retains its evidence independently of the request mailbox.
+[Named SSH and workload checks](destination-observation.md#review-the-named-ssh-and-workload-routes)
+
 ## Previously installed November 27 bootstrap
 
 A host already seeded at

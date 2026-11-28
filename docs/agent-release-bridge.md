@@ -29,8 +29,9 @@ the selected full host and DevBox lifecycle. Site access uses the existing read-
 GitHub credential and protected local release bindings. The host never dispatches
 GitHub Actions or modifies repository policy.
 
-Enable `dev-pair-agent-bridge.timer` after initial platform and renewal recovery
-have been verified. The timer starts at 04:00 JST and observes that morning’s run
+Day 0 commissioning arms `dev-pair-agent-bridge.timer` after the initial
+platform, renewal recovery and agent publisher authority have been verified. The bridge
+service starts `dev-pair-agent-observer.socket` on demand. The timer starts at 04:00 JST and observes that morning’s run
 every 15 minutes through 09:15. It also observes recent authorized manual runs
 throughout the day. `systemctl start dev-pair-agent-bridge@on-demand.service` can
 wake an immediate observation of a manual run from the past six hours. A run
@@ -38,8 +39,9 @@ waiting for completion remains eligible for a later observation. The bridge
 checks GitHub's exact completed run and artifact transport, calls the existing
 independent attestation verifier and native installer, and confirms the retained
 base and same-boot placement proofs. It rechecks the live predecessor and that
-renewal is idle under the owner lock before recording the offer. The ordinary
-`dev-pair-renewal@agent.service` owns continuity validation, activation and rollback.
+renewal is idle under the owner lock before recording the offer. The bridge also requires a signed prospective result for the exact candidate before
+offering it to renewal. The ordinary `dev-pair-renewal@agent.service` checks the
+observation again and owns continuity validation, activation and rollback.
 
 The existing artifact store retains at most three full or agent packages and
 must have its verified physical reserve. A base plus two successful agent refreshes
@@ -58,3 +60,24 @@ An obsolete bridge-owned offer can be replaced only after independent verificati
 and same-boot staging of a newer current official stable. The exact predecessor
 must still be active and no agent request or matching renewal attempt may exist.
 The prior installed evidence stays available for scoped recovery.
+
+## Enroll the independent nightly verifier
+
+After the initial signed workload review, the independent station administrator
+runs `tools/agent_observer_station.py install --help` from the exact protected
+station checkout. Installation takes the prior signed workload receipt, its
+trusted public signers, the approved host and guard digests, and the separate
+courier, collector and reviewer account inputs. The reviewer uses
+`tools/agent_observer_station.py enroll-acl` with a new private path for its
+approved read-only Tailscale OAuth credential. The station measures the live
+policy against the independently signed workload receipt before enabling its
+station timer. The restricted courier mailbox uses the existing Day 0 SSH
+transport. [Access station setup](owner-day0.md#independent-access-station-setup)
+
+The collector connects as the admitted named operator over Tailnet SSH and
+uses the destination observer gateway for the exact candidate on both role
+paths. The independent reviewer checks the observations and current policy
+under separate signing custody and returns the signed response. The bridge
+holds activation when that response is missing, expired or invalid. The
+station timer and worker are installed on the verifier station. Commissioning
+the destination installs only its bridge and local observer gateway.
