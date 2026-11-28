@@ -401,12 +401,19 @@ class TestConfinementContract(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             path = root / 'mountinfo'
+            (root / 'root/etc').mkdir(parents=True)
             path.write_text(content)
             db.observed_mounts(root, {'/work/job': True})
             for target in ('/etc/hostname', '/etc/hosts', '/etc/resolv.conf'):
                 path.write_text(content + f'53 28 0:16 / {target} ro,nosuid,nodev,noexec - ext4 tmp rw\n')
                 with self.subTest(target=target), self.assertRaisesRegex(db.Blocked, 'network configuration mount'):
                     db.observed_mounts(root, {'/work/job': True})
+            path.write_text(content)
+            resolver = root / 'root/etc/resolv.conf'
+            resolver.symlink_to('/run/writable-resolver')
+            with self.assertRaisesRegex(db.Blocked, 'must be an image-owned read-only file'):
+                db.observed_mounts(root, {'/work/job': True})
+            resolver.unlink()
             for original, replacement, failure in (
                     (' / ro,', ' / rw,', 'root filesystem'),
                     ('cgroup ro,', 'cgroup rw,', 'cgroup filesystem'),

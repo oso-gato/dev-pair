@@ -134,6 +134,16 @@ def verify_offline_runtime(proc=Path('/proc/self')):
     roots = [row[5].split(',') for row in mounts if row[4] == '/']
     require(len(roots) == 1 and 'ro' in roots[0], 'effective runtime root is writable')
     require(not any(row[4] in OFFLINE_CONFIG_FILES for row in mounts), 'unexpected runtime network configuration mount')
+    etc = proc / 'root/etc'
+    require(etc.is_dir() and not etc.is_symlink(), 'runtime /etc is unavailable')
+    for target in OFFLINE_CONFIG_FILES:
+        path = etc / Path(target).name
+        try:
+            node = path.lstat()
+        except FileNotFoundError:
+            continue
+        require(stat.S_ISREG(node.st_mode) and os.statvfs(path).f_flag & os.ST_RDONLY,
+                'runtime network configuration must be an image-owned read-only file')
 
 
 def frozen():

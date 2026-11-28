@@ -445,6 +445,7 @@ class GptboxTests(unittest.TestCase):
     def test_frozen_runtime_accepts_only_loopback_and_image_owned_configuration(self):
         proc = self.root / 'proc-fixture'
         (proc / 'net').mkdir(parents=True)
+        (proc / 'root/etc').mkdir(parents=True)
         network = proc / 'net/dev'
         mounts = proc / 'mountinfo'
         default_network = 'Inter-| Receive | Transmit\n face | bytes   | bytes\n    lo: 0 0\n'
@@ -460,6 +461,12 @@ class GptboxTests(unittest.TestCase):
             mounts.write_text(default_mounts + f'2 1 0:2 / {target} ro,relatime - vfs vfs rw\n')
             with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'network configuration mount'):
                 runtime.verify_offline_runtime(proc)
+        mounts.write_text(default_mounts)
+        resolver = proc / 'root/etc/resolv.conf'
+        resolver.symlink_to('/run/writable-resolver')
+        with self.assertRaisesRegex(RuntimeError, 'must be an image-owned read-only file'):
+            runtime.verify_offline_runtime(proc)
+        resolver.unlink()
         mounts.write_text(default_mounts.replace(' / ro,', ' / rw,'))
         with self.assertRaisesRegex(RuntimeError, 'root is writable'):
             runtime.verify_offline_runtime(proc)

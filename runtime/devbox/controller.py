@@ -614,8 +614,17 @@ def observed_mounts(root, binds):
         return entries[0]
 
     require('ro' in find('/')[0], 'effective root filesystem is writable')
-    require(not {'/etc/hostname', '/etc/hosts', '/etc/resolv.conf'}.intersection(rows),
-            'unexpected runtime network configuration mount')
+    etc = root / 'root/etc'
+    require(etc.is_dir() and not etc.is_symlink(), 'runtime /etc is unavailable')
+    for name in ('hostname', 'hosts', 'resolv.conf'):
+        require('/etc/' + name not in rows, 'unexpected runtime network configuration mount')
+        path = etc / name
+        try:
+            node = path.lstat()
+        except FileNotFoundError:
+            continue
+        require(stat.S_ISREG(node.st_mode) and os.statvfs(path).f_flag & os.ST_RDONLY,
+                'runtime network configuration must be an image-owned read-only file')
     if '/sys/fs/cgroup' in rows:
         require('ro' in find('/sys/fs/cgroup')[0], 'effective cgroup filesystem is writable')
     for target in ('/run', '/tmp'):
