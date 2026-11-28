@@ -91,6 +91,10 @@ HOME. The exact existing running target is checked before and after entry;
 unsafe fallback creation has no installed create helper. Readiness requires a
 new inspected `State.StartedAt` on each cycle, unchanged during the wait, and logs
 scoped with `--since` to that actual start; a previous marker cannot pass restart.
+Before maintenance entry, the current host controller also verifies the
+running kernel view through the exact inspected PID and rechecks the start
+identity. Retained signed images with older probes must pass this same check
+before an import receipt is issued or a job starts.
 Exact inspected `HostConfig.Tmpfs` paths/options are restricted to `/run` and
 `/tmp`, separately from bind-mount inspection. Both assembly and runtime
 explicitly request `notmpcopyup` so scratch mounts do not copy image contents.

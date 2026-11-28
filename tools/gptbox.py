@@ -24,7 +24,7 @@ from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Comma
                        role_subordinate_range, validate_sources)
 import candidate
 from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPROVALS, TURN_READONLY_MOUNTS,
-                           git_output, host_job_inputs, repository_origin)
+                           git_output, host_job_inputs, kernel_text, repository_origin, verify_offline_runtime)
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_VERSION = '0.169.0'
@@ -658,11 +658,12 @@ class Gptbox(Bootstrap):
             raise Blocked('unexpected/missing host bind mount')
         return item
 
-    def enter(self, identity, sealed, operation, job=None):
+    def enter(self, identity, sealed, operation, job=None, *, expected_start=None):
         if operation not in ('probe', 'version', 'turn', 'job-turn') or (operation == 'job-turn') != (job is not None):
             raise Blocked('unsupported fixed role entry')
         before = self.inspect_container(identity, sealed)
-        if before['State']['Status'] != 'running':
+        if (before['State']['Status'] != 'running' or
+                expected_start is not None and before['State'].get('StartedAt') != expected_start):
             raise Blocked('entry requires an already running exact target; no auto-create/start fallback')
         if operation in ('turn', 'job-turn'):
             readonly = JOB_READONLY_MOUNTS if job else TURN_READONLY_MOUNTS
@@ -681,6 +682,9 @@ class Gptbox(Bootstrap):
                           '--name', identity, '--no-tty', '--no-workdir', '--clean-path', '--',
                           '/usr/bin/python3', '-I', RUNTIME, 'entry', operation, *(job or ()), timeout=150 if job else 30)
         after = self.inspect_container(identity, sealed)
+        if expected_start is not None and (after['State']['Status'] != 'running' or
+                                          after['State'].get('StartedAt') != expected_start):
+            raise Blocked('maintenance start changed during fixed entry')
         if operation in ('turn', 'job-turn') and (after['State']['Status'] != 'running' or
                                    before['State']['StartedAt'] != after['State'].get('StartedAt')):
             raise Blocked('runtime changed during headless entry; inspect durable turn state')
@@ -747,10 +751,10 @@ class Gptbox(Bootstrap):
                 '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
             self.inspect_container(identity, sealed)
             self.engine('start', identity, timeout=20)
-            self.ready(identity, sealed)
-            if self.enter(identity, sealed, 'version').strip() != f'codex-cli {codex_version}':
+            started = self.ready(identity, sealed)
+            if self.enter(identity, sealed, 'version', expected_start=started).strip() != f'codex-cli {codex_version}':
                 raise Blocked('actual role binary version differs from exact image')
-            report = json.loads(self.enter(identity, sealed, 'job-turn', (job, operation, request_sha)))
+            report = json.loads(self.enter(identity, sealed, 'job-turn', (job, operation, request_sha), expected_start=started))
             if (report['schema'] != 2 or report['request_sha256'] != request_sha or any(report.get(field) != request[field]
                     for field in ('job', 'operation', 'action', 'role', 'model', 'effort', 'logical_session')) or
                     self.run('/usr/sbin/getenforce').strip() != 'Enforcing'):
@@ -941,10 +945,10 @@ class Gptbox(Bootstrap):
         for _ in range(2):
             self.engine('start', identity)
             previous = self.ready(identity, sealed, previous)
-            observed = json.loads(self.enter(identity, sealed, 'probe'), object_pairs_hook=fedora_oci.unique)
+            observed = json.loads(self.enter(identity, sealed, 'probe', expected_start=previous), object_pairs_hook=fedora_oci.unique)
             if observed.get('boundary_probe') != 'passed':
                 raise Blocked('runtime boundary probe did not pass')
-            if self.enter(identity, sealed, 'version').strip() != f'codex-cli {version}':
+            if self.enter(identity, sealed, 'version', expected_start=previous).strip() != f'codex-cli {version}':
                 raise Blocked('actual Distrobox entry returned unexpected Codex identity')
             if check_seal is not None:
                 running = self.inspect_container(identity, sealed)
@@ -1061,19 +1065,57 @@ class Gptbox(Bootstrap):
             raise Blocked('host boot or SELinux enforcement changed during imported maintenance test')
         return proof
 
+    def verify_running_offline(self, pid):
+        # Use only the current controller's code. A retained image may have
+        # emitted the original readiness marker with an older probe contract.
+        try:
+            fd = os.open(self.path(f'/proc/{pid}'), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                proc = Path('/proc/self/fd') / str(fd)
+                status = kernel_text(proc / 'status', 8192)
+                for field, expected in (('Uid', self.uid), ('Gid', self.gid)):
+                    rows = re.findall(rf'^{field}:[ \t]+(.+)$', status, re.M)
+                    if len(rows) != 1 or rows[0].split() != [expected] * 4:
+                        raise Blocked('actual maintenance process is outside the managed account')
+                namespaces = {}
+                for namespace in ('net', 'mnt'):
+                    target = os.readlink(proc / 'ns' / namespace)
+                    host = os.readlink(self.path('/proc/self/ns/' + namespace))
+                    pattern = rf'{namespace}:\[[1-9][0-9]*\]'
+                    if target == host or not all(re.fullmatch(pattern, name) for name in (target, host)):
+                        raise Blocked('actual maintenance network or mount namespace is shared with the host')
+                    namespaces[namespace] = target
+                verify_offline_runtime(proc)
+                if any(os.readlink(proc / 'ns' / name) != target for name, target in namespaces.items()):
+                    raise Blocked('maintenance namespaces changed during effective runtime readback')
+            finally:
+                os.close(fd)
+        except RuntimeError as error:
+            raise Blocked(str(error)) from None
+        except (OSError, ValueError, IndexError):
+            raise Blocked('effective maintenance runtime readback is unavailable') from None
+
     def ready(self, identity, sealed, previous_start=None):
         deadline = time.monotonic() + 30
-        first = self.inspect_container(identity, sealed, timeout=5)
-        started = first.get('State', {}).get('StartedAt')
+        first = self.inspect_container(identity, sealed, timeout=5).get('State', {})
+        started, pid = first.get('StartedAt'), first.get('Pid')
         if (not isinstance(started, str) or not re.fullmatch(r'20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:.]+(?:Z|[+-][0-9]{2}:[0-9]{2})', started)
-                or started == previous_start):
+                or started == previous_start or type(pid) is not int or not 1 < pid < 2**31):
             raise Blocked('current container start identity is missing or stale')
+
+        def same_start(item):
+            state = item['State']
+            return (state.get('Running') is True and state.get('Status') == 'running'
+                    and state.get('StartedAt') == started and type(state.get('Pid')) is int and state['Pid'] == pid)
+
         while time.monotonic() < deadline:
-            observed = self.inspect_container(identity, sealed, timeout=5)
-            if observed['State']['Status'] != 'running' or observed['State'].get('StartedAt') != started:
+            if not same_start(self.inspect_container(identity, sealed, timeout=5)):
                 raise Blocked('frozen initializer exited or changed start identity before readiness')
             logs = self.engine('logs', '--since=' + started, '--tail=20', identity, timeout=5)
             if 'container_setup_done' in logs.splitlines():
+                self.verify_running_offline(pid)
+                if not same_start(self.inspect_container(identity, sealed, timeout=5)):
+                    raise Blocked('maintenance container changed during effective runtime readback')
                 return started
             time.sleep(0.2)
         raise Blocked('frozen Distrobox readiness deadline exceeded')

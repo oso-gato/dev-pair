@@ -343,6 +343,30 @@ class MaintenanceImportTests(unittest.TestCase):
         self.assertEqual(self.app.path(self.receipt_path()).read_bytes(), initial)
         self.assertNotEqual(self.app.path(self.receipt_path(boot=REBOOT)).read_bytes(), initial)
 
+    def test_historical_image_probe_boolean_cannot_replace_current_live_readback(self):
+        self.prepare()
+        self.setup_release()
+        self.import_witness()
+        self.assertEqual(json.loads(self.app.seal_files['inputs.json'])['files'][g.RUNTIME], 'e' * 64)
+        # The retained fixture image knows only the old boolean/UID/label response.
+        original = self.app.execute
+
+        def legacy_entry(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if args[-1] == 'probe':
+                self.assertEqual(set(json.loads(result)), {'boundary_probe', 'uid', 'selinux_label'})
+                self.app.run.extra_interface = True
+            return result
+
+        with patch.object(self.app, 'execute', side_effect=legacy_entry):
+            self.assertEqual(self.verify()[0], 2)
+        self.assertEqual(self.app.run.starts, 2)
+        self.assertFalse(self.app.path(self.receipt_path()).exists())
+        self.assertFalse(self.app.run.containers)
+        self.app.run.extra_interface = False
+        self.assertEqual(self.verify()[0], 0)
+        self.assertTrue(self.app.path(self.receipt_path()).is_file())
+
     def test_two_platforms_can_reuse_exact_image_and_preserve_rollback(self):
         self.prepare()
         installs = []

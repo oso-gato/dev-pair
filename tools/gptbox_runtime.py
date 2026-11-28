@@ -127,10 +127,17 @@ def finalize():
             path.chmod(0o444)
     print(json.dumps(sealed, sort_keys=True))
 
+def kernel_text(path, maximum):
+    with path.open('rb') as stream:
+        data = stream.read(maximum + 1)
+    require(len(data) <= maximum, 'runtime kernel readback exceeds its bound')
+    return data.decode('utf-8')
+
+
 def verify_offline_runtime(proc=Path('/proc/self')):
-    interfaces = [line.partition(':')[0].strip() for line in (proc / 'net/dev').read_text().splitlines()[2:]]
+    interfaces = [line.partition(':')[0].strip() for line in kernel_text(proc / 'net/dev', 8192).splitlines()[2:]]
     require(interfaces == ['lo'], 'offline runtime must have only loopback')
-    mounts = [line.split(' - ', 1)[0].split() for line in (proc / 'mountinfo').read_text().splitlines()]
+    mounts = [line.split(' - ', 1)[0].split() for line in kernel_text(proc / 'mountinfo', 1024 ** 2).splitlines()]
     roots = [row[5].split(',') for row in mounts if row[4] == '/']
     require(len(roots) == 1 and 'ro' in roots[0], 'effective runtime root is writable')
     require(not any(row[4] in OFFLINE_CONFIG_FILES for row in mounts), 'unexpected runtime network configuration mount')

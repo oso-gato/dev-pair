@@ -25,6 +25,7 @@ BASE = 'b' * 64
 STAGE = 'c' * 64
 SEALED = 'd' * 64
 RUNTIME = 'e' * 64
+RUNTIME_PID = 43521
 
 class Engine:
     def __init__(self):
@@ -35,6 +36,7 @@ class Engine:
         self.active = False
         self.starts = 0
         self.stale_logs = False
+        self.extra_interface = False
         self.app = None
         self.images={}
 
@@ -123,7 +125,9 @@ class Engine:
                     record['inputs_sha256'] = '0' * 64
                 return 'Synthetic fixture upstream progress\n' + json.dumps(record)
             self.starts += 1
-            self.containers[identity]['State'].update(Status='running', Running=True, StartedAt=f'2026-11-15T00:00:{self.starts:02d}.123456789Z')
+            self.containers[identity]['State'].update(Status='running', Running=True, Pid=RUNTIME_PID,
+                                                      StartedAt=f'2026-11-15T00:00:{self.starts:02d}.123456789Z')
+            self.project_runtime_proc()
         if command[0] == 'logs':
             return '' if self.stale_logs and any(value.startswith('--since=') for value in command) else 'container_setup_done\n'
         if command[0] == 'stop':
@@ -131,6 +135,22 @@ class Engine:
         if command[0] == 'rm':
             self.containers.pop(command[-1], None)
         return ''
+
+    def project_runtime_proc(self):
+        proc = self.app.path(f'/proc/{RUNTIME_PID}')
+        host = self.app.path('/proc/self')
+        for directory in (proc / 'ns', host / 'ns', proc / 'root/etc', proc / 'net'):
+            directory.mkdir(parents=True, exist_ok=True)
+        for kind in ('net', 'mnt'):
+            for path, inode in ((host / 'ns' / kind, 41), (proc / 'ns' / kind, 42)):
+                path.unlink(missing_ok=True)
+                path.symlink_to(f'{kind}:[{inode}]')
+        (proc / 'status').write_text(f'Uid:\t{" ".join([self.app.uid] * 4)}\nGid:\t{" ".join([self.app.gid] * 4)}\n')
+        (proc / 'mountinfo').write_text('1 0 0:1 / / ro,relatime - vfs vfs rw\n')
+        network = 'Inter-| Receive | Transmit\n face | bytes   | bytes\n    lo: 0 0\n'
+        if self.extra_interface:
+            network += '  eth0: 0 0\n'
+        (proc / 'net/dev').write_text(network)
 
 class Fixture(g.Gptbox):
     def preflight(self):
@@ -538,7 +558,7 @@ class GptboxTests(unittest.TestCase):
     def test_restart_requires_new_start_identity_and_current_start_readiness_marker(self):
         self.assemble()
         row = copy.deepcopy(self.engine.saved_runtime)
-        row['State'].update(Status='running', Running=True, StartedAt='2026-11-15T01:02:03.123456789Z')
+        row['State'].update(Status='running', Running=True, Pid=RUNTIME_PID, StartedAt='2026-11-15T01:02:03.123456789Z')
         self.engine.containers[RUNTIME] = row
         with self.assertRaisesRegex(g.Blocked, 'stale'):
             self.app.ready(RUNTIME, SEALED, row['State']['StartedAt'])
@@ -549,6 +569,33 @@ class GptboxTests(unittest.TestCase):
         logs = [call for call, _ in self.engine.calls if 'logs' in call]
         self.assertIn('--since=' + row['State']['StartedAt'], logs[-1])
         self.assertTrue(all(any(value.startswith('--since=') for value in call) for call in logs))
+
+    def test_running_offline_gate_rejects_host_namespaces_and_engine_start_change(self):
+        self.assemble()
+        row = copy.deepcopy(self.engine.saved_runtime)
+        row['State'].update(Status='running', Running=True, Pid=RUNTIME_PID, StartedAt='2026-11-15T01:02:03.123456789Z')
+        self.engine.containers[RUNTIME] = row
+        proc = self.app.path(f'/proc/{RUNTIME_PID}')
+        for kind in ('net', 'mnt'):
+            path = proc / 'ns' / kind
+            path.unlink()
+            path.symlink_to(os.readlink(self.app.path('/proc/self/ns/' + kind)))
+            with self.subTest(kind=kind), self.assertRaisesRegex(g.Blocked, 'shared with the host'):
+                self.app.ready(RUNTIME, SEALED)
+            self.engine.project_runtime_proc()
+        sample = self.app.verify_running_offline
+
+        def change_pid(pid):
+            sample(pid)
+            row['State']['Pid'] += 1
+
+        with patch.object(self.app, 'verify_running_offline', side_effect=change_pid):
+            with self.assertRaisesRegex(g.Blocked, 'changed during effective runtime readback'):
+                self.app.ready(RUNTIME, SEALED)
+        entries = len(self.app.entry_calls)
+        with self.assertRaisesRegex(g.Blocked, 'already running exact target'):
+            self.app.enter(RUNTIME, SEALED, 'version', expected_start='2026-11-15T01:01:01Z')
+        self.assertEqual(len(self.app.entry_calls), entries)
 
     def test_explicit_no_copy_tmpfs_matches_actual_upstream_normalization(self):
         self.assemble()
