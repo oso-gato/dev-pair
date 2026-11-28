@@ -204,6 +204,45 @@ class DayZeroTests(unittest.TestCase):
             self.entry.apply_access(SOURCE, '3' * 40, io.BytesIO(envelope), workload=False)
         self.assertEqual(self.entry.app.finalize.call_args.kwargs, {'recover': True, 'previous_source': '3' * 40})
 
+    def test_matching_legacy_full_applying_journal_uses_native_scoped_recovery(self):
+        from destination_observation import access_envelope
+
+        target = {'source_sha': SOURCE, 'machine_id': MACHINE, 'tailnet': 'tail',
+                  'node_id': 'fixture', 'dns_name': 'erebus.tail.ts.net'}
+        signed = {**target, 'kind': bootstrap.CORE_ACCESS_CUTOVER, 'boot_id': BOOT,
+                  'execution_route': 'provider-recovery', 'keys_sha256': '1' * 64, 'acl_sha256': '2' * 64,
+                  'provider_recovery': 'hostinger://fixture/recovery', 'public_addresses': {'ipv4': None, 'ipv6': None},
+                  'tailnet_addresses': {'ipv4': '100.64.0.1', 'ipv6': 'fd7a:115c:a1e0::1'}}
+        legacy = {key: value for key, value in signed.items() if key not in ('kind', 'tailnet_addresses')}
+        app = bootstrap.Bootstrap(self.directory)
+
+        def journal(data, expected, previous, raw, recover, historical):
+            return app.initial_cutover_journal(data, expected, previous, raw, 'temporary', 'permanent',
+                                               bootstrap.ATTENDED_ACCESS, recover=recover, previous_source=historical,
+                                               receipt_sha='3' * 64, legacy_origin={})
+
+        initial = journal(legacy, target, {}, '', False, None)
+        previous = json.loads(initial)
+        mismatch = {**previous, 'target': {**target, 'machine_id': 'f' * 32}}
+        self.entry.app.signed_evidence.return_value = signed
+
+        with patch.object(day, 'STATE', self.directory), patch.object(day, 'record') as stored:
+            for prior in (mismatch, previous):
+                stored.return_value = prior
+                self.entry.app.finalize.side_effect = (
+                    lambda path, *, recover, previous_source: journal(signed, target, prior, initial, recover, previous_source)
+                )
+                message = io.BytesIO(access_envelope(b'provider fixture', b'signature fixture'))
+                if prior is mismatch:
+                    with self.assertRaises(bootstrap.Blocked):
+                        self.entry.apply_access(SOURCE, SOURCE, message, workload=False)
+                    self.assertFalse(self.entry.app.finalize.call_args.kwargs['recover'])
+                else:
+                    accepted = json.loads(self.entry.apply_access(SOURCE, SOURCE, message, workload=False))
+                    digest = sha256(initial.encode()).hexdigest()
+                    self.assertEqual(accepted['recovery_predecessor_sha256'], digest)
+                    self.assertEqual(app.text(bootstrap.STATE + '/cutover-recovery/' + digest + '.json'), initial)
+
     def test_attended_trust_preserves_other_protected_signers_and_reuses_the_access_key(self):
         target = self.directory / 'allowed_signers'
         signing_key = self.directory / 'review'

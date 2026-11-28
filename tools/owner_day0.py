@@ -730,9 +730,11 @@ class DayZero:
                     target = {key: signed[key] for key in ('source_sha', 'machine_id', 'tailnet', 'node_id', 'dns_name')}
                     earlier = {**target, 'source_sha': historical}
                     prior = history.get('target')
-                    claims = (history.get('intent') or {}).get('claims', {})
-                    recover = recover or (prior in (target, earlier) and (prior != target or any(
-                        claims.get(field) != signed.get(field) for field in ('boot_id', 'execution_route'))))
+                    intent = history.get('intent') or {}
+                    claims = intent.get('claims', {})
+                    route_changed = any(claims.get(field) != signed.get(field) for field in ('boot_id', 'execution_route'))
+                    recover = recover or (prior in (target, earlier)
+                                          and (prior != target or intent.get('kind') == 'legacy-full' or route_changed))
             return self.app.finalize(str(document), recover=recover,
                                      previous_source=historical if historical != revision else None)
 
