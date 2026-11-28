@@ -218,6 +218,11 @@ class Intake:
         base = self.site / 'repositories' / repository
         checkout = protect_directory(base / 'acquired')
         startup = protect_directory(base / 'startup')
+        cache = protect_directory(self.site / 'standards')
+        tree, startup_sha = self.verify_source(repository, config, checkout, startup, cache, checklist=checklist)
+        return checkout, startup, cache, tree, startup_sha
+
+    def verify_source(self, repository, config, checkout, startup, cache, *, checklist):
         checked_file(checkout / '.git/config', 8192)
         commit = config['commit']
         tree = fixed_git(checkout, 'rev-parse', '--verify', commit + '^{tree}').decode().strip()
@@ -225,9 +230,8 @@ class Intake:
         verify_acquired_git(lambda *args, **kw: fixed_git(checkout, *args, **kw), checkout,
                             {'repository': repository, 'acquired_commit': commit, 'acquired_tree': tree},
                             checklist=checklist)
-        cache = protect_directory(self.site / 'standards')
         corpus = load_private(startup, cache, config['startup_revision'], time.monotonic() + 20)
-        return checkout, startup, cache, tree, p.sha256(manifest_bytes(corpus.manifest))
+        return tree, p.sha256(manifest_bytes(corpus.manifest))
 
     def release_slots(self):
         import renewal
@@ -990,9 +994,21 @@ def owner_provider(options):
     return settings, dict(limits, spend_microusd=role_spend), proofs, stamp
 
 
-def first_source(intake, repository, workload):
+def verify_startup_adoption(repository, startup, revision):
     from session_controller import SHARED
 
+    checked_file(startup / '.git/config', 8192)
+    startup_git = lambda *args, **kw: fixed_git(startup, *args, **kw)
+    verify_acquired_git(startup_git, startup, {'repository': repository, 'acquired_commit': revision,
+                        'acquired_tree': startup_git('rev-parse', '--verify', revision + '^{tree}').decode().strip()},
+                        checklist=False)
+    adoption = startup_git('show', revision + ':STANDARDS.md', cap=262144).decode()
+    pins = re.findall(r'https://github\.com/oso-gato/standards/blob/([a-zA-Z0-9._-]+)/([^\s)]+)', adoption)
+    p.require(set(pins) == {(p.STANDARDS, name) for name in SHARED},
+              'The selected project must adopt all three exact shared standards references.')
+
+
+def first_source(intake, repository, workload):
     tree = intake.site / 'repositories' / repository
     try:
         acquired = protect_directory(tree / 'acquired')
@@ -1001,18 +1017,10 @@ def first_source(intake, repository, workload):
                   for key, path in (('commit', acquired), ('startup_revision', startup))}
         for value in config.values():
             p.digest(value, 40)
-        startup_git = lambda *args, **kw: fixed_git(startup, *args, **kw)
-        revision = config['startup_revision']
-        verify_acquired_git(startup_git, startup, {'repository': repository, 'acquired_commit': revision,
-                            'acquired_tree': startup_git('rev-parse', '--verify', revision + '^{tree}').decode().strip()},
-                            checklist=False)
+        verify_startup_adoption(repository, startup, config['startup_revision'])
         _, _, _, source_tree, startup_sha = intake.source(repository, config, checklist=workload == CHECKLIST)
     except FileNotFoundError as exc:
-        raise SitePending('owner-repository-inputs', 'Install the approved Git acquisition, project startup checkout and private standards cache.') from exc
-    adoption = fixed_git(startup, 'show', revision + ':STANDARDS.md', cap=262144).decode()
-    pins = re.findall(r'https://github\.com/oso-gato/standards/blob/([a-zA-Z0-9._-]+)/([^\s)]+)', adoption)
-    p.require(set(pins) == {(p.STANDARDS, name) for name in SHARED},
-              'The selected project must adopt all three exact shared standards references.')
+        raise SitePending('owner-repository-inputs', 'Run the attended owner setup or source recovery to provision the approved checkout and pinned startup inputs.') from exc
     return config, source_tree, startup_sha
 
 
@@ -1179,19 +1187,24 @@ class FirstCatalogue:
         return self.configured(approval)
 
 
+def setup_answer(incoming, outgoing, prompt):
+    outgoing.write(prompt + ' ')
+    outgoing.flush()
+    value = incoming.readline(1025)
+    p.require(value.endswith('\n') and len(value) <= 1024, 'The setup answer was interrupted or too long.')
+    return value.strip()
+
+
 def setup_site(first, incoming, outgoing):
     from gptbox_runtime import PROVIDER_BODY_MAX
+    from owner_source import provision
     from provider_broker import PROFILE, reserved_cost
 
     def say(message):
         print(message, file=outgoing, flush=True)
 
     def ask(prompt):
-        outgoing.write(prompt + ' ')
-        outgoing.flush()
-        value = incoming.readline(1025)
-        p.require(value.endswith('\n') and len(value) <= 1024, 'The setup answer was interrupted or too long.')
-        return value.strip()
+        return setup_answer(incoming, outgoing, prompt)
 
     if first.configured() is not None:
         say('An owner catalogue is already configured. Run ./day0.sh resume.')
@@ -1203,8 +1216,8 @@ def setup_site(first, incoming, outgoing):
         choice = ask('Workload [1/2/3]')
         p.require(choice in ('1', '2', '3'), 'Choose one of the listed workloads.')
         workload = tuple(WORKLOADS)[int(choice) - 1]
-        if not os.path.lexists(first.site / 'repositories' / repository / 'acquired'):
-            raise SitePending('owner-repository-inputs', 'Install the approved Git acquisition and startup inputs for this repository.')
+        if not provision(first.intake, repository, workload, ask, say):
+            return
         say('Setup requires an approved direct OpenAI API account. Enter only its credential reference.')
         with warnings.catch_warnings():
             warnings.simplefilter('error', getpass.GetPassWarning)
@@ -1244,7 +1257,7 @@ def setup_site(first, incoming, outgoing):
             return
         options.confirm_sha256 = p.identity(plan)
         first.initialize(options)
-        say('Owner catalogue configured. Run ./day0.sh resume for the existing activation checks.')
+        say('Owner catalogue configured. The protected activation checks can now continue.')
     except SitePending as wait:
         say(wait.observation['message'])
     except (EOFError, KeyboardInterrupt):
@@ -1255,12 +1268,16 @@ def catalogue_command(intake, argv):
     p.require(os.getuid() == os.geteuid() == 0 and not os.environ.get('SUDO_USER'),
               'Use the protected root commissioning terminal for first owner setup.')
     first = FirstCatalogue(intake)
-    if argv[:1] == ['--setup-site']:
-        p.require(argv == ['--setup-site'], 'Run the attended setup command without arguments.')
+    if argv[:1] in (['--setup-site'], ['--restore-source']):
+        p.require(len(argv) == 1, 'Run the attended command without additional arguments.')
         try:
             with open('/dev/tty', encoding='utf-8') as incoming, open('/dev/tty', 'w', encoding='utf-8') as outgoing:
                 p.require(incoming.isatty() and outgoing.isatty(), 'First owner setup requires the controlling terminal.')
-                setup_site(first, incoming, outgoing)
+                if argv[0] == '--setup-site':
+                    setup_site(first, incoming, outgoing)
+                else:
+                    from owner_source import restore
+                    restore(first, incoming, outgoing)
         except OSError as exc:
             if exc.errno in (errno.ENXIO, errno.ENOTTY):
                 raise ValueError('Open the protected root terminal to run first owner setup.') from exc
@@ -1330,7 +1347,7 @@ def main():
     try:
         p.require(os.geteuid() == 0, 'The installed intake service requires its protected account.')
         intake = Intake()
-        if sys.argv[1:2] and sys.argv[1] in ('--setup-site', '--inspect-site', '--initialize-site'):
+        if sys.argv[1:2] and sys.argv[1] in ('--setup-site', '--restore-source', '--inspect-site', '--initialize-site'):
             return catalogue_command(intake, sys.argv[1:])
         if sys.argv[1:] == ['--reconcile'] and not os.environ.get('SUDO_USER'):
             return intake.reconcile()
@@ -1378,4 +1395,6 @@ def main():
 
 
 if __name__ == '__main__':
+    # The attended provisioning helper shares this command's protected input checks.
+    sys.modules['owner_intake'] = sys.modules[__name__]
     raise SystemExit(main())

@@ -19,6 +19,7 @@ sys.path.insert(0, str(REPO_ROOT / 'tools'))
 import gptbox
 import gptbox_runtime
 import owner_intake as owner
+import owner_source
 import platform_release_intake
 import product_job as product
 import provider_broker
@@ -85,6 +86,10 @@ class FirstCatalogueTests(unittest.TestCase):
                         {'id': name, 'sha256': sha256(self.documents[name + '.txt']),
                          'bytes': len(self.documents[name + '.txt'])} for name in owner.IDS]}
         self.documents['manifest.json'] = owner.manifest_bytes(manifest)
+        shared = {name: ('Synthetic standards ' + name + '\n').encode() for name in owner_source.SHARED}
+        for name, body in shared.items():
+            owner.write_private(self.site / 'standards' / name, body)
+        self.use(mock.patch.object(owner_source, 'SHARED', {name: sha256(body) for name, body in shared.items()}))
         self.use(mock.patch.object(owner, 'load_private', return_value=SimpleNamespace(manifest=manifest)))
         self.use(mock.patch.multiple(owner, CREDENTIALS=self.credential.parent, BILLING_EVIDENCE=self.billing.parent))
         self.use(mock.patch.object(owner, 'protect_directory',
