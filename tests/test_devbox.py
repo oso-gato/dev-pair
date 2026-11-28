@@ -229,6 +229,9 @@ class TestConfinementContract(unittest.TestCase):
                 argv = db.container_args('owned', OWNER, value, side, '/empty')
                 self.assertIn('--read-only', argv)
                 self.assertIn('--network=none', argv)
+                self.assertIn('--no-hosts', argv)
+                self.assertIn('--no-hostname', argv)
+                self.assertFalse(any(option.startswith('--dns') for option in argv))
                 self.assertIn('--pull=never', argv)
                 self.assertIn('--timeout=' + str(lifetime), argv)
                 self.assertFalse(any(bad in arg for arg in argv
@@ -380,6 +383,13 @@ class TestConfinementContract(unittest.TestCase):
         altered['HostConfig']['SecurityOpt'] = ['label=disable']
         with self.assertRaisesRegex(db.Blocked, 'confinement exception'):
             db.inspect_policy(altered, CHILD, OWNER, value, 'inner', mounts)
+        for field in ('Dns', 'DnsOptions', 'DnsSearch'):
+            altered = deepcopy(row)
+            altered['HostConfig'][field] = ['unexpected']
+            with self.subTest(field=field), self.assertRaisesRegex(db.Blocked, 'engine-managed resolver'):
+                db.inspect_policy(altered, CHILD, OWNER, value, 'inner', mounts)
+        with self.assertRaisesRegex(db.Blocked, 'engine-managed resolver'):
+            db.inspect_policy({**row, 'ResolvConfPath': '/unexpected/resolver'}, CHILD, OWNER, value, 'inner', mounts)
 
     def test_effective_mount_flags_detect_writable_root_or_cgroup(self):
         content = '''28 1 0:11 / / ro,relatime - vfs root rw
@@ -393,6 +403,10 @@ class TestConfinementContract(unittest.TestCase):
             path = root / 'mountinfo'
             path.write_text(content)
             db.observed_mounts(root, {'/work/job': True})
+            for target in ('/etc/hostname', '/etc/hosts', '/etc/resolv.conf'):
+                path.write_text(content + f'53 28 0:16 / {target} ro,nosuid,nodev,noexec - ext4 tmp rw\n')
+                with self.subTest(target=target), self.assertRaisesRegex(db.Blocked, 'network configuration mount'):
+                    db.observed_mounts(root, {'/work/job': True})
             for original, replacement, failure in (
                     (' / ro,', ' / rw,', 'root filesystem'),
                     ('cgroup ro,', 'cgroup rw,', 'cgroup filesystem'),
@@ -401,6 +415,18 @@ class TestConfinementContract(unittest.TestCase):
                     path.write_text(content.replace(original, replacement))
                     with self.assertRaisesRegex(db.Blocked, failure):
                         db.observed_mounts(root, {'/work/job': True})
+
+    def test_live_nested_interfaces_are_loopback_only(self):
+        with TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            (proc / 'net').mkdir()
+            interfaces = proc / 'net/dev'
+            healthy = 'Inter-| Receive | Transmit\n face | bytes   | bytes\n    lo: 0 0\n'
+            interfaces.write_text(healthy)
+            db.offline_interfaces(proc)
+            interfaces.write_text(healthy + '  eth0: 0 0\n')
+            with self.assertRaisesRegex(db.Blocked, 'only loopback'):
+                db.offline_interfaces(proc)
 
     def test_development_seal_cannot_reuse_maintenance_identity(self):
         for role in ('development', 'maintenance'):

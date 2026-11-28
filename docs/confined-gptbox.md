@@ -74,8 +74,11 @@ Runtime uses nonroot UID/GID1000, keep-id mapping to the restricted service user
 read-only image/home/CODEX_HOME, no capabilities, NNP, default seccomp, private
 namespaces, no network and exact writable probe leaves under the maintenance
 workspace/state/cache classes. Controller code/configuration, engine storage and
-admission records remain outside those mounts. Host integration files are kept
-image-owned using `--no-hosts`, `--no-hostname`, `--dns=none`. The controller
+admission records remain outside those mounts. The offline profile uses
+`--network=none`, `--no-hosts`, and `--no-hostname`. On Fedora Cloud 44, Podman
+suppresses its generated resolver in this network mode. Live `/proc` checks
+require loopback as the only interface and reject separate mounts for the
+resolver, hosts and hostname files. The controller
 inspects exact IDs, capabilities, labels, mappings, mounts, namespaces and
 2GiB/256PID/one-CPU limits before entering. The image probe tests effective
 UID/caps/NNP/seccomp/SELinux, rejected code/config writes, legitimate data writes

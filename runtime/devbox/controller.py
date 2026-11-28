@@ -466,7 +466,7 @@ def container_args(name, owner, manifest, side, hooks):
             f'--timeout={OUTER_SECONDS if outer else INNER_SECONDS}', '--read-only', '--read-only-tmpfs=false',
             '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--network=none', '--pid=private',
             '--ipc=private', '--uts=private', '--log-driver=k8s-file',
-            '--log-opt=max-size=1mb', '--no-hosts', '--no-hostname', '--dns=none',
+            '--log-opt=max-size=1mb', '--no-hosts', '--no-hostname',
             '--image-volume=ignore', '--http-proxy=false', '--sdnotify=ignore', '--systemd=false',
             f'--hooks-dir={hooks}', '--workdir=/', '--unsetenv-all',
             f'--security-opt=label=level:{label_level(manifest, side)}']
@@ -495,6 +495,8 @@ def inspect_policy(row, identity, owner, manifest, side, mounts):
             and all(host.get(key) == 'private' for key in ('PidMode', 'IpcMode', 'UTSMode'))
             and host.get('UsernsMode') in ('private', 'keep-id'),
             f'{side} runtime readonly/namespace policy mismatch')
+    require(row.get('ResolvConfPath', '') == '' and all(host.get(key, []) == [] for key in ('Dns', 'DnsOptions', 'DnsSearch')),
+            f'{side} offline runtime has engine-managed resolver configuration')
     require(same_label(row.get('ProcessLabel'), process_label(manifest, side))
             and same_label(row.get('MountLabel'), file_label(manifest, side)), f'{side} SELinux policy mismatch')
     require(config.get('Timeout') == (OUTER_SECONDS if outer else INNER_SECONDS)
@@ -612,6 +614,8 @@ def observed_mounts(root, binds):
         return entries[0]
 
     require('ro' in find('/')[0], 'effective root filesystem is writable')
+    require(not {'/etc/hostname', '/etc/hosts', '/etc/resolv.conf'}.intersection(rows),
+            'unexpected runtime network configuration mount')
     if '/sys/fs/cgroup' in rows:
         require('ro' in find('/sys/fs/cgroup')[0], 'effective cgroup filesystem is writable')
     for target in ('/run', '/tmp'):
@@ -624,6 +628,11 @@ def observed_mounts(root, binds):
         if target not in (GRAPHROOT, PARENT_BUILD, JOB_BUILD):
             expected.add('noexec')
         require(expected <= options, f'effective mount flags differ at {target}')
+
+
+def offline_interfaces(proc):
+    interfaces = [line.partition(':')[0].strip() for line in (proc / 'net/dev').read_text().splitlines()[2:]]
+    require(interfaces == ['lo'], 'offline runtime must have only loopback')
 
 
 def probe_parent_writes():
@@ -740,6 +749,7 @@ def controller(expected, owner, seconds, operation=None, request_sha=None, *, pr
     require(os.getuid() == os.getgid() == 1000 and os.getgroups() in ([], [1000]), 'controller user mismatch')
     self_proc = Path('/proc/self')
     parent = proc_snapshot(self_proc, OUTER_CAPS, 0, process_label(manifest, 'outer'), 1000, 1000)
+    offline_interfaces(self_proc)
     observed_mounts(self_proc, {GRAPHROOT: True, IMAGE_COPY_DIR: True, ARCHIVE: False, MANIFEST: False,
                                **{f'{PARENT_JOB}/{key}': True for key in JOB_TARGETS},
                                **({PARENT_BUILD: True, **dict.fromkeys(ADMISSION_ROLE.values(), False)} if job else {})})
@@ -795,6 +805,7 @@ def controller(expected, owner, seconds, operation=None, request_sha=None, *, pr
             require(type(pid) is int and pid > 1, 'inner PID is unavailable to parent')
             proc = Path('/proc') / str(pid)
             child = proc_snapshot(proc, (0, 0, 0, 0, 0), 1, process_label(manifest, 'inner'), 1000, 1000)
+            offline_interfaces(proc)
             observed_mounts(proc, {dest: writable for dest, (_, writable) in target.items()})
             require(child['cgroup'] == parent['cgroup']
                     and all(child['namespaces'][key] != parent['namespaces'][key] for key in NS_NAMES),

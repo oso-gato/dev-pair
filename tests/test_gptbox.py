@@ -15,6 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import gptbox as g
+import gptbox_runtime as runtime
 
 REAL_COPY_WORKSPACE = g.fedora_oci.copy_workspace
 REAL_RECOVER_WORKSPACES = g.fedora_oci.recover_workspaces
@@ -236,6 +237,8 @@ class GptboxTests(unittest.TestCase):
         self.assertEqual(len(creates), 2)
         self.assertTrue(any('--network=slirp4netns:allow_host_loopback=false' in call for call in creates))
         self.assertTrue(any('--userns=keep-id:uid=1000,gid=1000' in call for call in creates))
+        self.assertTrue({'--network=none', '--no-hosts', '--no-hostname', '--read-only'} <= set(creates[1]))
+        self.assertFalse(any(value.startswith('--dns') for value in creates[1]))
         self.assertTrue(all('--privileged' not in call and '--security-opt=label=disable' not in call for call in creates))
         self.assertIn(g.FINAL_HOOK, creates[0])
         self.assertIn(g.FROZEN_HOOK, creates[1])
@@ -415,6 +418,10 @@ class GptboxTests(unittest.TestCase):
             lambda row: row['HostConfig'].update(IpcMode='host'),
             lambda row: row['HostConfig'].update(UsernsMode='host'),
             lambda row: row['HostConfig'].update(NetworkMode='bridge'),
+            lambda row: row['HostConfig'].update(Dns=['192.0.2.1']),
+            lambda row: row['HostConfig'].update(DnsOptions=['unknown.option']),
+            lambda row: row['HostConfig'].update(DnsSearch=['example.invalid']),
+            lambda row: row.update(ResolvConfPath='/unexpected/resolv.conf'),
             lambda row: row['HostConfig'].update(Memory=0),
             lambda row: row['HostConfig'].update(PidsLimit=-1),
             lambda row: row['HostConfig'].update(NanoCpus=0),
@@ -434,6 +441,28 @@ class GptboxTests(unittest.TestCase):
             with self.assertRaises(g.Blocked):
                 self.app.enter(RUNTIME, SEALED, 'version')
         self.assertEqual(len(self.app.entry_calls), before)
+
+    def test_frozen_runtime_accepts_only_loopback_and_image_owned_configuration(self):
+        proc = self.root / 'proc-fixture'
+        (proc / 'net').mkdir(parents=True)
+        network = proc / 'net/dev'
+        mounts = proc / 'mountinfo'
+        default_network = 'Inter-| Receive | Transmit\n face | bytes   | bytes\n    lo: 0 0\n'
+        default_mounts = '1 0 0:1 / / ro,relatime - vfs vfs rw\n'
+        network.write_text(default_network)
+        mounts.write_text(default_mounts)
+        runtime.verify_offline_runtime(proc)
+        network.write_text(default_network + '  eth0: 0 0\n')
+        with self.assertRaisesRegex(RuntimeError, 'only loopback'):
+            runtime.verify_offline_runtime(proc)
+        network.write_text(default_network)
+        for target in runtime.OFFLINE_CONFIG_FILES:
+            mounts.write_text(default_mounts + f'2 1 0:2 / {target} ro,relatime - vfs vfs rw\n')
+            with self.subTest(target=target), self.assertRaisesRegex(RuntimeError, 'network configuration mount'):
+                runtime.verify_offline_runtime(proc)
+        mounts.write_text(default_mounts.replace(' / ro,', ' / rw,'))
+        with self.assertRaisesRegex(RuntimeError, 'root is writable'):
+            runtime.verify_offline_runtime(proc)
 
     def test_busy_executor_is_not_duplicated_and_retry_stops_it_before_recovery(self):
         self.engine.bad_attestation = True

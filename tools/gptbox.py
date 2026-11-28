@@ -52,6 +52,7 @@ RELEASE_INNER = 'inner.json'
 INIT = ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt', '--init', '0']
 FINAL_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' finalize'
 FROZEN_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' frozen'
+OFFLINE_NETWORK_ARGS = ('--network=none', '--no-hosts', '--no-hostname')
 JOB_ENTER_WRAPPER = ('#!/bin/sh\ncase "$1" in inspect|exec) ;; *) exit 64 ;; esac\n'
                      'exec ' + CONTROL + '/bin/podman "$@"\n')
 ASSEMBLY_LIFETIME = 900
@@ -590,6 +591,9 @@ class Gptbox(Bootstrap):
         if host.get('UsernsMode') not in (('private', 'keep-id') if runtime else ('private',)):
             raise Blocked('host user namespace is not admitted')
         if runtime:
+            if (item.get('ResolvConfPath', '') != '' or
+                    any(host.get(key, []) != [] for key in ('Dns', 'DnsOptions', 'DnsSearch'))):
+                raise Blocked('offline runtime has engine-managed resolver configuration')
             if (not host.get('ReadonlyRootfs') or config.get('User') != '1000:1000'
                     or host.get('CapAdd') or item.get('EffectiveCaps') != [] or item.get('BoundingCaps') != []
                     or not any('no-new-privileges' in str(value) for value in host.get('SecurityOpt', []))):
@@ -733,10 +737,10 @@ class Gptbox(Bootstrap):
                 '--label=' + marker, '--label=manager=distrobox', '--label=distrobox.unshare_groups=0',
                 '--pull=never', '--restart=no', '--timeout=' + timeout, '--read-only', '--read-only-tmpfs=false',
                 '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL',
-                '--security-opt=no-new-privileges', '--security-opt=label=level:' + match[1], '--network=none',
+                '--security-opt=no-new-privileges', '--security-opt=label=level:' + match[1], *OFFLINE_NETWORK_ARGS,
                 '--pid=private', '--ipc=private', '--uts=private', '--cgroupns=private', '--memory=2g',
                 '--memory-swap=2g', '--pids-limit=256', '--cpus=1', '--http-proxy=false', '--image-volume=ignore',
-                '--no-hosts', '--no-hostname', '--dns=none', '--systemd=false', '--log-driver=k8s-file', '--log-opt=max-size=1mb',
+                '--systemd=false', '--log-driver=k8s-file', '--log-opt=max-size=1mb',
                 '--tmpfs=/run:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size=16m',
                 '--tmpfs=/tmp:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size=16m',
                 '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), *mount_args,
@@ -923,8 +927,8 @@ class Gptbox(Bootstrap):
         return image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + context,
                         '--timeout=' + str(RUNTIME_LIFETIME), '--restart=no', '--read-only', '--read-only-tmpfs=false',
                         '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL',
-                        '--security-opt=no-new-privileges', '--network=none', '--pid=private', '--ipc=private',
-                        '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1', '--no-hosts', '--no-hostname', '--dns=none',
+                        '--security-opt=no-new-privileges', *OFFLINE_NETWORK_ARGS, '--pid=private', '--ipc=private',
+                        '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1',
                         '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
                         '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
                         '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox',

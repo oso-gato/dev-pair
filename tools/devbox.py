@@ -302,6 +302,7 @@ def observe_parent(row, manifest, account):
     proc = Path('/proc') / str(pid)
     observed = db.proc_snapshot(proc, db.OUTER_CAPS, 0, db.process_label(manifest, 'outer'),
                                 account.pw_uid, account.pw_gid)
+    db.offline_interfaces(proc)
     db.require(all(observed['namespaces'][name] != os.readlink('/proc/self/ns/' + name) for name in db.NS_NAMES),
                'parent does not have private host-facing namespaces')
     db.require(os.readlink(proc / 'ns/cgroup') != os.readlink('/proc/self/ns/cgroup'),

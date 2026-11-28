@@ -39,6 +39,7 @@ TURN_READONLY_MOUNTS = (REQUIREMENTS.parent, TURN_INPUTS, CREDENTIAL.parent,
                         *(CODEX_HOME / name for name in (*LOADER_FILES, *LOADER_DIRS)))
 PROVIDER_DIR = Path('/run/dev-pair-provider')
 PROVIDER_SOCKET = PROVIDER_DIR / 'responses.sock'
+OFFLINE_CONFIG_FILES = ('/etc/hostname', '/etc/hosts', '/etc/resolv.conf')
 REPOSITORY_APPROVALS = Path('/var/lib/dev-pair/repository-approvals')
 JOB_READONLY_MOUNTS = (REQUIREMENTS.parent, TURN_INPUTS, PROVIDER_DIR,
                        *(CODEX_HOME / name for name in (*LOADER_FILES, *LOADER_DIRS)))
@@ -126,9 +127,19 @@ def finalize():
             path.chmod(0o444)
     print(json.dumps(sealed, sort_keys=True))
 
+def verify_offline_runtime(proc=Path('/proc/self')):
+    interfaces = [line.partition(':')[0].strip() for line in (proc / 'net/dev').read_text().splitlines()[2:]]
+    require(interfaces == ['lo'], 'offline runtime must have only loopback')
+    mounts = [line.split(' - ', 1)[0].split() for line in (proc / 'mountinfo').read_text().splitlines()]
+    roots = [row[5].split(',') for row in mounts if row[4] == '/']
+    require(len(roots) == 1 and 'ro' in roots[0], 'effective runtime root is writable')
+    require(not any(row[4] in OFFLINE_CONFIG_FILES for row in mounts), 'unexpected runtime network configuration mount')
+
+
 def frozen():
     if (os.getuid(), os.getgid()) != (1000, 1000):
         raise RuntimeError('frozen init must be unprivileged')
+    verify_offline_runtime()
     verify_files()
     sealed = json.loads((BASE / 'sealed.json').read_text())
     if sealed['inputs_sha256'] != digest(BASE / 'inputs.json') or sealed['packages_sha256'] != digest(BASE / 'packages.txt'):
@@ -138,6 +149,7 @@ def frozen():
     os.execv('/usr/bin/sleep', ['sleep', 'infinity'])
 
 def probe():
+    verify_offline_runtime()
     verify_files()
     if (os.getuid(), os.getgid()) != (1000, 1000) or os.getgroups() not in ([], [1000]):
         raise RuntimeError('runtime identity/groups mismatch')
@@ -158,7 +170,7 @@ def probe():
             os.close(descriptor)
             path.unlink()
             raise RuntimeError('managed code/configuration is writable')
-    for target in ('/etc/hostname', '/etc/hosts', '/etc/resolv.conf', '/etc/profile',
+    for target in (*OFFLINE_CONFIG_FILES, '/etc/profile',
                    '/home/gpt/.bashrc', str(CODEX), '/usr/bin/distrobox-init', __file__):
         if not Path(target).exists():
             continue
