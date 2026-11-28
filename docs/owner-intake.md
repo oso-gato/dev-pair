@@ -73,22 +73,23 @@ release with root ownership and protected ancestors.
 
 Commissioning enables `dev-pair-intake-recovery.timer` after the configured
 role and product roots and a current site grant are present. The timer observes
-only confirmed jobs from the bounded intake catalogue. A job has up to eight
-schedule attempts and four preparation attempts. A confirmed job with an
-acknowledged product start can recover once per boot while its durable
-product state is eligible. When the conductor records a protected renewal
-fence, the recovery timer checks for verified dispatch and restarts that same
-job after thaw, including on the same boot. The product entry checks the staged
-plan against the confirmed agreement before it can schedule work. Waiting at
-the fence uses no schedule attempts. When the current protected renewal closes
-workload access, the timer can record the hold for an acknowledged job whose
-worker has yet to observe it. Work dispatch still requires verified access on
-the selected runtime. Restart uses the remaining schedule
-allowance and retains any deadline for an earlier product error. An exhausted
-wait recorded before this behavior stays available for inspection. Its record
-identifies the last error, so a separate recovery review must check the exact
-pending operation and its remaining allowance before further execution.
-Terminal jobs also stay available for inspection.
+only confirmed jobs from the bounded intake catalogue. Initial intake has up
+to eight schedule attempts and four preparation attempts. After the product
+start is acknowledged, a restart uses a separate allowance of up to eight
+schedule attempts for the verified transition on the current boot. The timer
+can restart the same eligible job after boot or after a protected renewal
+thaws on the same boot. It checks the current release before scheduling. The
+product entry compares the staged plan with the confirmed agreement before
+dispatch. Waiting at the fence spends no schedule attempts. While a protected
+renewal closes workload access, the timer can record the hold for an
+acknowledged job whose worker has yet to observe it.
+
+Recovering a scheduled job preserves the deadline for any earlier product
+error. If scheduling reaches its limit, the owner can inspect the retained job.
+A later protected transition or boot can provide a new scheduling allowance
+for a still-eligible job. An exhausted wait from an earlier product error
+requires a separate review of the exact pending operation and remaining
+authority before further execution. Terminal jobs remain available for inspection.
 
 The named operator rule invokes the fixed entry with zero command-line
 arguments. The entry accepts a bounded stdin request containing the

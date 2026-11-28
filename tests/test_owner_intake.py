@@ -251,7 +251,8 @@ class OwnerIntakeTests(unittest.TestCase):
                 self.assertEqual(worker.prepare(job), 0)
                 self.assertEqual(published.stat().st_ino, original_node)
                 self.assertEqual(published.read_bytes(), initial)
-                with mock.patch.object(intake, 'boot_id', return_value='00000000-0000-4000-8000-000000000001'):
+                with (mock.patch.object(intake, 'boot_id', return_value='00000000-0000-4000-8000-000000000001'),
+                      mock.patch.object(product, 'renewal_dispatch_epoch', return_value='boot')):
                     self.assertEqual(worker.reconcile(), 0)
                     self.assertEqual(worker.prepare(job), 0)
                 terminal = product.read_state(product.job_path(job))
@@ -261,7 +262,7 @@ class OwnerIntakeTests(unittest.TestCase):
                     self.assertEqual(worker.reconcile(), 0)
         self.assertEqual(starts, ['dev-pair-intake@job-a.service', 'dev-pair-intake@job-a.service',
                                   'dev-pair-product@job-a.service', 'dev-pair-intake@job-a.service',
-                                  'dev-pair-product@job-a.service', 'dev-pair-intake@job-a.service',
+                                  'dev-pair-product@job-a.service',
                                   'dev-pair-product@job-a.service'])
         self.assertEqual([role for role, _ in saved_profiles], list(intake.ROLES))
         self.assertEqual(product.read_state(product.job_path(job))['phase'], 'blocked')
@@ -352,8 +353,9 @@ class OwnerIntakeTests(unittest.TestCase):
             scheduled.assert_called_once()
             self.assertEqual(scheduled.call_args.args[0], [intake.SYSTEMCTL, 'start', '--no-block',
                                                            'dev-pair-product@' + job + '.service'])
-            self.assertEqual(self.intake.record(job)['recovery']['queue_attempts'], recovery['queue_attempts'] + 1)
-            self.assertEqual(self.intake.record(job)['recovery']['prepare_attempts'], recovery['prepare_attempts'])
+            saved = self.intake.record(job)
+            self.assertEqual(saved['recovery'], recovery)
+            self.assertEqual(saved['renewal_wake']['epochs'][attempt.name]['attempts'], 1)
             self.assertEqual(product.main(['work', job]), 0)
             self.assertEqual(intake.main(), 0)
             self.assertEqual(product.main(['work', job]), 0)
@@ -405,7 +407,7 @@ class OwnerIntakeTests(unittest.TestCase):
         product.write_private(staged, p.canonical(other_plan).encode())
 
         with (mock.patch.object(product, 'ROOT', self.root),
-              mock.patch.object(product, 'renewal_dispatch_ready', return_value=True),
+              mock.patch.object(product, 'renewal_dispatch_epoch', return_value='boot'),
               mock.patch.multiple(product.candidate, ROOT=self.root,
                                   protected_file=lambda file, limit=p.MAX_MESSAGE: p.read_data(file, limit)),
               mock.patch.object(intake.candidate, 'invoke', return_value=b'') as scheduled):

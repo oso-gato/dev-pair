@@ -27,7 +27,7 @@ import job_protocol as p
 import product_job as product
 import provider_billing as billing
 from ledger_recovery import read_private, sync_directory, trusted_directory, write_private
-from renewal import DispatchDeferred as RenewalDispatchDeferred
+from renewal import DispatchDeferred as RenewalDispatchDeferred, MAX_ATTEMPTS as MAX_RENEWAL_ATTEMPTS
 from startup_delivery import IDS, load_private
 
 SITE = Path('/etc/dev-pair/product-intake')
@@ -43,6 +43,8 @@ MAX_INPUT = 8192
 MAX_SLOTS = 64
 QUEUE_ATTEMPTS = 8
 PREPARE_ATTEMPTS = 4
+WAKE_ATTEMPTS = 8
+WAKE_EXHAUSTED = 'Automatic scheduling after renewal reached its limit for the verified transition.'
 RETRY_SECONDS = 30
 PREPARE_SECONDS = 300
 SEED_BYTES = 6 * 1024 * 1024
@@ -515,6 +517,39 @@ class Intake:
         saved.update(phase='blocked', diagnostics=reason)
         self.save(job, saved)
 
+    def wake_product(self, job, saved, epoch, boot, deadline):
+        history = saved.get('renewal_wake')
+        if history is None or history['boot'] != boot:
+            history = saved['renewal_wake'] = {'boot': boot, 'epochs': {}}
+        epochs = history['epochs']
+        p.require(epoch in epochs or len(epochs) < MAX_RENEWAL_ATTEMPTS + 1,
+                  'The current boot renewal scheduling catalogue exceeds its bound.')
+        entry = epochs.setdefault(epoch, {'after': 0, 'attempts': 0})
+        now = int(time.monotonic())
+        previous_after = entry['after']
+        if now < previous_after:
+            return
+        if entry['attempts'] >= WAKE_ATTEMPTS:
+            if saved['diagnostics'] != WAKE_EXHAUSTED:
+                saved['diagnostics'] = WAKE_EXHAUSTED
+                self.save(job, saved)
+            return
+        if saved['diagnostics'] == WAKE_EXHAUSTED:
+            saved['diagnostics'] = None
+        entry['attempts'] += 1
+        entry['after'] = now + RETRY_SECONDS
+        self.save(job, saved)
+        try:
+            self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline)
+        except RenewalDispatchDeferred:
+            entry['attempts'] -= 1
+            entry['after'] = previous_after
+        except DispatchDeferred:
+            return
+        else:
+            saved['scheduled_boot'] = boot
+        self.save(job, saved)
+
     def schedule(self, job, saved, deadline):
         fence = product.workload_renewal_fence(self.root)
         if fence is not None:
@@ -524,7 +559,6 @@ class Intake:
                 except BlockingIOError:
                     return  # The product worker still owns this job's state.
             return
-        wake_product = False
         if saved['phase'] == 'blocked' and 'recovery' not in saved and saved['diagnostics'] in LEGACY_SCHEDULING_FAILURES:
             state = self.published(job, saved['plan'])
             if state is None or state['phase'] != 'submitted':
@@ -534,39 +568,27 @@ class Intake:
         if saved['phase'] == 'submitted':
             state = self.published(job, saved['plan'])
             p.require(state is not None, 'The acknowledged product plan is unavailable.')
-            wake_product = product.pending_renewal(state) is not None
-            if wake_product and not product.renewal_dispatch_ready(self.root):
-                return
-            if not wake_product and saved.get('scheduled_boot') == boot_id():
-                return
             if state['phase'] in product.TERMINAL or (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic')):
                 return
+            boot = boot_id()
+            if product.pending_renewal(state) is None and saved.get('scheduled_boot') == boot:
+                return
+            epoch = product.renewal_dispatch_epoch(self.root)
+            if epoch is not None:
+                self.wake_product(job, saved, epoch, boot, deadline)
+            return
         elif saved['phase'] not in ('confirmed', 'preparing'):
             return
         entry = self.recovery(saved)
         now = int(time.monotonic())
-        previous_after = entry['after']
-        if now < previous_after:
+        if now < entry['after']:
             return
-        if entry['queue_attempts'] >= QUEUE_ATTEMPTS or (not wake_product and entry['prepare_attempts'] >= PREPARE_ATTEMPTS):
+        if entry['queue_attempts'] >= QUEUE_ATTEMPTS or entry['prepare_attempts'] >= PREPARE_ATTEMPTS:
             self.block(job, saved, 'Automatic scheduling recovery reached its limit. The confirmed plan and job evidence are retained.')
             return
         entry['queue_attempts'] += 1
         entry['after'] = now + RETRY_SECONDS
         self.save(job, saved)
-        if wake_product:
-            try:
-                self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline)
-            except RenewalDispatchDeferred:
-                entry['queue_attempts'] -= 1
-                entry['after'] = previous_after
-                self.save(job, saved)
-                return
-            except DispatchDeferred:
-                return
-            saved['scheduled_boot'] = entry['boot']
-            self.save(job, saved)
-            return
         try:
             candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
                              min(deadline, time.monotonic() + 5))

@@ -718,24 +718,27 @@ def protected_renewal_fence(root):
     return fence
 
 
-def workload_renewal_fence(root):
-    """Allow renewal bookkeeping when a protected current fence holds workload access."""
+def current_renewal_fence(root):
     from renewal import Renewal
 
+    fence = protected_renewal_fence(root)
+    if fence in (None, 'boot'):
+        return fence
+    try:
+        attempt, _ = Renewal(root, None).transition()
+    except (OSError, ValueError):
+        return None
+    return fence if attempt is not None and attempt.name == fence else None
+
+
+def workload_renewal_fence(root):
+    """Allow renewal bookkeeping when a protected current fence holds workload access."""
     try:
         p.require_workload_access(root)
     except (OSError, ValueError):
-        fence = protected_renewal_fence(root)
-        if fence == 'boot':
-            return fence
+        fence = current_renewal_fence(root)
         if fence is not None:
-            try:
-                attempt, _ = Renewal(root, None).transition()
-            except (OSError, ValueError):
-                pass
-            else:
-                if attempt is not None and attempt.name == fence:
-                    return fence
+            return fence
         # Access may have been re-admitted and the marker cleared between reads.
         p.require_workload_access(root)
     return None
@@ -753,14 +756,17 @@ def record_renewal_wait(state, fence, now):
     return True
 
 
-def renewal_dispatch_ready(root):
+def renewal_dispatch_epoch(root):
+    """Read the current authorized attempt while ordinary dispatch is admitted."""
     from renewal import DispatchDeferred, Renewal
 
+    controller = Renewal(root, None)
     try:
-        with Renewal(root, None).dispatch_gate():
-            return True
+        with controller.dispatch_gate():
+            attempt, _ = controller.transition()
+            return attempt.name if attempt is not None else 'boot'
     except (BlockingIOError, DispatchDeferred):
-        return False
+        return None
 
 
 def pending_renewal(state):
@@ -789,7 +795,13 @@ def locked_job_state(job):
 
 
 def park_workload_renewal(root, state, fence):
-    if state['phase'] in TERMINAL or pending_renewal(state) is not None:
+    if state['phase'] in TERMINAL:
+        return
+    wait = pending_renewal(state)
+    if wait is not None:
+        if wait['fence'] != fence:
+            wait['fence'] = fence
+            durable_json(root / 'state.json', state)
         return
     if record_renewal_wait(state, fence, int(time.time())):
         durable_json(root / 'state.json', state)
@@ -820,7 +832,10 @@ def work(job):
             park_workload_renewal(root, state, fence)
             return state
         if wait is not None:
-            if not renewal_dispatch_ready(ROOT):
+            if renewal_dispatch_epoch(ROOT) is None:
+                fence = current_renewal_fence(ROOT)
+                if fence is not None:
+                    park_workload_renewal(root, state, fence)
                 return state
             del state['renewal_wait']
             state['phase'] = wait['phase']

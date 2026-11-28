@@ -593,7 +593,7 @@ class ProductJobTests(unittest.TestCase):
             self.assertEqual(held['renewal_wait']['fence'], 'stable-update')
             (fence / 'frozen').unlink()
             clock.return_value = retry_end + 1
-            with mock.patch.object(job, 'renewal_dispatch_ready', return_value=True):
+            with mock.patch.object(job, 'renewal_dispatch_epoch', return_value='stable-update'):
                 exhausted = job.work('demo')
         self.assertEqual(exhausted['phase'], 'waiting')
         self.assertEqual(exhausted['retry'], dict(previous, automatic=False))

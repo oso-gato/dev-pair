@@ -192,6 +192,7 @@ class WorkloadHoldTests(unittest.TestCase):
                 self.assertEqual(self.intake.reconcile(), 0)
             self.assertEqual(self.intake.record(self.job)['phase'], 'submitted')
             self.assertEqual(self.intake.record(self.job)['recovery'], self.recovery)
+            self.assertEqual(self.intake.record(self.job)['renewal_wake']['epochs']['boot']['attempts'], 0)
             self.assertEqual(p.loads(self.state_path.read_bytes()), parked)
             self.backend.assert_not_called()
             self.scheduled.assert_not_called()
@@ -220,3 +221,86 @@ class WorkloadHoldTests(unittest.TestCase):
         self.assertEqual(self.intake.record(self.job)['recovery'], self.recovery)
         self.backend.assert_not_called()
         self.scheduled.assert_not_called()
+
+    def test_accepted_wake_racing_later_renewals_does_not_exhaust_preparation_budget(self):
+        self.recovery['queue_attempts'] = intake.QUEUE_ATTEMPTS - 1
+        self.intake.save(self.job, dict(self.intake.record(self.job), recovery=self.recovery))
+        with self.controller.lock(), self.controller.host_fence():
+            attempt, transition = self.start_fence('first-update')
+            self.bootstrap.hold_changed_workload_access('b' * 64)
+            self.assertEqual(self.intake.reconcile(), 0)
+            self.publish('b' * 64)
+            self.controller.thaw(attempt, transition, 'completed', registries={})
+
+        with mock.patch.object(intake.time, 'monotonic', return_value=2000) as monotonic:
+            for operation, reference in (('second-update', 'c' * 64), ('third-update', 'd' * 64)):
+                with self.subTest(operation=operation), contextlib.ExitStack() as activation:
+                    transitions = []
+
+                    def late_worker(*_):
+                        activation.enter_context(self.controller.lock())
+                        activation.enter_context(self.controller.host_fence())
+                        transitions.append(self.start_fence(operation))
+                        self.bootstrap.hold_changed_workload_access(reference)
+                        self.assertEqual(product.main(['work', self.job]), 76)
+                        self.backend.assert_not_called()
+                        return b''
+
+                    self.scheduled.side_effect = late_worker
+                    self.scheduled.reset_mock()
+                    self.assertEqual(self.intake.reconcile(), 0)
+                    self.scheduled.assert_called_once()
+                    self.assertEqual(p.loads(self.state_path.read_bytes())['renewal_wait']['fence'], operation)
+                    self.assertEqual(self.intake.record(self.job)['recovery'], self.recovery)
+                    attempt, transition = transitions[0]
+                    monotonic.return_value += 45 * 60
+                    self.clock.return_value += 45 * 60
+                    self.publish(reference)
+                    self.controller.thaw(attempt, transition, 'completed', registries={})
+            self.scheduled.side_effect = None
+            self.scheduled.reset_mock()
+            self.assert_resumed_once()
+        self.assertEqual(self.intake.record(self.job)['recovery'], self.recovery)
+
+    def test_real_wake_failures_are_bounded_and_saved_fence_text_cannot_reset_them(self):
+        with self.controller.lock(), self.controller.host_fence():
+            attempt, transition = self.start_fence('first-update')
+            self.bootstrap.hold_changed_workload_access('b' * 64)
+            self.assertEqual(self.intake.reconcile(), 0)
+            self.publish('b' * 64)
+            self.controller.thaw(attempt, transition, 'completed', registries={})
+        with (mock.patch.object(intake, 'WAKE_ATTEMPTS', 2, create=True),
+              mock.patch.object(intake.time, 'monotonic', return_value=2000) as monotonic):
+            self.scheduled.side_effect = OSError('fixed service manager was unavailable')
+            for _ in range(2):
+                self.assertEqual(self.intake.reconcile(), 0)
+                monotonic.return_value += intake.RETRY_SECONDS
+            self.assertEqual(self.scheduled.call_count, 2)
+            initial = p.loads(self.state_path.read_bytes())
+            for name in ('forged-hold', 'boot', 'first-update'):
+                product.durable_json(self.state_path, dict(initial, renewal_wait=dict(initial['renewal_wait'], fence=name)))
+                self.assertEqual(self.intake.reconcile(), 0)
+                monotonic.return_value += intake.RETRY_SECONDS
+                self.assertEqual(self.scheduled.call_count, 2)
+            row = self.intake.record(self.job)
+            self.assertEqual(row['phase'], 'submitted')
+            self.assertIn('scheduling after renewal reached its limit', row['diagnostics'])
+            self.assertEqual(row['recovery'], self.recovery)
+
+            with self.controller.lock(), self.controller.host_fence():
+                attempt, transition = self.start_fence('second-update')
+                self.bootstrap.hold_changed_workload_access('c' * 64)
+                self.assertEqual(self.intake.reconcile(), 0)
+                self.assertEqual(p.loads(self.state_path.read_bytes())['renewal_wait']['fence'], attempt.name)
+                self.publish('c' * 64)
+                self.controller.thaw(attempt, transition, 'completed', registries={})
+            with self.controller.lock():
+                renewal.replace_json(self.controller.pointer, 'first-update')
+            self.assertEqual(self.intake.reconcile(), 0)
+            self.assertEqual(self.scheduled.call_count, 2)
+            with self.controller.lock():
+                renewal.replace_json(self.controller.pointer, 'second-update')
+            self.scheduled.side_effect = None
+            self.scheduled.reset_mock()
+            self.assert_resumed_once()
+            self.assertIsNone(self.intake.record(self.job)['diagnostics'])
