@@ -433,16 +433,19 @@ class Renewal:
         return attempt, read_json(attempt / 'journal.json')
 
     @contextlib.contextmanager
-    def host_fence(self):
+    def host_fence(self, *, shared=False):
         path = self.root / 'renewal-fence'
         owner = path.lstat()
         require(stat.S_ISDIR(owner.st_mode) and stat.S_IMODE(owner.st_mode) == 0o755 and
                 owner.st_uid == os.getuid(), 'unsafe host effect fence')
-        with os.fdopen(os.open(path / 'owner.lock', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+        lease = path / 'owner.lock'
+        with os.fdopen(os.open(lease, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
             node = os.fstat(stream.fileno())
             require(stat.S_ISREG(node.st_mode) and stat.S_IMODE(node.st_mode) == 0o644 and
                     node.st_uid == os.getuid() and node.st_nlink == 1, 'unsafe host effect lease')
-            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+            held = lease.lstat()
+            require((held.st_dev, held.st_ino) == (node.st_dev, node.st_ino), 'host effect lease was replaced')
             yield
 
     def mark_host_fence(self, operation, *, frozen):

@@ -139,6 +139,15 @@ class ExistingPaths:
     def lock(self, *, shared=False):
         return nullcontext()
 
+    def host_fence(self, *, shared=False):
+        return nullcontext()
+
+    def live_release(self):
+        return c.parse(self.app.read(c.CONTROL + '/current.json'))
+
+    def transition(self):
+        return None, None
+
     def stage(self, policy, boot):
         self.steps.append('F-stage')
         assert 'daemon-reload' in self.steps
@@ -470,8 +479,9 @@ class HostCommissioning(unittest.TestCase):
         self.assertEqual(self.app.automatic('apply', SOURCE), result)
         self.assertEqual(guard.read_bytes(), guarded)
         self.assertEqual(self.steps.count('enable:' + timer), 1)
-        with patch.object(self.services, 'identity', return_value={'machine_id': FIRST['machine_id'], 'boot_id': NEXT}):
-            with self.assertRaisesRegex(c.Blocked, 'not current on this boot'):
+        with (patch.object(self.services, 'identity', return_value={'machine_id': FIRST['machine_id'], 'boot_id': NEXT}),
+              patch.object(self.services, 'workload_scope', side_effect=c.Pending('workload-access', 'current boot not recovered'))):
+            with self.assertRaises(c.Pending):
                 self.app.require_runtime_feature('checklist-spool')
         with patch.object(self.services, 'workload_scope', side_effect=c.Pending('workload-access', 'retained access withdrawn')):
             with self.assertRaises(c.Pending):
@@ -507,6 +517,105 @@ class HostCommissioning(unittest.TestCase):
         self.assertIn('disable:' + timer, self.steps)
         with self.assertRaisesRegex(c.Blocked, 'feature is held'):
             self.app.require_runtime_feature('checklist-promotion')
+
+    def test_consecutive_installed_guards_requalify_only_approved_scope_without_arming_units(self):
+        from renewal import Renewal, replace_json
+
+        self.automatic_services()
+        self.app.automatic('apply', SOURCE)
+        identity = self.services.identity()
+        limits = {'proof': 'a' * 64, 'expect_live': False, 'withdrawn': False}
+        proof_calls = []
+
+        def access(app, policy, selected, boot, *, ssh=True):
+            self.assertEqual((selected, boot), (self.services.live_release(), identity['boot_id']))
+            proof_calls.append((selected, boot, ssh))
+            if limits['expect_live'] and not ssh:
+                raise AssertionError('requalification omitted the live listener proof')
+            return limits['proof']
+
+        def grant(feature, selected, *, recorded=None):
+            if feature == 'agent-renewal' and limits['withdrawn']:
+                raise c.Pending('agent-publication-read', 'Publisher scope withdrawn.')
+            if feature == 'checklist-promotion':
+                return {'subject': feature, 'expires_unix': expiry, 'sha256': c.digest(c.encoded([feature, selected]))}
+            return {'subject': feature, 'expires_unix': expiry, 'sha256': c.digest(feature.encode())}
+
+        expiry = int(time.time()) + 600
+        self.services.workload_scope, self.services.feature_authority = access, grant
+        self.services.agent_publication_status = lambda selected: 'awaiting-signed-publication'
+        result = self.app.automatic('apply', SOURCE)
+        self.assertEqual(set(result['timers']), {c.AGENT_BRIDGE[0], *(timer for feature, (timer, _) in c.TIMERS.items()
+                                                        if feature != 'agent-renewal')})
+        activation = self.app.path(c.ACTIVATION)
+        committed = activation.read_bytes()
+        actions_before = self.steps[:]
+
+        def guard(feature, *, owner_entry=False):
+            if owner_entry:
+                return self.app.require_runtime_feature(feature, owner_entry=True)
+            unit = next(iter(c.WORKLOAD_GUARDS[feature]))
+            path = self.app.path(c.UNIT_ROOT + '/' + unit + '.d/81-dev-pair-workload-guard.conf')
+            arguments = path.read_text().split('ExecCondition=', 1)[1].split()[-2:]
+
+            def installed(name):
+                try:
+                    self.app.require_runtime_feature(name)
+                except c.Pending as wait:
+                    raise c.Blocked(str(wait)) from wait
+
+            with patch.object(c, 'require_installed_workload', side_effect=installed):
+                return c.main(arguments)
+
+        def select(reference):
+            for leaf in ('current', 'site-current'):
+                replace_json(self.app.path(c.CONTROL + '/' + leaf + '.json'), reference)
+
+        self.app.path(c.CONTROL).chmod(0o700)
+        self.app.path(c.FENCE).chmod(0o755)
+        lock = self.app.path(c.FENCE + '/owner.lock')
+        lock.touch()
+        lock.chmod(0o644)
+        controller = Renewal(self.app.path(c.STATE), None)
+        with (patch.object(self.services, 'lock', side_effect=controller.lock),
+              patch.object(self.services, 'host_fence', side_effect=controller.host_fence)):
+            select(NEXT)
+            limits.update(proof='c' * 64, expect_live=True)
+            fence = self.app.path(c.FENCE + '/frozen')
+            replace_json(fence, 'fixture-attempt')
+            with controller.lock():
+                self.assertEqual(guard('agent-renewal'), 1)
+            self.assertEqual(guard('checklist-spool'), 1)
+            fence.unlink()
+            with controller.host_fence():
+                self.assertEqual(guard('checklist-promotion'), 1)
+            with patch.object(self.services, 'transition', return_value=(None, {'phase': 'rolling-back'})):
+                self.assertEqual(guard('owner-intake'), 1)
+            self.assertEqual(activation.read_bytes(), committed)
+            with patch.object(self.app, 'save_activation', side_effect=InterruptedError('fixture interrupted write')):
+                self.assertEqual(guard('agent-renewal'), 1)
+            self.assertEqual(activation.read_bytes(), committed)
+            for feature in c.TIMERS:
+                self.assertEqual(guard(feature), 0)
+            limits['expect_live'] = False
+            guard('owner-intake', owner_entry=True)
+            self.assertEqual(guard('agent-renewal'), 0)
+            self.assertFalse(proof_calls[-1][-1])
+            updated = c.parse(activation.read_bytes())
+            for row in updated['features'].values():
+                self.assertEqual(row['runtime'], {'boot_id': identity['boot_id'], 'release_sha256': NEXT, 'proof_sha256': 'c' * 64})
+            limits['withdrawn'] = True
+            self.assertEqual(guard('agent-renewal'), 1)
+            self.assertEqual(guard('owner-intake'), 0)
+            self.assertEqual(c.parse(activation.read_bytes()), updated)
+            limits.update(proof='a' * 64, withdrawn=False, expect_live=True)
+            select(RELEASE)
+            self.assertEqual(guard('checklist-promotion'), 0)
+            self.assertEqual(c.parse(activation.read_bytes())['features']['checklist-promotion']['runtime']['release_sha256'], RELEASE)
+            identity['boot_id'] = '11111111-2222-3333-4444-555555555555'
+            self.assertEqual(guard('checklist-promotion'), 0)
+            self.assertEqual(c.parse(activation.read_bytes())['features']['checklist-promotion']['runtime']['boot_id'], identity['boot_id'])
+        self.assertEqual(self.steps, actions_before)
 
     def test_partial_owner_entry_retries_and_expired_provider_scope_blocks_mutation(self):
         self.automatic_services()

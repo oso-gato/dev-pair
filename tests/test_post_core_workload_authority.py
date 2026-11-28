@@ -138,8 +138,13 @@ class SignedWorkloadAuthority(unittest.TestCase):
         storage = app.directory('/var/lib/dev-pair/checklist-validation', 0o700)
         cleanup = SimpleNamespace(STORAGE=storage, dispatch_gate=nullcontext,
                                   protected=lambda path, *, file: c.protected(path, 0, directory=not file))
-        managed = SimpleNamespace(require_recovery_enabled=lambda: self.assertIn(c.RECOVERY, setup.manager.enabled),
-                                  verify_managed_executor=lambda site, uid: self.assertEqual((site, uid), (selected, 1210)))
+        managed = d.Destination(root, checked_ssh)
+        managed.destination_identity = services.identity
+        managed.account = lambda: 1210
+        managed.manager_job = lambda unit: (False, 'success') if unit == c.RECOVERY else (True, 'failed')
+        managed.recovery_start = lambda: 1
+        managed.require_recovery_enabled = lambda: self.assertIn(c.RECOVERY, setup.manager.enabled)
+        managed.verify_managed_executor = lambda site, uid: self.assertEqual((site, uid), (selected, 1210))
 
         def cli():
             with redirect_stdout(io.StringIO()) as output:
@@ -194,8 +199,11 @@ class SignedWorkloadAuthority(unittest.TestCase):
             sign(core=True)
             self.assertEqual(bootstrap.finalize(str(receipt))['access_scope'], 'core')
             cli()
+            provision = c.encoded({'machine_id': machine['machine_id'], 'uid': 1210})
+            app.file(d.PROVISION, provision, 0o600)
+            app.file(d.CONTROL + '/ready.json', provision, 0o600)
             app.file(d.MANAGED_LISTENER, c.encoded({'version': 2, 'phase': 'ready', 'site': selected,
-                                                   'boot': machine['boot_id']}), 0o600)
+                                                   'boot': machine['boot_id'], 'recovery_after': 0}), 0o600)
             self.assertEqual(cli()['pending_features'], dict.fromkeys(c.TIMERS, 'workload-access'))
             sign(core=False, expired=True)
             with self.assertRaisesRegex(b.Blocked, 'stale or belongs to another'):
@@ -268,6 +276,28 @@ class SignedWorkloadAuthority(unittest.TestCase):
                 self.assertEqual(result['pending_features'], {'owner-intake': 'provider-slot-authority',
                                                              'checklist-promotion': 'promotion-enrollment'})
                 self.assertFalse(app.path('/etc/sudoers.d/60-dev-pair-owner').exists())
+                activation = app.path(c.ACTIVATION)
+                before = activation.read_bytes()
+                machine['boot_id'] = '11111111-2222-3333-4444-555555555555'
+
+                def installed(name):
+                    try:
+                        app.require_runtime_feature(name)
+                    except c.Pending as wait:
+                        raise c.Blocked(str(wait)) from wait
+
+                with patch.object(c, 'require_installed_workload', side_effect=installed):
+                    with patch.object(managed, 'manager_job', return_value=(True, 'success')):
+                        self.assertEqual(c.main(['guard', 'agent-renewal']), 1)
+                        self.assertEqual(activation.read_bytes(), before)
+                    self.assertEqual(c.main(['guard', 'agent-renewal']), 0)
+                    self.assertEqual(c.parse(activation.read_bytes())['features']['agent-renewal']['runtime']['boot_id'], machine['boot_id'])
+                    self.assertEqual(c.main(['guard', 'checklist-spool']), 0)
+                    self.assertEqual(c.main(['guard', 'owner-intake']), 1)
+                    self.assertEqual(c.main(['guard', 'checklist-promotion']), 1)
+                    (archive / 'hosts.yml').write_bytes(b'Different publisher custody.\n')
+                    self.assertEqual(c.main(['guard', 'agent-renewal']), 1)
+                self.assertFalse(app.path(c.CONTROL + '/offers/agent.json').exists())
             access = app.path('/var/lib/dev-pair/workload-access.json')
             access.unlink()
             self.assertFalse(cli()['timers'])

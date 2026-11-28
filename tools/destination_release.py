@@ -86,6 +86,15 @@ def record_text(value):
     return json.dumps(value, sort_keys=True) + '\n'
 
 
+def require_commissioned_listener(value):
+    require(type(value) is dict and set(value) == {'version', 'site', 'boot', 'phase', 'recovery_after'} and
+            type(value['version']) is int and value['version'] == 2 and value['phase'] == 'ready' and
+            type(value['site']) is str and re.fullmatch(DIGEST, value['site']) and
+            type(value['boot']) is str and re.fullmatch(r'[0-9a-f-]{36}', value['boot']) and
+            type(value['recovery_after']) is int and 0 <= value['recovery_after'] < 10**20,
+            'production release requires completed historical managed listener commissioning')
+
+
 class Destination(Bootstrap):
     def record(self, path):
         return json.loads(checked_file(path).read_bytes(), object_pairs_hook=relay.unique)
@@ -800,6 +809,23 @@ class Destination(Bootstrap):
         enabled = self.run(SYSTEMCTL, 'is-enabled', U_RECOVERY, ok=(0, 1), timeout=10).strip()
         require(enabled == 'enabled', 'renewal recovery is not enabled for the next boot')
 
+    def verify_settled_listener(self, listener, site, boot, uid):
+        # A completed commissioning record remains the historical readiness
+        # witness. The current executor and recovery are measured separately.
+        ready = self.record(self.path(CONTROL + '/ready.json'))
+        identity = self.destination_identity()
+        require(ready == self.record(self.path(PROVISION)) and ready['machine_id'] == identity['machine_id'] and
+                identity['boot_id'] == boot and ready['uid'] == self.account() == uid and
+                self.record(self.path(RENEWAL + '/current.json')) == site == self.record(self.path(RENEWAL + '/site-current.json')) and
+                not os.path.lexists(self.path(FENCE + '/frozen')), 'managed listener lacks settled current-site provisioning')
+        require_commissioned_listener(listener)
+        self.verify_managed_executor(site, uid)
+        running, result = self.manager_job(U_RECOVERY)
+        minimum = listener['recovery_after'] if listener['boot'] == boot else 0
+        require(not running and result == 'success' and self.recovery_start() > minimum,
+                'production release requires current boot renewal recovery')
+        self.require_recovery_enabled()
+
     def managed_executor(self, unit, uid):
         site, boot = self.record(RENEWAL + '/site-current.json'), self.destination_identity()['boot_id']
         require(type(site) is str and re.fullmatch(DIGEST, site), 'protected initial host selection reference is invalid')
@@ -910,18 +936,10 @@ class Destination(Bootstrap):
             if require_cutover:
                 listener = self.record(MANAGED_LISTENER)
                 site = self.record(RENEWAL + '/site-current.json')
-                require(listener['version'] == 2 and listener['phase'] == 'ready' and
-                        type(listener['site']) is str and re.fullmatch(DIGEST, listener['site']) and
-                        (listener['site'] == site or self.managed_proof_context()),
-                        'production release requires current completed managed listener readback')
+                require(listener['site'] == site or self.managed_proof_context(),
+                        'production release requires a managed current-site observation')
                 self.current_proof_source(ready)
-                self.verify_managed_executor(site, uid)
-                recovery_running, recovery_result = self.manager_job(U_RECOVERY)
-                same_boot = listener['boot'] == self.destination_identity()['boot_id']
-                minimum_start = listener['recovery_after'] if same_boot else 0
-                require(not recovery_running and recovery_result == 'success' and self.recovery_start() > minimum_start,
-                        'production release requires current boot renewal recovery')
-                self.require_recovery_enabled()
+                self.verify_settled_listener(listener, site, self.destination_identity()['boot_id'], uid)
                 guard = self.verify_workload_access()
                 _, dns = self.tailscale_state()
                 require(guard['target']['dns_name'] == dns, 'checklist proxy differs from independently verified cutover')

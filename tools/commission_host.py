@@ -54,6 +54,7 @@ OPENSSL = '/usr/bin/openssl'
 DEFAULT_SITE_SLOT = 'job-1'
 DEFAULT_SITE_BYTES = 8 * 1024**3
 CORE_HELD_FEATURES = tuple(sorted(TIMERS))
+WORKLOAD_SCOPE_FIELDS = ('boot_id', 'release_sha256', 'proof_sha256')
 DEFAULT_CHECKLIST = {'uid': 2200, 'subid_start': 2000000, 'validation_mib': 1536, 'validation_inodes': 32768,
                      'live_mib': 1024, 'live_inodes': 16384, 'reserve_mib': 1024, 'reserve_inodes': 1024}
 NUMBERS = {'uid': (1000, 2**31 - 1), 'subid_start': (65536, 2**32 - 1 - 65536),
@@ -190,6 +191,15 @@ def validate_feature_grant(grant):
             'invalid retained workload grant scope')
     hex_id(grant['sha256'])
     return grant
+
+
+def workload_scope_fields(value):
+    scope = {key: value[key] for key in WORKLOAD_SCOPE_FIELDS}
+    require(type(scope['boot_id']) is str and re.fullmatch(r'[0-9a-f-]{36}', scope['boot_id']),
+            'invalid recorded workload boot identity')
+    hex_id(scope['release_sha256'])
+    hex_id(scope['proof_sha256'])
+    return scope
 
 
 def verify_checkout(kit, revision, owner):
@@ -481,16 +491,19 @@ class Commission:
         require(type(value['schema']) is int and value['schema'] == 1 and value['policy_sha256'] == policy_sha and
                 value['machine_id'] == machine and type(value['features']) is dict and set(value['features']) <= set(TIMERS),
                 'workload activation belongs to another commissioning policy')
-        hex_id(value['release_sha256'])
-        hex_id(value['proof_sha256'])
-        require(type(value['boot_id']) is str and re.fullmatch(r'[0-9a-f-]{36}', value['boot_id']),
-                'invalid recorded workload boot identity')
+        workload_scope_fields(value)
         for saved in value['features'].values():
-            exact_fields(saved, ('phase', 'grant', 'next'), 'invalid workload activation state')
+            require(type(saved) is dict, 'invalid workload activation state')
+            exact_fields(saved, ('phase', 'grant', 'next', 'runtime') if 'runtime' in saved else ('phase', 'grant', 'next'),
+                         'invalid workload activation state')
             require(saved['phase'] in ('staging', 'active', 'armed', 'held') and type(saved['next']) is list and
                     len(saved['next']) <= 2 and all(type(value) is str and 0 < len(value) <= 128 for value in saved['next']) and
                     (saved['phase'] == 'armed') == bool(saved['next']), 'invalid workload activation phase or timer readback')
             validate_feature_grant(saved['grant'])
+            if 'runtime' in saved:
+                require(saved['phase'] in ('active', 'armed'), 'held workload has a runtime observation')
+                exact_fields(saved['runtime'], WORKLOAD_SCOPE_FIELDS, 'unknown automatic workload requalification record')
+                workload_scope_fields(saved['runtime'])
         return value
 
     def save_activation(self, value):
@@ -506,28 +519,50 @@ class Commission:
                 self.run('/usr/sbin/restorecon', '-F', target, timeout=10)
 
     def require_runtime_feature(self, feature, *, owner_entry=False):
+        from renewal import TERMINAL
+
         require(feature in TIMERS, 'unknown automatic workload feature')
-        raw = self.read(AUTOMATIC_POLICY)
-        decoded = parse(raw)
-        policy = read_policy(raw, hex_id(decoded['source_sha'], 40))
-        identity = self.services.identity()
-        saved = self.activation_record(digest(raw), identity['machine_id'])
-        require(saved is not None and saved['boot_id'] == identity['boot_id'],
-                'automatic workload activation is not current on this boot')
-        row = saved['features'].get(feature)
-        require(row is not None and (row['phase'] == 'armed' or row['phase'] == 'active' and not owner_entry),
-                'automatic workload feature is held')
-        require(row['grant']['expires_unix'] is None or row['grant']['expires_unix'] > time.time(),
-                'automatic workload grant expired')
-        if feature == 'owner-intake':
-            try:
-                self.provider_fence().require_ready()
-            except (OSError, ValueError) as exc:
-                raise Pending('provider-transition', 'Provider starts are held for the current broker transition.') from exc
-        release = saved['release_sha256']
-        require(self.services.workload_scope(self, policy, release, identity['boot_id'], ssh=False) == saved['proof_sha256'] and
-                self.services.feature_authority(feature, release, recorded=row['grant']) == row['grant'],
-                'automatic workload authorization changed')
+        controller = self.services.renewal()
+        with self.lock(), controller.lock(shared=True), controller.host_fence(shared=True):
+            raw = self.read(AUTOMATIC_POLICY)
+            decoded = parse(raw)
+            policy = read_policy(raw, hex_id(decoded['source_sha'], 40))
+            identity = self.services.identity()
+            saved = self.activation_record(digest(raw), identity['machine_id'])
+            row = saved['features'].get(feature) if saved else None
+            require(row is not None and (row['phase'] == 'armed' or row['phase'] == 'active' and not owner_entry),
+                    'automatic workload feature is held')
+            grant = row['grant']
+            require(grant['expires_unix'] is None or grant['expires_unix'] > time.time(), 'automatic workload grant expired')
+            if feature == 'owner-intake':
+                try:
+                    self.provider_fence().require_ready()
+                except (OSError, ValueError) as exc:
+                    raise Pending('provider-transition', 'Provider starts are held for the current broker transition.') from exc
+            selected, boot = controller.live_release(), identity['boot_id']
+            _, journal = controller.transition()
+            require((journal is None or journal['phase'] in TERMINAL)
+                    and not os.path.lexists(self.path(FENCE + '/frozen'))
+                    and selected == parse(self.read(CONTROL + '/site-current.json')),
+                    'automatic workload is frozen until renewal settles')
+            prior = row.get('runtime') or workload_scope_fields(saved)
+            changed = (selected, boot) != (prior['release_sha256'], prior['boot_id'])
+            if changed:
+                # This verifies the committed portable/base/site contract. A new
+                # full host or DevBox scope needs its own approved policy.
+                self.services.verify_selection(controller, selected, policy)
+            proof = self.services.workload_scope(self, policy, selected, boot, ssh=changed)
+            require(changed or proof == prior['proof_sha256'], 'automatic workload authorization changed')
+            # Promotion's digest embeds the originally approved local release.
+            # Re-measure its present enrolled material in that same digest scope.
+            authority_release = saved['release_sha256'] if feature == 'checklist-promotion' else selected
+            require(self.services.feature_authority(feature, authority_release, recorded=grant) == grant,
+                    'automatic workload authorization changed')
+            require(self.services.identity() == identity and (grant['expires_unix'] is None or grant['expires_unix'] > time.time()),
+                    'automatic workload grant or host changed during verification')
+            if changed:
+                row['runtime'] = workload_scope_fields({'boot_id': boot, 'release_sha256': selected, 'proof_sha256': proof})
+                self.save_activation(saved)
 
     def advance_workloads(self, policy, policy_sha, observed, site, bundle, core):
         selected = core['selected_release']
@@ -547,6 +582,7 @@ class Commission:
             if saved and any(saved[key] != current[key] for key in ('boot_id', 'release_sha256', 'proof_sha256')):
                 for feature in features.values():
                     feature.update(phase='held', next=[])
+                    feature.pop('runtime', None)
                 self.save_activation(current)
 
             timers, holds, retained_services = {}, {}, {}
@@ -617,6 +653,7 @@ class Commission:
         features = current['features']
         if features[feature]['phase'] != 'held':
             features[feature].update(phase='held', next=[])
+            features[feature].pop('runtime', None)
             self.save_activation(current)
         files = self.package({**policy, 'timers': [feature]}, bundle, retained=features, activation=True)
         if feature == 'owner-intake':
@@ -1491,22 +1528,25 @@ class Live:
 
     def workload_scope(self, app, policy, selected, boot, *, ssh=True):
         from bootstrap import Blocked as BootstrapBlocked
-        from destination_release import Destination, MANAGED_LISTENER
+        from destination_release import Destination, MANAGED_LISTENER, require_commissioned_listener
 
         try:
             if ssh:
                 self.bootstrap.verify_final_ssh()
             proof = self.bootstrap.verify_workload_access()
             listener = parse(app.read(MANAGED_LISTENER))
+            require_commissioned_listener(listener)
             require(proof.get('role_artifacts', {}).get('release_sha256') == selected and proof.get('scope') is None and
-                    (listener['site'], listener['boot'], listener['phase']) == (selected, boot, 'ready') and
                     self.identity() == {'machine_id': policy['machine_id'], 'boot_id': boot} and
                     not os.path.lexists(app.path(FENCE + '/frozen')),
                     'independent workload access or live checklist recovery differs')
             if ssh:
+                live, dns = self.bootstrap.tailscale_state()
+                target = proof['target']
+                require(dns == target['dns_name'] and self.bootstrap.identity_fields(live) == (target['tailnet'], target['node_id']),
+                        'current named tailnet route differs from the verified access scope')
                 destination = Destination()
-                destination.require_recovery_enabled()
-                destination.verify_managed_executor(selected, policy['checklist']['uid'])
+                destination.verify_settled_listener(listener, selected, boot, policy['checklist']['uid'])
         except (AttributeError, Blocked, BootstrapBlocked, OSError, RuntimeError, ValueError, TypeError, KeyError,
                 subprocess.SubprocessError):
             raise Pending('workload-access', 'The exact current role access and managed checklist probe is pending.') from None
