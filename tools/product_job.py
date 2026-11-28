@@ -673,24 +673,28 @@ def pause_reason(error):
     return None
 
 
-def record_pause(state, reason, now):
+def record_pause(state, reason, now, *, renewal_lease=False):
     previous = state.get('retry', {})
     phase = state['phase']
     if previous.get('phase') == phase:
         cutoff, observations = previous['until_unix'], previous['observations'] + 1
     else:
         cutoff, observations = now + RETRY_SECONDS, 1
+        previous = {}
     state['phase'] = 'waiting'
     state['retry'] = {'phase': phase, 'reason': reason, 'until_unix': cutoff, 'observations': observations,
                       'automatic': now < cutoff and observations < RETRY_OBSERVATIONS}
+    if renewal_lease and (not previous or previous.get('renewal_lease_only') is True):
+        state['retry']['renewal_lease_only'] = True
 
 
 def retry_available(retry, now):
     return retry is None or (retry['automatic'] and now < retry['until_unix'])
 
 
-def record_renewal_wait(root, state, reason, now):
-    if reason != 'renewal-observation' or not retry_available(state.get('retry'), now):
+def record_renewal_wait(root, state, reason, now, *, renewal_lease=False):
+    previous = state.get('retry')
+    if (reason != 'renewal-observation' and not renewal_lease) or not retry_available(previous, now):
         return False
     directory = root / 'renewal-fence'
     try:
@@ -701,6 +705,8 @@ def record_renewal_wait(root, state, reason, now):
         p.token(fence)
     except (OSError, ValueError):
         return False
+    if previous and previous['phase'] == state['phase'] and previous.get('renewal_lease_only') is True:
+        del state['retry']
     state['renewal_wait'] = {'phase': state['phase'], 'fence': fence}
     state['phase'] = RENEWAL_WAIT
     return True
@@ -764,9 +770,12 @@ def work(job):
         except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError) as exc:
             retry = pause_reason(exc)
             if retry is not None:
+                from renewal import DispatchLeaseBusy
+
                 now = int(time.time())
-                if not record_renewal_wait(ROOT, state, retry, now):
-                    record_pause(state, retry, now)
+                renewal_lease = isinstance(exc, DispatchLeaseBusy)
+                if not record_renewal_wait(ROOT, state, retry, now, renewal_lease=renewal_lease):
+                    record_pause(state, retry, now, renewal_lease=renewal_lease)
             else:
                 state['failed_stage'] = state['phase']
                 state['phase'] = 'blocked'
@@ -777,10 +786,11 @@ def work(job):
         return state
 
 
-def submit(path, *, deadline=None):
+def submit(path, *, expected_plan=None, deadline=None):
     p.require_workload_access(ROOT)
     raw = candidate.protected_file(path)
     value = plan(raw)
+    p.require(expected_plan is None or value == expected_plan, 'The staged product request is bound to another plan.')
     source_approval(value)
     parent, target = trusted_directory(JOBS), job_path(value['job_id'])
     if not os.path.lexists(target):

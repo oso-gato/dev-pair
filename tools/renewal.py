@@ -40,6 +40,10 @@ DEFAULT_DRIVER = Path('/usr/libexec/dev-pair/renewal/driver')
 LEDGER_USER = 'dp-checklist'
 
 
+class DispatchLeaseBusy(BlockingIOError):
+    """The protected renewal lease was busy before dispatch could be admitted."""
+
+
 def json_bytes(value):
     return canonical(value).encode()
 
@@ -507,7 +511,11 @@ class Renewal:
     @contextlib.contextmanager
     def dispatch_gate(self, *, for_enrollment=False):
         """Required entry point for registry enrollment and ordinary role dispatch."""
-        with self.lock(shared=not for_enrollment):
+        with contextlib.ExitStack() as owned:
+            try:
+                owned.enter_context(self.lock(shared=not for_enrollment))
+            except BlockingIOError as exc:
+                raise DispatchLeaseBusy(*exc.args) from exc
             _, state = self.transition()
             require(state is None or state['phase'] in TERMINAL, 'role dispatch frozen by renewal')
             require(not os.path.lexists(self.root / 'renewal-fence' / 'frozen'), 'role dispatch frozen pending host observation')

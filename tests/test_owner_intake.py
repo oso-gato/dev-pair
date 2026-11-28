@@ -374,6 +374,50 @@ class OwnerIntakeTests(unittest.TestCase):
         worker.build.assert_not_called()
         worker.turn.assert_called_once_with('development', initial, finished['first'])
 
+    def test_renewal_recovery_cannot_start_a_different_authorized_plan_from_the_queue(self):
+        first, second = (self.intake.draft(self.request(repo)) for repo in REPOSITORIES)
+        job, plan = first['job_id'], first['preview']['plan']
+        other_job, other_plan = second['job_id'], second['preview']['plan']
+        with mock.patch.object(intake.candidate, 'invoke', return_value=b''):
+            for draft in (first, second):
+                self.assertEqual(self.intake.confirm(draft['job_id'], draft['agreement_token'])['phase'], 'confirmed')
+                preview = draft['preview']
+                approved = preview['plan']
+                approved_job = approved['job_id']
+                agreement = approved['agreement']
+                product.durable_json(self.root / 'repository-approvals' / (approved_job + '.json'), {
+                    'schema': 1, 'job': approved_job, 'repository': agreement['repository'],
+                    'agreement_sha256': product.agreement_sha(approved), 'acquired_commit': agreement['initial_commit'],
+                    'acquired_tree': preview['source_tree'], 'standards_sha': p.STANDARDS,
+                    'startup_project_revision': preview['startup_revision'], 'startup_sha256': approved['startup_sha256'],
+                })
+        boot = intake.boot_id()
+        self.intake.save(job, dict(self.intake.record(job), phase='submitted', scheduled_boot=boot, recovery={
+            'boot': boot, 'after': 0, 'queue_attempts': 1, 'prepare_attempts': 1}))
+        root = product.job_path(job)
+        root.mkdir(mode=0o700)
+        state = {'phase': product.RENEWAL_WAIT, 'job_id': job, 'agreement_sha256': product.agreement_sha(plan),
+                 'repository': plan['agreement']['repository'], 'startup_sha256': plan['startup_sha256'],
+                 'renewal_wait': {'phase': 'host-check', 'fence': 'stable-update'}}
+        product.durable_json(root / 'plan.json', plan)
+        product.durable_json(root / 'state.json', state)
+        staged = self.intake.queue / (job + '.plan')
+        product.write_private(staged, p.canonical(other_plan).encode())
+
+        with (mock.patch.object(product, 'ROOT', self.root),
+              mock.patch.object(product, 'renewal_dispatch_ready', return_value=True),
+              mock.patch.multiple(product.candidate, ROOT=self.root,
+                                  protected_file=lambda file, limit=p.MAX_MESSAGE: p.read_data(file, limit)),
+              mock.patch.object(intake.candidate, 'invoke', return_value=b'') as scheduled):
+            for approved in (plan, other_plan):
+                self.assertEqual(product.source_approval(approved)[1]['job'], approved['job_id'])
+            self.assertEqual(self.intake.reconcile(), 0)
+            self.assertEqual([call.args[0][-1] for call in scheduled.call_args_list], [])
+        self.assertIn('bound to another plan', self.intake.record(job)['diagnostics'])
+        self.assertFalse(product.job_path(other_job).exists())
+        self.assertEqual(product.read_state(root), state)
+        self.assertEqual(staged.read_bytes(), p.canonical(other_plan).encode())
+
     def test_local_bundle_initializes_two_clean_role_checkouts_and_preserves_dirty_work(self):
         repo = REPOSITORIES[0]
         job = 'job-a'

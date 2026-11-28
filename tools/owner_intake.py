@@ -547,20 +547,20 @@ class Intake:
         entry['queue_attempts'] += 1
         entry['after'] = now + RETRY_SECONDS
         self.save(job, saved)
-        try:
-            if wake_product:
+        if wake_product:
+            try:
                 self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline)
-            else:
-                candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
-                                 min(deadline, time.monotonic() + 5))
-        except (OSError, ValueError, subprocess.SubprocessError, DispatchDeferred):
-            if not wake_product:
-                saved['diagnostics'] = 'The agreement is confirmed. Waiting to schedule the same preparation service.'
-                self.save(job, saved)
-        else:
-            if wake_product:
-                saved['scheduled_boot'] = entry['boot']
-                self.save(job, saved)
+            except DispatchDeferred:
+                return
+            saved['scheduled_boot'] = entry['boot']
+            self.save(job, saved)
+            return
+        try:
+            candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
+                             min(deadline, time.monotonic() + 5))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            saved['diagnostics'] = 'The agreement is confirmed. Waiting to schedule the same preparation service.'
+            self.save(job, saved)
 
     def reconcile(self):
         p.require_workload_access(self.root)
@@ -646,7 +646,7 @@ class Intake:
             return
         product.source_approval(plan)
         try:
-            product.submit(path, deadline=deadline)
+            product.submit(path, expected_plan=plan, deadline=deadline)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             if (not isinstance(exc, ValueError) or str(exc) == 'protected fixed command failed') and self.published(job, plan):
                 product.source_approval(plan)

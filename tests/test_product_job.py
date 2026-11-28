@@ -22,6 +22,7 @@ import host_handoff as handoff
 import job_protocol as p
 import ledger_recovery as recovery
 import product_job as job
+import renewal
 from test_checklist_quadlet import FixtureService
 
 
@@ -596,6 +597,56 @@ class ProductJobTests(unittest.TestCase):
         self.assertEqual(exhausted['retry'], dict(previous, automatic=False))
         self.assertNotIn('renewal_wait', exhausted)
         worker.turn.assert_called_once()
+
+    def test_renewal_admission_lock_race_uses_the_same_operation_after_long_thaw(self):
+        catalogue, path, initial = self.product_slot()
+        (self.root / 'renewal').mkdir(mode=0o700)
+        fence = self.root / 'renewal-fence'
+        fence.mkdir()
+        fence.chmod(0o755)
+        lease = fence / 'owner.lock'
+        lease.touch()
+        lease.chmod(0o644)
+        controller = renewal.Renewal(self.root, None)
+        worker = mock.Mock()
+        worker.host_test.return_value = {'progress': 'host-checks-passed', 'result': {'attempt_id': 'stored'}}
+        held = True
+        attempted, effects = [], []
+
+        def turn(role, checkpoint, result=None):
+            operation = role, checkpoint, result
+            if held:
+                attempted.append(operation)
+                controller.register({})  # Locked admission fails before consulting the binding.
+            effects.append(operation)
+            return {'candidate_sha': initial['candidate']['source_revision']}
+
+        worker.turn.side_effect = turn
+        with (mock.patch.multiple(job, ROOT=self.root, CATALOGUE=catalogue, JOBS=catalogue / 'jobs',
+                                  registered_contract=lambda value: value),
+              mock.patch.object(job, 'FedoraJob', return_value=worker),
+              mock.patch.object(renewal.Renewal, 'live_release', return_value='a' * 64),
+              mock.patch.object(job.time, 'time', return_value=1000) as clock):
+            with controller.lock(), controller.host_fence():
+                self.assertEqual(job.work('demo')['phase'], 'waiting')
+                controller.mark_host_fence('stable-update', frozen=True)
+                clock.return_value += 10
+                parked = job.work('demo')
+                self.assertEqual(parked['phase'], job.RENEWAL_WAIT)
+                self.assertNotIn('retry', parked)
+                self.assertEqual(effects, [])
+                controller.mark_host_fence('stable-update', frozen=False)
+            held = False
+            clock.return_value += 45 * 60
+            finished = job.work('demo')
+            self.assertEqual(finished['phase'], 'passed')
+            self.assertEqual(job.work('demo'), finished)
+        maintenance = ('maintenance', initial, None)
+        self.assertEqual(attempted, [maintenance, maintenance])
+        self.assertEqual(effects, [maintenance, ('development', initial, finished['first'])])
+        self.assertEqual(job.read_state(path), finished)
+        worker.build.assert_not_called()
+        worker.host_test.assert_called_once_with(1, initial)
 
 
 if __name__ == '__main__':
