@@ -535,7 +535,12 @@ class BrokerLifecycleTests(unittest.TestCase):
             inputs = selection()
             raw = broker.canonical(inputs)
             request_sha = hashlib.sha256(raw).hexdigest()
-            template = {**grant(request_sha), 'expires_unix': int(time.time()) + 1}
+            template = grant(request_sha)
+            expiry_seconds = 20
+            accept_timeout = 0.01
+            clock = SimpleNamespace(time=lambda: template['expires_unix'] - expiry_seconds,
+                                    monotonic=Mock(return_value=0.0))
+            idle_timeouts = []
             directory = root / 'channel'
             directory.mkdir()
             directory.chmod(0o750)
@@ -544,6 +549,23 @@ class BrokerLifecycleTests(unittest.TestCase):
             destination.mkdir(parents=True)
             destination.chmod(0o700)
             receipt = destination / (inputs['operation'] + '.json')
+
+            class IdleSocket(socket.socket):
+                def listen(listener, backlog):
+                    super().listen(backlog)
+                    # Reach the signed expiry only after the actual socket is listening.
+                    clock.monotonic.return_value = expiry_seconds - accept_timeout
+
+                def accept(listener):
+                    self.assertTrue(path.is_socket())
+                    self.assertEqual(json.loads(receipt.read_bytes())['status'], 'listening')
+                    self.assertAlmostEqual(listener.gettimeout(), accept_timeout, places=5)
+                    try:
+                        return super().accept()
+                    except TimeoutError:
+                        idle_timeouts.append(listener.gettimeout())
+                        raise
+
             approved = Mock()
             approved.validate_grant.return_value = {'request': {}, 'organization': 'org-fixture', 'project': 'proj_fixture'}
             approved.remaining.return_value = {'remaining_microusd': 3000}
@@ -552,6 +574,7 @@ class BrokerLifecycleTests(unittest.TestCase):
             args = ['provider_broker.py', '--grant', str(root / 'grant'), '--request', str(root / 'request'),
                     '--credential-file', str(root / template['allowance_ref']), '--socket', str(path), '--receipt', str(receipt)]
             with patch.object(sys, 'argv', args), patch.object(broker, 'EVIDENCE', root), \
+                    patch.object(broker, 'time', clock), \
                     patch.object(broker.billing, 'CREDENTIALS', root), \
                     patch.object(broker.billing, 'credential_from', return_value='offline-fixture-key-never-sent'), \
                     patch.object(broker.billing, 'matches_request', return_value=True), \
@@ -560,7 +583,7 @@ class BrokerLifecycleTests(unittest.TestCase):
                     patch.object(broker, 'host_repository_approval'), \
                     patch.object(broker.os, 'geteuid', side_effect=[0] + [os.getuid()] * 8), \
                     patch.object(broker, 'broker_channel_label', return_value=b'fixture-label'), \
-                    patch.object(broker, 'labeled_listener', side_effect=lambda _label: socket.socket(socket.AF_UNIX)), \
+                    patch.object(broker, 'labeled_listener', side_effect=lambda _label: IdleSocket(socket.AF_UNIX)) as sockets, \
                     patch.object(broker, 'load_allowance', return_value=approved,
                                  side_effect=None if available else FileNotFoundError('allowance unproven')), \
                     patch.object(broker, 'Provider', return_value=api) as acquire, \
@@ -569,10 +592,12 @@ class BrokerLifecycleTests(unittest.TestCase):
             self.assertFalse(path.exists())
             if not available:
                 acquire.assert_not_called()
+                sockets.assert_not_called()
                 self.assertFalse(receipt.exists())
                 return result, None
             api.discover.assert_called_once()
             api.responses.assert_not_called()
+            self.assertEqual(len(idle_timeouts), 1)
             return result, json.loads(receipt.read_bytes())
 
     def test_idle_clock_expiry_closes_normally_without_interruption(self):
