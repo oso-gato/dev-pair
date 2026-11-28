@@ -108,6 +108,12 @@ class ObservationFixture:
                          f'dev-pair-access-review namespaces="{observation.FINAL_NAMESPACE}" {keys["reviewer"]}\n')
         self.host.update_agent_observer(self.host.signer_fingerprint(keys['collector']), public=keys['collector'])
         self.signers = self.host.signer_trust_file()
+        self.station_signing = self.root / 'station-signing.json'
+        self.station_signing.write_bytes(observation.encoding({
+            'collector_key': str(self.root / 'collector-key.pub'),
+            'reviewer_key': str(self.root / 'reviewer-key.pub'),
+            'final_trust': str(self.signers),
+        }))
 
     def system(self, *args, **options):
         if args[0] == '/usr/sbin/nft':
@@ -166,13 +172,24 @@ class ObservationFixture:
             return observation.encoding({**role_result, 'challenge_sha256': fingerprint,
                                          'runtime_result_sha256': renewal.identity(list(outcome))})
 
+        real_sign = observation.sign_observation
+
+        def sign_fixture(raw, public, namespace):
+            key = self.root / ('collector-key' if namespace == observation.NAMESPACE else 'reviewer-key')
+            self.case.assertEqual(public.read_text().split(), key.with_suffix('.pub').read_text().split()[:2])
+            return real_sign(raw, key, namespace)
+
         with (patch.object(observation, 'ssh_candidate_probe', side_effect=challenge),
               patch.object(observation, 'configured_signers', return_value=self.signers),
-              patch.object(observation, 'measure_tailnet_policy', return_value=self.guard['acl_sha256'])):
+              patch.object(observation, 'measure_tailnet_policy', return_value=self.guard['acl_sha256']),
+              patch.object(observation, 'STATION_SIGNING', self.station_signing),
+              patch.object(observation, 'sign_observation', side_effect=sign_fixture)):
             collection = directory / 'collection.bundle'
-            collection.write_bytes(observation.collect_candidate(request, plan, directory, None, None, self.root / 'collector-key'))
-            response = observation.assemble_candidate(request, plan, collection, self.root / 'reviewer-key', None)
-        access_exchange.publish(self.mailbox, observation.digest(observation.encoding(request)), io.BytesIO(response), int(time.time()))
+            collection.write_bytes(observation.collect_candidate(request, plan, directory, None, None,
+                                                                 self.root / 'collector-key.pub'))
+            response = observation.assemble_candidate(request, plan, collection, self.root / 'reviewer-key.pub', None)
+            access_exchange.publish(self.mailbox, observation.digest(observation.encoding(request)), io.BytesIO(response),
+                                    int(time.time()))
 
     def select(self, candidate_access, request):
         control = self.destination.controller.control
