@@ -20,11 +20,13 @@ CONTEXT = ('operation machine_id previous_release_sha256 previous_base_platform_
            'target_release_sha256 platform_sha256 intake_sha256 site_config_sha256')
 MAX_MIGRATIONS = 32
 MAX_FILE = 256 * 1024
+COURIER = f'{INSTALL}/tools/billing_courier.py'
 # These entrypoints form the fixed billing launch and recovery chain. The full
 # release may change other files, but those changes need their own activation.
 CHAIN = {
     transition.TEMPLATE: ('runtime/renewal/dev-pair-provider@.service', 0o644),
     transition.DROP_IN: ('runtime/renewal/provider-start-fence.conf', 0o644),
+    COURIER: ('tools/billing_courier.py', 0o755),
     **{f'{INSTALL}/renewal/{name}': (f'runtime/renewal/{name}', 0o755)
        for name in ('provider-run', 'driver', 'host-release')},
     **{f'{INSTALL}/tools/{name}.py': (f'tools/{name}.py', 0o755 if name == 'owner_intake' else 0o644)
@@ -32,7 +34,7 @@ CHAIN = {
                     'commission_host', 'owner_intake', 'renewal', 'renewal_site', 'stable_renewal',
                     'bootstrap', 'destination_observation', 'platform_release_install', 'platform_release_intake')},
 }
-OLD_OPTIONAL = {transition.DROP_IN, transition.GATE,
+OLD_OPTIONAL = {transition.DROP_IN, transition.GATE, COURIER,
                 f'{INSTALL}/tools/host_fixed_migration.py', f'{INSTALL}/tools/provider_billing.py',
                 f'{INSTALL}/tools/stable_renewal.py'}
 
@@ -68,7 +70,7 @@ def fixed_inputs(directory, host, *, previous=False):
             'The signed release changes a fixed activation path, permission or feature.')
         observed[target] = verified(source, MAX_FILE)
     missing = set(CHAIN) - observed.keys()
-    p.require(missing <= OLD_OPTIONAL if previous else not missing,
+    p.require(missing <= (OLD_OPTIONAL if previous else {COURIER}),
               'The signed host release is missing a required fixed billing path.')
     return {target: observed.get(target) for target in CHAIN}
 
@@ -95,16 +97,22 @@ class Migration:
                   authority['previous_base_platform_sha256'] != authority['platform_sha256'],
                   'A fixed migration needs a distinct signed full predecessor and successor.')
         p.require(set(predecessor) == set(successor) == set(CHAIN) and
-                  all(type(value) is bytes and 0 < len(value) <= MAX_FILE for value in successor.values()) and
+                  all(type(value) is bytes and 0 < len(value) <= MAX_FILE or
+                      path == COURIER and value is None
+                      for path, value in successor.items()) and
                   predecessor[transition.TEMPLATE] == successor[transition.TEMPLATE] and
                   successor[transition.DROP_IN] == ('[Service]\nExecCondition=' + transition.CONDITION + '\n').encode(),
                   'The reviewed package differs from the supported provider service and fence.')
+        p.require(successor[COURIER] is not None or
+                  (predecessor[COURIER] is None and
+                   b'from billing_courier import ' not in successor[f'{INSTALL}/tools/owner_intake.py']),
+                  'The signed host package would remove or omit the billing courier required by owner setup.')
         if predecessor[transition.DROP_IN] is not None:
             p.require(predecessor[transition.DROP_IN] == successor[transition.DROP_IN],
                       'The predecessor uses an unrecognized provider fence.')
         self.intent = {'schema': 1, **authority, 'files': {
             target: [p.sha256(predecessor[target]) if predecessor[target] is not None else None,
-                     p.sha256(successor[target])] for target in CHAIN}}
+                     p.sha256(successor[target]) if successor[target] is not None else None] for target in CHAIN}}
         self.pending = self.fence.state / transition.FIXED_PENDING
         self.blocked = self.fence.state / transition.FIXED_BLOCKED
         self.evidence = self.fence.state / ('fixed-' + authority['target_release_sha256'] + '.json')
@@ -200,7 +208,8 @@ class Migration:
                     leaves.add(target)
                     self.save(self.pending, 'drained', leaves)
             self.files(final=True)
-            self.app.run('/usr/sbin/restorecon', '-F', *CHAIN, timeout=20)
+            installed = [target for target in CHAIN if self.new[target] is not None]
+            self.app.run('/usr/sbin/restorecon', '-F', *installed, timeout=20)
             self.fence.manager('daemon-reload', timeout=20)
             p.require(self.idle(end, temporary=True), 'The temporary provider fence could not be confirmed after file migration.')
             drop = self.fence.path(TEMPORARY)
@@ -304,11 +313,12 @@ def forward_started(controller, request):
                   'A fixed provider recovery record names a different stable transition or invalid phase.')
         p.require(type(intent['files']) is dict and intent['files'].keys() == CHAIN.keys(),
                   'Fixed provider recovery file scope changed.')
-        for pair in intent['files'].values():
+        for path, pair in intent['files'].items():
             p.require(type(pair) is list and len(pair) == 2, 'Invalid fixed provider recovery identities.')
             if pair[0] is not None:
                 p.digest(pair[0])
-            p.digest(pair[1])
+            if path != COURIER or pair != [None, None]:
+                p.digest(pair[1])
         records.append(intent)
     p.require(len(records) < 2 or records[0] == records[1], 'Fixed provider recovery records disagree.')
     return bool(records)

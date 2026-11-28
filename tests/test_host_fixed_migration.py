@@ -145,13 +145,15 @@ class FixedMigrationTests(unittest.TestCase):
         self.assertEqual(unowned.read_bytes(), migration.TEMP_BYTES)
         self.assertEqual(runner.read_bytes(), self.old[transition.LAUNCHER])
 
-    def signed_host(self, *, redirect=False):
+    def signed_host(self, *, redirect=False, skip=()):
         # Retained native host archive surrogate. File hashes and the bundle
         # traversal are production checks. Portable signing happened in F.
         home = self.root / 'signed-bundle'
         home.mkdir()
         files, rows = {}, []
         for target, (source, mode) in migration.CHAIN.items():
+            if target in skip:
+                continue
             path = home / source
             path.parent.mkdir(parents=True, exist_ok=True)
             body = self.new[target]
@@ -186,6 +188,29 @@ class FixedMigrationTests(unittest.TestCase):
         with mock.patch.object(migration.installer.intake, 'protected', side_effect=self.protected):
             with self.assertRaisesRegex(ValueError, 'changes a fixed activation path'):
                 migration.fixed_inputs(home, host)
+
+    def test_successor_follows_the_signed_optional_billing_courier(self):
+        self.assertIsNone(self.old[migration.COURIER])
+        self.upgrade.prepare(end=time.monotonic() + 6)
+        current = self.fence.path(migration.COURIER)
+        self.assertEqual(current.read_bytes(), self.new[migration.COURIER])
+        self.assertEqual(current.stat().st_mode & 0o777, 0o755)
+
+    def test_pre_courier_package_is_supported_and_cannot_remove_an_installed_courier(self):
+        home, host = self.signed_host(skip=(migration.COURIER,))
+        with mock.patch.object(migration.installer.intake, 'protected', side_effect=self.protected):
+            historical = migration.fixed_inputs(home, host)
+        self.assertIsNone(historical[migration.COURIER])
+        prior_window = migration.Migration(self.app, AUTHORITY, self.old, historical)
+        prior_window.prepare(end=time.monotonic() + 6)
+        prior_window.finish(end=time.monotonic() + 6)
+        self.assertFalse(self.fence.path(migration.COURIER).exists())
+        with self.assertRaisesRegex(ValueError, 'remove or omit the billing courier'):
+            migration.Migration(self.app, AUTHORITY, self.new, historical)
+        dependent = {**historical, f'{migration.INSTALL}/tools/owner_intake.py':
+                     b'from billing_courier import setup_route\n'}
+        with self.assertRaisesRegex(ValueError, 'remove or omit the billing courier'):
+            migration.Migration(self.app, AUTHORITY, self.old, dependent)
 
     def test_versioned_host_apply_closes_fence_before_target_selection(self):
         script = ROOT / 'runtime/renewal/host-release'
