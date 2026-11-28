@@ -2,6 +2,48 @@
 
 ## Latest continuation checkpoint
 
+### November 28, 2026 (UTC) — draft validation and production source selection
+
+Source `dd521c013873936ebf31614cef885baca400fea8` adds production source
+selection before managed setup. The delivered seed starts Day 0 and supplies
+the reviewed tree. A machine-bound handoff from the independent release
+custodian and its separately conveyed SHA-256 identify the approved merge
+on protected `main`. Day 0 compares the complete tree and executable modes,
+then stages and records that exact production commit. The owner continues
+with the same seed launcher. Final review and suite checks for `dd521c0`
+are underway. [Day 0 operations](owner-day0.md)
+
+The preceding tested source `cc6150d157fdb1ca9e6b7e3f9cd7438d106e0bf3` has
+tree `eaa15e9ef32a449d39331aded606764befc55a68`. The ordinary local suite
+ran 1,305 cases in 209.339 seconds, with 1,221 passes and 84 skips. Its log
+SHA-256 is `ea9cebf1c1dc5771122de6892e63c94c7a7217ffe4114fa02ff271ec505eeaef`.
+All 84 passed in separate protected, distinct-UID, browser or real Git fixture
+runs. An independent replay at the same source retained one owner job through
+a real mTLS failed persistence test, Git repair, passing retest and OpenSSH
+signed confirmation of delivery with SQLite restore. The fixture projected
+provider responses, publication service and target network. Replay receipt
+SHA-256 is `c37c65183ba90016f895f3896cefc2abf72a2d2e3ffd6e404b299099ed3305e0`.
+
+On disposable enforcing Fedora 44, the direct `dp-maint` diagnostic built
+from signed RPMs passed the fixed `entry probe` with UID 1000, SELinux
+`container_t`, immutable Codex home, `codex-cli 0.169.0` and private `/run`
+and `/tmp` tmpfs mounts. Its source was
+`afa2219288dc606ee39606836908e79b33cfdf54`. The supplemental `dp-dev` fixture
+reached the rootless Podman create unit and exhausted its fixed 80-second
+service limit before start. The two regular unmodified candidate builds had
+already stopped at the package step with native status 125. The direct
+maintenance diagnostic establishes that boundary only. Sealed maintenance,
+nested development placement and authenticated product admission remain open.
+
+The provisional fresh seed kit at `e90b0b02b83c8b9fcd22177d747dfbcf3392d72a`
+reproduced byte for byte with SHA-256
+`543e8ea32b5da7015d9ad647110a494d3e95a2d3bd1ae269d06a7d529e3424b9`.
+Gitless extraction and exact source checks passed. The verifier rejected both
+a changed archive and an incorrect source SHA. The final kit will pin the
+selected reviewed seed. The owner installs on the selected VPS. The signed
+production platform still requires separately authorized publication for
+the selected merge on protected `main`.
+
 ### November 28, 2026 — integrated job and signed Fedora checkpoints
 
 The original development window closes November 28 at 22:39:32 UTC
