@@ -27,6 +27,7 @@ import job_protocol as p
 import product_job as product
 import provider_billing as billing
 from ledger_recovery import read_private, sync_directory, trusted_directory, write_private
+from renewal import DispatchDeferred as RenewalDispatchDeferred, MAX_ATTEMPTS as MAX_RENEWAL_ATTEMPTS
 from startup_delivery import IDS, load_private
 
 SITE = Path('/etc/dev-pair/product-intake')
@@ -42,6 +43,8 @@ MAX_INPUT = 8192
 MAX_SLOTS = 64
 QUEUE_ATTEMPTS = 8
 PREPARE_ATTEMPTS = 4
+WAKE_ATTEMPTS = 8
+WAKE_EXHAUSTED = 'Automatic scheduling after renewal reached its limit for the verified transition.'
 RETRY_SECONDS = 30
 PREPARE_SECONDS = 300
 SEED_BYTES = 6 * 1024 * 1024
@@ -489,7 +492,15 @@ class Intake:
                           'Review a new draft with the intended users, access and observable acceptance before confirming.')
                 saved['phase'] = 'confirmed'
                 self.save(job, saved)
-            self.schedule(job, saved, time.monotonic() + 10)
+            deadline = time.monotonic() + 10
+            state = self.published(job, saved['plan']) if saved['phase'] == 'submitted' else None
+            if state is not None and state['phase'] not in product.TERMINAL and product.retry_expired(state, int(time.time())):
+                try:
+                    self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline, explicit=True)
+                except DispatchDeferred as exc:
+                    raise ValueError(str(exc)) from exc
+            else:
+                self.schedule(job, saved, deadline)
         return self.status(job)
 
     def published(self, job, plan, *, progress=False):
@@ -497,12 +508,10 @@ class Intake:
         if not os.path.lexists(root):
             return None
         root = trusted_directory(root)
-        p.require(product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE)) == plan,
+        p.require(plan['job_id'] == job and product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE)) == plan,
                   'The published product plan differs from the confirmed agreement.')
         state = product.read_progress(root) if progress else product.read_state(root)
-        p.require(state['job_id'] == job and state['agreement_sha256'] == product.agreement_sha(plan) and
-                  state['repository'] == plan['agreement']['repository'] and state['startup_sha256'] == plan['startup_sha256'],
-                  'The published product state differs from the confirmed agreement.')
+        product.require_state_plan(state, plan)
         return state
 
     def recovery(self, saved):
@@ -516,8 +525,48 @@ class Intake:
         saved.update(phase='blocked', diagnostics=reason)
         self.save(job, saved)
 
+    def wake_product(self, job, saved, epoch, boot, deadline):
+        history = saved.get('renewal_wake')
+        if history is None or history['boot'] != boot:
+            history = saved['renewal_wake'] = {'boot': boot, 'epochs': {}}
+        epochs = history['epochs']
+        p.require(epoch in epochs or len(epochs) < MAX_RENEWAL_ATTEMPTS + 1,
+                  'The current boot renewal scheduling catalogue exceeds its bound.')
+        entry = epochs.setdefault(epoch, {'after': 0, 'attempts': 0})
+        now = int(time.monotonic())
+        previous_after = entry['after']
+        if now < previous_after:
+            return
+        if entry['attempts'] >= WAKE_ATTEMPTS:
+            if saved['diagnostics'] != WAKE_EXHAUSTED:
+                saved['diagnostics'] = WAKE_EXHAUSTED
+                self.save(job, saved)
+            return
+        if saved['diagnostics'] == WAKE_EXHAUSTED:
+            saved['diagnostics'] = None
+        entry['attempts'] += 1
+        entry['after'] = now + RETRY_SECONDS
+        self.save(job, saved)
+        try:
+            self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline)
+        except RenewalDispatchDeferred:
+            entry['attempts'] -= 1
+            entry['after'] = previous_after
+        except DispatchDeferred:
+            return
+        else:
+            saved['scheduled_boot'] = boot
+        self.save(job, saved)
+
     def schedule(self, job, saved, deadline):
-        p.require_workload_access(self.root)
+        fence = product.workload_renewal_fence(self.root)
+        if fence is not None:
+            if saved['phase'] == 'submitted':
+                try:
+                    product.observe_workload_renewal(job, saved['plan'], fence)
+                except BlockingIOError:
+                    return  # The product worker still owns this job's state.
+            return
         if saved['phase'] == 'blocked' and 'recovery' not in saved and saved['diagnostics'] in LEGACY_SCHEDULING_FAILURES:
             state = self.published(job, saved['plan'])
             if state is None or state['phase'] != 'submitted':
@@ -525,12 +574,22 @@ class Intake:
             product.source_approval(saved['plan'])
             saved['phase'] = 'confirmed'
         if saved['phase'] == 'submitted':
-            if saved.get('scheduled_boot') == boot_id():
-                return
             state = self.published(job, saved['plan'])
             p.require(state is not None, 'The acknowledged product plan is unavailable.')
-            if state['phase'] in product.TERMINAL or (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic')):
+            if state['phase'] in product.TERMINAL:
                 return
+            now = int(time.time())
+            expired = product.retry_expired(state, now)
+            manual = expired and product.explicit_retry_matches(state, saved['plan'], now)
+            if expired and not manual:
+                return
+            boot = boot_id()
+            if not manual and product.pending_renewal(state) is None and saved.get('scheduled_boot') == boot:
+                return
+            epoch = product.renewal_dispatch_epoch(self.root)
+            if epoch is not None:
+                self.wake_product(job, saved, epoch, boot, deadline)
+            return
         elif saved['phase'] not in ('confirmed', 'preparing'):
             return
         entry = self.recovery(saved)
@@ -551,7 +610,7 @@ class Intake:
             self.save(job, saved)
 
     def reconcile(self):
-        p.require_workload_access(self.root)
+        product.workload_renewal_fence(self.root)
         end = time.monotonic() + 20
         queue = trusted_directory(self.queue)
         for count, path in enumerate(queue.glob('*.json'), 1):
@@ -611,8 +670,7 @@ class Intake:
         try:
             self.stage(job, record)
         except (OSError, ValueError, RuntimeError, KeyError, ImportError, subprocess.SubprocessError, DispatchDeferred) as exc:
-            deferred = isinstance(exc, (BlockingIOError, DispatchDeferred)) or str(exc) in (
-                'role dispatch frozen by renewal', 'role dispatch frozen pending host observation')
+            deferred = isinstance(exc, (BlockingIOError, DispatchDeferred, RenewalDispatchDeferred))
             with self.lock():
                 if deferred:
                     entry['after'] = int(time.monotonic()) + RETRY_SECONDS
@@ -627,14 +685,16 @@ class Intake:
             self.save(job, record)
         return 0
 
-    def submit_product(self, path, job, plan):
+    def submit_product(self, path, job, plan, *, deadline=None, explicit=False):
         state = self.published(job, plan)
+        now = int(time.time())
         if state is not None and (state['phase'] in product.TERMINAL or
-                                  (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic'))):
+                                  (not explicit and product.retry_expired(state, now) and
+                                   not product.explicit_retry_matches(state, plan, now))):
             return
         product.source_approval(plan)
         try:
-            product.submit(path)
+            product.submit(path, expected_plan=plan, deadline=deadline, explicit=explicit)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             if (not isinstance(exc, ValueError) or str(exc) == 'protected fixed command failed') and self.published(job, plan):
                 product.source_approval(plan)

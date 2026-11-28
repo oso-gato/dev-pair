@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Submit and follow a protected dev-pair product job."""
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -43,8 +44,8 @@ LOCAL_HEAD_COMMAND = (
 ).strip()
 LOCAL_TEST_PREFIX = 'cd /work/job && ' + LOCAL_HEAD_COMMAND + ' && ('
 LOCAL_TEST_SUFFIX = ') && ' + LOCAL_HEAD_COMMAND
-RENEWAL_PAUSES = {'checklist dispatch is frozen by renewal', 'role dispatch frozen by renewal',
-                  'role dispatch frozen pending host observation'}
+CHECKLIST_RENEWAL_PAUSE = 'checklist dispatch is frozen by renewal'
+RENEWAL_WAIT = 'waiting-for-renewal'
 RETRY_SECONDS = 180
 RETRY_OBSERVATIONS = 18
 RETRY_INTERVAL = 10
@@ -95,6 +96,14 @@ def durable_json(path, value):
 
 def agreement_sha(value):
     return p.identity({'adapter': value['adapter'], **value['agreement']})
+
+
+def require_state_plan(state, value):
+    p.require(type(state) is dict and state.get('job_id') == value['job_id'] and
+              state.get('agreement_sha256') == agreement_sha(value) and
+              state.get('repository') == value['agreement']['repository'] and
+              state.get('startup_sha256') == value['startup_sha256'],
+              'The published product state differs from the confirmed agreement.')
 
 
 def source_approval(value):
@@ -663,12 +672,17 @@ def progress_complete(state):
 
 
 def pause_reason(error):
+    from renewal import DispatchDeferred, DispatchLeaseBusy
+
     if isinstance(error, HostReplyLost):
         return 'host-reply-interrupted'
+    # The existing checklist gate also travels as a diagnostic over mTLS.
+    # Keep this wire value and the recipe's tracked bytes stable for saved jobs.
+    if isinstance(error, (DispatchDeferred, DispatchLeaseBusy)) or (
+            type(error) is ValueError and str(error) == CHECKLIST_RENEWAL_PAUSE):
+        return 'renewal-observation'
     if isinstance(error, BlockingIOError):
         return 'dispatch-lease-busy'
-    if isinstance(error, ValueError) and str(error) in RENEWAL_PAUSES:
-        return 'renewal-observation'
     return None
 
 
@@ -679,13 +693,130 @@ def record_pause(state, reason, now):
         cutoff, observations = previous['until_unix'], previous['observations'] + 1
     else:
         cutoff, observations = now + RETRY_SECONDS, 1
+        previous = {}
     state['phase'] = 'waiting'
     state['retry'] = {'phase': phase, 'reason': reason, 'until_unix': cutoff, 'observations': observations,
                       'automatic': now < cutoff and observations < RETRY_OBSERVATIONS}
+    if reason == 'renewal-observation' and (not previous or previous.get('renewal_only') is True):
+        state['retry']['renewal_only'] = True
 
 
-def work(job):
-    p.require_workload_access(ROOT)
+def retry_available(retry, now):
+    return retry is None or (retry['automatic'] and now < retry['until_unix'] and
+                             retry['observations'] < RETRY_OBSERVATIONS)
+
+
+def retry_expired(state, now):
+    return not retry_available(state.get('retry'), now)
+
+
+def retry_identity(retry):
+    p.require(type(retry) is dict, 'Invalid durable retry record.')
+    fields = 'phase reason until_unix observations automatic'
+    p.fields(retry, fields + (' renewal_only' if 'renewal_only' in retry else ''))
+    p.token(retry['phase'])
+    p.token(retry['reason'])
+    p.number(retry['until_unix'], 1, 2**63 - 1)
+    p.number(retry['observations'], 1, 2**63 - 1)
+    p.require(type(retry['automatic']) is bool and retry.get('renewal_only', True) is True,
+              'Invalid durable retry eligibility flags.')
+    return p.identity({key: value for key, value in retry.items() if key != 'automatic'})
+
+
+def explicit_retry_matches(state, value, now):
+    approval = state.get('explicit_retry')
+    retry = state.get('retry')
+    if approval is None or retry is None:
+        return False
+    p.fields(approval, 'plan_sha256 retry_sha256 until_unix')
+    p.digest(approval['plan_sha256'])
+    p.digest(approval['retry_sha256'])
+    p.number(approval['until_unix'], 1, 2**63 - 1)
+    hashes = {retry_identity(retry), p.identity(retry)}
+    # Existing approvals may have included the automatic flag before it was cleared.
+    if not retry['automatic']:
+        hashes.add(p.identity(dict(retry, automatic=True)))
+    return (now < approval['until_unix'] and approval['plan_sha256'] == p.identity(value) and
+            approval['retry_sha256'] in hashes)
+
+
+def protected_renewal_fence(root):
+    directory = root / 'renewal-fence'
+    try:
+        node = directory.lstat()
+        p.require(stat.S_ISDIR(node.st_mode) and node.st_uid == os.getuid() and
+                  stat.S_IMODE(node.st_mode) == 0o755, 'renewal fence directory is unavailable')
+        fence = p.loads(read_private(directory / 'frozen', 128))
+        p.token(fence)
+    except (OSError, ValueError):
+        return None
+    return fence
+
+
+def current_renewal_fence(root):
+    from renewal import Renewal
+
+    fence = protected_renewal_fence(root)
+    if fence in (None, 'boot'):
+        return fence
+    try:
+        attempt, _ = Renewal(root, None).transition()
+    except (OSError, ValueError):
+        return None
+    return fence if attempt is not None and attempt.name == fence else None
+
+
+def workload_renewal_fence(root):
+    """Allow renewal bookkeeping when a protected current fence holds workload access."""
+    try:
+        p.require_workload_access(root)
+    except (OSError, ValueError):
+        fence = current_renewal_fence(root)
+        if fence is not None:
+            return fence
+        # Access may have been re-admitted and the marker cleared between reads.
+        p.require_workload_access(root)
+    return None
+
+
+def record_renewal_wait(state, fence, now, *, explicit=False):
+    previous = state.get('retry')
+    available = retry_available(previous, now)
+    if fence is None or not (available or explicit):
+        return False
+    phase = previous['phase'] if state['phase'] == 'waiting' else state['phase']
+    if available and previous and previous['phase'] == phase and previous.get('renewal_only') is True:
+        del state['retry']
+    state['renewal_wait'] = {'phase': phase, 'fence': fence}
+    state['phase'] = RENEWAL_WAIT
+    return True
+
+
+def renewal_dispatch_epoch(root):
+    """Read the current authorized attempt while ordinary dispatch is admitted."""
+    from renewal import DispatchDeferred, Renewal
+
+    controller = Renewal(root, None)
+    try:
+        with controller.dispatch_gate():
+            attempt, _ = controller.transition()
+            return attempt.name if attempt is not None else 'boot'
+    except (BlockingIOError, DispatchDeferred):
+        return None
+
+
+def pending_renewal(state):
+    if state['phase'] != RENEWAL_WAIT:
+        return None
+    wait = state.get('renewal_wait')
+    p.fields(wait, 'phase fence')
+    p.token(wait['phase'])
+    p.token(wait['fence'])
+    return wait
+
+
+@contextlib.contextmanager
+def locked_job_state(job):
     root = trusted_directory(job_path(job))
     value = plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
     p.require(value['job_id'] == job, 'durable product plan identity changed')
@@ -695,10 +826,106 @@ def work(job):
         p.private_file(lock_path)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         state = read_state(root)
+        require_state_plan(state, value)
+        yield root, value, state
+
+
+def park_workload_renewal(root, value, state, fence):
+    if state['phase'] in TERMINAL:
+        return
+    wait = pending_renewal(state)
+    if wait is not None:
+        if wait['fence'] != fence:
+            wait['fence'] = fence
+            durable_json(root / 'state.json', state)
+        return
+    now = int(time.time())
+    if record_renewal_wait(state, fence, now, explicit=explicit_retry_matches(state, value, now)):
+        durable_json(root / 'state.json', state)
+    elif state['phase'] == 'waiting' and state['retry']['automatic']:
+        state['retry']['automatic'] = False
+        durable_json(root / 'state.json', state)
+
+
+def observe_workload_renewal(job, expected_plan, expected_fence):
+    """Record a hold for acknowledged work even if the worker never observed it."""
+    with locked_job_state(job) as (root, value, state):
+        p.require(value == expected_plan, 'The published product plan differs from the confirmed agreement.')
+        try:
+            fence = workload_renewal_fence(ROOT)
+        except (OSError, ValueError):
+            return
+        if fence == expected_fence:
+            park_workload_renewal(root, value, state, fence)
+
+
+def stop_automatic_retry(root, state):
+    state['phase'] = 'waiting'
+    state['retry']['automatic'] = False
+    durable_json(root / 'state.json', state)
+
+
+def consume_explicit_retry(root, value, state):
+    from renewal import DispatchDeferred, Renewal
+
+    controller = Renewal(ROOT, None)
+    with contextlib.ExitStack() as locks:
+        try:
+            locks.enter_context(controller.dispatch_gate())
+            locks.enter_context(controller.host_fence(shared=True))
+        except BlockingIOError as exc:
+            raise DispatchDeferred('Product retry admission is held by renewal.') from exc
+        if not explicit_retry_matches(state, value, int(time.time())):
+            return False
+        del state['explicit_retry']
+        stop_automatic_retry(root, state)
+        return True
+
+
+def work(job, *, automatic=False):
+    """Run a trusted direct attempt. The installed worker uses automatic admission."""
+    from renewal import DispatchDeferred
+
+    with locked_job_state(job) as (root, value, state):
         if state['phase'] in TERMINAL:
             return state
-        if state['phase'] == 'waiting':
-            state['phase'] = state['retry']['phase']
+        wait = pending_renewal(state)
+        fence = workload_renewal_fence(ROOT)
+        if fence is not None:
+            park_workload_renewal(root, value, state, fence)
+            return state
+        if wait is not None:
+            if renewal_dispatch_epoch(ROOT) is None:
+                fence = current_renewal_fence(ROOT)
+                if fence is not None:
+                    park_workload_renewal(root, value, state, fence)
+                return state
+            del state['renewal_wait']
+            state['phase'] = wait['phase']
+        retry = state.get('retry')
+        if retry is not None:
+            p.require(state['phase'] in ('waiting', retry['phase']), 'Durable product retry no longer matches its step.')
+            now = int(time.time())
+            if retry_expired(state, now):
+                approved = False
+                if explicit_retry_matches(state, value, now):
+                    try:
+                        approved = consume_explicit_retry(root, value, state)
+                    except DispatchDeferred:
+                        fence = current_renewal_fence(ROOT)
+                        if fence is None:
+                            stop_automatic_retry(root, state)
+                        else:
+                            park_workload_renewal(root, value, state, fence)
+                        return state
+                restricted = automatic or wait is not None or retry.get('renewal_only') is True
+                state.pop('explicit_retry', None)
+                if restricted and not approved:
+                    stop_automatic_retry(root, state)
+                    return state
+            state['phase'] = retry['phase']
+        elif state['phase'] == 'waiting':
+            p.require(False, 'Durable product retry is unavailable.')
         try:
             backend = FedoraJob(value)
             backend.ledger('job', registered_contract(value))
@@ -706,7 +933,10 @@ def work(job):
         except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError) as exc:
             retry = pause_reason(exc)
             if retry is not None:
-                record_pause(state, retry, int(time.time()))
+                now = int(time.time())
+                fence = protected_renewal_fence(ROOT) if retry == 'renewal-observation' else None
+                if not record_renewal_wait(state, fence, now):
+                    record_pause(state, retry, now)
             else:
                 state['failed_stage'] = state['phase']
                 state['phase'] = 'blocked'
@@ -717,10 +947,28 @@ def work(job):
         return state
 
 
-def submit(path):
-    p.require_workload_access(ROOT)
+def require_product_scheduling_access():
+    if workload_renewal_fence(ROOT) is not None:
+        from renewal import DispatchDeferred
+
+        raise DispatchDeferred('Product scheduling is held by renewal.')
+
+
+def authorize_explicit_retry(job, expected_plan):
+    with locked_job_state(job) as (root, value, state):
+        p.require(value == expected_plan, 'The published product plan differs from the confirmed agreement.')
+        now = int(time.time())
+        if state['phase'] not in TERMINAL and retry_expired(state, now) and not explicit_retry_matches(state, value, now):
+            state['explicit_retry'] = {'plan_sha256': p.identity(value), 'retry_sha256': retry_identity(state['retry']),
+                                       'until_unix': now + RETRY_SECONDS}
+            durable_json(root / 'state.json', state)
+
+
+def submit(path, *, expected_plan=None, deadline=None, explicit=True):
+    require_product_scheduling_access()
     raw = candidate.protected_file(path)
     value = plan(raw)
+    p.require(expected_plan is None or value == expected_plan, 'The staged product request is bound to another plan.')
     source_approval(value)
     parent, target = trusted_directory(JOBS), job_path(value['job_id'])
     if not os.path.lexists(target):
@@ -740,8 +988,14 @@ def submit(path):
             sync_directory(parent)
     target = trusted_directory(target)
     p.require(plan(read_private(target / 'plan.json', p.MAX_MESSAGE)) == value, 'job ID is already bound to another brief')
+    require_product_scheduling_access()
+    state = read_state(target)
+    if explicit and state['phase'] not in TERMINAL and retry_expired(state, int(time.time())):
+        authorize_explicit_retry(value['job_id'], value)
+        require_product_scheduling_access()
+    end = time.monotonic() + 10
     candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-product@' + value['job_id'] + '.service'],
-                     time.monotonic() + 10)
+                     end if deadline is None else min(end, deadline))
     return read_state(target)
 
 
@@ -762,11 +1016,11 @@ def main(argv=None):
         if args.action == 'submit':
             result = submit(args.approved_plan)
         elif args.action == 'work':
-            result = work(args.job)
+            result = work(args.job, automatic=True)
             while result['phase'] == 'waiting' and result['retry']['automatic']:
                 print(p.canonical(result), flush=True)
                 time.sleep(RETRY_INTERVAL)
-                result = work(args.job)
+                result = work(args.job, automatic=True)
         else:
             root = trusted_directory(job_path(args.job))
             previous = None
@@ -780,7 +1034,7 @@ def main(argv=None):
                     previous = result
                 time.sleep(1)
         print(p.canonical(result), flush=True)
-        if args.action == 'work' and result['phase'] == 'waiting':
+        if args.action == 'work' and result['phase'] in ('waiting', RENEWAL_WAIT):
             return 76
         return 2 if result['phase'] == 'blocked' else 0
     except BlockingIOError:
