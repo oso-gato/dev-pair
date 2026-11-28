@@ -1,6 +1,8 @@
 """Source-shaped engine env and real pipes; no Podman/Fedora/DAC admission."""
 import copy
+from contextlib import redirect_stderr
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -89,12 +91,31 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), ['dp-maint', 'dp-maint'])
 
     def test_builder_map_blocks_a_cached_single_mapping_before_image_operations(self):
-        _, app = self.case()
-        for bad in ('0 1001 1\n' * 2, '0 1001 1\n1 1000000 65536\n0 1001 1\n1 1065536 65536\n'):
+        case, app = self.case()
+        attempts = {'source_sha': fixture.SOURCE, 'context_sha256': fixture.EXPECTED,
+                    'distrobox_sha': g.DBX_SHA, 'count': 1}
+        app.target = g.ROOT + '/' + fixture.EXPECTED
+        app.directory(app.target, mode=0o755)
+        app.record('attempt', attempts)
+        cases = (('0 1001 1\n' * 2, g.StaleBuilderMapping, 'single-ID'),
+                 ('0 1001 1\n1 1000000 65536\n0 1001 1\n1 1065536 65536\n', b.Blocked, 'exact managed subordinate ranges'))
+        for bad, error, reason in cases:
             with (patch.object(app, 'engine', return_value=bad) as engine,
-                  self.assertRaisesRegex(b.Blocked, 'exact managed subordinate ranges')):
-                app.setup_executor()
+                  patch.object(app, '_candidate_image') as stage,
+                  self.assertRaisesRegex(error, reason)):
+                case.assemble(retry=True)
             engine.assert_called_once_with('unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map', timeout=15)
+            stage.assert_not_called()
+            self.assertEqual(json.loads(app.text(app.target + '/attempt.json')), attempts)
+
+    def test_owner_initializer_prints_scoped_reboot_recovery_for_stale_map(self):
+        args = ['gptbox.py', 'initialize', '--context', '/context', '--expected-context-sha256', CONTEXT,
+                '--distrobox-source', '/upstream', '--source-sha', SOURCE, '--apply']
+        with (patch.object(sys, 'argv', args), patch.object(g.Gptbox, 'initialize', side_effect=g.StaleBuilderMapping('single-ID')),
+              redirect_stderr(io.StringIO()) as output):
+            self.assertEqual(g.main(), 2)
+        self.assertIn('single-ID', output.getvalue())
+        self.assertIn('Run ./day0.sh resume after reboot.', output.getvalue())
     def test_real_symlink_mode_and_content_conflicts_preserved(self):
         for kind in ('symlink','mode','content'):
             with self.subTest(kind=kind):

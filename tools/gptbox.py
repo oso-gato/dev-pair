@@ -79,6 +79,10 @@ ADAPTER_SOURCE_FILES = ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selin
                         'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py')
 
 
+class StaleBuilderMapping(Blocked):
+    """Podman retained single-ID mappings for both builder namespaces."""
+
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -514,13 +518,15 @@ class Gptbox(Bootstrap):
         if retry and isinstance(self.run, Commands):
             self.run.reconcile_native(('--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--uid=dp-maint'), {})
         self.configure_executor(uid, control)
-        self.verify_builder_mapping()
 
     def verify_builder_mapping(self):
         mapping = self.engine('unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map', timeout=15)
         rows = [tuple(line.split()) for line in mapping.splitlines()]
-        expected = [('0', self.uid, '1'), ('1', '1000000', '65536'),
-                    ('0', self.gid, '1'), ('1', '1000000', '65536')]
+        uid, gid = ('0', self.uid, '1'), ('0', self.gid, '1')
+        if rows == [uid, gid]:
+            raise StaleBuilderMapping('Podman is still using single-ID UID and GID mappings for the managed builder.')
+        subordinates = ('1', '1000000', '65536')
+        expected = [uid, subordinates, gid, subordinates]
         if rows != expected:
             raise Blocked('native builder UID/GID namespace does not map the exact managed subordinate ranges')
 
@@ -1220,10 +1226,13 @@ class Gptbox(Bootstrap):
             self.record('cleanup-only', {**cleanup, 'phase': 'complete'})
             raise Blocked('build budget exhausted; exact owned resources cleaned without another build')
         if previous:
+            self.verify_builder_mapping()
             self.recover_resources(expected)
             self.recover_image_work(expected)
         if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
             raise Blocked('eight GiB free reserve is required before assembly')
+        if not previous:
+            self.verify_builder_mapping()
         verify_prepared_image()
         self.record('attempt', {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'count': count})
         base,imported,inputs=self._full_candidate(context,expected,revision,manifest,fresh=fresh,on_prepared=on_prepared)
@@ -1848,7 +1857,7 @@ class Gptbox(Bootstrap):
                               adapter_elapsed_seconds=round(time.monotonic() - adapter_started, 3))
                 save()
                 return record
-            except BaseException:
+            except BaseException as error:
                 snapshot_prepare_observations()
                 # Preserve successful prerequisite phase independently. Native
                 # per-command and OCI lifetimes remain finite after interruption.
@@ -1863,7 +1872,10 @@ class Gptbox(Bootstrap):
                 record['prepare_step'] = getattr(preparation, 'prepare_step', 'not-started')
                 record['failure'] = 'blocked-or-interrupted; inspect protected diagnostics; explicit retry required'
                 record['cleanup'] = 'not verified; root-only native stdin transport may remain until exact retry/reboot; native/OCI lifetimes remain finite'
-                if record['adapter_commenced']:
+                if isinstance(error, StaleBuilderMapping):
+                    record['failure'] = 'stale-builder-namespace; reboot and retry the exact source and context'
+                    record['cleanup'] = 'builder map probe finished; recorded resources retained'
+                elif record['adapter_commenced']:
                     try:
                         with self.run.phase(CLEANUP_EXECUTION, 'dev-pair-initialize-cleanup'):
                             cleanup = json.loads(self.text(self.target + '/cleanup-only.json', '{"count":0}'))
@@ -2247,6 +2259,7 @@ class DevelopmentGptbox(Gptbox):
         reserve = 8 * 1024 ** 3 + 2 * DEVELOPMENT_ARCHIVE_LIMIT
         if shutil.disk_usage(pending.parent).free < reserve:
             raise Blocked('insufficient capacity for the bounded development export and eight GiB reserve')
+        self.verify_builder_mapping()
         attempt = {**attempt, 'count': count + 1}
         self.record('attempt', attempt)
         base, _, inputs = self._full_candidate(context, expected, revision, manifest)
@@ -2565,6 +2578,13 @@ def main():
                 result = app.assemble(args.context, args.expected_context_sha256, args.distrobox_source, args.source_sha, args.apply, args.retry)
             print(json.dumps(result, indent=2))
         return 0
+    except StaleBuilderMapping as error:
+        print(str(error), file=sys.stderr)
+        action = ('Run ./day0.sh resume after reboot.' if args.stage in ('initialize', 'assemble-prepared-maintenance')
+                  else 'Retry the same source and context after reboot.')
+        print('Keep the recovery console available and reboot the host when authorized. ' + action +
+              ' Protected setup progress is retained.', file=sys.stderr)
+        return 2
     except (Blocked, OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError):
         print('gptbox operation blocked; no job/runtime admission; inspect protected evidence locally', file=sys.stderr)
         return 2
