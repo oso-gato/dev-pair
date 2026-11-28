@@ -65,7 +65,11 @@ class GpgCleanupTests(unittest.TestCase):
         def interrupted(*a,**k):raise KeyboardInterrupt('cancel')
         with patch.object(s.subprocess,'Popen',side_effect=self.launch(interrupted_wait=interrupted)),self.assertRaises(KeyboardInterrupt):self.seal()
         owner=s._PENDING;self.assertIs(owner['process'],self.children[0]);self.assertEqual(set(owner),{'process','end'})
-        with self.assertRaises(KeyboardInterrupt):s.reconcile_pending()
+        # The real child may already have exited after the first cleanup sent SIGKILL.
+        # Keep this second check on the interrupted-wait path regardless of timing.
+        with patch.object(owner['process'], 'poll', return_value=None):
+            with self.assertRaises(KeyboardInterrupt):
+                s.reconcile_pending()
         self.assertIs(s._PENDING,owner)
         with patch.object(s,'_encrypt',side_effect=AssertionError('second child forbidden')):self.assertEqual(self.seal()['reason'],'encryption-cleanup-unresolved')
     def test_cleanup_phase_signal_propagates_and_pending_has_no_fresh_wait(self):
