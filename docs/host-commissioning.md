@@ -100,8 +100,8 @@ dev-pair start owner/approved-repository
 ```
 
 Record a native reboot and verify the current release, Q loopback listener and
-next timer firing with the same entry. Separate controlled product promotion
-and any subsequent rollout require their approved release paths. The local
+next timer firing with the same entry. Optional checklist promotion uses its own protected enrollment and verification
+path after owner intake is ready. [Checklist promotion](product-release.md) The local
 commissioning fixture exercises ordering and durable readback with isolated
 files and a synthetic manager. Fedora and SELinux commissioning remain required
 on the selected target.

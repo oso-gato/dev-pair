@@ -87,6 +87,12 @@ Check the displayed revisions, destination, role settings, budget cap and UTC
 expiry before confirming. Resume to finish activation, then connect as `core`
 over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
 
+When the named owner terminal is available, `resume` can offer optional
+checklist promotion. Enroll only after the independent release authorities
+and time-limited credentials for that destination have been approved. See the
+protected enrollment, withdrawal and signed destination proof commands in the
+[promotion runbook](product-release.md).
+
 ## Independent access station setup
 
 The verifier station operator uses a separate, authorized Tailnet device and

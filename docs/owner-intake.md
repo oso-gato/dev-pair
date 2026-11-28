@@ -57,10 +57,10 @@ The [product loop](product-job.md) owns workspace changes, scoped tests,
 candidate repair and role registration. The controlled private release
 process remains the delivery path.
 
-## Install the intake once
+## Installed intake service
 
-Install these files from the combined independently reviewed release, with
-root ownership and protected ancestors.
+Host commissioning installs these files from the independently reviewed
+release with root ownership and protected ancestors.
 
 | Source | Installed path and mode |
 | --- | --- |
@@ -71,8 +71,8 @@ root ownership and protected ancestors.
 | [Scheduling recovery service](../runtime/product-job/dev-pair-intake-recovery.service) and [timer](../runtime/product-job/dev-pair-intake-recovery.timer) | Matching filenames under `/etc/systemd/system`, mode 0644 |
 | [Private directories](../runtime/product-job/dev-pair-intake.conf) | `/etc/tmpfiles.d/dev-pair-intake.conf` mode 0644 |
 
-Enable `dev-pair-intake-recovery.timer` as part of controlled installation
-after the configured role and product roots are present. The timer observes
+Commissioning enables `dev-pair-intake-recovery.timer` after the configured
+role and product roots and a current site grant are present. The timer observes
 only confirmed jobs from the bounded intake catalogue. A job has up to eight
 schedule attempts and four preparation attempts. A confirmed job with an
 acknowledged product start can recover once per boot while its durable
@@ -86,12 +86,12 @@ execution scope, role profiles and budgets come from root-owned configuration.
 The terminal command reads a brief file as the operator and passes only its
 text. The preparation unit uses a separate internal mode.
 
-Provision the ordinary [product](product-job.md), [role](role-entry.md),
-renewal and [Fedora executor](host-handoff.md) paths first. Trusted role image
-selection, provider credentials and allowance, independent release and named
-operator access are part of controlled setup. Keep
-`/var/lib/dev-pair/{maintenance,development}/conductor-inputs` as fixed
-mode-0700 directories owned by their role accounts for bounded Git transfer.
+The installed [product](product-job.md), [role](role-entry.md), renewal and
+[Fedora executor](host-handoff.md) paths share the protected commissioning
+policy. Trusted role selection, provider credentials and allowance, independent
+release and named operator access control intake. The fixed role directories
+`/var/lib/dev-pair/{maintenance,development}/conductor-inputs` use mode 0700
+and belong to their respective role accounts for bounded Git transfer.
 
 The intake reads the selected renewal launch plan's admitted
 `development_manifests` map. A slot has a released DevBox manifest, bounded
@@ -152,9 +152,9 @@ reads. Keep the API key in protected file custody and the reviewer signing key
 with the independent reviewer. A missing, expired or rejected review keeps
 first owner intake pending.
 
-When the wizard displays the exact checkout, startup revision, verified
-private destination, role limits and selected slot, enter the approved total
-USD cap and UTC expiry and confirm the matching plan. The wizard publishes the
+Enter the approved total USD cap and UTC expiry. Before confirming, check the
+exact checkout, startup revision, verified private destination, role limits
+and selected slot displayed by the wizard. The wizard publishes the
 catalogue and role profiles. It can join an interrupted publication and retains
 existing catalogue and job history. Resume Day 0 to finish activation. The
 normal owner command has its own approval for each later product job before
