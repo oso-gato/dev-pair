@@ -494,7 +494,7 @@ def projection(root):
         denied(export_current, 'frozen by renewal')
         transition.unlink()
         write(destination.MANAGED_LISTENER, renewal.json_bytes({**listener, 'phase': 'observe'}))
-        denied(export_current, 'completed managed listener')
+        denied(export_current, 'completed historical managed listener')
         write(destination.MANAGED_LISTENER, renewal.json_bytes(listener))
         write(control / 'current.json', renewal.json_bytes(old_site))
         denied(export_current, 'frozen by renewal')
