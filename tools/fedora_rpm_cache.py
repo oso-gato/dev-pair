@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Bounded, authenticated stock Fedora DNF construction cache."""
 import argparse
+import contextlib
 import ctypes
 import hashlib
 import io
@@ -118,7 +119,7 @@ def read_header(stream):
     return item
 
 
-def unpack(archive, expected_sha, wanted, destination, key, end, *, signature_check=None):
+def _unpack_transport(archive, expected_sha, wanted, destination, end):
     fd = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
         info = os.fstat(stream.fileno())
@@ -154,6 +155,11 @@ def unpack(archive, expected_sha, wanted, destination, key, end, *, signature_ch
         padding = stream.read(tarfile.RECORDSIZE + 1)
         require(seen == set(files) and 512 <= len(padding) <= tarfile.RECORDSIZE and padding == bytes(len(padding))
                 and stream.tell() == info.st_size, 'RPM cache transport is incomplete or has trailing data')
+    return files
+
+
+def unpack(archive, expected_sha, wanted, destination, key, end, *, signature_check=None):
+    files = _unpack_transport(archive, expected_sha, wanted, destination, end)
     if signature_check is None:
         validate_repositories(destination, files, key, end)
     else:
@@ -360,7 +366,12 @@ def validate_primary(path, sizes, packages, end):
 
 
 def validate_repositories(destination, files, key, end, *, signature_check=None):
+    _validate_repositories(destination, files, key, end, signature_check=signature_check)
+
+
+def _validate_repositories(destination, files, key, end, *, signature_check=None, verified_primary=None):
     all_rpms = []
+    descriptors = []
     for repo, kinds in REPOSITORIES.items():
         root = destination / repo
         nodes = {name.split('/', 1)[1]: entry for name, entry in files.items() if name.startswith(repo + '/')}
@@ -392,10 +403,97 @@ def validate_repositories(destination, files, key, end, *, signature_check=None)
         require(set(selected) == kinds and packages and set(nodes) == {'metalink.xml', 'repodata/repomd.xml'}
                 | set(selected.values()) | {'packages/' + name for name in packages},
                 'incomplete or unexpected Fedora cache metadata')
-        validate_primary(root / selected['primary'], primary, packages, end)
+        primary_name = selected['primary']
+        descriptor = (repo, primary_name, nodes[primary_name]['bytes'], nodes[primary_name]['sha256'], primary,
+                      tuple((name, item['bytes'], item['sha256']) for name, item in sorted(packages.items())))
+        if verified_primary is None:
+            validate_primary(root / primary_name, primary, packages, end)
+        else:
+            index = len(descriptors)
+            require(index < len(verified_primary) and descriptor == verified_primary[index], 'Fedora primary replay inputs differ')
+        descriptors.append(descriptor)
         all_rpms.extend(root / 'packages' / name for name in sorted(packages))
+    require(verified_primary is None or len(descriptors) == len(verified_primary), 'Fedora primary replay repository set differs')
     require(digest(key, end) == fedora_oci.KEY_SHA, 'Fedora RPM signing key differs from the pinned key')
     (signature_check or verify_signatures)(destination, key, all_rpms, end)
+    return tuple(descriptors)
+
+
+def _protected_replay_destination(destination):
+    require(destination.is_absolute() and '..' not in destination.parts, 'RPM replay requires an absolute private workspace')
+    for directory in (destination, *destination.parents):
+        info = directory.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid in (0, os.getuid()) and not info.st_mode & 0o022,
+                'RPM replay workspace ancestor is not protected')
+    info = destination.lstat()
+    require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700 and not any(destination.iterdir()),
+            'RPM replay requires a new controller-owned tree')
+
+
+def _primary_policy():
+    # These are stock Fedora paths. If their live identity cannot be pinned,
+    # both uses retain the complete ordinary verifier.
+    tools = []
+    for name in ('/usr/bin/prlimit', '/usr/bin/zstd', '/usr/bin/rpmkeys', '/usr/lib64/libxml2.so.2', '/usr/lib64/libzstd.so.1'):
+        try:
+            path = Path(name).resolve(strict=True)
+            info = path.stat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            return None
+        tools.append((path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+    return (tuple(tools), validate_primary, primary_packages, xml_document, xml_child, command, verify_signatures,
+            PRIMARY_LIMIT, PRIMARY_WINDOW_LIMIT, PRIMARY_NAMESPACE, METADATA_LIMIT, fedora_oci.KEY_SHA, SIGNER,
+            tuple((repo, tuple(sorted(kinds))) for repo, kinds in REPOSITORIES.items()))
+
+
+@contextlib.contextmanager
+def _maintenance_primary_handoff(context, expected_sha, wanted):
+    """One lexical maintenance attempt; no independent audit can mint replay evidence."""
+    require(HEX.fullmatch(context) and HEX.fullmatch(expected_sha), 'invalid maintenance RPM replay binding')
+    expected_binding = canonical(wanted)
+    owner_pid = os.getpid()
+    proof = None
+    used = False
+
+    def matches(role, actual_context, digest, binding):
+        return (os.getpid() == owner_pid and role == 'maintenance' and actual_context == context and digest == expected_sha
+                and canonical(binding) == expected_binding)
+
+    def construction(archive, digest, binding, destination, key, end, *, role, context):
+        nonlocal proof, used
+        available, used = not used, True
+        proof = None
+        if not available or not matches(role, context, digest, binding):
+            return unpack(archive, digest, binding, destination, key, end)
+        policy = _primary_policy()
+        if policy is None:
+            return unpack(archive, digest, binding, destination, key, end)
+        _protected_replay_destination(destination)
+        files = _unpack_transport(archive, digest, binding, destination, end)
+        descriptors = _validate_repositories(destination, files, key, end)
+        remaining(end)
+        if _primary_policy() == policy:
+            proof = policy, descriptors
+        return destination
+
+    def assembly(archive, digest, binding, destination, key, end, *, role, context):
+        nonlocal proof, used
+        verified, proof, used = proof, None, True
+        if verified is None or not matches(role, context, digest, binding) or _primary_policy() != verified[0]:
+            return unpack(archive, digest, binding, destination, key, end)
+        _protected_replay_destination(destination)
+        files = _unpack_transport(archive, digest, binding, destination, end)
+        _validate_repositories(destination, files, key, end, verified_primary=verified[1])
+        require(_primary_policy() == verified[0], 'Fedora primary replay verifier changed')
+        remaining(end)
+        return destination
+
+    try:
+        yield construction, assembly
+    finally:
+        proof, used = None, True
 
 
 def verify_signatures(destination, key, packages, end):

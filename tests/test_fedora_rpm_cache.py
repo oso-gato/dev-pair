@@ -1,4 +1,5 @@
 """Construction cache identity, staging and image history checks."""
+import contextlib
 import hashlib
 import io
 import os
@@ -20,6 +21,199 @@ import platform_release_ci
 
 
 cache = g.fedora_rpm_cache
+
+
+@unittest.skipUnless(Path('/usr/bin/zstd').exists(), 'requires the stock zstd executable')
+class PrimaryReplayTests(unittest.TestCase):
+    def setUp(self):
+        fixture = tempfile.TemporaryDirectory()
+        self.addCleanup(fixture.cleanup)
+        self.root = Path(fixture.name)
+        self.context = 'a' * 64
+        self.binding = cache.binding('1' * 40, g.candidate.STANDARDS, g.sha(g.PACKAGE_SCRIPT.encode()))
+        self.key = self.root / 'key'
+        self.key.write_bytes(b'synthetic pinned public key')
+        self.enterContext(patch.object(cache.fedora_oci, 'KEY_SHA', hashlib.sha256(self.key.read_bytes()).hexdigest()))
+        self.enterContext(patch.object(cache, '_primary_policy', return_value=('local policy fixture',)))
+        self.enterContext(patch.object(cache, '_protected_replay_destination'))  # Host /tmp is intentionally untrusted.
+        self.scans = self.enterContext(patch.object(cache, 'validate_primary', wraps=cache.validate_primary))
+        self.signatures = self.enterContext(patch.object(cache, 'verify_signatures'))
+        self.transport = self.enterContext(patch.object(cache, '_unpack_transport', wraps=cache._unpack_transport))
+        tree = self.root / 'input'
+        for repo, kinds in cache.REPOSITORIES.items():
+            root = tree / repo
+            (root / 'repodata').mkdir(parents=True)
+            (root / 'packages').mkdir()
+            name = 'example-1-1.fc44.x86_64.rpm'
+            rpm = (repo + '\nfixture, not an actual RPM').encode()
+            (root / 'packages' / name).write_bytes(rpm)
+            primary = (f'<metadata xmlns="{cache.PRIMARY_NAMESPACE.decode()}"><package>'
+                       f'<checksum type="sha256">{hashlib.sha256(rpm).hexdigest()}</checksum>'
+                       f'<size package="{len(rpm)}"/><location href="Packages/e/{name}"/></package></metadata>').encode()
+            compressed = subprocess.run(['/usr/bin/zstd', '-qc'], input=primary, capture_output=True, check=True, timeout=5).stdout
+            records = []
+            for kind in sorted(kinds):
+                data = compressed if kind == 'primary' else kind.encode()
+                digest = hashlib.sha256(data).hexdigest()
+                leaf = f'repodata/{digest}-{kind}'
+                (root / leaf).write_bytes(data)
+                expanded = (f'<open-checksum type="sha256">{hashlib.sha256(primary).hexdigest()}</open-checksum>'
+                            f'<open-size>{len(primary)}</open-size>') if kind == 'primary' else ''
+                records.append(f'<data type="{kind}"><checksum type="sha256">{digest}</checksum>'
+                               f'<size>{len(data)}</size><location href="{leaf}"/>{expanded}</data>')
+            repomd = ('<repomd>' + ''.join(records) + '</repomd>').encode()
+            (root / 'repodata/repomd.xml').write_bytes(repomd)
+            hashes = ''.join(f'<hash type="{name}">{hashlib.new(name, repomd).hexdigest()}</hash>' for name in ('sha256', 'sha512'))
+            (root / 'metalink.xml').write_text(f'<metalink><files><file name="repomd.xml"><verification>{hashes}</verification></file></files></metalink>')
+        self.archive = self.root / 'stock-cache.tar'
+        self.digest = cache.build_transport(tree, self.archive, self.binding)
+
+    def capture(self, operation, name, *, context=None, digest=None, archive=None, end=None, role='maintenance', **kwargs):
+        destination = self.root / name / 'rpm-cache'
+        destination.parent.mkdir()
+        destination.mkdir(mode=0o700)
+        args = (archive or self.archive, digest or self.digest, self.binding, destination, self.key,
+                time.monotonic() + 10 if end is None else end)
+        if operation is cache.unpack:
+            return operation(*args, **kwargs)
+        return operation(*args, role=role, context=context or self.context)
+
+    def scope(self):
+        return cache._maintenance_primary_handoff(self.context, self.digest, self.binding)
+
+    def test_replay_reconstructs_fresh_tree_and_reruns_all_live_signatures_once(self):
+        with self.scope() as (construct, assemble):
+            first = self.capture(construct, 'build')
+            member = next(first.glob('*/packages/*')).relative_to(first)
+            actor_copy = self.root / 'actor-copy'
+            actor_copy.mkdir()
+            cache.build_mounts(actor_copy, first, os.getuid(), os.getgid())
+            actor_member = actor_copy / 'rpm-cache' / member
+            actor_member.chmod(0o644)
+            actor_member.write_bytes(b'mutated writable build copy')
+            second = self.capture(assemble, 'assembly')
+            self.assertEqual(self.scans.call_count, 2)
+            self.assertEqual(self.transport.call_count, 2)
+            self.assertEqual(self.signatures.call_count, 2)
+            self.assertNotEqual((first / member).stat().st_ino, (second / member).stat().st_ino)
+            self.assertEqual((first / member).read_bytes(), (second / member).read_bytes())
+            self.assertNotEqual(actor_member.read_bytes(), (second / member).read_bytes())
+            self.assertEqual([len(call.args[2]) for call in self.signatures.call_args_list], [2, 2])
+            self.capture(assemble, 'consumed')
+            self.assertEqual(self.scans.call_count, 4)
+        self.capture(assemble, 'revoked')
+        self.assertEqual(self.scans.call_count, 6)
+
+    def test_audit_missing_producer_and_policy_context_changes_require_full_scan(self):
+        audit = Mock()
+        with self.scope() as (construct, assemble):
+            self.capture(cache.unpack, 'audit', signature_check=audit)
+            audit.assert_called_once()
+            self.signatures.assert_not_called()
+            self.capture(assemble, 'no-producer')
+            self.assertEqual(self.scans.call_count, 4)
+        with self.scope() as (construct, assemble):
+            self.capture(construct, 'original-policy')
+            with patch.object(cache, '_primary_policy', return_value=('changed policy',)):
+                self.capture(assemble, 'new-policy')
+        with self.scope() as (construct, assemble):
+            self.capture(construct, 'original-context')
+            self.capture(assemble, 'new-context', context='b' * 64)
+        self.assertEqual(self.scans.call_count, 12)
+        with self.scope() as (construct, assemble):
+            self.capture(construct, 'original-process')
+            with patch.object(cache.os, 'getpid', return_value=os.getpid() + 1):
+                self.capture(assemble, 'different-process')
+        self.assertEqual(self.scans.call_count, 16)
+
+    def test_bad_transport_key_signature_or_expiry_does_not_replay_again(self):
+        first_archive = self.archive.read_bytes()
+        corrupt = self.root / 'corrupt.tar'
+        corrupt.write_bytes(first_archive + b'foreign extra member or trailing content')
+        for trial in ('transport', 'key', 'signature', 'deadline'):
+            with self.subTest(trial=trial), self.scope() as (construct, assemble):
+                self.capture(construct, f'build-{trial}')
+                scans = self.scans.call_count
+                stock = self.signatures.call_count
+                with contextlib.ExitStack() as cleanup:
+                    args = {}
+                    reason = 'trailing data'
+                    if trial == 'transport':
+                        args['archive'] = corrupt
+                    if trial == 'deadline':
+                        args['end'] = time.monotonic() - 1
+                        reason = 'deadline exceeded'
+                    if trial == 'key':
+                        original = self.key.read_bytes()
+                        cleanup.callback(self.key.write_bytes, original)
+                        self.key.write_bytes(b'changed key')
+                        reason = 'signing key differs'
+                    if trial == 'signature':
+                        cleanup.callback(setattr, self.signatures, 'side_effect', None)
+                        self.signatures.side_effect = ValueError('live signature refused')
+                        reason = 'live signature refused'
+                    with self.assertRaisesRegex(ValueError, reason):
+                        self.capture(assemble, f'failed-{trial}', **args)
+                self.assertEqual(self.scans.call_count, scans)
+                self.assertEqual(self.signatures.call_count, stock + (trial == 'signature'))
+                self.capture(assemble, f'consumed-{trial}')
+                self.assertEqual(self.scans.call_count, scans + 2)
+
+    def test_first_signature_failure_cannot_mint_replay(self):
+        with self.scope() as (construct, assemble):
+            self.signatures.side_effect = ValueError('first signature refused')
+            try:
+                with self.assertRaisesRegex(ValueError, 'first signature refused'):
+                    self.capture(construct, 'refused-build')
+            finally:
+                self.signatures.side_effect = None
+            self.assertEqual(self.scans.call_count, 2)
+            self.capture(assemble, 'fresh-verification')
+            self.assertEqual(self.scans.call_count, 4)
+
+    def test_interrupted_repeat_construction_revokes_earlier_proof(self):
+        with self.scope() as (construct, assemble):
+            self.capture(construct, 'initial-construction')
+            self.signatures.side_effect = KeyboardInterrupt()
+            try:
+                with self.assertRaises(KeyboardInterrupt):
+                    self.capture(construct, 'interrupted-repeat')
+            finally:
+                self.signatures.side_effect = None
+            self.assertEqual(self.scans.call_count, 4)
+            self.capture(assemble, 'full-after-interruption')
+            self.assertEqual(self.scans.call_count, 6)
+
+    def test_cold_ordinary_assembly_replays_and_explicit_retry_fully_reauthenticates(self):
+        from test_gptbox import GptboxTests, REAL_COPY_WORKSPACE
+
+        fixture = GptboxTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        app = fixture.app
+        archive = fixture.root / 'stock-cache.tar'
+        archive.write_bytes(self.archive.read_bytes())
+        archive.chmod(0o444)
+        app.rpm_cache = archive, self.digest
+        (fixture.context / 'fedora-key').write_bytes(self.key.read_bytes())
+        build = cache.build_mounts
+        handoff = cache.assembly_handoff
+        fixture.engine.fail = lambda args: 'cp' in args
+        with patch.object(app, 'load_archive_verifier'), patch.object(app, 'verify_maintenance_cache_history'), \
+                patch.object(g.fedora_oci, 'copy_workspace', REAL_COPY_WORKSPACE), \
+                patch.object(cache, 'build_mounts', side_effect=lambda work, tree, *_: build(work, tree, os.getuid(), os.getgid())), \
+                patch.object(cache, 'assembly_handoff', side_effect=lambda work, tree, *_: handoff(work, tree, os.getgid())):
+            with self.assertRaisesRegex(g.Blocked, 'injected engine boundary failure'):
+                fixture.assemble()
+            self.assertEqual(self.scans.call_count, 2)
+            self.assertEqual(self.signatures.call_count, 2)
+            self.assertEqual(self.transport.call_count, 2)
+            fixture.engine.fail = None
+            recovered = fixture.assemble(retry=True)
+        self.assertEqual(self.scans.call_count, 4)
+        self.assertEqual(self.signatures.call_count, 3)
+        self.assertEqual(self.transport.call_count, 3)
+        self.assertFalse(recovered['job_admission'])
 
 
 class CacheTests(unittest.TestCase):

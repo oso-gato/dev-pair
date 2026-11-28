@@ -1235,14 +1235,21 @@ class Gptbox(Bootstrap):
             self.record('rpm-cache', value)
 
     def unpack_rpm_cache(self, workspace):
+        return fedora_rpm_cache.unpack(*self._rpm_cache_inputs(workspace))
+
+    def _rpm_cache_inputs(self, workspace):
         archive, digest = self.rpm_cache
         deadline = time.monotonic() + 120
         if isinstance(self.run, Commands):
             deadline = min(deadline, self.run.execution_deadline() or deadline)
         cache = workspace / 'rpm-cache'
         cache.mkdir(mode=0o700)
-        return fedora_rpm_cache.unpack(self.protected(archive), digest, self.rpm_cache_binding, cache,
-                                      self.rpm_cache_key, deadline)
+        return self.protected(archive), digest, self.rpm_cache_binding, cache, self.rpm_cache_key, deadline
+
+    def _unpack_assembly_rpm_cache(self, workspace, context, verifier):
+        if verifier is None:
+            return self.unpack_rpm_cache(workspace)
+        return verifier(*self._rpm_cache_inputs(workspace), role=self.role, context=context)
 
     def reconcile_rpm_executor(self):
         if isinstance(self.run, Commands):
@@ -1250,12 +1257,15 @@ class Gptbox(Bootstrap):
                                        '--uid=dp-maint'), {})
 
     def stage_assembly_cache(self, stage, expected):
+        return self._stage_assembly_cache(stage, expected, None)
+
+    def _stage_assembly_cache(self, stage, expected, cache_verifier):
         work = self.artifact_root + '/' + expected + '/assembly-cache'
         self.directory(work, mode=0o755)
         with fedora_oci.copy_workspace(self.path(work), verification=True,
                                        reserve=8 * 1024 ** 3 + fedora_rpm_cache.WORK_PEAK,
                                        reconcile=self.reconcile_rpm_executor) as private:
-            canonical_cache = self.unpack_rpm_cache(private)
+            canonical_cache = self._unpack_assembly_rpm_cache(private, expected, cache_verifier)
             cache, config = fedora_rpm_cache.assembly_handoff(private / 'rpm-handoff', canonical_cache, int(self.gid))
             self.engine('cp', '--archive=false', str(cache) + '/.', stage + ':' + fedora_rpm_cache.ROOT, timeout=120)
             self.engine('cp', '--archive=false', str(config), stage + ':' + fedora_rpm_cache.DROPIN_PATH, timeout=30)
@@ -1448,38 +1458,46 @@ class Gptbox(Bootstrap):
             self.verify_builder_mapping()
         verify_prepared_image()
         self.record('attempt', {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA, 'count': count})
-        base,imported,inputs=self._full_candidate(context,expected,revision,manifest,fresh=fresh,on_prepared=on_prepared)
-        if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
-            raise Blocked('eight GiB free reserve is required after image construction before actual assembly')
-        self.image_stage('assembly',revision,expected)
-        stage = runtime_id = None
-        stage_name, runtime_name = 'dp-gptbox-a-' + expected[:16] + '-' + str(count), 'dp-gptbox-r-' + expected[:16] + '-' + str(count)
-        self.record('resources', {stage_name: base})
-        try:
-            stage = self.create_assembly_stage(stage_name, expected, base)
-            sealed, _ = self.seal_assembly_stage(stage, base, revision, inputs)
-            self.record('resources', {stage_name: base, runtime_name: sealed})
-            # A separate immutable runtime, never the writable assembly container.
-            self.image_stage('runtime',revision,expected)
-            runtime_id = self.create_maintenance_probe(runtime_name, expected, sealed)
-            self.maintenance_probe_cycles(runtime_id, sealed, self.codex_version)
-            result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
-                      'distrobox_sha': DBX_SHA, 'fedora_base': imported, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
-                      'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
-                      'model_access': 'not verified', 'nested_placement': 'not verified',
-                      'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}
-        except BaseException:
-            self.record('failure', {'status': 'blocked-or-interrupted', 'job_admission': False,
-                                   'diagnostics': 'bounded protected diagnostics.json; collect additional scoped audit AVCs externally'})
-            raise
-        finally:
-            for identity in (runtime_id, stage):
-                if identity:
-                    self.engine('rm', '--force', identity)
-        self.observe_assembled_storage(expected,revision,sealed)
-        self.record('result', result)
-        self.image_stage('complete',revision,expected)
-        return result
+        with contextlib.ExitStack() as cache_handoff:
+            construction_cache = assembly_cache = None
+            if self.role == 'maintenance' and self.rpm_cache is not None and not retry:
+                construction_cache, assembly_cache = cache_handoff.enter_context(
+                    fedora_rpm_cache._maintenance_primary_handoff(expected, self.rpm_cache[1], self.rpm_cache_binding))
+            base,imported,inputs=self._full_candidate(context,expected,revision,manifest,fresh=fresh,on_prepared=on_prepared,cache_verifier=construction_cache)
+            if shutil.disk_usage(self.path('/var/lib/dev-pair')).free < 8 * 1024 ** 3:
+                raise Blocked('eight GiB free reserve is required after image construction before actual assembly')
+            self.image_stage('assembly',revision,expected)
+            stage = runtime_id = None
+            stage_name, runtime_name = 'dp-gptbox-a-' + expected[:16] + '-' + str(count), 'dp-gptbox-r-' + expected[:16] + '-' + str(count)
+            self.record('resources', {stage_name: base})
+            try:
+                stage = self.create_assembly_stage(stage_name, expected, base)
+                if assembly_cache is None:
+                    sealed, _ = self.seal_assembly_stage(stage, base, revision, inputs)
+                else:
+                    sealed, _ = self._seal_assembly_stage(stage, base, revision, inputs, assembly_cache)
+                self.record('resources', {stage_name: base, runtime_name: sealed})
+                # A separate immutable runtime, never the writable assembly container.
+                self.image_stage('runtime',revision,expected)
+                runtime_id = self.create_maintenance_probe(runtime_name, expected, sealed)
+                self.maintenance_probe_cycles(runtime_id, sealed, self.codex_version)
+                result = {'kind': 'maintenance-gptbox-probe-candidate', 'source_sha': revision, 'context_sha256': expected,
+                          'distrobox_sha': DBX_SHA, 'fedora_base': imported, 'assembled_image_id': sealed, 'runtime_container_id': runtime_id,
+                          'boundary_and_version_cycles': 2, 'runtime_container_removed': True, 'job_admission': False, 'authentication': 'not verified',
+                          'model_access': 'not verified', 'nested_placement': 'not verified',
+                          'note': 'Probe-only candidate; no Codex job, credential or model request is admitted.'}
+            except BaseException:
+                self.record('failure', {'status': 'blocked-or-interrupted', 'job_admission': False,
+                                       'diagnostics': 'bounded protected diagnostics.json; collect additional scoped audit AVCs externally'})
+                raise
+            finally:
+                for identity in (runtime_id, stage):
+                    if identity:
+                        self.engine('rm', '--force', identity)
+            self.observe_assembled_storage(expected,revision,sealed)
+            self.record('result', result)
+            self.image_stage('complete',revision,expected)
+            return result
 
     def development_oci_end(self):
         if self.role != 'development' or not isinstance(self.run, Commands):
@@ -1519,6 +1537,9 @@ class Gptbox(Bootstrap):
         return identity
 
     def seal_assembly_stage(self, stage, base, revision, inputs):
+        return self._seal_assembly_stage(stage, base, revision, inputs, None)
+
+    def _seal_assembly_stage(self, stage, base, revision, inputs, cache_verifier):
         lifetime, start_timeout = ASSEMBLY_LIFETIME, ASSEMBLY_LIFETIME
         if self.role == 'development' and isinstance(self.run, Commands):
             bound, end, lifetime = getattr(self, 'development_assembly', (None, None, None))
@@ -1529,7 +1550,10 @@ class Gptbox(Bootstrap):
             if state.get('Status') not in ('configured', 'created') or state.get('Running') is not False:
                 raise Blocked('assembly was already started')
         if self.rpm_cache:
-            self.stage_assembly_cache(stage, inputs['context_sha256'])
+            if cache_verifier is None:
+                self.stage_assembly_cache(stage, inputs['context_sha256'])
+            else:
+                self._stage_assembly_cache(stage, inputs['context_sha256'], cache_verifier)
             state = self.inspect_container(stage, base, runtime=False, lifetime=lifetime)['State']
             if state.get('Status') not in ('configured', 'created') or state.get('Running') is not False:
                 raise Blocked('cache transfer changed the configured assembly state')
@@ -1569,7 +1593,7 @@ class Gptbox(Bootstrap):
         if stage not in allowed:raise Blocked('unknown image stage')
         self.record('image-progress',{'schema':1,'source_sha':revision,'context_sha256':expected,'phase':'candidate-image','stage':stage})
 
-    def _full_candidate(self,context,expected,revision,manifest,*,fresh=False,on_prepared=None):
+    def _full_candidate(self,context,expected,revision,manifest,*,fresh=False,on_prepared=None,cache_verifier=None):
         budget=self.run.phase(IMAGE_EXECUTION,'dev-pair-gptbox-image',native=False) if isinstance(self.run,Commands) else contextlib.nullcontext()
         inherited_native=getattr(self.run,'native_prefix',None)
         self.image_phase_active=True;previous_marker=self.text(STATE+'/prepared')
@@ -1578,7 +1602,7 @@ class Gptbox(Bootstrap):
                 # Engine argv already names its unit; root storage collection
                 # still needs the enclosing adapter's registered native wrapper.
                 if isinstance(self.run,Commands):self.run.native_prefix=inherited_native
-                result=self._candidate_image(context,expected,revision,manifest,fresh=fresh)
+                result=self._candidate_image(context,expected,revision,manifest,fresh=fresh,cache_verifier=cache_verifier)
             if on_prepared:on_prepared()
             return result
         except BaseException:
@@ -1590,7 +1614,7 @@ class Gptbox(Bootstrap):
             raise
         finally:self.image_phase_active=False
 
-    def _candidate_image(self,context,expected,revision,manifest,*,fresh=False,on_prepared=None):
+    def _candidate_image(self,context,expected,revision,manifest,*,fresh=False,on_prepared=None,cache_verifier=None):
         self.image_stage('input-staging',revision,expected)
         self.directory('/var/lib/dev-pair/artifacts', mode=0o755)
         self.directory(self.artifact_root, mode=0o755)
@@ -1679,7 +1703,7 @@ class Gptbox(Bootstrap):
                 with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=self.reconcile_rpm_executor,
                                                   reserve=reserve) as (copy_tmp, verification_root):
                     try:
-                        canonical_cache = self.unpack_rpm_cache(verification_root) if self.rpm_cache else None
+                        canonical_cache = self._unpack_assembly_rpm_cache(verification_root, expected, cache_verifier) if self.rpm_cache else None
                         self.image_stage('signed-import',revision,expected)
                         with fedora_oci.verified(context, temporary_parent=verification_root, leased=True) as (plain, proof):
                             imported = fedora_oci.import_image(lambda *args, **kw: image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,*args,**kw), plain, uid=int(self.uid))
