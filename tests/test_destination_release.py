@@ -2,6 +2,7 @@
 import contextlib
 import base64
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import bootstrap as b
 import commission_host as commission
 import destination_release as d
+from destination_observation import access_envelope
 import job_protocol as jobs
 import owner_day0
 import release_trust as t
@@ -66,7 +68,8 @@ class BootstrapAccessTests(unittest.TestCase):
 
             app = b.Bootstrap(root, run)
             access = ['192.0.2.44/32']
-            data = {'version': 1, 'source_sha': SOURCE, 'machine_id': 'd' * 32, 'boot_id': '01234567-1234-5678-abcd-0123456789ab',
+            historical = owner_day0.INITIAL_MAINTENANCE_SOURCE
+            data = {'version': 1, 'source_sha': historical, 'machine_id': 'd' * 32, 'boot_id': '01234567-1234-5678-abcd-0123456789ab',
                     'issued_at': int(time.time()) - 5, 'expires_at': int(time.time()) + 600, 'node_id': 'node',
                     'tailnet': 'tail', 'dns_name': DNS, 'keys_sha256': '3' * 64, 'acl_sha256': '4' * 64,
                     'execution_route': 'provider-recovery', 'provider_recovery': 'hostinger://test-vps/recovery',
@@ -152,9 +155,35 @@ class BootstrapAccessTests(unittest.TestCase):
                 self.assertEqual(app.path(b.STATE + '/cutover-recovery/' + archived + '.json').read_bytes(), original)
                 app.atomic(b.CUTOVER, original.decode(), expected=pending.read_text())
                 data['boot_id'] = previous_boot
+                data['source_sha'] = SOURCE
                 identity.return_value = {key: data[key] for key in ('machine_id', 'boot_id')}
-                sign(True, issued_at=data['issued_at'] + 1)
-                self.assertEqual(app.finalize(str(receipt))['access_scope'], 'core')
+                continuation = {'schema': 1, 'machine_id': data['machine_id'], 'controller_source_sha': SOURCE,
+                                'maintenance_source_sha': historical, 'image_id': 'a' * 64, 'context_sha256': 'b' * 64,
+                                'initializer_sha256': 'c' * 64, 'desired_sha256': 'd' * 64}
+                day0_state = app.path('/var/lib/dev-pair-day0')
+                day0_state.mkdir(mode=0o700)
+                entry = owner_day0.DayZero(app=app)
+
+                def response():
+                    return io.BytesIO(access_envelope(receipt.read_bytes(), receipt.with_suffix('.json.sig').read_bytes()))
+
+                with (patch.object(owner_day0, 'STATE', day0_state), patch.object(owner_day0, 'CUTOVER', str(pending)),
+                      patch.object(owner_day0, 'local_file', side_effect=lambda path: path)):
+                    sign(True)
+                    with self.assertRaisesRegex(b.Blocked, 'access review source differs'):
+                        entry.apply_access(SOURCE, historical, response(), workload=False)
+                    self.assertEqual(pending.read_bytes(), original)
+                    app.atomic('/var/lib/dev-pair-day0/continuation.json', json.dumps(continuation))
+                    sign(True, acl_sha256='1' * 64)
+                    with self.assertRaisesRegex(b.Blocked, 'requires matching scoped evidence'):
+                        entry.apply_access(SOURCE, historical, response(), workload=False)
+                    self.assertEqual(pending.read_bytes(), original)
+                    sign(True, issued_at=data['issued_at'] + 1)
+                    self.assertEqual(entry.apply_access(SOURCE, historical, response(), workload=False)['access_scope'], 'core')
+                restored = json.loads(pending.read_bytes())
+                self.assertEqual(restored['target']['source_sha'], SOURCE)
+                self.assertEqual(restored['recovery_predecessor_sha256'], hashlib.sha256(original).hexdigest())
+                self.assertEqual(app.path(b.STATE + '/cutover-recovery/' + restored['recovery_predecessor_sha256'] + '.json').read_bytes(), original)
                 with self.assertRaisesRegex(b.Blocked, 'workload access'):
                     app.verify_workload_access()
                 sign(False, legacy=True)
@@ -218,7 +247,6 @@ class BootstrapAccessTests(unittest.TestCase):
                 app.path(b.SSH_CUTOVER).unlink()
                 app.atomic(b.GUARD_PATH, temporary_guard, expected=app.text(b.GUARD_PATH))
                 shutil.rmtree(app.path('/var/lib/dev-pair/renewal'))
-                historical = '11fbe9e0e0ff911fce13e33527c55020958a50a7'
                 data['source_sha'] = historical
                 sign(False, legacy=True)
                 self.assertEqual(app.finalize(str(receipt))['access_scope'], 'full')
@@ -247,10 +275,6 @@ class BootstrapAccessTests(unittest.TestCase):
                 self.assertEqual(pending.read_bytes(), original_standalone)
                 self.assertEqual(json.loads(marker.read_text())['phase'], 'held')
 
-                continuation = {'schema': 1, 'machine_id': data['machine_id'], 'controller_source_sha': SOURCE,
-                                'maintenance_source_sha': historical, 'image_id': 'a' * 64, 'context_sha256': 'b' * 64,
-                                'initializer_sha256': 'c' * 64, 'desired_sha256': 'd' * 64}
-                app.atomic('/var/lib/dev-pair-day0/continuation.json', json.dumps(continuation))
                 current.return_value = role_selection
                 data['source_sha'] = SOURCE
                 sign(False)

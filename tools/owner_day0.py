@@ -678,16 +678,22 @@ class DayZero:
             document = Path(temporary) / 'receipt.json'
             document.write_bytes(payload)
             document.with_name('receipt.json.sig').write_bytes(signature)
+            signed = self.app.signed_evidence(str(document), ACCESS_PRINCIPAL, ACCESS_NAMESPACE)
             if workload is not None:
-                signed = self.app.signed_evidence(str(document), ACCESS_PRINCIPAL, ACCESS_NAMESPACE)
                 expected_kind = WORKLOAD_ACCESS_CUTOVER if workload else CORE_ACCESS_CUTOVER
-                require(signed.get('kind') == expected_kind and signed.get('source_sha') == revision,
+                require(signed.get('kind') == expected_kind,
                         'The verifier’s response is for a different access stage or source.')
-                if not workload:
-                    history = record(Path(CUTOVER))
-                    if history and history['phase'] == 'applying' and signed.get('execution_route') == 'provider-recovery':
-                        claims = (history.get('intent') or {}).get('claims', {})
-                        recover = any(claims.get(field) != signed.get(field) for field in ('boot_id', 'execution_route'))
+            require(signed.get('source_sha') == revision,
+                    'The verifier’s response is for a different access stage or source.')
+            if signed.get('kind') == CORE_ACCESS_CUTOVER and signed.get('execution_route') == 'provider-recovery':
+                history = record(Path(CUTOVER))
+                if history and history.get('phase') == 'applying':
+                    target = {key: signed[key] for key in ('source_sha', 'machine_id', 'tailnet', 'node_id', 'dns_name')}
+                    earlier = {**target, 'source_sha': historical}
+                    prior = history.get('target')
+                    claims = (history.get('intent') or {}).get('claims', {})
+                    recover = recover or (prior in (target, earlier) and (prior != target or any(
+                        claims.get(field) != signed.get(field) for field in ('boot_id', 'execution_route'))))
             return self.app.finalize(str(document), recover=recover,
                                      previous_source=historical if historical != revision else None)
 

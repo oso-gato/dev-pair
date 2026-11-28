@@ -3399,7 +3399,7 @@ class Bootstrap:
             return
         path = self.path('/var/lib/dev-pair-day0/continuation.json')
         if not os.path.lexists(path):
-            raise Blocked('the access review source differs from the completed host cutover')
+            raise Blocked('the access review source differs from the recorded host cutover')
         progress = json.loads(checked_file(path, secret=True).read_text(), object_pairs_hook=relay.unique)
         if (type(progress) is not dict or set(progress) != {'schema', 'machine_id', 'controller_source_sha',
                 'maintenance_source_sha', 'image_id', 'context_sha256', 'initializer_sha256', 'desired_sha256'}
@@ -3407,7 +3407,7 @@ class Bootstrap:
                 or progress['controller_source_sha'] != source or progress['maintenance_source_sha'] != prior
                 or not all(type(progress[key]) is str and re.fullmatch(r'[0-9a-f]{64}', progress[key])
                            for key in ('image_id', 'context_sha256', 'initializer_sha256', 'desired_sha256'))):
-            raise Blocked('the access review is not a verified continuation of the completed host cutover')
+            raise Blocked('the access review is not a verified continuation of the recorded host cutover')
 
     def initial_cutover_journal(self, data, target, prior, prior_raw, temporary, permanent, transport,
                                 *, recover, previous_source, receipt_sha, legacy_origin):
@@ -3496,6 +3496,8 @@ class Bootstrap:
             earlier = {**target, 'source_sha': previous_source} if (recover or continued) and previous_source else target
             if prior and (prior.get('target') not in (target, earlier) or prior.get('phase') not in ('applying', 'complete')):
                 raise Blocked('cutover target conflict')
+            if prior and prior['target'] != target:
+                self.access_control_source(data['source_sha'], prior)
             if prior.get('phase') == 'complete':
                 if recover:
                     raise Blocked('access cutover is already complete')
@@ -3508,7 +3510,6 @@ class Bootstrap:
                         raise Blocked('fresh workload observations required before activation')
                     accepted = {key: value for key, value in prior.items() if key != 'scope'}
                     if prior['target'] != target:
-                        self.access_control_source(data['source_sha'], prior)
                         if (prior.get('core_keys_sha256') != data['keys_sha256'] or
                                 any(prior.get(key) != data[key] for key in ('provider_recovery', 'public_addresses'))):
                             raise Blocked('continued workload evidence changes the original verified host access route or keys')

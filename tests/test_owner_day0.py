@@ -173,10 +173,13 @@ class DayZeroTests(unittest.TestCase):
         from destination_observation import access_envelope
 
         envelope = access_envelope(b'fixed fixture receipt', b'fixture signature')
-        signed = {'kind': bootstrap.CORE_ACCESS_CUTOVER, 'source_sha': SOURCE, 'boot_id': BOOT,
+        target = {'source_sha': SOURCE, 'machine_id': MACHINE, 'tailnet': 'tail',
+                  'node_id': 'fixture', 'dns_name': 'erebus.tail.ts.net'}
+        signed = {**target, 'kind': bootstrap.CORE_ACCESS_CUTOVER, 'boot_id': BOOT,
                   'execution_route': 'provider-recovery'}
         self.entry.app.signed_evidence.return_value = signed
-        history = {'phase': 'applying', 'intent': {'claims': {'boot_id': 'earlier boot', 'execution_route': 'tailnet-core'}}}
+        history = {'phase': 'applying', 'target': target,
+                   'intent': {'claims': {'boot_id': 'earlier boot', 'execution_route': 'tailnet-core'}}}
         with patch.object(day, 'STATE', self.directory), patch.object(day, 'record', return_value=history):
             with self.assertRaisesRegex(bootstrap.Blocked, 'different access stage'):
                 self.entry.apply_access(SOURCE, SOURCE, io.BytesIO(envelope), workload=True)
