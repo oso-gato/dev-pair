@@ -23,8 +23,9 @@ from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Comma
                        ACCESS_MODE, ATTENDED_ACCESS, SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
-from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPROVALS, TURN_READONLY_MOUNTS,
-                           git_output, host_job_inputs, kernel_text, repository_origin, verify_offline_runtime)
+from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPROVALS, RUNTIME_SCRATCH_MIB, TURN_READONLY_MOUNTS,
+                           git_output, host_job_inputs, kernel_text, repository_origin, verify_offline_runtime,
+                           verify_runtime_scratch)
 
 DBX_SHA = '40c3cd724faa434aeb0a23e28776665b92de68bd'
 CODEX_VERSION = '0.169.0'
@@ -53,6 +54,12 @@ INIT = ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group',
 FINAL_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' finalize'
 FROZEN_HOOK = 'exec /usr/bin/python3 ' + RUNTIME + ' frozen'
 OFFLINE_NETWORK_ARGS = ('--network=none', '--no-hosts', '--no-hostname')
+# Podman converts the supported tmpfs ownership option U to OCI uid/gid
+# for the configured process user. Its CLI rejects those raw options.
+OFFLINE_RUNTIME_TMPFS = tuple(
+    f'--mount=type=tmpfs,destination={path},rw,nosuid,nodev,noexec,U,'
+    f'tmpfs-mode=0700,tmpfs-size={RUNTIME_SCRATCH_MIB}m,notmpcopyup'
+    for path in ('/run', '/tmp'))
 JOB_ENTER_WRAPPER = ('#!/bin/sh\ncase "$1" in inspect|exec) ;; *) exit 64 ;; esac\n'
                      'exec ' + CONTROL + '/bin/podman "$@"\n')
 ASSEMBLY_LIFETIME = 900
@@ -630,23 +637,30 @@ class Gptbox(Bootstrap):
         for destination, value in tmpfs.items():
             if not isinstance(value, str):
                 raise Blocked('invalid tmpfs inspection format')
-            options = set(value.split(','))
+            entries = value.split(',')
+            options = set(entries)
             if not {'rw', 'nosuid', 'nodev'} <= options or options & {'ro', 'suid', 'dev'}:
                 raise Blocked('tmpfs access/security options mismatch')
             expected_mode = 0o700 if runtime else (0o755 if destination == '/run' else 0o1777)
             mode = [entry[5:] for entry in options if entry.startswith('mode=')]
             if len(mode) != 1 or not re.fullmatch(r'[0-7]{3,4}', mode[0]) or int(mode[0], 8) != expected_mode:
                 raise Blocked('tmpfs mode differs from the fixed construction policy')
+            if runtime:
+                owner = {'U'} if 'U' in options else {'uid=1000', 'gid=1000'}
+                required = {'rw', 'nosuid', 'nodev', 'noexec', f'size={RUNTIME_SCRATCH_MIB}m', 'mode=' + mode[0]} | owner
+                optional = {'rprivate', 'private', 'relatime', 'noatime', 'strictatime'}
+                if (len(entries) != len(options) or not required <= options <= required | optional
+                        or item['State']['Status'] == 'running' and owner == {'U'}):
+                    raise Blocked('runtime tmpfs options or ownership differ from the fixed policy')
+                continue
             for entry in options:
                 if entry in {'rw', 'nosuid', 'nodev', 'noexec', 'rprivate', 'private', 'relatime', 'noatime', 'strictatime'} or entry.startswith('mode='):
                     continue
                 if entry.startswith(('uid=', 'gid=')):
-                    if entry.split('=', 1)[1] != ('1000' if runtime else '0'):
+                    if entry.split('=', 1)[1] != '0':
                         raise Blocked('tmpfs ownership mismatch')
                 elif not re.fullmatch(r'size=[0-9]+[kKmMgG]?', entry):
                     raise Blocked('undeclared tmpfs option')
-            if runtime and not {'uid=1000', 'gid=1000'} <= options:
-                raise Blocked('runtime tmpfs ownership is not inspected')
         actual = {}
         for mount in item.get('Mounts', []):
             if mount.get('Type') == 'tmpfs' and mount.get('Destination') in ('/run', '/tmp'):
@@ -745,8 +759,7 @@ class Gptbox(Bootstrap):
                 '--pid=private', '--ipc=private', '--uts=private', '--cgroupns=private', '--memory=2g',
                 '--memory-swap=2g', '--pids-limit=256', '--cpus=1', '--http-proxy=false', '--image-volume=ignore',
                 '--systemd=false', '--log-driver=k8s-file', '--log-opt=max-size=1mb',
-                '--tmpfs=/run:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size=16m',
-                '--tmpfs=/tmp:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size=16m',
+                *OFFLINE_RUNTIME_TMPFS,
                 '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), *mount_args,
                 '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
             self.inspect_container(identity, sealed)
@@ -933,8 +946,7 @@ class Gptbox(Bootstrap):
                         '--user=1000:1000', '--userns=keep-id:uid=1000,gid=1000', '--cap-drop=ALL',
                         '--security-opt=no-new-privileges', *OFFLINE_NETWORK_ARGS, '--pid=private', '--ipc=private',
                         '--uts=private', '--memory=2g', '--pids-limit=256', '--cpus=1',
-                        '--tmpfs=/run:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
-                        '--tmpfs=/tmp:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,notmpcopyup',
+                        *OFFLINE_RUNTIME_TMPFS,
                         '--hooks-dir=' + str(self.path(CONTROL + '/empty-hooks')), '--label=manager=distrobox',
                         '--label=distrobox.unshare_groups=0', *isolation, *arguments,
                         '--entrypoint=/usr/bin/distrobox-init', sealed, *INIT[1:], '--pre-init-hooks', FROZEN_HOOK))
@@ -1086,6 +1098,7 @@ class Gptbox(Bootstrap):
                         raise Blocked('actual maintenance network or mount namespace is shared with the host')
                     namespaces[namespace] = target
                 verify_offline_runtime(proc)
+                verify_runtime_scratch(proc, int(self.uid), int(self.gid))
                 if any(os.readlink(proc / 'ns' / name) != target for name, target in namespaces.items()):
                     raise Blocked('maintenance namespaces changed during effective runtime readback')
             finally:

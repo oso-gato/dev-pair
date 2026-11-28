@@ -40,6 +40,7 @@ TURN_READONLY_MOUNTS = (REQUIREMENTS.parent, TURN_INPUTS, CREDENTIAL.parent,
 PROVIDER_DIR = Path('/run/dev-pair-provider')
 PROVIDER_SOCKET = PROVIDER_DIR / 'responses.sock'
 OFFLINE_CONFIG_FILES = ('/etc/hostname', '/etc/hosts', '/etc/resolv.conf')
+RUNTIME_SCRATCH_MIB = 16
 REPOSITORY_APPROVALS = Path('/var/lib/dev-pair/repository-approvals')
 JOB_READONLY_MOUNTS = (REQUIREMENTS.parent, TURN_INPUTS, PROVIDER_DIR,
                        *(CODEX_HOME / name for name in (*LOADER_FILES, *LOADER_DIRS)))
@@ -153,10 +154,30 @@ def verify_offline_runtime(proc=Path('/proc/self')):
                 'runtime network configuration must be an image-owned read-only file')
 
 
+def verify_runtime_scratch(proc=Path('/proc/self'), expected_uid=1000, expected_gid=1000):
+    mounts = {}
+    for line in kernel_text(proc / 'mountinfo', 1024 * 1024).splitlines():
+        leading, trailing = line.split(' - ', 1)
+        fields = leading.split()
+        if fields[4] in ('/run', '/tmp'):
+            mounts.setdefault(fields[4], []).append((set(fields[5].split(',')), trailing.split()[0]))
+    for target in ('/run', '/tmp'):
+        entries = mounts.get(target, [])
+        require(len(entries) == 1 and entries[0][1] == 'tmpfs' and
+                {'rw', 'nosuid', 'nodev', 'noexec'} <= entries[0][0], 'unsafe runtime scratch mount at ' + target)
+        path = proc / 'root' / target[1:]
+        node, space = path.lstat(), os.statvfs(path)
+        require(stat.S_ISDIR(node.st_mode) and stat.S_IMODE(node.st_mode) == 0o700 and
+                (node.st_uid, node.st_gid) == (expected_uid, expected_gid) and
+                space.f_frsize * space.f_blocks == RUNTIME_SCRATCH_MIB * 1024 ** 2,
+                'runtime scratch ownership, mode or byte ceiling differs at ' + target)
+
+
 def frozen():
     if (os.getuid(), os.getgid()) != (1000, 1000):
         raise RuntimeError('frozen init must be unprivileged')
     verify_offline_runtime()
+    verify_runtime_scratch()
     verify_files()
     sealed = json.loads((BASE / 'sealed.json').read_text())
     if sealed['inputs_sha256'] != digest(BASE / 'inputs.json') or sealed['packages_sha256'] != digest(BASE / 'packages.txt'):
@@ -167,6 +188,7 @@ def frozen():
 
 def probe():
     verify_offline_runtime()
+    verify_runtime_scratch()
     verify_files()
     if (os.getuid(), os.getgid()) != (1000, 1000) or os.getgroups() not in ([], [1000]):
         raise RuntimeError('runtime identity/groups mismatch')
@@ -199,7 +221,7 @@ def probe():
         else:
             os.close(descriptor)
             raise RuntimeError('installed executable/configuration permits write access')
-    for target in ('/work/job', '/state', '/cache/job'):
+    for target in ('/run', '/tmp', '/work/job', '/state', '/cache/job'):
         path = Path(target) / '.dev-pair-write-probe'
         descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.write(descriptor, b'bounded writable-state probe\n')
@@ -824,6 +846,7 @@ def session_binding(selection, ident):
 
 def verify_job_environment():
     verify_turn_environment()
+    verify_runtime_scratch()
     require(Path('/proc/self/attr/current').read_text().startswith('system_u:system_r:container_t:s0:') and
             os.statvfs('/').f_flag & os.ST_RDONLY and
             re.search(r'^Seccomp:\s+2$', Path('/proc/self/status').read_text(), re.MULTILINE) and

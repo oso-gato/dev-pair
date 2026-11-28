@@ -237,6 +237,10 @@ class TestConfinementContract(unittest.TestCase):
                 self.assertFalse(any(bad in arg for arg in argv
                                      for bad in ('--cap-add', 'SYS_ADMIN', 'SETFCAP', 'label=disable', '--privileged')))
                 self.assertFalse(any(arg.startswith('--volume') for arg in argv))
+                size = 64 if side == 'outer' else 16
+                self.assertEqual([arg for arg in argv if arg.startswith(('--mount=', '--tmpfs='))],
+                                 [f'--mount=type=tmpfs,destination={path},rw,nosuid,nodev,noexec,U,'
+                                  f'tmpfs-mode=0700,tmpfs-size={size}m,notmpcopyup' for path in ('/run', '/tmp')])
         config = tomllib.loads((devbox.RUNTIME / 'host-containers.conf').read_text())
         self.assertEqual(config['containers']['default_capabilities'], ['CAP_SETUID', 'CAP_SETGID'])
         outer = db.container_args('outer', OWNER, manifest(), 'outer', '/empty')
@@ -370,10 +374,22 @@ class TestConfinementContract(unittest.TestCase):
                'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False, 'NetworkMode': 'none',
                               'PidMode': 'private', 'IpcMode': 'private', 'UTSMode': 'private',
                               'UsernsMode': 'keep-id', 'Cgroups': 'disabled',
-                              'Tmpfs': {'/run': 'test', '/tmp': 'test'}},
+                              'Tmpfs': dict.fromkeys(('/run', '/tmp'), 'rw,nosuid,nodev,noexec,U,mode=0700,size=16m,rprivate')},
                'Mounts': [{'Type': 'bind', 'Source': '/devbox/job/workspaces', 'Destination': '/work/job',
                            'RW': True}]}
         db.inspect_policy(row, CHILD, OWNER, value, 'inner', mounts)
+        running = deepcopy(row)
+        running['State'] = {'Running': True}
+        with self.assertRaisesRegex(db.Blocked, 'temporary mount options'):
+            db.inspect_policy(running, CHILD, OWNER, value, 'inner', mounts)
+        running['HostConfig']['Tmpfs'] = {path: spec.replace(',U,', ',uid=1000,gid=1000,')
+                                          for path, spec in running['HostConfig']['Tmpfs'].items()}
+        db.inspect_policy(running, CHILD, OWNER, value, 'inner', mounts)
+        options = running['HostConfig']['Tmpfs']['/run']
+        for old, new in (('16m', '64m'), ('0700', '0777'), ('noexec,', ''), ('gid=1000', 'gid=0')):
+            with self.subTest(option=old), self.assertRaisesRegex(db.Blocked, 'temporary mount options'):
+                running['HostConfig']['Tmpfs']['/run'] = options.replace(old, new)
+                db.inspect_policy(running, CHILD, OWNER, value, 'inner', mounts)
         altered = deepcopy(row)
         altered['Mounts'].append({'Type': 'bind', 'Source': '/var/run/podman/podman.sock',
                                   'Destination': '/run/host.sock', 'RW': True})
@@ -398,30 +414,43 @@ class TestConfinementContract(unittest.TestCase):
 51 28 0:9 / /sys/fs/cgroup ro,nosuid,nodev,noexec - cgroup2 cgroup rw
 52 28 0:15 / /work/job rw,nosuid,nodev,noexec - ext4 tmp rw
 '''
-        with TemporaryDirectory() as temporary:
+        space = SimpleNamespace(f_frsize=4096, f_blocks=4096)
+        with TemporaryDirectory() as temporary, patch.object(db.os, 'statvfs', return_value=space):
             root = Path(temporary)
             path = root / 'mountinfo'
             (root / 'root/etc').mkdir(parents=True)
+            for leaf in ('run', 'tmp'):
+                (root / 'root' / leaf).mkdir(mode=0o700)
             path.write_text(content)
-            db.observed_mounts(root, {'/work/job': True})
+            owner = (os.getuid(), os.getgid())
+            db.observed_mounts(root, {'/work/job': True}, scratch_owner=owner)
+            with self.assertRaisesRegex(db.Blocked, 'byte ceiling'):
+                db.observed_mounts(root, {'/work/job': True}, scratch_mib=64, scratch_owner=owner)
+            (root / 'root/tmp').chmod(0o777)
+            with self.assertRaisesRegex(db.Blocked, 'mode'):
+                db.observed_mounts(root, {'/work/job': True}, scratch_owner=owner)
+            (root / 'root/tmp').chmod(0o700)
+            with self.assertRaisesRegex(db.Blocked, 'ownership'):
+                db.observed_mounts(root, {'/work/job': True}, scratch_owner=(owner[0] + 1, owner[1]))
             for target in ('/etc/hostname', '/etc/hosts', '/etc/resolv.conf'):
                 path.write_text(content + f'53 28 0:16 / {target} ro,nosuid,nodev,noexec - ext4 tmp rw\n')
                 with self.subTest(target=target), self.assertRaisesRegex(db.Blocked, 'network configuration mount'):
-                    db.observed_mounts(root, {'/work/job': True})
+                    db.observed_mounts(root, {'/work/job': True}, scratch_owner=owner)
             path.write_text(content)
             resolver = root / 'root/etc/resolv.conf'
             resolver.symlink_to('/run/writable-resolver')
             with self.assertRaisesRegex(db.Blocked, 'must be an image-owned read-only file'):
-                db.observed_mounts(root, {'/work/job': True})
+                db.observed_mounts(root, {'/work/job': True}, scratch_owner=owner)
             resolver.unlink()
             for original, replacement, failure in (
                     (' / ro,', ' / rw,', 'root filesystem'),
                     ('cgroup ro,', 'cgroup rw,', 'cgroup filesystem'),
+                    ('/tmp rw,nosuid,nodev,noexec', '/tmp rw,nosuid,nodev', 'unsafe effective temporary mount'),
                     ('job rw,nosuid,nodev,noexec', 'job rw,nosuid,nodev', 'effective mount flags')):
                 with self.subTest(failure=failure):
                     path.write_text(content.replace(original, replacement))
                     with self.assertRaisesRegex(db.Blocked, failure):
-                        db.observed_mounts(root, {'/work/job': True})
+                        db.observed_mounts(root, {'/work/job': True}, scratch_owner=owner)
 
     def test_live_nested_interfaces_are_loopback_only(self):
         with TemporaryDirectory() as temporary:

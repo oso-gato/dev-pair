@@ -36,6 +36,8 @@ OCI_HISTORY_FIELDS = 'created created_by author comment empty_layer'
 OUTPUT_LIMIT = 1024 * 1024
 OUTER_SECONDS = 600
 INNER_SECONDS = 180
+OUTER_SCRATCH_MIB = 64
+INNER_SCRATCH_MIB = 16
 CLEANUP_SECONDS = 45
 GRAPHROOT = '/devbox/graph'
 IMAGE_COPY_DIR = '/devbox/image-copy'
@@ -470,8 +472,10 @@ def container_args(name, owner, manifest, side, hooks):
             '--image-volume=ignore', '--http-proxy=false', '--sdnotify=ignore', '--systemd=false',
             f'--hooks-dir={hooks}', '--workdir=/', '--unsetenv-all',
             f'--security-opt=label=level:{label_level(manifest, side)}']
-    for path, size in (('/run', '64m' if outer else '16m'), ('/tmp', '64m' if outer else '16m')):
-        args.append(f'--tmpfs={path}:rw,nosuid,nodev,noexec,uid=1000,gid=1000,mode=0700,notmpcopyup,size={size}')
+    size = OUTER_SCRATCH_MIB if outer else INNER_SCRATCH_MIB
+    for path in ('/run', '/tmp'):
+        args.append(f'--mount=type=tmpfs,destination={path},rw,nosuid,nodev,noexec,U,'
+                    f'tmpfs-mode=0700,tmpfs-size={size}m,notmpcopyup')
     if outer:
         # The host-only default capability set becomes bounding only for UID 1000.
         # Podman propagates explicit cap-add entries into the E/P/I/A sets as well.
@@ -505,7 +509,21 @@ def inspect_policy(row, identity, owner, manifest, side, mounts):
     security = host.get('SecurityOpt') or []
     require(not any('unconfined' in option or 'label=disable' in option for option in security),
             f'{side} contains a confinement exception')
-    require(set(host.get('Tmpfs') or {}) == {'/run', '/tmp'}, f'{side} temporary mount allowlist mismatch')
+    tmpfs = host.get('Tmpfs')
+    require(type(tmpfs) is dict and set(tmpfs) == {'/run', '/tmp'}, f'{side} temporary mount allowlist mismatch')
+    size = OUTER_SCRATCH_MIB if outer else INNER_SCRATCH_MIB
+    for value in tmpfs.values():
+        require(type(value) is str, f'{side} invalid temporary mount options')
+        entries = value.split(',')
+        options = set(entries)
+        owner = {'U'} if 'U' in options else {'uid=1000', 'gid=1000'}
+        required = {'rw', 'nosuid', 'nodev', 'noexec', f'size={size}m'} | owner
+        modes = {'mode=700', 'mode=0700'}
+        optional = modes | {'rprivate', 'private', 'relatime', 'noatime', 'strictatime'}
+        require(len(entries) == len(options) and required <= options <= required | optional
+                and len(options & modes) == 1
+                and not (row.get('State', {}).get('Running') and owner == {'U'}),
+                f'{side} temporary mount options or ownership mismatch')
     actual = {}
     for mount in row.get('Mounts', []):
         target = mount['Destination']
@@ -601,7 +619,7 @@ def proc_snapshot(root, capabilities, nnp, label, uid, gid):
             'cgroup': (root / 'cgroup').read_text().strip(), 'label': actual}
 
 
-def observed_mounts(root, binds):
+def observed_mounts(root, binds, *, scratch_mib=INNER_SCRATCH_MIB, scratch_owner=(1000, 1000)):
     rows = {}
     for line in (root / 'mountinfo').read_text().splitlines():
         leading, trailing = line.split(' - ', 1)
@@ -631,6 +649,12 @@ def observed_mounts(root, binds):
         options, kind = find(target)
         require(kind == 'tmpfs' and {'rw', 'nosuid', 'nodev', 'noexec'} <= options,
                 f'unsafe effective temporary mount at {target}')
+        path = root / 'root' / target[1:]
+        node, space = path.lstat(), os.statvfs(path)
+        require(stat.S_ISDIR(node.st_mode) and stat.S_IMODE(node.st_mode) == 0o700
+                and (node.st_uid, node.st_gid) == scratch_owner
+                and space.f_frsize * space.f_blocks == scratch_mib * 1024 ** 2,
+                f'effective temporary mount ownership, mode or byte ceiling differs at {target}')
     for target, is_writable in binds.items():
         options, _ = find(target)
         expected = {'nosuid', 'nodev', 'rw' if is_writable else 'ro'}
@@ -761,7 +785,8 @@ def controller(expected, owner, seconds, operation=None, request_sha=None, *, pr
     offline_interfaces(self_proc)
     observed_mounts(self_proc, {GRAPHROOT: True, IMAGE_COPY_DIR: True, ARCHIVE: False, MANIFEST: False,
                                **{f'{PARENT_JOB}/{key}': True for key in JOB_TARGETS},
-                               **({PARENT_BUILD: True, **dict.fromkeys(ADMISSION_ROLE.values(), False)} if job else {})})
+                               **({PARENT_BUILD: True, **dict.fromkeys(ADMISSION_ROLE.values(), False)} if job else {})},
+                    scratch_mib=OUTER_SCRATCH_MIB)
     probe_parent_writes()
     helper_caps()
     require(file_hash(BASE / 'distrobox-enter', MANIFEST_LIMIT, end)[0] == ENTER_SHA256,

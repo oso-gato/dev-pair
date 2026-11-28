@@ -172,6 +172,7 @@ class MaintenanceImportTests(unittest.TestCase):
         temp = TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.app = Fixture(Path(temp.name))
+        self.enterContext(patch.object(g, 'verify_runtime_scratch', side_effect=self.app.run.project_scratch_readback))
         pinned_enter = patch.object(g, 'ENTER_SHA256', g.sha(ENTRY))
         pinned_enter.start()
         self.addCleanup(pinned_enter.stop)

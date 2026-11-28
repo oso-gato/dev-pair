@@ -86,7 +86,7 @@ class Engine:
                     'CapDrop': ['ALL'] if runtime else [], 'SecurityOpt': ['no-new-privileges'],
                     'PidMode': 'private', 'IpcMode': 'private', 'UTSMode': 'private', 'NetworkMode': 'none' if runtime else 'slirp4netns',
                     'UsernsMode': 'private', 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0},
-                    'Tmpfs': ({'/run': 'rw,nosuid,nodev,uid=1000,gid=1000,mode=0700', '/tmp': 'rw,nosuid,nodev,uid=1000,gid=1000,mode=0700'}
+                    'Tmpfs': (dict.fromkeys(('/run', '/tmp'), 'rw,nosuid,nodev,noexec,U,mode=0700,size=16m')
                               if runtime else {'/run': 'rw,nosuid,nodev,mode=0755', '/tmp': 'rw,nosuid,nodev,mode=1777'}),
                     'IDMappings': {'UidMap': ['1000:1001:1'], 'GidMap': ['1000:1001:1']},
                     'Memory': 2147483648, 'PidsLimit': 256 if runtime else 512, 'NanoCpus': 1000000000}
@@ -125,6 +125,7 @@ class Engine:
                     record['inputs_sha256'] = '0' * 64
                 return 'Synthetic fixture upstream progress\n' + json.dumps(record)
             self.starts += 1
+            self.resolve_tmpfs_owners(self.containers[identity])
             self.containers[identity]['State'].update(Status='running', Running=True, Pid=RUNTIME_PID,
                                                       StartedAt=f'2026-11-15T00:00:{self.starts:02d}.123456789Z')
             self.project_runtime_proc()
@@ -136,21 +137,37 @@ class Engine:
             self.containers.pop(command[-1], None)
         return ''
 
+    @staticmethod
+    def resolve_tmpfs_owners(row):
+        row['HostConfig']['Tmpfs'] = {path: value.replace(',U,', ',uid=1000,gid=1000,')
+                                      for path, value in row['HostConfig']['Tmpfs'].items()}
+
     def project_runtime_proc(self):
         proc = self.app.path(f'/proc/{RUNTIME_PID}')
         host = self.app.path('/proc/self')
-        for directory in (proc / 'ns', host / 'ns', proc / 'root/etc', proc / 'net'):
+        for directory in (proc / 'ns', host / 'ns', proc / 'root/etc', proc / 'net',
+                          proc / 'root/run', proc / 'root/tmp'):
             directory.mkdir(parents=True, exist_ok=True)
+        for leaf in ('run', 'tmp'):
+            (proc / 'root' / leaf).chmod(0o700)
         for kind in ('net', 'mnt'):
             for path, inode in ((host / 'ns' / kind, 41), (proc / 'ns' / kind, 42)):
                 path.unlink(missing_ok=True)
                 path.symlink_to(f'{kind}:[{inode}]')
         (proc / 'status').write_text(f'Uid:\t{" ".join([self.app.uid] * 4)}\nGid:\t{" ".join([self.app.gid] * 4)}\n')
-        (proc / 'mountinfo').write_text('1 0 0:1 / / ro,relatime - vfs vfs rw\n')
+        (proc / 'mountinfo').write_text('1 0 0:1 / / ro,relatime - vfs vfs rw\n'
+                                        '2 1 0:2 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n'
+                                        '3 1 0:3 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n')
         network = 'Inter-| Receive | Transmit\n face | bytes   | bytes\n    lo: 0 0\n'
         if self.extra_interface:
             network += '  eth0: 0 0\n'
         (proc / 'net/dev').write_text(network)
+
+    def project_scratch_readback(self, proc, uid, gid):
+        assert (uid, gid) == (int(self.app.uid), int(self.app.gid))
+        space = SimpleNamespace(f_frsize=4096, f_blocks=4096)
+        with patch.object(runtime.os, 'statvfs', return_value=space):
+            runtime.verify_runtime_scratch(proc, os.getuid(), os.getgid())
 
 class Fixture(g.Gptbox):
     def preflight(self):
@@ -179,6 +196,7 @@ class GptboxTests(unittest.TestCase):
         self.app = Fixture(self.root, self.engine)
         self.app.entry_calls = []
         self.engine.app = self.app
+        self.enterContext(patch.object(g, 'verify_runtime_scratch', side_effect=self.engine.project_scratch_readback))
         self.app.directory('/var/lib/dev-pair', mode=0o755)
         path = self.app.path(g.STATE + '/prepared')
         path.parent.mkdir(parents=True)
@@ -558,6 +576,7 @@ class GptboxTests(unittest.TestCase):
     def test_restart_requires_new_start_identity_and_current_start_readiness_marker(self):
         self.assemble()
         row = copy.deepcopy(self.engine.saved_runtime)
+        self.engine.resolve_tmpfs_owners(row)
         row['State'].update(Status='running', Running=True, Pid=RUNTIME_PID, StartedAt='2026-11-15T01:02:03.123456789Z')
         self.engine.containers[RUNTIME] = row
         with self.assertRaisesRegex(g.Blocked, 'stale'):
@@ -573,6 +592,7 @@ class GptboxTests(unittest.TestCase):
     def test_running_offline_gate_rejects_host_namespaces_and_engine_start_change(self):
         self.assemble()
         row = copy.deepcopy(self.engine.saved_runtime)
+        self.engine.resolve_tmpfs_owners(row)
         row['State'].update(Status='running', Running=True, Pid=RUNTIME_PID, StartedAt='2026-11-15T01:02:03.123456789Z')
         self.engine.containers[RUNTIME] = row
         proc = self.app.path(f'/proc/{RUNTIME_PID}')
@@ -599,15 +619,15 @@ class GptboxTests(unittest.TestCase):
 
     def test_explicit_no_copy_tmpfs_matches_actual_upstream_normalization(self):
         self.assemble()
-        # Podman a6a942f... pkg/util/mount_opts.go:150-159 consumes
-        # notmpcopyup (not passed to OCI), and :216-238 appends rprivate
-        # while suppressing the default tmpcopyup. Inspector joins those OCI
-        # options into HostConfig.Tmpfs. Exercise that exact normalized shape.
+        # Podman 5.8.1 consumes notmpcopyup at validation and converts U into
+        # numeric ownership when generating the OCI spec at start.
         creates = [call for call, _ in self.engine.calls if 'create' in call]
         for command in creates:
-            options = [value for value in command if value.startswith('--tmpfs=')]
+            options = [value for value in command if value.startswith(('--tmpfs=', '--mount=type=tmpfs,'))]
             self.assertEqual(len(options), 2)
             self.assertTrue(all(value.endswith(',notmpcopyup') for value in options))
+            if '--read-only' in command:
+                self.assertEqual(tuple(options), g.OFFLINE_RUNTIME_TMPFS)
         for runtime, identity, image, original in (
                 (False, STAGE, BASE, self.engine.saved_stage),
                 (True, RUNTIME, SEALED, self.engine.saved_runtime)):
@@ -618,8 +638,46 @@ class GptboxTests(unittest.TestCase):
             # Unexpected copying is outside the explicitly constructed policy;
             # extra destinations and unsafe options remain rejected as before.
             row['HostConfig']['Tmpfs']['/run'] += ',tmpcopyup'
-            with self.assertRaisesRegex(g.Blocked, 'undeclared tmpfs option'):
+            error = 'runtime tmpfs options' if runtime else 'undeclared tmpfs option'
+            with self.assertRaisesRegex(g.Blocked, error):
                 self.app.inspect_container(identity, image, runtime=runtime)
+        row = copy.deepcopy(self.engine.saved_runtime)
+        self.engine.containers[RUNTIME] = row
+        row['State']['Status'] = 'running'
+        with self.assertRaisesRegex(g.Blocked, 'runtime tmpfs options'):
+            self.app.inspect_container(RUNTIME, SEALED)
+        self.engine.resolve_tmpfs_owners(row)
+        self.app.inspect_container(RUNTIME, SEALED)
+        for old, new in (('size=16m', 'size=64m'), ('uid=1000', 'uid=0'), ('noexec,', '')):
+            with self.subTest(option=old):
+                original = row['HostConfig']['Tmpfs']['/run']
+                row['HostConfig']['Tmpfs']['/run'] = original.replace(old, new)
+                with self.assertRaisesRegex(g.Blocked, 'runtime tmpfs options'):
+                    self.app.inspect_container(RUNTIME, SEALED)
+                row['HostConfig']['Tmpfs']['/run'] = original
+
+    def test_live_scratch_readback_rejects_unsafe_mount_ownership_mode_and_size(self):
+        self.assemble()
+        proc = self.app.path(f'/proc/{RUNTIME_PID}')
+        self.engine.project_runtime_proc()
+        path = proc / 'root/run'
+        mounts = proc / 'mountinfo'
+        content = mounts.read_text()
+        with patch.object(runtime.os, 'statvfs', return_value=SimpleNamespace(f_frsize=4096, f_blocks=4096)):
+            runtime.verify_runtime_scratch(proc, os.getuid(), os.getgid())
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                runtime.verify_runtime_scratch(proc, os.getuid() + 1, os.getgid())
+            path.chmod(0o777)
+            with self.assertRaisesRegex(RuntimeError, 'mode'):
+                runtime.verify_runtime_scratch(proc, os.getuid(), os.getgid())
+            path.chmod(0o700)
+            mounts.write_text(content.replace('nodev,noexec', 'nodev', 1))
+            with self.assertRaisesRegex(RuntimeError, 'unsafe runtime scratch'):
+                runtime.verify_runtime_scratch(proc, os.getuid(), os.getgid())
+            mounts.write_text(content)
+        with patch.object(runtime.os, 'statvfs', return_value=SimpleNamespace(f_frsize=4096, f_blocks=4097)):
+            with self.assertRaisesRegex(RuntimeError, 'byte ceiling'):
+                runtime.verify_runtime_scratch(proc, os.getuid(), os.getgid())
 
     def test_preview_and_low_storage_leave_engine_unchanged(self):
         before = len(self.engine.calls)
