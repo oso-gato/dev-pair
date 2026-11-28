@@ -292,17 +292,25 @@ Final chain/file identity and exact immutable0444 bytes/link checks are retained
 This relies on the existing trusted-root filesystem boundary; local descriptor
 checks are not a hostile-root or SELinux/ACL attestation.
 
-A failed final configuration comparison can include a closed `cache_comparison`
-inside the existing native failure witness. It compares only the two already
-captured bounded tuples. Row counts, multiset/order-only equality, the first
+A failed staging or final configuration comparison can include a closed
+`cache_comparison` inside the existing native failure witness. It compares only
+the two already captured bounded tuples at the failed gate. The staging witness
+uses the same normalization as admission for the owned mask and its parent
+mtime. Row counts, multiset/order-only equality, the first
 unmatched known row's before/after index, fixed manager lookup index/path class
 and changed-field bits are public. Bits are presence, device, inode, mode, UID,
 mtime and size. An order-only difference has zero field bits and remains
 rejected. Lookup indices use the sorted fixed allowed manager paths with the
 conventional /lib alias mapped to /usr/lib. Unknown/oversized rows are explicitly
-unavailable; no names or raw metadata are exported. Source/context/phase and
-cache-final-comparison binding, 1,536-byte projection, primary rejection,
+unavailable; no names or raw metadata are exported. Source, context, phase and
+the exact failed gate bind the 1,536-byte projection. Primary rejection,
 pre-interrupt status, exact cleanup and every deadline/output bound remain.
+
+The host-only `prepare-maintenance-host` command retains the most recent
+mask-staging comparison failure in the root-only
+`/var/lib/dev-pair/bootstrap/prepare-maintenance-host-diagnostics.json`. The
+receipt is bound to the source, context and enrolled unit and carries no
+execution or retry authority.
 
 
 Canonical /lib and /usr/lib aliases can produce duplicate snapshot path rows.

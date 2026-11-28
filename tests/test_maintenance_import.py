@@ -13,6 +13,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from test_gptbox import Engine, EXPECTED, SOURCE, SEALED, RUNTIME, g
+import bootstrap as b
+import fedora_ci_guest as guest
+import native_io as n
 from native_io_fixture import install, manager
 
 MANIFEST = '1' * 64
@@ -301,6 +304,63 @@ class MaintenanceImportTests(unittest.TestCase):
             self.assertEqual(len(after['native_units']), 1)
             self.assertNotEqual(first, after['native_units'][0])
         self.assertEqual(sum(row[0] == '/usr/bin/systemd-run' for row in calls), 2)
+
+    def test_mask_staging_lookup_change_retains_only_bounded_host_diagnostic(self):
+        root = install(self, self.app.root)
+        other = root / 'non-runtime-lookup'
+        other.mkdir(mode=0o755)
+        runner, calls = g.Commands(), []
+
+        def prerequisite(*args, **kwargs):
+            runner(sys.executable, '-c', 'raise AssertionError("must never launch")', timeout=10)
+
+        def change_lookup(*args):
+            before = other.stat()
+            os.utime(other, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+
+        def project(before, after, unit, **kwargs):
+            def mapped(rows):
+                return tuple((('/etc/systemd/system' if row[0] == str(other) else
+                               '/run/systemd/system' + row[0].removeprefix(str(root / 'system'))),
+                              *row[1:]) for row in rows)
+            return n.configuration_mismatch(mapped(before), mapped(after), unit, **kwargs)
+
+        prep = SimpleNamespace(run=runner, _host_prerequisites=prerequisite, _host_desired=self.app.desired)
+        with patch.object(self.app, 'preparation', return_value=prep), \
+                patch.object(subprocess, 'Popen', side_effect=manager(subprocess.Popen, calls)), \
+                patch.object(b, 'lookup_paths', return_value=(str(root / 'system'), str(other))), \
+                patch.object(b, 'verify_labels', side_effect=change_lookup), \
+                patch.object(b, 'configuration_mismatch', side_effect=project):
+            self.assertEqual(self.prepare_cli('--bootstrap-source', '192.0.2.1/32', '--apply')[0], 2)
+
+        self.assertFalse(any(row[0] == '/usr/bin/systemd-run' for row in calls))
+        self.assertEqual(list((root / 'records').iterdir()), [])
+        self.assertEqual(list((root / 'system').iterdir()), [])
+        self.assertFalse(self.app.path(g.STATE + '/host-ready.json').exists())
+        self.assertIsNone(runner.metadata_diagnostic)
+        _, intent = self.app.read_config_record(g.MAINTENANCE_HOST_INTENT)
+        path = g.STATE + '/prepare-maintenance-host-diagnostics.json'
+        _, receipt = self.app.read_config_record(path)
+        self.assertEqual(self.app.path(path).stat().st_mode & 0o777, 0o600)
+        self.assertEqual(receipt['unit'], intent['native_units'][0])
+        self.assertEqual(receipt['diagnostic_identity'], {'source_sha': SOURCE, 'context_sha256': EXPECTED, 'phase': 'prepare'})
+        self.assertFalse(receipt['native_failure']['launcher_handle_observed'])
+        witness = receipt['native_failure']['cache_comparison']
+        self.assertEqual(witness['stage'], 'cache-staging-comparison')
+        self.assertEqual(witness['path_class'], 'lookup-directory')
+        self.assertEqual(witness['row_index'], 1)
+        self.assertEqual(witness['lookup_index'], 0)
+        self.assertEqual(witness['changed_fields'], 32)
+        self.assertEqual(witness['rows'], [2, 2])
+        self.assertNotIn(str(root), json.dumps(receipt))
+        self.assertNotIn('must never launch', json.dumps(receipt))
+        expected = {'source_sha': SOURCE, 'context_sha256': EXPECTED}
+        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare')['cache_comparison'], witness)
+        receipt['native_failure']['launcher_handle_observed'] = True
+        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare'), {'availability': 'unavailable'})
+        receipt['native_failure']['launcher_handle_observed'] = False
+        receipt['native_failure']['cache_comparison']['stage'] = 'cache-final-comparison'
+        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare'), {'availability': 'unavailable'})
 
     def test_preflight_uses_signed_scope_before_any_oci_effect(self):
         self.prepare()

@@ -858,10 +858,13 @@ class Commands:
                 after = configuration_snapshot(paths, unit, owned_mask=True, end=command_end)
                 root = str(transport.profile_path.parent)
                 def normalized(rows):
-                    return tuple((row[:5] + (None,)) if row[0] == root else row for row in rows
+                    # The owned parent mtime is checked separately against the journal.
+                    return tuple((row[:5] + (0,)) if row[0] == root else row for row in rows
                                  if row[0] not in (str(transport.profile_path), str(transport.profile_path / '10-timeout-abort.conf')))
                 admission_reason = 'cache-staging-comparison'
-                if normalized(snapshot) != normalized(after):
+                before_staging, after_staging = normalized(snapshot), normalized(after)
+                if before_staging != after_staging:
+                    cache_comparison = configuration_mismatch(before_staging, after_staging, unit, stage=admission_reason)
                     raise Blocked('configuration changed during mask staging')
                 admission_reason = 'cache-parent-lookup'
                 before_root = next(row for row in snapshot if row[0] == root)

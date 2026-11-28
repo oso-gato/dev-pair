@@ -248,12 +248,13 @@ def configuration_snapshot(paths, unit, owned_mask=False, end=None):
     return tuple(snapshot)
 
 
-def configuration_mismatch(before,after,unit):
+def configuration_mismatch(before,after,unit,*,stage='cache-final-comparison'):
     """Fixed diagnostic projection of captured rows only; never an admission rule."""
     from collections import Counter
     if before==after:return None
     unavailable={'availability':'unavailable'}
     try:
+        require(stage in ('cache-staging-comparison','cache-final-comparison'),'Snapshot diagnostic stage')
         unit=canonical_unit(unit);stem=unit.removesuffix('.service')
         names=[unit]+[stem[:match.end()]+'.service' for match in re.finditer('-',stem)]+['service']
         bases=sorted({value.replace('/lib/systemd/','/usr/lib/systemd/',1) if value.startswith('/lib/systemd/') else value for value in LOOKUP_PATHS})
@@ -294,7 +295,7 @@ def configuration_mismatch(before,after,unit):
                 def values(row):return (*row[1:5],row[-1],row[5] if len(row)==7 else None)
                 fields=sum((a!=b)<<(bit+1) for bit,(a,b) in enumerate(zip(values(old),values(new))))
         kind,index=classify((old or new)[0])
-        return {'availability':'observed','stage':'cache-final-comparison','rows':[len(before),len(after)],
+        return {'availability':'observed','stage':stage,'rows':[len(before),len(after)],
             'order_only_equal':order_only,'row_index':before.index(old) if old is not None else after.index(new),
             'row_side':'before' if old is not None else 'after','path_class':kind,'lookup_index':index,
             'changed_fields':fields,'truncated':False}

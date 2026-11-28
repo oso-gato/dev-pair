@@ -1510,12 +1510,15 @@ def native_failure_projection(entry,expected,phase=None):
         decoder=value['decoder']
         if 'cache_comparison' in value:
             cache=value['cache_comparison']
-            require(entry.get('admission_stage')=='cache-recheck' and entry.get('admission_reason')=='cache-final-comparison',
+            comparison_stage=entry.get('admission_reason')
+            require(entry.get('admission_stage')=='cache-recheck' and comparison_stage in ('cache-staging-comparison','cache-final-comparison'),
                     'Cache witness stage mismatch')
+            require(comparison_stage!='cache-staging-comparison' or not value['launcher_handle_observed'],
+                    'Staging witness cannot have a launcher handle')
             if cache!={'availability':'unavailable'}:
                 require(type(cache) is dict and set(cache)=={'availability','stage','rows','order_only_equal','row_index','row_side',
                     'path_class','lookup_index','changed_fields','truncated'} and cache['availability']=='observed' and
-                    cache['stage']=='cache-final-comparison','Cache witness schema mismatch')
+                    cache['stage']==comparison_stage,'Cache witness schema mismatch')
                 require(type(cache['rows']) is list and len(cache['rows'])==2 and all(type(v) is int and 0<=v<=1024 for v in cache['rows']) and
                     type(cache['order_only_equal']) is bool and cache['truncated'] is False and cache['row_side'] in ('before','after') and
                     type(cache['row_index']) is int and 0<=cache['row_index']<cache['rows'][0 if cache['row_side']=='before' else 1],
