@@ -4,6 +4,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ import owner_intake as intake
 import owner_source
 import job_protocol as p
 import product_job as product
+import promotion_setup as promotion
 
 REPOSITORIES = ('owner/one', 'owner/two')
 MANIFESTS = {f'job-{key}': key * 64 for key in ('a', 'b', 'c')}
@@ -48,6 +50,11 @@ class OwnerIntakeTests(unittest.TestCase):
         self.intake = intake.Intake(self.site, self.root)
         self.patches = contextlib.ExitStack()
         self.addCleanup(self.patches.close)
+        if os.getuid() == 0 and Path('/').stat().st_uid != 0:
+            # A single-ID root namespace leaves host ancestors unmapped. Keep the
+            # private ownership checks on every path owned by this fixture.
+            for module in (intake, product):
+                self.enterContext(mock.patch.object(module, 'trusted_directory', side_effect=self.mapped_directory))
         self.patches.enter_context(mock.patch.object(intake, 'protect_directory', side_effect=self.protect))
         self.patches.enter_context(mock.patch.object(intake, 'checked_file', side_effect=lambda path, limit=65536:
                                                    p.read_data(path, limit)))
@@ -86,6 +93,17 @@ class OwnerIntakeTests(unittest.TestCase):
 
     def protect(self, path):
         self.assertTrue(path.is_dir())
+        return path
+
+    def mapped_directory(self, path):
+        self.assertTrue(path.is_relative_to(self.root))
+        self.assertEqual(path.resolve(strict=True), path)
+        for part in (path, *(parent for parent in path.parents if parent.is_relative_to(self.root))):
+            node = part.lstat()
+            self.assertTrue(stat.S_ISDIR(node.st_mode))
+            self.assertEqual(node.st_uid, 0)
+            self.assertFalse(node.st_mode & 0o022)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         return path
 
     def startup(self, project, cache, revision, end):
@@ -378,13 +396,38 @@ class OwnerIntakeTests(unittest.TestCase):
                 self.assertEqual(intake.main(), 0)
             return [p.loads(line.encode()) for line in stream.getvalue().splitlines()]
 
-        rows = invoke('status')
-        self.assertEqual(rows[0]['phase'], 'passed')
-        self.assertEqual(rows[0]['promotion']['phase'], 'awaiting-independent-destination')
-        confirmed = dict(pending, phase='confirmed', destination_receipt_sha256='b' * 64)
-        with mock.patch.object(product.time, 'sleep',
-                               side_effect=lambda _: product.durable_json(root / 'promotion.json', confirmed)) as pause:
-            events = invoke('reattach')
+        site = self.root / 'promotion-custody'
+        credentials = self.root / 'proposal-credentials'
+        site.mkdir(mode=0o700)
+        credentials.mkdir(mode=0o700)
+        with (mock.patch.object(promotion.release, 'SITE', site),
+              mock.patch.object(promotion.proposal, 'CREDENTIALS', credentials),
+              mock.patch.object(promotion, 'installed', return_value=True),
+              mock.patch.object(product, 'PROMOTION_POLICY', site / 'policy.json')):
+            held, = invoke('status')
+            self.assertEqual(held['phase'], 'passed')
+            self.assertEqual(held['promotion']['phase'], 'awaiting-independent-destination')
+            self.assertEqual(held['promotion']['reason'], 'protected-promotion-custody-missing')
+            self.assertTrue(held['promotion']['resume_required'])
+            with mock.patch.object(product.time, 'sleep') as held_pause:
+                held_event, = invoke('reattach')
+            held_pause.assert_not_called()
+            self.assertEqual(held_event['phase'], 'passed')
+            self.assertEqual(held_event['promotion'], held['promotion'])
+
+            files = promotion.files({}, 'fixture-fork', 'fixture-pr', 'fixture-observer', None)
+            for path, raw in files.items():
+                intake.write_private(path, raw)
+            intake.write_private(site / promotion.ENROLLMENT, p.canonical({
+                'version': 1, 'state': 'active', 'dns_name': 'erebus.example.ts.net',
+                'expires_unix': int(time.time()) + 600, 'trust_sha256': 'e' * 64,
+                'files': {str(path): p.sha256(raw) for path, raw in files.items()},
+            }).encode())
+            self.assertIsNone(promotion.custody_reason(product.PROMOTION_POLICY))
+            confirmed = dict(pending, phase='confirmed', destination_receipt_sha256='b' * 64)
+            with mock.patch.object(product.time, 'sleep',
+                                   side_effect=lambda _: product.durable_json(root / 'promotion.json', confirmed)) as pause:
+                events = invoke('reattach')
         pause.assert_called_once()
         self.assertEqual([event['phase'] for event in events], ['passed', 'passed'])
         self.assertEqual([event['promotion']['phase'] for event in events], ['awaiting-independent-destination', 'confirmed'])

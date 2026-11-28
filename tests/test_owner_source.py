@@ -149,16 +149,16 @@ class OwnerSourceTests(unittest.TestCase):
             lambda prompt: '' if prompt.startswith('Replace the retained') else next(responses), lambda _: None)
 
     def test_attended_source_provisions_exact_commits_and_real_role_bundle(self):
-        answers = io.StringIO('\n'.join((REPOSITORY, '1', self.acquired, self.startup, 'yes', '', '')))
+        answers = io.StringIO('\n'.join((REPOSITORY, '1', self.acquired, self.startup, 'yes', '', '', '')))
         output = io.StringIO()
-        with mock.patch.object(owner.getpass, 'getpass', return_value='fixture'), mock.patch.object(
-                owner, 'provider_custody', side_effect=owner.SitePending('provider', 'Billing custody still pending.')):
+        with mock.patch.object(owner, 'CREDENTIALS', self.path / 'provider-credentials'), mock.patch.object(
+                owner.getpass, 'getpass', side_effect=('fixture', '')):
             owner.setup_site(self.first, answers, output)
         transcript = output.getvalue()
         self.assertIn(self.acquired, transcript)
         self.assertIn(self.startup, transcript)
         self.assertIn(self.standard_pin, transcript)
-        self.assertIn('Billing custody still pending.', transcript)
+        self.assertIn('Provider credential setup is pending.', transcript)
         self.assertNotIn('Synthetic shared input', transcript)
         self.assertEqual(self.selections, [(source.https_origin(REPOSITORY), self.acquired, False),
             (source.https_origin(REPOSITORY), self.startup, True),
@@ -202,9 +202,8 @@ class OwnerSourceTests(unittest.TestCase):
                 os.environ.pop('SUDO_USER', None)
                 sys.argv = ['owner_intake.py', '--setup-site']
                 with mock.patch.object(owner, 'Intake', return_value=self.intake), mock.patch.object(
-                        owner.getpass, 'getpass', return_value='fixture'), mock.patch.object(
-                        source, 'read_token', side_effect=self.real_read_token), mock.patch.object(
-                        owner, 'provider_custody', side_effect=owner.SitePending('provider', 'Billing custody still pending.')):
+                        owner, 'CREDENTIALS', self.path / 'provider-credentials'), mock.patch.object(
+                        source, 'read_token', side_effect=self.real_read_token):
                     os._exit(owner.main())
             except BaseException:
                 traceback.print_exc()
@@ -213,9 +212,16 @@ class OwnerSourceTests(unittest.TestCase):
         output = bytearray()
         deadline = time.monotonic() + 10
         finished = False
-        project_prompt = False
-        standards_prompt = False
         enrolled = b'fixture_new_pinned_read_token'
+        reference = b'fixture-provider-reference'
+        answers = iter((
+            (b'token for fixture/project (Enter for public access) ', b'\n'),
+            (b'token for oso-gato/standards ', enrolled + b'\n'),
+            (b'Protected credential reference: ', reference + b'\n'),
+            (b'Absolute path to a root-private scoped API key file, or Enter to use a hidden prompt. ', b'\n'),
+            (b'Scoped OpenAI project API key, or Enter to wait: ', b'\n'),
+        ))
+        answer = next(answers)
         try:
             os.write(terminal, '\n'.join((REPOSITORY, '1', self.acquired, '', 'yes', '')).encode())
             while select.select([terminal], [], [], max(0, deadline - time.monotonic()))[0]:
@@ -229,14 +235,11 @@ class OwnerSourceTests(unittest.TestCase):
                     break
                 output.extend(chunk)
                 self.assertLess(len(output), 8192)
-                if not project_prompt and b'token for fixture/project (Enter for public access) ' in output:
-                    project_prompt = True
-                    os.write(terminal, b'\n')
-                if not standards_prompt and b'token for oso-gato/standards ' in output:
-                    standards_prompt = True
-                    os.write(terminal, enrolled + b'\n')
+                if answer is not None and answer[0] in output:
+                    os.write(terminal, answer[1])
+                    answer = next(answers, None)
             else:
-                self.fail('Attended source setup exceeded the terminal deadline.')
+                self.fail(f'Attended source setup exceeded the terminal deadline awaiting {answer and answer[0]!r}.')
             finished = True
         finally:
             if not finished:
@@ -246,12 +249,14 @@ class OwnerSourceTests(unittest.TestCase):
             _, status = os.waitpid(child, 0)
         transcript = output.decode()
         self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, transcript)
-        self.assertIn('Billing custody still pending.', transcript)
-        self.assertTrue(project_prompt and standards_prompt)
+        self.assertIn('Provider credential setup is pending.', transcript)
+        self.assertIsNone(answer)
         self.assertFalse(enrolled in output)
+        self.assertFalse(reference in output)
         self.assertEqual(self.credential.read_bytes(), enrolled + b'\n')
         self.assertEqual(stat.S_IMODE(self.credential.stat().st_mode), 0o600)
         self.assertFalse((source.CREDENTIALS / REPOSITORY).exists())
+        self.assertFalse((self.path / 'provider-credentials').exists())
         config, _, _ = owner.first_source(self.intake, REPOSITORY, owner.CHECKLIST)
         self.assertEqual(config, {'commit': self.acquired, 'startup_revision': self.acquired})
 
