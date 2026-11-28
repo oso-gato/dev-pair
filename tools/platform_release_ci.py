@@ -228,6 +228,9 @@ def verify_cache_signatures(probe, temporary, destination, key, packages, end):
     # Protected CI hosts use the exact imported Fedora verifier. There is no
     # dependency on host RPM packages, ambient keyrings or outbound transport.
     workspace = destination.parent
+    owner = workspace.lstat()
+    require(stat.S_ISDIR(owner.st_mode) and owner.st_uid == os.getuid() and owner.st_uid != 0
+            and stat.S_IMODE(owner.st_mode) == 0o700, 'RPM verification cache must belong to the private runner workspace')
     key_copy = workspace / 'fedora-key'
     shutil.copyfile(key, key_copy)
     key_copy.chmod(0o444)
@@ -238,10 +241,11 @@ def verify_cache_signatures(probe, temporary, destination, key, packages, end):
               'rpm_verify --import /run/dev-pair-rpm-verification/fedora-key; rpm_verify --list; '
               'rpm_verify --checksig --verbose "$@"')
     output = engine_copy(probe, temporary, 'run', '--rm', '--pull=never', '--network=none', '--http-proxy=false',
-                         '--read-only', '--read-only-tmpfs=false', '--user=0:0', '--cap-drop=ALL',
+                         '--read-only', '--read-only-tmpfs=false', f'--user={owner.st_uid}:{owner.st_gid}', '--cap-drop=ALL',
                          '--security-opt=no-new-privileges', '--no-hosts', '--no-hostname',
                          '--pid=private', '--ipc=private', '--uts=private', '--memory=1g', '--pids-limit=64', '--cpus=1',
-                         '--tmpfs=/tmp:rw,nosuid,nodev,noexec,mode=0700,size=16m',
+                         '--env=LANG=C', '--env=LC_ALL=C', '--env=HOME=/tmp',
+                         '--tmpfs=/tmp:rw,nosuid,nodev,noexec,mode=1777,size=16m',
                          '--volume', f'{workspace}:{inside}:ro,nosuid,nodev,noexec', fedora_oci.IMAGE,
                          '/bin/sh', '-ec', script, 'rpm-verification', *files, timeout=fedora_rpm_cache.remaining(end))
     keys, *rows = output.decode().splitlines()
@@ -378,6 +382,9 @@ def checked_cache(role, archive, digest):
     for path in (archive, *archive.parents):
         node = path.lstat()
         require(node.st_uid in (0, os.getuid()) and not node.st_mode & 0o022, 'outer-tooling cache ancestry is mutable')
+    node = archive.lstat()
+    require(stat.S_ISREG(node.st_mode) and node.st_uid == os.getuid() and node.st_nlink == 1
+            and 0 < node.st_size <= fedora_rpm_cache.LIMIT, 'outer-tooling cache must be a bounded runner-owned file')
     return archive, hex_id(digest)
 
 

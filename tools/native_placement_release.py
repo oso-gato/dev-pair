@@ -95,7 +95,7 @@ def stage_source(producer, base_root, base_index):
     files = host['files']
     required = ('tools/native_placements.py', 'tools/native_placement_release.py', 'tools/platform_release.py',
                 'tools/platform_release_protocol.py', 'tools/platform_release_install.py', 'tools/bootstrap.py',
-                'tools/gptbox.py', 'tools/fedora_oci.py', 'tools/native_io.py', *n.ENTRY_FILES)
+                'tools/gptbox.py', 'tools/fedora_oci.py', 'tools/fedora_rpm_cache.py', 'tools/native_io.py', *n.ENTRY_FILES)
     staged = {}
     for name in required:
         raw = producer.protected_bytes(n.SOURCE / name, 4 * 1024 ** 2)

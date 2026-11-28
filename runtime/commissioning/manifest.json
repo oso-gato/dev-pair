@@ -69,6 +69,7 @@
     {"source": "tools/destination_release.py", "target": "/usr/libexec/dev-pair/tools/destination_release.py", "mode": "0644", "feature": "base"},
     {"source": "tools/devbox.py", "target": "/usr/libexec/dev-pair/tools/devbox.py", "mode": "0644", "feature": "base"},
     {"source": "tools/fedora_oci.py", "target": "/usr/libexec/dev-pair/tools/fedora_oci.py", "mode": "0644", "feature": "base"},
+    {"source": "tools/fedora_rpm_cache.py", "target": "/usr/libexec/dev-pair/tools/fedora_rpm_cache.py", "mode": "0644", "feature": "base"},
     {"source": "tools/gptbox.py", "target": "/usr/libexec/dev-pair/tools/gptbox.py", "mode": "0644", "feature": "base"},
     {"source": "tools/gptbox_runtime.py", "target": "/usr/libexec/dev-pair/tools/gptbox_runtime.py", "mode": "0644", "feature": "base"},
     {"source": "tools/host_handoff.py", "target": "/usr/libexec/dev-pair/tools/host_handoff.py", "mode": "0644", "feature": "base"},

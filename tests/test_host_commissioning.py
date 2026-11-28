@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import time
@@ -251,6 +252,20 @@ class HostCommissioning(unittest.TestCase):
     def apply(self, timers=None):
         policy = FIRST if timers is None else {**FIRST, 'timers': timers}
         return self.app.apply(policy, POLICY, BOOT, JOBS, self.files(timers))
+
+    def test_installed_base_contains_imports_for_image_builder_and_placement_entrypoints(self):
+        source = Path(c.__file__).resolve().parents[1]
+        manifest = c.parse((source / c.MANIFEST).read_bytes())
+        for row in manifest['files']:
+            if row['feature'] == 'base' and row['target'].startswith(c.INSTALL + '/'):
+                self.app.file(row['target'], (source / row['source']).read_bytes(), int(row['mode'], 8))
+        tools = self.app.path(c.INSTALL + '/tools')
+        for script, arguments in (('gptbox.py', []), ('native_placements.py', ['run']),
+                                  ('native_placements.py', ['install-release']), ('platform_release_install.py', [])):
+            result = subprocess.run([sys.executable, '-EB', str(tools / script), *arguments, '--help'], cwd=self.root,
+                                    env={'PATH': '/usr/bin:/bin', 'LC_ALL': 'C.UTF-8'}, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertIn(b'usage:', result.stdout)
 
     def test_fenced_observation_then_timers_and_owner_terminal(self):
         result = self.apply()

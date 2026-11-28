@@ -235,7 +235,8 @@ class NightlyComposition(TestCase):
         checkout = native_host.SOURCE
         names = ('tools/native_placements.py', 'tools/native_placement_release.py', 'tools/platform_release.py',
                  'tools/platform_release_protocol.py', 'tools/platform_release_install.py', 'tools/bootstrap.py',
-                 'tools/gptbox.py', 'tools/fedora_oci.py', 'tools/native_io.py', 'tools/storage.py', *native_host.ENTRY_FILES)
+                 'tools/gptbox.py', 'tools/fedora_oci.py', 'tools/fedora_rpm_cache.py', 'tools/native_io.py',
+                 'tools/storage.py', *native_host.ENTRY_FILES)
         source_files = {name: (checkout / name).read_bytes() for name in names}
         destination.host = protocol.canonical({'schema': 1, 'source_revision': 'a'*40, 'state_contract': 1,
                                                'files': {name: publish.digest(raw) for name, raw in source_files.items()}})

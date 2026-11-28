@@ -199,6 +199,8 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(args[:5], ('run', '--rm', '--pull=never', '--network=none', '--http-proxy=false'))
         self.assertIn(g.FEDORA, args)
         self.assertIn('--cap-drop=ALL', args)
+        self.assertIn(f'--user={self.root.stat().st_uid}:{self.root.stat().st_gid}', args)
+        self.assertIn('--tmpfs=/tmp:rw,nosuid,nodev,noexec,mode=1777,size=16m', args)
         self.assertIn(f'{self.root}:/run/dev-pair-rpm-verification:ro,nosuid,nodev,noexec', args)
 
     def test_initialize_forwards_the_independent_cache_reference(self):
