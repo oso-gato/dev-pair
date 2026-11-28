@@ -151,6 +151,24 @@ class DayZeroTests(unittest.TestCase):
         self.entry.setup_owner.assert_called_once_with(tty)
         self.assertEqual(stage.call_args.args[2], 'owner-terminal-ready')
 
+    def test_first_owner_ready_offers_promotion_then_reapplies_only_after_enrollment(self):
+        tool = self.entry.repo / 'tools/commission_host.py'
+        tool.parent.mkdir(parents=True)
+        tool.touch()
+        self.entry.stage = Mock()
+        ready = {'phase': 'ready', 'owner_terminal': '/usr/local/bin/dev-pair'}
+        held = {**ready, 'pending_features': {'checklist-promotion': 'promotion-enrollment'}}
+        scheduled = {**ready, 'timers': {'dev-pair-promotion-scan.timer': {'next': ['scheduled']}}}
+        tty = object()
+        self.entry.setup_promotion = Mock(side_effect=[False, True])
+        self.entry.commission_apply = Mock(side_effect=[held, held, scheduled])
+        self.entry.commission(self.identity, SOURCE, tty=tty)
+        self.assertEqual(self.entry.commission_apply.call_count, 1)
+        self.assertIn('Checklist promotion is held', self.entry.stage.call_args.args[3])
+        self.entry.commission(self.identity, SOURCE, tty=tty)
+        self.assertEqual(self.entry.commission_apply.call_count, 3)
+        self.assertIn('Checklist promotion is scheduled.', self.entry.stage.call_args.args[3])
+
     def test_station_response_may_resume_checked_recovery_but_cannot_select_another_scope(self):
         from destination_observation import access_envelope
 

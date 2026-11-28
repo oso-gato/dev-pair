@@ -36,6 +36,7 @@ CHECKLIST_FILES = frozenset('examples/checklist/' + name for name in ('checklist
 FETCH = ['fetch', '--quiet', '--no-tags', '--no-auto-maintenance', '--no-recurse-submodules']
 MARKER = 'dev-pair-checklist-product-v1\n'
 DIAGNOSTIC_LIMIT = 16384
+LOGIN = r'[A-Za-z0-9][A-Za-z0-9-]{0,38}'
 
 
 class Unavailable(OSError):
@@ -180,6 +181,12 @@ def branch(job, sha):
     return 'dev-pair-products/' + job + '-' + sha[:12]
 
 
+def developer_scope(login, fork):
+    p.require(type(login) is str and re.fullmatch(LOGIN, login) and type(fork) is str and
+              re.fullmatch(LOGIN + r'/dev-pair', fork) and fork.lower() != REPOSITORY.lower(),
+              'an exact scoped GitHub developer and separate fork are required')
+
+
 def request_shape(request):
     p.fields(request, 'version job_id agreement_sha256 repository base_sha candidate_sha tree_sha bundle_sha256 '
                       'release_binding_sha256 review_policy_sha256 developer_id developer_login fork branch')
@@ -189,10 +196,8 @@ def request_shape(request):
         p.digest(request[name], 40)
     for name in ('agreement_sha256', 'bundle_sha256', 'release_binding_sha256', 'review_policy_sha256'):
         p.digest(request[name])
+    developer_scope(request['developer_login'], request['fork'])
     p.require(request['repository'] == REPOSITORY and request['base_sha'] != request['candidate_sha'] and
-              re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}', request['developer_login']) and
-              re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/dev-pair', request['fork']) and
-              request['fork'].lower() != REPOSITORY.lower() and
               request['branch'] == branch(request['job_id'], request['candidate_sha']),
               'proposal lacks the exact checklist repository, fork or branch')
     return request
@@ -255,7 +260,7 @@ def git_call(repository, end, *args, secret=None, login=None, bundle=False):
     env = {'HOME': str(HOME), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
            'GIT_TERMINAL_PROMPT': '0', 'GIT_NO_LAZY_FETCH': '1'}
     if secret is not None:
-        p.require(type(login) is str and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}', login),
+        p.require(type(login) is str and re.fullmatch(LOGIN, login),
                   'exact GitHub developer login required')
         credentials = base64.b64encode((login + ':' + secret).encode()).decode()
         options += ('-c', 'protocol.https.allow=always')
@@ -266,13 +271,47 @@ def git_call(repository, end, *args, secret=None, login=None, bundle=False):
     return capture([GIT, *options, '-C', str(repository), *args], end, env=env, classify_http=secret is not None)
 
 
+def scoped_permissions(forks, pulls, fork_name, developer_id):
+    fork = permissions(forks, fork_name, developer_id, push=True)
+    permissions(pulls, REPOSITORY, developer_id, push=False)
+    p.require(fork['fork'] is True and fork['parent']['full_name'] == REPOSITORY,
+              'developer write grant does not target the separately scoped fork')
+
+
+def scratch_directory():
+    directory = trusted_directory(HOME)
+    capacity = os.statvfs(directory)
+    mount_flags = os.ST_NODEV | os.ST_NOSUID | os.ST_NOEXEC
+    p.require(os.path.ismount(directory) and directory.stat().st_dev != ROOT.stat().st_dev and
+              capacity.f_flag & mount_flags == mount_flags and
+              SCRATCH_MIN <= capacity.f_blocks * capacity.f_frsize <= SCRATCH_LIMIT and
+              capacity.f_bavail * capacity.f_frsize >= SCRATCH_MIN and 64 <= capacity.f_files <= 65536,
+              'proposal staging needs a bounded dedicated build filesystem')
+    return directory
+
+
+def credential(name, gid):
+    p.require(CREDENTIALS.stat().st_dev == ROOT.stat().st_dev, 'proposal credentials require persistent separate custody')
+    node = CREDENTIALS.lstat()
+    path = CREDENTIALS / name
+    if node.st_uid == 0 and os.getuid() != 0:
+        p.require(stat.S_ISDIR(node.st_mode) and node.st_gid == gid and stat.S_IMODE(node.st_mode) == 0o750,
+                  'protected proposer credential directory required')
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(path, flags), 'rb') as stream:
+            leaf = os.fstat(stream.fileno())
+            p.require(stat.S_ISREG(leaf.st_mode) and leaf.st_nlink == 1 and leaf.st_uid == 0 and leaf.st_gid == gid and
+                      stat.S_IMODE(leaf.st_mode) == 0o440 and 0 < leaf.st_size <= 512,
+                      'protected proposer credential required')
+            return token(stream.read(513))
+    trusted_directory(CREDENTIALS)
+    return token(read_private(path, 512))
+
+
 def propose(request, staged, fork_secret, pull_secret, end):
     request_shape(request)
     forks, pulls = Hub(fork_secret, end), Hub(pull_secret, end)
-    fork = permissions(forks, request['fork'], request['developer_id'], push=True)
-    permissions(pulls, REPOSITORY, request['developer_id'], push=False)
-    p.require(fork['fork'] is True and fork['parent']['full_name'] == REPOSITORY,
-              'developer write grant does not target the separately scoped fork')
+    scoped_permissions(forks, pulls, request['fork'], request['developer_id'])
     existing = find_pull(pulls, request)
     if existing is not None:
         p.require(existing['state'] == 'open' or existing['merged'] is True, 'the bound proposal was closed without merging')
@@ -315,14 +354,7 @@ def main(argv=None):
         p.require(os.getuid() == os.geteuid() == account.pw_uid >= 1000 and
                   os.getgid() == os.getegid() == account.pw_gid and Path(account.pw_dir) == HOME,
                   'scoped proposal account required')
-        directory = trusted_directory(HOME)
-        capacity = os.statvfs(directory)
-        mount_flags = os.ST_NODEV | os.ST_NOSUID | os.ST_NOEXEC
-        p.require(os.path.ismount(directory) and directory.stat().st_dev != ROOT.stat().st_dev and
-                  capacity.f_flag & mount_flags == mount_flags and
-                  SCRATCH_MIN <= capacity.f_blocks * capacity.f_frsize <= SCRATCH_LIMIT and
-                  capacity.f_bavail * capacity.f_frsize >= SCRATCH_MIN and 64 <= capacity.f_files <= 65536,
-                  'proposal staging needs a bounded dedicated build filesystem')
+        scratch_directory()
         resource.setrlimit(resource.RLIMIT_FSIZE, (SCRATCH_LIMIT, SCRATCH_LIMIT))
         input_dir = INBOX / args.job
         for path in (input_dir, INBOX, ROOT, ROOT.parent, *ROOT.parent.parents):
@@ -339,10 +371,8 @@ def main(argv=None):
         request = request_shape(p.loads(p.read_data(request_path, 4096)))
         p.require(request['job_id'] == args.job and p.sha256(p.read_data(bundle_path, GIT_TRANSFER)) ==
                   request['bundle_sha256'], 'proposal input job or Git transport changed')
-        credentials = trusted_directory(CREDENTIALS)
-        p.require(credentials.stat().st_dev == ROOT.stat().st_dev, 'proposal credentials require persistent separate custody')
-        result = propose(request, bundle_path, token(read_private(credentials / 'fork.token', 512)),
-                         token(read_private(credentials / 'upstream-pr.token', 512)), time.monotonic() + 110)
+        result = propose(request, bundle_path, credential('fork.token', account.pw_gid),
+                         credential('upstream-pr.token', account.pw_gid), time.monotonic() + 110)
         print(p.canonical(result))
         return 0
     except AuthorityDenied:

@@ -21,10 +21,12 @@ import time
 from urllib.parse import quote, urlencode, urlsplit
 import uuid
 
-from bootstrap import Blocked, Bootstrap, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
+from bootstrap import (Blocked, Bootstrap, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, checked_file, relay,
+                       validate_public_keys)
 from release_trust import DIGEST, SHA, require
 
 SIGNERS = '/etc/dev-pair/destination-observer/allowed_signers'
+RELEASE_SITE = '/etc/dev-pair/destination-observer/release-site.json'
 NAMESPACE = 'dev-pair-destination-observation'
 FINAL_NAMESPACE = 'dev-pair-destination'
 FAMILIES = {'ipv4': socket.AF_INET, 'ipv6': socket.AF_INET6}
@@ -138,12 +140,13 @@ def state_dir(path):
     return path
 
 
-def write_once(path, message):
+def write_once(path, message, *, mode=0o600):
     """Publish complete bytes with a no-replace link and directory fsync."""
     if os.path.lexists(path):
         require(bounded_file(path) == message, 'existing observation differs from retained evidence')
         return
     with tempfile.NamedTemporaryFile(dir=path.parent) as stream:
+        os.fchmod(stream.fileno(), mode)
         stream.write(message)
         stream.flush()
         os.fsync(stream.fileno())
@@ -195,6 +198,38 @@ def agent_probe_challenge(value):
             'invalid independently issued candidate probe challenge')
 
 
+def validate_site(site):
+    require(matches(DNS, site['dns_name']) and matches(r'hostinger://[A-Za-z0-9_-]{1,100}/recovery', site['provider_recovery']),
+            'observation site requires an exact tailnet DNS name and provider recovery route')
+    keys(site['clients'], set(VANTAGES))
+    require(all(matches(NAME, value) for value in site['clients'].values())
+            and len(set(site['clients'].values())) == len(VANTAGES), 'named vantages must have distinct identities')
+    keys(site['public_addresses'], set(FAMILIES))
+    for family, value in site['public_addresses'].items():
+        Bootstrap.public_probe_host(value, family, site['provider_recovery'])
+    if site['kind'] != 'checklist-release':
+        return
+    keys(site['tailnet_addresses'], set(FAMILIES))
+    keys(site['negative_routes'], {'denied', 'public'})
+    for family, value in site['tailnet_addresses'].items():
+        remote = address(value, family)
+        require(remote in TAILNETS[remote.version], 'selected checklist address is outside Tailscale')
+    for vantage, routes in site['negative_routes'].items():
+        keys(routes, set(FAMILIES))
+        for family, route in routes.items():
+            if vantage == 'public' and site['public_addresses'][family] is None:
+                require(route is None, 'absent provider address needs external provider evidence')
+                continue
+            keys(route, {'source_address', 'control_address', 'control_dns'})
+            source = address(route['source_address'], family)
+            control = address(route['control_address'], family)
+            require((source in TAILNETS[source.version]) == (vantage == 'denied')
+                    and (vantage != 'public' or control.is_global)
+                    and matches(HOST, route['control_dns']) and route['control_dns'] != site['dns_name']
+                    and str(control) not in (site['tailnet_addresses'][family], site['public_addresses'][family]),
+                    'negative vantage requires its own admitted source and independent HTTPS control')
+
+
 def validate_plan(plan, now):
     require(type(plan) is dict and plan.get('kind') in {'checklist-release', *ACCESS_KINDS},
             'unsupported destination observation plan')
@@ -211,19 +246,12 @@ def validate_plan(plan, now):
     keys(plan, PLAN | fields)
     require(type(plan['version']) is int and plan['version'] == 1
             and matches(SHA, plan['source_sha']) and matches(r'[0-9a-f]{32}', plan['machine_id'])
-            and canonical_uuid(plan['boot_id']) and canonical_uuid(plan['ceremony_id'])
-            and matches(JOB, plan['job_id']) and matches(DNS, plan['dns_name'])
-            and matches(r'hostinger://[A-Za-z0-9_-]{1,100}/recovery', plan['provider_recovery']),
+            and canonical_uuid(plan['boot_id']) and canonical_uuid(plan['ceremony_id']) and matches(JOB, plan['job_id']),
             'observation plan does not select the exact destination and operation')
     require(type(plan['issued_at']) is int and type(plan['expires_at']) is int
             and plan['issued_at'] <= now < plan['expires_at'] <= plan['issued_at'] + LIFETIME,
             'observation plan is outside its 30-minute independent execution window')
-    keys(plan['clients'], set(VANTAGES))
-    require(all(matches(NAME, value) for value in plan['clients'].values())
-            and len(set(plan['clients'].values())) == len(VANTAGES), 'named vantages must have distinct identities')
-    keys(plan['public_addresses'], set(FAMILIES))
-    for family, value in plan['public_addresses'].items():
-        Bootstrap.public_probe_host(value, family, plan['provider_recovery'])
+    validate_site(plan)
     if not checklist:
         require(all(matches(DIGEST, plan[field]) for field in ('keys_sha256', 'acl_sha256'))
                 and matches(NAME, plan['node_id']) and matches(NAME, plan['tailnet'])
@@ -250,25 +278,6 @@ def validate_plan(plan, now):
             and (plan['rollback_image'] is None or matches(IMAGE, plan['rollback_image']) and plan['rollback_image'] != plan['image'])
             and all(type(plan[key]) is int and plan[key] > 0 for key in ('publisher_run_id', 'publisher_run_attempt')),
             'observation plan lacks the exact release and publisher attempt')
-    keys(plan['tailnet_addresses'], set(FAMILIES))
-    keys(plan['negative_routes'], {'denied', 'public'})
-    for family, value in plan['tailnet_addresses'].items():
-        remote = address(value, family)
-        require(remote in TAILNETS[remote.version], 'selected checklist address is outside Tailscale')
-    for vantage, routes in plan['negative_routes'].items():
-        keys(routes, set(FAMILIES))
-        for family, route in routes.items():
-            if vantage == 'public' and plan['public_addresses'][family] is None:
-                require(route is None, 'absent provider address needs external provider evidence')
-                continue
-            keys(route, {'source_address', 'control_address', 'control_dns'})
-            source = address(route['source_address'], family)
-            control = address(route['control_address'], family)
-            require((source in TAILNETS[source.version]) == (vantage == 'denied')
-                    and (vantage != 'public' or control.is_global)
-                    and matches(HOST, route['control_dns']) and route['control_dns'] != plan['dns_name']
-                    and str(control) not in (plan['tailnet_addresses'][family], plan['public_addresses'][family]),
-                    'negative vantage requires its own admitted source and independent HTTPS control')
 
 
 def probe_plan(plan):
@@ -301,7 +310,8 @@ def export_release(job):
     with destination.release_gate() as (setup, _, dns):
         promotion = record(trusted_directory(product.job_path(job)))
         activation = destination.initial_activation()
-        require(promotion and promotion['job_id'] == job and promotion['phase'] == 'awaiting-independent-destination'
+        require(promotion and promotion['job_id'] == job and
+                promotion['phase'] in ('awaiting-independent-destination', 'confirming-destination')
                 and matching_release(activation['active'], promotion['release'], promotion['binding'])
                 and not activation['pending'] and not activation['route_pending']
                 and destination.serve_config(dns), 'selected exact release is not awaiting independent destination checks')
@@ -949,15 +959,73 @@ def assemble_candidate(binding, site, collection, signer, acl_oauth):
     return access_envelope(payload, sign_observation(payload, signer, FINAL_NAMESPACE))
 
 
+def prepare_release_site(args):
+    public = {family: getattr(args, 'public_' + family) for family in FAMILIES}
+    site = {'version': 1, 'kind': 'checklist-release', 'dns_name': args.dns_name,
+            'provider_recovery': args.provider_recovery, 'clients': {role: getattr(args, role + '_client') for role in VANTAGES},
+            'public_addresses': {family: None if value == 'none' else value for family, value in public.items()},
+            'tailnet_addresses': {family: getattr(args, 'tailnet_' + family) for family in FAMILIES},
+            'negative_routes': {}}
+    for role in ('denied', 'public'):
+        routes = {family: getattr(args, role + '_route_' + family) for family in FAMILIES}
+        site['negative_routes'][role] = {family: dict(zip(('source_address', 'control_address', 'control_dns'), route))
+                                         if route is not None else None for family, route in routes.items()}
+    validate_site(site)
+    signer_lines, seen = [], set()
+    for role in ('plan', *VANTAGES):
+        keys_for_role = validate_public_keys(bounded_file(getattr(args, role + '_key'), 8192)).splitlines()
+        require(len(keys_for_role) == 1, 'each station role requires one separately admitted public key')
+        key = keys_for_role[0]
+        require(key.split()[0] in ('ssh-ed25519', 'sk-ssh-ed25519@openssh.com') and key not in seen,
+                'station roles require distinct Ed25519 public keys')
+        seen.add(key)
+        signer_lines.append(f'{observer_principal(role)} namespaces="{NAMESPACE}" {key}\n')
+    return site, ''.join(signer_lines).encode()
+
+
+def install_release_site(site, signers):
+    require(os.getuid() == os.geteuid() == 0, 'use the independently administered station root')
+    target, signers_path = Path(RELEASE_SITE), Path(SIGNERS)
+    directory = target.parent
+    for path in reversed((directory, *directory.parents)):
+        if not os.path.lexists(path):
+            path.mkdir(mode=0o755)
+        node = path.lstat()
+        require(stat.S_ISDIR(node.st_mode) and node.st_uid == 0 and not node.st_mode & 0o022,
+                'station profile requires protected root-owned ancestry')
+    records = ((signers_path, signers), (target, encoding(site)))
+    for path, raw in records:
+        if os.path.lexists(path):
+            existing = checked_file(path)
+            require(existing.stat().st_nlink == 1 and stat.S_IMODE(existing.stat().st_mode) == 0o644
+                    and bounded_file(existing) == raw, 'existing station profile or signer set requires independent reconciliation')
+    for path, raw in records:
+        write_once(path, raw, mode=0o644)
+    configured_signers()
+    return target
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', type=Path, help='independently signed observation plan')
     parser.add_argument('--directory', type=Path, help='private evidence directory for this ceremony')
     stages = parser.add_subparsers(dest='stage', required=True)
+    configure = stages.add_parser('prepare-release-site', help='install approved site inputs and public observer keys on the independent station')
+    for name in ('dns-name', 'provider-recovery', *(role + '-client' for role in VANTAGES)):
+        configure.add_argument('--' + name, required=True)
+    for family in FAMILIES:
+        configure.add_argument('--public-' + family, required=True, help='approved provider address, or none when confirmed absent')
+        configure.add_argument('--tailnet-' + family, required=True)
+        for role in ('denied', 'public'):
+            configure.add_argument('--' + role + '-route-' + family, nargs=3, metavar=('SOURCE', 'CONTROL-IP', 'CONTROL-DNS'),
+                                   required=role == 'denied', help='independent client source and healthy HTTPS control')
+    for role in ('plan', *VANTAGES):
+        configure.add_argument('--' + role + '-key', type=Path, required=True, help='independently supplied public SSH key file')
     export = stages.add_parser('export-release', help='read the exact settled release from protected J/D state')
     export.add_argument('job')
-    bundle = stages.add_parser('bundle-access', help='stream the independently signed access receipt for the owner')
-    bundle.add_argument('--receipt', type=Path, required=True)
+    for name in ('bundle-access', 'bundle-release'):
+        bundle = stages.add_parser(name, help='stream the independently signed receipt to the protected importer')
+        bundle.add_argument('--receipt', type=Path, required=True)
     begin = stages.add_parser('begin', help='prepare a plan from the admitted site profile and observed destination binding')
     begin.add_argument('--binding', type=Path, required=True)
     begin.add_argument('--site', type=Path, required=True)
@@ -993,10 +1061,13 @@ def arguments():
 def main():
     args = arguments()
     try:
+        if args.stage == 'prepare-release-site':
+            print(install_release_site(*prepare_release_site(args)))
+            return 0
         if args.stage == 'export-release':
             sys.stdout.buffer.write(encoding(export_release(args.job)))
             return 0
-        if args.stage == 'bundle-access':
+        if args.stage in ('bundle-access', 'bundle-release'):
             path = args.receipt
             sys.stdout.buffer.write(access_envelope(bounded_file(path, MAX_ACCESS_PART),
                                     bounded_file(path.with_name(path.name + '.sig'), MAX_ACCESS_PART)))

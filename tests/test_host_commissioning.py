@@ -345,6 +345,11 @@ class HostCommissioning(unittest.TestCase):
             files = self.files(policy['timers'])
             if activation:
                 files.update(c.workload_guard_files(policy['timers']))
+                if 'checklist-promotion' in policy['timers']:
+                    repository = Path(__file__).resolve().parents[1]
+                    for name in (*c.TIMERS['checklist-promotion'], 'dev-pair-promotion@.service'):
+                        files[c.UNIT_ROOT + '/' + name] = ((repository / 'runtime/product-job' / name).read_bytes(),
+                                                          0o644, 'checklist-promotion')
                 if 'agent-renewal' in policy['timers']:
                     repository = Path(__file__).resolve().parents[1]
                     for name in (c.AGENT_BRIDGE[0], 'dev-pair-agent-bridge@.service'):
@@ -422,7 +427,8 @@ class HostCommissioning(unittest.TestCase):
         def feature_authority(feature, selected, *, recorded=None):
             if feature == 'checklist-spool':
                 return grant
-            reason = 'owner-catalogue' if feature == 'owner-intake' else 'agent-release-authority'
+            reason = {'owner-intake': 'owner-catalogue', 'agent-renewal': 'agent-release-authority',
+                      'checklist-promotion': 'promotion-enrollment'}[feature]
             raise c.Pending(reason, 'This feature has no verified authority.')
 
         self.services.feature_authority = feature_authority
@@ -430,7 +436,8 @@ class HostCommissioning(unittest.TestCase):
         timer, service = c.TIMERS['checklist-spool']
         self.assertEqual(set(result['timers']), {timer})
         self.assertEqual(result['timers'][timer]['service'], service)
-        self.assertEqual(result['pending_features'], {'agent-renewal': 'agent-release-authority', 'owner-intake': 'owner-catalogue'})
+        self.assertEqual(result['pending_features'], {'agent-renewal': 'agent-release-authority',
+                         'owner-intake': 'owner-catalogue', 'checklist-promotion': 'promotion-enrollment'})
         guard = self.app.path(next(iter(c.workload_guard_files(('checklist-spool',)))))
         guarded = guard.read_bytes()
         self.app.require_runtime_feature('checklist-spool')
@@ -449,6 +456,32 @@ class HostCommissioning(unittest.TestCase):
         self.assertIn('disable:' + timer, self.steps)
         self.assertEqual(self.app.read(history), b'owned work\n')
         self.assertEqual((self.app.read(c.AUTOMATIC_POLICY), self.app.read(c.PRIVATE + '/intent.json')), (initial, intent))
+
+    def test_promotion_is_guarded_on_both_services_and_withdraws_its_owned_timer(self):
+        self.automatic_services()
+        self.app.automatic('apply', SOURCE)
+        self.services.workload_scope = lambda *args, **kwargs: 'a' * 64
+        enabled = False
+
+        def authority(feature, selected, *, recorded=None):
+            if feature == 'checklist-promotion' and enabled:
+                return {'subject': feature, 'expires_unix': int(time.time()) + 600, 'sha256': 'b' * 64}
+            raise c.Pending('not-enrolled', 'Feature held.')
+
+        self.services.feature_authority = authority
+        self.assertFalse(self.app.automatic('apply', SOURCE)['timers'])
+        enabled = True
+        timer = c.TIMERS['checklist-promotion'][0]
+        scheduled = self.app.automatic('apply', SOURCE)
+        self.assertEqual(set(scheduled['timers']), {timer})
+        for path, (raw, _, _) in c.workload_guard_files(('checklist-promotion',)).items():
+            self.assertEqual(self.app.path(path).read_bytes(), raw)
+        self.app.require_runtime_feature('checklist-promotion')
+        enabled = False
+        self.assertFalse(self.app.automatic('apply', SOURCE)['timers'])
+        self.assertIn('disable:' + timer, self.steps)
+        with self.assertRaisesRegex(c.Blocked, 'feature is held'):
+            self.app.require_runtime_feature('checklist-promotion')
 
     def test_partial_owner_entry_retries_and_expired_provider_scope_blocks_mutation(self):
         self.automatic_services()

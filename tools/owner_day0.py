@@ -732,6 +732,13 @@ class DayZero:
         require(result.returncode == 0, 'First owner setup paused. Run ./day0.sh resume to continue.')
         return os.path.lexists(OWNER_CATALOGUE)
 
+    def setup_promotion(self, tty):
+        script = local_file(Path('/usr/libexec/dev-pair/tools/promotion_setup.py'))
+        result = subprocess.run(['/usr/bin/python3', '-EBs', str(script), 'enroll'], env=ENV,
+                                stdin=tty.incoming, stdout=tty.outgoing, stderr=tty.outgoing,
+                                timeout=1800, check=False)
+        return result.returncode == 0
+
     def commission_apply(self, revision, tty):
         def apply():
             return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
@@ -777,13 +784,19 @@ class DayZero:
             if (observed.get('pending_features', {}).get('owner-intake') == 'owner-catalogue-selection' and
                     self.setup_owner(tty)):
                 observed = self.commission_apply(revision, tty)
+            if (observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and
+                    observed.get('pending_features', {}).get('checklist-promotion') == 'promotion-enrollment' and
+                    self.setup_promotion(tty)):
+                observed = self.commission_apply(revision, tty)
         phase = observed.get('phase', 'unknown')
         if phase in ('pending', 'source-gap'):
             self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
         elif phase == 'ready':
-            labels = {'owner-intake': 'Owner intake', 'checklist-spool': 'Checklist cleanup', 'agent-renewal': 'Agent renewal'}
+            labels = {'owner-intake': 'Owner intake', 'checklist-spool': 'Checklist cleanup',
+                      'checklist-promotion': 'Checklist promotion', 'agent-renewal': 'Agent renewal'}
             timer_labels = {'dev-pair-intake-recovery.timer': 'Owner intake recovery',
                             'dev-pair-checklist-spool.timer': 'Checklist cleanup',
+                            'dev-pair-promotion-scan.timer': 'Checklist promotion',
                             'dev-pair-agent-bridge.timer': 'Agent publication checks', 'dev-pair-renewal-agent.timer': 'Agent renewal'}
             lines = ['The managed checklist listener is ready.']
             for name in sorted(observed.get('timers', {})):

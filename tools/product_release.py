@@ -40,6 +40,36 @@ class Wait(OSError):
         self.reason = reason
 
 
+def trusted_release(policy, hub):
+    from release_trust import ReleaseTrust
+
+    proposal.permissions(hub, proposal.REPOSITORY, policy['observer_id'], push=False)
+    trust = ReleaseTrust(hub.gh)
+    rules = trust.policy('checklist')
+    p.require(rules['components']['checklist']['registry'] == REGISTRY and
+              rules['components']['checklist']['workflow'] == PUBLISHER and
+              not set(rules['reviewer_ids']) & {policy['developer_id'], policy['observer_id'], policy['merge_actor_id']},
+              'trusted reviewers, publication, proposer and merge actor require separate authority')
+    return trust, rules
+
+
+def protected_upstream(trust, site, rules, base):
+    main_protection(trust, base, rules['check'])
+    trust.workflow(MERGE_WORKFLOW, base, site['merge_workflow_sha256'])
+    env = trust.api('environments/checklist-merge')
+    branches = trust.api('environments/checklist-merge/deployment-branch-policies?per_page=100')
+    protection = trust.api('environments/checklist-merge/deployment_protection_rules')
+    p.require(env['name'] == 'checklist-merge' and env['deployment_branch_policy'] == {
+                'protected_branches': False, 'custom_branch_policies': True} and
+              branches['total_count'] == 1 and
+              [(item['name'], item['type']) for item in branches['branch_policies']] == [('main', 'branch')] and
+              protection['total_count'] == 1 and len(protection['custom_deployment_protection_rules']) == 1 and
+              protection['custom_deployment_protection_rules'][0]['enabled'] is True and
+              protection['custom_deployment_protection_rules'][0]['app']['id'] == site['merge_gate_app_id'],
+              'protected upstream workflow-specific merge permission required')
+    trust.checklist_environment(rules['writer_app_id'])
+
+
 def policy(raw):
     value = p.loads(raw)
     p.fields(value, 'version repository dns_name developer_id developer_login fork observer_id merge_actor_id '
@@ -51,6 +81,7 @@ def policy(raw):
     p.digest(value['merge_workflow_sha256'])
     p.require(len({value[key] for key in ('developer_id', 'observer_id', 'merge_actor_id')}) == 3 and
               value['repository'] == proposal.REPOSITORY, 'independent scoped product release custody required')
+    proposal.developer_scope(value['developer_login'], value['fork'])
     dns_name(value['dns_name'])
     return value
 
@@ -177,7 +208,6 @@ def stage(job, request, bundle):
 class Live:
     def __init__(self, policy, job, binding, end):
         from destination_release import Destination
-        from release_trust import ReleaseTrust
 
         self.policy, self.job, self.binding, self.end = policy, job, binding, end
         self.registry_auth = SITE / 'registry/config.json'
@@ -188,13 +218,7 @@ class Live:
             self.registry_auth = None
         self.hub = proposal.Hub(proposal.token(read_private(SITE / 'read.token', 512)), end,
                                 registry_auth=self.registry_auth)
-        proposal.permissions(self.hub, proposal.REPOSITORY, policy['observer_id'], push=False)
-        self.trust = ReleaseTrust(self.hub.gh)
-        self.rules = self.trust.policy('checklist')
-        p.require(self.rules['components']['checklist']['registry'] == REGISTRY and
-                  self.rules['components']['checklist']['workflow'] == PUBLISHER and
-                  not set(self.rules['reviewer_ids']) & {policy['developer_id'], policy['observer_id'], policy['merge_actor_id']},
-                  'trusted reviewers, publication, proposer and merge actor require separate authority')
+        self.trust, self.rules = trusted_release(policy, self.hub)
         observed_hub = self.hub
 
         class ReleaseCommands(Commands):
@@ -233,21 +257,24 @@ class Live:
         return proposal.find_pull(self.hub, request)
 
     def propose(self, request, bundle):
+        from promotion_setup import installed_scratch
+
         with dispatch_gate():
             self.protection(request)
-            stage(self.job, request, bundle)
-            args = candidate.as_role(proposal.DEVELOPER, product.PYTHON, '-EBs',
-                                     product.KIT / 'tools/checklist_proposal.py', self.job)
-            try:
-                proposal.capture(args, self.end, timeout=112)
-            except proposal.CommandFailed as exc:
-                if exc.exit_status == os.EX_NOPERM:
-                    raise proposal.AuthorityDenied('the protected developer grant was denied') from exc
-                if exc.exit_status == os.EX_UNAVAILABLE:
-                    raise proposal.ObservationUnavailable('the protected developer read was unavailable') from exc
-                if exc.exit_status == 2:
-                    raise ValueError('the protected developer policy was rejected') from exc
-                raise
+            with installed_scratch():
+                stage(self.job, request, bundle)
+                args = candidate.as_role(proposal.DEVELOPER, product.PYTHON, '-EBs',
+                                         product.KIT / 'tools/checklist_proposal.py', self.job)
+                try:
+                    proposal.capture(args, self.end, timeout=112)
+                except proposal.CommandFailed as exc:
+                    if exc.exit_status == os.EX_NOPERM:
+                        raise proposal.AuthorityDenied('the protected developer grant was denied') from exc
+                    if exc.exit_status == os.EX_UNAVAILABLE:
+                        raise proposal.ObservationUnavailable('the protected developer read was unavailable') from exc
+                    if exc.exit_status == 2:
+                        raise ValueError('the protected developer policy was rejected') from exc
+                    raise
 
     def protection(self, request):
         trust = self.trust
@@ -255,20 +282,7 @@ class Live:
         main = trust.api('branches/main')
         if main['commit']['sha'] != base:
             raise Wait('stale-reviewed-base')
-        main_protection(trust, base, self.rules['check'])
-        trust.workflow(MERGE_WORKFLOW, base, self.policy['merge_workflow_sha256'])
-        env = trust.api('environments/checklist-merge')
-        branches = trust.api('environments/checklist-merge/deployment-branch-policies?per_page=100')
-        rules = trust.api('environments/checklist-merge/deployment_protection_rules')
-        p.require(env['name'] == 'checklist-merge' and env['deployment_branch_policy'] == {
-                    'protected_branches': False, 'custom_branch_policies': True} and
-                  branches['total_count'] == 1 and
-                  [(item['name'], item['type']) for item in branches['branch_policies']] == [('main', 'branch')] and
-                  rules['total_count'] == 1 and len(rules['custom_deployment_protection_rules']) == 1 and
-                  rules['custom_deployment_protection_rules'][0]['enabled'] is True and
-                  rules['custom_deployment_protection_rules'][0]['app']['id'] == self.policy['merge_gate_app_id'],
-                  'protected upstream workflow-specific merge permission required')
-        trust.checklist_environment(self.rules['writer_app_id'])
+        protected_upstream(trust, self.policy, self.rules, base)
 
     def review(self, pull, request):
         source = pull['merge_commit_sha']
@@ -319,6 +333,13 @@ class Live:
                                 None if self.registry_auth is None else str(self.registry_auth))
 
     def evidence(self):
+        from promotion_setup import evidence_envelope, stored_proof
+
+        envelope = evidence_envelope(self.job)
+        if os.path.lexists(envelope):
+            candidate.protected_file(envelope, p.MAX_MESSAGE)
+            stored_proof(envelope)
+            return envelope
         path = EVIDENCE / (self.job + '.json')
         if not os.path.lexists(path) or not os.path.lexists(str(path) + '.sig'):
             raise Wait('signed-destination-evidence')
@@ -327,7 +348,11 @@ class Live:
         return path
 
     def confirm(self, evidence):
-        self.destination.confirm(str(evidence))
+        from promotion_setup import confirm_envelope
+
+        if evidence.suffix == '.envelope':
+            return confirm_envelope(self.destination, evidence)
+        return self.destination.confirm(str(evidence))
 
 
 def matches(activation, release, binding):
@@ -448,13 +473,19 @@ def automatic_due(state):
                          state.get('observation_retry', {}).get('after_unix', 0) <= int(time.time()))
 
 
+@contextlib.contextmanager
+def job_lock(root):
+    with os.fdopen(os.open(root / 'promotion.lock', os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), 'rb') as lock:
+        p.private_file(root / 'promotion.lock')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
 def run(job, *, resume_held=False):
     root = trusted_directory(product.job_path(job))
     value = product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
     p.require(value['job_id'] == job, 'protected release job changed')
-    with os.fdopen(os.open(root / 'promotion.lock', os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600), 'rb') as lock:
-        p.private_file(root / 'promotion.lock')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with job_lock(root):
         saved = record(root) or {'version': 1, 'job_id': job, 'plan_sha256': p.identity(value),
                                  'phase': 'awaiting-validated-candidate', 'reason': None}
         p.require(saved['job_id'] == job and saved['plan_sha256'] == p.identity(value), 'durable promotion plan changed')
@@ -548,13 +579,17 @@ def main():
     os.umask(0o077)
     try:
         p.require(os.geteuid() == 0, 'installed protected product controller required')
-        if args.command == 'scan':
-            scan()
-        else:
-            row = (run(args.job, resume_held=args.resume_held) if args.command == 'advance' else
-                   record(trusted_directory(product.job_path(args.job))))
-            print(p.canonical(row))
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        if args.command == 'status':
+            print(p.canonical(record(trusted_directory(product.job_path(args.job)))))
+            return
+        from promotion_setup import execution
+
+        with execution():
+            if args.command == 'scan':
+                scan()
+            else:
+                print(p.canonical(run(args.job, resume_held=args.resume_held)))
+    except (Blocked, OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
         parser.exit(2, 'Protected checklist promotion unavailable (' + type(exc).__name__ + ').\n')
 
 

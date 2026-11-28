@@ -4,17 +4,62 @@ The installed `dev-pair start` command on `core` records and confirms the produc
 
 The supported promotion scope is the existing checklist in `oso-gato/dev-pair`, delivered to the exact private tailnet DNS name in the confirmed agreement and the site policy. Validated local jobs keep their local evidence. Other requested external destinations retain their pending adapter status. The checklist proposer accepts regular modifications to the existing checklist application, its focused tests, and its README. The host retains the Q result and effect identity, source materialization receipt, exact Git commit and tree, and incremental candidate bundle.
 
-## Protected host setup
+## Enroll during Day 0
 
-Install the reviewed promotion sources and existing [destination controller](destination-release.md) in the selected protected runtime at `/usr/libexec/dev-pair`. Install the three `dev-pair-promotion*` files in `runtime/product-job` as systemd units. Enable `dev-pair-promotion-scan.timer` after the feature custody below is ready. It schedules eligible terminal product jobs after boot and on a three-minute interval. The normal root entries are `product_release.py status JOB` and `product_release.py advance JOB`. The same locked advance serves recovery after a disconnect or renewal fence. Install Git, the GitHub CLI with exact attestation verification and paginated API support, and Skopeo.
+After the named `core` terminal is ready, `./day0.sh resume` offers optional
+checklist promotion. Defer it to run local checklist jobs while the separate
+release authorities are being prepared. Obtain the independently approved
+fork, GitHub proposer and observer logins, merge actor and protection App IDs,
+merge-workflow SHA-256, and the UTC grant expiry. The grant can last up to 31
+days. The installer reads the private destination from the approved owner
+catalogue and checks it against the live guarded route.
 
-An explicit credential or protected policy rejection holds the job for its custodian. Failed observations and interrupted replies retry after three, six and twelve minutes, then require protected intervention. After resolving the recorded reason, the custodian can use `product_release.py advance JOB --resume-held`. Advance reuses the existing job and first reads the exact pull request or deployment status before its next allowed mutation.
+Enter three separately scoped fine-grained credentials at the hidden prompts.
+One grants the proposer branch write in the single admitted fork. The second
+identifies the same proposer and grants upstream pull request creation with
+read-only upstream contents. The third identifies a separate observer with
+read access to repository metadata, contents, branch protection, deployments,
+PR reviews, checks, actions and attestations. The GitHub accounts have no
+upstream push, maintenance or administrator role. Provide a fourth pull-only
+GHCR credential if the checklist registry is private. The independently held
+reviewer and upstream merge credential stay in their separate approved custody.
 
-Commission the dedicated nonlogin `dp-release-dev` account with the same numeric UID and private GID above 999 and with the designated SELinux and ancestry permissions. This ordinary Git/PR identity needs no Podman or provider access. The account home is `/var/lib/dev-pair/release-developer/home`. Place it on a protected dedicated scratch mount with mode 0700 and `nodev,nosuid,noexec`, 64–512 MiB of total space and 64–65536 inodes. Reserve at least 64 MiB available at each proposal start. A 256 MiB root-commissioned temporary filesystem can hold the checkout while credentials retain their separate persistent directory. The `release-developer` directory and its `inbox` are root-owned with the release developer group and mode 0750. The controller writes the exact request and bundle in that inbox with mode 0440 and grants only the necessary directory traversal.
+The setup reads back the exact fork and GitHub identities, protected main,
+required check, workflow bytes and the separately gated merge and publisher
+environments before it asks to activate the confirmed scope. Commissioning
+installs the reviewed controller and units and enables the owned scan timer
+when local custody and current independent workload access are ready. The
+bound `dp-release-dev` account has a locked password and no login or extra
+system group. The proposer receives read access to its two root-owned
+credentials. Proposal checkout work uses a 256 MiB dedicated tmpfs with
+`nodev,nosuid,noexec`. The root observer and optional registry credential have
+separate protected storage. Setup checks GitHub CLI support and installs
+Skopeo through Fedora's signed package repositories if it is absent.
 
-Keep the proposer credentials in `/var/lib/dev-pair/release-developer/credentials` on persistent storage, owned by `dp-release-dev` with mode 0700. Store each token as a mode 0600 file. `fork.token` grants the ordinary developer branch write in the single independently admitted fork. `upstream-pr.token` grants pull request creation in the upstream repository with read-only contents. Both identify the same scoped developer. The upstream actor must lack push, maintenance and administrator privilege. Configure the approved fork to permit the developer's scoped branch and upstream pull requests. The proposer verifies the commit parent, tree and allowed changes. It creates one deterministic branch and binds any returned pull request to the same head and agreement. If a write reply is interrupted, it first looks up that branch and pull request.
+After a disconnect, rerun `./day0.sh resume`. If enrollment was interrupted
+before activation, use the same approved expiry, identities and credentials to
+finish it. A changed enrollment must first withdraw the old custody. For
+withdrawal, use the authorized root terminal and run:
 
-Store `/etc/dev-pair/product-release/policy.json` and `read.token` as root-owned mode 0600 files in a protected directory. The policy's exact fields are `version` (1), `repository`, `dns_name`, `developer_id`, `developer_login`, `fork`, `observer_id`, `merge_actor_id`, `merge_gate_app_id`, `merge_workflow_sha256` and `expires_unix`. Numeric IDs bind the GitHub users and independently controlled merge protection app. The workflow digest binds `.github/workflows/checklist-product-merge.yml`. Install a time-limited scoped release policy and retain the separate `/etc/dev-pair/release-trust.json` reviewer, CI and registry policy. The observer's fine-grained read token needs the repository metadata, contents, branch protection, deployments, PR reviews, checks, actions and attestations involved in the verification, with no upstream write. A private registry also needs a separately scoped root-only `registry/config.json` under the same site directory for image lookup, attestation verification, and the D pull. Match the host's approved DNS with the owner intake catalogue and its completed cutover.
+```sh
+/usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/promotion_setup.py withdraw
+```
+
+A running promotion must settle before withdrawal can acquire the custody
+lock. Withdrawal removes the locally enrolled credentials and holds new work.
+Run `./day0.sh resume` to remove the owned timer schedule. Job state and
+independent evidence remain available. Revoke or rotate the remote credentials
+through their custodians. To replace withdrawn authority, run the installed
+`promotion_setup.py enroll` command and then resume Day 0.
+
+The timer schedules eligible terminal product jobs after boot and on a
+three-minute interval when current commissioning admits it. The protected
+root entries are `product_release.py status JOB` and `product_release.py
+advance JOB`, run with `/usr/bin/python3 -EBs` from the installed tools path.
+Advance observes the existing proposal and deployment before any next allowed
+mutation. Observational failures retry after three, six and twelve minutes.
+Resolve a held authority or verifier rejection before using `advance JOB
+--resume-held`.
 
 ## Independent upstream merge
 
@@ -28,6 +73,13 @@ The independently held reviewer approves the actual current candidate in GitHub 
 
 The normal observer advances the release through the existing destination controller and observes its active, pending, and confirmed records. It can resume the same pending deployment and recover a lost reply from the exact active record. A different pending or unconfirmed activation remains held. After independent quarantine of a failed first release, the controller can admit an independently reviewed correction with a different verified digest.
 
-The existing independent destination verifier exercises the named private URL and all required access, persistence, restart, reboot and restore checks in the [destination receipt contract](destination-release.md). Place its fresh SSH-signed receipt and detached signature as root-owned protected files at `/var/lib/dev-pair/product-release-evidence/JOB.json` and `JOB.json.sig`. This path is an inbox for independently acquired evidence. The host D verifier checks the signature, current boot and guard, exact source and OCI, exact DNS, actual live item and required observations before recording confirmation. The resolved image and DNS remain visible while the signature is pending. Keep the independent signing authority and probe access outside the host, proposer and provider roles.
+The independent verifier exercises the named private URL and the required
+access, persistence, restart, reboot and restore checks. The verifier returns a
+fresh signed envelope for the same job through the protected proof importer.
+The D verifier checks the signature, current boot and guard, exact source and
+OCI, exact DNS, actual live item and required observations before recording
+confirmation. The resolved image and DNS remain visible while the signed proof
+is pending or expired. Keep the independent signing authority and probe access
+outside the host, proposer and provider roles. [Independent destination observations](destination-observation.md)
 
 The implementation can be exercised locally with an isolated Git fork, synthetic GitHub API and a fixture activation journal. The protected GitHub permissions, workflow App, independent reviewer, registry publication, actual Fedora destination and independent probe producer require commissioned authority and real observations.

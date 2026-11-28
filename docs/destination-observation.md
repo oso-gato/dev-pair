@@ -21,21 +21,51 @@ The initial access verifier also needs the admitted `core` key, independently ch
 
 The final verifier uses its separate existing `dev-pair-access-review` authority in namespace `dev-pair-destination`. Use authorized OpenSSH signing custody on the independent station. An existing agent-backed public key or hardware-backed signer can produce detached signatures with `ssh-keygen -Y sign`. Keep private signing keys and agent access away from the owner terminal, development and maintenance roles, release proposer, product orchestrator and target.
 
-The root-protected site JSON is fixed independently before use. For release observations it has `version: 1`, `kind: checklist-release`, `dns_name`, `provider_recovery` in the form `hostinger://VPS-ID/recovery`, `public_addresses`, `tailnet_addresses`, five `clients` mapped by the vantage names above, and `negative_routes`. Address maps have `ipv4` and `ipv6` keys with canonical numeric values. A provider-confirmed absent public family and its negative route use null. The `negative_routes` map has `denied` and `public` maps, each with both family keys. Each selected route has `source_address`, `control_address` and `control_dns`. The client names identify actual individually admitted identities. The independent access administrator supplies actual ACL policy and route provenance during commissioning.
+The independent station administrator runs `prepare-release-site` once with
+approved site facts and the public SSH key for each role. It writes the
+protected release site and observer signer set under
+`/etc/dev-pair/destination-observer`. Use each site's actual identities and
+addresses. The command never asks for a private key. For example, when the
+provider's independently checked inventory has no public IPv6 address:
+
+```sh
+sudo /usr/bin/python3 -EBs tools/destination_observation.py prepare-release-site \
+  --dns-name "$dns" --provider-recovery "$recovery_route" \
+  --public-ipv4 "$public_v4" --public-ipv6 none \
+  --tailnet-ipv4 "$tailnet_v4" --tailnet-ipv6 "$tailnet_v6" \
+  --authorized-client "$authorized_client" --denied-client "$denied_client" \
+  --public-client "$public_client" --provider-client "$provider_client" \
+  --controller-client "$controller_client" \
+  --denied-route-ipv4 "$denied_source_v4" "$denied_control_v4" "$denied_control_dns_v4" \
+  --denied-route-ipv6 "$denied_source_v6" "$denied_control_v6" "$denied_control_dns_v6" \
+  --public-route-ipv4 "$public_source_v4" "$public_control_v4" "$public_control_dns_v4" \
+  --plan-key "$plan_public_key" --authorized-key "$authorized_public_key" \
+  --denied-key "$denied_public_key" --public-key "$public_client_key" \
+  --provider-key "$provider_public_key" --controller-key "$controller_public_key"
+```
+
+Use `hostinger://VPS-ID/recovery` for the independently approved provider
+recovery route. Provide `--public-route-ipv6` with the public client's source,
+control address and control DNS when the provider assigns a public IPv6
+address. Both denied-client routes always require an independent HTTPS
+control. Distribute the protected public signer configuration to each station
+through its independent administrator. Read the actual ACL and route
+provenance from the responsible access administrator.
 
 ## Observe a pending release
 
 From the existing authorized destination controller, export the exact protected J/D binding when the owner job is awaiting independent destination confirmation. This reads the settled activation, matching J release, guarded private route, platform source, machine, boot and exact CI run/attempt. Treat the result as a selection to check independently against the approved site and publication. A destination export alone supplies no client or recovery result. Transfer it through the existing authenticated protected controller path.
 
 ```sh
-/usr/bin/python3 -EBs tools/destination_observation.py export-release "$job"
+sudo /usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/destination_observation.py export-release "$job"
 ```
 
 On the independent verifier, prepare the plan in a new private ceremony directory. The tool uses the protected site profile and observed binding directly. It generates a random ceremony ID, produces `plan.json`, and retains that same plan on a repeated invocation. The existing plan signer signs the exact bytes, then distributes the plan and its detached signature to the named client stations. Each station uses a private directory under protected ancestry. Retain the original per-client records and transcripts in the independent evidence store.
 
 ```sh
 /usr/bin/python3 -EBs tools/destination_observation.py \
-  --directory "$ceremony" begin --binding "$received_binding" --site "$protected_site"
+  --directory "$ceremony" begin --binding "$received_binding" \
+  --site /etc/dev-pair/destination-observer/release-site.json
 ssh-keygen -Y sign -n dev-pair-destination-observation -f "$plan_signer_public" "$ceremony/plan.json"
 ```
 
@@ -65,9 +95,27 @@ Gather the signed probe and event files in the verifier's private ceremony direc
   --plan "$ceremony/plan.json" --directory "$ceremony" assemble
 ssh-keygen -Y sign -n dev-pair-destination -f "$access_review_signer_public" \
   "$ceremony/destination-receipt.json"
+/usr/bin/python3 -EBs tools/destination_observation.py bundle-release \
+  --receipt "$ceremony/destination-receipt.json" > "$ceremony/release-proof.envelope"
 ```
 
-The assembler waits for every required check and verifies the signature against its exact role. It issues the existing D JSON schema and puts the boot observed after the admitted reboot in the receipt. The wire format stores the exact production source, OCI image, completed primary item, observed boot and guard. The job and run remain in the separately signed retained plan. Use the normal protected J import path for the signed files as `/var/lib/dev-pair/product-release-evidence/JOB.json` and `JOB.json.sig`. D still checks the current machine/boot, private route, stored item and actual application health before recording confirmation.
+The assembler waits for every required check and verifies each role signature.
+The retained signed plan identifies the job and publisher attempt. The signed
+receipt includes the production source, OCI image, primary item, observed
+boot and guard. Return the envelope over the authenticated controller channel.
+From the protected destination terminal, submit it for the exact owner job:
+
+```sh
+sudo /usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/promotion_setup.py \
+  import-proof "$job" < "$received_envelope"
+```
+
+The importer checks the independent signature and current release binding.
+The next commissioned promotion scan verifies the live checklist and records
+confirmation on the same job. Resume Day 0 after a reboot if the schedule is
+held for the new boot. `dev-pair status JOB` shows when a proof is missing or
+expired. Return a fresh proof from the independent verifier for an expired
+receipt.
 
 The assembler also accepts separately measured pre-cutover access records against D's existing `Bootstrap.access_probe_plan`. Use a protected `kind: access-cutover` site profile with the same common site fields plus `node_id`, `tailnet`, `keys_sha256`, `acl_sha256`, and `execution_route`. Its independently checked binding carries the common exact job, platform source, machine, boot, DNS, recovery and provider addresses. Use `record-access TEST FAMILY --observed-at EPOCH --transcript FILE` for each actual typed access observation and `assemble` for the cutover schema. Confirm the initial operator scope and independently verified provider recovery through the [existing destination commissioning entry](destination-release.md). Generating initial access observations remains a native commissioning task.
 

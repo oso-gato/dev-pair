@@ -35,6 +35,7 @@ RECOVERY = 'dev-pair-renewal-recovery.service'
 TIMERS = {
     'agent-renewal': ('dev-pair-renewal-agent.timer', 'dev-pair-renewal@agent.service'),
     'checklist-spool': ('dev-pair-checklist-spool.timer', 'dev-pair-checklist-spool.service'),
+    'checklist-promotion': ('dev-pair-promotion-scan.timer', 'dev-pair-promotion-scan.service'),
     'owner-intake': ('dev-pair-intake-recovery.timer', 'dev-pair-intake-recovery.service'),
 }
 AGENT_BRIDGE = ('dev-pair-agent-bridge.timer', 'dev-pair-agent-bridge@poll.service')
@@ -42,6 +43,7 @@ GITHUB_CONFIG = Path('/root/.config/gh')
 WORKLOAD_GUARDS = {
     'agent-renewal': ('dev-pair-renewal@agent.service', AGENT_BRIDGE[1]),
     'checklist-spool': ('dev-pair-checklist-spool.service',),
+    'checklist-promotion': ('dev-pair-promotion-scan.service', 'dev-pair-promotion@.service'),
     'owner-intake': ('dev-pair-intake-recovery.service', 'dev-pair-intake@.service', 'dev-pair-product@.service'),
 }
 TLS_FILES = ('cert.pem', 'peer.pem', 'key.pem')
@@ -635,6 +637,8 @@ class Commission:
         self.services.post_provision(policy, selected)
         if feature == 'agent-renewal':
             self.unit(TIMERS[feature][1], files)
+        if feature == 'checklist-promotion':
+            self.unit('dev-pair-promotion@preflight.service', files)
         self.check_timer(feature, files, activation=True)
 
     def disable_owned_timer(self, feature, files):
@@ -1617,6 +1621,21 @@ class Live:
     def feature_authority(self, feature, selected, *, recorded=None):
         from bootstrap import Blocked as BootstrapBlocked
 
+        if feature == 'checklist-promotion':
+            from promotion_setup import EXTERNAL_ERRORS, enrollment, runtime_grant
+
+            try:
+                try:
+                    saved = enrollment()
+                except FileNotFoundError:
+                    saved = None
+                if saved is None or saved['state'] == 'staging':
+                    raise Pending('promotion-enrollment', 'Attended checklist promotion enrollment is available.')
+                if saved['state'] in ('withdrawing', 'withdrawn'):
+                    raise Pending('promotion-withdrawn', 'Checklist promotion custody is withdrawn.')
+                return runtime_grant(selected)
+            except (*EXTERNAL_ERRORS, Blocked):
+                raise Pending('promotion-custody', 'The protected checklist promotion enrollment is held.') from None
         try:
             if feature == 'owner-intake':
                 return self.owner_feature_authority(selected, recorded)
@@ -1763,6 +1782,8 @@ def main(argv=None):
             if args.operation == 'inspect':
                 report = {**observed, 'phase': 'inspection', 'policy_sha256': args.policy_sha256}
             else:
+                require('checklist-promotion' not in policy['timers'],
+                        'checklist promotion uses only the attended automatic commissioning path')
                 site, bundle = live.authority(policy)
                 files = app.package(policy, bundle)
                 report = app.apply(policy, args.policy_sha256, observed['boot_id'], site, files)
