@@ -529,15 +529,19 @@ class Commission:
             return {**report, 'timers': {}, 'pending_features': dict.fromkeys(TIMERS, waiting.report['prerequisite']),
                     'owner_terminal': None}
         timers, pending = {}, {}
+        billing_slot = None
         for feature in CORE_HELD_FEATURES:
             row = (saved['features'] if saved else {}).get(feature)
             if row is None or row['phase'] != 'armed':
                 pending[feature] = 'protected-feature-activation'
                 continue
             try:
-                self.require_runtime_feature(feature, owner_entry=feature == 'owner-intake')
+                self.require_runtime_feature(feature, owner_entry=feature == 'owner-intake',
+                                             repair_owner_billing=feature == 'owner-intake')
             except Pending as waiting:
                 pending[feature] = waiting.report['prerequisite']
+                if feature == 'owner-intake' and pending[feature] == 'provider-slot-authority':
+                    billing_slot = row['grant']['subject']
                 continue
             except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                 pending[feature] = 'protected-feature-requalification'
@@ -556,6 +560,8 @@ class Commission:
             timers[timer] = {'service': service, 'next': upcoming}
         result = {**report, 'timers': timers, 'pending_features': pending, 'held_features': sorted(pending),
                   'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' not in pending else None}
+        if billing_slot is not None:
+            result['owner_billing_slot'] = billing_slot
         if AGENT_BRIDGE[0] in timers:
             result['agent_publication'] = self.services.agent_publication_status(reference)
         return result
@@ -596,10 +602,11 @@ class Commission:
                 self.file(target, contents, mode)
                 self.run('/usr/sbin/restorecon', '-F', target, timeout=10)
 
-    def require_runtime_feature(self, feature, *, owner_entry=False):
+    def require_runtime_feature(self, feature, *, owner_entry=False, repair_owner_billing=False):
         from renewal import TERMINAL
 
-        require(feature in TIMERS, 'unknown automatic workload feature')
+        require(feature in TIMERS and (not repair_owner_billing or feature == 'owner-intake' and owner_entry),
+                'unknown automatic workload feature or billing repair scope')
         controller = self.services.renewal()
         with self.lock(), controller.lock(shared=True), controller.host_fence(shared=True):
             raw = self.read(AUTOMATIC_POLICY)
@@ -611,7 +618,8 @@ class Commission:
             require(row is not None and (row['phase'] == 'armed' or row['phase'] == 'active' and not owner_entry),
                     'automatic workload feature is held')
             grant = row['grant']
-            require(grant['expires_unix'] is None or grant['expires_unix'] > time.time(), 'automatic workload grant expired')
+            expired = grant['expires_unix'] is not None and grant['expires_unix'] <= time.time()
+            require(not expired or repair_owner_billing, 'automatic workload grant expired')
             if feature == 'owner-intake':
                 try:
                     self.provider_fence().require_ready()
@@ -642,8 +650,31 @@ class Commission:
                                  stable and feature in ('checklist-spool', 'agent-renewal') else selected)
             if stable and feature == 'agent-renewal':
                 self.services.agent_bridge_authority(selected, confirm_read=False)
-            require(self.services.feature_authority(feature, authority_release, recorded=grant) == grant,
-                    'automatic workload authorization changed')
+            try:
+                current_grant = self.services.feature_authority(feature, authority_release, recorded=grant)
+            except Pending as waiting:
+                if not repair_owner_billing or not stable or waiting.report['prerequisite'] != 'provider-slot-authority':
+                    raise
+                current_grant = None
+            if repair_owner_billing and stable and (expired or current_grant != grant):
+                runtime = workload_scope_fields({'boot_id': boot, 'release_sha256': selected, 'proof_sha256': proof})
+                with self.services.owner_billing_reauthorization(selected, grant) as (updated, consent):
+                    validate_feature_grant(updated)
+                    require(grant != updated and grant['subject'] == updated['subject'] and
+                            updated['expires_unix'] is not None and updated['expires_unix'] > time.time() and
+                            self.services.identity() == identity, 'owner consent or host changed during verification')
+                    self.provider_fence().require_ready()
+                    receipt = {'schema': 1, 'policy_sha256': saved['policy_sha256'], 'machine_id': saved['machine_id'],
+                               'previous_runtime': prior, 'previous_grant': grant,
+                               'runtime': runtime, 'grant': updated, 'consent_sha256': hex_id(consent)}
+                    history = PRIVATE + '/owner-billing-receipts'
+                    self.directory(history, 0o700)
+                    raw_receipt = encoded(receipt)
+                    self.file(history + '/' + digest(raw_receipt) + '.json', raw_receipt, 0o600)
+                    row.update(grant=updated, runtime=runtime)
+                    self.save_activation(saved)
+                return
+            require(current_grant == grant, 'automatic workload authorization changed')
             require(self.services.identity() == identity and (grant['expires_unix'] is None or grant['expires_unix'] > time.time()),
                     'automatic workload grant or host changed during verification')
             if changed:
@@ -1729,6 +1760,31 @@ class Live:
             except failures:
                 raise Pending('checklist-build-base', 'The independently verified checklist base is not ready in the rootless builder store.') from None
         return grant
+
+    @contextmanager
+    def owner_billing_reauthorization(self, selected, previous):
+        from bootstrap import Blocked as BootstrapBlocked
+        from owner_intake import FirstCatalogue, Intake
+
+        first = FirstCatalogue(Intake())
+        try:
+            with first.lock(), first.intake.lock():
+                job = previous['subject']
+                _, actual, manifests = first.intake.release_slots()
+                require(actual == selected and job in manifests, 'the selected release no longer owns the historical owner slot')
+                if job not in first.available_billing_slots():
+                    raise Pending('unused-provider-slot', 'The historical slot is already used or reserved. Its original job authority is retained.')
+                try:
+                    consent = first.billing_reauthorization(job, selected, manifests[job])
+                    current = self.owner_feature_authority(selected, recorded=previous)
+                    require(current != previous and current['expires_unix'] > time.time(),
+                            'the historical billing grant has not been renewed')
+                except (Blocked, BootstrapBlocked, OSError, RuntimeError, ValueError, TypeError, KeyError,
+                        subprocess.SubprocessError):
+                    raise Pending('provider-slot-authority', 'The unused owner slot needs newly confirmed signed billing terms.') from None
+                yield current, consent
+        except (FileNotFoundError, BlockingIOError):
+            raise Pending('provider-slot-authority', 'The protected owner slot is unavailable or busy. Resume billing setup.') from None
 
     def verified_workload_bundle(self, selected):
         controller = self.renewal()

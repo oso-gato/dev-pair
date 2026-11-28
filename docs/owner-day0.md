@@ -89,9 +89,11 @@ station admission, the wizard submits the exact VPS-bound request and checks
 for the custodian's signed terms each time you resume. Choose the protected
 offline handoff if you need to transfer the request and signed bundle through
 a separately authenticated channel. Once the independent terms verify, confirm
-the exact project, role settings, budget cap and UTC expiry. Day 0 can also
-reopen billing setup for a configured catalogue
-whose unused slot needs signed reauthorization. Once activation completes,
+the exact project, role settings, budget cap and UTC expiry. After a stable
+upgrade, run `./day0.sh resume` from the reviewed successor kit in the protected
+root terminal if the previously authorized owner slot needs renewed signed
+billing. Day 0 opens the wizard for that unused slot and rechecks the selected
+release after you confirm. Once activation completes,
 connect as `core` over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
 
 When the named owner terminal is available, `resume` can offer optional

@@ -218,9 +218,11 @@ normal owner command has its own approval for each later product job before
 issuing its job-bound provider allowance.
 
 For a configured catalogue, reopen the same wizard to reauthorize an unused
-slot with fresh signed terms and explicit budget consent. The catalogue,
-original slot profiles and prior receipts are retained. A retained draft or
-job reserves its existing slot. Older unscoped allowances remain available
+slot with valid independently signed terms and fresh explicit budget consent.
+After stable maintenance, Day 0 offers this repair for the previously armed
+slot when its grant expires or no longer matches the protected billing scope.
+The catalogue, original slot profiles and prior receipts are retained. A
+retained draft or job reserves its existing slot. Older unscoped allowances remain available
 for historical inspection and carry zero spendable balance. Their jobs need
 freshly approved authority on another eligible slot before any further paid
 work.

@@ -1161,6 +1161,23 @@ class FirstCatalogue:
             limits[key] = min(grant[field] for grant in grants)
         return limits
 
+    @staticmethod
+    def billing_consent(selection, credential, release, manifest):
+        return p.identity({'selection': selection, 'credential_stamp': credential,
+                           'release': release, 'development_manifest': manifest})
+
+    def billing_reauthorization(self, job, release, manifest):
+        p.require(job in self.available_billing_slots(),
+                  'Billing reauthorization requires the same unused configured slot.')
+        path = self.site / 'slots' / job / SLOT_BILLING
+        consent = p.loads(read_private(path, p.MAX_MESSAGE))
+        self.intake.slot(job, manifest, replacement=consent)
+        selection = {key: value for key, value in consent.items() if key != 'consent_sha256'}
+        credential = provider_custody(selection['settings']['allowance_ref'])
+        p.require(consent['consent_sha256'] == self.billing_consent(selection, credential, release, manifest),
+                  'The owner must consent to the exact current release and provider slot.')
+        return consent['consent_sha256']
+
     def reauthorization(self, job, options):
         p.require(job_id(job) in self.available_billing_slots(),
                   'Billing reauthorization requires an unused configured slot without a retained draft or job.')
@@ -1176,8 +1193,7 @@ class FirstCatalogue:
         roles = {role: checked_file(slot / role / 'profile.json', MAX_INPUT) for role in ROLES}
         selection = {'schema': 1, 'binding': self.intake.slot_billing_binding(job, base, roles),
                      'settings': settings, 'grant': grant, 'proofs': {kind: raw.decode() for kind, raw in proofs.items()}}
-        approval = p.identity({'selection': selection, 'credential_stamp': credential,
-                               'release': release, 'development_manifest': manifests[job]})
+        approval = self.billing_consent(selection, credential, release, manifests[job])
         scope = dict(selection, consent_sha256=approval)
         self.intake.slot(job, manifests[job], replacement=scope)
         return scope
@@ -1190,8 +1206,17 @@ class FirstCatalogue:
             scope = self.reauthorization(job, options)
             p.require(scope['consent_sha256'] == approval, 'The signed provider scope changed. Review the exact new selection.')
             path = protect_directory(self.site / 'slots' / job) / SLOT_BILLING
-            if os.path.lexists(path) and p.loads(checked_file(path)) == scope:
-                return
+            if os.path.lexists(path):
+                previous = read_private(path, p.MAX_MESSAGE)
+                retained = p.loads(previous)
+                if retained == scope:
+                    return
+                p.require(billing.canonical(retained) == previous, 'The previous billing consent has changed.')
+                receipt = private_leaf(path.parent / 'billing-receipts') / (p.sha256(previous) + '.json')
+                if os.path.lexists(receipt):
+                    p.require(read_private(receipt, p.MAX_MESSAGE) == previous, 'The historical billing consent has changed.')
+                else:
+                    billing.replace_record(receipt, retained)
             billing.replace_record(path, scope)
 
     def preview(self, options):
@@ -1391,7 +1416,7 @@ def setup_provider(ask, say, outgoing):
     return reference, billing_authority(reference)
 
 
-def setup_site(first, incoming, outgoing):
+def setup_site(first, incoming, outgoing, *, billing_slot=None):
     from gptbox_runtime import PROVIDER_BODY_MAX
     from owner_source import provision
     from provider_broker import PROFILE, reserved_cost
@@ -1408,6 +1433,7 @@ def setup_site(first, incoming, outgoing):
         job = None
         repository = workload = None
         manage = existing is not None
+        p.require(billing_slot is None or manage, 'Billing renewal requires the already configured owner slot.')
         if existing is None:
             say('Choose the approved repository and workload for the first owner job.')
             choice = ask('Repository (owner/name), or enter billing to manage provider authority.')
@@ -1421,7 +1447,8 @@ def setup_site(first, incoming, outgoing):
                 if not provision(first.intake, repository, workload, ask, say):
                     return
         if manage:
-            action = ask('Billing action [reauthorize/withdraw-key/rotate-reviewer/withdraw-reviewer/discard-pending/Enter]')
+            action = ('reauthorize' if billing_slot is not None else
+                      ask('Billing action [reauthorize/withdraw-key/rotate-reviewer/withdraw-reviewer/discard-pending/Enter]'))
             if not action:
                 return
             if action == 'rotate-reviewer':
@@ -1455,7 +1482,7 @@ def setup_site(first, incoming, outgoing):
             slots = first.available_billing_slots()
             if not slots:
                 raise SitePending('unused-provider-slot', 'No configured slot is unused and free of retained drafts or jobs.')
-            job = slots[0] if len(slots) == 1 else job_id(ask('Unused slot (' + ', '.join(slots) + ')'))
+            job = billing_slot or (slots[0] if len(slots) == 1 else job_id(ask('Unused slot (' + ', '.join(slots) + ')')))
             p.require(job in slots, 'Choose a currently unused configured slot.')
         say('Choose a registered OpenAI project credential with independently issued billing terms.')
         reference, (values, proofs, review) = setup_provider(ask, say, outgoing)
@@ -1520,12 +1547,16 @@ def catalogue_command(intake, argv):
               'Use the protected root commissioning terminal for first owner setup.')
     first = FirstCatalogue(intake)
     if argv[:1] in (['--setup-site'], ['--restore-source'], ['--rotate-source-credential']):
-        p.require(len(argv) == 1, 'Run the attended command without additional arguments.')
+        billing_slot = None
+        if len(argv) == 3 and argv[:2] == ['--setup-site', '--reauthorize-slot']:
+            billing_slot = job_id(argv[2])
+        else:
+            p.require(len(argv) == 1, 'Run the attended command without additional arguments.')
         try:
             with open('/dev/tty', encoding='utf-8') as incoming, open('/dev/tty', 'w', encoding='utf-8') as outgoing:
                 p.require(incoming.isatty() and outgoing.isatty(), 'First owner setup requires the controlling terminal.')
                 if argv[0] == '--setup-site':
-                    setup_site(first, incoming, outgoing)
+                    setup_site(first, incoming, outgoing, billing_slot=billing_slot)
                 else:
                     from owner_source import restore, rotate
                     action = restore if argv[0] == '--restore-source' else rotate

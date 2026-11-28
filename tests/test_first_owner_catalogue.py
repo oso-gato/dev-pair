@@ -537,6 +537,41 @@ class FirstCatalogueTests(unittest.TestCase):
             approved = live.owner_feature_authority(SELECTED, None)
             self.assertEqual(live.owner_feature_authority(SELECTED, approved), approved)
 
+    def test_stable_owner_repair_requires_current_exact_consent_and_preserves_prior_scope(self):
+        self.preview()
+        self.first.initialize(self.options)
+        live = object.__new__(commission_host.Live)
+        live.checklist_builder = mock.Mock()
+        slot = self.site / 'slots' / JOB
+        with mock.patch.object(owner, 'Intake', return_value=self.intake):
+            original = live.owner_feature_authority(SELECTED, None)
+            with self.assertRaises(commission_host.Pending) as held:
+                with live.owner_billing_reauthorization(SELECTED, original):
+                    self.fail('Initial consent cannot replace the original grant.')
+            self.assertEqual(held.exception.report['prerequisite'], 'provider-slot-authority')
+
+            self.options.requests = 1
+            scope = self.first.reauthorization(JOB, self.options)
+            self.first.replace_billing(JOB, self.options, scope['consent_sha256'])
+            with live.owner_billing_reauthorization(SELECTED, original) as (replacement, consent):
+                self.assertEqual(consent, scope['consent_sha256'])
+                self.assertNotEqual(replacement, original)
+            with self.assertRaisesRegex(ValueError, 'exact current release'):
+                self.first.billing_reauthorization(JOB, '7' * 64, self.manifest)
+
+            preceding = (slot / owner.SLOT_BILLING).read_bytes()
+            self.options.spend_microusd -= 1
+            scope = self.first.reauthorization(JOB, self.options)
+            self.first.replace_billing(JOB, self.options, scope['consent_sha256'])
+            self.assertEqual((slot / 'billing-receipts' / (sha256(preceding) + '.json')).read_bytes(), preceding)
+            prior_job = self.intake.queue / (JOB + '.json')
+            owner.write_private(prior_job, b'retained job history')
+            with self.assertRaises(commission_host.Pending) as used:
+                with live.owner_billing_reauthorization(SELECTED, original):
+                    self.fail('A retained job cannot receive new slot authority.')
+            self.assertEqual(used.exception.report['prerequisite'], 'unused-provider-slot')
+            self.assertEqual(prior_job.read_bytes(), b'retained job history')
+
     def test_wrong_git_origin_and_mismatched_verified_seed_runtime_are_refused(self):
         self.git(self.source, 'config', 'remote.origin.url', 'https://github.com/foreign/source')
         with self.assertRaisesRegex(ValueError, 'authorized repository'):

@@ -186,6 +186,45 @@ class DayZeroTests(unittest.TestCase):
         self.assertEqual(self.entry.commission_apply.call_count, 2)
         self.assertEqual(self.entry.stage.call_args.args[2], 'owner-terminal-ready')
 
+    def test_stable_resume_reopens_only_its_existing_owner_slot_from_selected_checkout(self):
+        selected = self.directory / 'selected'
+        tool = selected / 'tools/commission_host.py'
+        tool.parent.mkdir(parents=True)
+        tool.touch()
+        installed_wizard = self.directory / 'installed-owner-setup.py'
+        installed_wizard.touch()
+        self.entry.original = Mock(return_value=self.identity)
+        self.entry.ensure_git = Mock()
+        self.entry.stable_site = Mock(return_value={'source_sha': 'c' * 40, 'original_source_sha': SOURCE})
+        self.entry.stable_checkout = Mock(return_value=selected)
+        self.entry.stage = Mock()
+        tty = SimpleNamespace(incoming=io.StringIO(), outgoing=io.StringIO())
+        ready = {'phase': 'ready', 'selected_release': '1' * 64}
+        held = {**ready, 'owner_billing_slot': 'job-1', 'pending_features': {'owner-intake': 'provider-slot-authority'}}
+        restored = {**ready, 'owner_terminal': '/usr/local/bin/dev-pair',
+                    'pending_features': {'checklist-promotion': 'promotion-enrollment', 'agent-renewal': 'agent-observer-key'}}
+        self.entry.call = Mock(side_effect=[held, restored, held])
+        self.entry.setup_promotion = Mock()
+        self.entry.setup_agent_observer = Mock()
+        with (patch.object(day, 'record', return_value={'machine_id': MACHINE, 'source_sha': SOURCE}),
+              patch.object(day, 'kit_source', return_value=(SOURCE, True)),
+              patch.object(self.entry, 'owner_lock', side_effect=nullcontext),
+              patch.object(day, 'OWNER_SETUP', installed_wizard), patch.object(day, 'OWNER_CATALOGUE', tool),
+              patch.object(day, 'answer', side_effect=['yes', 'no']) as confirm,
+              patch.object(day.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as launch):
+            self.entry.start(None, tty)
+            self.assertEqual(self.entry.stage.call_args.args[2], 'owner-terminal-ready')
+            self.entry.start(None, tty)
+        self.assertEqual(confirm.call_count, 2)
+        self.assertIn('unused owner slot job-1', confirm.call_args.args[1])
+        launch.assert_called_once()
+        self.assertEqual(launch.call_args.args[0], ['/usr/bin/python3', '-IB', str(installed_wizard),
+                                                    '--setup-site', '--reauthorize-slot', 'job-1'])
+        self.assertEqual([call.kwargs['checkout'] for call in self.entry.call.call_args_list], [selected] * 3)
+        self.entry.setup_promotion.assert_not_called()
+        self.entry.setup_agent_observer.assert_not_called()
+        self.assertEqual(self.entry.stage.call_args.args[2], 'managed-listener-ready')
+
     def test_station_response_may_resume_checked_recovery_but_cannot_select_another_scope(self):
         from destination_observation import access_envelope
 

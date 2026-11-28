@@ -878,14 +878,19 @@ class DayZero:
                        if completed['access_scope'] == 'core' else 'The independent access review is accepted.')
             self.stage(identity, revision, 'access-cutover-complete', message + ' Run ./day0.sh resume to continue.')
 
-    def setup_owner(self, tty):
+    def setup_owner(self, tty, *, billing_slot=None):
         prompt = ('Repair the configured owner slot’s signed billing authority now? [Y/n]'
                   if os.path.lexists(OWNER_CATALOGUE) else 'Set up the first owner job now? [Y/n]')
+        if billing_slot is not None:
+            prompt = f'Renew the signed billing authority for the unused owner slot {billing_slot}? [Y/n]'
         if answer(tty, prompt).lower() not in ('', 'y', 'yes'):
             return False
         script = local_file(OWNER_SETUP)
-        print('Preparing the first owner setup in this terminal.', flush=True)
-        result = subprocess.run(['/usr/bin/python3', '-IB', str(script), '--setup-site'], env=ENV,
+        print('Opening the protected owner setup in this terminal.', flush=True)
+        args = ['--setup-site']
+        if billing_slot is not None:
+            args.extend(('--reauthorize-slot', billing_slot))
+        result = subprocess.run(['/usr/bin/python3', '-IB', str(script), *args], env=ENV,
                                 stdin=tty.incoming, stdout=tty.outgoing, stderr=tty.outgoing,
                                 timeout=1800, check=False)
         require(result.returncode == 0, 'First owner setup paused. Run ./day0.sh resume to continue.')
@@ -929,29 +934,40 @@ class DayZero:
                    'Checking the independently approved release and private site.')
         if not ((stable_checkout or self.repo) / 'tools/commission_host.py').is_file():
             return
-        observed = (self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800,
-                              checkout=stable_checkout) if stable_checkout else self.commission_apply(revision, tty))
+        def apply():
+            if stable_checkout:
+                return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800,
+                                 checkout=stable_checkout)
+            return self.commission_apply(revision, tty)
+
+        observed = apply()
         if tty is not None and observed.get('phase') == 'ready':
             pending = observed.get('pending_features', {}).get('owner-intake')
-            if pending == 'workload-access':
+            if stable_checkout is None and pending == 'workload-access':
                 try:
                     proof = self.app.verify_workload_access()
                 except Blocked:
                     proof = {}
                 if (proof.get('role_artifacts', {}).get('release_sha256') != observed['selected_release'] and
                         self.receiving_access(revision, historical, tty, workload=True)):
-                    observed = self.commission_apply(revision, tty)
-            if (observed.get('pending_features', {}).get('owner-intake') in
-                    ('owner-catalogue-selection', 'provider-slot-authority') and
-                    self.setup_owner(tty)):
-                observed = self.commission_apply(revision, tty)
-            if (observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and
+                    observed = apply()
+            pending = observed.get('pending_features', {}).get('owner-intake')
+            billing_slot = observed.get('owner_billing_slot')
+            if pending in ('owner-catalogue-selection', 'provider-slot-authority'):
+                if stable_checkout is None:
+                    continued = self.setup_owner(tty)
+                else:
+                    continued = (pending == 'provider-slot-authority' and billing_slot is not None and
+                                 self.setup_owner(tty, billing_slot=billing_slot))
+                if continued:
+                    observed = apply()
+            if (stable_checkout is None and observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and
                     observed.get('pending_features', {}).get('checklist-promotion') == 'promotion-enrollment' and
                     self.setup_promotion(tty)):
-                observed = self.commission_apply(revision, tty)
-            if (observed.get('pending_features', {}).get('agent-renewal') == 'agent-observer-key' and
+                observed = apply()
+            if (stable_checkout is None and observed.get('pending_features', {}).get('agent-renewal') == 'agent-observer-key' and
                     self.setup_agent_observer(tty)):
-                observed = self.commission_apply(revision, tty)
+                observed = apply()
         phase = observed.get('phase', 'unknown')
         if phase in ('pending', 'source-gap'):
             self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
@@ -969,7 +985,8 @@ class DayZero:
             for name, reason in sorted(pending.items()):
                 lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
                 if name == 'owner-intake' and reason in ('owner-catalogue-selection', 'provider-slot-authority'):
-                    lines.append('Run ./day0.sh resume to continue first owner setup.')
+                    lines.append('Run ./day0.sh resume to continue first owner setup.' if stable_checkout is None else
+                                 'Run ./day0.sh resume to renew the configured owner slot’s signed billing scope.')
             if observed.get('provider_start_pending'):
                 lines.append(observed['provider_start_pending'])
             if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
@@ -1011,7 +1028,7 @@ class DayZero:
                     return
                 checkout = self.stable_checkout(stable, revision)
                 self.progress = STATE / 'stable-progress.json'
-                self.commission(identity, stable['source_sha'], stable['original_source_sha'], stable_checkout=checkout)
+                self.commission(identity, stable['source_sha'], stable['original_source_sha'], tty, stable_checkout=checkout)
                 return
             historical, image = self.select_source(identity, revision, prior)
             report = self.app.status()
