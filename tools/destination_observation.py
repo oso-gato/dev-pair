@@ -314,7 +314,7 @@ def probe_plan(plan):
     return expected
 
 
-def export_release(job):
+def export_release(job, *, confirmed_receipt=None):
     """Read the normal J/D records on the destination under D's release lock."""
     from destination_release import Destination
     from product_release import matches as matching_release, record, trusted_directory, product
@@ -324,12 +324,17 @@ def export_release(job):
     with destination.release_gate() as (setup, _, dns):
         promotion = record(trusted_directory(product.job_path(job)))
         activation = destination.initial_activation()
+        live = activation['active']
         require(promotion and promotion['job_id'] == job and
-                promotion['phase'] in ('awaiting-independent-destination', 'confirming-destination')
-                and matching_release(activation['active'], promotion['release'], promotion['binding'])
+                matching_release(live, promotion['release'], promotion['binding'], job=job)
                 and not activation['pending'] and not activation['route_pending']
                 and destination.serve_config(dns), 'selected exact release is not awaiting independent destination checks')
-        live = activation['active']
+        already_confirmed = (confirmed_receipt is not None and promotion['phase'] == 'confirmed'
+                             and live.get('verified_destination') is True and live.get('promotion_job_id') == job
+                             and activation['confirmed'] == live['artifact_sha256']
+                             and confirmed_receipt == live['destination_receipt_sha256'] == promotion['destination_receipt_sha256'])
+        require(promotion['phase'] in ('awaiting-independent-destination', 'confirming-destination') or already_confirmed,
+                'selected exact release is not awaiting independent destination checks')
         previous = activation['previous']
         cutover = destination.verify_final_guard()
         return {'version': 1, 'kind': 'checklist-release', 'job_id': job, 'source_sha': setup['platform_sha'],
@@ -761,7 +766,9 @@ def assembled_receipt(plan, plan_sha, directory, *, now, verify):
             events[event] = event_check(record, plan, plan_sha, event)
         item, boot = check_release_sequence(plan, observations, events, now)
         data.update(boot_id=boot, item_id=item['item_id'], item_title_sha256=item['item_title_sha256'],
-                    release_source=plan['release_source'], image=plan['image'], guard_sha256=plan['guard_sha256'])
+                    release_source=plan['release_source'], image=plan['image'], guard_sha256=plan['guard_sha256'],
+                    job_id=plan['job_id'], publisher_run_id=plan['publisher_run_id'],
+                    publisher_run_attempt=plan['publisher_run_attempt'])
     require(len(encoding(data)) <= 16384, 'D receipt exceeds its protected input limit')
     return data
 

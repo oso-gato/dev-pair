@@ -76,10 +76,12 @@ The normal observer advances the release through the existing destination contro
 The independent verifier exercises the named private URL and the required
 access, persistence, restart, reboot and restore checks. The verifier returns a
 fresh signed envelope for the same job through the protected proof importer.
-The D verifier checks the signature, current boot and guard, exact source and
-OCI, exact DNS, actual live item and required observations before recording
-confirmation. The resolved image and DNS remain visible while the signed proof
-is pending or expired. Keep the independent signing authority and probe access
-outside the host, proposer and provider roles. [Independent destination observations](destination-observation.md)
+The D verifier checks the signature, owner job, publisher run and attempt,
+current boot and guard, exact source, OCI and DNS, live item and required
+observations before recording confirmation. The importer and installed D
+controller authenticate their source through the current boot observation and
+retained signed host bundle. The resolved image and DNS remain visible while
+the signed proof is pending or expired. Keep the independent signing authority
+and probe access outside the host, proposer and provider roles. [Independent destination observations](destination-observation.md)
 
 The implementation can be exercised locally with an isolated Git fork, synthetic GitHub API and a fixture activation journal. The protected GitHub permissions, workflow App, independent reviewer, registry publication, actual Fedora destination and independent probe producer require commissioned authority and real observations.

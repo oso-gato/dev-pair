@@ -100,9 +100,10 @@ ssh-keygen -Y sign -n dev-pair-destination -f "$access_review_signer_public" \
 ```
 
 The assembler waits for every required check and verifies each role signature.
-The retained signed plan identifies the job and publisher attempt. The signed
-receipt includes the production source, OCI image, primary item, observed
-boot and guard. Return the envelope over the authenticated controller channel.
+The signed plan and final receipt identify the owner job, publisher run ID and
+run attempt. The receipt also includes the production source, OCI image,
+primary item, observed boot and guard. Return the envelope over the authenticated
+controller channel.
 From the protected destination terminal, submit it for the exact owner job:
 
 ```sh
@@ -110,12 +111,13 @@ sudo /usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/promotion_setup.py \
   import-proof "$job" < "$received_envelope"
 ```
 
-The importer checks the independent signature and current release binding.
-The next commissioned promotion scan verifies the live checklist and records
+The importer checks the independent signature and current release binding,
+including the job and publisher attempt. The next commissioned promotion scan
+checks the same binding again against the live checklist and records
 confirmation on the same job. Resume Day 0 after a reboot if the schedule is
 held for the new boot. `dev-pair status JOB` shows when a proof is missing or
-expired. Return a fresh proof from the independent verifier for an expired
-receipt.
+expired. Return a fresh proof for an expired receipt or a changed publisher
+attempt. Existing confirmed delivery records remain valid.
 
 The assembler also accepts separately measured pre-cutover access records against D's existing `Bootstrap.access_probe_plan`. Use a protected `kind: access-cutover` site profile with the same common site fields plus `node_id`, `tailnet`, `keys_sha256`, `acl_sha256`, and `execution_route`. Its independently checked binding carries the common exact job, platform source, machine, boot, DNS, recovery and provider addresses. Use `record-access TEST FAMILY --observed-at EPOCH --transcript FILE` for each actual typed access observation and `assemble` for the cutover schema. Confirm the initial operator scope and independently verified provider recovery through the [existing destination commissioning entry](destination-release.md). Generating initial access observations remains a native commissioning task.
 

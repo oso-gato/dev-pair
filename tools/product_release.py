@@ -330,7 +330,8 @@ class Live:
 
     def deploy(self, release):
         self.destination.deploy(release['source_sha'], release['subject'], release['run_id'],
-                                None if self.registry_auth is None else str(self.registry_auth))
+                                None if self.registry_auth is None else str(self.registry_auth),
+                                job_id=self.job, run_attempt=release['run_attempt'])
 
     def evidence(self):
         from promotion_setup import evidence_envelope, stored_proof
@@ -351,17 +352,18 @@ class Live:
         from promotion_setup import confirm_envelope
 
         if evidence.suffix == '.envelope':
-            return confirm_envelope(self.destination, evidence)
-        return self.destination.confirm(str(evidence))
+            return confirm_envelope(self.destination, evidence, job_id=self.job)
+        return self.destination.confirm(str(evidence), job_id=self.job)
 
 
-def matches(activation, release, binding):
+def matches(activation, release, binding, *, job=None):
     attempt = release.get('run_attempt')
     return (type(attempt) is int and attempt > 0 and activation is not None and
             type(activation.get('run_attempt')) is int and activation['run_attempt'] == attempt and
             all(activation.get(key) == release[key] for key in
                 ('source_sha', 'subject', 'run_id', 'artifact_sha256', 'source_tree', 'pull_request', 'review_head')) and
-            activation.get('dns_name') == binding['dns_name'] and not activation.get('quarantined'))
+            activation.get('dns_name') == binding['dns_name'] and not activation.get('quarantined') and
+            (job is None or activation.get('promotion_job_id', job) == job))
 
 
 def advance(state, binding, bundle, result, site, backend, save):
@@ -416,21 +418,21 @@ def advance(state, binding, bundle, result, site, backend, save):
                   pull['merged_by']['id'] == site['merge_actor_id'], 'previously attested publication changed')
     activation = backend.activation()
     active = activation['active']
-    if not matches(active, release, binding) or activation['route_pending']:
+    if not matches(active, release, binding, job=job) or activation['route_pending']:
         pending = activation['pending']
-        p.require(pending is None or pending['operation'] == 'deploy' and matches(pending['release'], release, binding),
+        p.require(pending is None or pending['operation'] == 'deploy' and matches(pending['release'], release, binding, job=job),
                   'another deployment requires independent resolution')
         if active and active.get('quarantined'):
             p.require(active['artifact_sha256'] != release['artifact_sha256'],
                       'correction requires an independently verified different digest')
         else:
-            p.require(not active or matches(active, release, binding) or
+            p.require(not active or matches(active, release, binding, job=job) or
                       activation['confirmed'] == active['artifact_sha256'],
                       'an earlier deployment requires independent confirmation')
         transition('deploying')
         backend.deploy(release)
         activation = backend.activation()
-    p.require(matches(activation['active'], release, binding) and not activation['pending'] and not activation['route_pending'],
+    p.require(matches(activation['active'], release, binding, job=job) and not activation['pending'] and not activation['route_pending'],
               'exact tailnet release is yet to be observed')
     active = activation['active']
     if activation['confirmed'] != release['artifact_sha256'] or active.get('verified_destination') is not True:
@@ -440,7 +442,7 @@ def advance(state, binding, bundle, result, site, backend, save):
         backend.confirm(evidence)
         activation = backend.activation()
         active = activation['active']
-    p.require(matches(active, release, binding) and active['verified_destination'] is True and
+    p.require(matches(active, release, binding, job=job) and active['verified_destination'] is True and
               activation['confirmed'] == release['artifact_sha256'] and not activation['pending'] and
               not activation['route_pending'], 'authenticated destination confirmation is still pending')
     p.digest(active['destination_receipt_sha256'])

@@ -1315,6 +1315,13 @@ class Bootstrap:
         if type(expected) is not str or not re.fullmatch(r'[0-9a-f]{40}', expected):
             raise Blocked('exact independently admitted full source SHA required')
         script = Path(__file__).absolute()
+        install = self.path('/usr/libexec/dev-pair')
+        if checkout is None and (script.parent == install / 'tools' or
+                                 script.parent.parent.parent == install / 'host-releases'):
+            try:
+                return self.installed_destination_source(expected, script, install)
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                raise Blocked('selected installed destination source evidence is unavailable') from error
         repo = script.parents[1] if checkout is None else Path(checkout)
         recorded_script = repo / 'tools/bootstrap.py'
         if not repo.is_absolute():
@@ -1420,6 +1427,42 @@ class Bootstrap:
             if len(updated.encode()) > 16384:
                 raise Blocked('the protected signer trust file would exceed its bound')
             self.atomic(TRUST_SIGNERS, updated, mode=stat.S_IMODE(path.lstat().st_mode), expected=raw)
+
+    def installed_destination_source(self, expected, script, install):
+        import platform_release_install as platform_release
+        from systemd_service_profile import protected
+
+        boot = self.destination_identity()['boot_id']
+        site, host, _ = self.runtime_selected_host(boot)
+        binding = self.runtime_record('/var/lib/dev-pair/renewal/platform-bindings/' + site + '.json')
+        base = binding['base_platform_sha256']
+        selected = binding['platform_sha256']
+        if (set(binding) != {'schema', 'release_sha256', 'platform_sha256', 'base_platform_sha256', 'site_config_sha256',
+                             'plan_sha256', 'intake_sha256'}
+                or type(binding['schema']) is not int or binding['schema'] != 1 or binding['release_sha256'] != site
+                or any(type(value) is not str or not re.fullmatch(r'[0-9a-f]{64}', value) for value in (base, selected))
+                or host['source_revision'] != expected):
+            raise Blocked('installed destination source differs from the selected host release')
+        _, selected_index, intake = platform_release.intake.retained_index(selected)
+        if (binding['intake_sha256'] != intake or (selected_index['base_platform_sha256'] or selected) != base):
+            raise Blocked('selected host release lacks its independently admitted portable binding')
+        initial = selected_index if selected == base else platform_release.intake.retained_index(base)[1]
+        component = initial['components']['host']
+        if (initial['source_sha'], component['source_sha'], component['bundle_manifest_sha256']) != (
+                expected, expected, host['artifact_sha256']):
+            raise Blocked('installed destination source differs from independently admitted portable host code')
+        store = install / 'host-releases' / host['artifact_sha256']
+        if script not in (install / 'tools/bootstrap.py', store / 'tools/bootstrap.py'):
+            raise Blocked('installed destination verifier is outside the selected host release')
+        platform_release.check_host_bundle(store, component, time.monotonic() + 15)
+        manifest, _ = platform_release.protected_json(store / 'manifest.json', host['artifact_sha256'])
+        for name in ('bootstrap.py', 'destination_release.py'):
+            raw = protected(script.with_name(name), 0, 4 * 1024**2)
+            if manifest['files'].get('tools/' + name) != hashlib.sha256(raw).hexdigest():
+                raise Blocked('installed destination verifier differs from the selected signed host bundle')
+        if self.runtime_selected_host(boot)[:2] != (site, host):
+            raise Blocked('destination host selection changed during source verification')
+        return expected
 
     def signed_evidence(self, path, principal, namespace):
         if not path:

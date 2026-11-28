@@ -190,27 +190,29 @@ class StationSite(unittest.TestCase):
         job.mkdir(mode=0o700)
         storage.mkdir(mode=0o700)
         binding = {'source_sha': BASE, 'machine_id': '1' * 32, 'boot_id': '2' * 36, 'release_source': 'c' * 40,
-                   'image': release.REGISTRY + '@sha256:' + 'd' * 64, 'dns_name': DNS, 'guard_sha256': 'e' * 64}
+                   'image': release.REGISTRY + '@sha256:' + 'd' * 64, 'dns_name': DNS, 'guard_sha256': 'e' * 64,
+                   'job_id': JOB, 'publisher_run_id': 12, 'publisher_run_attempt': 2}
         receipt = self.root / 'independent.json'
-        proof = {**binding, 'expires_at': int(time.time()) + 60}
+        proof = {**binding, 'expires_at': int(time.time()) + 60, 'item_id': 1, 'item_title_sha256': 'a' * 64}
         receipt.write_bytes(station.encoding(proof))
         subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-n', 'dev-pair-destination', '-f', str(private), str(receipt)],
                        check=True, timeout=5, capture_output=True)
         signature = receipt.with_suffix('.json.sig').read_bytes()
         envelope = station.access_envelope(receipt.read_bytes(), signature)
 
-        class IndependentPrimitives:
+        class IndependentPrimitives(setup.Destination):
             def recent_destination_evidence(self, path, principal, fields, *, lifetime):
                 value, _ = station.verify_file(Path(path), principal, trusted, 'dev-pair-destination')
                 return value
 
-            def confirm(self, path):
-                return self.recent_destination_evidence(path, 'dev-pair-access-review', set(), lifetime=1800)
+            def confirm(self, path, *, job_id):
+                return self.release_proof(path, {**binding, 'job_id': job_id})
 
         with (patch.object(release, 'EVIDENCE', storage), patch.object(release.product, 'job_path', return_value=job),
               patch.object(station, 'export_release', return_value={**binding, 'image': 'another subject'}) as export,
-              patch.object(setup, 'Destination', IndependentPrimitives)):
-            with self.assertRaisesRegex(ValueError, 'exact pending destination'):
+              patch.object(setup, 'Destination', IndependentPrimitives),
+              patch.object(release, 'record', return_value={'phase': 'awaiting-independent-destination'})):
+            with self.assertRaisesRegex(release.Blocked, 'exact release, job or publisher attempt'):
                 setup.import_evidence(JOB, io.BytesIO(envelope))
             target = setup.evidence_envelope(JOB)
             self.assertFalse(target.exists())
@@ -219,12 +221,15 @@ class StationSite(unittest.TestCase):
                 setup.import_evidence(JOB, io.BytesIO(station.access_envelope(receipt.read_bytes(), b'not a signature')))
             setup.import_evidence(JOB, io.BytesIO(envelope))
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
-            self.assertEqual(setup.confirm_envelope(IndependentPrimitives(), target), proof)
+            self.assertEqual(setup.confirm_envelope(IndependentPrimitives(), target, job_id=JOB), proof)
             with patch.object(setup.time, 'time', return_value=proof['expires_at']):
                 with self.assertRaisesRegex(release.Wait, 'signed-destination-evidence-expired'):
                     setup.stored_proof(target)
             before = target.stat().st_ino
-            export.side_effect = AssertionError('already accepted proof performed another native observation')
+            export.return_value = {**binding, 'publisher_run_attempt': 3}
+            with self.assertRaisesRegex(release.Blocked, 'exact release, job or publisher attempt'):
+                setup.import_evidence(JOB, io.BytesIO(envelope))
+            export.return_value = binding
             setup.import_evidence(JOB, io.BytesIO(envelope))
             self.assertEqual(target.stat().st_ino, before)
             self.assertEqual(list(storage.iterdir()), [target])

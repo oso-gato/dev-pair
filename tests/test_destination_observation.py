@@ -267,8 +267,10 @@ class ReceiptTests(unittest.TestCase):
                         role = 'provider'
                 save(o.record_name(test, family), record, role)
             receipt = assemble()
-            self.assertEqual(set(receipt), o.BASE | {'dns_name', 'release_source', 'image',
-                             'guard_sha256', 'item_id', 'item_title_sha256', 'probes'})
+            publication = {'job_id', 'publisher_run_id', 'publisher_run_attempt'}
+            fields = {'dns_name', 'release_source', 'image', 'guard_sha256', 'item_id', 'item_title_sha256', 'probes'} | publication
+            self.assertEqual(set(receipt), o.BASE | fields)
+            self.assertEqual({key: receipt[key] for key in publication}, {key: self.plan[key] for key in publication})
             self.assertEqual(receipt['boot_id'], NEW_BOOT)
             self.assertEqual(receipt['item_id'], 33)
             self.assertEqual(len(receipt['probes']), len(self.expected))
@@ -290,9 +292,7 @@ class ReceiptTests(unittest.TestCase):
                     patch.object(o.Bootstrap, 'destination_identity', return_value={'machine_id': MACHINE, 'boot_id': NEW_BOOT}), \
                     patch.object(o.Bootstrap, 'path', return_value=signers):
                 D = o.Bootstrap(run=verifier)
-                self.assertEqual(D.recent_destination_evidence(final_path, final_principal,
-                                 {'dns_name', 'release_source', 'image', 'guard_sha256', 'item_id', 'item_title_sha256', 'probes'},
-                                 lifetime=1800), receipt)
+                self.assertEqual(D.recent_destination_evidence(final_path, final_principal, fields, lifetime=1800), receipt)
             signers.write_text(''.join(lines))
             name = o.record_name('unauthorized-app', 'ipv4')
             record = json.loads((path / name).read_bytes())

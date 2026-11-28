@@ -67,6 +67,8 @@ RUNUSER = '/usr/sbin/runuser'
 SYSTEMCTL = '/usr/bin/systemctl'
 TAILSCALE = '/usr/bin/tailscale'
 MIB = 1024**2
+RELEASE_PROOF_BINDING = ('source_sha', 'release_source', 'image', 'dns_name', 'guard_sha256')
+JOB_PROOF_BINDING = ('job_id', 'publisher_run_id', 'publisher_run_attempt')
 
 
 def inventory_digest(items):
@@ -1223,12 +1225,21 @@ class Destination(Bootstrap):
         self.save_activation(result)
         return self.finish_route(result, dns)
 
-    def deploy(self, source, image, run_id, secret):
+    def deploy(self, source, image, run_id, secret, *, job_id=None, run_attempt=None):
         with self.release_gate() as (_, uid, dns):
             state = self.initial_activation()
             self.serve_config(dns)
             release = ReleaseTrust(self.run).verify('checklist', source, image, run_id)
+            if job_id is not None:
+                require(type(job_id) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', job_id) and
+                        type(run_attempt) is int and run_attempt > 0 and release['run_attempt'] == run_attempt,
+                        'promotion deployment differs from the checked job or publisher attempt')
+                release['promotion_job_id'] = job_id
             active, pending = state['active'], state['pending']
+            if active and job_id is not None and all(active.get(key) == release[key] for key in
+                                                       ('source_sha', 'subject', 'run_id', 'run_attempt')):
+                require(active.get('promotion_job_id', job_id) == job_id,
+                        'exact destination rollout is already owned by another promotion job')
             if pending:
                 require(pending['operation'] == 'deploy' and all(pending['release'].get(key) == value for key, value in release.items()),
                         'an interrupted different release requires rollback before further deployment')
@@ -1342,22 +1353,39 @@ class Destination(Bootstrap):
                     'previous exact digest is unavailable for rollback')
             return self.activate(uid, dns, state, prior, 'rollback')
 
-    def confirm(self, evidence):
+    def release_proof(self, evidence, binding):
+        fields = {*RELEASE_PROOF_BINDING, 'probes', 'item_id', 'item_title_sha256'} - {'source_sha'}
+        names = RELEASE_PROOF_BINDING
+        if 'job_id' in binding:
+            require(type(binding['job_id']) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', binding['job_id'])
+                    and all(type(binding[key]) is int and 0 < binding[key] < 2**63 for key in JOB_PROOF_BINDING[1:]),
+                    'destination release lacks an exact promotion job and publisher attempt')
+            names += JOB_PROOF_BINDING
+            fields.update(JOB_PROOF_BINDING)
+        names += tuple(key for key in ('boot_id', 'machine_id') if key in binding)
+        data = self.recent_destination_evidence(evidence, 'dev-pair-access-review', fields, lifetime=1800)
+        require(all(type(data[key]) is type(binding[key]) and data[key] == binding[key] for key in names)
+                and type(data['item_id']) is int and 0 < data['item_id'] < 2**63
+                and type(data['item_title_sha256']) is str and re.fullmatch(DIGEST, data['item_title_sha256']),
+                'independent proof differs from the exact release, job or publisher attempt')
+        return data
+
+    def confirm(self, evidence, *, job_id=None):
         with self.release_gate() as (setup, uid, dns):
             state = self.initial_activation()
             release = state['active']
             require(release and not release.get('quarantined') and not state['pending'] and not state['route_pending'],
                     'no settled rollout to confirm')
-            data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
-                                                    {'release_source', 'image', 'dns_name', 'guard_sha256', 'probes',
-                                                     'item_id', 'item_title_sha256'}, lifetime=1800)
             cutover = self.verify_final_guard()
-            require(data['source_sha'] == setup['platform_sha'] and data['release_source'] == release['source_sha']
-                    and data['image'] == release['subject'] and data['dns_name'] == dns
-                    and data['guard_sha256'] == cutover['guard_sha256']
-                    and type(data['item_id']) is int and 0 < data['item_id'] < 2**63
-                    and type(data['item_title_sha256']) is str and re.fullmatch(DIGEST, data['item_title_sha256']),
-                    'external destination evidence lacks exact successful release/access checks')
+            owner_job = release.get('promotion_job_id')
+            require(not job_id or not owner_job or job_id == owner_job,
+                    'settled destination rollout is owned by a different promotion job')
+            binding = {'source_sha': setup['platform_sha'], 'release_source': release['source_sha'],
+                       'image': release['subject'], 'dns_name': dns, 'guard_sha256': cutover['guard_sha256']}
+            job_id = owner_job or job_id
+            if job_id is not None:
+                binding.update(job_id=job_id, publisher_run_id=release['run_id'], publisher_run_attempt=release['run_attempt'])
+            data = self.release_proof(evidence, binding)
             endpoint = f'https://{dns}/'
             expected = {}
             for family in ('ipv4', 'ipv6'):
@@ -1385,6 +1413,8 @@ class Destination(Bootstrap):
             state['confirmed'] = release['artifact_sha256']
             state['active'] = {**release, 'verified_destination': True,
                                'destination_receipt_sha256': hashlib.sha256(protect(evidence).read_bytes()).hexdigest()}
+            if job_id is not None:
+                state['active']['promotion_job_id'] = job_id
             self.save_activation(state)
             return {'url': f'https://{dns}/', 'source_sha': release['source_sha'], 'image': release['subject'], 'confirmed': True}
 

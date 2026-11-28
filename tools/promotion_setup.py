@@ -467,9 +467,6 @@ def attended():
         return True
 
 
-PROOF_FIELDS = {'release_source', 'image', 'dns_name', 'guard_sha256', 'probes', 'item_id', 'item_title_sha256'}
-
-
 def evidence_envelope(job):
     release.product.job_path(job)  # Validate the exact protected job ID before selecting a leaf.
     return release.EVIDENCE / (job + '.envelope')
@@ -493,16 +490,15 @@ def import_evidence(job, stream):
     target = evidence_envelope(job)
     root = trusted_directory(release.product.job_path(job))
     with release.job_lock(root):
-        if os.path.lexists(target) and p.loads(read_private(target, p.MAX_MESSAGE)) == envelope:
-            return
+        existing = p.loads(read_private(target, p.MAX_MESSAGE)) if os.path.lexists(target) else None
+        replay = existing == envelope
+        binding = export_release(job, confirmed_receipt=p.sha256(payload) if replay else None)
+        if replay and release.record(root)['phase'] == 'confirmed':
+            return  # The current settled J/D records already bind these exact independently verified bytes.
         with proof_files(payload, signature) as receipt:
-            binding = export_release(job)
-            data = Destination().recent_destination_evidence(str(receipt), 'dev-pair-access-review', PROOF_FIELDS,
-                                                            lifetime=1800)
-        p.require(all(data[key] == binding[key] for key in ('source_sha', 'machine_id', 'boot_id', 'release_source',
-                                                           'image', 'dns_name', 'guard_sha256')),
-                  'independent proof differs from the job’s exact pending destination')
-        replace_json(target, envelope)
+            Destination().release_proof(str(receipt), binding)
+        if not replay:
+            replace_json(target, envelope)
 
 
 def stored_proof(path):
@@ -517,10 +513,10 @@ def stored_proof(path):
     return payload, signature
 
 
-def confirm_envelope(destination, path):
+def confirm_envelope(destination, path, *, job_id):
     payload, signature = stored_proof(path)
     with proof_files(payload, signature) as receipt:
-        return destination.confirm(str(receipt))
+        return destination.confirm(str(receipt), job_id=job_id)
 
 
 def main(argv=None):
