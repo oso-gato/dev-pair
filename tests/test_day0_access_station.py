@@ -1,6 +1,7 @@
 """Check first access station setup, scoped enrollment and plan preparation."""
 
 from contextlib import ExitStack
+from hashlib import sha256
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +33,7 @@ class FirstAccessStationTests(unittest.TestCase):
         user = os.geteuid() or 12345
         self.courier = SimpleNamespace(pw_uid=user, pw_gid=os.getegid(), pw_name='courier',
                                        pw_dir=str(home), pw_shell='/bin/bash')
-        self.reviewer = SimpleNamespace(pw_uid=user + 1)
+        self.reviewer = SimpleNamespace(pw_uid=user + 1, pw_name='reviewer')
         self.mailbox = self.directory / 'mailboxes' / 'courier'
         self.site = self.directory / 'site.json'
         self.authorized = home / '.ssh' / 'authorized_keys'
@@ -201,6 +202,29 @@ class FirstAccessStationTests(unittest.TestCase):
 
 
 
+    def test_exact_courier_binding_is_handed_to_the_reviewer_plan_worker(self):
+        self.prepare()
+        ceremony = self.directory / 'reviewer-ceremony'
+        ceremony.mkdir(mode=0o700)
+        raw = observation.encoding(self.binding(CORE_ACCESS_CUTOVER))
+        request = sha256(raw).hexdigest()
+
+        def call(profile, command, **options):
+            if profile['user'] == 'courier':
+                self.assertEqual(command[-2:], ('export', request))
+                self.assertEqual(options, {'limit': transport.REQUEST_LIMIT})
+                return raw
+            self.assertEqual(profile, {'user': 'reviewer'})
+            self.assertEqual(command[-5:], ('begin', '--binding', '-', '--site', self.site))
+            self.assertEqual(options['data'], raw)
+            return (str(ceremony / 'plan.json') + '\n').encode()
+
+        args = SimpleNamespace(source_sha=self.sha, request=request, directory=ceremony)
+        self.assertEqual(station.begin_review(args, call), ceremony / 'plan.json')
+        with self.assertRaisesRegex(Blocked, 'does not match'):
+            station.begin_review(args, lambda *_args, **_opts: observation.encoding(self.binding(WORKLOAD_ACCESS_CUTOVER)))
+
+
 class NightlyStationCustodyTests(unittest.TestCase):
     def setUp(self):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -217,6 +241,7 @@ class NightlyStationCustodyTests(unittest.TestCase):
             + self.reviewer['signer'].read_bytes()
         )
         self.enterContext(patch.object(agent_observer_station, 'configured_signers', return_value=self.roster))
+        self.enterContext(patch.object(observation, 'checked_file', side_effect=lambda path: Path(path)))
 
     def agent(self, name):
         key = self.directory / name

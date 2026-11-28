@@ -106,9 +106,9 @@ SHA256 fingerprints through the independently verified handoff. Enter those
 values in Day 0. The operator then admits the VPS transport public key that Day
 0 displays. [Prepare and enroll the station](destination-observation.md#prepare-the-first-access-station)
 
-The station's `day0_access_exchange.py` command uses `--mailbox` and `pending`
-to locate a request. The independent
-verifier conducts the named checks and signs the exact request's observation
+The station operator selects a pending request and uses `begin-review` to
+prepare the plan in the independent reviewer's private directory. The verifier
+conducts the named checks and signs the exact request's observation
 bundle. Under the approved mailbox account, use `publish` with the request
 identifier (its filename without `.request`) and the signed bundle on standard
 input. `./day0.sh resume` retrieves and verifies it from the pinned station.

@@ -10,18 +10,21 @@ import pwd
 import re
 import resource
 import secrets
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 
-from bootstrap import Blocked, Bootstrap, WORKLOAD_ACCESS_CUTOVER, checked_file, relay, validate_public_keys
+from bootstrap import Blocked, Bootstrap, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
 from destination_observation import (AGENT_CANDIDATE, AGENT_ROLES, FAMILIES, FINAL_NAMESPACE, MAX_ACCESS_ENVELOPE,
-                                     MAX_ACCESS_PART, NAMESPACE, bounded_file, candidate_site, configured_signers,
-                                     digest, encoding, keys, observer_principal, policy_credential, require,
-                                     state_dir, verify_bytes, verify_file, write_once)
+                                     MAX_ACCESS_PART, NAMESPACE, STATION_SIGNING, approved_signer, bounded_file,
+                                     candidate_site, configured_signers, current_station_signer, digest, encoding,
+                                     keys, observer_principal, policy_credential, require, state_dir, station_signing,
+                                     verify_bytes, verify_file, verify_station_response, write_once)
 
 CONFIG = Path('/etc/dev-pair/agent-observer/station.json')
 PYTHON = '/usr/bin/python3'
@@ -30,6 +33,9 @@ TOOLS = Path(__file__).resolve().parent
 ENV = {'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C.UTF-8'}
 STATION_TOOLS = Path('/usr/libexec/dev-pair-observer/tools')
 STATION_UNITS = ('dev-pair-agent-observer-station.service', 'dev-pair-agent-observer-station.timer')
+UNIT_ROOT = Path('/etc/systemd/system')
+UNIT_HASHES = ('7080fd6641dab45871d250d8adb69657f1484e85db2b624681cfb4b9263ae881',
+               '2add841833bed54ef3a2deffb954532ec0e7285acd017329e58bd4983bd7282e')
 STATION_SCRIPTS = ('agent_observer_station.py', 'bootstrap.py', 'day0_access_exchange.py', 'destination_observation.py',
                    'native_io.py', 'native_relay.py', 'release_trust.py', 'selected_payload.py')
 RETENTION_SECONDS = 7 * 86400
@@ -53,9 +59,14 @@ def account_directory(path, uid):
     return path
 
 
-def configuration(path=CONFIG):
+def signing_paths(config):
+    return {'final_trust': str(config['final_trust']), 'reviewer_key': str(config['reviewer']['signer']),
+            'collector_key': str(config['collector']['signer'])}
+
+
+def configuration(path=CONFIG, *, check_current=True):
     config = json.loads(bounded_file(checked_file(path, secret=True)), object_pairs_hook=relay.unique)
-    keys(config, {'site', 'courier', 'collector', 'reviewer'})
+    keys(config, {'site', 'courier', 'collector', 'reviewer', 'final_trust'})
     keys(config['courier'], {'user', 'mailbox'})
     keys(config['collector'], {'user', 'observations', 'ssh_agent', 'core_key', 'known_hosts', 'signer'})
     keys(config['reviewer'], {'user', 'ssh_agent', 'signer', 'acl_oauth'})
@@ -85,33 +96,63 @@ def configuration(path=CONFIG):
             profile['acl_oauth'] = policy_credential(Path(profile['acl_oauth']), account.pw_uid)
     require(len(set(accounts)) == len(accounts), 'courier, collector and reviewer require distinct station accounts')
     config['site'] = checked_file(config['site'])
+    config['final_trust'] = checked_file(config['final_trust'])
     selected = (config['collector']['core_key'], config['collector']['signer'], config['reviewer']['signer'])
     material = [bounded_file(path).split()[:2] for path in selected]
     require(all(len(fields) == 2 for fields in material) and len({tuple(fields) for fields in material}) == 3,
             'named SSH, probe and final review require different keys')
+    if check_current:
+        require(station_signing() == signing_paths(config), 'the station signing authority changed')
+        current_station_signer(config['collector']['signer'], NAMESPACE)
+        current_station_signer(config['reviewer']['signer'], FINAL_NAMESPACE)
     return config
 
 
-def call_named(profile, command, *, data=None, limit=MAX_ACCESS_ENVELOPE, timeout=30):
+def call_named(profile, command, *, data=None, limit=MAX_ACCESS_ENVELOPE, file_limit=None, timeout=30):
+    require(0 < limit <= MAX_ACCESS_ENVELOPE and (data is None or len(data) <= MAX_ACCESS_ENVELOPE),
+            'independent station account transfer exceeds its byte bound')
+    ceiling = limit + 1 if file_limit is None else file_limit
+    require(0 < ceiling <= MAX_ACCESS_ENVELOPE + 1, 'independent station file output exceeds its bound')
     identity = profile.get('ssh_agent')
     launch = [RUNUSER, '--user', profile['user'], '--', '/usr/bin/env', '-i']
     if identity:
         launch.append('SSH_AUTH_SOCK=' + str(identity))
     launch.extend(('PATH=/usr/bin:/usr/sbin', 'LC_ALL=C.UTF-8', *map(str, command)))
 
-    def limit_output():
-        resource.setrlimit(resource.RLIMIT_FSIZE, (limit + 1, limit + 1))
+    def limit_files():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (ceiling, ceiling))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
     # The separate caller has no station configuration or other principal's agent.
-    with tempfile.TemporaryFile(dir='/run') as output:
-        args = {'stdin': subprocess.DEVNULL} if data is None else {'input': data}
-        process = subprocess.run(launch, **args, env=ENV, stdout=output, stderr=None, timeout=timeout,
-                                 preexec_fn=limit_output, check=False)
-        require(process.returncode == 0 and output.tell() <= limit,
-                'independent station account operation failed')
-        output.seek(0)
-        return output.read(limit + 1)
+    end = time.monotonic() + timeout
+    with tempfile.TemporaryFile(dir='/run') as incoming:
+        if data is not None:
+            incoming.write(data)
+            incoming.seek(0)
+        with subprocess.Popen(launch, stdin=incoming if data is not None else subprocess.DEVNULL,
+                              env=ENV, stdout=subprocess.PIPE, preexec_fn=limit_files, start_new_session=True) as process:
+            try:
+                output = bytearray()
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stdout, selectors.EVENT_READ)
+                    while selector.select(max(0, end - time.monotonic())):
+                        block = os.read(process.stdout.fileno(), limit + 1 - len(output))
+                        if not block:
+                            break
+                        output.extend(block)
+                        require(len(output) <= limit, 'independent station account stdout exceeds its bound')
+                    else:
+                        raise subprocess.TimeoutExpired(launch, timeout)
+                require(process.wait(timeout=max(0, end - time.monotonic())) == 0,
+                        'independent station account operation failed')
+            except BaseException:
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                raise
+    return bytes(output)
 
 
 def next_request(config, caller=call_named):
@@ -165,7 +206,8 @@ def reconcile(config, *, caller=call_named, scratch='/run'):
         records.chmod(0o644)
         verified = caller(reviewer, (*observer, 'assemble-candidate', *common, '--collection', records,
                                      '--signer', reviewer['signer'], '--acl-oauth', reviewer['acl_oauth']))
-    caller(courier, (*tool, 'publish', request), data=verified, limit=1024)
+    verify_station_response(verified, json.loads(raw, object_pairs_hook=relay.unique))
+    caller(courier, (*tool, 'publish', request), data=verified, limit=1024, file_limit=len(verified))
     return 'candidate-observation-published'
 
 
@@ -205,7 +247,7 @@ def source_assets(sha):
             not capture('status', '--porcelain=v1', '--untracked-files=all'),
             'station installer source differs from its exact reviewed checkout')
     sources = {f'tools/{name}': STATION_TOOLS / name for name in STATION_SCRIPTS}
-    sources.update({f'runtime/observer-station/{unit}': Path('/etc/systemd/system') / unit for unit in STATION_UNITS})
+    sources.update({f'runtime/observer-station/{unit}': UNIT_ROOT / unit for unit in STATION_UNITS})
     assets = {}
     for source, target in sources.items():
         path = root / source
@@ -229,25 +271,10 @@ def station_site(receipt, guard, host):
             'host_artifact_sha256': host, 'devbox_image': receipt['role_artifacts']['devbox_image']}
 
 
-def approved_signer(path, profile, principal, namespace):
-    public_keys = validate_public_keys(bounded_file(profile['signer'], 8192)).splitlines()
-    require(len(public_keys) == 1 and public_keys[0].split()[0] in ('ssh-ed25519', 'sk-ssh-ed25519@openssh.com'),
-            'station signer requires one independently admitted Ed25519 public key')
-    key = public_keys[0]
-    rows = [line.split() for line in bounded_file(path, 16384).decode('utf-8').splitlines()
-            if line.strip() and not line.lstrip().startswith('#')]
-    expected = [principal, f'namespaces="{namespace}"', *key.split()]
-    selected = [row for row in rows if row[0] == principal]
-    require(len(selected) == 1 and selected[0][:4] == expected and
-            all(key.split()[1] not in row for row in rows if row is not selected[0]),
-            'station signer differs from its exact independently scoped public trust')
-    return (' '.join(expected) + '\n').encode()
-
-
 def confirm_station_signers(admitted, final_trust, sha, caller=call_named, scratch='/run'):
     authorities = (('collector', configured_signers(), observer_principal('authorized'), NAMESPACE),
                    ('reviewer', final_trust, 'dev-pair-access-review', FINAL_NAMESPACE))
-    selected = [(role, principal, namespace, approved_signer(path, admitted[role], principal, namespace))
+    selected = [(role, principal, namespace, approved_signer(path, admitted[role]['signer'], principal, namespace))
                 for role, path, principal, namespace in authorities]
     with tempfile.TemporaryDirectory(prefix='station-signer-', dir=scratch) as directory:
         # Isolate the public input so ssh-keygen cannot fall back to a local
@@ -266,55 +293,97 @@ def confirm_station_signers(admitted, final_trust, sha, caller=call_named, scrat
             require(verified == challenge, 'the enrolled station signer did not answer its independent custody check')
 
 
+def station_owned():
+    """Recognize the exact station unit pair even when its own state is damaged."""
+    try:
+        return all(digest(bounded_file(checked_file(UNIT_ROOT / unit), 4096)) == expected
+                   for unit, expected in zip(STATION_UNITS, UNIT_HASHES))
+    except (Blocked, OSError, ValueError, TypeError, KeyError):
+        return False
+
+
+def timer_state():
+    timer = STATION_UNITS[1]
+    raw = subprocess.check_output(
+        ['/usr/bin/systemctl', 'show', timer, '--property=FragmentPath,DropInPaths,ActiveState,UnitFileState'],
+        env=ENV, timeout=25, text=True)
+    values = dict(line.split('=', 1) for line in raw.splitlines())
+    require(values.get('FragmentPath') == str(UNIT_ROOT / timer) and values.get('DropInPaths') == '',
+            'the loaded station timer differs from its owned unit')
+    return values
+
+
+def restore_station_hold():
+    if station_owned():
+        timer_state()
+        subprocess.run(['/usr/bin/systemctl', 'disable', '--now', STATION_UNITS[1]], env=ENV, check=True, timeout=25)
+        values = timer_state()
+        require(values.get('ActiveState') == 'inactive' and values.get('UnitFileState') == 'disabled',
+                'the owned independent station timer did not enter its held state')
+
+
 def install(args):
+    try:
+        install_station(args)
+    except (Blocked, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
+        restore_station_hold()
+        raise
+
+
+def install_station(args):
     assets = source_assets(args.source_sha)
     final_trust = checked_file(args.trusted_access_signers)
-    review_key = {'signer': checked_file(args.reviewer_signer)}
+    review_key = checked_file(args.reviewer_signer)
     final_scope = approved_signer(final_trust, review_key, 'dev-pair-access-review', FINAL_NAMESPACE)
     receipt, _ = verify_file(checked_file(args.access_receipt), 'dev-pair-access-review', final_scope, FINAL_NAMESPACE)
     site = station_site(receipt, args.guard_sha256, args.host_artifact_sha256)
     site_path = CONFIG.with_name('site.json')
-    controls = {'site': str(site_path), 'courier': {'user': args.courier_user, 'mailbox': args.mailbox},
+    controls = {'site': str(site_path), 'final_trust': str(final_trust),
+                'courier': {'user': args.courier_user, 'mailbox': args.mailbox},
                 'collector': {'user': args.collector_user, 'observations': args.observations,
                               'ssh_agent': args.collector_agent, 'core_key': args.core_key,
                               'known_hosts': args.known_hosts, 'signer': args.collector_signer},
                 'reviewer': {'user': args.reviewer_user, 'ssh_agent': args.reviewer_agent, 'signer': args.reviewer_signer,
                              'acl_oauth': args.acl_oauth}}
-    # The site file is a pinned independent approval. Repeating the same
-    # installation is safe. Changed enrolment needs a separately approved setup.
     app = Bootstrap()
-    all_files = {**assets, site_path: encoding(site), CONFIG: encoding(controls)}
+    all_files = {**assets, site_path: encoding(site), CONFIG: encoding(controls),
+                 STATION_SIGNING: encoding(signing_paths(controls))}
+    previous_config = None
     for path, raw in all_files.items():
         if os.path.lexists(path):
             for parent in (path, *path.parents):
                 node = parent.lstat()
                 require(node.st_uid == 0 and not stat.S_ISLNK(node.st_mode) and not node.st_mode & 0o022,
                         'unsafe installed station file')
-            require(path.is_file() and path.stat().st_size == len(raw) and path.read_bytes() == raw,
-                    'installed station inputs conflict with the approved exact setup')
-    owned_timer = CONFIG.is_file() and all(path.is_file() for path in assets if path.suffix in ('.service', '.timer'))
-    try:
-        with tempfile.TemporaryDirectory(prefix='candidate-station-config-', dir='/run') as directory:
-            staged_site, staged_config = (Path(directory) / name for name in ('site.json', 'station.json'))
-            staged_site.write_bytes(encoding(site))
-            staged_config.write_bytes(encoding({**controls, 'site': str(staged_site)}))
-            admitted = configuration(staged_config)
-        confirm_station_signers(admitted, final_trust, args.source_sha, caller=call_named)
-        for path, raw in assets.items():
-            app.atomic(str(path), raw.decode('utf-8'), mode=0o644)
-        observed = call_named(admitted['reviewer'], (PYTHON, '-EBs', STATION_TOOLS / 'destination_observation.py',
-                              'measure-acl', '--tailnet', site['tailnet'], '--acl-oauth', admitted['reviewer']['acl_oauth']),
-                              limit=256)
-        require(observed == (site['acl_sha256'] + '\n').encode('ascii'),
-                'current API policy differs from the original independently signed access review')
-    except (Blocked, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
-        if owned_timer:
-            subprocess.run(['/usr/bin/systemctl', 'disable', '--now', STATION_UNITS[1]], env=ENV, check=True, timeout=25)
-        raise
-    for path, raw in ((site_path, encoding(site)), (CONFIG, encoding(controls))):
-        app.atomic(str(path), raw.decode('utf-8'), mode=0o600 if path == CONFIG else 0o644)
+            existing = bounded_file(path, 512 * 1024)
+            legacy = path == CONFIG and existing == encoding({key: value for key, value in controls.items()
+                                                              if key != 'final_trust'})
+            require(existing == raw or legacy, 'installed station inputs conflict with the approved exact setup')
+            if legacy:
+                previous_config = existing.decode('utf-8')
+    with tempfile.TemporaryDirectory(prefix='candidate-station-config-', dir='/run') as directory:
+        staged_site, staged_config = (Path(directory) / name for name in ('site.json', 'station.json'))
+        staged_site.write_bytes(encoding(site))
+        staged_config.write_bytes(encoding({**controls, 'site': str(staged_site)}))
+        admitted = configuration(staged_config, check_current=False)
+    confirm_station_signers(admitted, final_trust, args.source_sha, caller=call_named)
+    for path, raw in assets.items():
+        app.atomic(str(path), raw.decode('utf-8'), mode=0o644)
+    observed = call_named(admitted['reviewer'], (PYTHON, '-EBs', STATION_TOOLS / 'destination_observation.py',
+                          'measure-acl', '--tailnet', site['tailnet'], '--acl-oauth', admitted['reviewer']['acl_oauth']),
+                          limit=256)
+    require(observed == (site['acl_sha256'] + '\n').encode('ascii'),
+            'current API policy differs from the original independently signed access review')
+    for path in (site_path, STATION_SIGNING, CONFIG):
+        app.atomic(str(path), all_files[path].decode('utf-8'), mode=0o600 if path == CONFIG else 0o644,
+                   expected=previous_config if path == CONFIG else None)
+    configuration()
     subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], env=ENV, check=True, timeout=25)
+    timer_state()
     subprocess.run(['/usr/bin/systemctl', 'enable', '--now', STATION_UNITS[1]], env=ENV, check=True, timeout=25)
+    enabled = timer_state()
+    require(enabled.get('ActiveState') == 'active' and enabled.get('UnitFileState') == 'enabled',
+            'the independent station timer did not arm')
 
 
 def enroll_acl(path):
@@ -360,7 +429,20 @@ def main():
             install(args)
             print('Installed the reviewed independent candidate observer timer.')
         else:
-            print(reconcile(configuration()))
+            try:
+                admitted = configuration()
+            except (Blocked, OSError, KeyError, TypeError, ValueError):
+                restore_station_hold()
+                raise
+            try:
+                print(reconcile(admitted))
+            except (Blocked, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
+                # Distinguish failed observations from withdrawn station authority.
+                try:
+                    configuration()
+                except (Blocked, OSError, KeyError, TypeError, ValueError):
+                    restore_station_hold()
+                raise
     except (Blocked, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
         print('Independent candidate observation withheld. ' + str(error), file=sys.stderr)
         return 2

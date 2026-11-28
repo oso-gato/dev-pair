@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from contextlib import nullcontext
 import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import os
@@ -29,6 +30,7 @@ from release_trust import DIGEST, SHA, require
 
 SIGNERS = '/etc/dev-pair/destination-observer/allowed_signers'
 RELEASE_SITE = '/etc/dev-pair/destination-observer/release-site.json'
+STATION_SIGNING = Path('/etc/dev-pair/agent-observer/signing.json')
 NAMESPACE = AGENT_OBSERVER_NAMESPACE
 FINAL_NAMESPACE = 'dev-pair-destination'
 FAMILIES = {'ipv4': socket.AF_INET, 'ipv6': socket.AF_INET6}
@@ -81,6 +83,7 @@ ACCESS_KINDS = {'access-cutover', *SCOPED_ACCESS}
 ROLE_ARTIFACTS = {'release_sha256', 'job', 'development_manifest', 'maintenance_image', 'development_image', 'devbox_image'}
 MAX_ACCESS_PART = 16384
 MAX_ACCESS_ENVELOPE = 2 * (4 * ((MAX_ACCESS_PART + 2) // 3)) + 128
+MAX_ACCESS_BINDING = 16384
 
 
 def encoding(data):
@@ -823,11 +826,58 @@ def candidate_site(binding, site, now):
             'candidate site lacks both private routes and the independently approved recovery route')
 
 
+def approved_signer(trust, key, principal, namespace):
+    public_keys = validate_public_keys(bounded_file(checked_file(key), 8192)).splitlines()
+    require(len(public_keys) == 1 and public_keys[0].split()[0] in ('ssh-ed25519', 'sk-ssh-ed25519@openssh.com'),
+            'station signer requires one independently admitted Ed25519 public key')
+    key = public_keys[0]
+    rows = [line.split() for line in bounded_file(checked_file(trust), 16384).decode('utf-8').splitlines()
+            if line.strip() and not line.lstrip().startswith('#')]
+    expected = [principal, f'namespaces="{namespace}"', *key.split()]
+    selected = [row for row in rows if row[0] == principal]
+    require(len(selected) == 1 and selected[0][:4] == expected and
+            all(key.split()[1] not in row for row in rows if row is not selected[0]),
+            'station signer differs from its exact independently scoped public trust')
+    return (' '.join(expected) + '\n').encode()
+
+
+def station_signing():
+    profile = json.loads(bounded_file(checked_file(STATION_SIGNING)), object_pairs_hook=relay.unique)
+    keys(profile, {'collector_key', 'reviewer_key', 'final_trust'})
+    return profile
+
+
+def current_station_signer(key, namespace):
+    profile = station_signing()
+    if namespace == NAMESPACE:
+        principal = observer_principal('authorized')
+        trust, selected = configured_signers(), profile['collector_key']
+    else:
+        require(namespace == FINAL_NAMESPACE, 'unsupported station signing namespace')
+        principal = 'dev-pair-access-review'
+        trust, selected = profile['final_trust'], profile['reviewer_key']
+    require(str(key) == selected, 'station signing input differs from the installed authority')
+    return principal, approved_signer(trust, key, principal, namespace)
+
+
 def sign_observation(payload, key, namespace):
-    signed = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(checked_file(key)), '-n', namespace],
-                            input=payload, capture_output=True, timeout=12, check=True)
+    signed = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(key), '-n', namespace],
+                            input=payload, capture_output=True, timeout=12, check=False)
+    require(signed.returncode == 0, 'the approved station agent could not sign')
     require(0 < len(signed.stdout) <= MAX_ACCESS_PART, 'independent signing output exceeds its bound')
     return signed.stdout
+
+
+def sign_as_station(payload, key, namespace):
+    principal, trust = current_station_signer(key, namespace)
+    with tempfile.TemporaryDirectory(prefix='station-public-key-') as directory:
+        public = Path(directory) / 'approved.pub'
+        public.write_bytes(b' '.join(trust.split()[2:4]) + b'\n')
+        signature = sign_observation(payload, public, namespace)
+    require(current_station_signer(key, namespace) == (principal, trust),
+            'independent station trust changed during signing')
+    verify_bytes(payload, signature, principal, trust, namespace)
+    return signature
 
 
 def policy_credential(path, uid=None):
@@ -934,6 +984,7 @@ def checked_candidate_readings(binding, readings, now, *, complete=True):
 
 def collect_candidate(binding, site, directory, identity, known_hosts, signer):
     candidate_site(binding, site, int(time.time()))
+    current_station_signer(signer, NAMESPACE)
     request_sha = digest(encoding(binding))
     directory = state_dir(directory)
     readings = []
@@ -951,7 +1002,7 @@ def collect_candidate(binding, site, directory, identity, known_hosts, signer):
                              'candidate': binding['role_artifacts']['release_sha256'], 'request_sha256': request_sha,
                              'challenge': str(uuid.uuid4()), 'expires_at': int(time.time()) + 120}
                 raw = encoding(challenge)
-                envelope = access_envelope(raw, sign_observation(raw, signer, NAMESPACE))
+                envelope = access_envelope(raw, sign_as_station(raw, signer, NAMESPACE))
                 reading = json.loads(ssh_candidate_probe(binding, family, envelope, identity, known_hosts),
                                      object_pairs_hook=relay.unique)
                 require(reading.get('challenge_sha256') == digest(raw), 'candidate SSH response does not prove the fresh challenge')
@@ -961,15 +1012,18 @@ def collect_candidate(binding, site, directory, identity, known_hosts, signer):
             readings.append(item)
     checked_candidate_readings(binding, readings, int(time.time()))
     raw = encoding({'request_sha256': request_sha, 'readings': readings})
-    return access_envelope(raw, sign_observation(raw, signer, NAMESPACE))
+    return access_envelope(raw, sign_as_station(raw, signer, NAMESPACE))
 
 
 def assemble_candidate(binding, site, collection, signer, acl_oauth):
     now = int(time.time())
     candidate_site(binding, site, now)
+    current_station_signer(signer, FINAL_NAMESPACE)
+    collector = station_signing()['collector_key']
+    principal, trust = current_station_signer(collector, NAMESPACE)
     with open_regular(collection) as stream:
         raw, signature = read_access_envelope(stream)
-    measured, _ = verify_bytes(raw, signature, observer_principal('authorized'), configured_signers(), NAMESPACE)
+    measured, _ = verify_bytes(raw, signature, principal, trust, NAMESPACE)
     keys(measured, {'request_sha256', 'readings'})
     require(measured['request_sha256'] == digest(encoding(binding)), 'collector signature does not select this candidate request')
     checked_candidate_readings(binding, measured['readings'], now)
@@ -985,7 +1039,28 @@ def assemble_candidate(binding, site, collection, signer, acl_oauth):
                 probes=measured['readings'], observation='named-candidate-challenges',
                 collector_signature=base64.b64encode(signature).decode('ascii'), policy_measurement=policy)
     payload = encoding(data)
-    return access_envelope(payload, sign_observation(payload, signer, FINAL_NAMESPACE))
+    require(current_station_signer(collector, NAMESPACE) == (principal, trust),
+            'independent collector trust changed during assembly')
+    signed = sign_as_station(payload, signer, FINAL_NAMESPACE)
+    require(current_station_signer(collector, NAMESPACE) == (principal, trust),
+            'independent collector trust changed during signing')
+    return access_envelope(payload, signed)
+
+
+def verify_station_response(wire, binding):
+    profile = station_signing()
+    reviewer = current_station_signer(profile['reviewer_key'], FINAL_NAMESPACE)
+    collector = current_station_signer(profile['collector_key'], NAMESPACE)
+    payload, signature = read_access_envelope(io.BytesIO(wire))
+    result, _ = verify_bytes(payload, signature, *reviewer, FINAL_NAMESPACE)
+    require(result.get('kind') == AGENT_CANDIDATE and
+            all(result.get(field) == value for field, value in binding.items() if field != 'job_id'),
+            'signed station response differs from the exact queued candidate')
+    collected = encoding({'request_sha256': digest(encoding(binding)), 'readings': result['probes']})
+    verify_bytes(collected, base64.b64decode(result['collector_signature'], validate=True), *collector, NAMESPACE)
+    require(current_station_signer(profile['reviewer_key'], FINAL_NAMESPACE) == reviewer and
+            current_station_signer(profile['collector_key'], NAMESPACE) == collector,
+            'independent signing trust changed before station publication')
 
 
 def prepare_release_site(args):
@@ -1056,7 +1131,7 @@ def arguments():
         bundle = stages.add_parser(name, help='stream the independently signed receipt to the protected importer')
         bundle.add_argument('--receipt', type=Path, required=True)
     begin = stages.add_parser('begin', help='prepare a plan from the admitted site profile and observed destination binding')
-    begin.add_argument('--binding', type=Path, required=True)
+    begin.add_argument('--binding', type=Path, required=True, help='approved binding file, or - for the bounded station stream')
     begin.add_argument('--site', type=Path, required=True)
     candidate_collect = stages.add_parser('collect-candidate', help='challenge both confined roles over both named SSH routes')
     candidate_collect.add_argument('--core-key', type=Path, required=True)
@@ -1120,7 +1195,10 @@ def main():
         if args.stage == 'begin':
             path = directory / 'plan.json'
             previous = json.loads(bounded_file(path), object_pairs_hook=relay.unique) if path.exists() else None
-            binding = json.loads(bounded_file(args.binding), object_pairs_hook=relay.unique)
+            raw = (sys.stdin.buffer.read(MAX_ACCESS_BINDING + 1) if args.binding == Path('-') else
+                   bounded_file(args.binding, MAX_ACCESS_BINDING))
+            require(0 < len(raw) <= MAX_ACCESS_BINDING, 'access ceremony binding exceeds its bound')
+            binding = json.loads(raw, object_pairs_hook=relay.unique)
             site = json.loads(bounded_file(checked_file(args.site)), object_pairs_hook=relay.unique)
             plan = prepare_plan(binding, site, int(time.time()), previous)
             write_once(path, encoding(plan))

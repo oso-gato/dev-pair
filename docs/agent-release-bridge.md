@@ -74,6 +74,14 @@ policy against the independently signed workload receipt before enabling its
 station timer. The restricted courier mailbox uses the existing Day 0 SSH
 transport. [Access station setup](owner-day0.md#independent-access-station-setup)
 
+The installed station verifies both independently approved signing keys during
+collection, assembly and publication. A withdrawn key holds the station's
+owned timer and leaves retained access evidence in custody. For an approved
+reviewer rotation, update the protected public trust and selected public key
+at their registered paths, enroll the new key in the reviewer's agent and
+rerun installation with a matching independently signed workload receipt.
+Successful setup checks the timer's live readback.
+
 On the destination, `./day0.sh resume` offers to enroll the collector when
 agent renewal is waiting for that approval. Supply the collector's public
 key and its `SHA256:` OpenSSH fingerprint from a separate verified handoff.

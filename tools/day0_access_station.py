@@ -18,8 +18,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).absolute().parent))
 
 from agent_observer_station import PYTHON, RUNUSER, STATION_TOOLS, account_directory, call_named, source_assets
-from bootstrap import Blocked, Bootstrap, CORE_ACCESS_CUTOVER, relay
-from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL, contact, key
+from bootstrap import Blocked, Bootstrap, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, relay
+from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL, REQUEST_LIMIT, contact, key, request_value
 from destination_observation import (CORE_SITE, FAMILIES, NAMESPACE, SIGNERS, VANTAGES, bounded_file,
                                      encoding, keys, matches, observer_principal, policy_credential, require,
                                      validate_site)
@@ -272,12 +272,38 @@ def admit_courier(args, app):
     return target
 
 
+def begin_review(args, caller=call_named):
+    require(matches(FINGERPRINT, args.request), 'select an exact request ID displayed by the mailbox')
+    assets = {path: (raw, 0o644) for path, raw in verified_assets(args.source_sha).items()}
+    require(all(os.path.lexists(path) for path in assets), 'prepare the exact independent station first')
+    preflight_files(assets)
+    config, courier = configured(args.source_sha)
+    reviewer = account(config['reviewer_user'])
+    ceremony = account_directory(args.directory, reviewer.pw_uid)
+    mailbox = account_directory(MAILBOX_ROOT / courier.pw_name, courier.pw_uid)
+    transport = STATION_TOOLS / 'day0_access_exchange.py'
+    raw = caller({'user': courier.pw_name}, (PYTHON, '-IB', transport, '--mailbox', mailbox, 'export', args.request),
+                 limit=REQUEST_LIMIT)
+    request = request_value(raw)
+    require(hashlib.sha256(raw).hexdigest() == args.request and request['source_sha'] == args.source_sha
+            and request['kind'] in (CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER),
+            'the selected request does not match this installed access ceremony')
+    operator = STATION_TOOLS / 'destination_observation.py'
+    profile = protected(CORE_PROFILE)
+    expected = ceremony / 'plan.json'
+    reported = caller({'user': reviewer.pw_name}, (PYTHON, '-EBs', operator, '--directory', ceremony,
+                       'begin', '--binding', '-', '--site', profile), data=raw, limit=4096, file_limit=REQUEST_LIMIT)
+    require(reported == (str(expected) + '\n').encode(), 'the independent reviewer did not retain the selected plan')
+    return expected
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     setup = commands.add_parser('prepare', help='measure the approved tailnet policy and install the independent station')
     admit = commands.add_parser('admit-courier', help='admit the enrolled VPS for only the fixed mailbox command')
-    for command in (setup, admit):
+    begin = commands.add_parser('begin-review', help='hand off the exact queued request and prepare a named reviewer plan')
+    for command in (setup, admit, begin):
         command.add_argument('--source-sha', required=True)
     for argument in ('station-address', 'courier-user', 'reviewer-user', 'dns-name', 'tailnet', 'provider-recovery',
                      'public-ipv4', 'public-ipv6', *(role + '-client' for role in VANTAGES)):
@@ -289,6 +315,8 @@ def arguments():
         setup.add_argument('--' + role + '-key', type=Path, required=True)
     admit.add_argument('--vps-address', required=True)
     admit.add_argument('--courier-key', type=Path, required=True)
+    begin.add_argument('--request', required=True)
+    begin.add_argument('--directory', type=Path, required=True)
     return parser.parse_args()
 
 
@@ -307,9 +335,11 @@ def main():
                 print(f'Station host fingerprint {Bootstrap.signer_fingerprint(selected["host_key"])}')
                 print(f'Access review public key {selected["review_key"]}')
                 print(f'Access review fingerprint {Bootstrap.signer_fingerprint(selected["review_key"])}')
-            else:
+            elif args.command == 'admit-courier':
                 admit_courier(args, Bootstrap())
                 print('Admitted the selected VPS for the fixed access mailbox command.')
+            else:
+                print(begin_review(args))
         return 0
     except (Blocked, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError) as error:
         print(f'Independent access station setup paused. {error}', file=sys.stderr)

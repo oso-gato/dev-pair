@@ -179,14 +179,26 @@ The assembler also accepts separately measured pre-cutover access records agains
 
 ## Review the named SSH and workload routes
 
-Use the request displayed by the station mailbox as `begin --binding`. Use
+The courier's `pending` command lists request IDs in the filenames. The station
+administrator selects an exact ID and the reviewer's existing private ceremony
+directory. Run this command from the exact reviewed checkout:
+
+```sh
+sudo /usr/bin/python3 -IB tools/day0_access_station.py begin-review \
+  --source-sha "$reviewed_commit" --request "$request_id" --directory "$ceremony"
+```
+
+The command reads the retained request under the courier's account, verifies
+its digest and hands the exact bytes to the reviewer. The ordinary observation
+tool uses the protected core site and writes the unsigned plan in the
+reviewer's directory. The two account directories stay private.
+
+For the offline route, use the output of `day0.sh access-request` with
+`begin --binding` and select
 `/etc/dev-pair/destination-observer/core-access-site.json` as `--site`.
-For the offline route, use the output of `day0.sh access-request` as the
-binding. The profile supplies the independently approved site and measured ACL.
-The request supplies the live machine and boot, enrolled node, tailnet addresses
-and installed core key digest. Verify those facts before signing the plan.
-Continue using the separate observation and final access-review signing
-authorities described above.
+The request identifies the live machine and boot, enrolled node, tailnet
+addresses and installed core key digest. Independently verify those facts
+before signing the plan.
 
 For the administrator stage measure the named key login, invalid-key and
 password rejection, password-gated sudo, script and transfer, mosh/tmux reconnect,
@@ -206,9 +218,10 @@ signing key is installed on the destination. If the selected verifier or an
 independent vantage is unavailable, keep the applicable protected bootstrap
 or recovery route and leave the corresponding stage pending.
 
-Once the core cutover and approved private placement are complete, use the
-owner's `access-request --workloads` output. Prepare a fresh plan with the same
-independent core site profile. On an authorized client, connect to `core` with
+Once the core cutover and approved private placement are complete, select the
+new workload request with `begin-review`. Use `access-request --workloads` on
+the offline route. Both routes prepare a fresh plan using the same independent
+core site profile. On an authorized client, connect to `core` with
 the verified host key and each planned tailnet address. Within that SSH session,
 run `sudo --preserve-env=SSH_CONNECTION,SSH_CLIENT /absolute/reviewed/checkout/day0.sh access-probe maintenance`
 and the corresponding `access-probe development` command. Capture each command's

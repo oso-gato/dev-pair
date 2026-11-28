@@ -22,8 +22,8 @@ import time
 sys.path.insert(0, str(Path(__file__).absolute().parent))
 
 from bootstrap import Blocked, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, relay, validate_public_keys
-from destination_observation import (CORE_BINDING, MAX_ACCESS_ENVELOPE, bounded_file, encoding, read_access_envelope,
-                                     state_dir)
+from destination_observation import (AGENT_CANDIDATE, CORE_BINDING, MAX_ACCESS_ENVELOPE, bounded_file, encoding,
+                                     read_access_envelope, state_dir, verify_station_response)
 
 CONFIG = Path('/etc/dev-pair/day0/access-exchange.json')
 HOST_KEY = CONFIG.with_name('access-exchange-known-hosts')
@@ -261,19 +261,33 @@ def receive(mailbox, original_command, incoming, outgoing, now):
         outgoing.write(response)
 
 
+def stored_request(mailbox, name):
+    leaf = mailbox / (name + '.request')
+    raw = bounded_file(leaf, REQUEST_LIMIT)
+    require(sha256(raw).hexdigest() == name, 'Stored independent access request digest differs.')
+    return leaf, raw, request_value(raw)
+
+
+def export_request(mailbox, name, now):
+    require(re.fullmatch(r'[0-9a-f]{64}', name), 'Expected the exact request identifier from the independent mailbox.')
+    with mailbox_lock(mailbox):
+        leaf, raw, _ = stored_request(mailbox, name)
+        require(now - leaf.stat().st_mtime <= RETENTION_SECONDS, 'Independent access request expired from the mailbox.')
+        return raw
+
+
 def publish(mailbox, name, incoming, now):
     require(re.fullmatch(r'[0-9a-f]{64}', name), 'Expected the exact request identifier from the independent mailbox.')
     response = incoming.read(MAX_ACCESS_ENVELOPE + 1)
     with mailbox_lock(mailbox):
-        leaf = mailbox / (name + '.request')
-        raw = bounded_file(leaf, REQUEST_LIMIT)
-        require(sha256(raw).hexdigest() == name, 'Stored independent access request digest differs.')
-        request = request_value(raw)
+        leaf, _, request = stored_request(mailbox, name)
         require(response_value(response, request)['expires_at'] > now, 'Signed response has expired.')
         target = leaf.with_suffix('.response')
         existing = current_response(target, request, now)
         require(existing is None or existing == response, 'An unexpired response already exists for this request.')
         if existing is None:
+            if request['kind'] == AGENT_CANDIDATE:
+                verify_station_response(response, request)
             store(target, response)
 
 
@@ -284,6 +298,8 @@ def main():
     commands.add_parser('receive')
     pending = commands.add_parser('pending')
     pending.add_argument('--kind', choices=sorted(KINDS))
+    export = commands.add_parser('export', help='return the exact retained request to an authorized local station operator')
+    export.add_argument('request')
     reply = commands.add_parser('publish')
     reply.add_argument('request')
     args = parser.parse_args()
@@ -296,6 +312,8 @@ def main():
             receive(args.mailbox, os.environ.get('SSH_ORIGINAL_COMMAND', ''), sys.stdin.buffer, sys.stdout.buffer, now)
         elif args.command == 'publish':
             publish(args.mailbox, args.request, sys.stdin.buffer, now)
+        elif args.command == 'export':
+            sys.stdout.buffer.write(export_request(args.mailbox, args.request, now))
         else:
             with mailbox_lock(args.mailbox):
                 for leaf in sorted(pending_requests(args.mailbox, now)):

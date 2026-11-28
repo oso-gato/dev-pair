@@ -78,9 +78,23 @@ class CandidateObservation(unittest.TestCase):
         self.binding = self.access.prepare({'previous_release_sha256': self.previous, 'operation': self.operation}, self.reference)
         self.authorized = self.gen_key('authorized')
         self.reviewer = self.gen_key('reviewer')
+        self.collector_public = self.authorized.with_suffix('.pub')
+        self.reviewer_public = self.reviewer.with_suffix('.pub')
         self.signers.write_text(
-            'dev-pair-observer-authorized namespaces="' + d.NAMESPACE + '" ' + self.authorized.with_suffix('.pub').read_text() +
-            'dev-pair-access-review namespaces="' + d.FINAL_NAMESPACE + '" ' + self.reviewer.with_suffix('.pub').read_text())
+            'dev-pair-observer-authorized namespaces="' + d.NAMESPACE + '" ' + self.collector_public.read_text() +
+            'dev-pair-access-review namespaces="' + d.FINAL_NAMESPACE + '" ' + self.reviewer_public.read_text())
+        profile = self.root / 'station-signers.json'
+        profile.write_bytes(d.encoding({'collector_key': str(self.collector_public), 'reviewer_key': str(self.reviewer_public),
+                                       'final_trust': str(self.signers)}))
+        self.enterContext(patch.object(d, 'STATION_SIGNING', profile))
+        real_sign = d.sign_observation
+
+        def fixture_sign(raw, key, namespace):
+            if key.name == 'approved.pub':
+                key = self.authorized if namespace == d.NAMESPACE else self.reviewer
+            return real_sign(raw, key, namespace)
+
+        self.enterContext(patch.object(d, 'sign_observation', side_effect=fixture_sign))
         collector = bootstrap.Bootstrap.observer_public_key(self.authorized.with_suffix('.pub').read_text())
         self.host.agent_observer_signers.return_value = (bootstrap.AGENT_OBSERVER_PREFIX + collector + '\n').encode()
         self.host.lock.return_value = nullcontext()
@@ -111,10 +125,10 @@ class CandidateObservation(unittest.TestCase):
         observations = self.root / 'observations'
         observations.mkdir(mode=0o700, exist_ok=True)
         with patch.object(d, 'state_dir', return_value=observations), patch.object(d, 'ssh_candidate_probe', self.probe):
-            wire = d.collect_candidate(self.binding, self.site, observations, None, None, self.authorized)
+            wire = d.collect_candidate(self.binding, self.site, observations, None, None, self.collector_public)
         collection = self.root / 'collection.bundle'
         collection.write_bytes(wire)
-        return d.assemble_candidate(self.binding, self.site, collection, self.reviewer, None)
+        return d.assemble_candidate(self.binding, self.site, collection, self.reviewer_public, None)
 
     def test_independent_probes_admit_exact_candidate_only_when_fenced_and_preserve_proof(self):
         wire = self.response()
@@ -142,7 +156,19 @@ class CandidateObservation(unittest.TestCase):
         observations.mkdir(mode=0o700)
         with patch.object(d, 'state_dir', return_value=observations), patch.object(d, 'ssh_candidate_probe', return_value=b'{}'):
             with self.assertRaisesRegex(bootstrap.Blocked, 'does not prove the fresh challenge'):
-                d.collect_candidate(self.binding, self.site, observations, None, None, self.authorized)
+                d.collect_candidate(self.binding, self.site, observations, None, None, self.collector_public)
+
+    def test_withdrawn_reviewer_cannot_sign_again_or_publish_the_in_flight_response(self):
+        wire = self.response()
+        d.verify_station_response(wire, self.binding)
+        replacement = self.gen_key('replacement-reviewer').with_suffix('.pub').read_text()
+        self.signers.write_text(self.signers.read_text().replace(self.reviewer_public.read_text(), replacement))
+        d.sign_observation.reset_mock()
+        with self.assertRaisesRegex(bootstrap.Blocked, 'differs from its exact independently scoped public trust'):
+            d.assemble_candidate(self.binding, self.site, self.root / 'collection.bundle', self.reviewer_public, None)
+        d.sign_observation.assert_not_called()
+        with self.assertRaisesRegex(bootstrap.Blocked, 'differs from its exact independently scoped public trust'):
+            d.verify_station_response(wire, self.binding)
         with self.assertRaisesRegex(bootstrap.Blocked, 'admitted ingress'):
             d.candidate_site(self.binding, {**self.site, 'devbox_image': '0' * 64}, int(time.time()))
 
@@ -294,11 +320,11 @@ class CandidateObservation(unittest.TestCase):
         initial = io.BytesIO()
         config = {'site': site, 'courier': {'user': 'courier', 'mailbox': mailbox},
                   'collector': {'user': 'collector', 'observations': observations,
-                                'core_key': self.authorized, 'known_hosts': self.authorized, 'signer': self.authorized},
-                  'reviewer': {'user': 'reviewer', 'signer': self.reviewer, 'acl_oauth': self.reviewer}}
+                                'core_key': self.authorized, 'known_hosts': self.authorized, 'signer': self.collector_public},
+                  'reviewer': {'user': 'reviewer', 'signer': self.reviewer_public, 'acl_oauth': self.reviewer}}
         roles = []
 
-        def call(profile, argv, *, data=None, **_):
+        def call(profile, argv, *, data=None, **bounds):
             roles.append(profile['user'])
             if 'pending' in argv:
                 return str(mailbox / (reference + '.request')).encode() + b'\n'
@@ -310,10 +336,13 @@ class CandidateObservation(unittest.TestCase):
             if 'collect-candidate' in argv:
                 directory = Path(argv[argv.index('--directory') + 1])
                 with patch.object(d, 'state_dir', return_value=directory), patch.object(d, 'ssh_candidate_probe', self.probe):
-                    return d.collect_candidate(self.binding, self.site, directory, None, None, self.authorized)
+                    return d.collect_candidate(self.binding, self.site, directory, None, None, self.collector_public)
             if 'assemble-candidate' in argv:
-                return d.assemble_candidate(self.binding, self.site, Path(argv[argv.index('--collection') + 1]), self.reviewer, None)
+                return d.assemble_candidate(self.binding, self.site, Path(argv[argv.index('--collection') + 1]),
+                                            self.reviewer_public, None)
             self.assertEqual(argv[-2:], ('publish', reference))
+            self.assertEqual(bounds, {'limit': 1024, 'file_limit': len(data)})
+            self.assertGreater(len(data), 1025)
             exchange.publish(mailbox, reference, io.BytesIO(data), int(time.time()))
             return b''
 
