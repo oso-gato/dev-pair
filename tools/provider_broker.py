@@ -24,9 +24,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gptbox_runtime import (HEX_SHA, JOB, PROVIDER_BODY_MAX, PROVIDER_REPLY_MAX, fixed_read,
                             host_repository_approval, job_selection, provider_host_path, receive_exact, require,
                             sync_directory, unique_object)
+import provider_billing as billing
 
 HOST = 'api.openai.com'
-PROFILE = 'openai-api-key'
+PROFILE = billing.PROFILE
 ALLOWANCES = Path('/var/lib/dev-pair/provider-allowances')
 EVIDENCE = Path('/var/lib/dev-pair/provider-evidence')
 REQUEST_FIELDS = set(('model stream service_tier input tools tool_choice parallel_tool_calls reasoning store '
@@ -135,7 +136,7 @@ def load_allowance(job, expected_sha):
     fields = {'schema', 'kind', 'job', 'auth_profile', 'allowance_ref', 'repository', 'agreement_sha256',
               'spend_microusd', 'expires_unix', 'models'}
     require(type(approval) is dict and approval.keys() == fields and type(approval['schema']) is int and
-            approval['schema'] == 1 and approval['kind'] == 'verified-full-billable-context' and
+            approval['schema'] == 1 and approval['kind'] in ('verified-full-billable-context', billing.ALLOWANCE_KIND) and
             approval['job'] == job and approval['auth_profile'] == PROFILE and
             type(approval['spend_microusd']) is int and 0 < approval['spend_microusd'] <= 100000000 and
             type(approval['expires_unix']) is int and 0 < approval['expires_unix'] < 2**63 and
@@ -161,10 +162,19 @@ class JobAllowance:
                 'no exact approved full-input billable ceiling and tariff')
         # The protected evidence must be reviewed for the default-tier text
         # Responses contract, including local tool schemas and provider overhead.
+        proofs = {}
         for suffix in ('context', 'tariff'):
             evidence = protected_file(self.root / (model + '.' + suffix), 1024 * 1024)
             require(hashlib.sha256(evidence).hexdigest() == proof[suffix + '_evidence_sha256'],
                     'approved model billing evidence digest mismatch')
+            proofs[suffix] = evidence
+        if approval['kind'] == billing.ALLOWANCE_KIND:
+            pricing, review = billing.validate_proofs(proofs, grant['allowance_ref'])
+            billing.assert_current(review)
+            require(model == review['request']['model'] and selection.get('effort') == review['request']['effort'] and
+                    pricing == {key: grant[key] for key in TARIFF_FIELDS} and
+                    approval['expires_unix'] <= review['expires_unix'], 'provider allowance exceeds the signed billing terms')
+            return review
 
     def connection(self, *, writable=False):
         if writable:
@@ -327,9 +337,13 @@ def responses_request(raw, selection, grant):
 
 
 class Provider:
-    def __init__(self, credential):
+    def __init__(self, credential, *, organization=None, project=None, review=None):
         require(re.fullmatch(r'[!-~]{20,512}', credential), 'invalid external API credential')
+        require((organization is None) == (project is None), 'incomplete provider account scope')
         self.credential = credential
+        self.account = {} if organization is None else {'OpenAI-Organization': billing.organization(organization),
+                                                        'OpenAI-Project': billing.project(project)}
+        self.review = review
 
     def request(self, method, path, deadline, *, body=None):
         remaining = deadline - time.monotonic()
@@ -337,7 +351,7 @@ class Provider:
         connection = http.client.HTTPSConnection(HOST, 443, timeout=min(15, remaining),
                                                  context=ssl.create_default_context())
         headers = {'Authorization': 'Bearer ' + self.credential, 'Connection': 'close',
-                   'Accept': 'text/event-stream' if body else 'application/json'}
+                   'Accept': 'text/event-stream' if body else 'application/json', **self.account}
         if body is not None:
             headers['Content-Type'] = 'application/json'
         try:
@@ -365,7 +379,13 @@ class Provider:
             connection.close()
 
     def responses(self, body, deadline):
-        return self.request('POST', '/v1/responses', deadline, body=body)
+        if self.review is None:
+            return self.request('POST', '/v1/responses', deadline, body=body)
+        with billing.lock(billing.protected(billing.EVIDENCE, directory=True, private=True), shared=True):
+            billing.assert_current(self.review)
+            require(billing.credential_from(billing.CREDENTIALS / self.review['request']['credential_ref']) ==
+                    self.credential, 'provider credential was withdrawn or changed')
+            return self.request('POST', '/v1/responses', deadline, body=body)
 
 
 class EventWitness:
@@ -719,7 +739,7 @@ def main():
         require(args.receipt == evidence / (selection['operation'] + '.json'), 'provider evidence location mismatch')
         host_repository_approval(selection)
         allowance = load_allowance(selection['job'], grant['allowance_sha256'])
-        allowance.validate_grant(selection, grant)
+        review = allowance.validate_grant(selection, grant)
         seconds = min(grant['seconds'], grant['expires_unix'] - time.time())
         remaining = allowance.remaining()['remaining_microusd']
         require(seconds > 0 and reserved_cost(grant) <= min(remaining, grant['spend_microusd']),
@@ -730,7 +750,15 @@ def main():
         with labeled_listener(channel_label):
             pass
         journal = Journal(args.receipt, selection, grant)
-        provider = Provider(protected_file(args.credential_file, 1024, secret=True).decode('ascii').removesuffix('\n'))
+        if review is None:
+            provider = Provider(protected_file(args.credential_file, 1024, secret=True).decode('ascii').removesuffix('\n'))
+        else:
+            require(args.credential_file == billing.CREDENTIALS / grant['allowance_ref'],
+                    'provider credential reference differs from the approved project')
+            secret = billing.credential_from(args.credential_file)
+            require(billing.request_record(grant['allowance_ref'], secret) == review['request'],
+                    'provider credential differs from independently reviewed custody')
+            provider = Provider(secret, organization=review['organization'], project=review['project'], review=review)
         discovery_end = min(deadline, time.monotonic() + 15)
         with provider_alarm(discovery_end, True):
             journal.value['availability'] = provider.discover(selection['model'], discovery_end)

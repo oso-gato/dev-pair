@@ -25,17 +25,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import checklist_candidate as candidate
 import job_protocol as p
 import product_job as product
+import provider_billing as billing
 from ledger_recovery import read_private, sync_directory, trusted_directory, write_private
 from startup_delivery import IDS, load_private
 
 SITE = Path('/etc/dev-pair/product-intake')
-CREDENTIALS = Path('/etc/dev-pair/provider-credentials')
-BILLING_EVIDENCE = Path('/etc/dev-pair/provider-evidence')
+CREDENTIALS = billing.CREDENTIALS
 ROOT = candidate.ROOT
 CATALOGUE = ROOT / 'product-jobs'
 SYSTEMCTL = '/usr/bin/systemctl'
 PYTHON = '/usr/bin/python3'
-MODEL = 'gpt-6.2-sol'
+MODEL = billing.MODEL
 ROLES = {'maintenance': 'dp-maint', 'development': 'dp-dev'}
 MAX_INPUT = 8192
 MAX_SLOTS = 64
@@ -254,7 +254,10 @@ class Intake:
 
         slot = self.site / 'slots' / job if staging is None else staging
         settings = p.loads(checked_file(slot / 'profile.json'))
-        p.fields(settings, 'schema host_seconds build_seconds turn_seconds allowance_ref spend_microusd expires_unix pricing')
+        scoped = 'billing_scope' in settings
+        p.fields(settings, 'schema host_seconds build_seconds turn_seconds allowance_ref spend_microusd expires_unix pricing'
+                 + (' billing_scope' if scoped else ''))
+        p.require(not scoped or settings['billing_scope'] == billing.ALLOWANCE_KIND, 'Unknown owner billing scope.')
         p.number(settings['schema'], 1, 1)
         p.number(settings['host_seconds'], 25, 60)
         p.number(settings['build_seconds'], 20, 240)
@@ -273,6 +276,14 @@ class Intake:
             proofs[kind] = checked_file(slot / (MODEL + '.' + kind), 1024 * 1024)
             p.require(p.sha256(proofs[kind]) == pricing[kind + '_evidence_sha256'],
                       'The approved provider pricing evidence has changed.')
+        if scoped:
+            approved, review = billing.validate_proofs(proofs, settings['allowance_ref'])
+            billing.assert_current(review)
+            secret = billing.credential_from(CREDENTIALS / settings['allowance_ref'])
+            p.require(approved == {key: pricing[key] for key in billing.PRICING} and
+                      settings['expires_unix'] <= review['expires_unix'] and
+                      review['request'] == billing.request_record(settings['allowance_ref'], secret),
+                      'The slot exceeds the reviewed provider billing scope.')
         roles, seeds = {}, {}
         reserve = 0
         for role in ROLES:
@@ -281,6 +292,8 @@ class Intake:
             for key in ('runtime_sha256', 'binary_sha256', 'layout_sha256'):
                 p.digest(profile[key])
             p.token(profile['credential_ref'])
+            p.require(not scoped or profile['credential_ref'] == settings['allowance_ref'],
+                      'The role credential differs from the reviewed provider account.')
             credential = CREDENTIALS / profile['credential_ref']
             # Check custody without loading the credential into the intake process.
             node = credential.lstat()
@@ -616,7 +629,7 @@ class Intake:
             bundle = fixed_git(checkout, 'bundle', 'create', '-', 'HEAD', cap=candidate.MAX_BUNDLE)
             for role, profile in roles.items():
                 selection = dict(job=job, repository=repository, agreement_sha256=product.agreement_sha(plan),
-                                 model=MODEL)
+                                 model=MODEL, effort=billing.EFFORT)
                 profile['grant']['allowance_sha256'] = allowance
                 account = pwd.getpwnam(ROLES[role])
                 load_allowance(job, allowance).validate_grant(selection, dict(profile['grant'],
@@ -646,7 +659,7 @@ class Intake:
     def allowance(self, plan, settings, proofs):
         job = plan['job_id']
         root = private_leaf(self.root / 'provider-allowances' / job)
-        approval = {'schema': 1, 'kind': 'verified-full-billable-context',
+        approval = {'schema': 1, 'kind': settings.get('billing_scope', 'verified-full-billable-context'),
                     'auth_profile': 'openai-api-key', 'job': job, 'repository': plan['agreement']['repository'],
                     'agreement_sha256': product.agreement_sha(plan),
                     'models': {MODEL: settings['pricing']},
@@ -787,6 +800,17 @@ def selected_site(intake):
                   'Owner setup belongs to a different inspected machine.')
     except (Blocked, CommissionBlocked, OSError, ValueError, KeyError, TypeError) as exc:
         raise SitePending('core-commissioning', 'Verify the selected core release and private tailnet cutover.') from exc
+    try:
+        host = controller.release(selected)['components']['host']['artifact_sha256']
+        p.digest(host)
+        tools = live.installer.HOST_RELEASES / host / 'tools'
+        for name in ('provider_billing.py', 'provider_broker.py'):
+            p.require(checked_file(tools / name, 256 * 1024) ==
+                      checked_file(Path(__file__).resolve().parent / name, 256 * 1024),
+                      'The selected release and owner setup have different provider billing code.')
+    except (KeyError, TypeError, OSError, ValueError) as exc:
+        raise SitePending('provider-billing-runtime',
+                          'Select the independently verified host release with matching scoped provider billing.') from exc
     site_sha = binding['site_config_sha256']
     site = live.installer.site_configuration(live.installer.SITE_CONFIGS / (site_sha + '.json'), site_sha)
     name = guard['target']['dns_name']
@@ -917,45 +941,23 @@ def provider_custody(reference):
     try:
         stamp = Live.credential_stamp(CREDENTIALS / reference)
     except FileNotFoundError as exc:
-        raise SitePending('provider-credential', 'The selected root-private API credential file is absent.') from exc
+        raise SitePending('provider-credential',
+                          'Register the scoped root-private API key with provider_billing.py register, then choose its reference.') from exc
     except (Blocked, OSError) as exc:
         raise SitePending('provider-credential-custody', 'Verify root ownership and private mode for the selected API credential.') from exc
     p.require(stamp[-1] <= MAX_INPUT, 'The protected provider credential exceeds the admitted size.')
     return stamp
 
 
-def billing_documents(reference):
-    proofs = {}
-    for kind in ('context', 'tariff'):
-        try:
-            raw = checked_file(BILLING_EVIDENCE / reference / (MODEL + '.' + kind), 1024 * 1024)
-        except FileNotFoundError as exc:
-            raise SitePending('provider-billing-evidence',
-                              'Install the reviewed full billable context and worst applicable tariff evidence.') from exc
-        p.require(bool(raw), 'Provider billing evidence is empty.')
-        proofs[kind] = raw
-    return proofs
-
-
 def billing_authority(reference):
-    proofs = billing_documents(reference)
     try:
-        context, tariff = (p.loads(proofs[kind]) for kind in ('context', 'tariff'))
-        p.require(context['model'] == tariff['model'] == MODEL, 'Reviewed billing evidence must name the selected model.')
-        pricing = {'max_context_tokens': context['max_context_tokens']}
-        for key in ('input_microusd_per_million', 'output_microusd_per_million', 'observed_models'):
-            pricing[key] = tariff[key]
-        p.number(pricing['max_context_tokens'], 1024, 2000000)
-        for key in ('input_microusd_per_million', 'output_microusd_per_million'):
-            p.number(pricing[key], 1, 10**9)
-        aliases = pricing['observed_models']
-        p.require(type(aliases) is list and 0 < len(aliases) <= 8 and
-                  all(type(model) is str and re.fullmatch(r'gpt-[a-z0-9][a-z0-9.-]{1,95}', model) for model in aliases) and
-                  len(set(aliases)) == len(aliases), 'Reviewed evidence lacks exact authorized response models.')
-    except (KeyError, TypeError, ValueError) as exc:
+        return billing.authority(reference)
+    except FileNotFoundError as exc:
+        raise SitePending('provider-billing-evidence',
+                          'Issue independently signed terms with provider_billing.py receive before selecting this credential.') from exc
+    except (KeyError, TypeError, ValueError, OSError, subprocess.SubprocessError) as exc:
         raise SitePending('provider-billing-authority',
-                          'The provider custodian must supply reviewed machine-readable context, tariff and response-model evidence for this account.') from exc
-    return pricing, proofs
+                          'The provider custodian must supply valid signed terms for this exact credential and project.') from exc
 
 
 def owner_provider(options):
@@ -966,7 +968,7 @@ def owner_provider(options):
     if options.profile != PROFILE:
         raise SitePending('unsupported-provider-profile', 'The installed broker needs a direct OpenAI API key and bounded allowance.')
     stamp = provider_custody(options.credential_ref)
-    pricing, proofs = billing_authority(options.credential_ref)
+    pricing, proofs, review = billing_authority(options.credential_ref)
     asserted = {'max_context_tokens': options.context_tokens, 'input_microusd_per_million': options.input_rate,
                 'output_microusd_per_million': options.output_rate, 'observed_models': options.observed_model}
     p.require(all(value is None or value == pricing[key] for key, value in asserted.items()),
@@ -981,6 +983,7 @@ def owner_provider(options):
         p.number(value, low, high)
     if options.expires_unix <= time.time() + 2 * (options.host_seconds + options.build_seconds + options.turn_seconds) + 60:
         raise SitePending('provider-allowance-expired', 'The approved API allowance must cover the full bounded first job.')
+    p.require(options.expires_unix <= review['expires_unix'], 'The job allowance expires after the signed provider terms.')
     for kind, raw in proofs.items():
         pricing[kind + '_evidence_sha256'] = p.sha256(raw)
     p.number(limits['max_requests'], 1, 32)
@@ -990,7 +993,8 @@ def owner_provider(options):
               'Approved spend does not cover both requested role operation limits.')
     settings = {'schema': 1, 'host_seconds': options.host_seconds, 'build_seconds': options.build_seconds,
                 'turn_seconds': options.turn_seconds, 'allowance_ref': options.credential_ref,
-                'spend_microusd': options.spend_microusd, 'expires_unix': options.expires_unix, 'pricing': pricing}
+                'spend_microusd': options.spend_microusd, 'expires_unix': options.expires_unix, 'pricing': pricing,
+                'billing_scope': billing.ALLOWANCE_KIND}
     return settings, dict(limits, spend_microusd=role_spend), proofs, stamp
 
 
@@ -1125,7 +1129,7 @@ class FirstCatalogue:
         plan = {'catalogue': catalogue, 'release_sha256': release, 'site_config_sha256': binding['site_config_sha256'],
                 'development_manifest_sha256': manifests[job], 'standards_sha': p.STANDARDS,
                 'source_tree': source_tree, 'startup_sha256': startup_sha, 'provider_profile': options.profile,
-                'provider_model': MODEL, 'provider_effort': 'high', 'credential_stamp': credential,
+                'provider_model': MODEL, 'provider_effort': billing.EFFORT, 'credential_stamp': credential,
                 'slot_profile': settings, 'roles': roles}
         return plan, proofs
 
@@ -1218,7 +1222,7 @@ def setup_site(first, incoming, outgoing):
         workload = tuple(WORKLOADS)[int(choice) - 1]
         if not provision(first.intake, repository, workload, ask, say):
             return
-        say('Setup requires an approved direct OpenAI API account. Enter only its credential reference.')
+        say('Choose a registered OpenAI project credential with independently issued billing terms.')
         with warnings.catch_warnings():
             warnings.simplefilter('error', getpass.GetPassWarning)
             try:
@@ -1226,7 +1230,9 @@ def setup_site(first, incoming, outgoing):
             except getpass.GetPassWarning as exc:
                 raise ValueError('Credential reference input requires a private controlling terminal.') from exc
         provider_custody(reference)
-        values, proofs = billing_authority(reference)
+        values, proofs, review = billing_authority(reference)
+        terms_expiry = datetime.fromtimestamp(review['expires_unix'], timezone.utc)
+        say(f'The signed provider terms are valid until {terms_expiry:%Y-%m-%d %H:%M} UTC.')
         text = ask('Approved total job budget in USD')
         p.require(re.fullmatch(r'(?:0|[1-9][0-9]{0,2})(?:\.[0-9]{1,6})?', text),
                   'Enter the approved USD amount with at most six decimals.')

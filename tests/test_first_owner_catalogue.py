@@ -22,6 +22,7 @@ import owner_intake as owner
 import owner_source
 import platform_release_intake
 import product_job as product
+import provider_billing
 import provider_broker
 import renewal
 import commission_host
@@ -46,25 +47,48 @@ class FirstCatalogueTests(unittest.TestCase):
         self.site = self.path / 'site'
         self.root = self.path / 'runtime'
         self.credential = self.path / 'credentials' / 'approved-api'
-        self.billing = self.path / 'billing' / self.credential.name
+        evidence = self.path / 'billing'
         for folder in (self.site / 'standards', self.root / 'renewal', self.root / 'product-jobs',
                        self.root / 'product-jobs/intake',
                        self.root / 'product-jobs/jobs', self.root / 'product-jobs/profiles',
                        self.root / 'repository-approvals', self.root / 'provider-allowances',
-                       self.credential.parent, self.billing):
+                       self.credential.parent, evidence / self.credential.name):
             folder.mkdir(mode=0o700, parents=True)
             folder.chmod(0o700)
         self.intake = owner.Intake(self.site, self.root)
         self.first = owner.FirstCatalogue(self.intake)
         owner.write_private(self.intake.catalogue / 'intake.lock', b'')
-        owner.write_private(self.credential, b'not-a-live-key')
-        self.bill = {
-            'context': {'model': owner.MODEL, 'max_context_tokens': 2000},
-            'tariff': {'model': owner.MODEL, 'input_microusd_per_million': 500000,
-                       'output_microusd_per_million': 2000000, 'observed_models': [owner.MODEL]},
-        }
+        secret = 'sk-proj-offline-test-key-never-sent'
+        owner.write_private(self.credential, secret.encode())
+        key = self.path / 'reviewer'
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)],
+                       check=True, timeout=5)
+        signers = self.path / 'allowed_signers'
+        owner.write_private(signers, b'provider-billing ' + key.with_suffix('.pub').read_bytes())
+        issued = int(time.time())
+        review = {'request': provider_billing.request_record(self.credential.name, secret),
+                  'organization': 'org-fixture', 'project': 'proj_fixture',
+                  'issued_unix': issued, 'expires_unix': issued + 5000, 'max_context_tokens': 2000,
+                  'input_microusd_per_million': 500000, 'output_microusd_per_million': 2000000,
+                  'observed_models': [owner.MODEL], 'sources': {
+                      kind: {'source': 'record:fixture-source', 'sha256': sha256(b'fixture'), 'bytes': 7}
+                      for kind in provider_billing.SOURCE_KINDS}}
+        signature = provider_billing.openssh('sign', '-f', str(key), '-n', provider_billing.NAMESPACE,
+                                             data=provider_billing.canonical(review)).decode()
+        self.bill = provider_billing.normalized(review, signature)
+        digest = provider_billing.review_digest(review)
+        self.billing = evidence / self.credential.name / digest
+        self.billing.mkdir(mode=0o700)
+        owner.write_private(self.billing.parent / provider_billing.ACTIVE, (digest + '\n').encode())
         for name, value in self.bill.items():
-            owner.write_private(self.billing / (owner.MODEL + '.' + name), canonical(value).encode())
+            owner.write_private(self.billing / (owner.MODEL + '.' + name), value)
+        owner.write_private(self.billing / 'review.bundle', provider_billing.canonical(
+            {'review': review, 'signature': signature,
+             'evidence': {kind: 'Zml4dHVyZQ==' for kind in provider_billing.SOURCE_KINDS}}))
+        self.use(mock.patch.multiple(provider_billing, CREDENTIALS=self.credential.parent, EVIDENCE=evidence,
+                                     SIGNERS=signers))
+        self.use(mock.patch.object(provider_billing, 'protected', side_effect=lambda path, *, directory=False, private=False:
+            self.protected(path, directory=directory, mode=(0o700 if directory else 0o600) if private else None)))
         self.source = self.site / 'repositories' / REPOSITORY / 'acquired'
         self.startup = self.site / 'repositories' / REPOSITORY / 'startup'
         for repository in (self.source, self.startup):
@@ -91,7 +115,7 @@ class FirstCatalogueTests(unittest.TestCase):
             owner.write_private(self.site / 'standards' / name, body)
         self.use(mock.patch.object(owner_source, 'SHARED', {name: sha256(body) for name, body in shared.items()}))
         self.use(mock.patch.object(owner, 'load_private', return_value=SimpleNamespace(manifest=manifest)))
-        self.use(mock.patch.multiple(owner, CREDENTIALS=self.credential.parent, BILLING_EVIDENCE=self.billing.parent))
+        self.use(mock.patch.object(owner, 'CREDENTIALS', self.credential.parent))
         self.use(mock.patch.object(owner, 'protect_directory',
                                    side_effect=lambda path: self.protected(path, directory=True)))
         self.use(mock.patch.object(commission_host, 'protected', side_effect=self.protected))
@@ -354,9 +378,12 @@ class FirstCatalogueTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'both requested'):
             self.first.preview(SimpleNamespace(**(vars(self.options) | {'spend_microusd': 1})))
         self.preview()
-        (self.billing / (owner.MODEL + '.tariff')).write_text(canonical(dict(self.bill['tariff'], review='changed receipt')))
-        with self.assertRaisesRegex(ValueError, 'selection changed'):
+        tariff = self.billing / (owner.MODEL + '.tariff')
+        tariff.write_text(canonical(dict(loads(self.bill['tariff']), review='changed receipt')))
+        with self.assertRaises(owner.SitePending) as changed:
             self.first.initialize(self.options)
+        self.assertEqual(changed.exception.observation['prerequisite'], 'provider-billing-authority')
+        tariff.write_bytes(self.bill['tariff'])
         occupied = self.intake.queue / (JOB + '.json')
         owner.write_private(occupied, b'prior owned history')
         pending('owner-slot-capacity')
@@ -385,8 +412,8 @@ class FirstCatalogueTests(unittest.TestCase):
         self.assertNotIn('tariff (', printed.getvalue())
         self.assertEqual(self.first.configured()['phase'], 'configured')
         settings, _, _, _ = self.intake.slot(JOB, self.manifest)
-        self.assertEqual(settings['pricing']['max_context_tokens'], self.bill['context']['max_context_tokens'])
-        self.assertEqual(settings['pricing']['input_microusd_per_million'], self.bill['tariff']['input_microusd_per_million'])
+        self.assertEqual(settings['pricing']['max_context_tokens'], loads(self.bill['context'])['max_context_tokens'])
+        self.assertEqual(settings['pricing']['input_microusd_per_million'], loads(self.bill['tariff'])['input_microusd_per_million'])
         self.assertFalse((self.root / 'provider-allowances' / JOB).exists())
 
     def test_declined_or_opaque_attended_setup_stays_held(self):

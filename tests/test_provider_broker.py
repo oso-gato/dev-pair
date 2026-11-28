@@ -526,6 +526,7 @@ class BrokerLifecycleTests(unittest.TestCase):
             destination.chmod(0o700)
             receipt = destination / (inputs['operation'] + '.json')
             approved = Mock()
+            approved.validate_grant.return_value = None
             approved.remaining.return_value = {'remaining_microusd': 3000}
             api = Mock()
             api.discover.return_value = 'available'
