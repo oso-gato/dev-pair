@@ -53,6 +53,8 @@ class Engine:
         command = args[position + 1:]
         if not command:
             return ''
+        if command == ('unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map'):
+            return '         0       1001          1\n         1    1000000      65536\n' * 2
         if 'distrobox-enter' in ' '.join(args[:position]):
             return ''
         if command[:2] == ('image', 'inspect'):

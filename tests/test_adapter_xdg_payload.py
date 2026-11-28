@@ -87,6 +87,14 @@ class ConfigTests(unittest.TestCase):
         result = subprocess.run([str(wrapper), 'USER', 'LOGNAME'], env={'USER': 'gpt', 'LOGNAME': 'gpt'},
                                 check=True, capture_output=True, text=True)
         self.assertEqual(result.stdout.splitlines(), ['dp-maint', 'dp-maint'])
+
+    def test_builder_map_blocks_a_cached_single_mapping_before_image_operations(self):
+        _, app = self.case()
+        for bad in ('0 1001 1\n' * 2, '0 1001 1\n1 1000000 65536\n0 1001 1\n1 1065536 65536\n'):
+            with (patch.object(app, 'engine', return_value=bad) as engine,
+                  self.assertRaisesRegex(b.Blocked, 'exact managed subordinate ranges')):
+                app.setup_executor()
+            engine.assert_called_once_with('unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map', timeout=15)
     def test_real_symlink_mode_and_content_conflicts_preserved(self):
         for kind in ('symlink','mode','content'):
             with self.subTest(kind=kind):

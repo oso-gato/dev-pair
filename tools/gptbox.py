@@ -514,6 +514,15 @@ class Gptbox(Bootstrap):
         if retry and isinstance(self.run, Commands):
             self.run.reconcile_native(('--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--uid=dp-maint'), {})
         self.configure_executor(uid, control)
+        self.verify_builder_mapping()
+
+    def verify_builder_mapping(self):
+        mapping = self.engine('unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map', timeout=15)
+        rows = [tuple(line.split()) for line in mapping.splitlines()]
+        expected = [('0', self.uid, '1'), ('1', '1000000', '65536'),
+                    ('0', self.gid, '1'), ('1', '1000000', '65536')]
+        if rows != expected:
+            raise Blocked('native builder UID/GID namespace does not map the exact managed subordinate ranges')
 
     def configure_executor(self, uid, control):
         self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--quiet', '--wait', '--collect', '--service-type=exec',
