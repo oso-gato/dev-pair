@@ -2,6 +2,44 @@
 
 ## Latest continuation checkpoint
 
+### November 28, 2026 — integrated fresh install development
+
+The owner’s 36-hour development window runs from November 27 at 10:39:32 UTC
+through November 28 at 22:39:32 UTC (November 29 at 07:39:32 JST). Development
+continues from draft [PR 13](https://github.com/oso-gato/dev-pair/pull/13) at
+`2109f57078881c6874fb2b6197c188ba77e65738` under standards
+`b9d4da5d442ac48dba2e8be62d81b5bdc83690b8`. API-selected GPT-6.2 Astra High
+coordinates and independently reviews in fresh sessions. GPT-6.2 Sol High
+implements and validates on the host. GPT-6.2 Sol Medium handles settled
+mechanical work. Independent backend attestation is unavailable.
+
+Local source `9b4a74e61a98bfeab91f76427f5aa797b52dfc75` brings the single
+pinned Day 0 entry together with protected release custody, independent SSH
+observations, repository and startup acquisition, signed project billing,
+checklist promotion and prospective nightly role observations. Earlier local
+fixtures exercised the failed checklist persistence test, repair and retest with
+real Git, mTLS, HTTP and SQLite. The published `11fbe9e` bootstrap remains a
+compatibility path for hosts already seeded with it. [Fresh setup](owner-day0.md)
+
+The disposable rehearsal booted the signed Fedora Cloud 44 image under
+unprivileged QEMU TCG with systemd and enforcing SELinux. It installed Fedora's
+signed Git prerequisite and found that the original Day 0 storage gate rejected
+stock Btrfs with no finite inode count. Storage repair `ed4d152` created a real
+20 GiB ext4 loop store with a fully allocated NOCOW backing on Btrfs. Same-boot
+reapply preserved its inode and UUID. After a reboot exposed loop ordering and
+boot-local device identity defects, `bab336f` brought the existing loop-backed
+mount up through systemd on the next boot with its original ext4 UUID.
+
+Maintenance testing of `faa7fbdbf07d49eeb4751a78d3d2336980edfacc` first stopped
+at transient systemd metadata verification. A later attempt reached the
+signed image import, where the native executor returned status 125 and cleanup
+completed. The development preview stopped at the extracted Git layout gate.
+Both native role placements and the authenticated job and renewal journeys
+still require verification. The owner separately installs on the selected
+Hostinger VPS and verifies real account consent and independent live access.
+A signed production platform still requires authorized protected-main
+publication. [Commissioning](host-commissioning.md)
+
 ### November 27, 2026 — owner handoff after offline maintenance
 
 The published [initial bootstrap](https://github.com/oso-gato/dev-pair/tree/11fbe9e0e0ff911fce13e33527c55020958a50a7)
