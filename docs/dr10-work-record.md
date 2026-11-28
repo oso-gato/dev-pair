@@ -26,14 +26,18 @@ unprivileged QEMU TCG with systemd and enforcing SELinux. It installed Fedora's
 signed Git prerequisite and found that the original Day 0 storage gate rejected
 stock Btrfs with no finite inode count. Storage repair `ed4d152` created a real
 20 GiB ext4 loop store with a fully allocated NOCOW backing on Btrfs. Same-boot
-reapply preserved its inode and UUID. After a reboot exposed loop ordering and
-boot-local device identity defects, `bab336f` brought the existing loop-backed
-mount up through systemd on the next boot with its original ext4 UUID.
+reapply preserved its inode and UUID. An explicit migration with `bab336f`
+showed an active ext4 mount on `/dev/loop0` with its original UUID. On the
+following automatic reboot, the loop service exited 1 after 10.3 seconds.
+Systemd reported a dependency failure and `/var/lib/dev-pair` was not a
+mountpoint. Automatic storage recovery remains open.
 
 Maintenance testing of `faa7fbdbf07d49eeb4751a78d3d2336980edfacc` first stopped
 at transient systemd metadata verification. A later attempt reached the
 signed image import, where the native executor returned status 125 and cleanup
-completed. The development preview stopped at the extracted Git layout gate.
+completed. The development preview rejected the rehearsal checkout because
+it required the extracted public-input Git layout. The preview did not
+reach native development placement.
 Both native role placements and the authenticated job and renewal journeys
 still require verification. The owner separately installs on the selected
 Hostinger VPS and verifies real account consent and independent live access.
