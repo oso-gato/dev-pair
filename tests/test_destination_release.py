@@ -755,6 +755,20 @@ class RolloutTests(unittest.TestCase):
 
 
 class ProvisioningTests(unittest.TestCase):
+    def test_managed_loop_waits_for_kernel_nodes_and_allocates_only_enrolled_slot(self):
+        app = d.Destination()
+        with patch.object(app, 'atomic') as save:
+            app.managed_loop_unit('/dev/loop7')
+        path, unit = save.call_args.args
+        self.assertEqual(path, '/etc/systemd/system/' + d.MANAGED_LOOP_SERVICE)
+        commands = [line.removeprefix('ExecStart=') for line in unit.splitlines() if line.startswith('ExecStart=')]
+        self.assertEqual(commands[:2], ['/usr/sbin/modprobe loop',
+                                        '/usr/bin/udevadm wait --timeout=10 --initialized=no /dev/loop-control'])
+        script = json.loads(commands[2].removeprefix('/usr/bin/python3 -IB -c '))
+        self.assertIn('fcntl.ioctl(fd, 0x4C80, 7)', script)
+        self.assertEqual(commands[3], '/usr/bin/udevadm wait --timeout=10 --initialized=no /dev/loop7')
+        self.assertEqual(save.call_args.kwargs['expected'], unit.replace(' --initialized=no', ''))
+
     def test_btrfs_backing_migrates_with_positive_proof_and_recovers_stable_identity(self):
         app = d.Destination()
         physical = d.managed_backing

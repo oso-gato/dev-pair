@@ -288,14 +288,16 @@ class Destination(Bootstrap):
                    f'try: fcntl.ioctl(fd, 0x4C80, {index})\n'
                    'except OSError as error:\n'
                    ' if error.errno != errno.EEXIST: raise\n')
-        self.atomic('/etc/systemd/system/' + MANAGED_LOOP_SERVICE,
-                    '[Unit]\nDescription=Prepare the enrolled Dev-pair loop device\n'
-                    'DefaultDependencies=no\nAfter=systemd-udevd.service\nBefore=local-fs.target\n'
-                    '[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=30s\n'
-                    'ExecStart=/usr/sbin/modprobe loop\n'
-                    'ExecStart=/usr/bin/udevadm wait --timeout=10 /dev/loop-control\n'
-                    f'ExecStart=/usr/bin/python3 -IB -c {json.dumps(command)}\n'
-                    f'ExecStart=/usr/bin/udevadm wait --timeout=10 {source}\n', mode=0o644)
+        wait = 'ExecStart=/usr/bin/udevadm wait --timeout=10'
+        content = ('[Unit]\nDescription=Prepare the enrolled Dev-pair loop device\n'
+                   'DefaultDependencies=no\nAfter=systemd-udevd.service\nBefore=local-fs.target\n'
+                   '[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=30s\n'
+                   'ExecStart=/usr/sbin/modprobe loop\n'
+                   f'{wait} --initialized=no /dev/loop-control\n'
+                   f'ExecStart=/usr/bin/python3 -IB -c {json.dumps(command)}\n'
+                   f'{wait} --initialized=no {source}\n')
+        self.atomic('/etc/systemd/system/' + MANAGED_LOOP_SERVICE, content, mode=0o644,
+                    expected=content.replace(f'{wait} --initialized=no', wait))
 
     def mount(self, path, spec, *, max_inodes=65536):
         image = spec['image']
