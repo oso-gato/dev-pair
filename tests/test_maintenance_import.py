@@ -23,6 +23,8 @@ BOOT = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
 REBOOT = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
 PACKAGE_LIST = b'local fixture package list\n'
 ENTRY = b'#!/bin/sh\n# fixture Distrobox entry\n'
+# SHA-256 of tools/gptbox_runtime.py at retained source 1b3d078.
+HISTORICAL_RUNTIME = '76303d6b78b0f3d089637c355c2f07102fa667c6b1be51ae3e593b68e958d6e1'
 
 
 def canonical(value):
@@ -55,6 +57,11 @@ class Runner(Engine):
             row = self.containers[output]
             row['Config']['Labels']['dev-pair.imported-probe'] = SEALED
             row['HostConfig']['IDMappings'] = {'UidMap': ['1000:0:1'], 'GidMap': ['1000:0:1']}
+        for value in args if 'create' in args else ():
+            if value.startswith('--label=dev-pair.job-request='):
+                row = self.containers[output]
+                row['Config']['Labels']['dev-pair.job-request'] = value.split('=', 2)[-1]
+                row['HostConfig']['IDMappings'] = {'UidMap': ['1000:0:1'], 'GidMap': ['1000:0:1']}
         if 'rm' in args and args[-1] == RUNTIME:
             self.cleanups += 1
         return output
@@ -73,7 +80,7 @@ class Fixture(g.Gptbox):
         self.directory('/var/lib/dev-pair', mode=0o755)
         self.state.mkdir(mode=0o700)
         self.target = g.ROOT + '/' + EXPECTED
-        files = {'/opt/dev-pair/bin/codex': g.CODEX_SHA, '/usr/bin/distrobox-init': 'f' * 64, g.RUNTIME: 'e' * 64}
+        files = {'/opt/dev-pair/bin/codex': g.CODEX_SHA, '/usr/bin/distrobox-init': 'f' * 64, g.RUNTIME: HISTORICAL_RUNTIME}
         inputs = {'source_sha': SOURCE, 'context_sha256': EXPECTED, 'distrobox_sha': g.DBX_SHA,
                   'role': 'maintenance', 'files': files}
         inputs_raw = g.image_inputs_bytes(inputs)
@@ -163,6 +170,8 @@ class Fixture(g.Gptbox):
                                    'selinux_label': self.run.containers[RUNTIME]['ProcessLabel']})
             if args[-1] == 'version':
                 return 'codex-cli 0.169.0\n'
+            if args[-4] == 'job-turn':
+                return json.dumps(self.job_response)
             raise AssertionError('unapproved fixture Distrobox entry')
         return super().execute(*args, **kwargs)
 
@@ -348,7 +357,7 @@ class MaintenanceImportTests(unittest.TestCase):
         self.prepare()
         self.setup_release()
         self.import_witness()
-        self.assertEqual(json.loads(self.app.seal_files['inputs.json'])['files'][g.RUNTIME], 'e' * 64)
+        self.assertEqual(json.loads(self.app.seal_files['inputs.json'])['files'][g.RUNTIME], HISTORICAL_RUNTIME)
         # The retained fixture image knows only the old boolean/UID/label response.
         original = self.app.execute
 
@@ -367,6 +376,52 @@ class MaintenanceImportTests(unittest.TestCase):
         self.app.run.extra_interface = False
         self.assertEqual(self.verify()[0], 0)
         self.assertTrue(self.app.path(self.receipt_path()).is_file())
+
+    def test_retained_image_with_null_capabilities_requires_zero_kernel_masks_for_import_and_job(self):
+        self.prepare()
+        self.setup_release()
+        self.import_witness()
+        self.app.run.capability_declarations = dict.fromkeys(('EffectiveCaps', 'BoundingCaps'))
+        old_entry = self.app.execute
+        for name in ('CapEff', 'CapBnd'):
+            def change_next_start(*args, **kwargs):
+                result = old_entry(*args, **kwargs)
+                if args[-1] == 'probe':
+                    self.app.run.capability_masks[name] = '0' * 15 + '1'
+                return result
+
+            with self.subTest(mask=name), patch.object(self.app, 'execute', side_effect=change_next_start):
+                starts = self.app.run.starts
+                self.assertEqual(self.verify()[0], 2)
+                self.assertEqual(self.app.run.starts, starts + 2)
+                self.assertFalse(self.app.path(self.receipt_path()).exists())
+                self.assertFalse(self.app.run.containers)
+                self.app.run.capability_masks[name] = '0' * 16
+        self.assertEqual(self.verify()[0], 0)
+
+        job, operation, request_sha = 'old-image', 'job-turn', '6' * 64
+        mounts = {str(target): (str(self.app.root), False) for target in g.JOB_READONLY_MOUNTS}
+        request = {'job': job, 'operation': operation, 'action': 'continue', 'role': 'maintenance',
+                   'model': 'gpt-6.2-sol', 'effort': 'high', 'logical_session': 'retained-session'}
+        self.app.job_response = {'schema': 2, 'request_sha256': request_sha, 'status': 'completed-turn', **request}
+        for branch in ('workspaces', 'state', 'cache'):
+            self.app.directory(f'/var/lib/dev-pair/maintenance/{branch}/{job}')
+        self.app.target = g.ROOT + '/' + EXPECTED
+        label = b'system_u:object_r:container_file_t:s0:c10,c20'
+
+        def run():
+            return self.app.run_job_locked(job, operation, request_sha, SEALED, EXPECTED, SOURCE, self.platform)
+
+        with (patch.object(g, 'host_job_inputs', side_effect=lambda *_: (mounts.copy(), request)),
+              patch.object(g.os, 'getxattr', return_value=label)):
+            entries = len(self.app.calls)
+            self.app.run.capability_masks['CapBnd'] = '0' * 15 + '1'
+            with self.assertRaisesRegex(g.Blocked, 'capability mask is not zero'):
+                run()
+            self.assertFalse(any(call[0] == 'entry' for call in self.app.calls[entries:]))
+            self.app.run.capability_masks['CapBnd'] = '0' * 16
+            self.assertEqual(run()['turn'], self.app.job_response)
+        self.assertFalse(self.app.run.containers)
 
     def test_two_platforms_can_reuse_exact_image_and_preserve_rollback(self):
         self.prepare()

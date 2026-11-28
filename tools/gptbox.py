@@ -601,8 +601,13 @@ class Gptbox(Bootstrap):
             if (item.get('ResolvConfPath', '') != '' or
                     any(host.get(key, []) != [] for key in ('Dns', 'DnsOptions', 'DnsSearch'))):
                 raise Blocked('offline runtime has engine-managed resolver configuration')
+            # Podman serializes its nil capability slices as JSON null.
+            # Require both declarations, and verify the actual masks at start.
+            for name in ('EffectiveCaps', 'BoundingCaps'):
+                if name not in item or (item[name] is not None and (type(item[name]) is not list or item[name])):
+                    raise Blocked('runtime capability declaration is missing, malformed, or nonempty')
             if (not host.get('ReadonlyRootfs') or config.get('User') != '1000:1000'
-                    or host.get('CapAdd') or item.get('EffectiveCaps') != [] or item.get('BoundingCaps') != []
+                    or host.get('CapAdd')
                     or not any('no-new-privileges' in str(value) for value in host.get('SecurityOpt', []))):
                 raise Blocked('runtime code/privilege policy mismatch')
             if not re.fullmatch(r'system_u:system_r:container_t:s0:c[0-9]+,c[0-9]+', item.get('ProcessLabel', '')):
@@ -1089,6 +1094,9 @@ class Gptbox(Bootstrap):
                     rows = re.findall(rf'^{field}:[ \t]+(.+)$', status, re.M)
                     if len(rows) != 1 or rows[0].split() != [expected] * 4:
                         raise Blocked('actual maintenance process is outside the managed account')
+                for field in ('CapEff', 'CapBnd'):
+                    if re.findall(rf'^{field}:[ \t]+(\S+)[ \t]*$', status, re.M) != ['0' * 16]:
+                        raise Blocked('actual maintenance effective or bounding capability mask is not zero')
                 namespaces = {}
                 for namespace in ('net', 'mnt'):
                     target = os.readlink(proc / 'ns' / namespace)

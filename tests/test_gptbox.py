@@ -37,6 +37,8 @@ class Engine:
         self.starts = 0
         self.stale_logs = False
         self.extra_interface = False
+        self.capability_declarations = {'EffectiveCaps': [], 'BoundingCaps': []}
+        self.capability_masks = {'CapEff': '0' * 16, 'CapBnd': '0' * 16}
         self.app = None
         self.images={}
 
@@ -92,7 +94,7 @@ class Engine:
                     'Memory': 2147483648, 'PidsLimit': 256 if runtime else 512, 'NanoCpus': 1000000000}
             self.containers[identity] = {'Id': identity, 'Name': name, 'Image': SEALED if runtime else BASE,
                 'Config': config, 'HostConfig': host, 'State': {'Status': 'created', 'Running': False, 'ExitCode': 0},
-                'EffectiveCaps': [], 'BoundingCaps': [],
+                **self.capability_declarations,
                 'ProcessLabel': 'system_u:system_r:' + ('container_t' if runtime else 'container_engine_t') + ':s0:c10,c20',
                 'MountLabel': 'system_u:object_r:container_file_t:s0:c10,c20',
                 'Mounts': [{'Type': 'bind', 'Destination': target, 'Source': source, 'RW': rw}
@@ -154,7 +156,8 @@ class Engine:
             for path, inode in ((host / 'ns' / kind, 41), (proc / 'ns' / kind, 42)):
                 path.unlink(missing_ok=True)
                 path.symlink_to(f'{kind}:[{inode}]')
-        (proc / 'status').write_text(f'Uid:\t{" ".join([self.app.uid] * 4)}\nGid:\t{" ".join([self.app.gid] * 4)}\n')
+        (proc / 'status').write_text(f'Uid:\t{" ".join([self.app.uid] * 4)}\nGid:\t{" ".join([self.app.gid] * 4)}\n' +
+                                     ''.join(f'{name}:\t{mask}\n' for name, mask in self.capability_masks.items()))
         (proc / 'mountinfo').write_text('1 0 0:1 / / ro,relatime - vfs vfs rw\n'
                                         '2 1 0:2 / /run rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n'
                                         '3 1 0:3 / /tmp rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n')
@@ -479,6 +482,20 @@ class GptboxTests(unittest.TestCase):
             with self.assertRaises(g.Blocked):
                 self.app.enter(RUNTIME, SEALED, 'version')
         self.assertEqual(len(self.app.entry_calls), before)
+
+    def test_maintenance_capability_declarations_must_be_present_and_empty(self):
+        self.assemble()
+        for field in ('EffectiveCaps', 'BoundingCaps'):
+            for value in ('', False, 0, {}, ['CAP_CHOWN']):
+                row = copy.deepcopy(self.engine.saved_runtime)
+                row[field] = value
+                self.engine.containers[RUNTIME] = row
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(g.Blocked, 'capability declaration'):
+                    self.app.inspect_container(RUNTIME, SEALED)
+            del row[field]
+            self.engine.containers[RUNTIME] = row
+            with self.subTest(field=field, value='absent'), self.assertRaisesRegex(g.Blocked, 'capability declaration'):
+                self.app.inspect_container(RUNTIME, SEALED)
 
     def test_frozen_runtime_accepts_only_loopback_and_image_owned_configuration(self):
         proc = self.root / 'proc-fixture'

@@ -378,6 +378,7 @@ class TestConfinementContract(unittest.TestCase):
                'Mounts': [{'Type': 'bind', 'Source': '/devbox/job/workspaces', 'Destination': '/work/job',
                            'RW': True}]}
         db.inspect_policy(row, CHILD, OWNER, value, 'inner', mounts)
+        db.inspect_policy({**row, 'EffectiveCaps': None, 'BoundingCaps': None}, CHILD, OWNER, value, 'inner', mounts)
         running = deepcopy(row)
         running['State'] = {'Running': True}
         with self.assertRaisesRegex(db.Blocked, 'temporary mount options'):
