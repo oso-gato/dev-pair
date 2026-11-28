@@ -1,5 +1,6 @@
 """Exercise deliberate stable intake, local approval and durable role continuity."""
 import copy
+from base64 import b64encode
 from contextlib import nullcontext
 import hashlib
 from pathlib import Path
@@ -346,7 +347,7 @@ class StableContinuity(unittest.TestCase):
               patch.object(self.controller, 'verify_driver', side_effect=fail_once)):
             paused = stable.apply(self.controller, self.operation)
             self.assertEqual(paused['phase'], 'verifying')
-            self.assertEqual(paused['forward_access_pending']['request_sha256'], r.identity(pending))
+            self.assertEqual(paused['forward_access_pending']['request_sha256'], r.sha(observation.encoding(pending)))
             self.assertNotIn('forward_attempts', paused)
             self.assertEqual(r.read_json(self.fx.root / 'renewal-fence/frozen'), paused['attempt_id'])
             state = stable.apply(self.controller, self.operation)
@@ -373,12 +374,20 @@ class IndependentStableAccess(unittest.TestCase):
         fixture.releases[target]['components']['devbox']['artifact_sha256'] = '9' * 64
         observer = site.CandidateAccess(fixture.controller, fixture.host, kind=observation.STABLE_CANDIDATE)
         grant = {'previous_release_sha256': old, 'operation': operation}
+        approver = fixture.gen_key('recovery-stable-reviewer')
+        stable_trust = observation.stable_signer(approver.with_suffix('.pub').read_text())
         plan = bootstrap.Bootstrap.access_probe_plan(fixture.route['dns_name'], fixture.guard['provider_recovery'],
                                                      fixture.guard['public_addresses'])
         fixture.host.access_probe_plan.return_value = plan
         fixture.host.verify_access_probes.side_effect = bootstrap.Bootstrap().verify_access_probes
 
-        def signed(binding):
+        def sign(body, signer, namespace):
+            payload = observation.encoding(body)
+            signature = subprocess.check_output(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(signer), '-n', namespace],
+                                                input=payload, stderr=subprocess.DEVNULL, timeout=5)
+            return payload, signature
+
+        def signed(binding, *, legacy=False):
             now = int(time.time())
             body = {key: value for key, value in binding.items() if key != 'job_id'}
             probes = [{'test': test, 'family': family, 'endpoint': endpoint, 'vantage': vantage,
@@ -387,17 +396,34 @@ class IndependentStableAccess(unittest.TestCase):
             body.update(issued_at=now, expires_at=now + 300, probes=probes, execution_route='tailnet-core',
                         acl_sha256=fixture.guard['acl_sha256'], provider_recovery=fixture.guard['provider_recovery'],
                         public_addresses=fixture.guard['public_addresses'])
-            payload = observation.encoding(body)
-            signature = subprocess.check_output(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(fixture.reviewer),
-                                                 '-n', observation.FINAL_NAMESPACE], input=payload,
-                                                stderr=subprocess.DEVNULL, timeout=5)
-            return observation.access_envelope(payload, signature)
+            if not legacy:
+                request_id = r.sha(observation.encoding(binding))
+                approval = {'kind': 'approve-stable-workload', 'version': 1, 'request_sha256': request_id,
+                            'machine_id': binding['machine_id'], 'boot_id': binding['boot_id'],
+                            'approved_at': now, 'expires_at': binding['candidate']['requested_at'] + 3600}
+                measurements = []
+                for role in observation.AGENT_ROLES:
+                    for family in observation.FAMILIES:
+                        reading = observation.expected_role_probe(binding, role + '-authorized', family)
+                        reading.update(challenge_sha256=r.identity([binding['boot_id'], role, family]),
+                                       runtime_result_sha256='7' * 64)
+                        measurements.append({'role': role, 'family': family, 'reading': reading, 'observed_at': now})
+                _, collector = sign({'request_sha256': request_id, 'readings': measurements}, fixture.authorized,
+                                    observation.NAMESPACE)
+                policy = {'method': 'tailscale-policy-api-v2', 'sha256': fixture.guard['acl_sha256'],
+                          'request_sha256': request_id, 'boot_id': binding['boot_id'], 'observed_at': now}
+                grant_wire = observation.access_envelope(*sign(approval, approver, observation.STABLE_NAMESPACE))
+                body.update(probes=measurements, observation='named-stable-challenges',
+                            collector_signature=b64encode(collector).decode(), policy_measurement=policy,
+                            stable_approval=b64encode(grant_wire).decode())
+            return observation.access_envelope(*sign(body, fixture.reviewer, observation.FINAL_NAMESPACE))
 
         with (patch.object(stable, 'for_release', return_value=grant),
               patch.object(stable, 'forward_started', return_value=True),
+              patch.object(observation, 'stable_host_trust', return_value=stable_trust),
               patch.object(stable, 'frozen_request') as checked):
             origin = observer.prepare(grant, target)
-            old_wire = signed(origin)
+            old_wire = signed(origin, legacy=True)
             retained = observer.proof_path(target)
             r.replace_json(retained, {'envelope': old_wire.decode('ascii'), 'accepted_at': int(time.time())})
             before = hashlib.sha256(retained.read_bytes()).hexdigest()
@@ -415,8 +441,10 @@ class IndependentStableAccess(unittest.TestCase):
             self.assertEqual(recovery['boot_id'], new_boot)
             self.assertEqual(recovery['role_artifacts'], origin['role_artifacts'])
             self.assertEqual(recovery['candidate']['operation'], operation)
-            with self.assertRaisesRegex(ValueError, 'different request or boot'):
+            with self.assertRaisesRegex(ValueError, 'distinct attended'):
                 observer.receive(old_wire, recovery)
+            with self.assertRaisesRegex(ValueError, 'different request or boot'):
+                observer.receive(signed(origin), recovery)
             observer.receive(signed(recovery), recovery)
             observer.accept(target, operation)
             self.assertIsNotNone(r.read_json(observer.recovery_proof_path(observer.recovery_context()))['accepted_at'])

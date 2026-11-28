@@ -1213,8 +1213,10 @@ class Renewal:
                 observer.fresh(request['target_sha256'], request['previous_sha256'], request['operation'],
                                expected=pending)
             except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                from destination_observation import encoding
+
                 self.phase(attempt, state, 'verifying', forward_access_pending={
-                    'boot_id': pending['boot_id'], 'request_sha256': identity(pending)})
+                    'boot_id': pending['boot_id'], 'request_sha256': sha(encoding(pending))})
                 return state
             try:
                 self.driver = reviewed_driver(self, bound_request(self, request))

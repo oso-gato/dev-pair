@@ -735,7 +735,7 @@ class CandidateAccess:
                 checked_at = proof['accepted_at']
         data, _ = self.verify(proof['envelope'], reference, guard or self.host.verify_final_guard(),
                               expected=expected, checked_at=checked_at,
-                              historical=self.scope == 'stable' and proof['accepted_at'] is not None)
+                              historical=self.scope == 'stable' and recovery is None and proof['accepted_at'] is not None)
         r.require(data['boot_id'] == self.host.destination_identity()['boot_id'] and
                   (data['candidate']['previous_release_sha256'], data['candidate']['operation']) == (previous, operation),
                   'signed candidate observation does not authorize this renewal attempt on this boot')
