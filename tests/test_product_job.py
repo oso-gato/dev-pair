@@ -567,6 +567,36 @@ class ProductJobTests(unittest.TestCase):
         self.assertEqual(failed['diagnostics'], 'invalid transport response')
         self.assertNotIn('retry', job.read_state(path))
 
+    def test_renewal_wait_preserves_the_previous_failure_deadline(self):
+        catalogue, path, _ = self.product_slot()
+        state = job.read_state(path)
+        job.record_pause(state, 'host-reply-interrupted', 1000)
+        previous = state['retry'].copy()
+        retry_end = previous['until_unix']
+        job.durable_json(path / 'state.json', state)
+        fence = self.root / 'renewal-fence'
+        fence.mkdir()
+        fence.chmod(0o755)
+        job.write_private(fence / 'frozen', b'"stable-update"')
+        worker = mock.Mock()
+        worker.turn.side_effect = ValueError('role dispatch frozen by renewal')
+        with (mock.patch.multiple(job, ROOT=self.root, CATALOGUE=catalogue, JOBS=catalogue / 'jobs',
+                                  registered_contract=lambda value: value),
+              mock.patch.object(job, 'FedoraJob', return_value=worker),
+              mock.patch.object(job.time, 'time', return_value=retry_end - 1) as clock):
+            held = job.work('demo')
+            self.assertEqual(held['phase'], job.RENEWAL_WAIT)
+            self.assertEqual(held['retry'], previous)
+            self.assertEqual(held['renewal_wait']['fence'], 'stable-update')
+            (fence / 'frozen').unlink()
+            clock.return_value = retry_end + 1
+            with mock.patch.object(job, 'renewal_dispatch_ready', return_value=True):
+                exhausted = job.work('demo')
+        self.assertEqual(exhausted['phase'], 'waiting')
+        self.assertEqual(exhausted['retry'], dict(previous, automatic=False))
+        self.assertNotIn('renewal_wait', exhausted)
+        worker.turn.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

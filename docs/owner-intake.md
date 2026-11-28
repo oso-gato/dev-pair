@@ -76,8 +76,15 @@ role and product roots and a current site grant are present. The timer observes
 only confirmed jobs from the bounded intake catalogue. A job has up to eight
 schedule attempts and four preparation attempts. A confirmed job with an
 acknowledged product start can recover once per boot while its durable
-product state is eligible. Terminal jobs and jobs whose normal conductor
-has exhausted automatic retries stay available for inspection.
+product state is eligible. When the conductor records a protected renewal
+fence, the recovery timer checks for verified dispatch and restarts that same
+job after thaw, including on the same boot. Waiting at the fence uses no
+schedule attempts. Restart uses the remaining schedule allowance and retains
+any deadline for an earlier product error. An exhausted wait recorded before
+this behavior stays available for inspection. Its record identifies the last
+error, so a separate recovery review must check the exact pending operation
+and its remaining allowance before further execution. Terminal jobs also
+stay available for inspection.
 
 The named operator rule invokes the fixed entry with zero command-line
 arguments. The entry accepts a bounded stdin request containing the

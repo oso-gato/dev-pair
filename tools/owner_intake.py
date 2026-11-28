@@ -518,6 +518,7 @@ class Intake:
 
     def schedule(self, job, saved, deadline):
         p.require_workload_access(self.root)
+        wake_product = False
         if saved['phase'] == 'blocked' and 'recovery' not in saved and saved['diagnostics'] in LEGACY_SCHEDULING_FAILURES:
             state = self.published(job, saved['plan'])
             if state is None or state['phase'] != 'submitted':
@@ -525,10 +526,13 @@ class Intake:
             product.source_approval(saved['plan'])
             saved['phase'] = 'confirmed'
         if saved['phase'] == 'submitted':
-            if saved.get('scheduled_boot') == boot_id():
-                return
             state = self.published(job, saved['plan'])
             p.require(state is not None, 'The acknowledged product plan is unavailable.')
+            wake_product = product.pending_renewal(state) is not None
+            if wake_product and not product.renewal_dispatch_ready(self.root):
+                return
+            if not wake_product and saved.get('scheduled_boot') == boot_id():
+                return
             if state['phase'] in product.TERMINAL or (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic')):
                 return
         elif saved['phase'] not in ('confirmed', 'preparing'):
@@ -537,18 +541,26 @@ class Intake:
         now = int(time.monotonic())
         if now < entry['after']:
             return
-        if entry['queue_attempts'] >= QUEUE_ATTEMPTS or entry['prepare_attempts'] >= PREPARE_ATTEMPTS:
+        if entry['queue_attempts'] >= QUEUE_ATTEMPTS or (not wake_product and entry['prepare_attempts'] >= PREPARE_ATTEMPTS):
             self.block(job, saved, 'Automatic scheduling recovery reached its limit. The confirmed plan and job evidence are retained.')
             return
         entry['queue_attempts'] += 1
         entry['after'] = now + RETRY_SECONDS
         self.save(job, saved)
         try:
-            candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
-                             min(deadline, time.monotonic() + 5))
-        except (OSError, ValueError, subprocess.SubprocessError):
-            saved['diagnostics'] = 'The agreement is confirmed. Waiting to schedule the same preparation service.'
-            self.save(job, saved)
+            if wake_product:
+                self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline)
+            else:
+                candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-intake@' + job + '.service'],
+                                 min(deadline, time.monotonic() + 5))
+        except (OSError, ValueError, subprocess.SubprocessError, DispatchDeferred):
+            if not wake_product:
+                saved['diagnostics'] = 'The agreement is confirmed. Waiting to schedule the same preparation service.'
+                self.save(job, saved)
+        else:
+            if wake_product:
+                saved['scheduled_boot'] = entry['boot']
+                self.save(job, saved)
 
     def reconcile(self):
         p.require_workload_access(self.root)
@@ -627,14 +639,14 @@ class Intake:
             self.save(job, record)
         return 0
 
-    def submit_product(self, path, job, plan):
+    def submit_product(self, path, job, plan, *, deadline=None):
         state = self.published(job, plan)
         if state is not None and (state['phase'] in product.TERMINAL or
                                   (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic'))):
             return
         product.source_approval(plan)
         try:
-            product.submit(path)
+            product.submit(path, deadline=deadline)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             if (not isinstance(exc, ValueError) or str(exc) == 'protected fixed command failed') and self.published(job, plan):
                 product.source_approval(plan)

@@ -20,6 +20,7 @@ import owner_source
 import job_protocol as p
 import product_job as product
 import promotion_setup as promotion
+import renewal
 
 REPOSITORIES = ('owner/one', 'owner/two')
 MANIFESTS = {f'job-{key}': key * 64 for key in ('a', 'b', 'c')}
@@ -265,6 +266,113 @@ class OwnerIntakeTests(unittest.TestCase):
         self.assertEqual([role for role, _ in saved_profiles], list(intake.ROLES))
         self.assertEqual(product.read_state(product.job_path(job))['phase'], 'blocked')
         self.assertEqual(product.plan((product.job_path(job) / 'plan.json').read_bytes()), draft['preview']['plan'])
+
+    def test_renewal_thaw_restarts_the_exact_disconnected_job_on_the_same_boot(self):
+        draft = self.intake.draft(self.request())
+        job, plan = draft['job_id'], draft['preview']['plan']
+        boot = intake.boot_id()
+        recovery = dict(boot=boot, after=0, queue_attempts=1, prepare_attempts=1)
+        self.intake.save(job, dict(self.intake.record(job), phase='submitted', scheduled_boot=boot, recovery=recovery))
+        root = product.job_path(job)
+        root.mkdir(mode=0o700)
+        product.write_private(root / 'plan.json', p.canonical(plan).encode())
+        initial = {'candidate': {'source_revision': plan['agreement']['initial_commit']}}
+        state = dict.fromkeys(('first', 'development', 'repair', 'final'))
+        state.update(job_id=job, phase='host-check', initial=initial, maintenance={'session_uuid': 'saved-session'},
+                     agreement_sha256=product.agreement_sha(plan), repository=plan['agreement']['repository'],
+                     startup_sha256=plan['startup_sha256'])
+        product.durable_json(root / 'state.json', state)
+        catalogue = self.intake.catalogue
+        product.write_private(catalogue / 'owner.lock', b'')
+        product.write_private(self.intake.queue / (job + '.plan'), p.canonical(plan).encode())
+
+        control = self.root / 'renewal'
+        attempt = control / 'attempts/stable-update'
+        attempt.mkdir(parents=True, mode=0o700)
+        control.chmod(0o700)
+        fence = self.root / 'renewal-fence'
+        fence.mkdir()
+        fence.chmod(0o755)
+        lease = fence / 'owner.lock'
+        lease.touch()
+        lease.chmod(0o644)
+        controller = renewal.Renewal(self.root, None)
+        transition = {'phase': 'verifying', 'freezes': {}}
+        renewal.replace_json(controller.pointer, attempt.name)
+        renewal.replace_json(attempt / 'journal.json', transition)
+        with controller.lock(), controller.host_fence():
+            controller.mark_host_fence(attempt.name, frozen=True)
+
+        worker = mock.Mock()
+        effects = []
+
+        def host_test(number, checkpoint):
+            with controller.dispatch_gate():
+                effects.append((number, checkpoint))
+            return {'progress': 'host-checks-passed', 'result': {'attempt_id': 'saved-host-attempt'}}
+
+        worker.host_test.side_effect = host_test
+        worker.turn.return_value = {'candidate_sha': initial['candidate']['source_revision']}
+        plan_inode = (root / 'plan.json').stat().st_ino
+        clock = time.time()
+        with (mock.patch.multiple(product, ROOT=self.root, CATALOGUE=catalogue, registered_contract=lambda value: value),
+              mock.patch.object(product, 'FedoraJob', return_value=worker),
+              mock.patch.object(product, 'source_approval', side_effect=lambda value: self.assertEqual(value, plan)),
+              mock.patch.object(product.candidate, 'protected_file', side_effect=lambda file: file.read_bytes()),
+              mock.patch.object(renewal.Renewal, 'live_release', return_value='a' * 64),
+              mock.patch.object(intake, 'Intake', return_value=self.intake),
+              mock.patch.object(intake.os, 'geteuid', return_value=0),
+              mock.patch.object(intake.os, 'umask'),
+              mock.patch.dict(intake.os.environ, {}, clear=True),
+              mock.patch.object(intake.sys, 'argv', [intake.__file__, '--reconcile']),
+              mock.patch.object(product, 'RETRY_OBSERVATIONS', 2),
+              mock.patch.object(product.time, 'sleep'),
+              mock.patch.object(product.time, 'time', side_effect=lambda: clock),
+              mock.patch.object(intake.candidate, 'invoke', return_value=b'') as scheduled,
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(product.main(['work', job]), 76)
+            paused = product.read_state(root)
+            self.assertEqual(effects, [])
+            self.assertEqual(intake.main(), 0)
+            scheduled.assert_not_called()
+            self.assertEqual(self.intake.record(job)['recovery'], recovery)
+            clock += 45 * 60
+            with controller.lock(), controller.host_fence():
+                controller.thaw(attempt, transition, 'completed', registries={})
+            self.assertEqual(intake.boot_id(), boot)
+            for reason in ('renewal-observation', 'host-reply-interrupted'):
+                exhausted = dict(state, phase='waiting', retry=dict(phase='host-check', reason=reason,
+                    until_unix=int(clock) - 1, observations=2, automatic=False))
+                product.durable_json(root / 'state.json', exhausted)
+                self.assertEqual(intake.main(), 0)
+                self.assertEqual(product.read_state(root), exhausted)
+            scheduled.assert_not_called()
+            product.durable_json(root / 'state.json', paused)
+            self.assertEqual(intake.main(), 0)
+            scheduled.assert_called_once()
+            self.assertEqual(scheduled.call_args.args[0], [intake.SYSTEMCTL, 'start', '--no-block',
+                                                           'dev-pair-product@' + job + '.service'])
+            self.assertEqual(self.intake.record(job)['recovery']['queue_attempts'], recovery['queue_attempts'] + 1)
+            self.assertEqual(self.intake.record(job)['recovery']['prepare_attempts'], recovery['prepare_attempts'])
+            self.assertEqual(product.main(['work', job]), 0)
+            self.assertEqual(intake.main(), 0)
+            self.assertEqual(product.main(['work', job]), 0)
+            scheduled.assert_called_once()
+            request = p.canonical({'action': 'reattach', 'job': job}).encode()
+            with (mock.patch.dict(intake.os.environ, {'SUDO_USER': 'core'}),
+                  mock.patch.object(intake.sys, 'argv', [intake.__file__]),
+                  mock.patch.object(intake.sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(request))),
+                  contextlib.redirect_stdout(io.StringIO()) as owner):
+                self.assertEqual(intake.main(), 0)
+            finished, = [p.loads(line) for line in owner.getvalue().splitlines()]
+        self.assertEqual((finished['job_id'], finished['phase']), (job, 'passed'))
+        self.assertEqual(finished['agreement_sha256'], paused['agreement_sha256'])
+        self.assertEqual(finished['maintenance'], paused['maintenance'])
+        self.assertEqual(finished['final']['result']['attempt_id'], 'saved-host-attempt')
+        self.assertEqual((root / 'plan.json').stat().st_ino, plan_inode)
+        self.assertEqual(effects, [(1, initial)])
+        worker.build.assert_not_called()
+        worker.turn.assert_called_once_with('development', initial, finished['first'])
 
     def test_local_bundle_initializes_two_clean_role_checkouts_and_preserves_dirty_work(self):
         repo = REPOSITORIES[0]

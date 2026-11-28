@@ -45,6 +45,7 @@ LOCAL_TEST_PREFIX = 'cd /work/job && ' + LOCAL_HEAD_COMMAND + ' && ('
 LOCAL_TEST_SUFFIX = ') && ' + LOCAL_HEAD_COMMAND
 RENEWAL_PAUSES = {'checklist dispatch is frozen by renewal', 'role dispatch frozen by renewal',
                   'role dispatch frozen pending host observation'}
+RENEWAL_WAIT = 'waiting-for-renewal'
 RETRY_SECONDS = 180
 RETRY_OBSERVATIONS = 18
 RETRY_INTERVAL = 10
@@ -684,6 +685,51 @@ def record_pause(state, reason, now):
                       'automatic': now < cutoff and observations < RETRY_OBSERVATIONS}
 
 
+def retry_available(retry, now):
+    return retry is None or (retry['automatic'] and now < retry['until_unix'])
+
+
+def record_renewal_wait(root, state, reason, now):
+    if reason != 'renewal-observation' or not retry_available(state.get('retry'), now):
+        return False
+    directory = root / 'renewal-fence'
+    try:
+        node = directory.lstat()
+        p.require(stat.S_ISDIR(node.st_mode) and node.st_uid == os.getuid() and
+                  stat.S_IMODE(node.st_mode) == 0o755, 'renewal fence directory is unavailable')
+        fence = p.loads(read_private(directory / 'frozen', 128))
+        p.token(fence)
+    except (OSError, ValueError):
+        return False
+    state['renewal_wait'] = {'phase': state['phase'], 'fence': fence}
+    state['phase'] = RENEWAL_WAIT
+    return True
+
+
+def renewal_dispatch_ready(root):
+    from renewal import Renewal
+
+    try:
+        with Renewal(root, None).dispatch_gate():
+            return True
+    except BlockingIOError:
+        return False
+    except ValueError as exc:
+        if str(exc) in RENEWAL_PAUSES:
+            return False
+        raise
+
+
+def pending_renewal(state):
+    if state['phase'] != RENEWAL_WAIT:
+        return None
+    wait = state.get('renewal_wait')
+    p.fields(wait, 'phase fence')
+    p.token(wait['phase'])
+    p.token(wait['fence'])
+    return wait
+
+
 def work(job):
     p.require_workload_access(ROOT)
     root = trusted_directory(job_path(job))
@@ -697,7 +743,19 @@ def work(job):
         state = read_state(root)
         if state['phase'] in TERMINAL:
             return state
-        if state['phase'] == 'waiting':
+        wait = pending_renewal(state)
+        if wait is not None:
+            if not renewal_dispatch_ready(ROOT):
+                return state
+            del state['renewal_wait']
+            state['phase'] = wait['phase']
+            retry = state.get('retry')
+            if not retry_available(retry, int(time.time())):
+                state['phase'] = 'waiting'
+                retry['automatic'] = False
+                durable_json(root / 'state.json', state)
+                return state
+        elif state['phase'] == 'waiting':
             state['phase'] = state['retry']['phase']
         try:
             backend = FedoraJob(value)
@@ -706,7 +764,9 @@ def work(job):
         except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError) as exc:
             retry = pause_reason(exc)
             if retry is not None:
-                record_pause(state, retry, int(time.time()))
+                now = int(time.time())
+                if not record_renewal_wait(ROOT, state, retry, now):
+                    record_pause(state, retry, now)
             else:
                 state['failed_stage'] = state['phase']
                 state['phase'] = 'blocked'
@@ -717,7 +777,7 @@ def work(job):
         return state
 
 
-def submit(path):
+def submit(path, *, deadline=None):
     p.require_workload_access(ROOT)
     raw = candidate.protected_file(path)
     value = plan(raw)
@@ -740,8 +800,9 @@ def submit(path):
             sync_directory(parent)
     target = trusted_directory(target)
     p.require(plan(read_private(target / 'plan.json', p.MAX_MESSAGE)) == value, 'job ID is already bound to another brief')
+    end = time.monotonic() + 10
     candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-product@' + value['job_id'] + '.service'],
-                     time.monotonic() + 10)
+                     end if deadline is None else min(end, deadline))
     return read_state(target)
 
 
@@ -780,7 +841,7 @@ def main(argv=None):
                     previous = result
                 time.sleep(1)
         print(p.canonical(result), flush=True)
-        if args.action == 'work' and result['phase'] == 'waiting':
+        if args.action == 'work' and result['phase'] in ('waiting', RENEWAL_WAIT):
             return 76
         return 2 if result['phase'] == 'blocked' else 0
     except BlockingIOError:
