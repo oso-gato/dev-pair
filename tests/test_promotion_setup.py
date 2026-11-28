@@ -131,6 +131,24 @@ class UpstreamPreflight(unittest.TestCase):
                 with self.subTest(value=value), self.assertRaises(ValueError):
                     setup.expiry(value)
 
+    def test_owner_progress_reports_incomplete_expired_and_withdrawn_custody_without_losing_validation(self):
+        state = {'phase': 'passed', 'materialized': {'bundle_sha256': 'd' * 64}}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            policy = root / 'policy.json'
+            policy.write_bytes(b'previously staged')
+            with (patch.object(release.product, 'read_state', return_value=state),
+                  patch.object(release.product, 'PROMOTION_POLICY', policy),
+                  patch.object(setup, 'enrollment') as custody):
+                for phase, reason in (('staging', 'protected-promotion-enrollment-incomplete'),
+                                      ('active', 'scoped-release-grant-expired'),
+                                      ('withdrawn', 'protected-promotion-withdrawn')):
+                    custody.return_value = {'state': phase, 'expires_unix': int(time.time()) - 1}
+                    progress = release.product.read_progress(root)
+                    self.assertEqual(progress['phase'], 'passed')
+                    self.assertEqual(progress['promotion']['reason'], reason)
+                    self.assertTrue(progress['promotion']['resume_required'])
+
 
 class StationSite(unittest.TestCase):
     def setUp(self):

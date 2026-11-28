@@ -181,6 +181,24 @@ def enrollment():
     return result
 
 
+def custody_reason(policy_path):
+    try:
+        saved = enrollment()
+    except FileNotFoundError:
+        if not installed() and policy_path.is_file():
+            return None  # Keep the separately commissioned standalone controller readable.
+        return 'protected-promotion-custody-missing'
+    except (OSError, ValueError, KeyError, TypeError):
+        return 'protected-promotion-custody-unavailable'
+    if saved['state'] in ('withdrawing', 'withdrawn'):
+        return 'protected-promotion-withdrawn'
+    if saved['state'] == 'staging':
+        return 'protected-promotion-enrollment-incomplete'
+    if saved['expires_unix'] <= time.time():
+        return 'scoped-release-grant-expired'
+    return None if policy_path.is_file() else 'protected-promotion-custody-missing'
+
+
 def file_bytes(path, uid, expected, *, withdrawing=False):
     role = path.parent == proposal.CREDENTIALS
     p.require(not role or uid is not None, 'proposal credential lacks its enrolled account')

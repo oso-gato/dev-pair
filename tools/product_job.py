@@ -636,15 +636,21 @@ def read_progress(root):
                         'destination', 'destination_receipt_sha256', 'resume_required') if key in delivery}
             if 'release' in delivery:
                 summary['image'] = delivery['release']['subject']
+            if delivery['phase'] not in PROMOTION_TERMINAL:
+                from promotion_setup import custody_reason
+
+                reason = custody_reason(PROMOTION_POLICY)
+                if reason is not None:
+                    summary.update(reason=reason, resume_required=True)
         except (OSError, ValueError, KeyError, TypeError):
             summary = {'phase': 'observation-held', 'reason': 'protected-release-record-unavailable',
                        'resume_required': True}
         state['promotion'] = summary
     elif state['phase'] == 'passed' and (state.get('materialized') or {}).get('bundle_sha256'):
-        enabled = PROMOTION_POLICY.is_file()
-        state['promotion'] = {'phase': 'awaiting-promotion',
-                              'reason': None if enabled else 'protected-promotion-custody-missing',
-                              'resume_required': not enabled}
+        from promotion_setup import custody_reason
+
+        reason = custody_reason(PROMOTION_POLICY)
+        state['promotion'] = {'phase': 'awaiting-promotion', 'reason': reason, 'resume_required': reason is not None}
     return state
 
 
