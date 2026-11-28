@@ -43,8 +43,7 @@ LOCAL_HEAD_COMMAND = (
 ).strip()
 LOCAL_TEST_PREFIX = 'cd /work/job && ' + LOCAL_HEAD_COMMAND + ' && ('
 LOCAL_TEST_SUFFIX = ') && ' + LOCAL_HEAD_COMMAND
-RENEWAL_PAUSES = {'checklist dispatch is frozen by renewal', 'role dispatch frozen by renewal',
-                  'role dispatch frozen pending host observation'}
+CHECKLIST_RENEWAL_PAUSE = 'checklist dispatch is frozen by renewal'
 RENEWAL_WAIT = 'waiting-for-renewal'
 RETRY_SECONDS = 180
 RETRY_OBSERVATIONS = 18
@@ -664,16 +663,21 @@ def progress_complete(state):
 
 
 def pause_reason(error):
+    from renewal import DispatchDeferred, DispatchLeaseBusy
+
     if isinstance(error, HostReplyLost):
         return 'host-reply-interrupted'
+    # The existing checklist gate also travels as a diagnostic over mTLS.
+    # Keep this wire value and the recipe's tracked bytes stable for saved jobs.
+    if isinstance(error, (DispatchDeferred, DispatchLeaseBusy)) or (
+            type(error) is ValueError and str(error) == CHECKLIST_RENEWAL_PAUSE):
+        return 'renewal-observation'
     if isinstance(error, BlockingIOError):
         return 'dispatch-lease-busy'
-    if isinstance(error, ValueError) and str(error) in RENEWAL_PAUSES:
-        return 'renewal-observation'
     return None
 
 
-def record_pause(state, reason, now, *, renewal_lease=False):
+def record_pause(state, reason, now):
     previous = state.get('retry', {})
     phase = state['phase']
     if previous.get('phase') == phase:
@@ -684,17 +688,17 @@ def record_pause(state, reason, now, *, renewal_lease=False):
     state['phase'] = 'waiting'
     state['retry'] = {'phase': phase, 'reason': reason, 'until_unix': cutoff, 'observations': observations,
                       'automatic': now < cutoff and observations < RETRY_OBSERVATIONS}
-    if renewal_lease and (not previous or previous.get('renewal_lease_only') is True):
-        state['retry']['renewal_lease_only'] = True
+    if reason == 'renewal-observation' and (not previous or previous.get('renewal_only') is True):
+        state['retry']['renewal_only'] = True
 
 
 def retry_available(retry, now):
     return retry is None or (retry['automatic'] and now < retry['until_unix'])
 
 
-def record_renewal_wait(root, state, reason, now, *, renewal_lease=False):
+def record_renewal_wait(root, state, reason, now):
     previous = state.get('retry')
-    if (reason != 'renewal-observation' and not renewal_lease) or not retry_available(previous, now):
+    if reason != 'renewal-observation' or not retry_available(previous, now):
         return False
     directory = root / 'renewal-fence'
     try:
@@ -705,7 +709,7 @@ def record_renewal_wait(root, state, reason, now, *, renewal_lease=False):
         p.token(fence)
     except (OSError, ValueError):
         return False
-    if previous and previous['phase'] == state['phase'] and previous.get('renewal_lease_only') is True:
+    if previous and previous['phase'] == state['phase'] and previous.get('renewal_only') is True:
         del state['retry']
     state['renewal_wait'] = {'phase': state['phase'], 'fence': fence}
     state['phase'] = RENEWAL_WAIT
@@ -713,17 +717,13 @@ def record_renewal_wait(root, state, reason, now, *, renewal_lease=False):
 
 
 def renewal_dispatch_ready(root):
-    from renewal import Renewal
+    from renewal import DispatchDeferred, Renewal
 
     try:
         with Renewal(root, None).dispatch_gate():
             return True
-    except BlockingIOError:
+    except (BlockingIOError, DispatchDeferred):
         return False
-    except ValueError as exc:
-        if str(exc) in RENEWAL_PAUSES:
-            return False
-        raise
 
 
 def pending_renewal(state):
@@ -762,7 +762,12 @@ def work(job):
                 durable_json(root / 'state.json', state)
                 return state
         elif state['phase'] == 'waiting':
-            state['phase'] = state['retry']['phase']
+            retry = state['retry']
+            if retry.get('renewal_only') is True and not retry_available(retry, int(time.time())):
+                retry['automatic'] = False
+                durable_json(root / 'state.json', state)
+                return state
+            state['phase'] = retry['phase']
         try:
             backend = FedoraJob(value)
             backend.ledger('job', registered_contract(value))
@@ -770,12 +775,9 @@ def work(job):
         except (OSError, ValueError, KeyError, ImportError, subprocess.SubprocessError) as exc:
             retry = pause_reason(exc)
             if retry is not None:
-                from renewal import DispatchLeaseBusy
-
                 now = int(time.time())
-                renewal_lease = isinstance(exc, DispatchLeaseBusy)
-                if not record_renewal_wait(ROOT, state, retry, now, renewal_lease=renewal_lease):
-                    record_pause(state, retry, now, renewal_lease=renewal_lease)
+                if not record_renewal_wait(ROOT, state, retry, now):
+                    record_pause(state, retry, now)
             else:
                 state['failed_stage'] = state['phase']
                 state['phase'] = 'blocked'

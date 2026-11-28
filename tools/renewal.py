@@ -44,6 +44,10 @@ class DispatchLeaseBusy(BlockingIOError):
     """The protected renewal lease was busy before dispatch could be admitted."""
 
 
+class DispatchDeferred(ValueError):
+    """The protected renewal controller is holding new dispatch."""
+
+
 def json_bytes(value):
     return canonical(value).encode()
 
@@ -517,8 +521,10 @@ class Renewal:
             except BlockingIOError as exc:
                 raise DispatchLeaseBusy(*exc.args) from exc
             _, state = self.transition()
-            require(state is None or state['phase'] in TERMINAL, 'role dispatch frozen by renewal')
-            require(not os.path.lexists(self.root / 'renewal-fence' / 'frozen'), 'role dispatch frozen pending host observation')
+            if state is not None and state['phase'] not in TERMINAL:
+                raise DispatchDeferred('role dispatch frozen by renewal')
+            if os.path.lexists(self.root / 'renewal-fence' / 'frozen'):
+                raise DispatchDeferred('role dispatch frozen pending host observation')
             release = self.live_release()
             protocol.require_workload_access(self.root, release=release)
             yield release

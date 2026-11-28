@@ -623,8 +623,9 @@ class Intake:
         try:
             self.stage(job, record)
         except (OSError, ValueError, RuntimeError, KeyError, ImportError, subprocess.SubprocessError, DispatchDeferred) as exc:
-            deferred = isinstance(exc, (BlockingIOError, DispatchDeferred)) or str(exc) in (
-                'role dispatch frozen by renewal', 'role dispatch frozen pending host observation')
+            from renewal import DispatchDeferred as RenewalDispatchDeferred
+
+            deferred = isinstance(exc, (BlockingIOError, DispatchDeferred, RenewalDispatchDeferred))
             with self.lock():
                 if deferred:
                     entry['after'] = int(time.monotonic()) + RETRY_SECONDS
