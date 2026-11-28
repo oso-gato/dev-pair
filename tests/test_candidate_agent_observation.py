@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 from contextlib import nullcontext
+from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import agent_observer_station as station
@@ -19,6 +20,8 @@ import bootstrap
 import destination_observation as d
 import renewal as r
 from renewal_site import CandidateAccess
+
+measure_tailnet_policy = d.measure_tailnet_policy
 
 
 class CandidateObservation(unittest.TestCase):
@@ -81,6 +84,7 @@ class CandidateObservation(unittest.TestCase):
         self.enterContext(patch.object(d, 'checked_file', side_effect=lambda path: Path(path)))
         self.enterContext(patch.object(bootstrap, 'checked_file', side_effect=lambda path: Path(path)))
         self.enterContext(patch.object(d, 'configured_signers', return_value=self.signers))
+        self.policy = self.enterContext(patch.object(d, 'measure_tailnet_policy', return_value=self.guard['acl_sha256']))
         self.calls = []
 
     def gen_key(self, name):
@@ -107,7 +111,7 @@ class CandidateObservation(unittest.TestCase):
             wire = d.collect_candidate(self.binding, self.site, observations, None, None, self.authorized)
         collection = self.root / 'collection.bundle'
         collection.write_bytes(wire)
-        return d.assemble_candidate(self.binding, self.site, collection, self.reviewer)
+        return d.assemble_candidate(self.binding, self.site, collection, self.reviewer, None)
 
     def test_independent_probes_admit_exact_candidate_only_when_fenced_and_preserve_proof(self):
         wire = self.response()
@@ -138,6 +142,40 @@ class CandidateObservation(unittest.TestCase):
                 d.collect_candidate(self.binding, self.site, observations, None, None, self.authorized)
         with self.assertRaisesRegex(bootstrap.Blocked, 'admitted ingress'):
             d.candidate_site(self.binding, {**self.site, 'devbox_image': '0' * 64}, int(time.time()))
+
+    def test_current_policy_change_blocks_signature_and_stale_signed_measurement_is_denied(self):
+        self.policy.return_value = '0' * 64
+        with self.assertRaisesRegex(bootstrap.Blocked, 'policy changed'):
+            self.response()
+        self.policy.return_value = self.guard['acl_sha256']
+        raw, _ = d.read_access_envelope(io.BytesIO(self.response()))
+        receipt = json.loads(raw)
+        receipt['policy_measurement']['observed_at'] = receipt['issued_at'] - 1801
+        changed = d.encoding(receipt)
+        wire = d.access_envelope(changed, d.sign_observation(changed, self.reviewer, d.FINAL_NAMESPACE))
+        with self.assertRaisesRegex(ValueError, 'policy measurement is stale'):
+            self.access.receive(wire, self.binding)
+        self.assertFalse(self.access.proof_path(self.reference).exists())
+
+    def test_policy_request_is_read_only_and_refuses_unapproved_token_scope(self):
+        credential = self.root / 'oauth.json'
+        credential.write_bytes(d.encoding({'client_id': 'fixture-id', 'client_secret': 'fixture-secret'}))
+        token = {'token_type': 'Bearer', 'expires_in': 3600, 'scope': 'policy_file:read', 'access_token': 'a' * 30}
+        policy = {'acls': [], 'grants': []}
+        with (patch.object(d, 'policy_credential', return_value=credential),
+              patch.object(d, 'tailscale_json', side_effect=[token, policy]) as calls):
+            actual = measure_tailnet_policy('fixture.example', credential)
+        self.assertEqual(actual, d.digest(d.encoding(policy)))
+        request, policy_get = calls.call_args_list
+        self.assertEqual(request.args[:2], ('POST', '/api/v2/oauth/token'))
+        self.assertEqual(parse_qs(request.kwargs['body'])['scope'], ['policy_file:read'])
+        self.assertEqual(policy_get.args[:2], ('GET', '/api/v2/tailnet/fixture.example/acl'))
+        self.assertEqual(policy_get.kwargs['headers']['Cache-Control'], 'no-cache')
+        with (patch.object(d, 'policy_credential', return_value=credential),
+              patch.object(d, 'tailscale_json', return_value={**token, 'scope': 'all:read'}) as calls,
+              self.assertRaisesRegex(bootstrap.Blocked, 'exactly the approved policy read scopes')):
+            measure_tailnet_policy('fixture.example', credential)
+        self.assertEqual(calls.call_count, 1)
 
     def test_final_signer_cannot_replace_independently_signed_collector_results(self):
         raw, _ = d.read_access_envelope(io.BytesIO(self.response()))
@@ -207,7 +245,7 @@ class CandidateObservation(unittest.TestCase):
         config = {'site': site, 'courier': {'user': 'courier', 'mailbox': mailbox},
                   'collector': {'user': 'collector', 'observations': observations,
                                 'core_key': self.authorized, 'known_hosts': self.authorized, 'signer': self.authorized},
-                  'reviewer': {'user': 'reviewer', 'signer': self.reviewer}}
+                  'reviewer': {'user': 'reviewer', 'signer': self.reviewer, 'acl_oauth': self.reviewer}}
         roles = []
 
         def call(profile, argv, *, data=None, **_):
@@ -224,7 +262,7 @@ class CandidateObservation(unittest.TestCase):
                 with patch.object(d, 'state_dir', return_value=directory), patch.object(d, 'ssh_candidate_probe', self.probe):
                     return d.collect_candidate(self.binding, self.site, directory, None, None, self.authorized)
             if 'assemble-candidate' in argv:
-                return d.assemble_candidate(self.binding, self.site, Path(argv[argv.index('--collection') + 1]), self.reviewer)
+                return d.assemble_candidate(self.binding, self.site, Path(argv[argv.index('--collection') + 1]), self.reviewer, None)
             self.assertEqual(argv[-2:], ('publish', reference))
             exchange.publish(mailbox, reference, io.BytesIO(data), int(time.time()))
             return b''

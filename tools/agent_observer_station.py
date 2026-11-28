@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -EBs
 """Reconcile one queued agent observation under three enrolled station accounts."""
 import argparse
+import getpass
 from itertools import islice
 import json
 import os
@@ -17,7 +18,8 @@ import time
 
 from bootstrap import Blocked, Bootstrap, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
 from destination_observation import (AGENT_CANDIDATE, AGENT_ROLES, FAMILIES, FINAL_NAMESPACE, MAX_ACCESS_ENVELOPE,
-                                     bounded_file, candidate_site, digest, encoding, keys, require, state_dir, verify_file)
+                                     bounded_file, candidate_site, digest, encoding, keys, policy_credential,
+                                     require, state_dir, verify_file, write_once)
 
 CONFIG = Path('/etc/dev-pair/agent-observer/station.json')
 PYTHON = '/usr/bin/python3'
@@ -54,7 +56,7 @@ def configuration(path=CONFIG):
     keys(config, {'site', 'courier', 'collector', 'reviewer'})
     keys(config['courier'], {'user', 'mailbox'})
     keys(config['collector'], {'user', 'observations', 'ssh_agent', 'core_key', 'known_hosts', 'signer'})
-    keys(config['reviewer'], {'user', 'ssh_agent', 'signer'})
+    keys(config['reviewer'], {'user', 'ssh_agent', 'signer', 'acl_oauth'})
     accounts = []
     for role in ('courier', 'collector', 'reviewer'):
         profile = config[role]
@@ -77,6 +79,8 @@ def configuration(path=CONFIG):
             profile['observations'] = account_directory(profile['observations'], account.pw_uid)
             for field in ('core_key', 'known_hosts'):
                 profile[field] = checked_file(profile[field])
+        else:
+            profile['acl_oauth'] = policy_credential(Path(profile['acl_oauth']), account.pw_uid)
     require(len(set(accounts)) == len(accounts), 'courier, collector and reviewer require distinct station accounts')
     config['site'] = checked_file(config['site'])
     selected = (config['collector']['core_key'], config['collector']['signer'], config['reviewer']['signer'])
@@ -158,7 +162,7 @@ def reconcile(config, *, caller=call_named, scratch='/run'):
         records.write_bytes(collected)
         records.chmod(0o644)
         verified = caller(reviewer, (*observer, 'assemble-candidate', *common, '--collection', records,
-                                     '--signer', reviewer['signer']))
+                                     '--signer', reviewer['signer'], '--acl-oauth', reviewer['acl_oauth']))
     caller(courier, (*tool, 'publish', request), data=verified, limit=1024)
     return 'candidate-observation-published'
 
@@ -233,12 +237,13 @@ def install(args):
                 'collector': {'user': args.collector_user, 'observations': args.observations,
                               'ssh_agent': args.collector_agent, 'core_key': args.core_key,
                               'known_hosts': args.known_hosts, 'signer': args.collector_signer},
-                'reviewer': {'user': args.reviewer_user, 'ssh_agent': args.reviewer_agent, 'signer': args.reviewer_signer}}
+                'reviewer': {'user': args.reviewer_user, 'ssh_agent': args.reviewer_agent, 'signer': args.reviewer_signer,
+                             'acl_oauth': args.acl_oauth}}
     with tempfile.TemporaryDirectory(prefix='candidate-station-config-', dir='/run') as directory:
         staged_site, staged_config = (Path(directory) / name for name in ('site.json', 'station.json'))
         staged_site.write_bytes(encoding(site))
         staged_config.write_bytes(encoding({**controls, 'site': str(staged_site)}))
-        configuration(staged_config)
+        admitted = configuration(staged_config)
     # The site file is a pinned independent approval. Repeating the same
     # installation is safe. Changed enrolment needs a separately approved setup.
     app = Bootstrap()
@@ -251,10 +256,30 @@ def install(args):
                         'unsafe installed station file')
             require(path.is_file() and path.stat().st_size == len(raw) and path.read_bytes() == raw,
                     'installed station inputs conflict with the approved exact setup')
-    for path, raw in all_files.items():
+    for path, raw in assets.items():
+        app.atomic(str(path), raw.decode('utf-8'), mode=0o644)
+    observed = call_named(admitted['reviewer'], (PYTHON, '-EBs', STATION_TOOLS / 'destination_observation.py',
+                          'measure-acl', '--tailnet', site['tailnet'], '--acl-oauth', admitted['reviewer']['acl_oauth']),
+                          limit=256)
+    require(observed == (site['acl_sha256'] + '\n').encode('ascii'),
+            'current API policy differs from the original independently signed access review')
+    for path, raw in ((site_path, encoding(site)), (CONFIG, encoding(controls))):
         app.atomic(str(path), raw.decode('utf-8'), mode=0o600 if path == CONFIG else 0o644)
     subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], env=ENV, check=True, timeout=25)
     subprocess.run(['/usr/bin/systemctl', 'enable', '--now', STATION_UNITS[1]], env=ENV, check=True, timeout=25)
+
+
+def enroll_acl(path):
+    require(os.getuid() == os.geteuid() > 0 and sys.stdin.isatty() and sys.stderr.isatty() and
+            path.is_absolute() and not os.path.lexists(path),
+            'use the independent reviewer terminal and a new private credential path')
+    state_dir(path.parent)
+    client = input('Tailscale OAuth client ID: ').strip()
+    secret = getpass.getpass('Tailscale OAuth client secret: ')
+    require(all(re.fullmatch(r'[A-Za-z0-9._~-]{8,512}', value) for value in (client, secret)),
+            'Tailscale OAuth credential format is unsupported')
+    write_once(path, encoding({'client_id': client, 'client_secret': secret}))
+    policy_credential(path)
 
 
 def arguments():
@@ -262,10 +287,12 @@ def arguments():
     commands = parser.add_subparsers(dest='command')
     cleanup_args = commands.add_parser('cleanup', help='expire this authorized account’s scoped candidate scratch')
     cleanup_args.add_argument('base', type=Path)
+    enrollment = commands.add_parser('enroll-acl', help='store the acquired read-only OAuth credential in reviewer custody')
+    enrollment.add_argument('file', type=Path)
     setup = commands.add_parser('install', help='install reviewed station assets under enrolled independent identities')
     for key in ('source-sha', 'access-receipt', 'trusted-access-signers', 'guard-sha256', 'host-artifact-sha256',
                 'courier-user', 'mailbox', 'collector-user', 'observations', 'collector-agent', 'core-key',
-                'known-hosts', 'collector-signer', 'reviewer-user', 'reviewer-agent', 'reviewer-signer'):
+                'known-hosts', 'collector-signer', 'reviewer-user', 'reviewer-agent', 'reviewer-signer', 'acl-oauth'):
         setup.add_argument('--' + key, required=True)
     return parser.parse_args()
 
@@ -273,6 +300,9 @@ def arguments():
 def main():
     args = arguments()
     try:
+        if args.command == 'enroll-acl':
+            enroll_acl(args.file)
+            return 0
         if args.command == 'cleanup':
             cleanup(args.base)
             return 0

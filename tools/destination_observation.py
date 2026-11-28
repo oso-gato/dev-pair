@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 import uuid
 
 from bootstrap import Blocked, Bootstrap, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
@@ -68,6 +68,9 @@ AGENT_SITE_FIELDS = {'version', 'source_sha', 'machine_id', 'dns_name', 'tailnet
                      'keys_sha256', 'guard_sha256', 'acl_sha256', 'host_artifact_sha256', 'devbox_image',
                      'provider_recovery', 'public_addresses'}
 AGENT_CLIENT_COMMAND = '/usr/libexec/dev-pair/renewal/agent-observer client'
+TAILSCALE_API = 'api.tailscale.com'
+TAILSCALE_POLICY_SCOPES = {'policy_file:read', 'devices:core:read', 'devices:posture_attributes:read'}
+TAILSCALE_POLICY_LIMIT = 1024 * 1024
 WORKLOAD_KINDS = {WORKLOAD_ACCESS_CUTOVER, AGENT_CANDIDATE}
 SCOPED_ACCESS = {CORE_ACCESS_CUTOVER, *WORKLOAD_KINDS}
 ACCESS_KINDS = {'access-cutover', *SCOPED_ACCESS}
@@ -77,7 +80,7 @@ MAX_ACCESS_ENVELOPE = 2 * (4 * ((MAX_ACCESS_PART + 2) // 3)) + 128
 
 
 def encoding(data):
-    return (json.dumps(data, sort_keys=True, separators=(',', ':')) + '\n').encode('utf-8')
+    return (json.dumps(data, sort_keys=True, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
 
 
 def digest(data):
@@ -788,6 +791,56 @@ def sign_observation(payload, key, namespace):
     return signed.stdout
 
 
+def policy_credential(path, uid=None):
+    uid = os.geteuid() if uid is None else uid
+    require(path.is_absolute() and path.resolve(strict=True) == path and uid > 0,
+            'Tailscale policy read requires a canonical private independent reviewer credential')
+    for parent in path.parents:
+        node = parent.lstat()
+        require(stat.S_ISDIR(node.st_mode) and node.st_uid in (0, uid) and not node.st_mode & 0o022,
+                'Tailscale policy credential ancestry changed')
+    node = path.lstat()
+    require(stat.S_ISREG(node.st_mode) and node.st_uid == uid and stat.S_IMODE(node.st_mode) == 0o600 and
+            node.st_nlink == 1 and 0 < node.st_size <= 8192, 'Tailscale policy credential is outside independent custody')
+    return path
+
+
+def tailscale_json(method, path, limit, *, headers=None, body=None):
+    connection = http.client.HTTPSConnection(TAILSCALE_API, timeout=8, context=ssl.create_default_context())
+    try:
+        connection.request(method, path, body=body, headers={'Accept': 'application/json', **(headers or {})})
+        with connection.getresponse() as response:
+            require(response.status == 200 and response.headers.get_content_type() == 'application/json',
+                    'independent Tailscale policy endpoint withheld its JSON result')
+            raw = response.read(limit + 1)
+        require(0 < len(raw) <= limit, 'Tailscale policy response exceeds the protected byte limit')
+        value = json.loads(raw, object_pairs_hook=relay.unique)
+        require(type(value) is dict, 'Tailscale policy response is not an object')
+        return value
+    finally:
+        connection.close()
+
+
+def measure_tailnet_policy(tailnet, credential):
+    require(matches(r'[A-Za-z0-9._@-]{1,128}', tailnet) and tailnet != '-',
+            'independent policy read requires the exact admitted tailnet name')
+    oauth = json.loads(bounded_file(policy_credential(credential), 8192), object_pairs_hook=relay.unique)
+    keys(oauth, {'client_id', 'client_secret'})
+    require(all(matches(r'[A-Za-z0-9._~-]{8,512}', value) for value in oauth.values()),
+            'Tailscale policy OAuth credential is malformed')
+    body = urlencode({**oauth, 'grant_type': 'client_credentials', 'scope': 'policy_file:read'})
+    credentials = tailscale_json('POST', '/api/v2/oauth/token', 16384,
+                                 headers={'Content-Type': 'application/x-www-form-urlencoded'}, body=body)
+    token, scopes = credentials.get('access_token'), credentials.get('scope')
+    require(credentials.get('token_type') == 'Bearer' and type(credentials.get('expires_in')) is int and
+            0 < credentials['expires_in'] <= 3600 and matches(r'[A-Za-z0-9._~+/-]{16,4096}={0,2}', token) and
+            type(scopes) is str and set(scopes.split()) in ({'policy_file:read'}, TAILSCALE_POLICY_SCOPES),
+            'Tailscale token did not grant exactly the approved policy read scopes')
+    policy = tailscale_json('GET', '/api/v2/tailnet/' + quote(tailnet, safe='') + '/acl', TAILSCALE_POLICY_LIMIT,
+                            headers={'Authorization': 'Bearer ' + token, 'Cache-Control': 'no-cache'})
+    return digest(encoding(policy))
+
+
 def ssh_candidate_probe(binding, family, payload, identity, known_hosts):
     options = ('BatchMode=yes', 'IdentitiesOnly=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null',
                'ConnectTimeout=8', 'ConnectionAttempts=1', 'RequestTTY=no', 'ClearAllForwardings=yes',
@@ -872,7 +925,7 @@ def collect_candidate(binding, site, directory, identity, known_hosts, signer):
     return access_envelope(raw, sign_observation(raw, signer, NAMESPACE))
 
 
-def assemble_candidate(binding, site, collection, signer):
+def assemble_candidate(binding, site, collection, signer, acl_oauth):
     now = int(time.time())
     candidate_site(binding, site, now)
     with open_regular(collection) as stream:
@@ -881,11 +934,17 @@ def assemble_candidate(binding, site, collection, signer):
     keys(measured, {'request_sha256', 'readings'})
     require(measured['request_sha256'] == digest(encoding(binding)), 'collector signature does not select this candidate request')
     checked_candidate_readings(binding, measured['readings'], now)
+    policy_sha = measure_tailnet_policy(site['tailnet'], acl_oauth)
+    require(policy_sha == site['acl_sha256'], 'Tailscale policy changed since the independent full workload review')
+    now = int(time.time())
+    candidate_site(binding, site, now)
+    policy = {'method': 'tailscale-policy-api-v2', 'sha256': policy_sha, 'request_sha256': measured['request_sha256'],
+              'boot_id': binding['boot_id'], 'observed_at': now}
     data = {key: value for key, value in binding.items() if key != 'job_id'}
     data.update(issued_at=now, expires_at=now + LIFETIME, acl_sha256=site['acl_sha256'], execution_route='tailnet-core',
                 provider_recovery=site['provider_recovery'], public_addresses=site['public_addresses'],
                 probes=measured['readings'], observation='named-candidate-challenges',
-                collector_signature=base64.b64encode(signature).decode('ascii'))
+                collector_signature=base64.b64encode(signature).decode('ascii'), policy_measurement=policy)
     payload = encoding(data)
     return access_envelope(payload, sign_observation(payload, signer, FINAL_NAMESPACE))
 
@@ -907,6 +966,10 @@ def arguments():
     candidate_collect.add_argument('--known-hosts', type=Path, required=True)
     candidate_assemble = stages.add_parser('assemble-candidate', help='independently verify and sign a prospective renewal receipt')
     candidate_assemble.add_argument('--collection', type=Path, required=True)
+    candidate_assemble.add_argument('--acl-oauth', type=Path, required=True)
+    acl = stages.add_parser('measure-acl', help='read and hash the exact current Tailscale policy for independent access review')
+    acl.add_argument('--tailnet', required=True)
+    acl.add_argument('--acl-oauth', type=Path, required=True)
     for candidate in (candidate_collect, candidate_assemble):
         candidate.add_argument('--binding', type=Path, required=True)
         candidate.add_argument('--site', type=Path, required=True)
@@ -938,6 +1001,9 @@ def main():
             sys.stdout.buffer.write(access_envelope(bounded_file(path, MAX_ACCESS_PART),
                                     bounded_file(path.with_name(path.name + '.sig'), MAX_ACCESS_PART)))
             return 0
+        if args.stage == 'measure-acl':
+            print(measure_tailnet_policy(args.tailnet, args.acl_oauth))
+            return 0
         if args.stage in ('collect-candidate', 'assemble-candidate'):
             binding = json.loads(bounded_file(args.binding), object_pairs_hook=relay.unique)
             site = json.loads(bounded_file(checked_file(args.site)), object_pairs_hook=relay.unique)
@@ -945,7 +1011,7 @@ def main():
                 require(args.directory is not None, 'select the private exact candidate observation directory')
                 answer = collect_candidate(binding, site, args.directory, args.core_key, args.known_hosts, args.signer)
             else:
-                answer = assemble_candidate(binding, site, args.collection, args.signer)
+                answer = assemble_candidate(binding, site, args.collection, args.signer, args.acl_oauth)
             sys.stdout.buffer.write(answer)
             return 0
         require(args.directory is not None, 'select the private ceremony evidence directory')

@@ -545,7 +545,7 @@ class CandidateAccess:
         automatic = data.get('observation') == 'named-candidate-challenges'
         p.fields(data, 'version kind machine_id boot_id dns_name source_sha tailnet_addresses role_artifacts candidate '
                  'issued_at expires_at probes provider_recovery public_addresses ' + ' '.join(sorted(ACCESS)) +
-                 (' observation collector_signature' if automatic else ''))
+                 (' observation collector_signature policy_measurement' if automatic else ''))
         p.number(data['version'], 1, 1)
         scope = data['candidate']
         validate_candidate(scope)
@@ -580,7 +580,15 @@ class CandidateAccess:
             checked_candidate_readings(data, data['probes'], data['issued_at'])
             request = {key: data[key] for key in (CORE_BINDING | {'role_artifacts', 'candidate'}) - {'job_id'}}
             request['job_id'] = 'host-access'
-            collection = {'request_sha256': r.sha(encoding(request)), 'readings': data['probes']}
+            request_sha = r.sha(encoding(request))
+            policy = data['policy_measurement']
+            p.fields(policy, 'method sha256 request_sha256 boot_id observed_at')
+            r.require(policy['method'] == 'tailscale-policy-api-v2' and policy['sha256'] == guard['acl_sha256'] and
+                      (policy['request_sha256'], policy['boot_id']) == (request_sha, data['boot_id']) and
+                      type(policy['observed_at']) is int and
+                      max(row['observed_at'] for row in data['probes']) <= policy['observed_at'] == data['issued_at'],
+                      'independent Tailscale policy measurement is stale or for a different candidate')
+            collection = {'request_sha256': request_sha, 'readings': data['probes']}
             collector_signature = base64.b64decode(data['collector_signature'], validate=True)
             measured, _ = verify_bytes(encoding(collection), collector_signature, observer_principal('authorized'),
                                        signers, NAMESPACE)
