@@ -63,6 +63,7 @@
     {"source": "tools/job_protocol.py", "target": "/usr/libexec/dev-pair/tools/job_protocol.py", "mode": "0644", "feature": "base"},
     {"source": "tools/jobs.py", "target": "/usr/libexec/dev-pair/tools/jobs.py", "mode": "0644", "feature": "base"},
     {"source": "tools/ledger_recovery.py", "target": "/usr/libexec/dev-pair/tools/ledger_recovery.py", "mode": "0644", "feature": "base"},
+    {"source": "tools/managed_backing.py", "target": "/usr/libexec/dev-pair/tools/managed_backing.py", "mode": "0644", "feature": "base"},
     {"source": "tools/native_io.py", "target": "/usr/libexec/dev-pair/tools/native_io.py", "mode": "0644", "feature": "base"},
     {"source": "tools/native_placement_release.py", "target": "/usr/libexec/dev-pair/tools/native_placement_release.py", "mode": "0644", "feature": "base"},
     {"source": "tools/native_placements.py", "target": "/usr/libexec/dev-pair/tools/native_placements.py", "mode": "0644", "feature": "base"},

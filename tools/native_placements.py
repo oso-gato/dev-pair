@@ -33,7 +33,8 @@ SOURCE = Path(__file__).resolve().parent.parent
 SYS = '/usr/bin/systemctl'
 PODMAN = (db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd')
 OUTER_FILES = ('Containerfile', 'controller.py', 'containers.conf', 'enter-podman')
-ENTRY_FILES = ('tools/devbox.py', 'runtime/devbox/controller.py', 'runtime/devbox/host-containers.conf')
+ENTRY_FILES = ('tools/devbox.py', 'tools/managed_backing.py', 'tools/storage.py',
+               'runtime/devbox/controller.py', 'runtime/devbox/host-containers.conf')
 INODE_CEILING = 524288
 JOB_LIMIT = 48
 SCRATCH_BYTES = db.GIB

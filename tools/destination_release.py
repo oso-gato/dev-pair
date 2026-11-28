@@ -17,6 +17,7 @@ import time
 import uuid
 
 from bootstrap import Blocked, Bootstrap, SUDO_PACKAGE_QUERY, TRUST_SIGNERS, checked_file, relay
+import managed_backing
 from release_trust import DIGEST, SHA, ReleaseTrust, protect, require
 from selinux_bootstrap import INSTALL as SELINUX_INSTALL, OVERRIDE as SELINUX_OVERRIDE, code_digest as selinux_code_digest
 
@@ -167,6 +168,7 @@ class Destination(Bootstrap):
                 and info.st_blocks * 512 >= spec['mib'] * MIB and info.st_uid == info.st_gid == 0
                 and stat.S_IMODE(info.st_mode) == 0o600,
                 'checklist mount does not use its fully reserved owned backing file')
+        managed_backing.verify_backing(image, info, Blocked)
         geometry = os.statvfs(path)
         require(0 < geometry.f_blocks * geometry.f_frsize <= spec['mib'] * MIB
                 and 0 < geometry.f_files <= max_inodes
@@ -177,12 +179,20 @@ class Destination(Bootstrap):
         require(len(matches) == 1 and matches[0].split()[3:5] == ['/', path],
                 'checklist storage is not the unique dedicated filesystem root')
 
+    def physical_reserve(self, reserve_inodes):
+        return managed_backing.observe(Path(MANAGED_IMAGE).parent, Blocked).check(
+            8192 * MIB, reserve_inodes, Blocked, 'physical storage reserve is no longer available')
+
     def allocate(self, spec, receipt, reserve_mib, reserve_inodes):
         image = Path(spec['image'])
         size = spec['mib'] * MIB
         previous = self.record(receipt) if os.path.lexists(receipt) else None
+        reserve = reserve_mib * MIB
+        reserve_message = 'selected VPS cannot preserve the declared free reserve'
+        if not previous and not os.path.lexists(image):
+            managed_backing.observe(image.parent, Blocked).check(reserve + size, reserve_inodes, Blocked, reserve_message)
         open_type = 0 if previous else os.O_CREAT | os.O_EXCL
-        descriptor = os.open(image, open_type | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        descriptor = os.open(image, open_type | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
         try:
             if not previous:
                 os.fchown(descriptor, 0, 0)
@@ -191,7 +201,7 @@ class Destination(Bootstrap):
             old = os.fstat(descriptor)
             identity = {'image': str(image), 'device': old.st_dev, 'inode': old.st_ino,
                         'size': size, 'fs_uuid': spec['uuid']}
-            require(stat.S_IMODE(old.st_mode) == 0o600 and old.st_uid == old.st_gid == 0
+            require(stat.S_ISREG(old.st_mode) and stat.S_IMODE(old.st_mode) == 0o600 and old.st_uid == old.st_gid == 0
                     and old.st_size in (0, size) and old.st_nlink == 1, 'unexpected dedicated backing file')
             if previous:
                 require(previous == {**identity, 'state': previous.get('state')}
@@ -200,19 +210,22 @@ class Destination(Bootstrap):
                 previous = {**identity, 'state': 'created'}
                 self.atomic(receipt, record_text(previous))
             remaining = max(size - old.st_blocks * 512, 0)
-            space = os.statvfs(image.parent)
-            require(space.f_bavail * space.f_frsize >= reserve_mib * MIB + remaining
-                    and 0 < space.f_files and space.f_favail >= reserve_inodes, 'selected VPS cannot preserve the declared free reserve')
+            space = managed_backing.observe(image.parent, Blocked)
+            space.check(reserve + remaining, reserve_inodes, Blocked, reserve_message)
+            if space.kind == 'btrfs':
+                require(not remaining or previous['state'] == 'created', 'recorded Btrfs backing allocation changed')
+                managed_backing.prepare_btrfs(descriptor, empty=old.st_size == old.st_blocks == 0, error=Blocked)
             if remaining:
                 os.posix_fallocate(descriptor, 0, size)
                 os.fsync(descriptor)
             current = os.fstat(descriptor)
             require(current.st_size == size and current.st_blocks * 512 >= size, 'checklist backing is not fully allocated')
+            if space.kind == 'btrfs':
+                managed_backing.verify_btrfs(descriptor, size, Blocked)
         finally:
             os.close(descriptor)
-        remaining = os.statvfs(image.parent)
-        require(remaining.f_bavail * remaining.f_frsize >= reserve_mib * MIB and remaining.f_favail >= reserve_inodes,
-                'filesystem reserve was not preserved after allocation')
+        managed_backing.observe(image.parent, Blocked).check(
+            reserve, reserve_inodes, Blocked, 'filesystem reserve was not preserved after allocation')
         observed = self.run('/usr/sbin/blkid', '-p', '-o', 'export', str(image), ok=(0, 2), timeout=10)
         expected = {'UUID': spec['uuid'], 'TYPE': 'ext4'}
         if not observed:
@@ -225,6 +238,10 @@ class Destination(Bootstrap):
             observed = self.run('/usr/sbin/blkid', '-p', '-o', 'export', str(image), timeout=10)
         fields = dict(line.split('=', 1) for line in observed.splitlines())
         require(all(fields.get(key) == value for key, value in expected.items()), 'foreign checklist backing filesystem')
+        if space.kind == 'btrfs':
+            managed_backing.verify_backing(image, current, Blocked)
+            managed_backing.observe(image.parent, Blocked).check(
+                reserve, reserve_inodes, Blocked, 'filesystem reserve was not preserved after formatting')
         self.atomic(receipt, record_text({**identity, 'state': 'formatted'}), expected=record_text(previous))
 
     def mount(self, path, spec, *, max_inodes=65536):
@@ -429,7 +446,8 @@ class Destination(Bootstrap):
         self.destination_source(source)
         repo = Path(__file__).absolute().parents[1]
         files = (*FILES, 'runtime/checklist/' + EXECUTOR, 'tools/release_trust.py', 'tools/bootstrap.py', 'tools/selinux_bootstrap.py',
-                 'tools/native_io.py', 'tools/native_relay.py', 'tools/selected_payload.py', 'tools/destination_release.py')
+                 'tools/native_io.py', 'tools/native_relay.py', 'tools/selected_payload.py', 'tools/destination_release.py',
+                 'tools/managed_backing.py', 'tools/storage.py')
         if os.path.lexists(repo / 'tools/platform_release_protocol.py'):
             files += ('tools/platform_release_protocol.py',)
         selected = {}
@@ -552,9 +570,7 @@ class Destination(Bootstrap):
         managed = self.record(MANAGED_INTENT)
         require(managed['machine_id'] == self.destination_identity()['machine_id'], 'managed ext4 belongs to a different host')
         self.mount_observation(ROOT, managed['filesystem'], max_inodes=MANAGED_INODES)
-        physical = os.statvfs(Path(MANAGED_IMAGE).parent)
-        require(physical.f_bavail * physical.f_frsize >= 8192 * MIB and physical.f_favail >= managed['reserve_inodes'],
-                'physical storage reserve is no longer available')
+        self.physical_reserve(managed['reserve_inodes'])
         secrets = {file: checked_file(Path(args.tls_profile) / file, secret=True).read_bytes() for file in TLS_FILES}
         require(all(0 < len(value) <= 8192 for value in secrets.values()), 'invalid checklist TLS profile size')
         role_files = {CODE + '/' + name: code[name] for name in FILES}
@@ -834,9 +850,7 @@ class Destination(Bootstrap):
                         'release requires the isolated checklist account and enforcing SELinux')
                 managed = self.record(MANAGED_INTENT)
                 self.mount_observation(ROOT, managed['filesystem'], max_inodes=MANAGED_INODES)
-                physical = os.statvfs(Path(MANAGED_IMAGE).parent)
-                require(physical.f_bavail * physical.f_frsize >= 8192 * MIB and physical.f_favail >= managed['reserve_inodes'],
-                        'physical storage reserve is no longer available')
+                self.physical_reserve(managed['reserve_inodes'])
                 dns = None
                 if require_cutover:
                     listener = self.record(MANAGED_LISTENER)

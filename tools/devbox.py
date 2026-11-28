@@ -16,9 +16,11 @@ import stat
 import sys
 import time
 
-RUNTIME = Path(__file__).resolve().parent.parent / 'runtime/devbox'
-sys.path.insert(0, str(RUNTIME))
+TOOLS = Path(__file__).resolve().parent
+RUNTIME = TOOLS.parent / 'runtime/devbox'
+sys.path[:0] = [str(RUNTIME), str(TOOLS)]
 import controller as db
+import managed_backing
 
 ROOT = Path('/var/lib/dev-pair/development')
 MANAGED_BACKING = Path('/var/lib/dev-pair-managed.ext4')
@@ -85,20 +87,21 @@ def managed_storage(mountinfo, *, for_recovery=False):
                and 0 < backing.st_size <= 20 * db.GIB and backing.st_blocks * 512 >= backing.st_size,
                'managed ext4 backing is foreign, sparse or exceeds twenty GiB')
     guest = os.statvfs(root)
-    host = os.statvfs(MANAGED_BACKING.parent)
     db.require(0 < guest.f_blocks * guest.f_frsize <= backing.st_size
                and 0 < guest.f_files <= MANAGED_INODE_LIMIT and 0 <= guest.f_favail <= guest.f_files,
                'managed ext4 byte or inode ceiling is unavailable')
+    host = managed_backing.observe(MANAGED_BACKING.parent, db.Blocked)
+    if host.kind == 'btrfs' and os.geteuid() == 0:
+        managed_backing.verify_backing(MANAGED_BACKING, backing, db.Blocked)
     if not for_recovery:
         db.require(guest.f_favail > 0, 'managed ext4 byte or inode ceiling is unavailable')
-        db.require(host.f_bavail * host.f_frsize >= 8 * db.GIB
-                   and host.f_files >= host.f_favail >= HOST_INODE_RESERVE,
-                   'physical host byte and finite inode reserve required')
+        host.check(8 * db.GIB, HOST_INODE_RESERVE, db.Blocked, 'physical host byte and finite inode reserve required')
     return {'device': row[2], 'source': source, 'bytes': guest.f_blocks * guest.f_frsize,
             'backing_bytes': backing.st_size, 'backing_inode': backing.st_ino,
             'available_bytes': guest.f_bavail * guest.f_frsize, 'inodes': guest.f_files,
-            'available_inodes': guest.f_favail, 'host_available_bytes': host.f_bavail * host.f_frsize,
-            'host_available_inodes': host.f_favail}
+            'available_inodes': guest.f_favail, 'host_available_bytes': host.available_bytes,
+            'host_available_inodes': host.available_inodes,
+            **({'host_available_metadata_bytes': host.metadata_bytes} if host.kind == 'btrfs' else {})}
 
 
 def storage_mount(path, ceiling, mountinfo):

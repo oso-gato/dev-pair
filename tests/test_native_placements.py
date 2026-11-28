@@ -219,6 +219,9 @@ class TestKernelOwnership(unittest.TestCase):
             patched.enter_context(patch.object(Path, 'exists', lambda path: path in paths or path in framed))
             patched.enter_context(patch.object(Path, 'read_text', lambda path: paths[path]))
             patched.enter_context(patch.object(n.os, 'statvfs', lambda path: stats[path]))
+            physical = n.devbox.managed_backing
+            observed = patched.enter_context(patch.object(physical, 'observe', side_effect=lambda path, error:
+                physical.ParentSpace('ext4', stats[path].f_bavail * stats[path].f_frsize, stats[path].f_favail)))
             proof = n.devbox.storage_mount(build, 8 * db.GIB, info)
             self.assertEqual(proof['managed_storage']['host_available_bytes'], 8 * db.GIB)
             self.assertEqual(proof['managed_storage']['available_bytes'], db.GIB)
@@ -232,6 +235,14 @@ class TestKernelOwnership(unittest.TestCase):
                 n.devbox.managed_storage(info)
             stats[enclosing].f_favail = 10000
             stats[host].f_files, stats[host].f_favail = 100000, 4096
+            ext4 = observed.side_effect
+            observed.side_effect = None
+            observed.return_value = physical.ParentSpace('btrfs', 8 * db.GIB, None, 200 * 1024 ** 2, 16384)
+            with patch.object(physical, 'verify_backing'):
+                proof = n.devbox.storage_mount(build, 8 * db.GIB, info)['managed_storage']
+                self.assertIsNone(proof['host_available_inodes'])
+                self.assertEqual(proof['host_available_metadata_bytes'], 200 * 1024 ** 2)
+            observed.side_effect = ext4
             framed[parent_backing].st_blocks -= 1
             with self.assertRaisesRegex(db.Blocked, 'sparse'):
                 n.devbox.storage_mount(build, 8 * db.GIB, info)

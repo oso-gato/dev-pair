@@ -483,12 +483,19 @@ class DayZeroTests(unittest.TestCase):
         self.assertEqual(subprocess.check_output(['/usr/bin/git', '-C', str(source), 'status', '--porcelain'], text=True), '')
 
     def test_physical_free_inodes_are_distinct_from_future_inner_capacity(self):
-        with (patch.object(day, 'record', return_value=None), patch.object(day.os, 'statvfs') as volume,
+        from managed_backing import ParentSpace
+
+        with (patch.object(day, 'record', return_value=None), patch.object(day, 'physical_space') as volume,
               redirect_stdout(io.StringIO())):
-            volume.return_value = SimpleNamespace(f_bavail=30 * 1024, f_frsize=day.MIB, f_favail=6000)
+            volume.return_value = ParentSpace('ext4', 30 * 1024 * day.MIB, 6000)
             self.assertEqual(self.entry.storage_geometry(), (20480, 262144, 4096))
-            volume.return_value.f_bavail = 20 * 1024
+            volume.return_value = ParentSpace('ext4', 20 * 1024 * day.MIB, 6000)
             with self.assertRaisesRegex(bootstrap.Blocked, 'physical reserve'):
+                self.entry.storage_geometry()
+            volume.return_value = ParentSpace('btrfs', 30 * 1024 * day.MIB, None, 200 * day.MIB, 16384)
+            self.assertEqual(self.entry.storage_geometry(), (20480, 262144, 4096))
+            volume.return_value = ParentSpace('btrfs', 30 * 1024 * day.MIB, None, 100 * day.MIB, 16384)
+            with self.assertRaisesRegex(bootstrap.Blocked, 'Btrfs metadata reserve'):
                 self.entry.storage_geometry()
 
     def test_existing_relabel_marker_runs_the_lower_enforcing_gate(self):

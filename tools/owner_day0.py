@@ -22,6 +22,7 @@ import warnings
 
 from bootstrap import (ATTENDED_ACCESS, ATTENDED_RECEIPT, Blocked, Bootstrap, CORE_ACCESS_CUTOVER, CUTOVER,
                        STATE as BOOTSTRAP, TRUST_SIGNERS, WORKLOAD_ACCESS_CUTOVER)
+from managed_backing import observe as physical_space
 
 REPO = Path(__file__).resolve().parents[1]
 STATE = Path('/var/lib/dev-pair-day0')
@@ -193,8 +194,8 @@ class DayZero:
         protected = record(STATE / 'continuation-progress.json') or record(self.progress)
         report = self.app.status()
         print(f"Host {item['host']} | Fedora 44 | SELinux { {'1': 'enforcing', '0': 'permissive'}.get(item['selinux'], item['selinux'])}")
-        physical = os.statvfs('/var/lib')
-        print(f'Physical /var/lib free {physical.f_bavail * physical.f_frsize // MIB} MiB | {physical.f_favail} inodes')
+        physical = physical_space('/var/lib', Blocked)
+        print(f'Physical /var/lib free {physical.available_bytes // MIB} MiB | {physical.display()}')
         print('Source ' + (protected['source_sha'] if protected else source or 'awaiting the verified owner kit'))
         print('Day 0 phase ' + (protected['phase'] if protected else 'ready for inspection'))
         desired = record(Path(BOOTSTRAP) / 'desired.json') if report['prepared'] else None
@@ -318,16 +319,16 @@ class DayZero:
 
     def storage_geometry(self):
         existing = record(Path('/var/lib/dev-pair-managed-storage.json'))
-        observed = os.statvfs('/var/lib')
-        free = observed.f_bavail * observed.f_frsize // MIB
-        print(f'Physical /var/lib free {free} MiB | {observed.f_favail} inodes.', flush=True)
+        observed = physical_space('/var/lib', Blocked)
+        free = observed.available_bytes // MIB
+        print(f'Physical /var/lib free {free} MiB | {observed.display()}.', flush=True)
         if existing:
-            require(free >= 8192 and observed.f_favail >= existing['reserve_inodes'],
-                    'The enrolled host lacks its physical recovery reserve.')
+            observed.check(8192 * MIB, existing['reserve_inodes'], Blocked,
+                           'The enrolled host lacks its physical recovery reserve.')
             return existing['filesystem']['mib'], existing['filesystem']['inodes'], existing['reserve_inodes']
         size = min(20480, ((free - 9216) // 256) * 256)
-        require(size >= 16384 and observed.f_favail >= 4096 + 16,
-                'The inspected /var/lib filesystem lacks managed capacity plus the required 8 GiB physical reserve.')
+        observed.check((16384 + 9216) * MIB, 4096 + 16, Blocked,
+                       'The inspected /var/lib filesystem lacks managed capacity plus the required 8 GiB physical reserve.')
         print(f'This host can reserve a {size} MiB managed filesystem for the pair.', flush=True)
         return size, 262144, 4096
 
