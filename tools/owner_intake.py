@@ -27,6 +27,7 @@ import job_protocol as p
 import product_job as product
 import provider_billing as billing
 from ledger_recovery import read_private, sync_directory, trusted_directory, write_private
+from renewal import DispatchDeferred as RenewalDispatchDeferred
 from startup_delivery import IDS, load_private
 
 SITE = Path('/etc/dev-pair/product-intake')
@@ -497,12 +498,10 @@ class Intake:
         if not os.path.lexists(root):
             return None
         root = trusted_directory(root)
-        p.require(product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE)) == plan,
+        p.require(plan['job_id'] == job and product.plan(read_private(root / 'plan.json', p.MAX_MESSAGE)) == plan,
                   'The published product plan differs from the confirmed agreement.')
         state = product.read_progress(root) if progress else product.read_state(root)
-        p.require(state['job_id'] == job and state['agreement_sha256'] == product.agreement_sha(plan) and
-                  state['repository'] == plan['agreement']['repository'] and state['startup_sha256'] == plan['startup_sha256'],
-                  'The published product state differs from the confirmed agreement.')
+        product.require_state_plan(state, plan)
         return state
 
     def recovery(self, saved):
@@ -517,7 +516,14 @@ class Intake:
         self.save(job, saved)
 
     def schedule(self, job, saved, deadline):
-        p.require_workload_access(self.root)
+        fence = product.workload_renewal_fence(self.root)
+        if fence is not None:
+            if saved['phase'] == 'submitted':
+                try:
+                    product.observe_workload_renewal(job, saved['plan'], fence)
+                except BlockingIOError:
+                    return  # The product worker still owns this job's state.
+            return
         wake_product = False
         if saved['phase'] == 'blocked' and 'recovery' not in saved and saved['diagnostics'] in LEGACY_SCHEDULING_FAILURES:
             state = self.published(job, saved['plan'])
@@ -539,7 +545,8 @@ class Intake:
             return
         entry = self.recovery(saved)
         now = int(time.monotonic())
-        if now < entry['after']:
+        previous_after = entry['after']
+        if now < previous_after:
             return
         if entry['queue_attempts'] >= QUEUE_ATTEMPTS or (not wake_product and entry['prepare_attempts'] >= PREPARE_ATTEMPTS):
             self.block(job, saved, 'Automatic scheduling recovery reached its limit. The confirmed plan and job evidence are retained.')
@@ -550,6 +557,11 @@ class Intake:
         if wake_product:
             try:
                 self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline)
+            except RenewalDispatchDeferred:
+                entry['queue_attempts'] -= 1
+                entry['after'] = previous_after
+                self.save(job, saved)
+                return
             except DispatchDeferred:
                 return
             saved['scheduled_boot'] = entry['boot']
@@ -563,7 +575,7 @@ class Intake:
             self.save(job, saved)
 
     def reconcile(self):
-        p.require_workload_access(self.root)
+        product.workload_renewal_fence(self.root)
         end = time.monotonic() + 20
         queue = trusted_directory(self.queue)
         for count, path in enumerate(queue.glob('*.json'), 1):
@@ -623,8 +635,6 @@ class Intake:
         try:
             self.stage(job, record)
         except (OSError, ValueError, RuntimeError, KeyError, ImportError, subprocess.SubprocessError, DispatchDeferred) as exc:
-            from renewal import DispatchDeferred as RenewalDispatchDeferred
-
             deferred = isinstance(exc, (BlockingIOError, DispatchDeferred, RenewalDispatchDeferred))
             with self.lock():
                 if deferred:

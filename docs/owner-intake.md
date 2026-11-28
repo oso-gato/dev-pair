@@ -80,7 +80,10 @@ product state is eligible. When the conductor records a protected renewal
 fence, the recovery timer checks for verified dispatch and restarts that same
 job after thaw, including on the same boot. The product entry checks the staged
 plan against the confirmed agreement before it can schedule work. Waiting at
-the fence uses no schedule attempts. Restart uses the remaining schedule
+the fence uses no schedule attempts. When the current protected renewal closes
+workload access, the timer can record the hold for an acknowledged job whose
+worker has yet to observe it. Work dispatch still requires verified access on
+the selected runtime. Restart uses the remaining schedule
 allowance and retains any deadline for an earlier product error. An exhausted
 wait recorded before this behavior stays available for inspection. Its record
 identifies the last error, so a separate recovery review must check the exact

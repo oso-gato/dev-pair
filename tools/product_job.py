@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Submit and follow a protected dev-pair product job."""
 import argparse
+import contextlib
 import fcntl
 import json
 import os
@@ -95,6 +96,14 @@ def durable_json(path, value):
 
 def agreement_sha(value):
     return p.identity({'adapter': value['adapter'], **value['agreement']})
+
+
+def require_state_plan(state, value):
+    p.require(type(state) is dict and state.get('job_id') == value['job_id'] and
+              state.get('agreement_sha256') == agreement_sha(value) and
+              state.get('repository') == value['agreement']['repository'] and
+              state.get('startup_sha256') == value['startup_sha256'],
+              'The published product state differs from the confirmed agreement.')
 
 
 def source_approval(value):
@@ -696,10 +705,7 @@ def retry_available(retry, now):
     return retry is None or (retry['automatic'] and now < retry['until_unix'])
 
 
-def record_renewal_wait(root, state, reason, now):
-    previous = state.get('retry')
-    if reason != 'renewal-observation' or not retry_available(previous, now):
-        return False
+def protected_renewal_fence(root):
     directory = root / 'renewal-fence'
     try:
         node = directory.lstat()
@@ -708,10 +714,41 @@ def record_renewal_wait(root, state, reason, now):
         fence = p.loads(read_private(directory / 'frozen', 128))
         p.token(fence)
     except (OSError, ValueError):
+        return None
+    return fence
+
+
+def workload_renewal_fence(root):
+    """Allow renewal bookkeeping when a protected current fence holds workload access."""
+    from renewal import Renewal
+
+    try:
+        p.require_workload_access(root)
+    except (OSError, ValueError):
+        fence = protected_renewal_fence(root)
+        if fence == 'boot':
+            return fence
+        if fence is not None:
+            try:
+                attempt, _ = Renewal(root, None).transition()
+            except (OSError, ValueError):
+                pass
+            else:
+                if attempt is not None and attempt.name == fence:
+                    return fence
+        # Access may have been re-admitted and the marker cleared between reads.
+        p.require_workload_access(root)
+    return None
+
+
+def record_renewal_wait(state, fence, now):
+    previous = state.get('retry')
+    if fence is None or not retry_available(previous, now):
         return False
-    if previous and previous['phase'] == state['phase'] and previous.get('renewal_only') is True:
+    phase = previous['phase'] if state['phase'] == 'waiting' else state['phase']
+    if previous and previous['phase'] == phase and previous.get('renewal_only') is True:
         del state['retry']
-    state['renewal_wait'] = {'phase': state['phase'], 'fence': fence}
+    state['renewal_wait'] = {'phase': phase, 'fence': fence}
     state['phase'] = RENEWAL_WAIT
     return True
 
@@ -736,8 +773,8 @@ def pending_renewal(state):
     return wait
 
 
-def work(job):
-    p.require_workload_access(ROOT)
+@contextlib.contextmanager
+def locked_job_state(job):
     root = trusted_directory(job_path(job))
     value = plan(read_private(root / 'plan.json', p.MAX_MESSAGE))
     p.require(value['job_id'] == job, 'durable product plan identity changed')
@@ -747,9 +784,41 @@ def work(job):
         p.private_file(lock_path)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         state = read_state(root)
+        require_state_plan(state, value)
+        yield root, value, state
+
+
+def park_workload_renewal(root, state, fence):
+    if state['phase'] in TERMINAL or pending_renewal(state) is not None:
+        return
+    if record_renewal_wait(state, fence, int(time.time())):
+        durable_json(root / 'state.json', state)
+    elif state['phase'] == 'waiting' and state['retry']['automatic']:
+        state['retry']['automatic'] = False
+        durable_json(root / 'state.json', state)
+
+
+def observe_workload_renewal(job, expected_plan, expected_fence):
+    """Record a hold for acknowledged work even if the worker never observed it."""
+    with locked_job_state(job) as (root, value, state):
+        p.require(value == expected_plan, 'The published product plan differs from the confirmed agreement.')
+        try:
+            fence = workload_renewal_fence(ROOT)
+        except (OSError, ValueError):
+            return
+        if fence == expected_fence:
+            park_workload_renewal(root, state, fence)
+
+
+def work(job):
+    with locked_job_state(job) as (root, value, state):
         if state['phase'] in TERMINAL:
             return state
         wait = pending_renewal(state)
+        fence = workload_renewal_fence(ROOT)
+        if fence is not None:
+            park_workload_renewal(root, state, fence)
+            return state
         if wait is not None:
             if not renewal_dispatch_ready(ROOT):
                 return state
@@ -776,7 +845,8 @@ def work(job):
             retry = pause_reason(exc)
             if retry is not None:
                 now = int(time.time())
-                if not record_renewal_wait(ROOT, state, retry, now):
+                fence = protected_renewal_fence(ROOT) if retry == 'renewal-observation' else None
+                if not record_renewal_wait(state, fence, now):
                     record_pause(state, retry, now)
             else:
                 state['failed_stage'] = state['phase']
@@ -788,8 +858,15 @@ def work(job):
         return state
 
 
+def require_product_scheduling_access():
+    if workload_renewal_fence(ROOT) is not None:
+        from renewal import DispatchDeferred
+
+        raise DispatchDeferred('Product scheduling is held by renewal.')
+
+
 def submit(path, *, expected_plan=None, deadline=None):
-    p.require_workload_access(ROOT)
+    require_product_scheduling_access()
     raw = candidate.protected_file(path)
     value = plan(raw)
     p.require(expected_plan is None or value == expected_plan, 'The staged product request is bound to another plan.')
@@ -812,6 +889,7 @@ def submit(path, *, expected_plan=None, deadline=None):
             sync_directory(parent)
     target = trusted_directory(target)
     p.require(plan(read_private(target / 'plan.json', p.MAX_MESSAGE)) == value, 'job ID is already bound to another brief')
+    require_product_scheduling_access()
     end = time.monotonic() + 10
     candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-product@' + value['job_id'] + '.service'],
                      end if deadline is None else min(end, deadline))

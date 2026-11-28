@@ -501,7 +501,8 @@ class ProductJobTests(unittest.TestCase):
         job.write_private(path / 'plan.json', p.canonical(self.value).encode())
         initial = {'candidate': {'source_revision': self.value['agreement']['initial_commit']}}
         state = dict.fromkeys(('maintenance', 'first', 'development', 'repair', 'final'))
-        state.update(job_id='demo', phase='maintenance-turn', initial=initial)
+        state.update(job_id='demo', phase='maintenance-turn', initial=initial, agreement_sha256=job.agreement_sha(self.value),
+                     startup_sha256=self.value['startup_sha256'], repository=self.value['agreement']['repository'])
         job.write_private(path / 'state.json', p.canonical(state).encode())
         return catalogue, path, initial
 
