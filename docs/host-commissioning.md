@@ -14,10 +14,21 @@ identity programmatically. The owner uses the same front-door resume command
 when the protected installation settles.
 
 The controller reuses a single eligible full platform already in protected
-intake. When intake is empty, an attended resume uses the protected release
-trust and GitHub read identity to acquire a full release for the exact reviewed
-source. The signed host bundle binds the fixed installation manifest. The
-authenticated source checkout binds the fixed checklist recipe.
+intake. When intake is empty, attended resume enrolls the independent release
+custodian's handoff and protected GitHub read identity. The custodian uses
+`tools/release_setup.py prepare --help` in their own verified checkout to see
+the required exact source, selected machine, GitHub roles and independently
+verified checklist base inputs. They convey the resulting protected handoff and
+its SHA-256 separately. On the host, give `./day0.sh resume` the handoff path,
+its SHA-256 and the scoped GitHub read token when prompted. The independently
+administered branch, required check, reviewer and protected publication
+controls must already be in effect. [Platform publication](platform-release.md#independent-release-authority)
+
+Intake acquires a signed full publication for the exact source from protected
+`main`. The signed host bundle binds the fixed installation manifest, and the
+authenticated source checkout binds the fixed checklist recipe. A draft source
+kit can complete standalone setup. Full commissioning waits for the separately
+authorized and eligible signed publication.
 
 The controller reuses an approved site profile for the inspected host. On a
 fresh installation, it derives the first host and site profiles from the
@@ -45,19 +56,17 @@ approved agent publisher and successful read access to protected main and its
 fixed workflow. An empty run list can qualify the schedule. The bridge
 verifies signed artifacts before it offers a compatible release to renewal.
 
-This stage uses the approved owner catalogue and slot profiles to activate
-owner intake. The protected root terminal can run the first-catalogue wizard
-when the approved repository checkout, startup and private standards inputs,
-provider authority and reviewed billing evidence are available. A missing or
-expired grant requires the authorized provider custodian. A fresh site also
-needs controlled repository and startup provisioning and a source for the
-normalized billing evidence. [First owner setup](owner-day0.md#resume-and-recovery)
+When the selected platform is ready, Day 0 asks for the independent workload
+access review. After that review succeeds, accept the offer to set up the first
+owner job. The wizard acquires the authorized repository and pinned startup
+inputs, reads independently signed provider terms and shows the exact site
+selection before confirming the catalogue. A missing or expired grant needs a
+current approval from the authorized custodian. [First owner setup](owner-intake.md#repository-and-slot-inputs)
 
-A `pending` result names the specific prerequisite, such as available storage,
-protected release trust, GitHub read custody or an eligible attested
-publication. A `source-gap` identifies missing intake code or protected inputs
-that the controller cannot reconstruct from existing authority. The completed
-local maintenance probe remains available while those prerequisites settle.
+A `pending` result names the prerequisite to resolve, such as storage,
+protected release trust, GitHub read custody or an eligible attested publication.
+The completed offline maintenance probe remains available while commissioning
+waits. Keep the recorded state and resume the same source.
 
 For diagnostics, the internal controller supports `discover` and `status` on
 the verified checkout. `prepare` verifies and retains the policy without

@@ -11,11 +11,11 @@ storage and the live connection before it prepares the maintenance gateway.
 It asks for the named `core` password in the terminal with echo disabled.
 
 <a id="dr11-2"></a>
-**DR11.2** For the first run, paste the command supplied for the published
-offline maintenance bootstrap as a single action. The block below is the
-template for that command and takes the full reviewed commit in place of
-`REPLACE_WITH_REVIEWED_COMMIT`. Its last command opens the installer prompts.
-You can also start from the separately verified [offline source kit](docs/owner-day0.md#optional-offline-source-kit).
+**DR11.2** Start from the separately verified [offline source kit](docs/owner-day0.md#optional-offline-source-kit).
+When the exact reviewed source is available through GitHub, the command below
+also fetches it into a protected checkout and opens the installer prompts.
+Use the full reviewed commit provided with the delivery in place of
+`REPLACE_WITH_REVIEWED_COMMIT`.
 
 ```sh
 (
@@ -66,14 +66,12 @@ leaving the network name blank. Keep the original access route until independent
 recovery and tailnet-only SSH have been verified.
 
 <a id="dr11-4"></a>
-**DR11.4** The first bootstrap verifies the public build context, builds the
-confined maintenance gptbox and verifies both offline probe cycles. After that
-checkpoint, keep the original checkout and protected state. Use the separately
-reviewed continuation in its own `/root/dev-pair-day0-<commit>/dev-pair` checkout
-and run `./day0.sh resume` there. The continuation guides independent access
-review, protected commissioning and first owner setup as their prerequisites
-become available. Native setup and external observations on the selected VPS
-remain to be verified. [Day-zero operations](docs/owner-day0.md)
+**DR11.4** Keep this checkout for the entire fresh installation. After the offline
+maintenance checks, the same `./day0.sh resume` continues independent access review,
+protected commissioning and first owner setup. Source is delivered as a draft. Full
+commissioning requires a separately authorized signed publication from protected `main`
+for the exact source. The complete native owner journey and independent observations on
+the selected VPS still require verification. [Day-zero operations](docs/owner-day0.md)
 
 <a id="dr0"></a>
 ## DR0 — Overview
@@ -86,7 +84,7 @@ remain to be verified. [Day-zero operations](docs/owner-day0.md)
 ## DR1 — Project documentation
 
 <a id="dr1-1"></a>
-**DR1.1** The development restart has four local starting documents:
+**DR1.1** Read the four local starting documents in the order below.
 
 | Clause | Document | Purpose |
 |---|---|---|
@@ -99,7 +97,7 @@ remain to be verified. [Day-zero operations](docs/owner-day0.md)
 **DR1.6** Governance and engineering standards live in the private `oso-gato/standards` repository. Both are referenced at the same full commit SHA, alongside the repository setup guide, in STANDARDS. Neither shared rules document is copied here. A central update does not automatically change this project's adopted version.
 
 <a id="dr1-7"></a>
-**DR1.7** Read this README, STANDARDS, its three pinned shared documents, then REQUIREMENTS and ARCHITECTURE before work. Authorized access to the private standards is required, or a verified execution cache of the exact revision. Report an access blocker if those documents cannot be loaded. Runtime enforcement of this entry procedure remains to be built and tested.
+**DR1.7** Read this README, STANDARDS, its three pinned shared documents, then REQUIREMENTS and ARCHITECTURE before work. Authorized access to the private standards is required, or a verified execution cache of the exact revision. Report an access blocker if those documents cannot be loaded. Owner intake verifies the startup corpus for admitted jobs. The full native job journey still requires verification.
 
 <a id="current-status"></a>
 <a id="dr2"></a>
@@ -143,7 +141,7 @@ remain to be verified. [Day-zero operations](docs/owner-day0.md)
 **DR4.1** DevBox is the stable Podman development container hosting its Distrobox-based Codex gptbox. It implements the agreed product and runs function/unit, integration and end-to-end checks wherever its environment is sufficient. Checks requiring the real VPS go to the maintenance agent through a durable request. That agent returns results and diagnostics; DevBox repairs failures and requests retesting until acceptance passes or agreed limits produce a clear blocker. Independent review and verification at the delivery destination complete the loop.
 
 <a id="dr4-2"></a>
-**DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. Offline candidate preparation records proposed boundaries; their runtime enforcement and the remaining lifecycle capabilities are not implemented or verified.
+**DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. The component record describes the implementation checks so far. Native enforcement and the full lifecycle still require verification on the selected VPS. [Component history](docs/status-history.md)
 
 <a id="first-working-milestone"></a>
 <a id="dr5"></a>
@@ -166,7 +164,7 @@ remain to be verified. [Day-zero operations](docs/owner-day0.md)
 ## DR7 — Required platform self-update
 
 <a id="dr7-1"></a>
-**DR7.1** Dev-pair must repair platform defects encountered during its own development or other product jobs. DevBox requests its replacement with a verified Podman image; the maintenance side performs the replacement and restores every active session to actual work. Host configuration and maintenance-agent updates follow the same recorded-target, checkpoint, verification and recovery discipline. See REQUIREMENTS R9 and ARCHITECTURE A8. These capabilities are required but not yet implemented.
+**DR7.1** Dev-pair must repair platform defects encountered during its own development or other product jobs. DevBox requests its replacement with a verified Podman image; the maintenance side performs the replacement and restores every active session to actual work. Host configuration and maintenance-agent updates follow the same recorded-target, checkpoint, verification and recovery discipline. See REQUIREMENTS R9 and ARCHITECTURE A8. The controlled replacement and recovery paths have component coverage. The full platform repair and session-resumption journey still requires native verification.
 
 <a id="dr8"></a>
 ## DR8 — Later hosted applications
@@ -178,7 +176,7 @@ remain to be verified. [Day-zero operations](docs/owner-day0.md)
 ## DR9 — Agent freshness and stable platform releases
 
 <a id="dr9-1"></a>
-**DR9.1** The two active agent environments rebuild nightly from verified official stable tooling, with cached inputs and complete session restoration. Host and DevBox releases run on separate, slower tested change cycles. Requirements R11 and architecture A10 define the contract. Model availability is checked separately from CLI/image version; these capabilities have not yet been adapted and verified in this restart. Existing Claudebox implementations in fedora-bootstrap and fedora-dev are linked in A11; they are the reference for the Codex adaptation.
+**DR9.1** The two active agent environments rebuild nightly from verified official stable tooling, with cached inputs and complete session restoration. Host and DevBox releases run on separate, slower tested change cycles. Requirements R11 and architecture A10 define the contract. The agent publication bridge checks protected scheduled and on-demand runs and offers an exact candidate to renewal. Activation requires independent observation and continuity checks. Verify both placements and restoration on the selected VPS before accepting the nightly cycle. Model availability is checked separately from CLI and image version. A11 retains the earlier Claudebox implementations as references. [Agent publication and renewal](docs/agent-release-bridge.md)
 
 <a id="dr10"></a>
 ## DR10 — Development sessions and launch brief

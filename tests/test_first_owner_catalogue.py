@@ -271,7 +271,7 @@ class FirstCatalogueTests(unittest.TestCase):
         with mock.patch.object(owner, 'Intake', return_value=self.intake):
             authority = live.owner_feature_authority(SELECTED, None)
         self.assertEqual((authority['subject'], authority['expires_unix']), (JOB, self.options.expires_unix))
-        live.checklist_builder.assert_called_once_with(prepare=False)
+        live.checklist_builder.assert_called_once_with(prepare=True)
         config_inode = self.first.catalogue.stat().st_ino
         self.assertEqual(self.first.initialize(self.options)['phase'], 'configured')
         self.assertEqual(self.first.catalogue.stat().st_ino, config_inode)

@@ -1,117 +1,110 @@
 # Day-zero operations from hPanel
 
-For a first run, paste the command supplied for the published offline
-maintenance bootstrap into the chosen VPS root terminal in hPanel. It follows
-the [README acquisition command](../README.md#dr11-2) and pins the
-[published bootstrap source](https://github.com/oso-gato/dev-pair/tree/11fbe9e0e0ff911fce13e33527c55020958a50a7).
-If the terminal lacks a controlling TTY, reopen an interactive terminal and run
-the same command. The installer uses a local pseudo-terminal when available and
-discards its transcript.
+Open the selected Fedora 44 VPS root terminal in hPanel and keep an independent
+provider recovery session available. Start from the exact reviewed draft source
+using the [source kit](#optional-offline-source-kit) or the [README acquisition command](../README.md#dr11-2).
+Use the same checkout throughout fresh setup.
+
+```sh
+./day0.sh start
+./day0.sh status
+./day0.sh resume
+```
+
+Run `start` once to open setup. Run `status` to see the recorded phase and
+`resume` to continue after a pause, a reboot or an independent handoff. If a
+prompt requires a controlling TTY, reopen an interactive root terminal and run
+`resume`. The installer uses a local pseudo-terminal when available and discards
+its transcript.
 
 ## Resume and recovery
 
-From the protected checkout, run `./day0.sh status` to read the recorded phase
-and inspect the live host. Run `./day0.sh resume` to continue. Its machine-bound
-progress survives the setup reboot. Keep the provider recovery terminal available.
+Begin with the approved operator account, the owner's GitHub public keys and the
+selected tailnet. The named `core` console and sudo password is entered without
+echo. Press Enter at the Tailscale auth-key prompt to use browser sign-in. Leave
+the tailnet name blank to defer enrollment. Setup checks Fedora, the selected
+host, storage and SELinux and can resume a checked relabel across setup reboots.
+The confined maintenance gptbox must complete both offline probe cycles before
+commissioning proceeds.
 
-Finish building the confined maintenance gptbox and passing both offline
-probe cycles with the original checkout. If interrupted, resume that checkout
-until the maintenance checkpoint completes. Retain the checkout, the protected
-journals and the sealed image. When you receive a separately reviewed
-continuation, use its pinned acquisition command in the same root terminal.
-It stages the new revision in its own `/root/dev-pair-day0-<full-commit>/dev-pair`
-checkout and runs `./day0.sh resume` there. Keep the original checkout at its
-standard path. The public checkout uses the full commit in its path and the
-offline kit uses the first 12 characters. The continuation checks the earlier
-completed maintenance proof and source, reuses the sealed image and named
-`core` setup, and records the new controller identity.
+During initial setup the installer scopes temporary SSH to the observed live
+peer when the hPanel terminal uses SSH. In a local hPanel console it displays a
+challenge. Open a second hPanel root terminal on the same VPS, run the displayed
+command and enter the challenge there. This confirms a separate local session
+on the same machine and boot. An already available independently signed provider
+proof can authorize the zero-public-SSH route. Keep provider recovery available
+until authorized tailnet access and independent recovery have been measured.
 
-During initial setup the installer scopes temporary SSH to an observed live peer
-when the hPanel terminal uses SSH. In a local hPanel console it displays a short
-challenge. Open a second hPanel root terminal for the same VPS and run the
-command displayed on screen. Enter the challenge there, then continue in the
-first terminal. This confirms a separate local session on the same machine and
-boot. The existing SSH route stays available during setup. The new `core` SSH
-login is restricted to tailnet sources and destinations. An already available
-independently signed provider proof can instead authorize the zero-public-SSH
-setup route. The final access review still checks external reachability.
+After enrollment, `resume` asks for the independent access verifier's signing
+public key, its station's Tailscale IP, its dedicated SSH transport account and
+its pinned SSH host public key. Give the station operator the request transport
+public key displayed by setup. The station operator admits it for the selected
+VPS. A later `resume` sends the exact request or picks up its signed reply. The
+verifier checks named `core` SSH, public and unauthorized tailnet denial, loss
+and recovery, and the independent provider terminal. The host checks the reply
+against the current machine, boot, tailnet node and keys before closing the
+initial SSH route. [Independent access verification](destination-observation.md#review-the-named-ssh-and-workload-routes)
 
-After tailnet enrollment, keep the independent provider recovery terminal
-available and test `core` SSH from your tailnet. In the selected root terminal,
-run `./day0.sh access-request > ../access-request.json` from the verified checkout.
-Send the generated request to your independent access verifier on the
-authenticated controller channel. The verifier checks the actual named
-administrator, outside clients and provider recovery and returns one signed
-bundle. Place it beside the checkout and run
-`./day0.sh access-response < ../signed-access.bundle` in the selected
-root terminal. The installer verifies the bundle against the live machine, boot,
-tailnet node and keys before closing the initial SSH route. Run `./day0.sh resume`
-to continue. [Independent access verification](destination-observation.md)
-
-If cutover stopped partway through, return a fresh bundle for the same pending
-scope, boot and route. After a reboot or when the earlier scope cannot be
-established, use a fresh administrator-only bundle verified from the independent
-provider terminal. Run `./day0.sh access-response --recover-cutover < ../signed-access.bundle`
-there. The installer keeps the previous journal, preserves the current ingress
-restrictions and holds workloads until their separate access review is complete.
-
-Protected commissioning requires the signed full platform release for the
-reviewed source, a protected site policy and the applicable release trust and
-read authority. After commissioning installs the role images, run
-`./day0.sh access-request --workloads > ../workload-access-request.json` to
-request a separate review of those images and the selected DevBox placement.
-The independent verifier runs the confined role checks through the named
-`core` tailnet SSH path and returns a signed workload bundle. Apply it in
-the selected root terminal with
-`./day0.sh access-response < ../signed-workload-access.bundle`, then run
-`./day0.sh resume`. Provider and owner intake grants still control normal jobs.
-[Commissioning](host-commissioning.md)
-
-When a replacement changes the selected role release or images, the existing
-approval holds job and application dispatch until a fresh workload review
-binds the replacement. A protected rollback can reuse the retained approval
-for its exact previous placement. An unattended replacement also needs a
-prospective observation route to test the candidate before changing the live
-selection. Optional owner and provider activation needs its own supported
-policy transition and approved grants.
-
-On a previously reviewed legacy host, resume verifies the stored full cutover
-and can retain the managed release recorded when that review was accepted. A
-standalone review keeps its original scope when commissioning adds the first
-managed release. That release gets a fresh signed workload review. If you moved
-from an approved earlier checkout, the installer retains its completed cutover
-record and binds the new workload review to the verified continuation source.
-
-When Day 0 reports that owner intake is waiting for the first catalogue, use the
-protected root terminal. First arrange the approved repository acquisition,
-startup checkout and pinned private standards. The direct OpenAI API profile
-requires a root-private credential in authorized custody, an approved allowance
-with a cap and expiry, and independently reviewed machine-readable billing
-evidence for the account and model. The evidence binds the full billable
-context, applicable rates and authorized response model names. Repository and
-startup provisioning and issuance of those normalized billing records still
-need a controlled path on a fresh host. Keep credential values outside the
-terminal, source and artifacts.
+If the independent station is reached through an approved offline handoff, leave
+its IP blank. In the protected root terminal, export the request beside the
+checkout, convey it over the authenticated controller channel, and import the
+verifier's signed response.
 
 ```sh
-/usr/bin/python3 -IB /usr/libexec/dev-pair/tools/owner_intake.py --setup-site
+./day0.sh access-request > ../access-request.json
+./day0.sh access-response < ../signed-access.bundle
+./day0.sh resume
 ```
 
-The wizard asks for the approved repository, workload, credential reference,
-job budget and expiry. Check the displayed checkout and startup revisions,
-destination and bounded API use for both roles. Type `yes` to confirm that
-exact setup or press Enter to leave it pending. After confirmation, run
-`./day0.sh resume` from the continuation checkout. When the owner terminal is
-ready, connect as `core` over the verified tailnet route and use the
-[owner terminal command](owner-intake.md).
+If cutover stops partway through, obtain a fresh bundle for the same pending
+scope, boot and route. After reboot, or when the earlier scope cannot be
+established, get a fresh administrator-only bundle verified from the independent
+provider terminal. Run `./day0.sh access-response --recover-cutover < ../signed-access.bundle`
+there. The installer preserves the previous journal and current ingress
+restrictions and holds workloads for their separate access review.
+
+Protected commissioning requires an independently authorized, signed full
+platform publication for the exact source. At the release prompt, supply the
+custodian's protected handoff path and separately conveyed SHA-256. When asked,
+enter the scoped GitHub read token at the hidden prompt. A draft checkout or
+kit can reach this point before protected publication. Resume when the eligible
+signed publication is available. [Host commissioning](host-commissioning.md)
+
+After commissioning installs the role images, `resume` uses the same station
+for a separate signed review of both roles and the selected DevBox placement.
+For the offline path, export with `./day0.sh access-request --workloads`, return
+the signed workload bundle via `./day0.sh access-response` and resume. Keep
+operator recovery available throughout. A replacement that changes the selected
+role release or images needs a fresh scope for those bytes and placement. A
+protected rollback can reuse the retained exact previous approval. An unattended
+agent replacement also needs independently signed prospective observations.
+
+At the first owner setup prompt, select the approved project repository and
+workload. Follow the prompts for exact source and startup revisions, approved
+read access and pinned private standards. Use a registered OpenAI project
+credential reference with independently signed billing terms in protected custody.
+Check the displayed revisions, destination, role settings, budget cap and UTC
+expiry before confirming. Resume to finish activation, then connect as `core`
+over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
+
+## Previously installed November 27 bootstrap
+
+A host already seeded at
+[11fbe9e0e0ff911fce13e33527c55020958a50a7](https://github.com/oso-gato/dev-pair/tree/11fbe9e0e0ff911fce13e33527c55020958a50a7)
+can resume that checkout to complete its original offline maintenance proof.
+Keep that checkout at its original path along with the protected journals and
+sealed image. Stage the current reviewed source in its own protected checkout
+and run `./day0.sh resume` there. The compatibility path verifies the earlier
+source and proof, reuses the maintained image and operator setup, and records
+the current controller identity. Existing standalone cutover evidence keeps
+its scope. The first managed release gets its own signed workload access review.
 
 ## Optional offline source kit
 
-The delivery can include a deterministic source archive with the exact source
-commit and shallow Git objects. In the protected hPanel root directory, verify
-the archive against the SHA-256 supplied separately by the reviewer. Then unpack
-it into a fresh directory, check `MANIFEST.sha256`, enter the enclosed `dev-pair`
-checkout and run `./day0.sh start`. The installer verifies the kit again before
-installing the signed Fedora Git prerequisite. It checks the full checkout commit
-before any further host setup. The public-input verification and Tailscale steps
-use their normal network services after source acquisition.
+The deterministic kit contains the exact source commit and shallow Git objects.
+In the protected hPanel root directory, verify it against the SHA-256 conveyed
+separately by the reviewer. Unpack it into a fresh directory, check
+`MANIFEST.sha256`, enter the enclosed `dev-pair` checkout and run `./day0.sh start`.
+The installer verifies the kit again before installing the signed Fedora Git
+prerequisite, then checks the full checkout commit. Public-input verification
+and Tailscale use their normal network services after source acquisition.
