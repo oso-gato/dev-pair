@@ -23,6 +23,7 @@ from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Comma
                        ACCESS_MODE, ATTENDED_ACCESS, SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
+import fedora_rpm_cache
 from gptbox_runtime import (JOB, JOB_READONLY_MOUNTS, OPERATION, REPOSITORY_APPROVALS, RUNTIME_SCRATCH_MIB, TURN_READONLY_MOUNTS,
                            git_output, host_job_inputs, kernel_text, repository_origin, verify_offline_runtime,
                            verify_runtime_scratch)
@@ -82,8 +83,28 @@ DEVELOPMENT_TIMED_EXEC = (
     'left=$((end - now - 1 - 10)); limit=$((max - 10)); '
     '[ "$left" -le "$limit" ] || left=$limit; [ "$left" -gt 0 ] || exit 124; '
     'set -- "${left}s" "$@"; ' + candidate.OCI_TIMEOUT)
+# Match the pinned upstream setup_dnf availability resolution; aliases
+# absent from Fedora's architecture-specific metadata are not forced.
+PACKAGE_DEPENDENCIES = ('bash bash-completion bc bzip2 cracklib-dicts curl diffutils dnf-plugins-core findutils '
+                'glibc-all-langpacks glibc-common glibc-locale-source gnupg2 gnupg2-smime hostname iproute '
+                'iputils keyutils krb5-libs less lsof man-db man-pages mtr ncurses nss-mdns openssh-clients '
+                'pam passwd pigz pinentry procps-ng rsync shadow-utils sudo tcpdump time traceroute tree '
+                'tzdata unzip util-linux util-linux-script vte-profile wget wget2-wget which whois words '
+                'xorg-x11-xauth xz zip mesa-dri-drivers mesa-vulkan-drivers vulkan')
+PACKAGE_SCRIPT = ('set -eu; dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates upgrade; for file in /etc/dnf/dnf.conf /etc/yum.conf; do '
+                  'if [ -f "$file" ]; then sed -i "/tsflags=nodocs/d" "$file"; fi; done; dnf -q --setopt=gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates list '
+                  + PACKAGE_DEPENDENCIES + ' > /tmp/upstream-packages; '
+                  'grep -v Packages /tmp/upstream-packages | grep "$(uname -m)" | cut -d" " -f1 > /tmp/resolved-packages; '
+                  'test -s /tmp/resolved-packages; '
+                  'dnf -y --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates '
+                  'install --allowerasing python3 coreutils $(cat /tmp/resolved-packages); '
+                  'test -d /usr/share/i18n/charmaps; test -f /usr/share/zoneinfo/UTC; '
+                  'locale -a | grep -qi en_us.utf8 || localedef -i en_US -f UTF-8 en_US.UTF-8; '
+                  'mkdir -p /usr/lib/dev-pair/gptbox; '
+                  'rpm -qa --qf "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n" | sort > /usr/lib/dev-pair/gptbox/rpms.txt; '
+                  'rm /tmp/upstream-packages /tmp/resolved-packages; dnf clean all')
 ADAPTER_SOURCE_FILES = ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py',
-                        'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py',
+                        'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'fedora_rpm_cache.py',
                         'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py')
 
 
@@ -198,6 +219,7 @@ class Gptbox(Bootstrap):
 
     def __init__(self, root=Path('/'), run=None):
         super().__init__(root, run or ProbeCommands())
+        self.rpm_cache = None
 
     @property
     def codex_version(self):
@@ -316,6 +338,17 @@ class Gptbox(Bootstrap):
             recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':tools/' + name)
             if recorded.encode() != data:
                 raise Blocked('adapter revision does not identify executing source')
+
+    def load_archive_verifier(self, revision):
+        repo = Path(__file__).resolve().parents[1]
+        relative = 'runtime/devbox/controller.py'
+        path = self.protected(repo / relative)
+        _, _, data = capture_release_file(path, 262144, os.getuid(), contents=True)
+        recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':' + relative)
+        if recorded.encode() != data:
+            raise Blocked('DevBox archive verifier differs from the exact reviewed source')
+        self.archive_verifier = ModuleType('dev_pair_archive_verifier')
+        exec(compile(data, str(path), 'exec'), self.archive_verifier.__dict__)
 
     def ci_producer_source(self):
         source = Path('/root/dev-pair-ci-inputs/dev-pair')
@@ -444,7 +477,7 @@ class Gptbox(Bootstrap):
             self.run.diagnostic = diagnostic
             self.run.metadata_diagnostic = metadata
         try:
-            scope=self.run.adapter_image_launcher(self.target.rsplit('/',1)[-1],self.uid,getattr(self,'failure_diagnostic_identity',None)) if image_diagnostic and isinstance(self.run,Commands) else contextlib.nullcontext()
+            scope=self.run.adapter_image_launcher(self.target.rsplit('/',1)[-1],self.uid,getattr(self,'failure_diagnostic_identity',None),rpm_cache=self.rpm_cache is not None) if image_diagnostic and isinstance(self.run,Commands) else contextlib.nullcontext()
             previous_step=getattr(self.run,'current_step',None)
             try:
                 if image_diagnostic:self.run.current_step='candidate-image'
@@ -592,7 +625,8 @@ class Gptbox(Bootstrap):
             raise Blocked('container identity/image mismatch')
         if host.get('Privileged') or any('label=disable' in str(value) or 'unconfined' in str(value) for value in host.get('SecurityOpt', [])):
             raise Blocked('privilege or confinement bypass in inspected container')
-        network_ok = host.get('NetworkMode') == 'none' if runtime else host.get('NetworkMode') in ('slirp4netns', 'slirp4netns:allow_host_loopback=false')
+        network_ok = (host.get('NetworkMode') == 'none' if runtime or self.rpm_cache
+                      else host.get('NetworkMode') in ('slirp4netns', 'slirp4netns:allow_host_loopback=false'))
         if host.get('PidMode') != 'private' or host.get('IpcMode') != 'private' or host.get('UTSMode') != 'private' or not network_ok:
             raise Blocked('host/shared namespaces are not admitted')
         if host.get('UsernsMode') not in (('private', 'keep-id') if runtime else ('private',)):
@@ -904,6 +938,8 @@ class Gptbox(Bootstrap):
         if (built['kind'] != 'full-adapter-candidate' or built['fedora_base'] != legacy['fedora_base']
                 or (prepared['kind'] == 'full-adapter-candidate' and prepared != built)):
             raise Blocked('local maintenance candidate differs from protected preparation or completion')
+        if 'rpm_cache_manifest_sha256' in built:
+            self.require_maintenance_cache_history(sealed, built['rpm_cache_manifest_sha256'])
         self.prepared_build_files(context, built)
         _, attempt = self.read_config_record(self.target + '/attempt.json')
         count = attempt.get('count')
@@ -1165,13 +1201,99 @@ class Gptbox(Bootstrap):
                 self.engine('rm', '--force', identity)
 
     def recover_image_work(self, expected):
-        work = self.path(self.artifact_root + '/' + expected + '/image-work')
-        if not work.exists() and not work.is_symlink(): return
-        self.protected(work)
-        def reconcile():
-            if isinstance(self.run, Commands):
-                self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
-        fedora_oci.recover_workspaces(work,uid=int(self.uid),reconcile=reconcile)
+        for name in ('image-work', 'assembly-cache'):
+            work = self.path(self.artifact_root + '/' + expected + '/' + name)
+            if work.exists() or work.is_symlink():
+                fedora_oci.recover_workspaces(self.protected(work), uid=int(self.uid),
+                                              reconcile=self.reconcile_rpm_executor)
+
+    def bind_rpm_cache(self, context, expected, revision):
+        marker = self.path(self.target + '/rpm-cache.json')
+        if self.rpm_cache is None:
+            if marker.exists() or marker.is_symlink():
+                raise Blocked('this construction target requires its original RPM cache manifest')
+            return
+        archive, digest = self.rpm_cache
+        self.protected(archive)
+        self.rpm_cache_key = self.protected(Path(context) / 'fedora-key')
+        self.rpm_cache_binding = fedora_rpm_cache.binding(revision, candidate.STANDARDS, sha(PACKAGE_SCRIPT.encode()))
+        if self.role == 'maintenance':
+            self.load_archive_verifier(revision)
+        value = {**self.rpm_cache_binding, 'context_sha256': expected, 'manifest_sha256': raw_digest(digest)}
+        if marker.exists() or marker.is_symlink():
+            prior = self.protected_bytes(marker, 4096, 0o600)
+            if prior != image_inputs_bytes(value):
+                raise Blocked('construction target RPM cache identity changed')
+        else:
+            if any(os.path.lexists(self.path(self.target + '/' + name))
+                   for name in ('attempt.json', 'candidate-image.json', 'result.json', 'publication.json')):
+                raise Blocked('existing construction target has no RPM cache binding')
+            self.record('rpm-cache', value)
+
+    def unpack_rpm_cache(self, workspace):
+        archive, digest = self.rpm_cache
+        deadline = time.monotonic() + 120
+        if isinstance(self.run, Commands):
+            deadline = min(deadline, self.run.execution_deadline() or deadline)
+        cache = workspace / 'rpm-cache'
+        cache.mkdir(mode=0o755)
+        return fedora_rpm_cache.unpack(self.protected(archive), digest, self.rpm_cache_binding, cache,
+                                      self.rpm_cache_key, deadline)
+
+    def reconcile_rpm_executor(self):
+        if isinstance(self.run, Commands):
+            self.run.reconcile_native(('--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit,
+                                       '--uid=dp-maint'), {})
+
+    def stage_assembly_cache(self, stage, expected):
+        work = self.artifact_root + '/' + expected + '/assembly-cache'
+        self.directory(work, mode=0o755)
+        with fedora_oci.copy_workspace(self.path(work), verification=True,
+                                       reserve=8 * 1024 ** 3 + fedora_rpm_cache.WORK_PEAK,
+                                       reconcile=self.reconcile_rpm_executor) as private:
+            cache = self.unpack_rpm_cache(private)
+            config = private / fedora_rpm_cache.DROPIN_NAME
+            config.write_bytes(fedora_rpm_cache.DROPIN)
+            config.chmod(0o444)
+            self.engine('cp', '--archive=false', str(cache) + '/.', stage + ':' + fedora_rpm_cache.ROOT, timeout=120)
+            self.engine('cp', '--archive=false', str(config), stage + ':' + fedora_rpm_cache.DROPIN_PATH, timeout=30)
+
+    def archive_verification_deadline(self):
+        deadline = time.monotonic() + 240
+        if isinstance(self.run, Commands):
+            deadline = min(deadline, self.run.execution_deadline() or deadline)
+        return deadline
+
+    def verify_maintenance_cache_history(self, image, expected):
+        work = self.artifact_root + '/' + expected + '/assembly-cache'
+        rows = json.loads(self.engine('image', 'inspect', image), object_pairs_hook=fedora_oci.unique)
+        if type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != image:
+            raise Blocked('maintenance cache-history image identity differs')
+        diff_ids = image_diff_ids(rows[0]['RootFS']['Layers'])
+        with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=self.reconcile_rpm_executor,
+                                         reserve=8 * 1024 ** 3 + 2 * DEVELOPMENT_ARCHIVE_LIMIT) as (private, verification):
+            raw = private / 'sealed.oci.tar'
+            self.execute('/usr/bin/env', 'TMPDIR=' + str(private), '/usr/bin/prlimit',
+                         f'--fsize={DEVELOPMENT_ARCHIVE_LIMIT}:{DEVELOPMENT_ARCHIVE_LIMIT}', '--', self.wrapper,
+                         'save', '--format=oci-archive', '--output', str(raw), 'sha256:' + image, timeout=240)
+            archive = verification / raw.name
+            with archive.open('xb') as output:
+                os.fchmod(output.fileno(), 0o400)
+                _, size, _ = capture_release_file(raw, DEVELOPMENT_ARCHIVE_LIMIT, int(self.uid), output=output)
+            verifier = self.archive_verifier
+            try:
+                verifier.check_archive_image(archive, {'archive_bytes': size, 'image_id': image, 'diff_ids': diff_ids},
+                                             DEVELOPMENT_EXPANSION_LIMIT, self.archive_verification_deadline(),
+                                             layer_audit=fedora_rpm_cache.audit_layer)
+            except (verifier.Blocked, tarfile.TarError, EOFError) as error:
+                raise Blocked(f'maintenance cache history verification failed: {error}') from None
+        self.record('rpm-cache-history', {'image_id': image, 'manifest_sha256': self.rpm_cache[1]})
+
+    def require_maintenance_cache_history(self, image, manifest):
+        expected = {'image_id': image, 'manifest_sha256': manifest}
+        raw = self.protected_bytes(self.path(self.target + '/rpm-cache-history.json'), 4096, 0o600)
+        if raw != image_inputs_bytes(expected):
+            raise Blocked('maintenance cache history receipt differs from the assembled image')
 
     def observe_assembled_storage(self,expected,revision,sealed):
         prepared=json.loads(self.text(STATE+'/gptbox-image.json'))
@@ -1211,9 +1333,11 @@ class Gptbox(Bootstrap):
                 if not (size is None or type(size) is int and 0<=size<2**63) or not (layers is None and count is None or type(layers) is list and len(layers)<=128 and type(count) is int and count==len(layers) and all(type(v) is str and re.fullmatch('sha256:[0-9a-f]{64}',v) for v in layers)):raise Blocked('invalid legacy logical descriptors')
         elif record.get('kind')=='full-adapter-candidate':
             keys=set('schema kind source_sha context_sha256 standards_sha base_image codex_sha256 distrobox_sha init_sha256 runtime_sha256 inputs_sha256 recipe_sha256 platform distrobox_assembled runtime_validated image_id fedora_base'.split())
-            if set(record)!=keys or type(record['schema']) is not int or record['schema']!=1 or record['standards_sha']!=candidate.STANDARDS or record['distrobox_sha']!=DBX_SHA or record['platform']!={'os':'linux','architecture':'amd64'}:raise Blocked('invalid full prepared completion')
+            if not keys <= set(record) <= keys | {'rpm_cache_manifest_sha256'} or type(record['schema']) is not int or record['schema']!=1 or record['standards_sha']!=candidate.STANDARDS or record['distrobox_sha']!=DBX_SHA or record['platform']!={'os':'linux','architecture':'amd64'}:raise Blocked('invalid full prepared completion')
             for name in ('image_id', 'runtime_sha256', 'init_sha256', 'inputs_sha256', 'recipe_sha256'):
                 raw_digest(record[name])
+            if 'rpm_cache_manifest_sha256' in record:
+                raw_digest(record['rpm_cache_manifest_sha256'])
         else:raise Blocked('unknown prepared recipe kind')
         try:fedora_oci.validate_import_proof(record['fedora_base'])
         except (ValueError,KeyError,TypeError):raise Blocked('prepared signed import proof rejected') from None
@@ -1245,6 +1369,7 @@ class Gptbox(Bootstrap):
         prepared=self._prepared_completion(context,expected,revision,manifest) if not fresh else None
         self.target = ROOT + '/' + expected
         self.directory(self.target, mode=0o755)
+        self.bind_rpm_cache(context, expected, revision)
         previous = json.loads(self.text(self.target + '/attempt.json', '{}'))
         if previous and (set(previous)!={'source_sha','context_sha256','distrobox_sha','count'} or type(previous.get('count')) is not int or not 1<=previous['count']<=2):raise Blocked('invalid protected attempt record')
         if previous and (previous.get('source_sha') != revision or previous.get('context_sha256') != expected or previous.get('distrobox_sha') != DBX_SHA):
@@ -1269,6 +1394,8 @@ class Gptbox(Bootstrap):
                     or result.get('distrobox_sha') != DBX_SHA or result.get('boundary_and_version_cycles') != 2
                     or result.get('runtime_container_removed') is not True or result.get('job_admission') is not False):
                 raise Blocked('completed adapter identity/evidence mismatch')
+            if self.rpm_cache:
+                self.require_maintenance_cache_history(result['assembled_image_id'], self.rpm_cache[1])
             self.recover_resources(expected)
             rows = json.loads(self.engine('image', 'inspect', result['assembled_image_id']))
             labels = (rows[0].get('Labels') or rows[0].get('Config', {}).get('Labels', {})) if len(rows) == 1 else {}
@@ -1357,14 +1484,17 @@ class Gptbox(Bootstrap):
             # this shell-program argument escaped. The shell gets its raw bytes.
             guard = DEVELOPMENT_TIMED_EXEC.replace('$', '$$')
             assembly_args = ['-ec', guard, 'development-assembly', str(end), str(lifetime), *INIT]
+        network = (('--network=none', '--no-hosts', '--no-hostname', '--http-proxy=false') if self.rpm_cache
+                   else ('--network=slirp4netns:allow_host_loopback=false',))
+        finalizer = FINAL_HOOK if self.rpm_cache is None else FINAL_HOOK + '-offline-cache'
         identity = image_id(self.engine('create', '--name=' + name, '--label=dev-pair.context=' + expected,
             '--timeout=' + str(lifetime), '--restart=no',
-            '--network=slirp4netns:allow_host_loopback=false', '--pid=private', '--ipc=private', '--uts=private',
+            *network, '--pid=private', '--ipc=private', '--uts=private',
             '--userns=private', '--cap-add=SYS_ADMIN', '--security-opt=no-new-privileges',
             '--security-opt=label=type:container_engine_t', '--memory=2g', '--pids-limit=512', '--cpus=1',
             '--tmpfs=/run:rw,nosuid,nodev,mode=0755,notmpcopyup', '--tmpfs=/tmp:rw,nosuid,nodev,mode=1777,notmpcopyup',
             '--hooks-dir=' + str(self.path(self.control + '/empty-hooks')), '--entrypoint=' + entrypoint,
-            base, *assembly_args, '--', FINAL_HOOK))
+            base, *assembly_args, '--', finalizer))
         if end is not None:
             self.development_assembly = (identity, end, lifetime)
         return identity
@@ -1375,17 +1505,22 @@ class Gptbox(Bootstrap):
             bound, end, lifetime = getattr(self, 'development_assembly', (None, None, None))
             if bound != stage:
                 raise Blocked('development assembly lifetime is unbound')
+        state = self.inspect_container(stage, base, runtime=False, lifetime=lifetime)['State']
+        if self.rpm_cache or self.role == 'development' and isinstance(self.run, Commands):
+            if state.get('Status') not in ('configured', 'created') or state.get('Running') is not False:
+                raise Blocked('assembly was already started')
+        if self.rpm_cache:
+            self.stage_assembly_cache(stage, inputs['context_sha256'])
             state = self.inspect_container(stage, base, runtime=False, lifetime=lifetime)['State']
             if state.get('Status') not in ('configured', 'created') or state.get('Running') is not False:
-                raise Blocked('development assembly was already started')
+                raise Blocked('cache transfer changed the configured assembly state')
+        if self.role == 'development' and isinstance(self.run, Commands):
             # Even a start delayed until the end of the attached command must
             # fit the independently configured OCI lifetime and cleanup reserve.
             end = min(end, self.development_oci_end())
             start_timeout = min(lifetime, math.floor(end - time.monotonic() - lifetime))
             if start_timeout <= OCI_KILL_GRACE:
                 raise Blocked('development assembly start no longer fits its inspected lifetime')
-        else:
-            self.inspect_container(stage, base, runtime=False)
         output = self.engine('start', '--attach', stage, timeout=start_timeout)
         lines = output.strip().splitlines()
         attestation = json.loads(lines[-1], object_pairs_hook=fedora_oci.unique) if lines else None
@@ -1401,10 +1536,13 @@ class Gptbox(Bootstrap):
             format_args = ('--format=oci',)
         else:
             stopped = json.loads(self.engine('inspect', '--type=container', stage))[0]['State']
-            format_args = ()
+            format_args = ('--format=oci',) if self.rpm_cache else ()
         if stopped.get('ExitCode') != 0 or stopped.get('Running'):
             raise Blocked('actual upstream assembly did not exit successfully')
-        return image_id(self.engine('commit', '--pause=false', *format_args, stage)), attestation
+        sealed = image_id(self.engine('commit', '--pause=false', *format_args, stage))
+        if self.rpm_cache and self.role == 'maintenance':
+            self.verify_maintenance_cache_history(sealed, inputs['context_sha256'])
+        return sealed, attestation
 
 
     def image_stage(self,stage,revision,expected):
@@ -1448,30 +1586,13 @@ class Gptbox(Bootstrap):
                   'files': {'/opt/dev-pair/bin/codex': sha(files['codex']), '/usr/bin/distrobox-init': sha(files['distrobox-init']), RUNTIME: sha(runtime)}}
         input_bytes = image_inputs_bytes(inputs)
         input_digest = sha(input_bytes)
-        # Match the pinned upstream setup_dnf availability resolution; aliases
-        # absent from Fedora's architecture-specific metadata are not forced.
-        dependencies = ('bash bash-completion bc bzip2 cracklib-dicts curl diffutils dnf-plugins-core findutils '
-                        'glibc-all-langpacks glibc-common glibc-locale-source gnupg2 gnupg2-smime hostname iproute '
-                        'iputils keyutils krb5-libs less lsof man-db man-pages mtr ncurses nss-mdns openssh-clients '
-                        'pam passwd pigz pinentry procps-ng rsync shadow-utils sudo tcpdump time traceroute tree '
-                        'tzdata unzip util-linux util-linux-script vte-profile wget wget2-wget which whois words '
-                        'xorg-x11-xauth xz zip mesa-dri-drivers mesa-vulkan-drivers vulkan')
-        recipe = (f'FROM {FEDORA}\n'
-                  'RUN set -eu; dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates upgrade; for file in /etc/dnf/dnf.conf /etc/yum.conf; do '
-                  'if [ -f "$file" ]; then sed -i "/tsflags=nodocs/d" "$file"; fi; done; dnf -q --setopt=gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates list '
-                  + dependencies + ' > /tmp/upstream-packages; '
-                  'grep -v Packages /tmp/upstream-packages | grep "$(uname -m)" | cut -d" " -f1 > /tmp/resolved-packages; '
-                  'test -s /tmp/resolved-packages; '
-                  'dnf -y --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo="*" --enablerepo=fedora --enablerepo=updates '
-                  'install --allowerasing python3 coreutils $(cat /tmp/resolved-packages); '
-                  'test -d /usr/share/i18n/charmaps; test -f /usr/share/zoneinfo/UTC; '
-                  'locale -a | grep -qi en_us.utf8 || localedef -i en_US -f UTF-8 en_US.UTF-8; '
-                  'mkdir -p /usr/lib/dev-pair/gptbox; '
-                  'rpm -qa --qf "%{NAME}-%{EPOCHNUM}:%{VERSION}-%{RELEASE}.%{ARCH}\\n" | sort > /usr/lib/dev-pair/gptbox/rpms.txt; '
-                  'rm /tmp/upstream-packages /tmp/resolved-packages; dnf clean all\n'
+        recipe = (f'FROM {FEDORA}\nRUN {PACKAGE_SCRIPT}\n'
                   f'COPY --chmod=0555 codex /opt/dev-pair/bin/codex\nCOPY --chmod=0555 distrobox-init /usr/bin/distrobox-init\nCOPY --chmod=0555 runtime.py {RUNTIME}\nCOPY --chmod=0444 inputs.json {BASE}/inputs.json\n'
                   f'LABEL dev-pair.context={expected} dev-pair.distrobox={DBX_SHA} org.opencontainers.image.revision={revision} dev-pair.role={self.role} dev-pair.standards={candidate.STANDARDS} dev-pair.codex.version={self.codex_version} dev-pair.inputs={input_digest} dev-pair.runtime={sha(runtime)} dev-pair.init={sha(files['distrobox-init'])} dev-pair.codex.sha256={sha(files['codex'])}\nENV HOME=/home/gpt PATH=/opt/dev-pair/bin:/usr/bin:/bin container=podman LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8\n')
         lines = recipe.splitlines()
+        if self.rpm_cache:
+            label = next(index for index, line in enumerate(lines) if line.startswith('LABEL '))
+            lines[label] += ' dev-pair.rpm-cache=' + self.rpm_cache[1]
         # Fixed source-controlled package/locale operation, never submitted
         # script input. This native inner bound also covers detached RUN
         # helpers; remaining build/VM budgets can still end sooner.
@@ -1504,6 +1625,8 @@ class Gptbox(Bootstrap):
             'distrobox_sha':DBX_SHA,'init_sha256':sha(files['distrobox-init']),'runtime_sha256':sha(runtime),
             'inputs_sha256':input_digest,'recipe_sha256':sha(recipe.encode()),
             'platform':{'os':'linux','architecture':'amd64'},'distrobox_assembled':False,'runtime_validated':False}
+        if self.rpm_cache:
+            binding['rpm_cache_manifest_sha256'] = self.rpm_cache[1]
         location=self.target+'/candidate-image.json'
         path=self.path(location);exists=path.exists() or path.is_symlink();prior=None
         if exists:
@@ -1527,21 +1650,26 @@ class Gptbox(Bootstrap):
                 except BaseException as error:
                     if first_error is None:first_error=error
                     raise
-            def reconcile_copy():
-                if isinstance(self.run, Commands):
-                    self.run.reconcile_native(('--unit='+self.unit,'--description=dev-pair-owned-'+self.unit,'--uid=dp-maint'), {})
             work = self.artifact_root + '/' + expected + '/image-work'
             self.directory(work, mode=0o755)
             try:
-                with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=reconcile_copy, reserve=8*1024**3) as (copy_tmp, verification_root):
+                reserve = 8 * 1024 ** 3 + (fedora_rpm_cache.WORK_PEAK if self.rpm_cache else 0)
+                with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=self.reconcile_rpm_executor,
+                                                  reserve=reserve) as (copy_tmp, verification_root):
                     try:
+                        canonical_cache = self.unpack_rpm_cache(verification_root) if self.rpm_cache else None
                         self.image_stage('signed-import',revision,expected)
                         with fedora_oci.verified(context, temporary_parent=verification_root, leased=True) as (plain, proof):
                             imported = fedora_oci.import_image(lambda *args, **kw: image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,*args,**kw), plain, uid=int(self.uid))
                         self.image_stage('build',revision,expected)
+                        network = '--network=slirp4netns:allow_host_loopback=false'
+                        mounts = ()
+                        if canonical_cache is not None:
+                            mounts = fedora_rpm_cache.build_mounts(copy_tmp, canonical_cache, int(self.uid), int(self.gid))
+                            network = '--network=none'
                         end = self.development_oci_end()
                         build_args = ('--pid=private', '--build-arg=DP_OCI_END=' + str(end)) if end is not None else ()
-                        base = image_id(image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', '--network=slirp4netns:allow_host_loopback=false', '--pull=never', '--http-proxy=false', *build_args, '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
+                        base = image_id(image_call('/usr/bin/env','TMPDIR='+str(copy_tmp),self.wrapper,'build', '--quiet', network, '--pull=never', '--http-proxy=false', *mounts, *build_args, '--file', str(self.path(build) / 'Containerfile'), str(self.path(build)), timeout=600))
                     except BaseException as error:
                         if first_error is None:first_error=error
                         raise
@@ -1563,6 +1691,8 @@ class Gptbox(Bootstrap):
         wanted={'dev-pair.context':expected,'dev-pair.distrobox':DBX_SHA,'org.opencontainers.image.revision':revision,
             'dev-pair.role':self.role,'dev-pair.standards':candidate.STANDARDS,'dev-pair.codex.version':self.codex_version,
             'dev-pair.inputs':binding['inputs_sha256'],'dev-pair.runtime':binding['runtime_sha256'],'dev-pair.init':binding['init_sha256'],'dev-pair.codex.sha256':binding['codex_sha256']}
+        if self.rpm_cache:
+            wanted['dev-pair.rpm-cache'] = self.rpm_cache[1]
         if (type(rows) is not list or len(rows)!=1 or image_id(rows[0]['Id'])!=base or rows[0].get('Architecture')!='amd64' or
             rows[0].get('Os')!='linux' or any(labels.get(k)!=v for k,v in wanted.items())):
             raise Blocked('full candidate immutable image/platform/labels mismatch')
@@ -1806,6 +1936,8 @@ class Gptbox(Bootstrap):
                     'source_verification': 'complete' if self.path('/usr/bin/git').exists() else 'pending signed Git prerequisite'}
         target = {'source_sha': revision, 'context_sha256': expected, 'distrobox_sha': DBX_SHA,
                   'bootstrap_sources': sources}
+        if self.rpm_cache:
+            target['rpm_cache_manifest_sha256'] = self.rpm_cache[1]
         if console_receipt:
             target['bootstrap_transport'] = ATTENDED_ACCESS if self.attended_access else ACCESS_MODE
         path = STATE + '/initialize.json'
@@ -2106,16 +2238,7 @@ class DevelopmentGptbox(Gptbox):
 
     def source(self, revision):
         super().source(revision)
-        repo = Path(__file__).resolve().parents[1]
-        relative = 'runtime/devbox/controller.py'
-        path = self.protected(repo / relative)
-        _, _, data = capture_release_file(path, 262144, os.getuid(), contents=True)
-        recorded = self.run('/usr/bin/git', '-C', str(repo), 'show', revision + ':' + relative)
-        if recorded.encode() != data:
-            raise Blocked('DevBox archive verifier differs from the exact reviewed source')
-        # Execute the exact verified bytes without importing an unbound cache/module.
-        self.archive_verifier = ModuleType('dev_pair_development_archive_verifier')
-        exec(compile(data, str(path), 'exec'), self.archive_verifier.__dict__)
+        self.load_archive_verifier(revision)
 
     def verify_host_readiness(self, revision=None, expected=None):
         desired_raw = self.protected_bytes(self.path(STATE + '/desired.json'), 16384, 0o600)
@@ -2191,6 +2314,9 @@ class DevelopmentGptbox(Gptbox):
             with phase(DEVELOPMENT_EXECUTION):
                 self.verify_host_readiness(revision, expected)
                 builder = self.verify_builder()
+                if self.rpm_cache:
+                    self.directory(self.target, mode=0o755)
+                self.bind_rpm_cache(context, expected, revision)
                 attempt = self.read_attempt(expected, revision)
                 publication = self.read_publication(attempt)
                 reused = release.exists() or release.is_symlink()
@@ -2426,6 +2552,8 @@ class DevelopmentGptbox(Gptbox):
                   'dev-pair.inputs': sha(image_inputs_bytes(inputs)), 'dev-pair.standards': candidate.STANDARDS,
                   'dev-pair.distrobox': DBX_SHA, 'dev-pair.codex.version': self.codex_version,
                   'org.opencontainers.image.revision': revision}
+        if self.rpm_cache:
+            labels['dev-pair.rpm-cache'] = self.rpm_cache[1]
         rows = json.loads(self.engine('image', 'inspect', 'sha256:' + sealed), object_pairs_hook=fedora_oci.unique)
         if (type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != sealed
                 or rows[0]['Os'] != 'linux' or rows[0]['Architecture'] != 'amd64'):
@@ -2480,11 +2608,10 @@ class DevelopmentGptbox(Gptbox):
 
     def verify_archive(self, path, inner, labels):
         verifier = self.archive_verifier
-        deadline = time.monotonic() + 240
-        if isinstance(self.run, Commands):
-            deadline = min(deadline, self.run.execution_deadline() or deadline)
+        deadline = self.archive_verification_deadline()
         try:
-            verifier.check_archive_image(path, inner, DEVELOPMENT_EXPANSION_LIMIT, deadline)
+            audit = {'layer_audit': fedora_rpm_cache.audit_layer} if self.rpm_cache else {}
+            verifier.check_archive_image(path, inner, DEVELOPMENT_EXPANSION_LIMIT, deadline, **audit)
             # The shared check proved the unique config blob and its bounded raw digest.
             with tarfile.open(path, 'r:') as archive:
                 name = 'blobs/sha256/' + inner['image_id']
@@ -2615,13 +2742,21 @@ def main():
     parser.add_argument('--password-file')
     parser.add_argument('--work-deadline-monotonic', type=float, help=argparse.SUPPRESS)
     parser.add_argument('--ci-tooling-sha256', help=argparse.SUPPRESS)
+    parser.add_argument('--rpm-cache', type=Path, help='protected Fedora construction cache transport')
+    parser.add_argument('--expected-rpm-cache-manifest-sha256', help='independently supplied construction cache manifest digest')
     args = parser.parse_args()
     if args.stage == 'prepare-development-host' and not args.bootstrap_source:
         parser.error('prepare-development-host requires --bootstrap-source')
     if args.console_receipt and args.stage != 'initialize':
         parser.error('--console-receipt is supported only for maintenance initialize')
+    if (args.rpm_cache is None) != (args.expected_rpm_cache_manifest_sha256 is None):
+        parser.error('construction cache and the independently supplied manifest digest are both required')
+    if args.rpm_cache is not None and (not args.apply or args.stage == 'prepare-development-host'):
+        parser.error('construction cache requires an applied image build')
     try:
         app = DevelopmentGptbox() if args.stage in ('prepare-development-host', 'build-development') else Gptbox()
+        if args.rpm_cache is not None:
+            app.rpm_cache = (app.protected(args.rpm_cache), raw_digest(args.expected_rpm_cache_manifest_sha256))
         if args.ci_tooling_sha256 is not None:
             app.use_ci_tooling(args.ci_tooling_sha256)
         budget = contextlib.nullcontext()

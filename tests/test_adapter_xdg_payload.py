@@ -65,6 +65,17 @@ class ConfigTests(unittest.TestCase):
                 self.assertIsNone(run.adapter_image_selection(mutation + operations['load'], None))
             self.assertIsNone(run.adapter_image_selection(tuple(v for v in prefix if not v.startswith('XDG_CONFIG_HOME='))+operations['load'],None))
         self.assertIsNone(run._adapter_image_binding)
+        build = operations['build']
+        offline = (*build[:5], '--network=none', *build[6:8],
+                   *g.fedora_rpm_cache.mount_args(Path(work) / 'image-copy'), *build[8:])
+        with run.adapter_image_launcher(CONTEXT, app.uid):
+            self.assertIsNone(run.adapter_image_selection(prefix + offline, None))
+        with run.adapter_image_launcher(CONTEXT, app.uid, rpm_cache=True):
+            self.assertEqual(run.adapter_image_selection(prefix + offline, None)['suboperation'], 'build')
+            self.assertIsNone(run.adapter_image_selection(prefix + build, None))
+            altered = tuple(value.replace('/rpm-cache:', '/unknown-build-path:') for value in offline)
+            self.assertIsNone(run.adapter_image_selection(prefix + altered, None))
+            self.assertIsNone(run.adapter_image_selection(prefix + offline + ('--volume', '/etc:/etc'), None))
 
     def test_executor_rejects_environment_mismatch_before_native_launch(self):
         _, app = self.case()

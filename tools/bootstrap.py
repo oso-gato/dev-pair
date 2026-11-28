@@ -398,6 +398,7 @@ class Commands:
     current_step = 'unscoped'
     _maintenance_launcher_binding = None
     _adapter_image_binding = None
+    _adapter_rpm_cache = False
 
     @contextlib.contextmanager
     def maintenance_launcher(self, context, uid):
@@ -409,11 +410,15 @@ class Commands:
         finally:self._maintenance_launcher_binding=previous
 
     @contextlib.contextmanager
-    def adapter_image_launcher(self,context,uid,identity=None):
+    def adapter_image_launcher(self,context,uid,identity=None,*,rpm_cache=False):
         previous=self._adapter_image_binding;previous_identity=getattr(self,"_selected_payload_identity",None)
+        previous_cache = self._adapter_rpm_cache
         self._adapter_image_binding=(context,uid);self._selected_payload_identity=identity
+        self._adapter_rpm_cache = rpm_cache
         try:yield
-        finally:self._adapter_image_binding=previous;self._selected_payload_identity=previous_identity
+        finally:
+            self._adapter_image_binding=previous;self._selected_payload_identity=previous_identity
+            self._adapter_rpm_cache = previous_cache
 
     def adapter_image_selection(self,args,input_text):
         if self.current_step!='candidate-image' or input_text is not None:return None
@@ -442,8 +447,16 @@ class Commands:
         if copied and len(operation)==3 and operation[:2]==('load','--input') and re.fullmatch(archive+r'base\.oci\.tar',operation[2]):selected='load'
         elif copied and len(operation)==5 and operation[:3]==('save','--format=oci-archive','--output') and operation[4]==image and re.fullmatch(archive+r'imported\.oci\.tar',operation[3]):selected='save'
         elif len(operation)==3 and operation[:2]==('image','inspect') and re.fullmatch(r'(?:sha256:)?[0-9a-f]{64}',operation[2]):selected='inspect'
-        elif copied and operation==('build','--quiet','--network=slirp4netns:allow_host_loopback=false','--pull=never','--http-proxy=false','--file',
-                '/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/build/Containerfile','/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/build'):selected='build'
+        elif copied:
+            network = '--network=slirp4netns:allow_host_loopback=false'
+            mounts = ()
+            if self._adapter_rpm_cache:
+                from fedora_rpm_cache import mount_args
+                network, mounts = '--network=none', mount_args(Path(work) / 'image-copy')
+            build = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + context + '/build'
+            if operation == ('build', '--quiet', network, '--pull=never', '--http-proxy=false', *mounts,
+                             '--file', build + '/Containerfile', build):
+                selected = 'build'
         return {'context_sha256':context,'unit':unit,'suboperation':selected} if selected else None
 
     def maintenance_launcher_selection(self,args,input_text,probe):
@@ -3835,6 +3848,8 @@ def main():
     init.add_argument('--source-sha', required=True)
     init.add_argument('--distrobox-source', required=True)
     init.add_argument('--retry', action='store_true')
+    init.add_argument('--rpm-cache', help='protected Fedora construction cache transport')
+    init.add_argument('--expected-rpm-cache-manifest-sha256', help='independently supplied construction cache manifest digest')
     prep = sub.add_parser('prepare')
     for entry in (prep, init):
         entry.add_argument('--apply', action='store_true', help='perform host changes; absent means inspect only')
@@ -3873,6 +3888,10 @@ def main():
                 forwarded.append('--apply')
             if args.retry:
                 forwarded.append('--retry')
+            if args.rpm_cache is not None:
+                forwarded.extend(['--rpm-cache', args.rpm_cache])
+            if args.expected_rpm_cache_manifest_sha256 is not None:
+                forwarded.extend(['--expected-rpm-cache-manifest-sha256', args.expected_rpm_cache_manifest_sha256])
             os.execv(sys.executable, forwarded)
         if args.stage == '_fetch-github-keys':
             sys.stdout.buffer.write(fetch_github_response())

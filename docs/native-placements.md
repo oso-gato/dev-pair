@@ -60,6 +60,52 @@ inner record. The protected producer evidence also binds the attempt and
 published directory identity. A temporary CI guest's release path is usable
 only while that guest exists.
 
+### Optional verified cache for the inner role builds
+
+The maintenance `bootstrap.py initialize --apply` and development
+`gptbox.py build-development --apply` commands above also accept both of these
+arguments together. The `assemble-prepared-maintenance` continuation accepts
+the same arguments after source-bound maintenance host preparation.
+
+```sh
+--rpm-cache "$RPM_CACHE_TAR" \
+--expected-rpm-cache-manifest-sha256 "$TRUSTED_RPM_CACHE_MANIFEST_SHA256"
+```
+
+Use a protected, root-owned absolute archive path and obtain the manifest
+digest independently of the archive. The cache is a separate USTAR transport
+limited to 384 MiB. Its manifest binds the exact reviewed source, adopted
+standards, Fedora base config ID and package recipe. The same archive can
+serve both inner roles at that source. Each role still requires its own
+original verified input context. The builder records the cache digest with
+the target and requires it again on retry.
+
+To package an acquired cache, use the stock Fedora 44 `fedora` and `updates`
+cache directory IDs. Include each official metalink, `repomd.xml`, the
+referenced primary zstd and zchunk metadata and group metadata, the updates
+zchunk update information, and the Fedora-signed RPMs needed for the exact
+recipe. Leave generated solv files and repository configuration outside the
+archive. The consumer checks the upstream metadata hashes and every RPM
+against the pinned Fedora key in an isolated keyring.
+
+```sh
+recipe_sha=$(PYTHONPATH="$MAINT/dev-pair/tools" /usr/bin/python3 -B -c \
+  'from gptbox import PACKAGE_SCRIPT, sha; print(sha(PACKAGE_SCRIPT.encode()))')
+/usr/bin/python3 -B "$MAINT/dev-pair/tools/fedora_rpm_cache.py" \
+  --cache "$STOCK_FEDORA_CACHE_DIRECTORY" --output "$RPM_CACHE_TAR" \
+  --source-sha "$REVIEWED_SOURCE_SHA" \
+  --standards-sha b9d4da5d442ac48dba2e8be62d81b5bdc83690b8 \
+  --recipe-sha256 "$recipe_sha"
+```
+
+The builder uses the verified snapshot with networking disabled for the
+inner package build and genuine Distrobox assembly. The assembly remains
+free of host binds. The finalizer removes the staged cache and configuration,
+and the builder checks the exported image layer history before completing
+the role. Host prerequisite provisioning and the outer DevBox tooling below
+continue to use their existing online paths. Cold VFS builds on QEMU TCG can
+hit the existing 600-second image budget while committing the new layer.
+
 ## Prepare and exercise the nested placement
 
 The root console needs the already provisioned, locked `dp-dev` account with

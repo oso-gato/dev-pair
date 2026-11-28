@@ -86,13 +86,21 @@ def verify_files():
             raise RuntimeError('image-owned executable identity mismatch')
     return expected
 
-def finalize():
+def finalize(offline_cache=False):
     if os.getuid() != 0:
         raise RuntimeError('assembly finalizer requires container root')
     expected = verify_files()
     account = pwd.getpwnam('gpt')
     if (account.pw_uid, account.pw_gid, account.pw_dir) != (1000, 1000, '/home/gpt'):
         raise RuntimeError('upstream init did not create intended account')
+    if offline_cache:
+        configuration = Path('/etc/dnf/libdnf5.conf.d/99-dev-pair-construction-cache.conf')
+        cache = Path('/var/cache/libdnf5')
+        if (not stat.S_ISREG(configuration.lstat().st_mode) or configuration.read_bytes() != b'[main]\ncacheonly=all\n'
+                or not stat.S_ISDIR(cache.lstat().st_mode)):
+            raise RuntimeError('authenticated construction cache profile is missing')
+        shutil.rmtree(cache)
+        configuration.unlink()
     for user in ('root', 'gpt'):
         subprocess.run(['/usr/sbin/usermod', '--lock', user], check=True)
     subprocess.run(['/usr/sbin/usermod', '--groups', '', 'gpt'], check=True)
@@ -941,6 +949,8 @@ if __name__ == '__main__':
     try:
         if sys.argv[1:] == ['finalize']:
             finalize()
+        elif sys.argv[1:] == ['finalize-offline-cache']:
+            finalize(offline_cache=True)
         elif sys.argv[1:] == ['frozen']:
             frozen()
         elif len(sys.argv) >= 3 and sys.argv[1] == 'entry':

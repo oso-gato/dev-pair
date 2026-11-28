@@ -221,7 +221,7 @@ def archive_fields(value, kind, required, optional=''):
             f'invalid development OCI {kind} structural keys')
 
 
-def check_archive_image(path, release, storage_limit, deadline):
+def check_archive_image(path, release, storage_limit, deadline, *, layer_audit=None):
     check_archive_headers(path, release['archive_bytes'], deadline)
     with tarfile.open(path, 'r:') as archive:
         members = {archive_path(member.name): member for member in archive if member.isreg()}
@@ -293,11 +293,12 @@ def check_archive_image(path, release, storage_limit, deadline):
         for layer, expected in zip(layers, release['diff_ids']):
             digest, member = descriptor(layer, (plain, compressed))
             with archive.extractfile(member) as stream:
-                actual, size = hash_layer(stream, member.size, deadline)
+                check_plain = layer_audit if layer['mediaType'] == plain and layer_audit else hash_layer
+                actual, size = check_plain(stream, member.size, deadline)
             require((actual, size) == (digest, member.size), 'development archive layer blob digest mismatch')
             if layer['mediaType'] == compressed:
                 with archive.extractfile(member) as stream, gzip.GzipFile(fileobj=stream) as expanded:
-                    actual, size = hash_layer(expanded, remaining, deadline)
+                    actual, size = (layer_audit or hash_layer)(expanded, remaining, deadline)
             require(actual == expected, 'development archive ordered layer DiffID mismatch')
             require(0 < size <= remaining, 'development archive expanded layer budget exceeded')
             remaining -= size

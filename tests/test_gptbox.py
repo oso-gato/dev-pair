@@ -87,7 +87,8 @@ class Engine:
                       'Labels': {'manager': 'distrobox', 'distrobox.unshare_groups': '0', 'dev-pair.context': EXPECTED}}
             host = {'Privileged': False, 'ReadonlyRootfs': runtime, 'CapAdd': [] if runtime else ['CAP_SYS_ADMIN'],
                     'CapDrop': ['ALL'] if runtime else [], 'SecurityOpt': ['no-new-privileges'],
-                    'PidMode': 'private', 'IpcMode': 'private', 'UTSMode': 'private', 'NetworkMode': 'none' if runtime else 'slirp4netns',
+                    'PidMode': 'private', 'IpcMode': 'private', 'UTSMode': 'private',
+                    'NetworkMode': 'none' if '--network=none' in command else 'slirp4netns',
                     'UsernsMode': 'private', 'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0},
                     'Tmpfs': (dict.fromkeys(('/run', '/tmp'), 'rw,nosuid,nodev,noexec,U,mode=0700,size=16m')
                               if runtime else {'/run': 'rw,nosuid,nodev,mode=0755', '/tmp': 'rw,nosuid,nodev,mode=1777'}),
@@ -226,6 +227,33 @@ class GptboxTests(unittest.TestCase):
 
     def assemble(self, retry=False):
         return self.app.assemble(self.context, EXPECTED, '/unused', SOURCE, apply=True, retry=retry)
+
+    def test_offline_assembly_stages_before_start_without_host_binds(self):
+        self.app.target = g.ROOT + '/' + EXPECTED
+        self.app.directory(self.app.target, mode=0o755)
+        self.app.scripts = self.app.inputs(self.context, EXPECTED, '/unused', SOURCE)[1]
+        self.app.setup_executor()
+        self.app.rpm_cache = (self.root / 'cache.tar', '3' * 64)
+        self.engine.build = self.root
+        self.engine.images[BASE] = {'Id': BASE}
+        inputs = {'context_sha256': EXPECTED}
+        (self.root / 'inputs.json').write_bytes(g.image_inputs_bytes(inputs))
+        stage = self.app.create_assembly_stage('dp-gptbox-a-' + EXPECTED[:16] + '-1', EXPECTED, BASE)
+        self.assertEqual(self.engine.saved_stage['Mounts'], [])
+        self.assertEqual(self.engine.saved_stage['HostConfig']['NetworkMode'], 'none')
+        create = next(args for args, _ in self.engine.calls if 'create' in args)
+        self.assertIn(g.FINAL_HOOK + '-offline-cache', create)
+
+        def transfer(identity, context):
+            self.assertEqual((identity, context), (stage, EXPECTED))
+            self.assertEqual(self.engine.containers[identity]['State']['Status'], 'created')
+            self.assertFalse(any('start' in args for args, _ in self.engine.calls if '--attach' in args))
+
+        with (patch.object(self.app, 'stage_assembly_cache', side_effect=transfer) as copy,
+              patch.object(self.app, 'verify_maintenance_cache_history') as audit):
+            self.assertEqual(self.app.seal_assembly_stage(stage, BASE, SOURCE, inputs)[0], SEALED)
+        copy.assert_called_once_with(stage, EXPECTED)
+        audit.assert_called_once_with(SEALED, EXPECTED)
 
     def test_exhausted_cleanup_only_reclaims_recorded_image_work(self):
         self.app.target=g.ROOT+'/'+EXPECTED
@@ -722,7 +750,7 @@ class ProductionInputContractTests(unittest.TestCase):
             repo = root / 'reviewed-adapter-source'
             tools = repo / 'tools'
             tools.mkdir(parents=True)
-            for name in ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py', 'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py', 'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py'):
+            for name in g.ADAPTER_SOURCE_FILES:
                 (tools / name).write_bytes((ROOT / 'tools' / name).read_bytes())
             upstream = root / 'synthetic-upstream-NOT-DISTROBOX'
             upstream.mkdir()
