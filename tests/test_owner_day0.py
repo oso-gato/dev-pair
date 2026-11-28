@@ -259,10 +259,15 @@ class DayZeroTests(unittest.TestCase):
 
         self.entry.app.atomic.side_effect = write
         self.entry.app.lock.return_value = nullcontext()
-        with patch.object(day, 'TRUST_SIGNERS', str(target)), patch.object(day, 'answer', return_value=public) as prompt:
+        fingerprint = bootstrap.Bootstrap.signer_fingerprint(public)
+        with (patch.object(day, 'TRUST_SIGNERS', str(target)),
+              patch.object(day, 'answer', side_effect=[public, 'SHA256:incorrect', public, fingerprint]) as prompt):
+            with self.assertRaisesRegex(bootstrap.Blocked, 'fingerprint differs'):
+                self.entry.access_trust(None)
+            self.assertEqual(target.read_text(), old)
             self.assertTrue(self.entry.access_trust(None))
             self.assertTrue(self.entry.access_trust(None))
-        prompt.assert_called_once()
+        self.assertEqual(prompt.call_count, 4)
         self.entry.app.atomic.assert_called_once()
         self.assertEqual(target.read_text(), old + 'dev-pair-access-review namespaces="dev-pair-destination" ' +
                          ' '.join(public.split()[:2]) + '\n')

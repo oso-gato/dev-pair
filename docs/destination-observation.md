@@ -21,6 +21,60 @@ The initial access verifier also needs the admitted `core` key, independently ch
 
 The final verifier uses its separate existing `dev-pair-access-review` authority in namespace `dev-pair-destination`. Use authorized OpenSSH signing custody on the independent station. An existing agent-backed public key or hardware-backed signer can produce detached signatures with `ssh-keygen -Y sign`. Keep private signing keys and agent access away from the owner terminal, development and maintenance roles, release proposer, product orchestrator and target.
 
+### Prepare the first access station
+
+Use the exact reviewed source in a root-protected Git checkout on the separately
+authorized station. The station uses stock Python 3, Git, OpenSSH, Tailscale
+and `runuser`. Keep the dedicated unprivileged courier and independent reviewer
+accounts separate. The courier needs a root-owned, traversable home, a standard
+shell for its forced command, and the station's approved key-only SSH listener
+on the tailnet. Use the normal root-managed `.ssh/authorized_keys` route and
+preserve any existing unrelated identities. The reviewer enrolls an approved
+read-only Tailscale OAuth credential in their private directory using
+`tools/agent_observer_station.py enroll-acl`.
+
+The station administrator runs the following from the reviewed checkout. Use
+the provider's independently confirmed public addresses, or `none` for each
+confirmed absent family. Choose the approved execution route, `provider-recovery`
+or `tailnet-core`, where the receipt will be applied.
+
+```sh
+sudo /usr/bin/python3 -IB tools/day0_access_station.py prepare \
+  --source-sha "$reviewed_commit" --station-address "$station_ip" \
+  --courier-user "$courier" --reviewer-user "$reviewer" --acl-oauth "$oauth_file" \
+  --dns-name "$vps_dns" --tailnet "$tailnet" --provider-recovery "$recovery_route" \
+  --public-ipv4 "$public_v4" --public-ipv6 "$public_v6" --execution-route "$apply_route" \
+  --authorized-client "$authorized_client" --denied-client "$denied_client" \
+  --public-client "$public_client" --provider-client "$provider_client" \
+  --controller-client "$controller_client" \
+  --plan-key "$plan_public_key" --authorized-key "$authorized_public_key" \
+  --denied-key "$denied_public_key" --public-key "$public_client_key" \
+  --provider-key "$provider_public_key" --controller-key "$controller_public_key" \
+  --access-review-key "$access_review_public_key"
+```
+
+The command verifies the source and station address, measures the current ACL
+through the reviewer's read-only authority, and records the core site and
+separate public signer roster. The scoped final public trust is available at
+`/etc/dev-pair/destination-observer/access-review-allowed-signers` for the
+approved candidate observer. The station operator conveys the contact values
+and both OpenSSH SHA256 fingerprints through an independently authenticated
+handoff. After obtaining the VPS's newly generated courier public key and its
+approved source address on the same tailnet, the station operator runs:
+
+```sh
+sudo /usr/bin/python3 -IB tools/day0_access_station.py admit-courier \
+  --source-sha "$reviewed_commit" --vps-address "$vps_tailnet_ip" \
+  --courier-key "$vps_courier_public_key"
+```
+
+The exact authorization restricts that key to the approved source and a fixed
+mailbox command with no terminal or forwarding. The command verifies any
+existing scoped authorization before reuse. The mailbox is private to the
+courier, and observation and signing custody stay with the independent roles.
+
+### Prepare a checklist release site
+
 The independent station administrator runs `prepare-release-site` once with
 approved site facts and the public SSH key for each role. It writes the
 protected release site and observer signer set under
@@ -123,16 +177,14 @@ The assembler also accepts separately measured pre-cutover access records agains
 
 ## Review the named SSH and workload routes
 
-Use the owner-generated `day0.sh access-request` output as `begin --binding`.
-The independent site profile selects `kind` `core-access-cutover`, the exact
-`dns_name` and `tailnet`, each named `clients` entry, `provider_recovery`, both
-`public_addresses` (null only on provider-confirmed absence), the measured
-`acl_sha256` and the intended `execution_route`. The controller supplies
-`version: 1`. Determine the provider addresses and policy from the independently
-held inventory. The host-generated request supplies the live machine and boot,
-the enrolled node, tailnet addresses and the installed core key digest. Verify
-those facts before signing the plan. Continue to use the separate observation
-and final access-review signing authorities described above.
+Use the request displayed by the station mailbox as `begin --binding`. Use
+`/etc/dev-pair/destination-observer/core-access-site.json` as `--site`.
+For the offline route, use the output of `day0.sh access-request` as the
+binding. The profile supplies the independently approved site and measured ACL.
+The request supplies the live machine and boot, enrolled node, tailnet addresses
+and installed core key digest. Verify those facts before signing the plan.
+Continue using the separate observation and final access-review signing
+authorities described above.
 
 For the administrator stage measure the named key login, invalid-key and
 password rejection, password-gated sudo, script and transfer, mosh/tmux reconnect,

@@ -99,16 +99,15 @@ protected enrollment, withdrawal and signed destination proof commands in the
 
 ## Independent access station setup
 
-The verifier station operator uses a separate, authorized Tailnet device and
-keeps the signing material with the independent verifier. Install the reviewed
-`tools/day0_access_exchange.py` and its imports on that station from the exact
-source. Give the request transport account a private mailbox (mode 0700) and
-admit only the VPS public transport key, with SSH forwarding and TTY disabled
-and a forced `receive` command. From the station's protected installation the
-fixed command is `/usr/bin/python3 -EBs /usr/libexec/dev-pair-observer/tools/day0_access_exchange.py --mailbox`
-followed by the approved absolute mailbox path and `receive`.
+The independent station operator prepares the access site and protected
+mailbox on a separate authorized Tailnet device. The operator supplies the
+station address and account, both public keys, and the matching OpenSSH
+SHA256 fingerprints through the independently verified handoff. Enter those
+values in Day 0. The operator then admits the VPS transport public key that Day
+0 displays. [Prepare and enroll the station](destination-observation.md#prepare-the-first-access-station)
 
-Use that tool with `--mailbox` and `pending` to locate a request. The independent
+The station's `day0_access_exchange.py` command uses `--mailbox` and `pending`
+to locate a request. The independent
 verifier conducts the named checks and signs the exact request's observation
 bundle. Under the approved mailbox account, use `publish` with the request
 identifier (its filename without `.request`) and the signed bundle on standard

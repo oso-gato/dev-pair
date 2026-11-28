@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import re
 import resource
+import secrets
 import shutil
 import stat
 import subprocess
@@ -16,10 +17,11 @@ import sys
 import tempfile
 import time
 
-from bootstrap import Blocked, Bootstrap, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
+from bootstrap import Blocked, Bootstrap, WORKLOAD_ACCESS_CUTOVER, checked_file, relay, validate_public_keys
 from destination_observation import (AGENT_CANDIDATE, AGENT_ROLES, FAMILIES, FINAL_NAMESPACE, MAX_ACCESS_ENVELOPE,
-                                     bounded_file, candidate_site, digest, encoding, keys, policy_credential,
-                                     require, state_dir, verify_file, write_once)
+                                     MAX_ACCESS_PART, NAMESPACE, bounded_file, candidate_site, configured_signers,
+                                     digest, encoding, keys, observer_principal, policy_credential, require,
+                                     state_dir, verify_bytes, verify_file, write_once)
 
 CONFIG = Path('/etc/dev-pair/agent-observer/station.json')
 PYTHON = '/usr/bin/python3'
@@ -227,10 +229,49 @@ def station_site(receipt, guard, host):
             'host_artifact_sha256': host, 'devbox_image': receipt['role_artifacts']['devbox_image']}
 
 
+def approved_signer(path, profile, principal, namespace):
+    public_keys = validate_public_keys(bounded_file(profile['signer'], 8192)).splitlines()
+    require(len(public_keys) == 1 and public_keys[0].split()[0] in ('ssh-ed25519', 'sk-ssh-ed25519@openssh.com'),
+            'station signer requires one independently admitted Ed25519 public key')
+    key = public_keys[0]
+    rows = [line.split() for line in bounded_file(path, 16384).decode('utf-8').splitlines()
+            if line.strip() and not line.lstrip().startswith('#')]
+    expected = [principal, f'namespaces="{namespace}"', *key.split()]
+    selected = [row for row in rows if row[0] == principal]
+    require(len(selected) == 1 and selected[0][:4] == expected and
+            all(key.split()[1] not in row for row in rows if row is not selected[0]),
+            'station signer differs from its exact independently scoped public trust')
+    return (' '.join(expected) + '\n').encode()
+
+
+def confirm_station_signers(admitted, final_trust, sha, caller=call_named, scratch='/run'):
+    authorities = (('collector', configured_signers(), observer_principal('authorized'), NAMESPACE),
+                   ('reviewer', final_trust, 'dev-pair-access-review', FINAL_NAMESPACE))
+    selected = [(role, principal, namespace, approved_signer(path, admitted[role], principal, namespace))
+                for role, path, principal, namespace in authorities]
+    with tempfile.TemporaryDirectory(prefix='station-signer-', dir=scratch) as directory:
+        # Isolate the public input so ssh-keygen cannot fall back to a local
+        # private sibling when the selected agent lacks the enrolled key.
+        public = Path(directory) / 'approved.pub'
+        public.parent.chmod(0o755)
+        for role, principal, namespace, approved in selected:
+            public.write_bytes(b' '.join(approved.split()[2:4]) + b'\n')
+            public.chmod(0o644)
+            challenge = {'version': 1, 'kind': 'station-signing-custody', 'role': role, 'source_sha': sha,
+                         'challenge': secrets.token_hex(32)}
+            payload = encoding(challenge)
+            signature = caller(admitted[role], ('/usr/bin/ssh-keygen', '-Y', 'sign', '-f', public, '-n', namespace),
+                               data=payload, limit=MAX_ACCESS_PART, timeout=15)
+            verified, _ = verify_bytes(payload, signature, principal, approved, namespace)
+            require(verified == challenge, 'the enrolled station signer did not answer its independent custody check')
+
+
 def install(args):
     assets = source_assets(args.source_sha)
-    receipt, _ = verify_file(checked_file(args.access_receipt), 'dev-pair-access-review',
-                             checked_file(args.trusted_access_signers), FINAL_NAMESPACE)
+    final_trust = checked_file(args.trusted_access_signers)
+    review_key = {'signer': checked_file(args.reviewer_signer)}
+    final_scope = approved_signer(final_trust, review_key, 'dev-pair-access-review', FINAL_NAMESPACE)
+    receipt, _ = verify_file(checked_file(args.access_receipt), 'dev-pair-access-review', final_scope, FINAL_NAMESPACE)
     site = station_site(receipt, args.guard_sha256, args.host_artifact_sha256)
     site_path = CONFIG.with_name('site.json')
     controls = {'site': str(site_path), 'courier': {'user': args.courier_user, 'mailbox': args.mailbox},
@@ -239,11 +280,6 @@ def install(args):
                               'known_hosts': args.known_hosts, 'signer': args.collector_signer},
                 'reviewer': {'user': args.reviewer_user, 'ssh_agent': args.reviewer_agent, 'signer': args.reviewer_signer,
                              'acl_oauth': args.acl_oauth}}
-    with tempfile.TemporaryDirectory(prefix='candidate-station-config-', dir='/run') as directory:
-        staged_site, staged_config = (Path(directory) / name for name in ('site.json', 'station.json'))
-        staged_site.write_bytes(encoding(site))
-        staged_config.write_bytes(encoding({**controls, 'site': str(staged_site)}))
-        admitted = configuration(staged_config)
     # The site file is a pinned independent approval. Repeating the same
     # installation is safe. Changed enrolment needs a separately approved setup.
     app = Bootstrap()
@@ -256,13 +292,25 @@ def install(args):
                         'unsafe installed station file')
             require(path.is_file() and path.stat().st_size == len(raw) and path.read_bytes() == raw,
                     'installed station inputs conflict with the approved exact setup')
-    for path, raw in assets.items():
-        app.atomic(str(path), raw.decode('utf-8'), mode=0o644)
-    observed = call_named(admitted['reviewer'], (PYTHON, '-EBs', STATION_TOOLS / 'destination_observation.py',
-                          'measure-acl', '--tailnet', site['tailnet'], '--acl-oauth', admitted['reviewer']['acl_oauth']),
-                          limit=256)
-    require(observed == (site['acl_sha256'] + '\n').encode('ascii'),
-            'current API policy differs from the original independently signed access review')
+    owned_timer = CONFIG.is_file() and all(path.is_file() for path in assets if path.suffix in ('.service', '.timer'))
+    try:
+        with tempfile.TemporaryDirectory(prefix='candidate-station-config-', dir='/run') as directory:
+            staged_site, staged_config = (Path(directory) / name for name in ('site.json', 'station.json'))
+            staged_site.write_bytes(encoding(site))
+            staged_config.write_bytes(encoding({**controls, 'site': str(staged_site)}))
+            admitted = configuration(staged_config)
+        confirm_station_signers(admitted, final_trust, args.source_sha, caller=call_named)
+        for path, raw in assets.items():
+            app.atomic(str(path), raw.decode('utf-8'), mode=0o644)
+        observed = call_named(admitted['reviewer'], (PYTHON, '-EBs', STATION_TOOLS / 'destination_observation.py',
+                              'measure-acl', '--tailnet', site['tailnet'], '--acl-oauth', admitted['reviewer']['acl_oauth']),
+                              limit=256)
+        require(observed == (site['acl_sha256'] + '\n').encode('ascii'),
+                'current API policy differs from the original independently signed access review')
+    except (Blocked, OSError, KeyError, TypeError, ValueError, subprocess.SubprocessError):
+        if owned_timer:
+            subprocess.run(['/usr/bin/systemctl', 'disable', '--now', STATION_UNITS[1]], env=ENV, check=True, timeout=25)
+        raise
     for path, raw in ((site_path, encoding(site)), (CONFIG, encoding(controls))):
         app.atomic(str(path), raw.decode('utf-8'), mode=0o600 if path == CONFIG else 0o644)
     subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], env=ENV, check=True, timeout=25)

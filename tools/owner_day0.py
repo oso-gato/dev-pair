@@ -530,6 +530,11 @@ class DayZero:
         if not public:
             return False
         public = key(public, hardware=True)
+        fingerprint = answer(tty, 'Enter the access-review key’s OpenSSH SHA256 fingerprint from the independently verified handoff.')
+        require(fingerprint == Bootstrap.signer_fingerprint(public), 'The independently supplied access-review fingerprint differs.')
+        require(not current or all(public.split()[1] not in line.split() for line in current.splitlines()
+                                   if not line.lstrip().startswith('#')),
+                'The access-review key is already assigned to another signing authority.')
         entry = f'{ACCESS_PRINCIPAL} namespaces="{ACCESS_NAMESPACE}" {public}\n'
         before = current or ''
         if before and not before.endswith('\n'):
@@ -582,6 +587,8 @@ class DayZero:
             return False
         account = answer(tty, 'Independent station’s dedicated access transport account.')
         host_key = key(answer(tty, 'Paste the independent station’s SSH host public key from its operator.'))
+        fingerprint = answer(tty, 'Enter the station host key’s OpenSSH SHA256 fingerprint from the independently verified handoff.')
+        require(fingerprint == Bootstrap.signer_fingerprint(host_key), 'The independently supplied station host fingerprint differs.')
         signers = local_file(Path(TRUST_SIGNERS)).read_text(encoding='utf-8')
         require(host_key.split()[1] not in signers.split(), 'The SSH host key must be separate from access signing keys.')
         configure(self.app, host, account, host_key)
