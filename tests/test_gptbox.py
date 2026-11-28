@@ -141,7 +141,7 @@ class Fixture(g.Gptbox):
         return super().directory(name, mode, owner=None)
 
     def execute(self, *args, timeout=120, ok=(0,)):
-        if args[0].endswith('/distrobox-enter'):
+        if any(value.endswith('/distrobox-enter') for value in args[:5]):
             self.entry_calls.append(args)
             self.assert_ready_identity = args[args.index('--name') + 1]
             return '{"boundary_probe":"passed"}\n' if args[-1] == 'probe' else 'codex-cli 0.169.0\n'

@@ -43,6 +43,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(home.stat().st_mode&0o777,0o755);self.assertEqual(list(home.iterdir()),[])
         self.assertEqual(app.path(g.CONTROL+'/containers.conf').stat().st_mode&0o777,0o444)
         self.assertIn('XDG_CONFIG_HOME='+str(config),app.executor)
+        self.assertEqual(tuple(v for v in app.executor if v.startswith(('--uid=', 'USER=', 'LOGNAME='))),
+                         ('--uid=dp-maint', 'USER=dp-maint', 'LOGNAME=dp-maint'))
         prefix=tuple(v.replace(str(case.root),'',1).replace('RuntimeMaxSec=1800','RuntimeMaxSec=120') for v in app.executor)
         work='/var/lib/dev-pair/artifacts/gptbox-adapter/'+CONTEXT+'/image-work';wrapper=g.CONTROL+'/bin/podman'
         operations={'load':('/usr/bin/env','TMPDIR='+work+'/image-copy',wrapper,'load','--input',work+'/verification-work/dev-pair-fedora-abc123_4/base.oci.tar'),
@@ -55,8 +57,36 @@ class ConfigTests(unittest.TestCase):
             for change in ('XDG_CONFIG_HOME=/tmp','XDG_CONFIG_HOME='+g.CONTROL+'/home','XDG_CONFIG_HOME='+g.CONTROL+'/xdg-config/child'):
                 wrong=tuple(change if v.startswith('XDG_CONFIG_HOME=') else v for v in prefix)
                 self.assertIsNone(run.adapter_image_selection(wrong+operations['load'],None))
+            for correct, wrong in (('--uid=dp-maint', '--uid=dp-dev'), ('USER=dp-maint', 'USER=gpt'),
+                                   ('LOGNAME=dp-maint', 'LOGNAME=gpt')):
+                mutation = tuple(wrong if value == correct else value for value in prefix)
+                self.assertIsNone(run.adapter_image_selection(mutation + operations['load'], None))
             self.assertIsNone(run.adapter_image_selection(tuple(v for v in prefix if not v.startswith('XDG_CONFIG_HOME='))+operations['load'],None))
         self.assertIsNone(run._adapter_image_binding)
+
+    def test_executor_rejects_environment_mismatch_before_native_launch(self):
+        _, app = self.case()
+        app.setup_executor()
+        for correct, wrong in (('--uid=dp-maint', '--uid=dp-dev'), ('USER=dp-maint', 'USER=gpt'),
+                               ('LOGNAME=dp-maint', 'LOGNAME=gpt')):
+            original = app.executor
+            app.executor = [wrong if value == correct else value for value in original]
+            with patch.object(app, 'run') as run, self.assertRaisesRegex(b.Blocked, 'environment differ'):
+                app.engine('image', 'inspect', 'f' * 64)
+            run.assert_not_called()
+            app.executor = original
+
+    def test_distrobox_keeps_inner_user_and_wrapper_runs_host_engine_as_builder(self):
+        case, app = self.case()
+        case.assemble()
+        self.assertTrue(app.entry_calls)
+        self.assertTrue(all(call[:3] == ('/usr/bin/env', 'USER=gpt', 'LOGNAME=gpt') for call in app.entry_calls))
+        wrapper = case.root / 'podman-env-probe'
+        wrapper.write_text(g.podman_wrapper_script(g.podman_wrapper_tail('/usr/bin/printenv')))
+        wrapper.chmod(0o555)
+        result = subprocess.run([str(wrapper), 'USER', 'LOGNAME'], env={'USER': 'gpt', 'LOGNAME': 'gpt'},
+                                check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.splitlines(), ['dp-maint', 'dp-maint'])
     def test_real_symlink_mode_and_content_conflicts_preserved(self):
         for kind in ('symlink','mode','content'):
             with self.subTest(kind=kind):

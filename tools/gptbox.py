@@ -19,7 +19,7 @@ import tarfile
 import time
 from types import ModuleType
 
-from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Commands, PrepareCost, KEYS_URL, PACKAGES, SOURCE_BASELINE,
+from bootstrap import (Bootstrap, Blocked, STATE, DEVELOPMENT_HOST_INTENT, Commands, PrepareCost, KEYS_URL, PACKAGES, SOURCE_BASELINE, BUILDER_ACCOUNT,
                        ACCESS_MODE, ATTENDED_ACCESS, SUDO_PACKAGE_QUERY, _RoleIdentity, _canonical_role_id, github_keys, operator_password,
                        role_subordinate_range, validate_sources)
 import candidate
@@ -101,6 +101,12 @@ def podman_wrapper_tail(engine):
     limit = fedora_oci.SAVE_FILE_LIMIT
     return (f'if [ "$1" = save ]; then exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n'
             f'exec {engine} "$@"\n')
+
+
+def podman_wrapper_script(body):
+    # The pinned Distrobox entry names its container user through USER. Its
+    # child Podman process still needs the real host account's subordinates.
+    return f'#!/bin/sh\nexport USER={BUILDER_ACCOUNT} LOGNAME={BUILDER_ACCOUNT}\n' + body
 
 
 def image_id(value):
@@ -253,7 +259,7 @@ class Gptbox(Bootstrap):
             raise Blocked(f'required protected development evidence is missing: {path.name}') from None
 
     def verify_builder(self):
-        name, shell, start = 'dp-maint', '/usr/sbin/nologin', 1000000
+        name, shell, start = BUILDER_ACCOUNT, '/usr/sbin/nologin', 1000000
         marker = self.protected_bytes(self.path(STATE + '/identity-' + name + '.json'), 4096, 0o600)
         if marker != image_inputs_bytes({'name': name, 'shell': shell, 'substart': start}):
             raise Blocked('managed builder identity marker does not match the bootstrap role')
@@ -385,6 +391,9 @@ class Gptbox(Bootstrap):
             raise Blocked('executing public input dependency differs from reviewed source')
 
     def execute(self, *args, timeout=120, ok=(0,)):
+        if self.executor and tuple(value for value in self.executor if value.startswith(('--uid=', 'USER=', 'LOGNAME='))) != (
+                '--uid=' + BUILDER_ACCOUNT, 'USER=' + BUILDER_ACCOUNT, 'LOGNAME=' + BUILDER_ACCOUNT):
+            raise Blocked('native executor account and engine environment differ')
         prefix = [value.replace('RuntimeMaxSec=1800', 'RuntimeMaxSec=' + str(timeout)) for value in self.executor]
         image_diagnostic=bool(getattr(self,'image_phase_active',False))
         previous_metadata = self.run.metadata_diagnostic if isinstance(self.run, Commands) else None
@@ -440,7 +449,7 @@ class Gptbox(Bootstrap):
 
     def setup_executor(self, retry=False, *, verified=None):
         if self.role == 'development':
-            if type(verified) is not _RoleIdentity or verified.name != 'dp-maint':
+            if type(verified) is not _RoleIdentity or verified.name != BUILDER_ACCOUNT:
                 raise Blocked('development executor requires live verified builder identity')
             uid, self.gid = str(verified.uid), str(verified.gid)
         else:
@@ -470,7 +479,7 @@ class Gptbox(Bootstrap):
             storage = MAINTENANCE_STORE
             self.directory(storage, owner='dp-maint')
         runroot = f'/run/user/{uid}/dev-pair-gptbox'
-        script = '#!/bin/sh\n'
+        script = ''
         if self.role == 'development':
             runroot += '-development-' + context
             destination = self.path(self.artifact_root + '/' + context + '/export-work/image-copy') / RELEASE_ARCHIVE
@@ -485,7 +494,7 @@ class Gptbox(Bootstrap):
             engine = f'/usr/bin/podman --root {self.path(storage)} --runroot {runroot} --storage-driver=vfs --events-backend=file'
         script += podman_wrapper_tail(engine)
         self.wrapper = str(self.path(control + '/bin/podman'))
-        self.atomic(control + '/bin/podman', script, mode=0o555)
+        self.atomic(control + '/bin/podman', podman_wrapper_script(script), mode=0o555, expected='#!/bin/sh\n' + script)
         if self.role == 'maintenance':
             self.directory(control + '/job-bin', mode=0o755)
             self.atomic(control + '/job-bin/podman', JOB_ENTER_WRAPPER, mode=0o555)
@@ -508,10 +517,10 @@ class Gptbox(Bootstrap):
 
     def configure_executor(self, uid, control):
         self.executor = ['/usr/bin/systemd-run', '--unit=' + self.unit, '--description=dev-pair-owned-' + self.unit, '--quiet', '--wait', '--collect', '--service-type=exec',
-                         '--uid=dp-maint', '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=10',
+                         '--uid=' + BUILDER_ACCOUNT, '--property=RuntimeMaxSec=1800', '--property=TimeoutStopSec=10',
                          '--property=KillMode=control-group', '--property=MemoryMax=2G', '--property=TasksMax=512',
                          '--property=CPUQuota=100%', '/usr/bin/env', '-i', 'PATH=' + str(self.path(control + '/bin')) + ':/usr/bin:/usr/sbin:/bin',
-                         'HOME=' + str(self.path(control + '/home')), 'USER=gpt', 'LOGNAME=gpt',
+                         'HOME=' + str(self.path(control + '/home')), 'USER=' + BUILDER_ACCOUNT, 'LOGNAME=' + BUILDER_ACCOUNT,
                          'XDG_RUNTIME_DIR=/run/user/' + uid, 'XDG_CONFIG_HOME=' + str(self.path(control + '/xdg-config')),
                          'CONTAINERS_CONF=' + str(self.path(control + '/containers.conf')),
                          'DBX_CONTAINER_MANAGER=podman']
@@ -523,12 +532,14 @@ class Gptbox(Bootstrap):
             if not all(value.isdigit() and int(value) >= 1000 for value in (uid, gid)):
                 raise Blocked('managed maintenance account required')
         else:
+            if type(identity) is not _RoleIdentity or identity.name != BUILDER_ACCOUNT:
+                raise Blocked('managed maintenance account required')
             uid, gid = str(identity.uid), str(identity.gid)
         self.uid, self.gid = uid, gid
         engine = (f'/usr/bin/podman --root {self.path(MAINTENANCE_STORE)} --runroot /run/user/{uid}/dev-pair-gptbox'
                   ' --storage-driver=vfs --events-backend=file')
         files = {
-            'bin/podman': (0o555, sha(('#!/bin/sh\n' + podman_wrapper_tail(engine)).encode())),
+            'bin/podman': (0o555, sha(podman_wrapper_script(podman_wrapper_tail(engine)).encode())),
             'distrobox-enter': (0o555, ENTER_SHA256),
             'job-bin/podman': (0o555, sha(JOB_ENTER_WRAPPER.encode())),
             'containers.conf': (0o444, sha(CONTAINERS_CONF.encode())),
@@ -644,7 +655,9 @@ class Gptbox(Bootstrap):
                     or not before['State'].get('StartedAt')):
                 raise Blocked('headless role entry requires the exact running job mounts')
         protected_entry = job or getattr(self, 'protected_job_entry', False)
-        environment = ('/usr/bin/env', 'PATH=' + CONTROL + '/job-bin:/usr/bin:/usr/sbin:/bin') if protected_entry else ()
+        environment = ('/usr/bin/env', 'USER=gpt', 'LOGNAME=gpt')
+        if protected_entry:
+            environment += ('PATH=' + CONTROL + '/job-bin:/usr/bin:/usr/sbin:/bin',)
         output = self.execute(*environment, str(self.path(CONTROL + '/distrobox-enter')),
                           '--name', identity, '--no-tty', '--no-workdir', '--clean-path', '--',
                           '/usr/bin/python3', '-I', RUNTIME, 'entry', operation, *(job or ()), timeout=150 if job else 30)

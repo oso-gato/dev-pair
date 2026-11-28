@@ -149,6 +149,7 @@ SUDO_ROLES = {'dp-maint': 'maintenance-sudo-denial', 'dp-dev': 'development-sudo
 SUDO_DENIAL_ROLES = {**SUDO_ROLES, 'dp-checklist': 'checklist-sudo-denial'}
 ROLE_DIRECTORIES = {'dp-maint':'maintenance','dp-dev':'development'}
 ROLE_CHILDREN = ('workspaces','checkpoints','evidence','deliverables','builds','cache','state')
+BUILDER_ACCOUNT = 'dp-maint'
 
 
 @dataclass(frozen=True)
@@ -419,14 +420,15 @@ class Commands:
         context,uid=self._adapter_image_binding
         if type(context) is not str or not re.fullmatch('[0-9a-f]{64}',context) or type(uid) is not str or not re.fullmatch('[1-9][0-9]{0,9}',uid):return None
         unit='dev-pair-gptbox-'+context+'.service';control='/usr/local/libexec/dev-pair-gptbox'
-        fixed=('/usr/bin/systemd-run','--unit='+unit,'--description=dev-pair-owned-'+unit,'--quiet','--wait','--collect','--service-type=exec','--uid=dp-maint')
+        fixed=('/usr/bin/systemd-run','--unit='+unit,'--description=dev-pair-owned-'+unit,'--quiet','--wait','--collect','--service-type=exec','--uid='+BUILDER_ACCOUNT)
         if args[:8]!=fixed or len(args)<24 or not args[8].startswith('--property=RuntimeMaxSec='):return None
         try:
             duration=float(args[8].split('=',2)[2])
             if not math.isfinite(duration) or not 0<duration<=600:return None
         except ValueError:return None
         tail=('--property=TimeoutStopSec=10','--property=KillMode=control-group','--property=MemoryMax=2G','--property=TasksMax=512','--property=CPUQuota=100%',
-            '/usr/bin/env','-i','PATH='+control+'/bin:/usr/bin:/usr/sbin:/bin','HOME='+control+'/home','USER=gpt','LOGNAME=gpt',
+            '/usr/bin/env','-i','PATH='+control+'/bin:/usr/bin:/usr/sbin:/bin','HOME='+control+'/home',
+            'USER='+BUILDER_ACCOUNT,'LOGNAME='+BUILDER_ACCOUNT,
             'XDG_RUNTIME_DIR=/run/user/'+uid,'XDG_CONFIG_HOME='+control+'/xdg-config','CONTAINERS_CONF='+control+'/containers.conf','DBX_CONTAINER_MANAGER=podman')
         if args[9:24]!=tail:return None
         rest=args[24:];work='/var/lib/dev-pair/artifacts/gptbox-adapter/'+context+'/image-work';wrapper=control+'/bin/podman'
