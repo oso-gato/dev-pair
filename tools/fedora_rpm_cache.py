@@ -257,6 +257,7 @@ def primary_packages(stream, packages, end):
         result = evaluate(expressions[index], context)
         require(result, 'cannot read Fedora primary metadata field')
         try:
+            remaining(end)
             value = as_string(result)
             require(value, 'cannot read Fedora primary metadata field')
             try:
@@ -290,11 +291,12 @@ def primary_packages(stream, packages, end):
         context = xpath_context(doc)
         require(context and register(context, b'c', PRIMARY_NAMESPACE) == 0,
                 'cannot open Fedora primary metadata query')
+        # Evaluate each aggregate once at the package, even with duplicate children.
         for query in (
-            b"string(c:location[count(../*[local-name()='location'])=1 and not(*)"
-            b" and not(../descendant::*[local-name()='package'])]/@href)",
-            b"string(c:size[count(../*[local-name()='size'])=1 and not(*)]/@package)",
-            b"string(c:checksum[count(../*[local-name()='checksum'])=1 and not(*)]/@type)",
+            b"string(self::c:package[count(*[local-name()='location'])=1"
+            b" and not(descendant::*[local-name()='package'])]/c:location[not(*)]/@href)",
+            b"string(self::c:package[count(*[local-name()='size'])=1]/c:size[not(*)]/@package)",
+            b"string(self::c:package[count(*[local-name()='checksum'])=1]/c:checksum[not(*)]/@type)",
             b'string(c:checksum)',
         ):
             expression = compile_xpath(query)

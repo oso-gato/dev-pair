@@ -110,6 +110,7 @@ class CacheTests(unittest.TestCase):
             ('inconsistent selected location', document(entry.replace('Packages/e/', 'elsewhere/'))),
             ('duplicate location', document(entry.replace(location, location * 2))),
             ('duplicate selected checksum', document(entry.replace(checksum, checksum * 2))),
+            ('duplicate selected size', document(entry.replace(size, size * 2))),
             ('missing unselected location', document('<c:package/>' + entry)),
             ('nested package', document(entry.replace('ignored', '<r:package/>'))),
             ('malformed unselected descendant', document(unselected.replace('</c:package>', '<a></c:package>') + entry)),
