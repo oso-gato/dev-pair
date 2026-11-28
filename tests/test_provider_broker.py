@@ -557,6 +557,7 @@ class BrokerLifecycleTests(unittest.TestCase):
                     clock.monotonic.return_value = expiry_seconds - accept_timeout
 
                 def accept(listener):
+                    self.assertFalse(idle_timeouts, 'broker attempted another accept after idle expiry')
                     self.assertTrue(path.is_socket())
                     self.assertEqual(json.loads(receipt.read_bytes())['status'], 'listening')
                     self.assertAlmostEqual(listener.gettimeout(), accept_timeout, places=5)
@@ -564,6 +565,7 @@ class BrokerLifecycleTests(unittest.TestCase):
                         return super().accept()
                     except TimeoutError:
                         idle_timeouts.append(listener.gettimeout())
+                        clock.monotonic.return_value = float(expiry_seconds)
                         raise
 
             approved = Mock()
