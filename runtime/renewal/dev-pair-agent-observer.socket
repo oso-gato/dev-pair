@@ -1,0 +1,11 @@
+[Unit]
+Description=Named SSH gateway for exact dev-pair candidate probes
+
+[Socket]
+ListenStream=/run/dev-pair-agent-observer.sock
+SocketUser=root
+SocketGroup=core
+SocketMode=0660
+Accept=yes
+MaxConnections=2
+RemoveOnStop=yes

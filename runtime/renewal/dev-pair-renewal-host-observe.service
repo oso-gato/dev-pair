@@ -1,0 +1,15 @@
+[Unit]
+Description=Measure the current dev-pair host release after boot
+Requires=dev-pair-renewal-boot-fence.service
+After=local-fs.target dev-pair-renewal-boot-fence.service
+Before=dev-pair-renewal-recovery.service
+RequiresMountsFor=/var/lib/dev-pair /usr/libexec/dev-pair/host-releases
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/dev-pair/renewal/host-release observe
+TimeoutStartSec=105s
+KillMode=control-group

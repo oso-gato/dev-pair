@@ -1,0 +1,59 @@
+#!/usr/bin/python3 -IB
+"""Enter the fixed checklist host service from its selected protected bundle."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+STORE = Path('/usr/libexec/dev-pair/host-releases')
+SELECTOR = Path('/var/lib/dev-pair/renewal-fence/selected-host.json')
+PYTHON = '/usr/bin/python3'
+HOST_ARGS = ('serve-host', '--state', '/var/lib/dev-pair/checklist-executor/ledger',
+             '--tls', '/var/lib/dev-pair/checklist-executor/tls',
+             '--approval', '/etc/dev-pair/checklist/approval.json', '--port', '19425', '--lifetime', '600')
+
+
+def checked(path, max_bytes, mode=None):
+    for part in (path, *path.parents):
+        info = part.lstat()
+        if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
+            raise ValueError('unprotected checklist launch path')
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > max_bytes or (
+            mode is not None and stat.S_IMODE(info.st_mode) != mode):
+        raise ValueError('invalid checklist launch file')
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+        raw = stream.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError('checklist launch file exceeds bound')
+    return raw
+
+
+def selected_command(selector=SELECTOR, store=STORE):
+    record = json.loads(checked(selector, 4096, 0o644))
+    digest = record.get('artifact_sha256')
+    if set(record) != {'schema', 'artifact_sha256'} or type(record['schema']) is not int or record['schema'] != 1 or (
+            type(digest) is not str or re.fullmatch('[0-9a-f]{64}', digest) is None):
+        raise ValueError('invalid checklist bundle selector')
+    location = store / digest
+    raw = checked(location / 'manifest.json', 1 << 20, 0o444)
+    if hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError('checklist release manifest changed')
+    relative = 'tools/host_handoff.py'
+    script = location / relative
+    if hashlib.sha256(checked(script, 4 << 20, 0o444)).hexdigest() != json.loads(raw)['files'][relative]:
+        raise ValueError('selected checklist service bytes changed')
+    return [PYTHON, '-EBs', str(script), *HOST_ARGS]
+
+
+if __name__ == '__main__':
+    command = selected_command()
+    if sys.argv[1:] == ['--describe'] and os.geteuid() == 0:
+        print(json.dumps(command))
+    elif len(sys.argv) == 1:
+        os.execv(command[0], command)
+    else:
+        raise SystemExit(2)

@@ -1,0 +1,1215 @@
+"""Owner-run start, status and resume for the reviewed hPanel bootstrap."""
+import argparse
+from contextlib import ExitStack, contextmanager, nullcontext
+import fcntl
+import getpass
+from hashlib import file_digest, sha256
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import warnings
+
+from bootstrap import (ATTENDED_ACCESS, ATTENDED_RECEIPT, Blocked, Bootstrap, CORE_ACCESS_CUTOVER, CUTOVER,
+                       STATE as BOOTSTRAP, TRUST_SIGNERS, WORKLOAD_ACCESS_CUTOVER)
+import managed_backing
+
+REPO = Path(__file__).resolve().parents[1]
+STATE = Path('/var/lib/dev-pair-day0')
+HANDOFF = Path('/etc/dev-pair/day0')
+ROOT = Path('/var/lib/dev-pair')
+GIT = Path('/usr/bin/git')
+OWNER_KITS = Path('/root')
+OWNER_CATALOGUE = Path('/etc/dev-pair/product-intake/repositories.json')
+OWNER_SETUP = Path('/usr/libexec/dev-pair/tools/owner_intake.py')
+# OpenSSH match-principals returns SSH_ERR_KEY_NOT_FOUND when none matched.
+NO_MATCHING_PRINCIPAL = 210
+INITIAL_MAINTENANCE_SOURCE = 'a160b1c1724fb70d38d9992ad377ab791b2db0ee'
+INITIAL_MAINTENANCE_PRODUCTION_TREE = 'a0f038de4d44844a743d338998ca14deee4ac3cc08fea9ef53db85d7d466c595'
+MIB = 1024**2
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8',
+       'PYTHONDONTWRITEBYTECODE': '1', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+
+
+def require(value, reason):
+    if not value:
+        raise Blocked(reason)
+
+
+def pin(value, length=64):
+    require(type(value) is str and re.fullmatch(r'[0-9a-f]{%d}' % length, value), 'expected a complete pinned SHA')
+    return value
+
+
+def local_file(path):
+    for node in (path, *path.parents):
+        info = node.lstat()
+        proper = stat.S_ISREG(info.st_mode) and info.st_nlink == 1 if node == path else stat.S_ISDIR(info.st_mode)
+        require(proper and info.st_uid == 0 and not info.st_mode & 0o022, 'protected local path required')
+    return path
+
+
+def checksum(path):
+    with local_file(path).open('rb') as stream:
+        return file_digest(stream, 'sha256').hexdigest()
+
+
+def kit_source(repo, supplied=None):
+    """Verify the checked archive's own manifest before bootstrapping signed Git."""
+    package = repo.parent
+    marker, manifest = package / 'SOURCE', package / 'MANIFEST.sha256'
+    if not os.path.lexists(marker) and not os.path.lexists(manifest):
+        return pin(supplied, 40), False
+    if not os.path.lexists(manifest):
+        revision = pin(local_file(marker).read_text().removesuffix('\n'), 40)
+        require(supplied is None or supplied == revision, 'staged public source differs from the supplied pin')
+        return revision, False
+    revision = pin(local_file(marker).read_text().removesuffix('\n'), 40)
+    require(supplied is None or supplied == revision, 'source argument differs from the verified owner kit')
+    manifest = local_file(manifest)
+    require(manifest.stat().st_size <= 2 * MIB, 'owner kit manifest exceeds its bound')
+    seen = set()
+    for line in manifest.read_text().splitlines():
+        match = re.fullmatch(r'([0-9a-f]{64})  ([A-Za-z0-9._/+@-]+)', line)
+        require(match, 'owner kit manifest contains an invalid path')
+        digest, name = match.groups()
+        leaf = PurePosixPath(name)
+        require(leaf.as_posix() == name and not leaf.is_absolute() and '..' not in leaf.parts and
+                name not in seen and (name in ('SOURCE', 'README.txt') or leaf.parts[0] == repo.name),
+                'owner kit manifest path is outside its approved source')
+        seen.add(name)
+        # Git may update only its index metadata. The clean exact objects are
+        # checked on every run after Git is available.
+        if name == f'{repo.name}/.git/index' and GIT.is_file():
+            local_file(package / name)
+        else:
+            require(checksum(package / name) == digest, 'owner kit bytes differ from the verified manifest')
+    required = {'SOURCE', f'{repo.name}/day0.sh', f'{repo.name}/tools/owner_day0.py', f'{repo.name}/.git/HEAD'}
+    require(required <= seen, 'owner kit is incomplete')
+    return revision, True
+
+
+def secure_directory(path):
+    for parent in path.parents:
+        info = parent.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022,
+                'protected day-zero state ancestry required')
+    path.mkdir(mode=0o700, exist_ok=True)
+    node = path.lstat()
+    require(stat.S_ISDIR(node.st_mode) and node.st_uid == 0 and stat.S_IMODE(node.st_mode) == 0o700,
+            'protected day-zero state directory required')
+    return path
+
+
+def record(path):
+    if not os.path.lexists(path):
+        return None
+    node = local_file(path).stat()
+    require(node.st_size <= 65536 and not node.st_mode & 0o077, 'day-zero record must be private and bounded')
+    return json.loads(path.read_bytes())
+
+
+def save(app, path, value):
+    old = record(path)
+    if old == value:
+        return
+    before = path.read_text() if old is not None else None
+    app.atomic(str(path), json.dumps(value, sort_keys=True) + '\n', expected=before)
+
+
+@contextmanager
+def tty_open():
+    with ExitStack() as stack:
+        try:
+            incoming = stack.enter_context(open('/dev/tty', encoding='utf-8'))
+            outgoing = stack.enter_context(open('/dev/tty', 'w', encoding='utf-8', buffering=1))
+        except OSError as error:
+            raise Blocked('Open an interactive hPanel root terminal and run one command on its own line.') from error
+        yield SimpleNamespace(incoming=incoming, outgoing=outgoing)
+
+
+def answer(tty, prompt):
+    tty.outgoing.write(prompt + ' ')
+    tty.outgoing.flush()
+    line = tty.incoming.readline(1025)
+    require(line.endswith('\n') and len(line) <= 1024, 'interactive answer was interrupted or too long')
+    return line.strip()
+
+
+def secret_answer(tty, prompt):
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        return getpass.getpass(prompt + ' ', stream=tty.outgoing)
+
+
+@contextmanager
+def secret_file(contents):
+    with tempfile.TemporaryDirectory(prefix='dev-pair-day0-', dir='/run') as work:
+        path = Path(work) / 'credential'
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w') as stream:
+            stream.write(contents + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            yield path
+        finally:
+            contents = ''
+
+
+class DayZero:
+    def __init__(self, repo=REPO, app=None):
+        self.repo = repo
+        self.app = app or Bootstrap()
+        self.progress = STATE / 'progress.json'
+
+    def call(self, name, *args, timeout=900, capture=True, checkout=None):
+        script = local_file((checkout or self.repo) / 'tools' / name)
+        connection = {name: os.environ[name] for name in ('SSH_CONNECTION', 'SSH_CLIENT') if name in os.environ}
+        result = subprocess.run(['/usr/bin/python3', '-EBs', str(script), *map(str, args)], env={**ENV, **connection},
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE if capture else None,
+                                timeout=timeout, check=False, text=True)
+        require(result.returncode == 0, f'{name} paused. Read the controller message above, then run ./day0.sh resume.')
+        return json.loads(result.stdout) if capture else None
+
+    def original(self, revision=None):
+        current = self.app.console_inspect(revision)
+        release = dict(re.findall(r'^([A-Z_]+)=["\']?([^\n"\']*)', current['os_release'], re.M))
+        require((release.get('ID'), release.get('VERSION_ID'), current['arch'], current['pid1']) ==
+                ('fedora', '44', 'x86_64', 'systemd'), 'Day 0 requires Fedora 44 x86_64 with systemd.')
+        return current
+
+    def status(self, source=None):
+        item = self.original()
+        original = record(STATE / 'progress.json')
+        stable = self.stable_site(item, original)
+        if stable and stable.get('pending'):
+            print('Stable maintenance is fenced for its recorded recovery operation.')
+            print('Next Resume the exact stable maintenance operation in the reviewed successor checkout.')
+            return
+        protected = (record(STATE / 'stable-progress.json') if stable else
+                     record(STATE / 'continuation-progress.json') or original)
+        if stable and protected and (protected['source_sha'], protected['machine_id']) != (
+                stable['source_sha'], item['machine_id']):
+            protected = None
+        report = self.app.status()
+        print(f"Host {item['host']} | Fedora 44 | SELinux { {'1': 'enforcing', '0': 'permissive'}.get(item['selinux'], item['selinux'])}")
+        physical = managed_backing.observe('/var/lib', Blocked)
+        print(f'Physical /var/lib free {physical.available_bytes // MIB} MiB | {physical.display()}')
+        print('Source ' + (stable['source_sha'] if stable else
+                           protected['source_sha'] if protected else source or 'awaiting the verified owner kit'))
+        print('Day 0 phase ' + (protected['phase'] if protected else
+                               'stable release verified' if stable else 'ready for inspection'))
+        desired = record(Path(BOOTSTRAP) / 'desired.json') if report['prepared'] else None
+        probe = Path(BOOTSTRAP) / 'gptbox-adapter' / pin(desired['gptbox_context_sha256']) / 'result.json' if desired else None
+        maintenance = 'probe completion recorded' if probe and record(probe) else 'build and probes pending'
+        initializer = record(Path(BOOTSTRAP) / 'initialize.json')
+        if initializer is not None and (type(initializer) is not dict or initializer.get('phase') != 'complete'):
+            maintenance = 'original setup reconciliation pending'
+        print('Maintenance gptbox ' + maintenance)
+        print('Tailnet enrollment ' + ('recorded' if report['enrollment_recorded'] else 'pending'))
+        access = report.get('access_scope')
+        print('SSH access ' + report['phase'] + (' | workload access pending' if access == 'core' else ''))
+        print('Next ' + (protected['next'] if protected else
+                         'Run ./day0.sh resume in the selected signed stable checkout.' if stable else
+                         'Run ./day0.sh start in the selected hPanel root terminal.'))
+
+    def stage(self, identity, revision, phase, next_step):
+        save(self.app, self.progress, {'schema': 1, 'machine_id': identity['machine_id'], 'source_sha': revision,
+                                       'phase': phase, 'next': next_step})
+        print(phase.replace('-', ' ').capitalize() + '. ' + next_step, flush=True)
+
+    def ensure_git(self, revision, archive):
+        if not GIT.is_file():
+            require(archive, 'Use the verified pre-Git owner kit when Git is absent.')
+            print('Installing the signed Fedora Git prerequisite.', flush=True)
+            subprocess.run(['/usr/bin/dnf', '-y', '--setopt=gpgcheck=1', '--setopt=localpkg_gpgcheck=1',
+                            '--disablerepo=*', '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'],
+                           env=ENV, stdin=subprocess.DEVNULL, timeout=420, check=True)
+        return self.app.destination_source(revision)
+
+    def production_entry(self, source, tty=None, *, draft=False):
+        from day0_source import (SOURCE_NAME, confirm_checkout, confirm_main, handoff, reviewed_seed,
+                                 production_checkout, stage_checkout, verified_tree)
+        from release_setup import private_publish
+
+        authority = STATE / SOURCE_NAME
+        previous = record(STATE / 'progress.json')
+        native = tuple(Path(BOOTSTRAP) / name for name in ('desired.json', 'initialize.json', 'host-ready.json'))
+
+        def retained():
+            machine = self.app.destination_identity()['machine_id']
+            _, grant = handoff(authority, machine)
+            revision, _ = kit_source(self.repo, source)
+            require(not draft, 'This host already has an independently approved production source.')
+            if previous is not None and revision not in (grant['review']['review_head'], grant['source_sha']):
+                # Historical continuation and deliberately selected stable successors still use their own checks.
+                return self.repo, source
+            reviewed_seed(grant, revision)
+            checkout = production_checkout(OWNER_KITS, grant['source_sha'])
+            original_tree = verified_tree(self.repo, revision, grant['review']['source_tree']) if checkout != self.repo else None
+            confirm_checkout(OWNER_KITS, grant, original_tree)
+            return checkout, grant['source_sha']
+
+        if os.path.lexists(authority):
+            return retained()
+        if previous is not None:
+            return self.repo, source
+        require(not any(map(os.path.lexists, native)),
+                'This host already has managed bootstrap evidence. Use its original pinned checkout and protected recovery entry.')
+        if draft:
+            return self.repo, source
+        if tty is None:
+            return None
+
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        print(f"Selected host {identity['host']} | machine {identity['machine_id']} | Fedora 44 x86_64.", flush=True)
+        supplied = answer(tty, 'Enter the independent first-release handoff’s protected absolute path, or press Enter to wait.')
+        if not supplied:
+            return None
+        digest = answer(tty, 'Enter the SHA-256 received separately from the release custodian, or press Enter to wait.')
+        if not digest:
+            return None
+        raw, grant = handoff(Path(supplied), identity['machine_id'], pin(digest))
+        reviewed_seed(grant, revision)
+        with self.owner_lock():
+            if os.path.lexists(authority):
+                require(handoff(authority, identity['machine_id'])[0] == raw,
+                        'Another exact independently approved source is already selected on this host.')
+                return retained()
+            require(record(STATE / 'progress.json') is None and not any(map(os.path.lexists, native)),
+                    'This host began setup under a different source. Use its original pinned checkout.')
+            self.ensure_git(revision, archive)
+            seed_tree = verified_tree(self.repo, revision, grant['review']['source_tree'])
+            target = grant['source_sha']
+            confirm_main(target)
+            checkout = stage_checkout(OWNER_KITS, grant, seed_tree)
+            confirm_main(target)
+            private_publish(authority, raw)
+        print(f'Independently approved production source {target} selected.', flush=True)
+        return checkout, target
+
+    def transport(self, tty, identity, revision):
+        saved = record(STATE / 'transport.json')
+        observed = self.app.observed_ssh_peer()
+        if observed:
+            remote = observed['remote']
+            network = f'{remote}/{remote.max_prefixlen}'
+            require(saved in (None, {'mode': 'observed-ssh', 'network': network}) or
+                    self.app.status()['phase'] == 'tailnet-only',
+                    'The current SSH peer differs from the authorized original route. Use the original route or independent recovery.')
+            if saved is None:
+                message = (f'Observed SSH source {network}. Open a second independent hPanel root terminal and confirm it works. '
+                           f'Type yes to scope temporary SSH to this observed source only.')
+                if answer(tty, message).lower() != 'yes':
+                    return None
+                save(self.app, STATE / 'transport.json', {'mode': 'observed-ssh', 'network': network})
+            self.app.validate_bootstrap_access([network])
+            return ['--bootstrap-source', network]
+        provider = HANDOFF / 'provider-console.json'
+        if os.path.lexists(provider) and os.path.lexists(Path(TRUST_SIGNERS)):
+            require(saved in (None, {'mode': 'verified-provider-console'}), 'Protected initial transport differs.')
+            self.app.validate_bootstrap_access([], str(provider))
+            save(self.app, STATE / 'transport.json', {'mode': 'verified-provider-console'})
+            return ['--console-receipt', str(provider)]
+        require(saved in (None, {'mode': ATTENDED_ACCESS}), 'Protected initial transport differs.')
+        if self.attended(tty, identity, revision):
+            save(self.app, STATE / 'transport.json', {'mode': ATTENDED_ACCESS})
+            return ['--console-receipt', ATTENDED_RECEIPT]
+        return None
+
+    def attended(self, tty, identity, revision):
+        receipt = Path(ATTENDED_RECEIPT)
+        runtime = secure_directory(receipt.parent)
+        prior = record(receipt)
+        if prior and (prior.get('boot_id'), prior.get('source_sha')) == (identity['boot_id'], revision) and \
+                0 <= time.time() - prior.get('created_at', 0) <= 1800:
+            self.app.validate_bootstrap_access([], ATTENDED_RECEIPT)
+            return True
+        require(self.app.ssh_ancestors() == [] and not os.environ.get('SSH_CLIENT') and
+                not os.environ.get('SSH_CONNECTION'), 'Open the recovery challenge from the local hPanel root terminal.')
+        challenge = {'schema': 1, 'machine_id': identity['machine_id'], 'boot_id': identity['boot_id'],
+                     'source_sha': revision, 'owner_checkout': str(self.repo), 'created_at': int(time.time()),
+                     'origin_session': os.getsid(0),
+                     'code': secrets.token_hex(4)}
+        save(self.app, runtime / 'challenge.json', challenge)
+        print('In a second hPanel root terminal for the same VPS, enter this checkout and run', flush=True)
+        print(f'  cd {self.repo} && ./day0.sh resume --confirm-recovery', flush=True)
+        print(f'Recovery challenge {challenge["code"]}', flush=True)
+        answer(tty, 'Press Enter here after confirming in the second terminal.')
+        observed = record(receipt)
+        if not observed or any(observed.get(key) != challenge[key] for key in ('created_at', 'origin_session')):
+            return False
+        self.app.validate_bootstrap_access([], ATTENDED_RECEIPT)
+        return True
+
+    def confirm_recovery(self, tty, source):
+        revision, _ = kit_source(self.repo, source)
+        identity = self.original(revision)
+        require(self.app.ssh_ancestors() == [] and not os.environ.get('SSH_CLIENT') and
+                not os.environ.get('SSH_CONNECTION'), 'Open the second local hPanel root terminal, then confirm again.')
+        receipt = Path(ATTENDED_RECEIPT)
+        challenge = record(receipt.with_name('challenge.json'))
+        require(challenge and challenge['schema'] == 1 and challenge['source_sha'] == revision and
+                challenge['owner_checkout'] == str(self.repo) and
+                all(challenge[key] == identity[key] for key in ('machine_id', 'boot_id')) and
+                0 <= time.time() - challenge['created_at'] <= 600 and challenge['origin_session'] != os.getsid(0),
+                'No matching request from a different current hPanel session. Resume in the first terminal.')
+        code = secret_answer(tty, 'Enter the recovery challenge shown in the first terminal.')
+        require(secrets.compare_digest(code, challenge['code']), 'Recovery challenge did not match.')
+        fields = {name: challenge[name] for name in ('schema', 'machine_id', 'boot_id', 'source_sha', 'owner_checkout', 'created_at', 'origin_session')}
+        save(self.app, receipt, {**fields, 'kind': ATTENDED_ACCESS, 'confirmed_session': os.getsid(0)})
+        print('Separate current-boot root recovery confirmed. Continue in the first terminal.')
+
+    def selinux(self, identity, revision, tty):
+        observed = self.call('selinux_bootstrap.py', 'inspect')
+        state = ROOT / 'selinux-bootstrap/intent.json'
+        if (observed['live'] == 'Enforcing' and observed['persistent'] == 'enforcing' and
+                observed['policy_present'] and not os.path.lexists(state) and not os.path.lexists('/.autorelabel')):
+            return True
+        from selinux_bootstrap import code_digest
+        self.stage(identity, revision, 'selinux-transition', 'Keep an independent hPanel root recovery session available.')
+        if observed['live'] != 'Enforcing':
+            if answer(tty, 'Type yes to start the checked relabel and its bounded setup reboots.').lower() != 'yes':
+                return False
+            extra = ('--reboot',)
+        else:
+            extra = ()
+        result = self.call('selinux_bootstrap.py', 'converge', '--apply', '--expected-code-sha256', code_digest(),
+                           '--source-sha', revision, *extra)
+        if result.get('phase') not in ('enforcing', 'already-enforcing'):
+            self.stage(identity, revision, 'selinux-reboot-pending', 'Reconnect after the relabel and run ./day0.sh resume.')
+            return False
+        return True
+
+    def storage_geometry(self):
+        existing = record(Path('/var/lib/dev-pair-managed-storage.json'))
+        reserve = existing['reserve_inodes'] if existing else 4096 + 16
+        observed = managed_backing.provisioning_space('/var/lib', Blocked, reserve)
+        free = observed.available_bytes // MIB
+        print(f'Physical /var/lib free {free} MiB | {observed.display()}.', flush=True)
+        if existing:
+            observed.check(8192 * MIB, reserve, Blocked,
+                           'The enrolled host lacks its physical recovery reserve.')
+            return existing['filesystem']['mib'], existing['filesystem']['inodes'], existing['reserve_inodes']
+        size = min(20480, ((free - 9216) // 256) * 256)
+        observed.check((16384 + 9216) * MIB, reserve, Blocked,
+                       'The inspected /var/lib filesystem lacks managed capacity plus the required 8 GiB physical reserve.')
+        print(f'This host can reserve a {size} MiB managed filesystem for the pair.', flush=True)
+        return size, 262144, 4096
+
+    def managed_storage(self, revision, access, geometry):
+        size, inodes, reserve = geometry
+        self.call('destination_release.py', 'managed-storage', '--apply', '--platform-sha', revision,
+                  '--managed-mib', size, '--managed-inodes', inodes, '--reserve-inodes', reserve, *access)
+
+    def checked_inputs(self, path, revision):
+        from public_inputs import read_manifest
+
+        approved = record(path / 'admission.json')
+        require(type(approved) is dict and set(approved) == {'source_sha', 'manifest_sha256', 'context_sha256'} and
+                approved['source_sha'] == revision, 'protected maintenance context source changed')
+        manifest = read_manifest(path / 'manifest.json', pin(approved['manifest_sha256']))
+        expected = pin(approved['context_sha256'])
+        require(manifest['source_sha'] == revision and manifest['context_sha256'] == expected,
+                'verified public maintenance context differs from the protected handoff')
+        self.app.check_gptbox_inputs(path / 'context/context', expected)
+        return path / 'context/context', path / 'context/distrobox', expected
+
+    def inputs(self, revision):
+        store = secure_directory(ROOT / 'day0-inputs')
+        selected = store / revision
+        work = store / '.maintenance-work'
+        if os.path.lexists(work):
+            secure_directory(work)
+            marker = record(work / 'owner.json')
+            owned = marker == {'source_sha': revision, 'kind': 'day0-maintenance-public-inputs'}
+            require((owned or not any(work.iterdir())) and not any(os.path.ismount(path) for path in work.rglob('*')),
+                    'Unexpected day-zero input staging is preserved for recovery.')
+            shutil.rmtree(work)
+        if os.path.lexists(selected):
+            return self.checked_inputs(selected, revision)
+        secure_directory(work)
+        save(self.app, work / 'owner.json', {'source_sha': revision, 'kind': 'day0-maintenance-public-inputs'})
+        cache, handoff, result = (work / name for name in ('cache', 'handoff', 'result'))
+        secure_directory(result)
+        self.call('public_inputs.py', 'fetch', '--output', cache)
+        measured = self.call('public_inputs.py', 'build', '--cache', cache, '--distrobox-source', cache / 'distrobox',
+                             '--output', handoff, '--role', 'maintenance')
+        admission = {key: measured[key] for key in ('source_sha', 'manifest_sha256', 'context_sha256')}
+        require(admission['source_sha'] == revision, 'public maintenance input producer returned another source')
+        self.call('public_inputs.py', 'extract', '--payload', handoff / 'maintenance-inputs.tar.gz',
+                  '--manifest', handoff / 'manifest.json', '--expected-manifest-sha256', pin(admission['manifest_sha256']),
+                  '--output', result / 'context', '--role', 'maintenance')
+        shutil.copyfile(handoff / 'manifest.json', result / 'manifest.json')
+        save(self.app, result / 'admission.json', admission)
+        self.checked_inputs(result, revision)
+        require(not os.path.lexists(selected), 'a maintenance context appeared outside the day-zero lock')
+        result.rename(selected)
+        descriptor = os.open(store, os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        shutil.rmtree(work)
+        return self.checked_inputs(selected, revision)
+
+    def maintenance_receipt(self, revision, context):
+        from gptbox import Gptbox
+
+        app = Gptbox()
+        app.target = BOOTSTRAP + '/gptbox-adapter/' + context
+        path = Path(app.target) / 'result.json'
+        if not os.path.lexists(path):
+            return None
+        observed = record(path)
+        image = pin(observed['assembled_image_id'])
+        self.probes(observed, revision, context)
+        app.maintenance_host_readiness(context)
+        app.local_maintenance_completion(context, revision, image)
+        return image
+
+    @staticmethod
+    def probes(observed, revision, context):
+        require(type(observed) is dict and observed.get('kind') == 'maintenance-gptbox-probe-candidate' and
+                observed.get('source_sha') == revision and observed.get('context_sha256') == context and
+                type(observed.get('boundary_and_version_cycles')) is int and observed['boundary_and_version_cycles'] == 2 and
+                observed.get('runtime_container_removed') is True and observed.get('job_admission') is False,
+                'The confined maintenance gptbox and both offline probe cycles are still pending.')
+        return pin(observed.get('assembled_image_id'))
+
+    def prepare(self, revision, access, input_paths, tty, *, already_prepared=False):
+        context, upstream, expected = input_paths
+        checkout = Path(context).parent / 'dev-pair'
+        for entry in ('bootstrap.py', 'gptbox.py'):
+            require(checksum(checkout / 'tools' / entry) == checksum(self.repo / 'tools' / entry),
+                    'Sanitized public-input checkout does not contain the exact owner source.')
+        common = ('--apply', '--source-sha', revision, '--expected-context-sha256', expected, '--distrobox-source', upstream)
+        if already_prepared:
+            attempt = Path(BOOTSTRAP) / 'gptbox-adapter' / expected / 'attempt.json'
+            retry = ('--retry',) if os.path.lexists(attempt) else ()
+            result = self.call('gptbox.py', 'assemble-prepared-maintenance', *common, '--context', context,
+                               *retry, timeout=1850, checkout=checkout)
+            return self.probes(result, revision, expected)
+        if access[0] == '--console-receipt' and access[1] != ATTENDED_RECEIPT:
+            # Signed provider evidence uses the ordinary clean-checkout source
+            # verifier. Its closed receipt does not carry an alternate checkout.
+            checkout = self.repo
+        options = [*common, '--gptbox-context', context, *access]
+        if access[0] == '--bootstrap-source':
+            options.append('--provider-ssh')
+        if os.path.lexists(Path(BOOTSTRAP) / 'initialize.json'):
+            options.append('--retry')
+        if os.path.lexists(Path(BOOTSTRAP) / 'operator-password-set'):
+            result = self.call('bootstrap.py', 'initialize', *options, timeout=2500, checkout=checkout)
+        else:
+            value = secret_answer(tty, 'Set the named core console and sudo password.')
+            confirmation = secret_answer(tty, 'Repeat the core password.')
+            require(value and value == confirmation, 'The core passwords must be nonempty and match.')
+            with secret_file(value) as credential:
+                result = self.call('bootstrap.py', 'initialize', *options, '--password-file', credential,
+                                   timeout=2500, checkout=checkout)
+        require(result.get('phase') == result.get('maintenance_gptbox') == 'complete',
+                'The combined host preparation and maintenance gptbox are incomplete.')
+        return self.probes(result['result'], revision, expected)
+
+    def resume_maintenance(self, identity, revision, expected, tty):
+        journal = record(Path(BOOTSTRAP) / 'initialize.json')
+        incomplete = False
+        if journal is not None:
+            target = journal.get('target') if type(journal) is dict else None
+            require(type(target) is dict and journal.get('phase') in ('prepare', 'maintenance-gptbox', 'complete') and
+                    target.get('source_sha') == revision and target.get('context_sha256') == expected,
+                    'The combined initializer journal does not match this prepared host.')
+            incomplete = journal['phase'] != 'complete'
+        if not incomplete:
+            if self.maintenance_receipt(revision, expected) is not None:
+                return True
+            require(journal is None, 'The completed initializer is missing its exact sealed maintenance proof.')
+        access = ()
+        if incomplete:
+            access = self.transport(tty, identity, revision)
+            if access is None:
+                self.stage(identity, revision, 'recovery-confirmation-pending',
+                           'Confirm the original recovery route to resume the interrupted combined initializer.')
+                return False
+        self.stage(identity, revision, 'maintenance-gptbox',
+                   'Resuming the original initializer and its owned resources.' if incomplete else
+                   'Resuming the prepared host without resetting core or ingress.')
+        paths = self.inputs(revision)
+        require(paths[2] == expected, 'The prepared host uses different verified maintenance inputs.')
+        image = self.prepare(revision, access, paths, tty, already_prepared=not incomplete)
+        require(self.maintenance_receipt(revision, expected) == image, 'The maintenance probe evidence did not read back.')
+        return True
+
+    def enroll(self, tty):
+        current = self.app.status()
+        if current['enrollment_recorded']:
+            admitted = record(Path(BOOTSTRAP) / 'enrollment-intent.json')
+            live = json.loads(self.app.run('/usr/bin/tailscale', 'status', '--json', timeout=15))
+            require(live.get('BackendState') == 'Running', 'Previously enrolled Tailscale is not running. Keep the recovery console open.')
+            self.app.check_node(live, admitted['tailnet'])
+            return True
+        existing = record(Path(BOOTSTRAP) / 'enrollment-intent.json')
+        tailnet = existing['tailnet'] if existing else answer(tty, 'Expected Tailscale network name, or press Enter to finish host bootstrap and enroll later.')
+        if not tailnet:
+            return False
+        key = secret_answer(tty, 'Tailscale auth key, or press Enter for browser/device sign-in.')
+        if key:
+            require(re.fullmatch(r'tskey-auth-[A-Za-z0-9-]{10,250}', key), 'Expected a Tailscale auth key.')
+            with secret_file(key) as credential:
+                self.app.enroll(str(credential), tailnet)
+        else:
+            print('Open the Tailscale sign-in address in this terminal and approve this host in the intended network.', flush=True)
+
+            def browser(command):
+                subprocess.run(command, env=ENV, stdin=tty.incoming, stdout=tty.outgoing, stderr=tty.outgoing,
+                               timeout=620, check=True)
+
+            self.app.enroll(None, tailnet, browser=browser)
+        return True
+
+    def access_trust(self, tty):
+        from bootstrap import SIGNER_TRUST_LOCK
+
+        with self.app.lock(SIGNER_TRUST_LOCK):
+            return self.enroll_access_trust(tty)
+
+    def enroll_access_trust(self, tty):
+        from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL, key
+
+        path = Path(TRUST_SIGNERS)
+        current = None
+        if os.path.lexists(path):
+            path = local_file(path)
+            info = path.stat()
+            require(info.st_size <= 16384, 'The protected access trust file exceeds its bound.')
+            matched = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'match-principals', '-I', ACCESS_PRINCIPAL,
+                                      '-f', str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, env=ENV, timeout=10, check=False)
+            if matched.returncode == 0:
+                return True
+            require(matched.returncode == NO_MATCHING_PRINCIPAL, 'The protected access trust file could not be checked.')
+            current = path.read_text(encoding='utf-8')
+        public = answer(tty, 'Paste the access-review signing public key supplied by the independent verifier, or press Enter to defer.')
+        if not public:
+            return False
+        public = key(public, hardware=True)
+        fingerprint = answer(tty, 'Enter the access-review key’s OpenSSH SHA256 fingerprint from the independently verified handoff.')
+        require(fingerprint == Bootstrap.signer_fingerprint(public), 'The independently supplied access-review fingerprint differs.')
+        require(not current or all(public.split()[1] not in line.split() for line in current.splitlines()
+                                   if not line.lstrip().startswith('#')),
+                'The access-review key is already assigned to another signing authority.')
+        entry = f'{ACCESS_PRINCIPAL} namespaces="{ACCESS_NAMESPACE}" {public}\n'
+        before = current or ''
+        if before and not before.endswith('\n'):
+            before += '\n'
+        require(len((before + entry).encode()) <= 16384, 'The protected access trust file would exceed its bound.')
+        self.app.atomic(str(path), before + entry, mode=stat.S_IMODE(info.st_mode) if current is not None else 0o600,
+                        expected=current)
+        return True
+
+    def setup_agent_observer(self, tty, *, revoke=False):
+        enrolled = self.app.agent_observer_signers()
+        if revoke:
+            require(enrolled, 'No independently approved agent collector is enrolled.')
+            fingerprint = answer(tty, 'Enter the enrolled collector’s exact OpenSSH SHA256 fingerprint to withdraw it.')
+            self.app.update_agent_observer(fingerprint)
+            print('Independent collector approval withdrawn. New automatic agent observations are held.', flush=True)
+            return True
+        if enrolled:
+            return True
+        public = answer(tty, 'Paste the independent agent collector’s signing public key, or press Enter to wait.')
+        if not public:
+            return False
+        fingerprint = answer(tty, 'Enter the collector’s OpenSSH SHA256 fingerprint from the separate verified handoff.')
+        if not fingerprint:
+            return False
+        self.app.update_agent_observer(fingerprint, public=public)
+        print('Independent agent collector enrolled for confined role observations.', flush=True)
+        return True
+
+    def observer_trust(self, source, tty, *, revoke=False):
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        with self.owner_lock():
+            previous = record(STATE / 'progress.json')
+            require(previous and previous['machine_id'] == identity['machine_id'] and identity['selinux'] == '1' and
+                    not os.path.lexists('/.autorelabel'), 'Complete checked Day 0 setup on the selected host first.')
+            self.ensure_git(revision, archive)
+            self.select_source(identity, revision, previous)
+            if not revoke:
+                self.app.verify_final_guard()
+            self.setup_agent_observer(tty, revoke=revoke)
+
+    def access_station(self, tty):
+        from day0_access_exchange import configuration, configure, identity_public, key
+
+        if configuration() is not None:
+            return True
+        host = answer(tty, 'Independent verifier station Tailscale IP, or press Enter to keep access review offline.')
+        if not host:
+            return False
+        account = answer(tty, 'Independent station’s dedicated access transport account.')
+        host_key = key(answer(tty, 'Paste the independent station’s SSH host public key from its operator.'))
+        fingerprint = answer(tty, 'Enter the station host key’s OpenSSH SHA256 fingerprint from the independently verified handoff.')
+        require(fingerprint == Bootstrap.signer_fingerprint(host_key), 'The independently supplied station host fingerprint differs.')
+        signers = local_file(Path(TRUST_SIGNERS)).read_text(encoding='utf-8')
+        require(host_key.split()[1] not in signers.split(), 'The SSH host key must be separate from access signing keys.')
+        configure(self.app, host, account, host_key)
+        print('The independent station operator admits this request transport public key for the selected VPS.', flush=True)
+        print(identity_public(self.app), flush=True)
+        return True
+
+    def receiving_access(self, revision, historical, tty, *, workload=False):
+        from day0_access_exchange import ExchangeUnavailable, exchange, public_identity
+        from destination_observation import encoding
+
+        scope = 'workload' if workload else 'named administrator'
+        if not self.access_trust(tty):
+            print('Independent access review requires the verifier’s signing public key.', flush=True)
+            return False
+        if not self.access_station(tty):
+            option = ' --workloads' if workload else ''
+            print(f'Offline access handoff is available through ./day0.sh access-request{option} and ./day0.sh access-response.',
+                  flush=True)
+            return False
+        request = encoding(self.app.access_cutover_binding(revision, workload=workload))
+        try:
+            response = exchange(request)
+        except ExchangeUnavailable as wait:
+            print(str(wait), flush=True)
+            print('The verifier station operator can check access using this transport public key.', flush=True)
+            print(public_identity(), flush=True)
+            return False
+        if response is None:
+            receipt_id = sha256(request).hexdigest()
+            print(f'Independent {scope} access review requested. Keep the provider recovery route available.', flush=True)
+            print(f'Request {receipt_id} is at the independent station. Run ./day0.sh resume after review.', flush=True)
+            return False
+        self.apply_access(revision, historical, io.BytesIO(response), workload=workload)
+        print(f'Independent {scope} access review accepted.', flush=True)
+        return True
+
+    def finalize(self, revision=None, historical=None, tty=None):
+        if self.app.status()['phase'] == 'tailnet-only':
+            self.app.refresh_workload_gate()
+            return True
+        admitted = HANDOFF / 'cutover.json'
+        if os.path.lexists(admitted):
+            self.app.finalize(str(admitted))
+            return True
+        if tty is None:
+            print('Independent access review still needs named tailnet and provider vantage points.')
+            print('Use ./day0.sh access-request to export the live host selection to the independent verifier.')
+            return False
+        return self.receiving_access(pin(revision, 40), pin(historical, 40), tty)
+
+    @contextmanager
+    def owner_lock(self):
+        secure_directory(STATE)
+        descriptor = os.open(STATE / 'owner.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            info = os.fstat(descriptor)
+            require(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and
+                    stat.S_IMODE(info.st_mode) == 0o600, 'Unsafe day-zero ownership lock.')
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def compatible_predecessor(self, historical):
+        pin(historical, 40)
+        if historical == INITIAL_MAINTENANCE_SOURCE:
+            return True
+        for name in (historical, historical[:12]):
+            parent = OWNER_KITS / ('dev-pair-day0-' + name)
+            marker = parent / 'SOURCE'
+            if not os.path.lexists(marker):
+                continue
+            require(local_file(marker).read_text() == historical + '\n', 'Original owner checkout source pin differs.')
+            checkout = parent / 'dev-pair'
+            local_file(checkout / 'day0.sh')
+            local_file(checkout / '.git/HEAD')
+            git = ['/usr/bin/git', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', '-C', str(checkout)]
+
+            def capture(*args):
+                return subprocess.check_output([*git, *args], env=ENV, timeout=10)
+
+            require(capture('rev-parse', '--verify', 'HEAD').strip() == historical.encode() and
+                    not capture('status', '--porcelain=v1', '--untracked-files=all'),
+                    'Original owner checkout differs from its recorded pin.')
+            entries = capture('ls-tree', '-r', '-z', historical)
+            require(len(entries) <= 256 * 1024, 'Original owner checkout tree exceeds its bound.')
+            production = [row for row in entries.split(b'\0') if row and not row.split(b'\t', 1)[1].startswith(b'tests/')]
+            return sha256(b'\0'.join(production)).hexdigest() == INITIAL_MAINTENANCE_PRODUCTION_TREE
+        return False
+
+    def stable_site(self, identity, original):
+        """Observe the signed stable host without rebasing the original installation."""
+        if original is None:
+            return None
+        import renewal as r
+        import stable_renewal as stable
+        from renewal_site import Resolver
+
+        if not all(os.path.lexists(path) for path in (ROOT / stable.POLICY, ROOT / 'renewal/current.json')):
+            return None
+        controller = r.Renewal(ROOT, None)
+        with controller.lock(shared=True), controller.host_fence(shared=True):
+            policy = stable.site_commitment(controller)
+            require(original['machine_id'] == identity['machine_id'] == policy['machine_id'],
+                    'The original Day 0 enrollment belongs to a different machine.')
+            reference = controller.live_release()
+            binding = r.read_json(controller.control / 'platform-bindings' / (reference + '.json'))
+            base = pin(binding['base_platform_sha256'])
+            _, state = controller.transition()
+            active_stable = state is not None and state['request']['scope'] == 'stable' and state['phase'] not in r.TERMINAL
+            if base == policy['platform_sha256'] and not active_stable:
+                return None
+            if active_stable:
+                stable.bound_request(controller, state['request'])
+                return {'pending': True}
+            if os.path.lexists(controller.root / 'renewal-fence/frozen'):
+                return {'pending': True}
+            resolver = Resolver(controller, portable=ROOT / 'platform-releases')
+            require(stable.settled(resolver, policy['site_config_sha256']) == binding,
+                    'The stable release selectors do not match their protected placement.')
+            stable.lineage(resolver, base, policy['platform_sha256'], policy['site_config_sha256'],
+                           identity['machine_id'], policy['source_sha'])
+            grant = stable.binding(controller, base, resolver=resolver, machine=identity['machine_id'])
+            selected, host, _ = self.app.runtime_selected_host(identity['boot_id'])
+            original_source = self.stable_origin(identity, original, policy['source_sha'])
+            require(selected == reference and host == controller.release(reference)['components']['host'] ==
+                    controller.release(grant['target_release_sha256'])['components']['host'],
+                    'The stable host is not the exact authorized and observed full publisher.')
+            return {'source_sha': host['source_revision'], 'original_source_sha': original_source,
+                    'commissioning_source_sha': policy['source_sha'], 'bundle': stable.host_bundle(controller, grant)}
+
+    def stable_origin(self, identity, original, commissioning_source):
+        historical = pin(original['source_sha'], 40)
+        journal_path = Path(BOOTSTRAP) / 'initialize.json'
+        desired_path = Path(BOOTSTRAP) / 'desired.json'
+        journal, desired = record(journal_path), record(desired_path)
+        ready = record(Path(BOOTSTRAP) / 'host-ready.json')
+        require(journal and desired and ready and journal.get('phase') == journal.get('maintenance_gptbox') == 'complete'
+                and ready.get('source_sha') == historical, 'The original Day 0 maintenance proof is incomplete.')
+        context = pin(desired['gptbox_context_sha256'])
+        image = self.probes(journal['result'], historical, context)
+        require(journal['target']['source_sha'] == historical and journal['target']['context_sha256'] == context,
+                'The original Day 0 maintenance journal no longer matches its source.')
+        continuation = record(STATE / 'continuation.json')
+        if historical != commissioning_source or continuation is not None:
+            require(continuation == {
+                'schema': 1, 'machine_id': identity['machine_id'], 'controller_source_sha': commissioning_source,
+                'maintenance_source_sha': historical, 'image_id': image, 'context_sha256': context,
+                'initializer_sha256': checksum(journal_path), 'desired_sha256': checksum(desired_path),
+            }, 'The initial commissioning source differs from the retained Day 0 continuation.')
+        return historical
+
+    def stable_checkout(self, authority, revision):
+        from commission_host import Blocked as CommissionBlocked, verify_checkout
+
+        source = pin(authority['source_sha'], 40)
+        if revision == source:
+            checkout = self.repo
+        else:
+            require(revision in (authority['original_source_sha'], authority['commissioning_source_sha']),
+                    'Use the original or the selected signed stable Day 0 checkout.')
+            checkout = None
+            for name in (source, source[:12]):
+                parent = OWNER_KITS / ('dev-pair-day0-' + name)
+                marker = parent / 'SOURCE'
+                if os.path.lexists(marker):
+                    require(local_file(marker).read_text() == source + '\n', 'The selected stable checkout pin differs.')
+                    checkout = parent / 'dev-pair'
+                    break
+            require(checkout is not None, f'Open the exact reviewed stable checkout {source} and run ./day0.sh resume.')
+        try:
+            verify_checkout(checkout, source, 0)
+        except CommissionBlocked as error:
+            raise Blocked(str(error)) from error
+        for name in ('commission_host.py', 'bootstrap.py'):
+            require(checksum(checkout / 'tools' / name) == checksum(authority['bundle'] / 'tools' / name),
+                    'The stable Day 0 controller differs from its independently approved host bundle.')
+        return checkout
+
+    def select_source(self, identity, revision, previous):
+        if previous is None or previous['source_sha'] == revision:
+            require(record(STATE / 'continuation.json') is None,
+                    'Use the reviewed continuation checkout for this machine.')
+            return revision, None
+        historical = previous['source_sha']
+        require(self.compatible_predecessor(historical),
+                'This machine has day-zero progress under an unsupported pinned source.')
+        desired_path = Path(BOOTSTRAP) / 'desired.json'
+        journal_path = Path(BOOTSTRAP) / 'initialize.json'
+        desired, journal = record(desired_path), record(journal_path)
+        ready = record(Path(BOOTSTRAP) / 'host-ready.json')
+        require(type(desired) is dict and type(journal) is dict and type(ready) is dict and
+                ready.get('source_sha') == historical and
+                journal.get('phase') == journal.get('maintenance_gptbox') == 'complete',
+                'Finish maintenance initialization using the original reviewed checkout first.')
+        context = pin(desired['gptbox_context_sha256'])
+        image = self.maintenance_receipt(historical, context)
+        require(image and self.probes(journal['result'], historical, context) == image and
+                journal['target']['context_sha256'] == context and
+                journal['target']['source_sha'] == historical,
+                'The original sealed maintenance image does not match its completed initialization.')
+        checkpoint = {'schema': 1, 'machine_id': identity['machine_id'], 'controller_source_sha': revision,
+                      'maintenance_source_sha': historical, 'image_id': image,
+                      'context_sha256': context, 'initializer_sha256': checksum(journal_path),
+                      'desired_sha256': checksum(desired_path)}
+        path = STATE / 'continuation.json'
+        retained = record(path)
+        require(retained is None or retained == checkpoint, 'Protected Day 0 continuation differs from this exact source or host.')
+        if retained is None:
+            save(self.app, path, checkpoint)
+        self.progress = STATE / 'continuation-progress.json'
+        return historical, image
+
+    def apply_access(self, revision, historical, response, *, workload=None, recover=False):
+        from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL
+        from destination_observation import read_access_envelope
+
+        payload, signature = read_access_envelope(response)
+        # The operator/import path and the station use the same native verifier.
+        with tempfile.TemporaryDirectory(prefix='cutover-', dir=STATE) as temporary:
+            document = Path(temporary) / 'receipt.json'
+            document.write_bytes(payload)
+            document.with_name('receipt.json.sig').write_bytes(signature)
+            signed = self.app.signed_evidence(str(document), ACCESS_PRINCIPAL, ACCESS_NAMESPACE)
+            if workload is not None:
+                expected_kind = WORKLOAD_ACCESS_CUTOVER if workload else CORE_ACCESS_CUTOVER
+                require(signed.get('kind') == expected_kind,
+                        'The verifier’s response is for a different access stage or source.')
+            require(signed.get('source_sha') == revision,
+                    'The verifier’s response is for a different access stage or source.')
+            if signed.get('kind') == CORE_ACCESS_CUTOVER and signed.get('execution_route') == 'provider-recovery':
+                history = record(Path(CUTOVER))
+                if history and history.get('phase') == 'applying':
+                    target = {key: signed[key] for key in ('source_sha', 'machine_id', 'tailnet', 'node_id', 'dns_name')}
+                    earlier = {**target, 'source_sha': historical}
+                    prior = history.get('target')
+                    intent = history.get('intent') or {}
+                    claims = intent.get('claims', {})
+                    route_changed = any(claims.get(field) != signed.get(field) for field in ('boot_id', 'execution_route'))
+                    recover = recover or (prior in (target, earlier)
+                                          and (prior != target or intent.get('kind') == 'legacy-full' or route_changed))
+            return self.app.finalize(str(document), recover=recover,
+                                     previous_source=historical if historical != revision else None)
+
+    def access_exchange(self, source, response=None, *, workload=False, role=None, recover=False):
+        from destination_observation import encoding
+
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        with self.owner_lock():
+            previous = record(STATE / 'progress.json')
+            require(previous and previous['machine_id'] == identity['machine_id'] and identity['selinux'] == '1' and
+                    not os.path.lexists('/.autorelabel'), 'Complete checked Day 0 maintenance setup and Tailscale enrollment first.')
+            self.ensure_git(revision, archive)
+            historical, image = self.select_source(identity, revision, previous)
+            expected = pin(record(Path(BOOTSTRAP) / 'desired.json')['gptbox_context_sha256'])
+            journal = record(Path(BOOTSTRAP) / 'initialize.json')
+            require(journal is None or journal['phase'] == journal['maintenance_gptbox'] == 'complete',
+                    'Resume the original maintenance initializer before requesting cutover.')
+            require(image or self.maintenance_receipt(historical, expected), 'Complete the confined maintenance gptbox and probes first.')
+            if role:
+                driver = local_file(Path('/usr/libexec/dev-pair/renewal/driver'))
+                connection = {key: os.environ[key] for key in ('SSH_CONNECTION', 'SSH_CLIENT') if key in os.environ}
+                subprocess.run(['/usr/bin/python3', '-IB', str(driver), 'access-probe'], env={**ENV, **connection},
+                               input=encoding({'role': role, 'source_sha': revision}), timeout=660, check=True)
+                return
+            if response is None:
+                sys.stdout.buffer.write(encoding(self.app.access_cutover_binding(revision, workload=workload)))
+                return
+            completed = self.apply_access(revision, historical, response, recover=recover)
+            message = ('Named core access is tailnet-only. Independent workload access remains held.'
+                       if completed['access_scope'] == 'core' else 'The independent access review is accepted.')
+            self.stage(identity, revision, 'access-cutover-complete', message + ' Run ./day0.sh resume to continue.')
+
+    def setup_owner(self, tty, *, billing_slot=None):
+        prompt = ('Repair the configured owner slot’s signed billing authority now? [Y/n]'
+                  if os.path.lexists(OWNER_CATALOGUE) else 'Set up the first owner job now? [Y/n]')
+        if billing_slot is not None:
+            prompt = f'Renew the signed billing authority for the unused owner slot {billing_slot}? [Y/n]'
+        if answer(tty, prompt).lower() not in ('', 'y', 'yes'):
+            return False
+        script = local_file(OWNER_SETUP)
+        print('Opening the protected owner setup in this terminal.', flush=True)
+        args = ['--setup-site']
+        if billing_slot is not None:
+            args.extend(('--reauthorize-slot', billing_slot))
+        result = subprocess.run(['/usr/bin/python3', '-IB', str(script), *args], env=ENV,
+                                stdin=tty.incoming, stdout=tty.outgoing, stderr=tty.outgoing,
+                                timeout=1800, check=False)
+        require(result.returncode == 0, 'First owner setup paused. Run ./day0.sh resume to continue.')
+        return os.path.lexists(OWNER_CATALOGUE)
+
+    def setup_promotion(self, tty):
+        script = local_file(Path('/usr/libexec/dev-pair/tools/promotion_setup.py'))
+        result = subprocess.run(['/usr/bin/python3', '-EBs', str(script), 'enroll'], env=ENV,
+                                stdin=tty.incoming, stdout=tty.outgoing, stderr=tty.outgoing,
+                                timeout=1800, check=False)
+        return result.returncode == 0
+
+    def commission_apply(self, revision, tty):
+        def apply():
+            return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
+
+        observed = apply()
+        if observed.get('phase') != 'pending':
+            return observed
+        if observed.get('prerequisite') == 'release-trust':
+            from day0_source import SOURCE_NAME, handoff as checked_handoff
+
+            retained = STATE / SOURCE_NAME
+            if os.path.lexists(retained):
+                raw, grant = checked_handoff(retained, self.app.destination_identity()['machine_id'])
+                require(grant['source_sha'] == revision,
+                        'Protected commissioning must use the independently approved production source.')
+                handoff, digest = retained, sha256(raw).hexdigest()
+            else:
+                if tty is None:
+                    return observed
+                handoff = answer(tty, 'Enter the absolute path to the release custodian’s handoff, or press Enter to wait.')
+                if not handoff:
+                    return observed
+                digest = answer(tty, 'Enter the SHA-256 received separately from the independent release custodian, or press Enter to wait.')
+                if not digest:
+                    return observed
+            self.call('release_setup.py', 'install', '--source-sha', revision,
+                      '--handoff', handoff, '--sha256', pin(digest), timeout=120)
+            observed = apply()
+        if tty is not None and observed.get('phase') == 'pending' and observed.get('prerequisite') == 'release-read-custody':
+            token = secret_answer(tty, 'Paste the approved read-only GitHub token, or press Enter to wait.')
+            if token:
+                with secret_file(token) as credential:
+                    self.call('release_setup.py', 'register-read', '--source-sha', revision,
+                              '--token-file', credential, timeout=400)
+                observed = apply()
+        return observed
+
+    def commission(self, identity, revision, historical=None, tty=None, *, stable_checkout=None):
+        self.stage(identity, revision, 'host-bootstrap-complete',
+                   'Checking the independently approved release and private site.')
+        if not ((stable_checkout or self.repo) / 'tools/commission_host.py').is_file():
+            return
+        def apply():
+            if stable_checkout:
+                return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800,
+                                 checkout=stable_checkout)
+            return self.commission_apply(revision, tty)
+
+        observed = apply()
+        if tty is not None and observed.get('phase') == 'ready':
+            pending = observed.get('pending_features', {}).get('owner-intake')
+            if stable_checkout is None and pending == 'workload-access':
+                try:
+                    proof = self.app.verify_workload_access()
+                except Blocked:
+                    proof = {}
+                if (proof.get('role_artifacts', {}).get('release_sha256') != observed['selected_release'] and
+                        self.receiving_access(revision, historical, tty, workload=True)):
+                    observed = apply()
+            pending = observed.get('pending_features', {}).get('owner-intake')
+            billing_slot = observed.get('owner_billing_slot')
+            if pending in ('owner-catalogue-selection', 'provider-slot-authority'):
+                if stable_checkout is None:
+                    continued = self.setup_owner(tty)
+                else:
+                    continued = (pending == 'provider-slot-authority' and billing_slot is not None and
+                                 self.setup_owner(tty, billing_slot=billing_slot))
+                if continued:
+                    observed = apply()
+            if (stable_checkout is None and observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and
+                    observed.get('pending_features', {}).get('checklist-promotion') == 'promotion-enrollment' and
+                    self.setup_promotion(tty)):
+                observed = apply()
+            if (stable_checkout is None and observed.get('pending_features', {}).get('agent-renewal') == 'agent-observer-key' and
+                    self.setup_agent_observer(tty)):
+                observed = apply()
+        phase = observed.get('phase', 'unknown')
+        if phase in ('pending', 'source-gap'):
+            self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
+        elif phase == 'ready':
+            labels = {'owner-intake': 'Owner intake', 'checklist-spool': 'Checklist cleanup',
+                      'checklist-promotion': 'Checklist promotion', 'agent-renewal': 'Agent renewal'}
+            timer_labels = {'dev-pair-intake-recovery.timer': 'Owner intake recovery',
+                            'dev-pair-checklist-spool.timer': 'Checklist cleanup',
+                            'dev-pair-promotion-scan.timer': 'Checklist promotion',
+                            'dev-pair-agent-bridge.timer': 'Agent publication checks', 'dev-pair-renewal-agent.timer': 'Agent renewal'}
+            lines = ['The managed checklist listener is ready.']
+            for name in sorted(observed.get('timers', {})):
+                lines.append(f'{timer_labels[name]} is scheduled.')
+            pending = observed.get('pending_features', {})
+            for name, reason in sorted(pending.items()):
+                lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
+                if name == 'owner-intake' and reason in ('owner-catalogue-selection', 'provider-slot-authority'):
+                    lines.append('Run ./day0.sh resume to continue first owner setup.' if stable_checkout is None else
+                                 'Run ./day0.sh resume to renew the configured owner slot’s signed billing scope.')
+            if observed.get('provider_start_pending'):
+                lines.append(observed['provider_start_pending'])
+            if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
+                lines.append('Owner jobs remain held.')
+            for units in observed.get('retained_services', {}).values():
+                for unit in units:
+                    lines.append(f'{unit} is still running from an earlier launch.')
+            if observed.get('agent_publication') == 'awaiting-signed-publication':
+                lines.append('Agent renewal is waiting for an eligible signed publication.')
+            if observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and 'owner-intake' not in observed.get('held_features', ()):
+                lines.append('The named core tailnet terminal is available for approved jobs.')
+                stage = 'owner-terminal-ready'
+            else:
+                if pending.get('owner-intake') == 'workload-access':
+                    lines.append('Run ./day0.sh resume after independent workload access review.')
+                stage = 'managed-listener-ready'
+            self.stage(identity, revision, stage, ' '.join(lines))
+        else:
+            self.stage(identity, revision, 'commissioning-pending',
+                       'The protected commissioning controller is still waiting. Run ./day0.sh resume.')
+
+    def start(self, source, tty):
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        with self.owner_lock():
+            prior = record(STATE / 'progress.json')
+            require(prior is None or prior['machine_id'] == identity['machine_id'],
+                    'The day-zero progress belongs to a different machine.')
+            if prior is None:
+                message = f"Selected host {identity['host']} | machine {identity['machine_id']} | Fedora 44 x86_64. Continue here? Type yes."
+                if answer(tty, message).lower() != 'yes':
+                    return
+                self.stage(identity, revision, 'host-identified', 'Checking the pinned source and signed Fedora prerequisites.')
+            self.ensure_git(revision, archive)
+            stable = self.stable_site(identity, prior)
+            if stable:
+                if stable.get('pending'):
+                    print('Stable maintenance is fenced. Resume the exact recorded operation in the reviewed successor checkout.')
+                    return
+                checkout = self.stable_checkout(stable, revision)
+                self.progress = STATE / 'stable-progress.json'
+                self.commission(identity, stable['source_sha'], stable['original_source_sha'], tty, stable_checkout=checkout)
+                return
+            historical, image = self.select_source(identity, revision, prior)
+            report = self.app.status()
+            if not report['prepared']:
+                geometry = self.storage_geometry()
+                access = self.transport(tty, identity, revision)
+                if access is None:
+                    self.stage(identity, revision, 'recovery-confirmation-pending',
+                               'Source and capacity checks are complete. Confirm the separate provider recovery route, then run ./day0.sh resume.')
+                    return
+                if not self.selinux(identity, revision, tty):
+                    return
+                self.stage(identity, revision, 'managed-storage', 'Verifying the protected allocation and recovery reserve.')
+                self.managed_storage(revision, access, geometry)
+                self.stage(identity, revision, 'maintenance-gptbox', 'Checking public inputs, building the confined host gptbox and running both offline probes.')
+                paths = self.inputs(revision)
+                image = self.prepare(revision, access, paths, tty)
+                require(self.maintenance_receipt(revision, paths[2]) == image, 'The completed maintenance probe evidence did not read back.')
+            else:
+                require(identity['selinux'] == '1' and not os.path.lexists('/.autorelabel'),
+                        'An enrolled host requires checked enforcing SELinux before continuing. Keep recovery available.')
+                desired = record(Path(BOOTSTRAP) / 'desired.json')
+                expected = pin(desired['gptbox_context_sha256'])
+                if not image and not self.resume_maintenance(identity, historical, expected, tty):
+                    return
+            if report.get('phase') != 'tailnet-only':
+                self.app.publish_workload_gate('held')
+            self.stage(identity, revision, 'host-bootstrap-complete',
+                       'The confined maintenance gptbox passed both offline probe cycles.')
+            if not self.enroll(tty):
+                self.stage(identity, revision, 'host-bootstrap-complete',
+                           'Maintenance gptbox verified. Run ./day0.sh resume to enroll Tailscale when ready.')
+                return
+            if not self.finalize(revision, historical, tty):
+                self.stage(identity, revision, 'host-bootstrap-complete',
+                           'Maintenance gptbox and tailnet enrollment are verified. Run ./day0.sh resume to continue independent access review.')
+                return
+            self.commission(identity, revision, historical, tty)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument('stage', choices=('start', 'status', 'resume', 'access-request', 'access-response', 'access-probe',
+                                         'observer-trust'))
+    parser.add_argument('role', nargs='?', choices=('maintenance', 'development'))
+    parser.add_argument('--source-sha')
+    parser.add_argument('--draft-evaluation', action='store_true', help='evaluate exact draft source on an isolated development host')
+    parser.add_argument('--confirm-recovery', action='store_true')
+    parser.add_argument('--workloads', action='store_true')
+    parser.add_argument('--recover-cutover', action='store_true')
+    parser.add_argument('--revoke', action='store_true', help='withdraw the independently enrolled agent collector')
+    args = parser.parse_args()
+
+    def interrupted(_signal, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupted)
+    try:
+        require(os.getuid() == os.geteuid() == 0, 'Open the selected VPS root terminal in hPanel.')
+        require((args.role is not None) == (args.stage == 'access-probe') and
+                (not args.workloads or args.stage == 'access-request') and
+                (not args.recover_cutover or args.stage == 'access-response') and
+                (not args.revoke or args.stage == 'observer-trust') and
+                (not args.confirm_recovery or args.stage == 'resume'),
+                'Select the exact access request, response or fixed role probe.')
+        os.umask(0o077)
+        day0 = DayZero()
+        interactive = args.stage in ('start', 'resume', 'observer-trust')
+        with (tty_open() if interactive else nullcontext()) as tty:
+            entry = day0.production_entry(args.source_sha, tty if args.stage in ('start', 'resume') and
+                                          not args.confirm_recovery else None, draft=args.draft_evaluation)
+            if entry is None:
+                require(args.stage in ('start', 'status', 'resume') and not args.confirm_recovery,
+                        'Select the independently approved production source with ./day0.sh resume first.')
+                print('Day 0 is waiting for the independently approved release handoff. Run ./day0.sh resume when it is available.')
+                return 0
+            checkout, source = entry
+            if checkout != day0.repo:
+                script = local_file(checkout / 'tools/owner_day0.py')
+                command = ['/usr/bin/python3', '-EBs', str(script), args.stage]
+                if args.role:
+                    command.append(args.role)
+                command.extend(('--source-sha', source))
+                for active, option in ((args.confirm_recovery, '--confirm-recovery'), (args.workloads, '--workloads'),
+                                       (args.recover_cutover, '--recover-cutover'), (args.revoke, '--revoke')):
+                    if active:
+                        command.append(option)
+                os.chdir(checkout)
+                os.execv(command[0], command)
+            if args.confirm_recovery:
+                day0.confirm_recovery(tty, source)
+            elif args.stage == 'status':
+                day0.status(source)
+            elif args.stage == 'observer-trust':
+                day0.observer_trust(source, tty, revoke=args.revoke)
+            elif args.stage in ('access-request', 'access-response', 'access-probe'):
+                day0.access_exchange(source, sys.stdin.buffer if args.stage == 'access-response' else None,
+                                     workload=args.workloads, role=args.role, recover=args.recover_cutover)
+            else:
+                day0.start(source, tty)
+        return 0
+    except KeyboardInterrupt:
+        print('Day 0 interrupted. Run ./day0.sh resume in the selected hPanel terminal.', file=sys.stderr)
+        return 2
+    except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, getpass.GetPassWarning) as error:
+        print(f'Day 0 paused. {error}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

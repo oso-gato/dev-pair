@@ -1,0 +1,16 @@
+[Unit]
+Description=Scoped dev-pair provider operation %i
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/var/lib/dev-pair
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/dev-pair/renewal/provider-run %i
+RuntimeMaxSec=170s
+TimeoutStopSec=10s
+KillMode=control-group
+LimitCORE=0

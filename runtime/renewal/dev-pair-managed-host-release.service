@@ -1,0 +1,13 @@
+[Unit]
+Description=Select an approved immutable dev-pair host control plane
+After=local-fs.target
+RequiresMountsFor=/var/lib/dev-pair /usr/libexec/dev-pair/host-releases
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/dev-pair/renewal/host-release apply
+TimeoutStartSec=105s
+KillMode=control-group

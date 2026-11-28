@@ -1,0 +1,92 @@
+#!/usr/bin/python3 -I
+"""Intake of a digest-selected, independently approved agent release."""
+import os
+from pathlib import Path
+import re
+import sys
+import urllib.request
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+import renewal as r
+from renewal_site import AGENT, Resolver, offer_record
+
+ROOT = r.DEFAULT_ROOT
+CONTROL = ROOT / 'renewal'
+LATEST = 'https://api.github.com/repos/openai/codex/releases/latest'
+
+
+def stable_version(raw):
+    from platform_release_protocol import upstream_release_json
+
+    row = upstream_release_json(raw)
+    match = re.fullmatch(r'rust-v([0-9]+\.[0-9]+\.[0-9]+)', row.get('tag_name', ''))
+    r.require(row.get('draft') is False and row.get('prerelease') is False and match is not None and
+              row.get('html_url') == 'https://github.com/openai/codex/releases/tag/' + row['tag_name'],
+              'latest official stable Codex release could not be identified')
+    return match[1]
+
+
+def official_version():
+    from platform_release_protocol import UPSTREAM_RELEASE_LIMIT
+
+    request = urllib.request.Request(LATEST, headers={'Accept': 'application/vnd.github+json',
+                                                     'User-Agent': 'dev-pair-approved-agent-intake/1'})
+    with urllib.request.urlopen(request, timeout=8) as response:
+        r.require(response.geturl() == LATEST and response.status == 200, 'official stable release lookup changed')
+        data = response.read(UPSTREAM_RELEASE_LIMIT + 1)
+    return stable_version(data)
+
+
+def publish_request(controller, scope, request, base, offer_sha=None):
+    with controller.lock():
+        current = controller.live_release()
+        r.require(current == base, 'current release changed during agent intake')
+        path = controller.control / 'requests' / (scope + '.json')
+        offer = controller.control / 'offers' / (scope + '.json')
+        if request is None:
+            r.require(not os.path.lexists(offer), 'agent offer appeared during intake')
+        else:
+            r.require(r.sha(r.read_private(offer, r.MAX_CONTROL)) == offer_sha, 'agent offer changed during intake')
+        if request is None or request['target_sha256'] == current:
+            if os.path.lexists(path):
+                path.unlink()
+                r.sync_directory(path.parent)
+        else:
+            r.replace_json(path, {'schema': 1, 'offer_sha256': offer_sha, 'request': request})
+
+
+def controller_offer(controller, scope='agent'):
+    current = controller.live_release()
+    path = CONTROL / 'offers' / (scope + '.json')
+    if not os.path.lexists(path):
+        publish_request(controller, scope, None, current)
+        return {'status': 'no-approved-offer', 'release_sha256': current}
+    raw = r.read_private(path, r.MAX_CONTROL)
+    offer = offer_record(r.loads(raw), scope)
+    stable = official_version()
+    resolver = Resolver(controller)
+    _, index, _ = resolver.index(offer['platform_sha256'])
+    r.require(index['kind'] == AGENT, 'approved agent offer does not name a portable agent package')
+    for role in r.ROLES:
+        component = index['components'][role + '-agent']
+        r.require(component['codex_version'] == stable, 'approved offer is not the current official stable CLI')
+    with controller.lock():
+        r.require(controller.live_release() == current and r.read_private(path, r.MAX_CONTROL) == raw,
+                  'site selection changed during portable intake')
+        binding = resolver.resolve(offer)
+        if offer['operation'].startswith('agent-ci-') and binding['release_sha256'] != current:
+            controller.verify_prospective_agent({'scope': scope, 'operation': offer['operation'],
+                                                 'target_sha256': binding['release_sha256'],
+                                                 'previous_sha256': current})
+    reference = binding['release_sha256']
+    request = {'schema': 1, 'operation': offer['operation'], 'scope': scope,
+               'previous_sha256': offer['previous_release_sha256'], 'target_sha256': reference,
+               'affected_jobs': offer['affected_jobs'], 'reason': offer['reason']}
+    publish_request(controller, scope, request, current, r.sha(raw))
+    return {'status': 'current' if reference == current else 'verified', 'version': stable, 'release_sha256': reference}
+
+
+if __name__ == '__main__':
+    r.require(os.getuid() == 0 and len(sys.argv) == 1, 'protected agent candidate intake required')
+    print(r.canonical(controller_offer(r.Renewal(ROOT, None))))

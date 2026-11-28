@@ -1,0 +1,10 @@
+[Unit]
+Description=Recover confirmed dev-pair jobs after interruption or reboot
+
+[Timer]
+OnBootSec=15s
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

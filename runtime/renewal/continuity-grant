@@ -1,0 +1,210 @@
+#!/usr/bin/python3 -I
+"""Reserve an externally approved allowance before issuing a continuity grant."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+import time
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+import renewal as r
+from renewal import protocol as p
+
+CONTROL = r.DEFAULT_ROOT / 'renewal'
+PROVIDER = 'openai-api-key'
+STOCK_ENVELOPE_BYTES = 128 * 1024  # Stock instructions, role tool schemas, request framing and tool exchange.
+
+
+def request_body_floor(rollout, documents, instructions, prompt, project_notes, output_tokens):
+    # Codex serializes retained JSON items and injects local instructions on resume.
+    # Count the entire rollout and supplement any source startup text it does not already carry.
+    def escaped(raw):
+        return json.dumps(raw.decode('utf-8'), ensure_ascii=False).encode()[1:-1]
+
+    missing = sum(len(text) for item in documents if (text := escaped(item)) not in rollout)
+    injected = sum(len(escaped(item)) for item in (*instructions, prompt, *project_notes))
+    return STOCK_ENVELOPE_BYTES + len(rollout) + missing + 2 * injected + 128 * output_tokens
+
+
+def capacity_inputs(selection, turn, account, leaf, startup_ids, startup_max):
+    from renewal_site import protected_bytes
+
+    docs = leaf / 'turn' / 'startup'
+    manifest = protected_bytes(docs / 'manifest.json', 4096)
+    r.require(r.sha(manifest) == selection['startup_sha256'], 'continuity startup manifest differs')
+    records = r.loads(manifest)['documents']
+    r.require(type(records) is list and [row['id'] for row in records] == list(startup_ids),
+              'continuity startup catalogue differs')
+    documents = []
+    for row in records:
+        raw = protected_bytes(docs / (row['id'] + '.txt'), startup_max)
+        r.require((len(raw), r.sha(raw)) == (row['bytes'], row['sha256']), 'continuity startup document differs')
+        documents.append(raw)
+    r.require(sum(map(len, documents)) <= startup_max, 'continuity startup corpus exceeds role bound')
+    files = (('requirements', leaf / 'requirements' / 'requirements.toml', 65536),
+             ('config', leaf / 'loaders' / 'config.toml', 8192),
+             ('prompt', leaf / 'turn' / 'prompt.txt', 16384))
+    staged = []
+    for name, path, limit in files:
+        raw = protected_bytes(path, limit)
+        r.require(r.sha(raw) == selection[name + '_sha256'], 'continuity staged request envelope differs')
+        staged.append(raw)
+
+    job_root = r.DEFAULT_ROOT / selection['role']
+    saved = turn['native_rollout']
+    p.fields(saved, 'path bytes sha256')
+    path = Path(saved['path'])
+    r.require(not path.is_absolute() and path.parts[:2] == ('codex', 'sessions') and '..' not in path.parts and
+              path.name.endswith(selection['session_uuid'] + '.jsonl'), 'continuity rollout selects a foreign path')
+    rollout = role_input(job_root / 'state' / selection['job'] / path, account.pw_uid, 4 * 1024 * 1024)
+    r.require((len(rollout), r.sha(rollout)) == (saved['bytes'], saved['sha256']), 'saved continuity transcript differs')
+    workspace = job_root / 'workspaces' / selection['job']
+    notes = [role_input(workspace / name, account.pw_uid, 32768) for name in ('AGENTS.override.md', 'AGENTS.md')
+             if os.path.lexists(workspace / name)]
+    return rollout, documents, staged[:2], staged[2], notes
+
+
+def role_input(path, uid, max_bytes):
+    r.require(path.resolve(strict=True) == path, 'untrusted continuity input path')
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+        node = os.fstat(stream.fileno())
+        r.require(stat.S_ISREG(node.st_mode) and node.st_uid == uid and node.st_nlink == 1 and
+                  not node.st_mode & 0o022 and node.st_size <= max_bytes, 'untrusted or oversized continuation input')
+        raw = stream.read(max_bytes + 1)
+    r.require(len(raw) == node.st_size, 'continuity input changed during validation')
+    return raw
+
+
+def claim(control, profile, claim_id, turn, account, validate, now):
+    p.fields(profile, 'schema authorization_id approved_until total_microusd max_operations permitted scopes grant')
+    r.require(type(profile['schema']) is int and profile['schema'] == 1, 'unsupported continuity allowance')
+    r.token(profile['authorization_id'])
+    p.number(profile['approved_until'], int(now) + 10, 2**63 - 1)
+    p.number(profile['max_operations'], 1, 144)
+    p.number(profile['total_microusd'], 1, 1000000000)
+    r.require(type(profile['permitted']) is list and len(profile['permitted']) <= r.MAX_SESSIONS and
+              type(profile['scopes']) is list and set(profile['scopes']) <= set(r.SCOPE_COMPONENTS),
+              'invalid continuity permission set')
+    for item in profile['permitted']:
+        p.fields(item, 'role job model effort')
+    permitted = {key: turn[key] for key in ('role', 'job', 'model', 'effort')}
+    r.require(permitted in profile['permitted'] and turn['scope'] in profile['scopes'],
+              'continuity allowance does not authorize this job/model/scope')
+    defaults = profile['grant']
+    p.fields(defaults, 'allowance_ref allowance_sha256 spend_microusd seconds max_requests max_request_bytes max_context_tokens '
+                       'max_output_tokens input_microusd_per_million output_microusd_per_million observed_models')
+    grant = {**defaults, 'schema': 1, 'auth_profile': PROVIDER, 'request_sha256': claim_id,
+             'peer_uid': account.pw_uid, 'peer_gid': account.pw_gid, 'expires_unix': profile['approved_until']}
+    validate(r.json_bytes(grant))
+    leaf = control / 'allowance-journals' / (profile['authorization_id'] + '.json')
+    lock = leaf.with_suffix('.lock')
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(lock, flags, 0o600), 'rb+') as stream:
+        node = os.fstat(stream.fileno())
+        r.require(stat.S_ISREG(node.st_mode) and node.st_uid == os.getuid() and node.st_nlink == 1 and
+                  stat.S_IMODE(node.st_mode) == 0o600, 'unsafe provider allowance ledger lock')
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        reference = r.identity(profile)
+        record = r.read_json(leaf) if os.path.lexists(leaf) else {'profile_sha256': reference, 'claims': {}}
+        r.require(record['profile_sha256'] == reference, 'continuity allowance was changed after use')
+        claims = record['claims']
+        r.require(type(claims) is dict and len(claims) <= profile['max_operations'], 'invalid allowance journal')
+        reserve = {**permitted, 'scope': turn['scope'], 'operation': turn['operation'],
+                   'activation_operation': turn['activation_operation'], 'session_uuid': turn['session_uuid'],
+                   'release_sha256': turn['release_sha256'], 'grant_sha256': r.identity(grant),
+                   'spend_microusd': grant['spend_microusd']}
+        if claim_id in claims:
+            r.require(claims[claim_id] == reserve, 'continuity claim identity changed')
+        else:
+            r.require(len(claims) < profile['max_operations'] and
+                      sum(item['spend_microusd'] for item in claims.values()) + reserve['spend_microusd'] <= profile['total_microusd'],
+                      'approved aggregate continuity allowance exhausted')
+            claims[claim_id] = reserve
+            r.replace_json(leaf, record)
+        grant_path = control / 'provider-grants' / (claim_id + '.json')
+        if os.path.lexists(grant_path):
+            r.require(r.read_json(grant_path) == grant, 'continuity grant changed after reservation')
+        else:
+            r.replace_json(grant_path, grant)
+        return grant_path
+
+
+def check_request_capacity(grant, reserve, minimum_requests, minimum_bytes, body_max):
+    r.require(type(reserve) is int and reserve > 0 and grant['max_requests'] >= minimum_requests and
+              grant['spend_microusd'] >= grant['max_requests'] * reserve,
+              'continuity ceiling cannot fund the authorized model and tool-result requests')
+    r.require(0 < minimum_bytes <= grant['max_request_bytes'] <= body_max,
+              'continuity allowance cannot carry the saved startup, transcript and tool exchange')
+
+
+def authorize(payload):
+    p.fields(payload, 'request_sha256 turn')
+    request_sha = payload['request_sha256']
+    r.digest(request_sha)
+    turn = payload['turn']
+    controller = r.Renewal(r.DEFAULT_ROOT, None)
+    _, state = controller.transition()
+    r.require(state is not None and state['phase'] == 'backed-up', 'continuity grant lacks a safe backup phase')
+    activation = state['request']
+    reference = turn['release_sha256']
+    r.require(reference in (activation['target_sha256'], activation['previous_sha256']), 'continuity release is unapproved')
+    attempt_id = state.get('attempt_id', activation['operation'])
+    expected = 'renew-' + r.identity([attempt_id, reference, turn['role'], turn['job'], turn['logical_session']])[:50]
+    r.require(turn['operation'] == expected and turn['activation_operation'] == activation['operation'] and
+              turn['attempt_id'] == attempt_id and
+              turn['scope'] == activation['scope'] and turn['release_sha256'] == reference,
+              'continuity grant does not match the authorized renewal turn')
+    r.session(turn['session_uuid'])
+    origin = turn['binding']
+    for key in ('job_id', 'credential_ref'):
+        r.token(origin[key])
+    role, job, operation = (turn[key] for key in ('role', 'job', 'operation'))
+    r.require(origin['role'] == role and origin['job_id'] == job, 'continuity provider binding changed')
+    selected = controller.release(reference)['components']['host']['artifact_sha256']
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(INSTALL / 'host-releases' / selected / 'tools'))
+    from provider_broker import grant_document, job_selection, load_allowance, protected_file, reserved_cost
+    from gptbox_runtime import PROVIDER_BODY_MAX, STARTUP_IDS, STARTUP_MAX, host_repository_approval
+    account = r.pwd.getpwnam({'maintenance': 'dp-maint', 'development': 'dp-dev'}[role])
+    path = r.DEFAULT_ROOT / 'turn-inputs' / role / job / operation / 'turn' / 'request.json'
+    selection = job_selection(protected_file(path, 4096), request_sha, role, job, operation)
+    r.require(protected_file(path.with_name('approval.json'), 4096) == host_repository_approval(selection),
+              'continuity slot repository approval changed')
+    for key in ('logical_session', 'session_uuid'):
+        r.require(selection[key] == turn[key], 'continuity selection changed')
+    for key in ('provider', 'model', 'effort', 'standards_sha', 'agreement_sha256'):
+        r.require(selection[key] == origin[key], 'continuity provider policy changed')
+    r.require(selection['action'] == 'resume', 'continuity grant requires exactly one recorded resume')
+    inputs = capacity_inputs(selection, turn, account, path.parent.parent, STARTUP_IDS, STARTUP_MAX)
+    profile = r.read_json(CONTROL / 'provider-allowances' / (origin['credential_ref'] + '.json'))
+    expected_end = turn['minimum_grant_valid_until']
+    p.number(expected_end, int(time.time()) + 10, int(time.time()) + 6100)
+    r.require(profile['approved_until'] >= expected_end, 'allowance expires before viable recovery')
+    credential = Path('/etc/dev-pair/provider-credentials') / origin['credential_ref']
+    node = credential.lstat()
+    r.require(credential.resolve(strict=True) == credential and stat.S_ISREG(node.st_mode) and
+              node.st_uid == 0 and stat.S_IMODE(node.st_mode) == 0o600,
+              'protected continuity provider credential unavailable')
+    admitted = {**selection, **{key: turn[key] for key in ('scope', 'activation_operation', 'release_sha256')}}
+    def coherent_grant(raw):
+        grant = grant_document(raw)
+        load_allowance(job, grant['allowance_sha256']).validate_grant(selection, grant)
+        needed = request_body_floor(*inputs, grant['max_output_tokens'])
+        check_request_capacity(grant, reserved_cost(grant), r.CONTINUITY_REQUESTS, needed, PROVIDER_BODY_MAX)
+
+    path = claim(CONTROL, profile, request_sha, admitted, account, coherent_grant, time.time())
+    grant = r.read_json(path)
+    print(r.canonical({'operation': operation, 'request_sha256': request_sha, 'job': job,
+                       'allowance_sha256': grant['allowance_sha256'], 'spend_microusd': grant['spend_microusd'],
+                       'request_body_floor': request_body_floor(*inputs, grant['max_output_tokens']),
+                       'max_request_bytes': grant['max_request_bytes']}))
+
+
+if __name__ == '__main__':
+    r.require(os.getuid() == 0 and len(sys.argv) == 1, 'protected continuity grant entry required')
+    data = sys.stdin.buffer.read(r.MAX_CONTROL + 1)
+    r.require(len(data) <= r.MAX_CONTROL, 'continuity grant request exceeds byte limit')
+    authorize(r.loads(data))

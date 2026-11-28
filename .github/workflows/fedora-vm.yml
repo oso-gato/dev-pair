@@ -1,0 +1,48 @@
+name: Fedora 44 VM probe
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  fedora-vm:
+    if: >-
+      github.repository == 'oso-gato/dev-pair' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      (github.event.action != 'labeled' ||
+       (github.run_attempt == 1 &&
+        (github.event.label.name == format('fedora-m-{0}', github.event.pull_request.head.sha) ||
+         github.event.label.name == format('fedora-d-{0}', github.event.pull_request.head.sha))))
+    concurrency:
+      group: fedora-vm-${{ github.event.pull_request.number }}-${{ github.event.action == 'labeled' && 'native' || 'hosted' }}
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out exact public candidate
+        # Official actions/checkout v4.3.1, independently resolved from upstream.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - name: Check local code and protocol behavior
+        run: python3 -B -m unittest discover -s tests -q
+      - name: Probe the authorized signed Fedora scenario
+        if: github.event.action == 'labeled'
+        env:
+          DP_EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
+          DP_MERGE_SOURCE: ${{ github.sha }}
+          DP_EVENT_LABEL: ${{ github.event.label.name }}
+        run: |
+          case "$DP_EVENT_LABEL" in
+            "fedora-m-$DP_EXPECTED_SOURCE") scenario=maintenance ;;
+            "fedora-d-$DP_EXPECTED_SOURCE") scenario=development ;;
+            *) exit 2 ;;
+          esac
+          python3 -B tools/fedora_ci.py --expected-source "$DP_EXPECTED_SOURCE" --scenario "$scenario" --github-event "$GITHUB_EVENT_PATH"

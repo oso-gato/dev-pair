@@ -1,5 +1,83 @@
 # dev-pair
 
+<a id="set-up-the-fedora-host"></a>
+<a id="dr11"></a>
+## DR11 — Set up the Fedora host
+
+<a id="dr11-1"></a>
+**DR11.1** Open the chosen VPS root terminal in hPanel. Keep an independent recovery
+session available. The setup checks Fedora 44 x86_64, the host identity, SELinux,
+storage and the live connection before it prepares the maintenance gateway.
+It asks for the named `core` password in the terminal with echo disabled.
+
+<a id="dr11-2"></a>
+**DR11.2** Start from the separately verified [offline source kit](docs/owner-day0.md#optional-offline-source-kit).
+When the exact reviewed seed is available through GitHub, the command below
+fetches it into a protected checkout and opens the installer prompts.
+Use the full reviewed seed commit provided with the delivery in place of
+`REPLACE_WITH_REVIEWED_COMMIT`.
+
+```sh
+(
+  set -eu
+  umask 077
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+  source_sha=REPLACE_WITH_REVIEWED_COMMIT
+  printf '%s\n' "$source_sha" | grep -Eq '^[0-9a-f]{40}$'
+  test "$(id -u)" -eq 0
+  test "$(uname -m)" = x86_64
+  . /etc/os-release
+  test "$ID" = fedora
+  test "$VERSION_ID" = 44
+  if [ ! -x /usr/bin/git ]; then
+    dnf -y --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo='*' \
+      --enablerepo=fedora --enablerepo=updates install git-core
+  fi
+  kit="/root/dev-pair-day0-$source_sha"
+  if [ ! -e "$kit" ]; then
+    install -d -m 0700 "$kit"
+  fi
+  test ! -L "$kit"
+  test "$(stat -c '%u:%a' "$kit")" = 0:700
+  if [ ! -e "$kit/dev-pair" ]; then
+    git -c core.hooksPath=/dev/null init -q "$kit/dev-pair"
+  fi
+  test ! -L "$kit/dev-pair"
+  test ! -L "$kit/dev-pair/.git"
+  test ! -L "$kit/SOURCE"
+  cd "$kit/dev-pair"
+  git -c core.hooksPath=/dev/null fetch --depth=1 --no-tags https://github.com/oso-gato/dev-pair.git "$source_sha"
+  git -c core.hooksPath=/dev/null checkout --detach "$source_sha"
+  test "$(git rev-parse HEAD)" = "$source_sha"
+  test -z "$(git status --porcelain=v1 --untracked-files=all)"
+  printf '%s\n' "$source_sha" > "$kit/SOURCE"
+  ./day0.sh start
+)
+```
+
+<a id="dr11-3"></a>
+**DR11.3** From the same checkout, run `./day0.sh status` to inspect progress or `./day0.sh resume`
+to continue after a pause, reboot or independent handoff. On a disabled or unverified
+permissive host, setup performs a checked relabel before enforcing SELinux and
+holds workloads while the transition is incomplete. For Tailscale, press Enter
+at the auth-key prompt to use browser sign-in. You can defer enrollment by
+leaving the network name blank. Keep the original access route until independent
+recovery and tailnet-only SSH have been verified.
+
+<a id="dr11-4"></a>
+**DR11.4** Keep the delivered checkout for the entire fresh installation. Before
+managed setup begins, the installer displays the selected machine ID and asks
+for the independent first-release handoff and its separately conveyed SHA-256.
+It verifies the approved merge on protected `main`, checks that its full Git
+tree and file modes match the delivered seed and protects the production checkout.
+If the handoff is pending, run `./day0.sh resume` when it arrives. The same
+launcher uses the selected source for access review, commissioning and owner
+setup. Commissioning verifies the separately authorized signed publication for
+that exact commit. The complete native owner journey and independent observations
+on the selected VPS still require verification. [Day-zero operations](docs/owner-day0.md)
+· [Compatibility for an existing November 27 installation](docs/owner-day0.md#previously-installed-november-27-bootstrap)
+
 <a id="dr0"></a>
 ## DR0 — Overview
 
@@ -11,7 +89,7 @@
 ## DR1 — Project documentation
 
 <a id="dr1-1"></a>
-**DR1.1** The development restart has four local starting documents:
+**DR1.1** Read the four local starting documents in the order below.
 
 | Clause | Document | Purpose |
 |---|---|---|
@@ -24,27 +102,32 @@
 **DR1.6** Governance and engineering standards live in the private `oso-gato/standards` repository. Both are referenced at the same full commit SHA, alongside the repository setup guide, in STANDARDS. Neither shared rules document is copied here. A central update does not automatically change this project's adopted version.
 
 <a id="dr1-7"></a>
-**DR1.7** Read this README, STANDARDS, its three pinned shared documents, then REQUIREMENTS and ARCHITECTURE before work. Authorized access to the private standards is required, or a verified execution cache of the exact revision. Report an access blocker if those documents cannot be loaded. Runtime enforcement of this entry procedure remains to be built and tested.
+**DR1.7** Read this README, STANDARDS, its three pinned shared documents, then REQUIREMENTS and ARCHITECTURE before work. Authorized access to the private standards is required, or a verified execution cache of the exact revision. Report an access blocker if those documents cannot be loaded. Owner intake verifies the startup corpus for admitted jobs. The full native job journey still requires verification.
 
 <a id="current-status"></a>
 <a id="dr2"></a>
 ## DR2 — Current status
 
 <a id="dr2-1"></a>
-**DR2.1** This project adopts a **pre-1.0 working draft** of `oso-gato/standards`, pinned to the exact commit in [STANDARDS.md](STANDARDS.md). Version 1.0 remains a future milestone. The product owner approved the naming and adoption model on November 10, 2026.
+**DR2.1** This project adopts a **pre-1.0 working draft** of `oso-gato/standards`, pinned to the exact commit in [STANDARDS.md](STANDARDS.md). Version 1.0 remains a future milestone. The product owner approved the naming and adoption model and explicitly migrated the current DR10 job to the Tailscale draft on November 10, 2026 (America/New_York).
 
 <a id="dr2-2"></a>
-**DR2.2** This is a documentation baseline for restarting development. There are no runtime scripts, container images defined here, installation commands, automated tests or CI workflows yet. No live host has been verified or changed by this restart. The intended architecture and acceptance requirements are documented; operational access and budgets still need to be established before dependent execution.
-
 <a id="dr2-3"></a>
-**DR2.3** The previous source and documentation remain in Git history at commit [`90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5`](https://github.com/oso-gato/dev-pair/tree/90b7fac3bea54ae61a5dabf1ff9aede1a7a67cd5). They may be consulted selectively but do not govern the new implementation. No history or existing tags are rewritten.
+<a id="dr2-4"></a>
+<a id="dr2-5"></a>
+<a id="dr2-6"></a>
+<a id="dr2-7"></a>
+<a id="dr2-8"></a>
+<a id="dr2-9"></a>
 
-<a id="platform-and-agents"></a>
+**DR2.2–DR2.9** The [component and diagnostic history](docs/status-history.md) preserves the earlier validation results, receipts and known gaps.
+
 <a id="dr3"></a>
+<a id="platform-and-agents"></a>
 ## DR3 — Platform and agents
 
 <a id="dr3-1"></a>
-**DR3.1** The first deployment targets **Fedora Cloud 45** and rootless **Podman**, with Quadlet and systemd managing container lifecycle. Fedora lists Cloud 45 as released on November 3, 2026: [official download](https://fedoraproject.org/cloud/download/). The provider's actual image and required capabilities must be verified during implementation.
+**DR3.1** The first deployment targets **Fedora Cloud 44** and rootless **Podman**, with Quadlet and systemd managing container lifecycle. On November 10, 2026, the owner reported that the existing Hostinger VPS runs Fedora Cloud 44 and corrected the earlier Fedora 45 target. The actual host OS, provider image and required capabilities have not been inspected and must be verified before adoption or deployment.
 
 | Clause | Name | Meaning | Implementation status |
 |---|---|---|---|
@@ -63,14 +146,14 @@
 **DR4.1** DevBox is the stable Podman development container hosting its Distrobox-based Codex gptbox. It implements the agreed product and runs function/unit, integration and end-to-end checks wherever its environment is sufficient. Checks requiring the real VPS go to the maintenance agent through a durable request. That agent returns results and diagnostics; DevBox repairs failures and requests retesting until acceptance passes or agreed limits produce a clear blocker. Independent review and verification at the delivery destination complete the loop.
 
 <a id="dr4-2"></a>
-**DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. None of these capabilities is implemented yet.
+**DR4.2** Builds and tests use isolated work trees and dependency environments, protecting all deployed code on the host, DevBox, maintenance container and application/test containers. Runtime code is immutable; updates activate verified replacement artifacts. Explicit workspaces, data and caches remain writable without overriding installed code. Valid work trees and caches persist through active iteration to avoid repeated downloads. Cleanup occurs at configured lifecycle boundaries and preserves source, evidence and deliverables. [REQUIREMENTS.md](REQUIREMENTS.md) defines the acceptance outcomes; [ARCHITECTURE.md](ARCHITECTURE.md) defines the intended handoff and storage boundaries. The component record describes the implementation checks so far. Native enforcement and the full lifecycle still require verification on the selected VPS. [Component history](docs/status-history.md)
 
 <a id="first-working-milestone"></a>
 <a id="dr5"></a>
 ## DR5 — First working milestone
 
 <a id="dr5-1"></a>
-**DR5.1** Prove one complete journey on one VPS: provision the platform, start Codex in both roles, accept a small product brief, build and independently verify the product, deploy it, and return its usable address. Demonstrate job recovery after interruption, recovery from a failed deployment, a failed host test followed by a successful DevBox repair/retest, immutable OS/application/agent code, repeated-build reuse and safe cleanup.
+**DR5.1** Prove one complete journey on one VPS: provision the platform, start Codex in both roles, accept a small product brief, build and independently verify the product, deploy it, and return its usable tailnet address to an authorized client. Demonstrate job recovery after interruption, recovery from a failed deployment, a failed host test followed by a successful DevBox repair/retest, immutable OS/application/agent code, repeated-build reuse and safe cleanup.
 
 <a id="dr5-2"></a>
 **DR5.2** REQUIREMENTS defines the acceptance evidence. Build this path before adding concurrent projects, bare-metal support or another agent adapter. Add source, meaningful tests and setup instructions as the implementation earns them; four files are the starting point, not a permanent file-count limit.
@@ -80,13 +163,13 @@
 ## DR6 — Setup
 
 <a id="dr6-1"></a>
-**DR6.1** There is no setup command yet. Implementation must provide a reproducible Fedora 45 setup and validate it on a disposable or explicitly designated VPS before this README can describe it as ready to use. Do not use a historical installer as the new setup procedure without adapting and testing it against the adopted standards, requirements and architecture.
+**DR6.1** The executable [Fedora Cloud 44 first bootstrap](docs/fedora-bootstrap.md) now has a shared `initialize` entry that performs preparation and [confined maintenance gptbox assembly/probes](docs/confined-gptbox.md), records separate candidate-bound outcomes and supports explicit bounded recovery. Preparation installs signed prerequisites, `core` with GitHub-imported SSH keys and an externally supplied console/sudo password, tailnet-only mosh with interactive tmux reconnection, persistent `erebus` hostname and chronyd, separate rootless runtime accounts, durable paths and a source-scoped ingress guard. Assembly uses pinned genuine Distrobox initialization with controlled confinement, then seals and probes the immutable agent image. Source tests and independent review pass; actual package installation, assembly and authenticated agent operation remain unverified. A separate [SELinux convergence helper](docs/selinux-bootstrap.md) prepares checked relabel/reboot transitions; its transition matrix remains unverified. Initial root/SSH remains available until real tailnet administration and independent recovery evidence permit final cutover. Jobs and renewal remain disabled. DR2.5 describes the separate CI target; the [candidate fixture exercise](docs/candidate-preparation.md#exercise-the-local-path) is offline preparation only. Neither establishes a verified working platform installation.
 
 <a id="dr7"></a>
 ## DR7 — Required platform self-update
 
 <a id="dr7-1"></a>
-**DR7.1** Dev-pair must repair platform defects encountered during its own development or other product jobs. DevBox requests its replacement with a verified Podman image; the maintenance side performs the replacement and restores every active session to actual work. Host configuration and maintenance-agent updates follow the same recorded-target, checkpoint, verification and recovery discipline. See REQUIREMENTS R9 and ARCHITECTURE A8. These capabilities are required but not yet implemented.
+**DR7.1** Dev-pair must repair platform defects encountered during its own development or other product jobs. DevBox requests its replacement with a verified Podman image; the maintenance side performs the replacement and restores every active session to actual work. Host configuration and maintenance-agent updates follow the same recorded-target, checkpoint, verification and recovery discipline. See REQUIREMENTS R9 and ARCHITECTURE A8. The controlled replacement and recovery paths have component coverage. The full platform repair and session-resumption journey still requires native verification.
 
 <a id="dr8"></a>
 ## DR8 — Later hosted applications
@@ -98,18 +181,21 @@
 ## DR9 — Agent freshness and stable platform releases
 
 <a id="dr9-1"></a>
-**DR9.1** The two active agent environments rebuild nightly from verified official stable tooling, with cached inputs and complete session restoration. Host and DevBox releases run on separate, slower tested change cycles. Requirements R11 and architecture A10 define the contract. Model availability is checked separately from CLI/image version; these capabilities have not yet been adapted and verified in this restart. Existing Claudebox implementations in fedora-bootstrap and fedora-dev are linked in A11; they are the reference for the Codex adaptation.
+**DR9.1** The two active agent environments rebuild nightly from verified official stable tooling, with cached inputs and complete session restoration. Host and DevBox releases run on separate, slower tested change cycles. Requirements R11 and architecture A10 define the contract. The agent publication bridge checks protected scheduled and on-demand runs and offers an exact candidate to renewal. Activation requires independent observation and continuity checks. Verify both placements and restoration on the selected VPS before accepting the nightly cycle. Model availability is checked separately from CLI and image version. A11 retains the earlier Claudebox implementations as references. [Agent publication and renewal](docs/agent-release-bridge.md)
 
 <a id="dr10"></a>
 ## DR10 — Development sessions and launch brief
 
 <a id="dr10-1"></a>
-**DR10.1** Follow [A12's session workflow](ARCHITECTURE.md#a12): architecture/coordination with **GPT-6 Astra High**, implementation with **GPT-6.1 Sol High**, and independent review in a fresh **GPT-6 Astra High** session. Use Sol Medium for settled mechanical work; reserve Extra High for a specific difficult problem. Each handoff records the exact candidate, applicable requirements, evidence and next action. The owner provides product decisions, not code review or manual worker coordination.
+**DR10.1** Follow [A12's session workflow](ARCHITECTURE.md#a12): architecture/coordination with **GPT-6.2 Astra High**, implementation with **GPT-6.2 Sol High**, and independent review in a fresh **GPT-6.2 Astra High** session. Use Sol Medium for settled mechanical work; reserve Extra High for a specific difficult problem. Each handoff records the exact candidate, applicable requirements, evidence and next action. The owner provides product decisions, not code review or manual worker coordination.
 
 <a id="dr10-2"></a>
-**DR10.2** To start the separate development conversation, select repository **`oso-gato/dev-pair`**, branch **`main`**, model **GPT-6 Astra**, effort **High**, and an environment with authorized access to private `oso-gato/standards` and the two A11 reference repos. Verify the actual checkout and permissions after startup. Use the title **Dev-pair — architecture and coordination** and the following brief; selecting settings in the client is required because text in a prompt does not switch models:
+**DR10.2** To start the separate development conversation, select repository **`oso-gato/dev-pair`**, branch **`main`**, model **GPT-6.2 Astra**, effort **High**, and an environment with authorized access to private `oso-gato/standards` and the two A11 reference repos. Verify the actual checkout and permissions after startup. Use the title **Dev-pair — architecture and coordination** and the following brief; selecting settings in the client is required because text in a prompt does not switch models:
 
-> Develop oso-gato/dev-pair under ARCHITECTURE A12. First verify the checkout, record its exact revision, and read README, STANDARDS, its three pinned shared documents, REQUIREMENTS and ARCHITECTURE. Begin with the original-charter omission review in A12.11 and inspect the existing fedora-bootstrap and fedora-dev implementations at A11's revisions. Preserve the lowercase names erebus and strix, Fedora/Podman, separate Distrobox agent layers, agentbox → gptbox, nightly agent refreshes, slower platform releases, immutable deployed code, reusable isolated build trees, host-test feedback and complete session recovery. Produce a concise evidence-backed mapping and resolve only material product/authority decisions with me. Then coordinate A12.12's first implementation slice in a separate GPT-6.1 Sol High builder session, with fresh GPT-6 Astra High review and authorized host validation. Keep durable handoffs so I do not have to carry context between sessions. I am the product owner and do not review code. Verify model settings and session creation; report unavailable capabilities, missing execution budgets/access and genuine blockers without inventing success or silently changing requirements. Proceed autonomously within the established agreement and permissions.
+> Develop oso-gato/dev-pair under ARCHITECTURE A12. First verify the checkout, record its exact revision, and read README, STANDARDS, its three pinned shared documents, REQUIREMENTS and ARCHITECTURE. Begin with the original-charter omission review in A12.11 and inspect the existing fedora-bootstrap and fedora-dev implementations at A11's revisions. Preserve the lowercase names erebus and strix, Fedora/Podman, Tailscale-only authorized workload access with scoped fresh-host bootstrap and verified recovery, separate Distrobox agent layers, agentbox → gptbox, nightly agent refreshes, slower platform releases, immutable deployed code, reusable isolated build trees, host-test feedback and complete session recovery. Produce a concise evidence-backed mapping and resolve only material product/authority decisions with me. Then coordinate A12.12's first implementation slice in a separate GPT-6.2 Sol High builder session, with fresh GPT-6.2 Astra High review and authorized host validation. Keep durable handoffs so I do not have to carry context between sessions. I am the product owner and do not review code. Verify model settings and session creation; report unavailable capabilities, missing execution budgets/access and genuine blockers without inventing success or silently changing requirements. Proceed autonomously within the established agreement and permissions.
 
 <a id="dr10-3"></a>
-**DR10.3** This section documents the workflow and supplies a launch brief. It does not create cloud conversations, configure their models, implement orchestration, or establish runtime/release compliance. Report actual session links and verified progress separately. Current model-selection references are [OpenAI's Codex model guidance](https://learn.chatgpt.com/docs/models) and [GPT-6.1 Sol effort settings](https://developers.openai.com/api/docs/models/gpt-6.1-sol); verify account/client support when launching.
+**DR10.3** This section documents the workflow and supplies a launch brief. It does not create cloud conversations, configure their models, implement orchestration, or establish runtime/release compliance. Report actual session links and verified progress separately. Verify account and client support when launching. See [OpenAI's Codex model guidance](https://learn.chatgpt.com/docs/models).
+
+<a id="dr10-4"></a>
+**DR10.4** The [DR10 work record](docs/dr10-work-record.md) records the source baseline, original-charter reconciliation, owner decisions, actual session capabilities and implementation handoffs. [Local candidate preparation](docs/candidate-preparation.md) is the first partial A12.12(1) implementation; production gptbox construction, both Distrobox placements and runtime acceptance remain unverified. Exact candidate review and current delivery status belong in the accompanying pull request.

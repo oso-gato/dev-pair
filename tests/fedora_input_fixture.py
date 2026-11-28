@@ -1,0 +1,49 @@
+"""External Fedora trust boundary injection for unrelated synthetic engine tests only."""
+import contextlib
+import hashlib
+from pathlib import Path
+from unittest.mock import patch
+import fedora_oci
+
+@contextlib.contextmanager
+def synthetic_verified(source, **kwargs):
+    root = Path(source); root.mkdir(exist_ok=True)
+    for name in fedora_oci.FILES:
+        if not (root / name).exists(): (root / name).write_bytes(b'UNTRUSTED SYNTHETIC INPUT, NOT FEDORA')
+    yield root / 'fixture.oci.tar', {'fixture': 'not signature evidence'}
+
+
+def synthetic_import(engine, plain, uid=None, seconds=120):
+    engine('load', '--input', str(plain))
+    engine('save', '--format=oci-archive', '--output', str(plain.parent / 'fixture-export'), fedora_oci.IMAGE)
+    return {'source':dict(fedora_oci.PROVENANCE),'imported_config':'sha256:'+fedora_oci.CONFIG,'imported_manifest':'sha256:'+fedora_oci.MANIFEST,
+        'conversion':'source manifest/config retained on load; storage save gzip representation derived and fully rehashed',
+        'saveback':{'manifest_sha256':fedora_oci.MANIFEST,'config_sha256':fedora_oci.CONFIG,'compressed_layer_sha256':fedora_oci.LAYER,'diff_id_sha256':fedora_oci.DIFF,
+            'derivation':'storage export gzip recompression allowed; exact source config bytes and rootfs diff stream required'},
+        'verification':'Source archive chain plus exported config-byte/rootfs-diff equality and full derived descriptor/blob graph',
+        'failure_recovery':'Import is nontransactional; unreferenced store layers may remain, no broad prune/removal'}
+
+
+def install(test):
+    fake = b'UNTRUSTED SYNTHETIC INPUT, NOT FEDORA'
+    artifacts = {name:(url,len(fake),hashlib.sha256(fake).hexdigest()) for name,(url,_,_) in fedora_oci.ARTIFACTS.items()}
+    for item in (patch.object(fedora_oci, 'copy_workspace', synthetic_copy),
+                 patch.object(fedora_oci, 'image_workspaces', synthetic_image),
+                 patch.object(fedora_oci, 'recover_workspaces', return_value=None),
+                 patch.object(fedora_oci, 'ARTIFACTS', artifacts),
+                 patch.object(fedora_oci, 'verified', synthetic_verified),
+                 patch.object(fedora_oci, 'import_image', synthetic_import)):
+        item.start(); test.addCleanup(item.stop)
+
+
+@contextlib.contextmanager
+def synthetic_copy(parent, **kwargs):
+    root=Path(parent)/'image-copy';root.mkdir(exist_ok=True)
+    try:yield root
+    finally:root.rmdir()
+
+
+@contextlib.contextmanager
+def synthetic_image(parent, **kwargs):
+    with synthetic_copy(parent) as copying:
+        yield copying, Path(parent)

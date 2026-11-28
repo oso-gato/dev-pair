@@ -1,0 +1,16 @@
+[Unit]
+Description=Fence dev-pair host effects until this boot is verified
+After=local-fs.target
+RequiresMountsFor=/var/lib/dev-pair
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -IB /usr/libexec/dev-pair/tools/renewal.py boot-fence
+RemainAfterExit=yes
+TimeoutStartSec=10s
+
+[Install]
+WantedBy=multi-user.target

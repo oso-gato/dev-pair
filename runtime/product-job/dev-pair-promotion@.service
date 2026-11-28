@@ -1,0 +1,15 @@
+[Unit]
+Description=Dev-pair protected checklist promotion %i
+After=network-online.target
+ConditionPathExists=/etc/dev-pair/product-release/policy.json
+
+[Service]
+Type=oneshot
+User=root
+UMask=0077
+ExecStart=/usr/bin/python3 -EBs /usr/libexec/dev-pair/tools/product_release.py advance %i
+TimeoutStartSec=1200
+TimeoutStopSec=15
+MemoryMax=768M
+TasksMax=256
+CPUQuota=100%

@@ -1,0 +1,211 @@
+#!/usr/bin/python3 -IB
+"""The named operator's terminal commands for the dev-pair product conductor."""
+import argparse
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+ENTRY = '/usr/libexec/dev-pair/tools/owner_intake.py'
+COMMAND = ('/usr/bin/sudo', '-n', '--', ENTRY)
+BRIEF_MAX = 1800
+CHECKLIST = 'checklist-persistence'
+GENERAL = 'general-development'
+EXTERNAL = 'general-with-external-validation'
+WORKLOADS = (CHECKLIST, GENERAL, EXTERNAL)
+
+
+def query(request):
+    payload = json.dumps(request, ensure_ascii=False, separators=(',', ':')).encode()
+    if len(payload) > 8192:
+        raise ValueError('Owner input is too long.')
+    response = subprocess.run(COMMAND, input=payload, stdout=subprocess.PIPE, check=False)
+    if not response.stdout:
+        response.check_returncode()
+        raise ValueError('The protected intake returned no job record.')
+    return json.loads(response.stdout), response.returncode
+
+
+def show(record):
+    phase = 'recorded validation passed' if record['phase'] == 'passed' else record['phase'].replace('-', ' ')
+    print(f"Job {record['job_id']} · {phase}", flush=True)
+    if record.get('failed_stage'):
+        print('Stopped during ' + record['failed_stage'].replace('-', ' '), flush=True)
+    if record.get('diagnostics'):
+        print(record['diagnostics'], flush=True)
+    if record.get('product_phase') and record['product_phase'] != record['phase']:
+        print('Published product state ' + record['product_phase'].replace('-', ' '), flush=True)
+    for role in ('maintenance', 'development'):
+        if record.get(role) and record[role].get('session_uuid'):
+            print(f"{role.title()} session {record[role]['session_uuid']}", flush=True)
+    for key, label in (('first', 'Host check'), ('final', 'Final host check')):
+        result = (record.get(key) or {}).get('result')
+        if result:
+            print(f"{label} {result['status']} · attempt {result['attempt_id']}", flush=True)
+            if result['status'] != 'pass':
+                print(result['diagnostics'], flush=True)
+
+    if record.get('promotion'):
+        release = record['promotion']
+        print('Delivery ' + release['phase'].replace('-', ' '), flush=True)
+        for key in ('reason', 'pull_url', 'destination', 'image'):
+            if release.get(key):
+                print(release[key].replace('-', ' ') if key == 'reason' else release[key], flush=True)
+
+
+def review(record):
+    show(record)
+    preview = record['preview']
+    plan = preview['plan']
+    agreement = plan['agreement']
+    expires = datetime.fromtimestamp(preview['expires_unix'], timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    print(f"Repository {agreement['repository']} at {agreement['initial_commit']}")
+    print(f"Startup revision {preview['startup_revision']} · standards {preview['standards_sha']}")
+    print(f"Verified startup SHA-256 {plan['startup_sha256']}")
+    print()
+    print(agreement['brief'])
+    print()
+    if plan['adapter'] == 'checklist-quadlet':
+        print('The checklist adapter verifies persistence after one controlled restart per candidate.')
+        print('The job allows one changed retest. Other product criteria require their agreed evidence.')
+        print(f"{agreement['build_seconds']}s per build · {agreement['host_seconds']}s per host check · "
+              f"{agreement['turn_seconds']}s per role turn")
+    else:
+        print(f"Local tests in confined DevBox · {agreement['turn_seconds']}s per role turn")
+        if preview.get('product_agreement', {}).get('external_validation'):
+            print('The requested external check stays pending until an approved adapter is available.')
+    print(f"Approved provider ceiling USD {preview['provider_microusd'] / 1_000_000:.6f} · expires {expires}")
+    for role, limits in preview['provider_limits'].items():
+        print(f"{role.title()} · up to {limits['max_requests']} provider requests · "
+              f"{limits['max_context_tokens']} input tokens per request · "
+              f"{limits['max_output_tokens']} output tokens per response · "
+              f"USD {limits['spend_microusd'] / 1_000_000:.6f} maximum · up to {limits['seconds']}s")
+    print(f"Agreement SHA-256 {record['agreement_token']}", flush=True)
+
+
+def brief(args, interactive):
+    if args.brief_file:
+        if args.brief_file == '-':
+            raw = sys.stdin.buffer.read(BRIEF_MAX + 1)
+        else:
+            with Path(args.brief_file).open('rb') as stream:
+                raw = stream.read(BRIEF_MAX + 1)
+        if len(raw) > BRIEF_MAX:
+            raise ValueError(f'The product brief exceeds {BRIEF_MAX} UTF-8 bytes.')
+        return raw.decode('utf-8')
+    if args.brief is not None:
+        return args.brief
+    if not interactive:
+        raise ValueError('Give the product brief with --brief or --brief-file.')
+    return input('What should the pair build or fix? ')
+
+
+def details(args, text, interactive):
+    keys = ('audience', 'access', 'acceptance', 'external_validation')
+    answers = dict.fromkeys(keys, '')
+    labels = {'users': 'audience', 'audience': 'audience', 'access': 'access',
+              'acceptance': 'acceptance', 'external validation': 'external_validation'}
+    for line in text.splitlines():
+        label, _, value = line.partition(':')
+        key = labels.get(label.strip().lower())
+        if key and value.strip():
+            answers[key] = value.strip()
+    for key in keys:
+        value = getattr(args, key)
+        if value is not None:
+            answers[key] = value.strip()
+    permissions = ('Who may share, open or change a shared checklist? ' if 'shar' in text.lower() else
+                   'Who may take that action or see or change the affected data? ')
+    prompts = {'audience': 'Who will use this change? ', 'access': permissions,
+               'acceptance': 'What should those people be able to do or observe for this to count as done? ',
+               'external_validation': 'Which external check or environment is needed? '}
+    for key in keys[:3]:
+        if not answers[key] and interactive:
+            answers[key] = input(prompts[key]).strip()
+        if not answers[key]:
+            raise ValueError(f"Describe {key} with --{key.replace('_', '-')} before confirming the agreement.")
+    workload = args.workload
+    if workload is None and interactive:
+        print('Choose validation for this outcome.')
+        print('1 Repair existing checklist restart persistence, with access and sharing preserved.')
+        print('2 Develop and test in DevBox.')
+        print('3 Develop and test in DevBox, with a required external check pending.')
+        choice = input('Validation [1/2/3] ').strip()
+        workload = dict(zip(('1', '2', '3'), WORKLOADS)).get(choice)
+    if workload is None:
+        raise ValueError('Select an explicit --workload for this outcome.')
+    if workload == EXTERNAL and not answers['external_validation'] and interactive:
+        answers['external_validation'] = input(prompts['external_validation']).strip()
+    if workload == EXTERNAL and not answers['external_validation']:
+        raise ValueError('Describe the required check with --external-validation.')
+    return dict(answers, workload=workload)
+
+
+def follow(action, job):
+    payload = json.dumps({'action': action, 'job': job}).encode()
+    with subprocess.Popen(COMMAND, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=False) as process:
+        with process.stdin:
+            process.stdin.write(payload)
+        for line in process.stdout:
+            show(json.loads(line))
+        return process.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='dev-pair', description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    for action in ('start', 'draft'):
+        new = sub.add_parser(action, help='review an agreement for an approved repository')
+        new.add_argument('repository')
+        source = new.add_mutually_exclusive_group()
+        source.add_argument('--brief')
+        source.add_argument('--brief-file', metavar='FILE')
+        new.add_argument('--audience', help='intended users')
+        new.add_argument('--access', help='who may act and view or change affected data')
+        new.add_argument('--acceptance', help='observable result required by the product agreement')
+        new.add_argument('--constraints', default='', help='additional scope or data limits')
+        new.add_argument('--workload', choices=WORKLOADS, help='approved validation path')
+        new.add_argument('--external-validation', help='required check beyond the available local environment')
+    submit = sub.add_parser('submit', help='confirm and start the exact saved agreement')
+    submit.add_argument('job')
+    submit.add_argument('agreement_sha256')
+    for action in ('status', 'reattach'):
+        sub.add_parser(action, help='read the latest job progress').add_argument('job')
+    sub.add_parser('agreement', help='read the saved product agreement').add_argument('job')
+    args = parser.parse_args()
+    try:
+        if args.action in ('status', 'reattach'):
+            return follow(args.action, args.job)
+        if args.action == 'agreement':
+            record, code = query({'action': 'agreement', 'job': args.job})
+            review(record)
+            return code
+        if args.action == 'submit':
+            record, code = query({'action': 'submit', 'job': args.job, 'agreement_token': args.agreement_sha256})
+            show(record)
+            return code
+        interactive = sys.stdin.isatty() and args.brief_file != '-'
+        text = brief(args, interactive)
+        record, code = query({'action': 'draft', 'repository': args.repository, 'brief': text,
+                              'constraints': args.constraints, **details(args, text, interactive)})
+        review(record)
+        if code:
+            return code
+        job, token = record['job_id'], record['agreement_token']
+        if args.action == 'start' and interactive and input('Start this exact agreement? [y/N] ').strip().lower() in ('y', 'yes'):
+            accepted, code = query({'action': 'submit', 'job': job, 'agreement_token': token})
+            show(accepted)
+        else:
+            print(f"Confirm when ready with dev-pair submit {job} {token}")
+        print(f"Follow with dev-pair reattach {job}")
+        return code
+    except subprocess.CalledProcessError as error:
+        return error.returncode
+    except (EOFError, OSError, ValueError) as error:
+        print('Dev-pair request stopped. ' + str(error), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

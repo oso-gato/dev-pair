@@ -1,0 +1,133 @@
+name: Fedora agent refresh
+
+on:
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-release-main
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    if: >-
+      github.repository == 'oso-gato/dev-pair' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_protected &&
+      github.run_attempt == 1 &&
+      vars.PLATFORM_AGENT_REFRESH_ENABLED == 'true'
+    environment: agent-refresh
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tooling-verified: ${{ steps.tooling.outputs.tooling-verified }}
+      base: ${{ steps.tooling.outputs.base }}
+      artifact-bytes: ${{ steps.tooling.outputs.artifact-bytes }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Verify exact current tooling and refresh custody
+        id: tooling
+        env:
+          BASE_PLATFORM: ${{ vars.PLATFORM_BASE_SHA256 }}
+          ARTIFACT_BYTES: ${{ vars.PLATFORM_AGENT_ARTIFACT_BYTES }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/platform_tooling_refresh.py --source "$GITHUB_SHA" --output "$RUNNER_TEMP/agent-tooling" --actions
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-tooling-${{ github.sha }}
+          path: ${{ runner.temp }}/agent-tooling/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  agent:
+    needs: resolve
+    if: needs.resolve.outputs.tooling-verified == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        role: [maintenance, development]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-tooling-${{ github.sha }}
+          path: ${{ runner.temp }}/agent-tooling
+      - name: Reverify approved public inputs and build the native agent image
+        env:
+          ROLE: ${{ matrix.role }}
+        run: python3 -B tools/platform_release_ci.py "$ROLE" --source "$GITHUB_SHA"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-${{ matrix.role }}-${{ github.sha }}
+          path: ${{ runner.temp }}/platform-${{ matrix.role }}-${{ github.sha }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [resolve, agent]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: platform-*-${{ github.sha }}
+          path: ${{ runner.temp }}/platform-parts
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: agent-tooling-${{ github.sha }}
+          path: ${{ runner.temp }}/agent-tooling
+      - name: Assemble the portable agent-only release
+        env:
+          BASE_PLATFORM: ${{ needs.resolve.outputs.base }}
+          ARTIFACT_BYTES: ${{ needs.resolve.outputs.artifact-bytes }}
+        run: |
+          python3 -B tools/platform_release.py assemble --agent-only --site-chain --source "$GITHUB_SHA" \
+            --input "$RUNNER_TEMP/platform-parts" --output "$RUNNER_TEMP/platform-subjects-$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --base-platform "$BASE_PLATFORM" \
+            --refresh-tooling "$RUNNER_TEMP/agent-tooling/tooling.json" \
+            --approved-artifact-bytes "$ARTIFACT_BYTES"
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ runner.temp }}/platform-subjects-${{ github.sha }}/platform.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: platform-subjects-${{ github.sha }}
+          path: ${{ runner.temp }}/platform-subjects-${{ github.sha }}/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+      - name: Record exact agent refresh coordinates
+        run: |
+          printf 'Source `%s` · Actions run `%s`\n\n' "$GITHUB_SHA" "$GITHUB_RUN_ID" >> "$GITHUB_STEP_SUMMARY"
+          (cd "$RUNNER_TEMP/platform-subjects-$GITHUB_SHA" && sha256sum platform.json) >> "$GITHUB_STEP_SUMMARY"

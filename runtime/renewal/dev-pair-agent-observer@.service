@@ -1,0 +1,16 @@
+[Unit]
+Description=Verify one independently signed dev-pair candidate challenge
+RequiresMountsFor=/var/lib/dev-pair
+
+[Service]
+Type=exec
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/dev-pair/renewal/agent-observer serve
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=11min
+TimeoutStopSec=15s
+KillMode=control-group

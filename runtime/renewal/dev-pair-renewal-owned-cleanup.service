@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile the exact owned dev-pair runtimes after an interrupted renewal
+After=local-fs.target
+RequiresMountsFor=/var/lib/dev-pair
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/libexec/dev-pair/renewal/owned-cleanup
+TimeoutStartSec=125s
+TimeoutStopSec=15s
+KillMode=control-group

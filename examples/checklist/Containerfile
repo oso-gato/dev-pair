@@ -1,0 +1,9 @@
+ARG CHECKLIST_BASE
+FROM ${CHECKLIST_BASE}
+ARG CHECKLIST_SOURCE
+LABEL org.opencontainers.image.revision=${CHECKLIST_SOURCE}
+COPY --chown=0:0 --chmod=0444 checklist.py /opt/dev-pair-checklist/checklist.py
+RUN ["/usr/bin/python3", "-IB", "-c", "import sqlite3"]
+USER 65532:65532
+ENTRYPOINT ["/usr/bin/python3", "-IB", "/opt/dev-pair-checklist/checklist.py"]
+CMD ["serve", "--container", "--port", "8000", "--database", "/data/checklist.sqlite3"]

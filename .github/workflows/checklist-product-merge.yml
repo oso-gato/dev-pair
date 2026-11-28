@@ -1,0 +1,35 @@
+name: Protected checklist product merge
+
+on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checklist-product-merge-main
+  cancel-in-progress: false
+
+jobs:
+  merge-approved-head:
+    if: github.repository == 'oso-gato/dev-pair' && github.ref_protected && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: checklist-merge
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Merge one independently approved exact current head
+        env:
+          PRODUCT_MERGE_POLICY: ${{ vars.PRODUCT_MERGE_POLICY }}
+          CHECKLIST_MERGE_TOKEN: ${{ secrets.CHECKLIST_MERGE_TOKEN }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -EBs tools/checklist_merge_gate.py

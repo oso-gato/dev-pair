@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe protected checklist delivery outcomes
+
+[Timer]
+OnBootSec=45s
+OnUnitInactiveSec=3min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

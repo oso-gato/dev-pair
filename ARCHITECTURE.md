@@ -11,7 +11,7 @@
 ## A1 — Platform
 
 <a id="a1-1"></a>
-**A1.1** Use Fedora Cloud 45 for the first VPS and versioned Fedora 45 base images for the agent environments. Verify the provider image, architecture, runtime capabilities and official image identities before adoption. Pin deployed images by digest and record their source revisions. Apply tested maintenance updates; a major Fedora upgrade is a deliberate platform change, never an automatic consequence of a floating `latest` tag.
+**A1.1** Use Fedora Cloud 44 for the first VPS and versioned Fedora 44 base images for the agent environments. Verify the provider image, architecture, runtime capabilities and official image identities before adoption. Pin deployed images by digest and record their source revisions. Apply tested maintenance updates; a major Fedora upgrade is a deliberate platform change, never an automatic consequence of a floating `latest` tag.
 
 <a id="a1-2"></a>
 **A1.2** Use rootless Podman with Quadlet and systemd. Docker Engine is not a dependency. Keep SELinux enforcing and retain container confinement; an exception requires a demonstrated need and a recorded scope.
@@ -78,6 +78,15 @@
 <a id="a4-3"></a>
 **A4.3** The runtime must declare the following storage classes and ownership:
 
+The owner-approved directory design uses `/var/lib/dev-pair/maintenance` and
+`/var/lib/dev-pair/development`, owned separately by the restricted role accounts.
+Within each, `workspaces`, `checkpoints`, `evidence`, `deliverables`, `builds`,
+`cache` and `state` implement the classes below. Credential delivery uses separate
+protected sources and scoped mounts; naming a directory does not enforce access,
+quotas or safe cleanup. Configure and validate actual resource budgets against
+the target's capacity before enabling jobs. A11 supplies lifecycle lessons, not
+a requirement to reproduce the historical home-directory layout.
+
 | Clause | Storage | Lifetime and handling |
 |---|---|---|
 | <a id="a4-4"></a>**A4.4** | Source workspaces, uncommitted edits, checkpoints, evidence, deliverables | Durable per project/job; protected from build cleanup and container replacement |
@@ -138,7 +147,19 @@
 **A7.2** Back up declared durable state and prove restoration. Match rollback to the application's data changes; reverting an image alone may not undo a database migration. Keep the previous working release available until the new release is verified.
 
 <a id="a7-3"></a>
-**A7.3** Administrative access is private where practical and authenticates with managed keys or identities. Public product access follows the product agreement. Supply credentials at runtime with minimal scope, keep them out of logs and source, and document renewal before calling unattended operation ready.
+**A7.3** Enforce R7.16–R7.18 for all VPS workload entry points, including development/maintenance, demonstrator use and later hosted apps. Select and document Tailscale topology, workload endpoints, identity/ACL policy and listener/firewall routes before deployment. Host-mediated access, sidecar routing or individual workload identities remain design options subject to rootless Podman and SELinux boundaries; no per-container daemon or privileged-networking requirement is inferred. Test authorized tailnet use, public/unauthorized rejection and loss of the tailnet with no exposure fallback. Supply enrollment/runtime credentials externally with minimal scope, redact logs and record renewal/revocation. This design is required, not implemented.
+
+<a id="a7-4"></a>
+**A7.4** Run job execution independently of the attached client connection, under the appropriate role's lifecycle supervisor, with stable job/session identity and durable context, checkpoints and evidence. Reattachment observes or resumes the existing session without dispatching a duplicate job. Keep bootstrap and provider authentication compatible with a headless host, documenting any authorized remote-device interaction separately from ongoing unattended operation. Validate the complete headless and disconnect/reconnect journeys in R7.14–R7.15; a detached shell or a process listing alone is insufficient evidence.
+
+<a id="a7-5"></a>
+**A7.5** Provision a fresh VPS through the separately authorized, scoped public SSH or provider-console route; record its allowed sources, authentication, effects, duration and retirement condition. Initial access may precede Tailscale enrollment. Verify host identity and inspect first, then enroll through external secret references, configure tailnet-only workload ingress and prove named-administrator key access plus a controlled recovery route independent of the pair/tailnet before retiring temporary public access and direct remote root. Record cutover/rollback checkpoints so enrollment failure cannot strand the host. Operator recovery uses its own scoped authority and must not reopen application ingress. A3 validation requests may observe/test approved paths; they do not authorize enrollment or access-policy changes themselves.
+
+<a id="a7-6"></a>
+**A7.6** Provision `core` as the human operator with password-gated sudo and console authentication, separate from locked, noninteractive `dp-maint` and `dp-dev` runtime accounts. Accept the password through a protected external channel, never command arguments, logs, images or source. Fetch public keys from the owner's `oso-gato` GitHub account over verified HTTPS, validate the complete bounded response before installing, and preserve the prior working key set on retrieval/validation failure. Install mosh and tmux; scope mosh UDP ingress to `tailscale0` and attach tmux only for interactive terminals so commands and file transfers remain usable. Preserve `erebus` across cloud-init runs, enable clock synchronization, and declare the renewal timezone. These are intended first-bootstrap behaviors under R7.19; README and the bootstrap guide record actual implementation and evidence.
+
+<a id="a7-7"></a>
+**A7.7** Inspect live SELinux state, persistent configuration and kernel boot arguments before changing mode. Preserve an already-enforcing host. For a disabled/unlabeled provider image, use a recorded, resumable permissive relabel transition before enforcing; a permissive state alone is not proof that relabeling completed. Verify the running enforcing state and durable configuration before recording completion or disarming transition machinery. Keep workloads disabled until admission verifies enforcement and confinement. Missing policy, conflicting boot arguments, relabel failure or failed enforcement must surface as incomplete/blocked, never success or an implicit permanent permissive fallback. Preserve the independently verified recovery route through the authorized setup reboots. Adapt the A11 reference's useful transition lessons without importing its suppressed failures, retired service dependencies or container-label exceptions.
 
 <a id="a8"></a>
 ## A8 — Managed repair and renewal
@@ -168,7 +189,7 @@
 ## A9 — Later application hosting
 
 <a id="a9-1"></a>
-**A9.1** The maintenance side manages owner-approved application containers alongside the pair, with separate state, identities and resource allocations. Reserve enough capacity for development and recovery. Application installation and renewal use isolated candidates and verified artifacts; unrelated applications cannot acquire the pair’s privileged control interface.
+**A9.1** The maintenance side manages owner-approved application containers alongside the pair, with separate state, identities and resource allocations. Reserve enough capacity for development and recovery. Application installation and renewal use isolated candidates and verified artifacts, with tailnet access and failure/recovery acceptance under R7.17–R7.18/A7.3/A7.5; unrelated applications cannot acquire the pair’s privileged control interface.
 
 <a id="a9-2"></a>
 **A9.2** Use oso-gato/fedora-desktop as a reference for the desired remotely accessible desktop experience, not as inherited implementation or policy. The requested successor is an Omarchy workload under the container-as-app goal. Keep Fedora as the host/DevBox platform and keep desktop-specific design in the workload’s own project.
@@ -229,14 +250,14 @@
 
 | Clause | Separate session | Model / effort | Responsibility and completion evidence |
 |---|---|---|---|
-| <a id="a12-2"></a>**A12.2** | Dev-pair — architecture and coordination | `gpt-6-astra` / `high` | Reconcile the original charter, current requirements and A11 implementation references. Maintain a concise requirement-to-acceptance mapping and an ordered work queue. Preserve owner decisions; resolve material conflicts before dependent work. Hand one bounded implementation slice to a builder, then coordinate repair, review and delivery. |
-| <a id="a12-3"></a>**A12.3** | Dev-pair — build — task ID | `gpt-6.1-sol` / `high` | Work in an isolated branch/worktree. Implement the slice and meaningful tests, run suitable local checks, request external checks where needed, diagnose failures and repair. Hand off an exact candidate commit and evidence, never a moving branch alone. |
-| <a id="a12-4"></a>**A12.4** | Dev-pair — review — task ID | `gpt-6-astra` / `high` | A fresh session independently reads the governing documents, exact candidate and evidence. Check lost requirements, behavior, failure paths and boundaries. Report pass, changes required or blocked with clause/file references. Do not edit the candidate or accept the author's summary as proof; fixes return to the builder and receive fresh affected checks and review. |
-| <a id="a12-5"></a>**A12.5** | Dev-pair — host validation — task ID | `gpt-6.1-sol` / `high` | Use only the designated authorized executor/target to perform A3 host checks and renewal tests. Return candidate-bound results to the builder. Bootstrap may use an authorized cloud/operator execution route until the pair works; record that fact and later prove the pair's own handoff loop. No deployment authority follows merely from naming this session. |
-| <a id="a12-6"></a>**A12.6** | Dev-pair — focused task — task ID | `gpt-6.1-sol` / `medium` | Optional for mechanical documentation, naming or small isolated changes with settled behavior. Charter interpretation, permission changes and lifecycle/recovery work use the higher-effort roles above. |
+| <a id="a12-2"></a>**A12.2** | Dev-pair — architecture and coordination | `gpt-6.2-astra` / `high` | Reconcile the original charter, current requirements and A11 implementation references. Maintain a concise requirement-to-acceptance mapping and an ordered work queue. Preserve owner decisions; resolve material conflicts before dependent work. Hand one bounded implementation slice to a builder, then coordinate repair, review and delivery. |
+| <a id="a12-3"></a>**A12.3** | Dev-pair — build — task ID | `gpt-6.2-sol` / `high` | Work in an isolated branch/worktree. Implement the slice and meaningful tests, run suitable local checks, request external checks where needed, diagnose failures and repair. Hand off an exact candidate commit and evidence, never a moving branch alone. |
+| <a id="a12-4"></a>**A12.4** | Dev-pair — review — task ID | `gpt-6.2-astra` / `high` | A fresh session independently reads the governing documents, exact candidate and evidence. Check lost requirements, behavior, failure paths and boundaries. Report pass, changes required or blocked with clause/file references. Do not edit the candidate or accept the author's summary as proof; fixes return to the builder and receive fresh affected checks and review. |
+| <a id="a12-5"></a>**A12.5** | Dev-pair — host validation — task ID | `gpt-6.2-sol` / `high` | Use only the designated authorized executor/target to perform A3 host checks and renewal tests. Return candidate-bound results to the builder. Bootstrap may use an authorized cloud/operator execution route until the pair works; record that fact and later prove the pair's own handoff loop. No deployment authority follows merely from naming this session. |
+| <a id="a12-6"></a>**A12.6** | Dev-pair — focused task — task ID | `gpt-6.2-sol` / `medium` | Optional for mechanical documentation, naming or small isolated changes with settled behavior. Charter interpretation, permission changes and lifecycle/recovery work use the higher-effort roles above. |
 
 <a id="a12-7"></a>
-**A12.7** Keep model, effort and allowed escalation in runtime/session configuration, separate from `agentbox → gptbox`. The table is the initial operating recommendation, not a permanent shared-standard requirement. Use Astra High for difficult architecture or platform diagnosis and escalate a specific unresolved problem to `xhigh` only with a recorded reason and within the job's budget. Do not use maximum effort for every action. Verify model/effort availability before launch, record the actual settings, and surface unavailable selections rather than claiming the requested model ran. A prompt alone does not configure a model. Existing session model changes follow A5.4/A10.6; do not silently switch a resumed job.
+**A12.7** Keep model, effort and allowed escalation in runtime/session configuration, separate from `agentbox → gptbox`. The table records this project's current development selections. Use Astra High for difficult architecture or platform diagnosis and escalate a specific unresolved problem to `xhigh` only with a recorded reason and within the job's budget. Do not use maximum effort for every action. Verify model/effort availability before launch, record the actual settings, and surface unavailable selections rather than claiming the requested model ran. A prompt alone does not configure a model. Existing session model changes follow A5.4/A10.6; do not silently switch a resumed job.
 
 <a id="a12-8"></a>
 **A12.8** Use one existing issue/PR or equivalent durable job record for the handoff: task/outcome; applicable requirement IDs; source baseline and standards SHA; branch/worktree and exact candidate SHA; tests and their environment/evidence; unresolved decisions; next action; session/model/effort; and applicable authority, time, spending and retry limits. Include image digests and external request IDs when relevant. Record secret references only. This is a compact record, not a compulsory spec/plan/tasks document bundle. Persist it before changing sessions; the product owner should not shuttle context between workers.
