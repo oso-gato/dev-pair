@@ -298,5 +298,55 @@ class NightlyStationCustodyTests(unittest.TestCase):
             agent_observer_station.confirm_station_signers(admitted, self.final, source, caller, scratch=self.directory)
 
 
+class NightlyScheduleReadbackTests(unittest.TestCase):
+    def setUp(self):
+        self.station = agent_observer_station
+        service, timer = self.station.STATION_UNITS
+        tool = self.station.STATION_TOOLS / 'agent_observer_station.py'
+        self.argv = [self.station.PYTHON, '-EBs', str(tool)]
+        self.service = dict.fromkeys(self.station.SERVICE_PROPERTIES, '')
+        self.service.update(Id=service, LoadState='loaded', FragmentPath=str(self.station.UNIT_ROOT / service),
+                            Type='oneshot', User='root', Group='root', NeedDaemonReload='no',
+                            KillMode='control-group', SendSIGKILL='yes', FinalKillSignal='9',
+                            TimeoutStartFailureMode='terminate', TimeoutStopFailureMode='terminate',
+                            ExecStart='{ path=/usr/bin/python3 ; argv[]=' + ' '.join(self.argv) +
+                                      ' ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }')
+        self.timer = dict(Id=timer, LoadState='loaded', FragmentPath=str(self.station.UNIT_ROOT / timer), DropInPaths='',
+                          Unit=service, NeedDaemonReload='no', ActiveState='active', UnitFileState='enabled')
+        self.conditions = []
+        self.commands = [[self.argv[0], self.argv, [], 0, 0, 0, 0, 0, 0, 0]]
+        vendor = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.object(self.station.systemd_service_profile, 'VENDOR', vendor + '/no-global-drop-in'))
+        self.enterContext(patch.object(self.station.subprocess, 'check_output', side_effect=self.manager))
+
+    def manager(self, command, **_options):
+        if command[0] == '/usr/bin/systemctl':
+            values = self.service if command[-1].endswith('.service') else self.timer
+            omitted = self.station.systemd_service_profile.COMMAND_HOOKS
+            return ''.join(f'{key}={value}\n' for key, value in values.items() if key not in omitted or value)
+        self.assertEqual(command[0], '/usr/bin/busctl')
+        if command[-1] == 'ExecStartEx':
+            return observation.encoding({'type': 'a(sasasttttuii)', 'data': self.commands}).decode()
+        self.assertEqual(command[-2:], ['Conditions', 'Asserts'])
+        conditions = self.conditions if command[4].endswith('_2eservice') else []
+        return ''.join(observation.encoding({'type': 'a(sbbsi)', 'data': data}).decode() for data in (conditions, []))
+
+    def test_default_station_units_arm_only_for_the_exact_effective_service(self):
+        self.assertEqual(self.station.ready_timer()['ActiveState'], 'active')
+        for field, value in (('FragmentPath', '/run/systemd/transient/replacement.service'),
+                             ('DropInPaths', '/etc/systemd/system/dev-pair-agent-observer-station.service.d/local.conf'),
+                             ('ExecStart', '{ path=/usr/bin/false ; argv[]=/usr/bin/false ; ignore_errors=no }')):
+            with self.subTest(field=field), patch.dict(self.service, {field: value}):
+                with self.assertRaises((Blocked, ValueError)):
+                    self.station.ready_timer()
+        self.conditions = [['ConditionPathExists', False, False, '/run/not-ready', -1]]
+        with self.assertRaisesRegex(Blocked, 'unapproved conditions'):
+            self.station.ready_timer()
+        self.conditions = []
+        self.commands.append(self.commands[0])
+        with self.assertRaisesRegex(Blocked, 'command or flags differ'):
+            self.station.ready_timer()
+
+
 if __name__ == '__main__':
     unittest.main()

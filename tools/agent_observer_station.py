@@ -25,6 +25,7 @@ from destination_observation import (AGENT_CANDIDATE, AGENT_ROLES, FAMILIES, FIN
                                      candidate_site, configured_signers, current_station_signer, digest, encoding,
                                      keys, observer_principal, policy_credential, require, state_dir, station_signing,
                                      verify_bytes, verify_file, verify_station_response, write_once)
+import systemd_service_profile
 
 CONFIG = Path('/etc/dev-pair/agent-observer/station.json')
 PYTHON = '/usr/bin/python3'
@@ -37,7 +38,12 @@ UNIT_ROOT = Path('/etc/systemd/system')
 UNIT_HASHES = ('7080fd6641dab45871d250d8adb69657f1484e85db2b624681cfb4b9263ae881',
                '2add841833bed54ef3a2deffb954532ec0e7285acd017329e58bd4983bd7282e')
 STATION_SCRIPTS = ('agent_observer_station.py', 'bootstrap.py', 'day0_access_exchange.py', 'destination_observation.py',
-                   'native_io.py', 'native_relay.py', 'release_trust.py', 'selected_payload.py')
+                   'fedora_oci.py', 'native_io.py', 'native_relay.py', 'release_trust.py', 'selected_payload.py',
+                   'systemd_service_profile.py')
+MANAGER = 'org.freedesktop.systemd1'
+UNIT_PROPERTIES = ('Id', 'LoadState', 'FragmentPath', 'DropInPaths')
+SERVICE_PROPERTIES = (*UNIT_PROPERTIES, 'Type', 'User', 'Group', 'ExecStart', *systemd_service_profile.PROPERTIES)
+TIMER_PROPERTIES = (*UNIT_PROPERTIES, 'Unit', 'NeedDaemonReload', 'ActiveState', 'UnitFileState')
 RETENTION_SECONDS = 7 * 86400
 
 
@@ -302,15 +308,67 @@ def station_owned():
         return False
 
 
+def unit_state(unit, properties):
+    raw = subprocess.check_output(
+        ['/usr/bin/systemctl', 'show', '--all', '--property=' + ','.join(properties), unit],
+        env=ENV, timeout=15, text=True)
+    values = systemd_service_profile.manager_properties(raw, properties)
+    require(values['Id'] == unit and values['LoadState'] == 'loaded' and
+            values['FragmentPath'] == str(UNIT_ROOT / unit), 'the loaded station unit differs from its owned fragment')
+    return values
+
+
+def bus_values(unit, interface, properties, signature):
+    escaped = ''.join(letter if letter.isalnum() else '_' + format(ord(letter), '02x') for letter in unit)
+    path = '/org/freedesktop/systemd1/unit/' + escaped
+    raw = subprocess.check_output(
+        ['/usr/bin/busctl', '--json=short', 'get-property', MANAGER, path, MANAGER + '.' + interface, *properties],
+        env=ENV, timeout=15, text=True)
+    require(len(raw) <= 16384, 'station unit bus readback exceeds its bound')
+    rows = raw.splitlines()
+    require(len(rows) == len(properties), 'station unit bus readback is incomplete')
+    values = []
+    for row in rows:
+        value = json.loads(row, object_pairs_hook=relay.unique)
+        keys(value, {'type', 'data'})
+        require(value['type'] == signature and type(value['data']) is list, 'station unit bus readback has the wrong type')
+        values.append(value['data'])
+    return values
+
+
+def require_unconditional(unit):
+    require(bus_values(unit, 'Unit', ('Conditions', 'Asserts'), 'a(sbbsi)') == [[], []],
+            'the loaded station unit has unapproved conditions or assertions')
+
+
+def service_state():
+    unit = STATION_UNITS[0]
+    row = unit_state(unit, SERVICE_PROPERTIES)
+    systemd_service_profile.observe(row, (), Path, Bootstrap().run)
+    argv = [PYTHON, '-EBs', str(STATION_TOOLS / 'agent_observer_station.py')]
+    require((row['Type'], row['User'], row['Group']) == ('oneshot', 'root', 'root') and
+            systemd_service_profile.exec_start_matches(row['ExecStart'], ' '.join(argv)),
+            'the loaded station service does not select its fixed launcher and account')
+    (commands,) = bus_values(unit, 'Service', ('ExecStartEx',), 'a(sasasttttuii)')
+    require(len(commands) == 1 and type(commands[0]) is list and len(commands[0]) == 10 and
+            commands[0][:3] == [PYTHON, argv, []], 'the loaded station service start command or flags differ')
+    require_unconditional(unit)
+
+
 def timer_state():
     timer = STATION_UNITS[1]
-    raw = subprocess.check_output(
-        ['/usr/bin/systemctl', 'show', timer, '--property=FragmentPath,DropInPaths,ActiveState,UnitFileState'],
-        env=ENV, timeout=25, text=True)
-    values = dict(line.split('=', 1) for line in raw.splitlines())
-    require(values.get('FragmentPath') == str(UNIT_ROOT / timer) and values.get('DropInPaths') == '',
+    values = unit_state(timer, TIMER_PROPERTIES)
+    require(values['DropInPaths'] == '' and values['Unit'] == STATION_UNITS[0],
             'the loaded station timer differs from its owned unit')
     return values
+
+
+def ready_timer():
+    timer = timer_state()
+    require(timer['NeedDaemonReload'] == 'no', 'the station timer has pending unit changes')
+    require_unconditional(STATION_UNITS[1])
+    service_state()
+    return timer
 
 
 def restore_station_hold():
@@ -379,9 +437,9 @@ def install_station(args):
                    expected=previous_config if path == CONFIG else None)
     configuration()
     subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], env=ENV, check=True, timeout=25)
-    timer_state()
+    ready_timer()
     subprocess.run(['/usr/bin/systemctl', 'enable', '--now', STATION_UNITS[1]], env=ENV, check=True, timeout=25)
-    enabled = timer_state()
+    enabled = ready_timer()
     require(enabled.get('ActiveState') == 'active' and enabled.get('UnitFileState') == 'enabled',
             'the independent station timer did not arm')
 

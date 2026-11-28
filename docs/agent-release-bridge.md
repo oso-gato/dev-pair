@@ -80,7 +80,14 @@ owned timer and leaves retained access evidence in custody. For an approved
 reviewer rotation, update the protected public trust and selected public key
 at their registered paths, enroll the new key in the reviewer's agent and
 rerun installation with a matching independently signed workload receipt.
-Successful setup checks the timer's live readback.
+Setup checks the loaded service and timer before and after arming. Conflicting
+service policy holds the station timer. The only admitted service drop-in is
+the verified stock Fedora 44 timeout policy. Resolve other overrides through
+the station administrator and rerun the checked installation.
+
+For an earlier provisional development station, preserve the private mailboxes,
+independent evidence and credential custody during a separately reviewed
+replacement window.
 
 On the destination, `./day0.sh resume` offers to enroll the collector when
 agent renewal is waiting for that approval. Supply the collector's public
