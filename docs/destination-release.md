@@ -35,6 +35,8 @@ Reserve the pristine managed filesystem before the SELinux transition or initial
 
 Verify Fedora and the local ext4 tools are available. An interrupted ambiguous backing file remains preserved. On a host with a previously completed and disarmed SELinux transition, the helper accepts only that exact protected state beside the empty mount root. It durably preserves the original directory at `/var/lib/dev-pair-selinux-preserved` and copies the same verified state into the new filesystem before publishing managed readiness. Complete an already armed transition using its previously reviewed helper first. An occupied root with any other content requires its own recovery plan.
 
+The boot mount prepares the enrolled loop slot even if Fedora starts with no loop devices. On Btrfs, the protected backing record binds the filesystem and subvolume UUIDs, subvolume ID, and the inode number and generation. These identities survive changes to the anonymous device number at reboot. Enrollment verifies that the mounted loop still points to the same complete file at offset zero. Reapply an earlier Btrfs enrollment to upgrade its backing record before relying on automatic recovery.
+
 ```sh
 /usr/bin/python3 -EBs tools/destination_release.py managed-storage --apply \
   --platform-sha "$platform_sha" --managed-mib "$managed_mib" \

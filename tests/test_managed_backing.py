@@ -11,6 +11,30 @@ import managed_backing as backing
 
 
 class BackingTests(unittest.TestCase):
+    def test_stable_identity_uses_the_held_inode_and_subvolume(self):
+        fsid = UUID('aabbccdd-eeff-4411-9988-020301020304')
+        subvol = UUID('12345678-abcd-4411-9988-020301020304')
+
+        def fill(fd, command, data):
+            self.assertEqual(fd, 10)
+            if command == backing.BTRFS_IOC_FS_INFO:
+                struct.pack_into('=QQ16sI', data, 0, 1, 1, fsid.bytes, 16384)
+            elif command == backing.BTRFS_IOC_GET_SUBVOL_INFO:
+                struct.pack_into('=Q', data, 0, 259)
+                data[296:312] = subvol.bytes
+            elif command == backing.FS_IOC_GETVERSION:
+                struct.pack_into('=I', data, 0, 48)
+            else:
+                self.fail('unexpected backing ioctl')
+
+        with patch.object(backing.fcntl, 'ioctl', side_effect=fill):
+            self.assertEqual(backing.btrfs_identity(10, RuntimeError),
+                             {'filesystem_uuid': str(fsid), 'subvolume_id': 259,
+                              'subvolume_uuid': str(subvol), 'inode_generation': 48})
+        with (patch.object(backing.fcntl, 'ioctl', side_effect=OSError),
+              self.assertRaisesRegex(RuntimeError, 'stable Btrfs')):
+            backing.btrfs_identity(10, RuntimeError)
+
     def test_space_uses_native_type_and_does_not_invent_inodes(self):
         fs = SimpleNamespace(f_frsize=4096, f_bavail=8192, f_bfree=8193, f_blocks=8194,
                              f_flag=0, f_files=0, f_ffree=0, f_favail=0)

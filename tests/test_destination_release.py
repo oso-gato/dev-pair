@@ -10,6 +10,7 @@ import select
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -754,6 +755,81 @@ class RolloutTests(unittest.TestCase):
 
 
 class ProvisioningTests(unittest.TestCase):
+    def test_btrfs_backing_migrates_with_positive_proof_and_recovers_stable_identity(self):
+        app = d.Destination()
+        physical = d.managed_backing
+        receipt = '/var/lib/dev-pair-managed-storage.json.backing'
+        fs_uuid = '17ada99b-89fb-4131-98d6-144fabf2e32a'
+        spec = {'image': d.MANAGED_IMAGE, 'mib': 1024, 'uuid': fs_uuid, 'inodes': 65536}
+        size = spec['mib'] * d.MIB
+        node = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0, st_gid=0, st_size=size,
+                               st_blocks=size // 512, st_nlink=1, st_dev=50, st_ino=2469)
+        stable = {'filesystem_uuid': 'parent-uuid', 'subvolume_id': 259, 'subvolume_uuid': 'subvol-uuid', 'inode_generation': 48}
+        identity = {'image': spec['image'], 'inode': node.st_ino, 'size': size, 'fs_uuid': fs_uuid, 'state': 'formatted'}
+        legacy = {**identity, 'device': 51}
+        current = {**identity, 'btrfs': stable}
+        space = physical.ParentSpace('btrfs', 12 * 1024 * d.MIB, None, 200 * d.MIB, 16384)
+
+        def protect(path):
+            return SimpleNamespace(stat=lambda: SimpleNamespace(st_mtime_ns=10) if path == receipt else node)
+
+        with contextlib.ExitStack() as mocks:
+            record = mocks.enter_context(patch.object(app, 'record', return_value=legacy))
+            write = mocks.enter_context(patch.object(app, 'atomic'))
+            signature = mocks.enter_context(patch.object(app, 'run', return_value=f'TYPE=ext4\nUUID={fs_uuid}\n'))
+            mocks.enter_context(patch.object(d.os.path, 'lexists', return_value=True))
+            mocks.enter_context(patch.object(d.os, 'open', return_value=10))
+            mocks.enter_context(patch.object(d.os, 'fstat', return_value=node))
+            mocks.enter_context(patch.object(d.os, 'close'))
+            allocate = mocks.enter_context(patch.object(d.os, 'posix_fallocate'))
+            mocks.enter_context(patch.object(d, 'protect', side_effect=protect))
+            mocks.enter_context(patch.object(physical, 'provisioning_space', return_value=space))
+            mocks.enter_context(patch.object(physical, 'btrfs_identity', return_value=stable))
+            birth = mocks.enter_context(patch.object(physical, 'birth_ns', return_value=20))
+            mocks.enter_context(patch.object(physical, 'prepare_btrfs'))
+            extents = mocks.enter_context(patch.object(physical, 'verify_btrfs'))
+            readback = mocks.enter_context(patch.object(physical, 'verify_backing', return_value=stable))
+
+            with self.assertRaisesRegex(b.Blocked, 'object identity changed'):
+                app.allocate(spec, receipt, 8192, 4096)
+            birth.return_value = 5
+            signature.return_value = 'TYPE=ext4\nUUID=foreign\n'
+            with self.assertRaisesRegex(b.Blocked, 'foreign checklist backing'):
+                app.allocate(spec, receipt, 8192, 4096)
+            write.assert_not_called()
+            signature.return_value = f'TYPE=ext4\nUUID={fs_uuid}\n'
+            app.allocate(spec, receipt, 8192, 4096)
+            write.assert_called_once_with(receipt, d.record_text(current), expected=d.record_text(legacy))
+            allocate.assert_not_called()
+            self.assertEqual(extents.call_count, 2)
+            readback.assert_called_once()
+
+            birth.reset_mock()
+            record.return_value = current
+            node.st_dev = 52
+            app.allocate(spec, receipt, 8192, 4096)
+            birth.assert_not_called()
+            record.return_value = {**current, 'btrfs': {**stable, 'subvolume_id': 260}}
+            with self.assertRaisesRegex(b.Blocked, 'object identity changed'):
+                app.allocate(spec, receipt, 8192, 4096)
+
+    def test_btrfs_loop_requires_current_inode_and_full_unique_association(self):
+        app = d.Destination()
+        node = SimpleNamespace(st_dev=50, st_ino=2469)
+        row = {'name': '/dev/loop4', 'maj:min': '7:4', 'back-maj:min': '0:50', 'back-ino': 2469,
+               'offset': 0, 'sizelimit': 0, 'ro': False}
+        cases = ([row], [], [row, row], [{**row, 'back-ino': 2470}], [{**row, 'back-maj:min': '0:51'}],
+                 [{**row, 'offset': 4096}], [{**row, 'sizelimit': 4096}], [{**row, 'ro': True}])
+        with patch.object(app, 'run') as run:
+            for rows in cases:
+                with self.subTest(rows=rows):
+                    run.return_value = json.dumps({'loopdevices': rows})
+                    if rows == [row]:
+                        app.observe_btrfs_loop(Path(d.MANAGED_IMAGE), node, '/dev/loop4', '7:4')
+                    else:
+                        with self.assertRaisesRegex(b.Blocked, 'Btrfs backing'):
+                            app.observe_btrfs_loop(Path(d.MANAGED_IMAGE), node, '/dev/loop4', '7:4')
+
     def test_completed_transition_is_preserved_before_mounted_copy_and_unrelated_data_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

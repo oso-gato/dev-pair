@@ -311,11 +311,11 @@ class Destination(Bootstrap):
         if 'loop' in spec:
             self.managed_loop_unit(spec['loop'])
             dependencies = f'Requires={MANAGED_LOOP_SERVICE}\nAfter={MANAGED_LOOP_SERVICE}\n'
-        self.atomic('/etc/systemd/system/' + unit,
-                    '[Unit]\nDescription=Dedicated Dev-pair checklist storage\n'
-                    f'{dependencies}'
-                    f'[Mount]\nWhat={image}\nWhere={path}\nType=ext4\nOptions={loop},nodiscard,nodev,nosuid\n'
-                    '[Install]\nWantedBy=local-fs.target\n', mode=0o644)
+        header = '[Unit]\nDescription=Dedicated Dev-pair checklist storage\n'
+        mount_config = (f'[Mount]\nWhat={image}\nWhere={path}\nType=ext4\nOptions={loop},nodiscard,nodev,nosuid\n'
+                        '[Install]\nWantedBy=local-fs.target\n')
+        self.atomic('/etc/systemd/system/' + unit, header + dependencies + mount_config,
+                    mode=0o644, expected=header + mount_config if dependencies else None)
         self.run(SYSTEMCTL, 'daemon-reload', timeout=15)
         self.run(SYSTEMCTL, 'enable', '--now', unit, timeout=40)
         self.mount_observation(path, spec, max_inodes=max_inodes)
