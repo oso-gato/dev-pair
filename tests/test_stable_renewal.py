@@ -271,13 +271,14 @@ class StableContinuity(unittest.TestCase):
                       'affected_jobs': ['product'], 'reason': 'Deliberate reviewed stable update'}
         r.replace_json(self.fx.control / stable.OFFER, self.offer)
         r.replace_json(self.fx.control / 'site-current.json', self.fx.prior)
-        grant = {'target_release_sha256': self.target}
+        grant = {**self.offer, 'target_release_sha256': self.target}
         self.enterContext(patch.object(stable, 'binding', return_value=grant))
         self.enterContext(patch.object(stable, 'bound_request', return_value=grant))
         self.enterContext(patch.object(stable, 'active_request', side_effect=lambda _, approval: approval['request']))
         self.observer = Mock()
         self.observer.recover_request.return_value = None
         self.enterContext(patch.object(stable, 'access', return_value=self.observer))
+        self.boot_handoff = self.enterContext(patch.object(stable, 'BootHandoff')).return_value
         self.install = self.enterContext(patch.object(stable, 'reviewed_driver', return_value=self.controller.driver))
 
     def target_release(self):

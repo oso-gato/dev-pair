@@ -2,6 +2,7 @@
 import argparse
 from contextlib import contextmanager
 import fcntl
+import json
 import os
 from pathlib import Path
 import pwd
@@ -21,6 +22,11 @@ OFFER = 'offers/stable.json'
 REQUEST = 'requests/stable.json'
 POLICY = 'bootstrap/host-commissioning/automatic-policy.json'
 INSTALLED = Path('/usr/libexec/dev-pair/tools/stable_renewal.py')
+BOOT_HOLD = r.DEFAULT_ROOT / 'renewal/stable-boot-hold.json'
+RECOVERY_UNIT = 'dev-pair-renewal-recovery.service'
+RECONCILE_UNITS = tuple(f'dev-pair-renewal@{scope}.service' for scope in ('agent', 'devbox', 'host'))
+SYSTEMCTL = '/usr/bin/systemctl'
+LEGACY_RECOVERY = ('/usr/bin/python3', '-I', '/usr/libexec/dev-pair/tools/renewal.py', 'recover')
 FIELDS = ('schema operation machine_id previous_release_sha256 previous_platform_sha256 '
           'previous_base_platform_sha256 previous_base_intake_sha256 target_release_sha256 '
           'platform_sha256 intake_sha256 site_config_sha256 affected_jobs')
@@ -401,6 +407,126 @@ def prepare(controller, reason, *, source=None, run=None, platform=None, kit_sou
                         for name in sorted(previous) if previous[name] != replacement[name]}}
 
 
+class BootHandoff:
+    """Keep older installed controllers away from the approved stable journal."""
+
+    def __init__(self, controller, grant):
+        from bootstrap import Bootstrap
+        from commission_host import UNIT_ROOT
+
+        self.controller = controller
+        self.grant = grant
+        self.bundle = host_bundle(controller, grant)
+        self.app = Bootstrap(controller.root.parents[2])
+        self.marker = controller.control / BOOT_HOLD.name
+        self.unit_root = UNIT_ROOT + '/'
+        self.template = 'dev-pair-renewal@.service'
+        self.recovery, self.reconcile = (self.unit_root + name + '.d/90-dev-pair-stable-boot.conf'
+                                         for name in (RECOVERY_UNIT, self.template))
+        self.argv = ('/usr/bin/python3', '-EBs', str(self.bundle / 'tools/stable_renewal.py'),
+                     'boot-recover', '--platform-sha256', grant['platform_sha256'])
+        self.files = {self.recovery: ('[Service]\nExecStart=\nExecStart=' + ' '.join(self.argv) + '\n').encode(),
+                      self.reconcile: f'[Unit]\nConditionPathExists=!{BOOT_HOLD}\n'.encode()}
+
+    def system(self, *args, timeout=15):
+        return self.app.run(SYSTEMCTL, *args, timeout=timeout)
+
+    def read(self, name):
+        from systemd_service_profile import protected
+
+        path = self.app.path(name)
+        return protected(path, 0, 8192, mode=0o644) if os.path.lexists(path) else None
+
+    def confirm_files(self):
+        present = {}
+        for name, contents in self.files.items():
+            raw = self.read(name)
+            r.require(raw in (None, contents), 'foreign stable boot override preserved')
+            if raw is not None:
+                present[name] = raw
+        return present
+
+    def check_units(self, present):
+        from commission_host import workload_guard_command, workload_guard_files
+        from systemd_service_profile import PROPERTIES, exec_start_matches, manager_properties, observe
+
+        fields = ('Id', 'LoadState', 'FragmentPath', 'DropInPaths', 'ExecStart', 'User', 'Group', 'Type', *PROPERTIES)
+        ordinary = ' '.join(LEGACY_RECOVERY[:-1])
+        for unit in (RECOVERY_UNIT, *RECONCILE_UNITS):
+            recovery = unit == RECOVERY_UNIT
+            fragment = self.unit_root + (RECOVERY_UNIT if recovery else self.template)
+            scope = unit.partition('@')[2].removesuffix('.service')
+            expected_base = self.bundle / 'runtime/renewal' / Path(fragment).name
+            r.require(self.read(fragment) == s.protected_bytes(expected_base, 8192), 'foreign renewal service fragment preserved')
+            owned = {name for name in present if name.startswith(fragment + '.d/')}
+            command = ' '.join(self.argv if self.recovery in present else LEGACY_RECOVERY) if recovery else (
+                f'{ordinary} reconcile {scope} --check-candidate')
+            guard = ''
+            if not recovery:
+                ordering = fragment + '.d/80-dev-pair-commissioning.conf'
+                if self.read(ordering) is not None:
+                    expected = self.bundle / 'runtime/commissioning/dev-pair-renewal@.service.conf'
+                    r.require(self.read(ordering) == s.protected_bytes(expected, 8192), 'foreign renewal ordering override preserved')
+                    owned.add(ordering)
+            if scope == 'agent':
+                for name, (raw, _, _) in workload_guard_files(['agent-renewal']).items():
+                    if name.startswith(self.unit_root + unit + '.d/') and self.read(name) is not None:
+                        r.require(self.read(name) == raw, 'foreign renewal workload override preserved')
+                        owned.add(name)
+                        guard = workload_guard_command('agent-renewal')
+            row = manager_properties(self.system('show', '--all', '--property=' + ','.join(fields), unit), fields)
+            r.require(row['Id'] == unit and row['LoadState'] == 'loaded' and row['FragmentPath'] == fragment
+                      and (row['User'], row['Group'], row['Type']) in (('root', 'root', 'oneshot'), ('root', '', 'oneshot'))
+                      and exec_start_matches(row['ExecStart'], command), 'effective renewal service command differs')
+            if guard:
+                r.require(exec_start_matches(row['ExecCondition'], guard), 'effective renewal workload guard differs')
+                row = {**row, 'ExecCondition': ''}
+            observe(row, owned, self.app.path, self.app.run)
+            encoded = self.app.run('/usr/bin/busctl', '--json=short', 'get-property', 'org.freedesktop.systemd1',
+                                   '/org/freedesktop/systemd1/unit/' + re.sub(
+                                       r'[^a-zA-Z0-9]', lambda match: '_' + format(ord(match[0]), '02x'), unit),
+                                   'org.freedesktop.systemd1.Unit', 'Conditions', 'Asserts', timeout=10)
+            conditions, assertions = [json.loads(line) for line in encoded.splitlines()]
+            expected_condition = not recovery and self.reconcile in present
+            values = conditions['data']
+            r.require(conditions['type'] == assertions['type'] == 'a(sbbsi)' and assertions['data'] == []
+                      and (values == [] if not expected_condition else
+                           len(values) == 1 and len(values[0]) == 5 and
+                           values[0][:4] == ['ConditionPathExists', False, True, str(BOOT_HOLD)]),
+                      'effective renewal service condition differs')
+
+    def arm(self, approval):
+        present = self.confirm_files()
+        if present and not os.path.lexists(self.marker):
+            self.system('daemon-reload')
+        self.check_units(present)
+        if os.path.lexists(self.marker):
+            r.require(r.read_json(self.marker) == approval and present == self.files,
+                      'another protected stable boot handoff already exists')
+            return
+        for name, raw in self.files.items():
+            self.app.atomic(name, raw.decode(), mode=0o644)
+            self.app.run('/usr/sbin/restorecon', '-F', name, timeout=10)
+        self.system('daemon-reload')
+        r.require(self.confirm_files() == self.files, 'stable boot handoff files differ')
+        self.check_units(self.files)
+        r.replace_json(self.marker, approval)
+
+    def cleanup(self, approval=None):
+        present = self.confirm_files()
+        if os.path.lexists(self.marker):
+            r.require(r.read_json(self.marker) == approval, 'foreign stable boot hold preserved')
+            self.marker.unlink()
+            r.sync_directory(self.marker.parent)
+        for name in reversed(present):
+            r.require(self.read(name) == present[name], 'foreign stable boot override preserved')
+            path = self.app.path(name)
+            path.unlink()
+            r.sync_directory(path.parent)
+        if present:
+            self.system('daemon-reload')
+
+
 def apply(controller, operation, *, kit_source=None):
     with controller.lock():
         attempt, state = controller.transition()
@@ -410,7 +536,14 @@ def apply(controller, operation, *, kit_source=None):
             grant = bound_request(controller, state['request'])
             match_kit_bundle(controller, grant, kit_source)
             controller.driver = reviewed_driver(controller, grant)
-            return controller.resume(attempt, state)
+            approval = r.read_json(controller.control / REQUEST)
+            boot = BootHandoff(controller, grant)
+            approved_request(controller, approval)
+            boot.arm(approval)
+            result = controller.resume(attempt, state)
+            if result['phase'] in r.TERMINAL and not controller.unfinished_thaw(attempt, result):
+                boot.cleanup(approval)
+            return result
         offer = s.offer_record(r.read_json(controller.control / OFFER), SCOPE)
         r.require(offer['operation'] == operation, 'confirm the exact prepared stable maintenance window')
         grant = binding(controller, offer['platform_sha256'])
@@ -421,14 +554,23 @@ def apply(controller, operation, *, kit_source=None):
             r.require(controller.live_release() == target and r.read_json(controller.control / 'site-current.json') == target,
                       'completed stable window no longer selects the live release')
             controller.verify_driver('observe', state, target)
+            BootHandoff(controller, grant).cleanup(r.read_json(controller.control / REQUEST))
             return state
         access(controller).fresh(target, offer['previous_release_sha256'], operation)
         request = {'schema': 1, 'scope': SCOPE, 'operation': operation, 'previous_sha256': offer['previous_release_sha256'],
                    'target_sha256': target, 'affected_jobs': offer['affected_jobs'], 'reason': offer['reason']}
         approval = {'schema': 1, 'offer_sha256': r.identity(offer), 'request': request}
         active_request(controller, approval)
+        boot = BootHandoff(controller, grant)
+        boot.arm(approval)
         r.replace_json(controller.control / REQUEST, approval)
-    return controller.apply(SCOPE)
+    result = controller.apply(SCOPE)
+    if result['phase'] in r.TERMINAL:
+        with controller.lock():
+            attempt, state = controller.transition()
+            if state == result and not controller.unfinished_thaw(attempt, state):
+                boot.cleanup(approval)
+    return result
 
 
 def pending_review(observer):
@@ -585,6 +727,45 @@ def apply_with_access(controller, operation, *, kit_source=None):
     return apply(controller, operation, kit_source=kit_source)
 
 
+def boot_recover(controller, platform, *, deadline=None):
+    """Reopen only the interrupted approved maintenance window after restart."""
+    deadline = time.monotonic() + 45 * 60 if deadline is None else deadline
+    grant = binding(controller, platform)
+    boot = BootHandoff(controller, grant)
+    r.require(Path(__file__).absolute() == Path(boot.argv[2]), 'boot recovery must run the exact signed successor')
+    while True:
+        try:
+            with lease(controller):
+                with controller.lock():
+                    attempt, state = controller.transition()
+                    pending = state is not None and (state['phase'] not in r.TERMINAL or
+                                                      controller.unfinished_thaw(attempt, state))
+                    approval = r.read_json(boot.marker) if os.path.lexists(boot.marker) else None
+                    if approval is not None:
+                        request, _ = approved_request(controller, approval)
+                        r.require(request['operation'] == grant['operation'] and
+                                  request['target_sha256'] == grant['target_release_sha256'],
+                                  'boot recovery approval differs from the signed successor')
+                    if pending:
+                        r.require(approval is not None and state['request'] == request and
+                                  r.read_json(controller.control / REQUEST) == approval,
+                                  'the protected boot handoff does not authorize the active attempt')
+                        r.require(boot.confirm_files() == boot.files, 'the protected boot handoff is incomplete')
+                        boot.check_units(boot.files)
+                    else:
+                        boot.cleanup(approval)
+                        os.execv(LEGACY_RECOVERY[0], LEGACY_RECOVERY)
+                result = apply_with_access(controller, request['operation'])
+        except BlockingIOError:
+            result = {'phase': 'stable-boot-owner-in-progress', 'operation': grant['operation']}
+        waiting = result['phase'] in ('awaiting-independent-stable-access', 'stable-boot-owner-in-progress')
+        if not waiting and not (result['phase'] == 'verifying' and result.get('forward_access_pending')):
+            return result
+        if result.get('access_state') == 'stable-reviewer-trust-required' or time.monotonic() >= deadline:
+            return result
+        time.sleep(min(15, max(0, deadline - time.monotonic())))
+
+
 def named_access_probe(controller, grant, pending, role):
     from bootstrap import Bootstrap
 
@@ -616,6 +797,8 @@ def main():
     observation.add_argument('--role', required=True, choices=r.ROLES)
     activate = actions.add_parser('apply')
     activate.add_argument('--operation', required=True)
+    boot = actions.add_parser('boot-recover', help=argparse.SUPPRESS)
+    boot.add_argument('--platform-sha256', required=True)
     actions.add_parser('access-status', help='send or poll through the enrolled independent station')
     trust = actions.add_parser('reviewer-trust', help='pin the independently supplied stable review key')
     trust.add_argument('--fingerprint', required=True)
@@ -627,9 +810,14 @@ def main():
     try:
         r.require(os.getuid() == os.geteuid() == 0, 'stable renewal requires the authorized root maintenance terminal')
         os.umask(0o077)
-        confirm_kit_source(args.kit_source_sha)
+        if args.action != 'boot-recover':
+            confirm_kit_source(args.kit_source_sha)
         controller = r.Renewal(r.DEFAULT_ROOT, r.SiteDriver(r.DEFAULT_DRIVER), ledger_user=r.LEDGER_USER)
-        if args.action == 'reviewer-trust':
+        if args.action == 'boot-recover':
+            r.require(args.kit_source_sha is None, 'boot recovery requires the fixed signed package entry')
+            p.digest(args.platform_sha256)
+            result = boot_recover(controller, args.platform_sha256)
+        elif args.action == 'reviewer-trust':
             result = enroll_stable_reviewer(Bootstrap(), args.fingerprint, sys.stdin)
         elif args.action in ('prepare', 'apply'):
             with lease(controller):

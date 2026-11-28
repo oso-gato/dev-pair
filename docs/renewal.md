@@ -136,6 +136,17 @@ also find an already staged selected successor using its original Day 0 entry.
 For an earlier immutable kit without stable routing, keep it for the
 enrollment record and run the ordinary commands from the reviewed successor.
 
+Before the stable activation journal is published, the controller verifies the
+installed recovery services and hands boot recovery to the exact signed host
+bundle for that window. On restart, recovery resumes the recorded operation
+with its original job and session fence. It sends any required current-boot
+access request to the enrolled independent station and checks for the signed
+response for up to 45 minutes. The exact operation remains fenced while the
+response is pending. Use its ordinary pinned `apply` command to continue after
+the boot polling window or to use the offline handoff. The temporary service
+handoff is cleared after a verified thaw, and the regular recovery service and
+scheduled reconciliation return to their installed commands.
+
 ### Nightly and scoped manual operation
 
 The engineering schedule is `04:00 Asia/Tokyo`, with persistent missed-run handling. Enable `dev-pair-renewal-agent.timer` and `dev-pair-renewal-recovery.service` after the installation gates pass. The timer and operator use the same service, including candidate resolution. For an on-demand check, start `dev-pair-renewal@agent.service`. The separate deliberate release windows use `dev-pair-renewal@devbox.service` and `dev-pair-renewal@host.service`. These commands consume only approved requests and accept no executable input. The boot recovery service uses the same reconciliation logic and exact interrupted operation.
