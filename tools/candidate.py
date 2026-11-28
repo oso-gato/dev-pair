@@ -5,6 +5,7 @@ import hashlib
 import json
 import pathlib
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -25,6 +26,17 @@ DESTINATIONS = {'workspace': '/work/job', 'state': '/state/codex',
                 'cache': '/cache/job', 'credentials': '/run/secrets/codex'}
 BLOCKER = ('No validated Fedora 44 Distrobox confinement adapter exists. '
            'Normal Distrobox home/host integration is not an isolation boundary; execution denied.')
+# Fedora Coreutils 9.10 treats a timeout process with PID 1 as an orphaned
+# parent after it forks. Keep the shell alive and forward the OCI stop signal.
+OCI_TIMEOUT = (
+    'timeout_pid=; '
+    'stop_timeout() { trap "" TERM; '
+    'if [ -n "$timeout_pid" ]; then '
+    'kill -TERM "$timeout_pid" 2>/dev/null || :; wait "$timeout_pid" || exit "$?"; fi; '
+    'exit 143; }; '
+    'trap stop_timeout TERM; '
+    '/usr/bin/timeout --signal=TERM --kill-after=10s "$@" <&0 & '
+    'timeout_pid=$!; wait "$timeout_pid"')
 
 
 def require(condition, message):
@@ -99,9 +111,15 @@ def validate(m, fixture=False):
 
 
 def recipe(m):
-    # No package downloads, writable-home code, unpinned RUN installation or live patching.
+    package_upgrade = (
+        'dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 '
+        '--disablerepo="*" --enablerepo=fedora --enablerepo=updates upgrade; '
+        'mkdir -p /usr/lib/dev-pair; rpm -qa --qf "%{NEVRA}\\n" | sort > /usr/lib/dev-pair/base-rpms.txt; '
+        'dnf clean all')
+    package_step = ('RUN /bin/sh -ec ' + shlex.quote(OCI_TIMEOUT) +
+                    ' candidate-build 540s /bin/sh -ec ' + shlex.quote(package_upgrade) + '\n')
     return (f"FROM {m['fedora']['image']}\n"
-            + ('' if m['kind'] == 'fixture' else 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec \'dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 --disablerepo=\"*\" --enablerepo=fedora --enablerepo=updates upgrade; mkdir -p /usr/lib/dev-pair; rpm -qa --qf \"%{NEVRA}\\n\" | sort > /usr/lib/dev-pair/base-rpms.txt; dnf clean all\'\n')
+            + ('' if m['kind'] == 'fixture' else package_step)
             +
             f"LABEL org.opencontainers.image.revision={m['source_sha']}\n"
             f"LABEL dev-pair.standards={STANDARDS}\n"

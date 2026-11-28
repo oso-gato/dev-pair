@@ -5,6 +5,8 @@ import importlib.util
 import hashlib
 import json
 import pathlib
+import select
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -37,6 +39,41 @@ class PreparationTests(unittest.TestCase):
             self.assertEqual((self.root / 'a' / name).read_bytes(),
                              (self.root / 'b' / name).read_bytes())
         self.assertEqual(self.binary.read_bytes(), (self.root / 'a/codex').read_bytes())
+
+    def test_signed_package_recipe_keeps_timeout_as_a_bounded_child(self):
+        recipe = candidate.recipe({**self.m, 'kind': 'reviewed'}).decode()
+        command = shlex.split(recipe.splitlines()[1].removeprefix('RUN '))
+        self.assertEqual(command[:2], ['/bin/sh', '-ec'])
+        self.assertEqual(command[3:7], ['candidate-build', '540s', '/bin/sh', '-ec'])
+        self.assertNotIn('RUN ', candidate.recipe(self.m).decode())
+
+        parent = command[:2] + ['export ENTRY_PID=$$; ' + command[2], command[3]]
+        payload = ('import os, sys; '
+                   'assert os.getppid() != int(os.environ["ENTRY_PID"]); '
+                   'sys.exit(int(sys.argv[1]))')
+        for status in (0, 37):
+            result = subprocess.run([*parent, '3s', sys.executable, '-c', payload, str(status)],
+                                    capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, status, result.stderr)
+        expired = subprocess.run([*parent, '0.1s', '/usr/bin/sleep', '30'],
+                                 capture_output=True, timeout=3)
+        self.assertEqual(expired.returncode, 124)
+
+        with subprocess.Popen([*parent, '30s', '/bin/sh', '-ec', 'echo started; exec /usr/bin/sleep 30'],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            try:
+                self.assertTrue(select.select([process.stdout], [], [], 3)[0])
+                self.assertEqual(process.stdout.readline(), b'started\n')
+                process.terminate()
+                _, error = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 143, error)
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
 
     def test_adopted_pin_matches_docs_and_fixture_rejects_prior_pin_before_writes(self):
         standards_doc = (ROOT / 'STANDARDS.md').read_text()

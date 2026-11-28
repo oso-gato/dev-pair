@@ -81,7 +81,7 @@ DEVELOPMENT_TIMED_EXEC = (
     'case $end:$max:$now in *[!0-9:]*|:*|*::*|*:) exit 124;; esac; '
     'left=$((end - now - 1 - 10)); limit=$((max - 10)); '
     '[ "$left" -le "$limit" ] || left=$limit; [ "$left" -gt 0 ] || exit 124; '
-    'exec /usr/bin/timeout --signal=TERM --kill-after=10s "${left}s" "$@"')
+    'set -- "${left}s" "$@"; ' + candidate.OCI_TIMEOUT)
 ADAPTER_SOURCE_FILES = ('gptbox.py', 'gptbox_runtime.py', 'bootstrap.py', 'selinux_bootstrap.py',
                         'candidate.py', 'native_io.py', 'native_relay.py', 'fedora_oci.py',
                         'public_inputs.py', 'storage.py', 'storage_observation.py', 'selected_payload.py')
@@ -1481,7 +1481,8 @@ class Gptbox(Bootstrap):
             lines[1] = ('ARG DP_OCI_END\nRUN /bin/sh -ec ' + shlex.quote(DEVELOPMENT_TIMED_EXEC) +
                         ' development-build "$DP_OCI_END" 550 /bin/sh -ec ' + package_script)
         else:
-            lines[1] = 'RUN /usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec ' + package_script
+            lines[1] = ('RUN /bin/sh -ec ' + shlex.quote(candidate.OCI_TIMEOUT) +
+                        ' maintenance-build 540s /bin/sh -ec ' + package_script)
         recipe = '\n'.join(lines) + '\n'
         for name, data in {**files, 'inputs.json': input_bytes, 'Containerfile': recipe.encode()}.items():
             # Binary-safe atomic creation in a protected new build directory.

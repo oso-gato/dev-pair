@@ -6,6 +6,7 @@ import subprocess
 import json
 import os
 from pathlib import Path
+import shlex
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -253,7 +254,8 @@ class GptboxTests(unittest.TestCase):
         recipe = (self.engine.build / 'Containerfile').read_text()
         shell = next(line[4:] for line in recipe.splitlines() if line.startswith('RUN '))
         subprocess.run(['/bin/sh', '-n'], input=shell, text=True, check=True, capture_output=True)
-        self.assertIn('/usr/bin/timeout --signal=TERM --kill-after=10s 540s /bin/sh -ec', shell)
+        self.assertEqual(shlex.split(shell)[:7], ['/bin/sh', '-ec', g.candidate.OCI_TIMEOUT,
+                                                  'maintenance-build', '540s', '/bin/sh', '-ec'])
         self.assertIn('glibc-all-langpacks', shell)
         self.assertIn('dnf-plugins-core', shell)
         self.assertIn('test -d /usr/share/i18n/charmaps', shell)

@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 from types import SimpleNamespace
@@ -282,13 +283,14 @@ class DevelopmentImageTests(unittest.TestCase):
 
     def test_oci_entry_guard_rejects_expired_or_zero_payload_before_dispatch(self):
         uptime = int(Path('/proc/uptime').read_text().split()[0].split('.')[0])
-        command = ['/bin/sh', '-ec', g.DEVELOPMENT_TIMED_EXEC, 'fixture']
+        command = ['/bin/sh', '-ec', 'export ENTRY_PID=$$; ' + g.DEVELOPMENT_TIMED_EXEC, 'fixture']
         for end, ceiling in ((uptime, 550), (uptime + 30, 0), (uptime + 30, 10)):
             result = subprocess.run([*command, str(end), str(ceiling), '/bin/sh', '-c', 'printf forbidden'],
                                     capture_output=True, check=False, timeout=3)
             self.assertEqual(result.returncode, 124)
             self.assertEqual(result.stdout, b'')
-        result = subprocess.run([*command, str(uptime + 30), '15', '/bin/sh', '-c', 'printf allowed'],
+        payload = ('import os; assert os.getppid() != int(os.environ["ENTRY_PID"]); print("allowed", end="")')
+        result = subprocess.run([*command, str(uptime + 30), '15', sys.executable, '-c', payload],
                                 capture_output=True, check=True, timeout=3)
         self.assertEqual(result.stdout, b'allowed')
 
