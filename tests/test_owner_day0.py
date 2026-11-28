@@ -55,8 +55,88 @@ class DayZeroTests(unittest.TestCase):
         self.assertIn('Checklist cleanup is scheduled.', details)
         self.assertIn('Agent renewal is held pending release read custody.', details)
         self.assertIn('Owner intake is held pending owner catalogue selection.', details)
-        self.assertIn('/usr/libexec/dev-pair/tools/owner_intake.py --setup-site.', details)
+        self.assertIn('Run ./day0.sh resume to continue first owner setup.', details)
         self.assertNotIn('terminal is available', details)
+
+    def test_resume_uses_single_pinned_source_for_core_roles_and_owner_setup(self):
+        tool = self.entry.repo / 'tools/commission_host.py'
+        tool.parent.mkdir(parents=True)
+        tool.touch()
+        stage = self.entry.stage = Mock()
+        self.entry.original = Mock(return_value=self.identity)
+        self.entry.ensure_git = Mock(return_value=SOURCE)
+        self.entry.resume_maintenance = Mock(return_value=True)
+        self.entry.enroll = Mock(return_value=True)
+        self.entry.receiving_access = Mock(side_effect=[False, True, True])
+        self.entry.setup_owner = Mock(return_value=True)
+        self.entry.app.status.return_value = {'prepared': True, 'phase': 'temporary-bootstrap'}
+        self.entry.app.verify_workload_access.side_effect = bootstrap.Blocked('independent role receipt pending')
+        selected = '1' * 64
+        ready = {'phase': 'ready', 'selected_release': selected}
+        self.entry.commission_apply = Mock(side_effect=[
+            {**ready, 'pending_features': {'owner-intake': 'workload-access'}},
+            {**ready, 'pending_features': {'owner-intake': 'owner-catalogue-selection'}},
+            {**ready, 'owner_terminal': '/usr/local/bin/dev-pair'},
+        ])
+        previous = {'machine_id': MACHINE, 'source_sha': SOURCE}
+
+        def current(path):
+            return {'desired.json': {'gptbox_context_sha256': '2' * 64}, 'progress.json': previous}.get(path.name)
+
+        tty = object()
+        with (patch.object(day, 'record', side_effect=current),
+              patch.object(day, 'kit_source', return_value=(SOURCE, True)),
+              patch.object(self.entry, 'owner_lock', side_effect=nullcontext)):
+            self.entry.start(None, tty)
+            self.entry.commission_apply.assert_not_called()
+            self.entry.setup_owner.assert_not_called()
+            self.entry.start(None, tty)
+        self.assertEqual(
+            [(item.args, item.kwargs) for item in self.entry.receiving_access.call_args_list],
+            [((SOURCE, SOURCE, tty), {}), ((SOURCE, SOURCE, tty), {}),
+             ((SOURCE, SOURCE, tty), {'workload': True})],
+        )
+        self.assertEqual([item.args for item in self.entry.commission_apply.call_args_list], [(SOURCE, tty)] * 3)
+        self.entry.setup_owner.assert_called_once_with(tty)
+        self.assertEqual(stage.call_args.args[2], 'owner-terminal-ready')
+
+    def test_station_response_may_resume_checked_recovery_but_cannot_select_another_scope(self):
+        from destination_observation import access_envelope
+
+        envelope = access_envelope(b'fixed fixture receipt', b'fixture signature')
+        signed = {'kind': bootstrap.CORE_ACCESS_CUTOVER, 'source_sha': SOURCE, 'boot_id': BOOT,
+                  'execution_route': 'provider-recovery'}
+        self.entry.app.signed_evidence.return_value = signed
+        history = {'phase': 'applying', 'intent': {'claims': {'boot_id': 'earlier boot', 'execution_route': 'tailnet-core'}}}
+        with patch.object(day, 'STATE', self.directory), patch.object(day, 'record', return_value=history):
+            with self.assertRaisesRegex(bootstrap.Blocked, 'different access stage'):
+                self.entry.apply_access(SOURCE, SOURCE, io.BytesIO(envelope), workload=True)
+            self.entry.app.finalize.assert_not_called()
+            self.entry.apply_access(SOURCE, '3' * 40, io.BytesIO(envelope), workload=False)
+        self.assertEqual(self.entry.app.finalize.call_args.kwargs, {'recover': True, 'previous_source': '3' * 40})
+
+    def test_attended_trust_preserves_other_protected_signers_and_reuses_the_access_key(self):
+        target = self.directory / 'allowed_signers'
+        signing_key = self.directory / 'review'
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-N', '', '-t', 'ed25519', '-f', str(signing_key)],
+                       check=True, timeout=5, capture_output=True)
+        public = signing_key.with_suffix('.pub').read_text()
+        old = '# protected authority from the provider\n'
+        target.write_text(old)
+        target.chmod(0o640)
+
+        def write(path, content, *, mode, expected):
+            self.assertEqual((path, mode, expected), (str(target), 0o640, old))
+            target.write_text(content)
+
+        self.entry.app.atomic.side_effect = write
+        with patch.object(day, 'TRUST_SIGNERS', str(target)), patch.object(day, 'answer', return_value=public) as prompt:
+            self.assertTrue(self.entry.access_trust(None))
+            self.assertTrue(self.entry.access_trust(None))
+        prompt.assert_called_once()
+        self.entry.app.atomic.assert_called_once()
+        self.assertEqual(target.read_text(), old + 'dev-pair-access-review namespaces="dev-pair-destination" ' +
+                         ' '.join(public.split()[:2]) + '\n')
 
     def test_gitless_kit_verification_and_signed_prerequisite(self):
         repo = self.entry.repo

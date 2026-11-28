@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager
 import fcntl
 import getpass
 from hashlib import file_digest, sha256
+import io
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,7 +20,8 @@ import tempfile
 import time
 import warnings
 
-from bootstrap import ATTENDED_ACCESS, ATTENDED_RECEIPT, Blocked, Bootstrap, STATE as BOOTSTRAP, TRUST_SIGNERS
+from bootstrap import (ATTENDED_ACCESS, ATTENDED_RECEIPT, Blocked, Bootstrap, CORE_ACCESS_CUTOVER, CUTOVER,
+                       STATE as BOOTSTRAP, TRUST_SIGNERS, WORKLOAD_ACCESS_CUTOVER)
 
 REPO = Path(__file__).resolve().parents[1]
 STATE = Path('/var/lib/dev-pair-day0')
@@ -27,6 +29,10 @@ HANDOFF = Path('/etc/dev-pair/day0')
 ROOT = Path('/var/lib/dev-pair')
 GIT = Path('/usr/bin/git')
 OWNER_KITS = Path('/root')
+OWNER_CATALOGUE = Path('/etc/dev-pair/product-intake/repositories.json')
+OWNER_SETUP = Path('/usr/libexec/dev-pair/tools/owner_intake.py')
+# OpenSSH match-principals returns SSH_ERR_KEY_NOT_FOUND when none matched.
+NO_MATCHING_PRINCIPAL = 210
 INITIAL_MAINTENANCE_SOURCE = 'a160b1c1724fb70d38d9992ad377ab791b2db0ee'
 INITIAL_MAINTENANCE_PRODUCTION_TREE = 'a0f038de4d44844a743d338998ca14deee4ac3cc08fea9ef53db85d7d466c595'
 MIB = 1024**2
@@ -496,7 +502,83 @@ class DayZero:
             self.app.enroll(None, tailnet, browser=browser)
         return True
 
-    def finalize(self):
+    def access_trust(self, tty):
+        from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL, key
+
+        path = Path(TRUST_SIGNERS)
+        current = None
+        if os.path.lexists(path):
+            path = local_file(path)
+            info = path.stat()
+            require(info.st_size <= 16384, 'The protected access trust file exceeds its bound.')
+            matched = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'match-principals', '-I', ACCESS_PRINCIPAL,
+                                      '-f', str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, env=ENV, timeout=10, check=False)
+            if matched.returncode == 0:
+                return True
+            require(matched.returncode == NO_MATCHING_PRINCIPAL, 'The protected access trust file could not be checked.')
+            current = path.read_text(encoding='utf-8')
+        public = answer(tty, 'Paste the access-review signing public key supplied by the independent verifier, or press Enter to defer.')
+        if not public:
+            return False
+        public = key(public, hardware=True)
+        entry = f'{ACCESS_PRINCIPAL} namespaces="{ACCESS_NAMESPACE}" {public}\n'
+        before = current or ''
+        if before and not before.endswith('\n'):
+            before += '\n'
+        require(len((before + entry).encode()) <= 16384, 'The protected access trust file would exceed its bound.')
+        self.app.atomic(str(path), before + entry, mode=stat.S_IMODE(info.st_mode) if current is not None else 0o600,
+                        expected=current)
+        return True
+
+    def access_station(self, tty):
+        from day0_access_exchange import configuration, configure, identity_public, key
+
+        if configuration() is not None:
+            return True
+        host = answer(tty, 'Independent verifier station Tailscale IP, or press Enter to keep access review offline.')
+        if not host:
+            return False
+        account = answer(tty, 'Independent station’s dedicated access transport account.')
+        host_key = key(answer(tty, 'Paste the independent station’s SSH host public key from its operator.'))
+        signers = local_file(Path(TRUST_SIGNERS)).read_text(encoding='utf-8')
+        require(host_key.split()[1] not in signers.split(), 'The SSH host key must be separate from access signing keys.')
+        configure(self.app, host, account, host_key)
+        print('The independent station operator admits this request transport public key for the selected VPS.', flush=True)
+        print(identity_public(self.app), flush=True)
+        return True
+
+    def receiving_access(self, revision, historical, tty, *, workload=False):
+        from day0_access_exchange import ExchangeUnavailable, exchange, public_identity
+        from destination_observation import encoding
+
+        scope = 'workload' if workload else 'named administrator'
+        if not self.access_trust(tty):
+            print('Independent access review requires the verifier’s signing public key.', flush=True)
+            return False
+        if not self.access_station(tty):
+            option = ' --workloads' if workload else ''
+            print(f'Offline access handoff is available through ./day0.sh access-request{option} and ./day0.sh access-response.',
+                  flush=True)
+            return False
+        request = encoding(self.app.access_cutover_binding(revision, workload=workload))
+        try:
+            response = exchange(request)
+        except ExchangeUnavailable as wait:
+            print(str(wait), flush=True)
+            print('The verifier station operator can check access using this transport public key.', flush=True)
+            print(public_identity(), flush=True)
+            return False
+        if response is None:
+            receipt_id = sha256(request).hexdigest()
+            print(f'Independent {scope} access review requested. Keep the provider recovery route available.', flush=True)
+            print(f'Request {receipt_id} is at the independent station. Run ./day0.sh resume after review.', flush=True)
+            return False
+        self.apply_access(revision, historical, io.BytesIO(response), workload=workload)
+        print(f'Independent {scope} access review accepted.', flush=True)
+        return True
+
+    def finalize(self, revision, historical, tty):
         if self.app.status()['phase'] == 'tailnet-only':
             self.app.refresh_workload_gate()
             return True
@@ -504,9 +586,7 @@ class DayZero:
         if os.path.lexists(admitted):
             self.app.finalize(str(admitted))
             return True
-        print('Independent access review still needs named tailnet and provider vantage points.')
-        print('Use ./day0.sh access-request to export the live host selection to the independent verifier.')
-        return False
+        return self.receiving_access(revision, historical, tty)
 
     @contextmanager
     def owner_lock(self):
@@ -582,8 +662,31 @@ class DayZero:
         self.progress = STATE / 'continuation-progress.json'
         return historical, image
 
+    def apply_access(self, revision, historical, response, *, workload=None, recover=False):
+        from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL
+        from destination_observation import read_access_envelope
+
+        payload, signature = read_access_envelope(response)
+        # The operator/import path and the station use the same native verifier.
+        with tempfile.TemporaryDirectory(prefix='cutover-', dir=STATE) as temporary:
+            document = Path(temporary) / 'receipt.json'
+            document.write_bytes(payload)
+            document.with_name('receipt.json.sig').write_bytes(signature)
+            if workload is not None:
+                signed = self.app.signed_evidence(str(document), ACCESS_PRINCIPAL, ACCESS_NAMESPACE)
+                expected_kind = WORKLOAD_ACCESS_CUTOVER if workload else CORE_ACCESS_CUTOVER
+                require(signed.get('kind') == expected_kind and signed.get('source_sha') == revision,
+                        'The verifier’s response is for a different access stage or source.')
+                if not workload:
+                    history = record(Path(CUTOVER))
+                    if history and history['phase'] == 'applying' and signed.get('execution_route') == 'provider-recovery':
+                        claims = (history.get('intent') or {}).get('claims', {})
+                        recover = any(claims.get(field) != signed.get(field) for field in ('boot_id', 'execution_route'))
+            return self.app.finalize(str(document), recover=recover,
+                                     previous_source=historical if historical != revision else None)
+
     def access_exchange(self, source, response=None, *, workload=False, role=None, recover=False):
-        from destination_observation import encoding, read_access_envelope
+        from destination_observation import encoding
 
         revision, archive = kit_source(self.repo, source)
         identity = self.original()
@@ -607,25 +710,44 @@ class DayZero:
             if response is None:
                 sys.stdout.buffer.write(encoding(self.app.access_cutover_binding(revision, workload=workload)))
                 return
-            payload, signature = read_access_envelope(response)
-            # A verified signed pair is one bounded envelope in the transport.
-            # The bootstrap verifier checks the exact bytes again under its lock.
-            with tempfile.TemporaryDirectory(prefix='cutover-', dir=STATE) as temporary:
-                document = Path(temporary) / 'receipt.json'
-                document.write_bytes(payload)
-                document.with_name('receipt.json.sig').write_bytes(signature)
-                completed = self.app.finalize(str(document), recover=recover,
-                                              previous_source=historical if historical != revision else None)
+            completed = self.apply_access(revision, historical, response, recover=recover)
             message = ('Named core access is tailnet-only. Independent workload access remains held.'
                        if completed['access_scope'] == 'core' else 'The independent access review is accepted.')
             self.stage(identity, revision, 'access-cutover-complete', message + ' Run ./day0.sh resume to continue.')
 
-    def commission(self, identity, revision):
+    def setup_owner(self, tty):
+        if answer(tty, 'Set up the first owner job now? [Y/n]').lower() not in ('', 'y', 'yes'):
+            return False
+        script = local_file(OWNER_SETUP)
+        print('Preparing the first owner setup in this terminal.', flush=True)
+        result = subprocess.run(['/usr/bin/python3', '-IB', str(script), '--setup-site'], env=ENV,
+                                stdin=tty.incoming, stdout=tty.outgoing, stderr=tty.outgoing,
+                                timeout=1800, check=False)
+        require(result.returncode == 0, 'First owner setup paused. Run ./day0.sh resume to continue.')
+        return os.path.lexists(OWNER_CATALOGUE)
+
+    def commission_apply(self, revision, tty):
+        return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
+
+    def commission(self, identity, revision, historical=None, tty=None):
         self.stage(identity, revision, 'host-bootstrap-complete',
-                   'Confined maintenance gptbox and both offline probes verified. Workloads require an independently approved release and site.')
+                   'Checking the independently approved release and private site.')
         if not (self.repo / 'tools/commission_host.py').is_file():
             return
-        observed = self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
+        observed = self.commission_apply(revision, tty)
+        if tty is not None and observed.get('phase') == 'ready':
+            pending = observed.get('pending_features', {}).get('owner-intake')
+            if pending == 'workload-access':
+                try:
+                    proof = self.app.verify_workload_access()
+                except Blocked:
+                    proof = {}
+                if (proof.get('role_artifacts', {}).get('release_sha256') != observed['selected_release'] and
+                        self.receiving_access(revision, historical, tty, workload=True)):
+                    observed = self.commission_apply(revision, tty)
+            if (observed.get('pending_features', {}).get('owner-intake') == 'owner-catalogue-selection' and
+                    self.setup_owner(tty)):
+                observed = self.commission_apply(revision, tty)
         phase = observed.get('phase', 'unknown')
         if phase in ('pending', 'source-gap'):
             self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
@@ -641,8 +763,7 @@ class DayZero:
             for name, reason in sorted(pending.items()):
                 lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
                 if name == 'owner-intake' and reason == 'owner-catalogue-selection':
-                    lines.append('Set up the first owner slot with /usr/bin/python3 -IB '
-                                 '/usr/libexec/dev-pair/tools/owner_intake.py --setup-site.')
+                    lines.append('Run ./day0.sh resume to continue first owner setup.')
             if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
                 lines.append('Owner jobs remain held.')
             for units in observed.get('retained_services', {}).values():
@@ -654,8 +775,8 @@ class DayZero:
                 lines.append('The named core tailnet terminal is available for approved jobs.')
                 stage = 'owner-terminal-ready'
             else:
-                if self.app.status().get('access_scope') == 'core':
-                    lines.append('Export ./day0.sh access-request --workloads for independent role checks.')
+                if pending.get('owner-intake') == 'workload-access':
+                    lines.append('Run ./day0.sh resume after independent workload access review.')
                 stage = 'managed-listener-ready'
             self.stage(identity, revision, stage, ' '.join(lines))
         else:
@@ -702,16 +823,16 @@ class DayZero:
             if report.get('phase') != 'tailnet-only':
                 self.app.publish_workload_gate('held')
             self.stage(identity, revision, 'host-bootstrap-complete',
-                       'The confined maintenance gptbox passed both offline probe cycles. Workloads remain held.')
+                       'The confined maintenance gptbox passed both offline probe cycles.')
             if not self.enroll(tty):
                 self.stage(identity, revision, 'host-bootstrap-complete',
                            'Maintenance gptbox verified. Run ./day0.sh resume to enroll Tailscale when ready.')
                 return
-            if not self.finalize():
+            if not self.finalize(revision, historical, tty):
                 self.stage(identity, revision, 'host-bootstrap-complete',
-                           'Maintenance gptbox and tailnet enrollment are verified. Independent access handoff and workload activation remain pending.')
+                           'Maintenance gptbox and tailnet enrollment are verified. Run ./day0.sh resume to continue independent access review.')
                 return
-            self.commission(identity, revision)
+            self.commission(identity, revision, historical, tty)
 
 
 def main():
