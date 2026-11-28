@@ -14,21 +14,21 @@ identity programmatically. The owner uses the same front-door resume command
 when the protected installation settles.
 
 The controller reuses a single eligible full platform already in protected
-intake. When intake is empty, attended resume enrolls the independent release
-custodian's handoff and protected GitHub read identity. The custodian uses
+intake. Day 0 uses the independent release custodian’s handoff when selecting
+the approved merge before fresh setup. When intake is empty, attended resume
+reuses that handoff and enrols the protected GitHub read identity. The custodian uses
 `tools/release_setup.py prepare --help` in their own verified checkout to see
 the required exact source, selected machine, GitHub roles and independently
 verified checklist base inputs. They convey the resulting protected handoff and
-its SHA-256 separately. On the host, give `./day0.sh resume` the handoff path,
-its SHA-256 and the scoped GitHub read token when prompted. The independently
+its SHA-256 separately. When commissioning prompts for GitHub custody, enter
+the scoped GitHub read token in the hidden prompt. The independently
 administered branch, required check, reviewer and protected publication
 controls must already be in effect. [Platform publication](platform-release.md#independent-release-authority)
 
 Intake acquires a signed full publication for the exact source from protected
 `main`. The signed host bundle binds the fixed installation manifest, and the
-authenticated source checkout binds the fixed checklist recipe. A draft source
-kit can complete standalone setup. Full commissioning waits for the separately
-authorized and eligible signed publication.
+authenticated source checkout binds the fixed checklist recipe. Commissioning
+waits for the separately authorized and eligible signed publication.
 
 The controller reuses an approved site profile for the inspected host. On a
 fresh installation, it derives the first host and site profiles from the

@@ -12,9 +12,9 @@ It asks for the named `core` password in the terminal with echo disabled.
 
 <a id="dr11-2"></a>
 **DR11.2** Start from the separately verified [offline source kit](docs/owner-day0.md#optional-offline-source-kit).
-When the exact reviewed source is available through GitHub, the command below
-also fetches it into a protected checkout and opens the installer prompts.
-Use the full reviewed commit provided with the delivery in place of
+When the exact reviewed seed is available through GitHub, the command below
+fetches it into a protected checkout and opens the installer prompts.
+Use the full reviewed seed commit provided with the delivery in place of
 `REPLACE_WITH_REVIEWED_COMMIT`.
 
 ```sh
@@ -66,12 +66,16 @@ leaving the network name blank. Keep the original access route until independent
 recovery and tailnet-only SSH have been verified.
 
 <a id="dr11-4"></a>
-**DR11.4** Keep this checkout for the entire fresh installation. After the offline
-maintenance checks, the same `./day0.sh resume` continues independent access review,
-protected commissioning and first owner setup. Source is delivered as a draft. Full
-commissioning requires a separately authorized signed publication from protected `main`
-for the exact source. The complete native owner journey and independent observations on
-the selected VPS still require verification. [Day-zero operations](docs/owner-day0.md)
+**DR11.4** Keep the delivered checkout for the entire fresh installation. Before
+managed setup begins, the installer displays the selected machine ID and asks
+for the independent first-release handoff and its separately conveyed SHA-256.
+It verifies the approved merge on protected `main`, checks that its full Git
+tree and file modes match the delivered seed and protects the production checkout.
+If the handoff is pending, run `./day0.sh resume` when it arrives. The same
+launcher uses the selected source for access review, commissioning and owner
+setup. Commissioning verifies the separately authorized signed publication for
+that exact commit. The complete native owner journey and independent observations
+on the selected VPS still require verification. [Day-zero operations](docs/owner-day0.md)
 · [Compatibility for an existing November 27 installation](docs/owner-day0.md#previously-installed-november-27-bootstrap)
 
 <a id="dr0"></a>

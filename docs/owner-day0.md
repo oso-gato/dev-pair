@@ -1,9 +1,9 @@
 # Day-zero operations from hPanel
 
 Open the selected Fedora 44 VPS root terminal in hPanel and keep an independent
-provider recovery session available. Start from the exact reviewed draft source
+provider recovery session available. Start from the exact reviewed seed
 using the [source kit](#optional-offline-source-kit) or the [README acquisition command](../README.md#dr11-2).
-Use the same checkout throughout fresh setup.
+Keep using that launcher throughout fresh setup.
 
 ```sh
 ./day0.sh start
@@ -16,6 +16,19 @@ Run `start` once to open setup. Run `status` to see the recorded phase and
 prompt requires a controlling TTY, reopen an interactive root terminal and run
 `resume`. The installer uses a local pseudo-terminal when available and discards
 its transcript.
+
+Before managed setup, Day 0 displays the machine ID and asks for the release
+custodian’s first-release handoff path and its separately conveyed SHA-256.
+If the custodian is still preparing the handoff, press Enter and resume when it
+arrives. Supply the independently issued file through a root-private local
+path. It binds this machine to the exact reviewed pull request and its approved
+merge on protected `main`. Day 0 checks the complete reviewed tree and executable
+modes against the approved merge and stages it in a protected checkout. It
+records that commit once and uses it on subsequent commands from the original
+launcher. The separately authorized signed full publication must match the
+recorded commit. If protected `main` has advanced and release verification holds
+that commit, keep the existing checkout and state for independently authorized
+resolution. [First-release authority](host-commissioning.md)
 
 ## Resume and recovery
 
@@ -63,12 +76,10 @@ provider terminal. Run `./day0.sh access-response --recover-cutover < ../signed-
 there. The installer preserves the previous journal and current ingress
 restrictions and holds workloads for their separate access review.
 
-Protected commissioning requires an independently authorized, signed full
-platform publication for the exact source. At the release prompt, supply the
-custodian's protected handoff path and separately conveyed SHA-256. When asked,
-enter the scoped GitHub read token at the hidden prompt. A draft checkout or
-kit can reach this point before protected publication. Resume when the eligible
-signed publication is available. [Host commissioning](host-commissioning.md)
+Protected commissioning reuses the first-release handoff and verifies an
+independently authorized signed full platform publication for the exact source.
+When asked, enter the scoped GitHub read token at the hidden prompt. Resume
+when the eligible signed publication is available. [Host commissioning](host-commissioning.md)
 
 After commissioning installs the role images, `resume` uses the same station
 for a separate signed review of both roles and the selected DevBox placement.
@@ -139,5 +150,12 @@ In the protected hPanel root directory, verify it against the SHA-256 conveyed
 separately by the reviewer. Unpack it into a fresh directory, check
 `MANIFEST.sha256`, enter the enclosed `dev-pair` checkout and run `./day0.sh start`.
 The installer verifies the kit again before installing the signed Fedora Git
-prerequisite, then checks the full checkout commit. Public-input verification
-and Tailscale use their normal network services after source acquisition.
+prerequisite, then checks the full checkout commit. Production selection uses
+GitHub to confirm the approved source and fetch the merge commit when needed.
+Public-input verification and Tailscale use their normal network services.
+
+Use `./day0.sh start --draft-evaluation` only for deliberate evaluation in an
+isolated development host. It pins the evaluation source under the existing
+bootstrap rules. A host with evaluation progress must keep its original pinned
+checkout and journals for recovery. Start production on a virgin host with the
+independently issued release handoff.

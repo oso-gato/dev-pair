@@ -1,6 +1,6 @@
 """Owner-run start, status and resume for the reviewed hPanel bootstrap."""
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import fcntl
 import getpass
 from hashlib import file_digest, sha256
@@ -237,6 +237,68 @@ class DayZero:
                             '--disablerepo=*', '--enablerepo=fedora', '--enablerepo=updates', 'install', 'git-core'],
                            env=ENV, stdin=subprocess.DEVNULL, timeout=420, check=True)
         return self.app.destination_source(revision)
+
+    def production_entry(self, source, tty=None, *, draft=False):
+        from day0_source import (SOURCE_NAME, confirm_checkout, confirm_main, handoff, reviewed_seed,
+                                 production_checkout, stage_checkout, verified_tree)
+        from release_setup import private_publish
+
+        authority = STATE / SOURCE_NAME
+        previous = record(STATE / 'progress.json')
+        native = tuple(Path(BOOTSTRAP) / name for name in ('desired.json', 'initialize.json', 'host-ready.json'))
+
+        def retained():
+            machine = self.app.destination_identity()['machine_id']
+            _, grant = handoff(authority, machine)
+            revision, _ = kit_source(self.repo, source)
+            require(not draft, 'This host already has an independently approved production source.')
+            if previous is not None and revision not in (grant['review']['review_head'], grant['source_sha']):
+                # Historical continuation and deliberately selected stable successors still use their own checks.
+                return self.repo, source
+            reviewed_seed(grant, revision)
+            checkout = production_checkout(OWNER_KITS, grant['source_sha'])
+            original_tree = verified_tree(self.repo, revision, grant['review']['source_tree']) if checkout != self.repo else None
+            confirm_checkout(OWNER_KITS, grant, original_tree)
+            return checkout, grant['source_sha']
+
+        if os.path.lexists(authority):
+            return retained()
+        if previous is not None:
+            return self.repo, source
+        require(not any(map(os.path.lexists, native)),
+                'This host already has managed bootstrap evidence. Use its original pinned checkout and protected recovery entry.')
+        if draft:
+            return self.repo, source
+        if tty is None:
+            return None
+
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        print(f"Selected host {identity['host']} | machine {identity['machine_id']} | Fedora 44 x86_64.", flush=True)
+        supplied = answer(tty, 'Enter the independent first-release handoff’s protected absolute path, or press Enter to wait.')
+        if not supplied:
+            return None
+        digest = answer(tty, 'Enter the SHA-256 received separately from the release custodian, or press Enter to wait.')
+        if not digest:
+            return None
+        raw, grant = handoff(Path(supplied), identity['machine_id'], pin(digest))
+        reviewed_seed(grant, revision)
+        with self.owner_lock():
+            if os.path.lexists(authority):
+                require(handoff(authority, identity['machine_id'])[0] == raw,
+                        'Another exact independently approved source is already selected on this host.')
+                return retained()
+            require(record(STATE / 'progress.json') is None and not any(map(os.path.lexists, native)),
+                    'This host began setup under a different source. Use its original pinned checkout.')
+            self.ensure_git(revision, archive)
+            seed_tree = verified_tree(self.repo, revision, grant['review']['source_tree'])
+            target = grant['source_sha']
+            confirm_main(target)
+            checkout = stage_checkout(OWNER_KITS, grant, seed_tree)
+            confirm_main(target)
+            private_publish(authority, raw)
+        print(f'Independently approved production source {target} selected.', flush=True)
+        return checkout, target
 
     def transport(self, tty, identity, revision):
         saved = record(STATE / 'transport.json')
@@ -908,19 +970,30 @@ class DayZero:
             return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
 
         observed = apply()
-        if tty is None or observed.get('phase') != 'pending':
+        if observed.get('phase') != 'pending':
             return observed
         if observed.get('prerequisite') == 'release-trust':
-            handoff = answer(tty, 'Enter the absolute path to the release custodian’s handoff, or press Enter to wait.')
-            if not handoff:
-                return observed
-            digest = answer(tty, 'Enter the SHA-256 received separately from the independent release custodian, or press Enter to wait.')
-            if not digest:
-                return observed
+            from day0_source import SOURCE_NAME, handoff as checked_handoff
+
+            retained = STATE / SOURCE_NAME
+            if os.path.lexists(retained):
+                raw, grant = checked_handoff(retained, self.app.destination_identity()['machine_id'])
+                require(grant['source_sha'] == revision,
+                        'Protected commissioning must use the independently approved production source.')
+                handoff, digest = retained, sha256(raw).hexdigest()
+            else:
+                if tty is None:
+                    return observed
+                handoff = answer(tty, 'Enter the absolute path to the release custodian’s handoff, or press Enter to wait.')
+                if not handoff:
+                    return observed
+                digest = answer(tty, 'Enter the SHA-256 received separately from the independent release custodian, or press Enter to wait.')
+                if not digest:
+                    return observed
             self.call('release_setup.py', 'install', '--source-sha', revision,
                       '--handoff', handoff, '--sha256', pin(digest), timeout=120)
             observed = apply()
-        if observed.get('phase') == 'pending' and observed.get('prerequisite') == 'release-read-custody':
+        if tty is not None and observed.get('phase') == 'pending' and observed.get('prerequisite') == 'release-read-custody':
             token = secret_answer(tty, 'Paste the approved read-only GitHub token, or press Enter to wait.')
             if token:
                 with secret_file(token) as credential:
@@ -1070,11 +1143,12 @@ class DayZero:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('stage', choices=('start', 'status', 'resume', 'access-request', 'access-response', 'access-probe',
                                          'observer-trust'))
     parser.add_argument('role', nargs='?', choices=('maintenance', 'development'))
     parser.add_argument('--source-sha')
+    parser.add_argument('--draft-evaluation', action='store_true', help='evaluate exact draft source on an isolated development host')
     parser.add_argument('--confirm-recovery', action='store_true')
     parser.add_argument('--workloads', action='store_true')
     parser.add_argument('--recover-cutover', action='store_true')
@@ -1090,25 +1164,44 @@ def main():
         require((args.role is not None) == (args.stage == 'access-probe') and
                 (not args.workloads or args.stage == 'access-request') and
                 (not args.recover_cutover or args.stage == 'access-response') and
-                (not args.revoke or args.stage == 'observer-trust'),
+                (not args.revoke or args.stage == 'observer-trust') and
+                (not args.confirm_recovery or args.stage == 'resume'),
                 'Select the exact access request, response or fixed role probe.')
         os.umask(0o077)
         day0 = DayZero()
-        if args.confirm_recovery:
-            require(args.stage == 'resume', 'Run ./day0.sh resume --confirm-recovery in the second terminal.')
-            with tty_open() as tty:
-                day0.confirm_recovery(tty, args.source_sha)
-        elif args.stage == 'status':
-            day0.status(args.source_sha)
-        elif args.stage == 'observer-trust':
-            with tty_open() as tty:
-                day0.observer_trust(args.source_sha, tty, revoke=args.revoke)
-        elif args.stage in ('access-request', 'access-response', 'access-probe'):
-            day0.access_exchange(args.source_sha, sys.stdin.buffer if args.stage == 'access-response' else None,
-                                 workload=args.workloads, role=args.role, recover=args.recover_cutover)
-        else:
-            with tty_open() as tty:
-                day0.start(args.source_sha, tty)
+        interactive = args.stage in ('start', 'resume', 'observer-trust')
+        with (tty_open() if interactive else nullcontext()) as tty:
+            entry = day0.production_entry(args.source_sha, tty if args.stage in ('start', 'resume') and
+                                          not args.confirm_recovery else None, draft=args.draft_evaluation)
+            if entry is None:
+                require(args.stage in ('start', 'status', 'resume') and not args.confirm_recovery,
+                        'Select the independently approved production source with ./day0.sh resume first.')
+                print('Day 0 is waiting for the independently approved release handoff. Run ./day0.sh resume when it is available.')
+                return 0
+            checkout, source = entry
+            if checkout != day0.repo:
+                script = local_file(checkout / 'tools/owner_day0.py')
+                command = ['/usr/bin/python3', '-EBs', str(script), args.stage]
+                if args.role:
+                    command.append(args.role)
+                command.extend(('--source-sha', source))
+                for active, option in ((args.confirm_recovery, '--confirm-recovery'), (args.workloads, '--workloads'),
+                                       (args.recover_cutover, '--recover-cutover'), (args.revoke, '--revoke')):
+                    if active:
+                        command.append(option)
+                os.chdir(checkout)
+                os.execv(command[0], command)
+            if args.confirm_recovery:
+                day0.confirm_recovery(tty, source)
+            elif args.stage == 'status':
+                day0.status(source)
+            elif args.stage == 'observer-trust':
+                day0.observer_trust(source, tty, revoke=args.revoke)
+            elif args.stage in ('access-request', 'access-response', 'access-probe'):
+                day0.access_exchange(source, sys.stdin.buffer if args.stage == 'access-response' else None,
+                                     workload=args.workloads, role=args.role, recover=args.recover_cutover)
+            else:
+                day0.start(source, tty)
         return 0
     except KeyboardInterrupt:
         print('Day 0 interrupted. Run ./day0.sh resume in the selected hPanel terminal.', file=sys.stderr)
