@@ -369,3 +369,105 @@ class WorkloadHoldTests(unittest.TestCase):
         self.assertEqual(product.main(['work', self.job]), 0)
         self.assertEqual(product.main(['work', self.job]), 0)
         self.worker.host_test.assert_called_once_with(1, self.initial)
+
+    def test_manual_approval_from_interrupted_active_stage_survives_a_short_hold(self):
+        original = self.expired_retry(phase='maintenance-turn')
+        self.clock.return_value = 3400
+        self.intake.confirm(self.job, self.intake.record(self.job)['agreement_token'])
+        self.scheduled.assert_called_once()
+        with self.controller.lock(), self.controller.host_fence():
+            attempt, transition = self.start_fence('short-hold')
+            self.bootstrap.hold_changed_workload_access('b' * 64)
+            self.clock.return_value = 3410
+            self.assertEqual(product.main(['work', self.job]), 76)
+            self.backend.assert_not_called()
+            parked = p.loads(self.state_path.read_bytes())
+            self.assertEqual(parked['phase'], product.RENEWAL_WAIT)
+            self.assertEqual(parked['retry'], original)
+            self.assertEqual(parked['explicit_retry']['until_unix'], 3580)
+            self.publish('b' * 64)
+            self.controller.thaw(attempt, transition, 'completed', registries={})
+        self.clock.return_value = 3420
+        self.scheduled.reset_mock()
+        self.assert_resumed_once()
+        self.assertNotIn('explicit_retry', p.loads(self.state_path.read_bytes()))
+
+    def test_legacy_full_retry_hash_survives_automatic_flag_normalization(self):
+        retry = self.expired_retry()
+        self.clock.return_value = 3400
+        self.assertEqual(product.main(['submit', str(self.staged)]), 0)
+        retained = p.loads(self.state_path.read_bytes())
+        retained['explicit_retry']['retry_sha256'] = p.identity(retry)
+        product.durable_json(self.state_path, retained)
+        with self.controller.lock(), self.controller.host_fence():
+            attempt, transition = self.start_fence('short-hold')
+            self.bootstrap.hold_changed_workload_access('b' * 64)
+            self.assertEqual(self.intake.reconcile(), 0)
+            observed = p.loads(self.state_path.read_bytes())
+            observed['retry']['automatic'] = False  # Persisted by earlier hold bookkeeping.
+            product.durable_json(self.state_path, observed)
+            self.publish('b' * 64)
+            self.controller.thaw(attempt, transition, 'completed', registries={})
+        self.clock.return_value = 3420
+        self.scheduled.reset_mock()
+        self.assert_resumed_once()
+
+    def test_manual_approval_stays_unspent_before_marker_and_expires_across_long_hold(self):
+        state = dict(self.state)
+        product.record_pause(state, 'host-reply-interrupted', 1000)
+        product.durable_json(self.state_path, state)
+        self.clock.return_value = 3400
+        self.intake.confirm(self.job, self.intake.record(self.job)['agreement_token'])
+        original = p.loads(self.state_path.read_bytes())['explicit_retry']
+        with self.controller.lock(), self.controller.host_fence():
+            self.clock.return_value = 3410
+            self.assertEqual(product.main(['work', self.job]), 76)
+            observed = p.loads(self.state_path.read_bytes())
+            self.assertEqual(observed.get('explicit_retry'), original)
+            self.backend.assert_not_called()
+            attempt, transition = self.start_fence('long-hold')
+            self.bootstrap.hold_changed_workload_access('b' * 64)
+            self.assertEqual(self.intake.reconcile(), 0)
+            self.clock.return_value = 3580
+            self.publish('b' * 64)
+            self.controller.thaw(attempt, transition, 'completed', registries={})
+        self.assertEqual(self.intake.reconcile(), 0)
+        self.scheduled.assert_called_once()
+        self.assertEqual(product.main(['work', self.job]), 76)
+        self.backend.assert_not_called()
+
+    def test_changed_retry_identity_cannot_replay_a_queued_manual_approval(self):
+        self.expired_retry()
+        self.clock.return_value = 3400
+        self.assertEqual(product.main(['submit', str(self.staged)]), 0)
+        retained = p.loads(self.state_path.read_bytes())
+        self.clock.return_value = 3420
+        for field, changed in (('phase', 'host-check'), ('until_unix', 1179), ('observations', 2),
+                               ('reason', 'dispatch-lease-busy'), ('renewal_only', True)):
+            with self.subTest(field=field):
+                retry = dict(retained['retry'], **{field: changed})
+                product.durable_json(self.state_path, dict(retained, retry=retry))
+                self.assertEqual(product.main(['work', self.job]), 76)
+                self.backend.assert_not_called()
+                self.assertNotIn('explicit_retry', p.loads(self.state_path.read_bytes()))
+        malformed = dict(retained, retry=dict(retained['retry'], observations='1'))
+        with self.assertRaisesRegex(ValueError, 'invalid numeric budget'):
+            product.explicit_retry_matches(malformed, self.plan, 3420)
+
+    def test_manual_approval_queued_before_expiry_cannot_execute_late_after_a_hold(self):
+        self.expired_retry()
+        self.clock.return_value = 3400
+        self.intake.confirm(self.job, self.intake.record(self.job)['agreement_token'])
+        with self.controller.lock(), self.controller.host_fence():
+            attempt, transition = self.start_fence('short-hold')
+            self.bootstrap.hold_changed_workload_access('b' * 64)
+            self.assertEqual(self.intake.reconcile(), 0)
+            self.publish('b' * 64)
+            self.controller.thaw(attempt, transition, 'completed', registries={})
+        self.clock.return_value = 3579
+        self.assertEqual(self.intake.reconcile(), 0)
+        self.assertEqual(self.scheduled.call_count, 2)
+        self.clock.return_value = 3580
+        self.assertEqual(product.main(['work', self.job]), 76)
+        self.backend.assert_not_called()
+        self.assertNotIn('explicit_retry', p.loads(self.state_path.read_bytes()))

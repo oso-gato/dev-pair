@@ -92,7 +92,9 @@ dispatch, including when a queued invocation starts late or after reboot.
 When the limit is reached, explicitly submit the same approved plan again to
 authorize one attempt when the environment is ready. The named owner can use
 the same job ID and agreement digest with `dev-pair submit`. The authorization
-expires after three minutes and is consumed before work starts. The original
+expires after three minutes and is consumed when normal dispatch is admitted.
+If renewal closes access first, the timer can enqueue the same authorized
+attempt after thaw while the authorization is still valid. The original
 automatic retry budget remains in force. Status and reattach read the protected
 job record. Protected registry reservations and the host effect ledger determine
 which steps can proceed.

@@ -710,16 +710,34 @@ def retry_expired(state, now):
     return not retry_available(state.get('retry'), now)
 
 
+def retry_identity(retry):
+    p.require(type(retry) is dict, 'Invalid durable retry record.')
+    fields = 'phase reason until_unix observations automatic'
+    p.fields(retry, fields + (' renewal_only' if 'renewal_only' in retry else ''))
+    p.token(retry['phase'])
+    p.token(retry['reason'])
+    p.number(retry['until_unix'], 1, 2**63 - 1)
+    p.number(retry['observations'], 1, 2**63 - 1)
+    p.require(type(retry['automatic']) is bool and retry.get('renewal_only', True) is True,
+              'Invalid durable retry eligibility flags.')
+    return p.identity({key: value for key, value in retry.items() if key != 'automatic'})
+
+
 def explicit_retry_matches(state, value, now):
     approval = state.get('explicit_retry')
-    if approval is None:
+    retry = state.get('retry')
+    if approval is None or retry is None:
         return False
     p.fields(approval, 'plan_sha256 retry_sha256 until_unix')
     p.digest(approval['plan_sha256'])
     p.digest(approval['retry_sha256'])
     p.number(approval['until_unix'], 1, 2**63 - 1)
+    hashes = {retry_identity(retry), p.identity(retry)}
+    # Existing approvals may have included the automatic flag before it was cleared.
+    if not retry['automatic']:
+        hashes.add(p.identity(dict(retry, automatic=True)))
     return (now < approval['until_unix'] and approval['plan_sha256'] == p.identity(value) and
-            approval['retry_sha256'] == p.identity(state['retry']))
+            approval['retry_sha256'] in hashes)
 
 
 def protected_renewal_fence(root):
@@ -761,12 +779,13 @@ def workload_renewal_fence(root):
     return None
 
 
-def record_renewal_wait(state, fence, now):
+def record_renewal_wait(state, fence, now, *, explicit=False):
     previous = state.get('retry')
-    if fence is None or not retry_available(previous, now):
+    available = retry_available(previous, now)
+    if fence is None or not (available or explicit):
         return False
     phase = previous['phase'] if state['phase'] == 'waiting' else state['phase']
-    if previous and previous['phase'] == phase and previous.get('renewal_only') is True:
+    if available and previous and previous['phase'] == phase and previous.get('renewal_only') is True:
         del state['retry']
     state['renewal_wait'] = {'phase': phase, 'fence': fence}
     state['phase'] = RENEWAL_WAIT
@@ -811,7 +830,7 @@ def locked_job_state(job):
         yield root, value, state
 
 
-def park_workload_renewal(root, state, fence):
+def park_workload_renewal(root, value, state, fence):
     if state['phase'] in TERMINAL:
         return
     wait = pending_renewal(state)
@@ -820,7 +839,8 @@ def park_workload_renewal(root, state, fence):
             wait['fence'] = fence
             durable_json(root / 'state.json', state)
         return
-    if record_renewal_wait(state, fence, int(time.time())):
+    now = int(time.time())
+    if record_renewal_wait(state, fence, now, explicit=explicit_retry_matches(state, value, now)):
         durable_json(root / 'state.json', state)
     elif state['phase'] == 'waiting' and state['retry']['automatic']:
         state['retry']['automatic'] = False
@@ -836,24 +856,49 @@ def observe_workload_renewal(job, expected_plan, expected_fence):
         except (OSError, ValueError):
             return
         if fence == expected_fence:
-            park_workload_renewal(root, state, fence)
+            park_workload_renewal(root, value, state, fence)
+
+
+def stop_automatic_retry(root, state):
+    state['phase'] = 'waiting'
+    state['retry']['automatic'] = False
+    durable_json(root / 'state.json', state)
+
+
+def consume_explicit_retry(root, value, state):
+    from renewal import DispatchDeferred, Renewal
+
+    controller = Renewal(ROOT, None)
+    with contextlib.ExitStack() as locks:
+        try:
+            locks.enter_context(controller.dispatch_gate())
+            locks.enter_context(controller.host_fence(shared=True))
+        except BlockingIOError as exc:
+            raise DispatchDeferred('Product retry admission is held by renewal.') from exc
+        if not explicit_retry_matches(state, value, int(time.time())):
+            return False
+        del state['explicit_retry']
+        stop_automatic_retry(root, state)
+        return True
 
 
 def work(job, *, automatic=False):
     """Run a trusted direct attempt. The installed worker uses automatic admission."""
+    from renewal import DispatchDeferred
+
     with locked_job_state(job) as (root, value, state):
         if state['phase'] in TERMINAL:
             return state
         wait = pending_renewal(state)
         fence = workload_renewal_fence(ROOT)
         if fence is not None:
-            park_workload_renewal(root, state, fence)
+            park_workload_renewal(root, value, state, fence)
             return state
         if wait is not None:
             if renewal_dispatch_epoch(ROOT) is None:
                 fence = current_renewal_fence(ROOT)
                 if fence is not None:
-                    park_workload_renewal(root, state, fence)
+                    park_workload_renewal(root, value, state, fence)
                 return state
             del state['renewal_wait']
             state['phase'] = wait['phase']
@@ -862,15 +907,21 @@ def work(job, *, automatic=False):
             p.require(state['phase'] in ('waiting', retry['phase']), 'Durable product retry no longer matches its step.')
             now = int(time.time())
             if retry_expired(state, now):
-                approved = explicit_retry_matches(state, value, now)
+                approved = False
+                if explicit_retry_matches(state, value, now):
+                    try:
+                        approved = consume_explicit_retry(root, value, state)
+                    except DispatchDeferred:
+                        fence = current_renewal_fence(ROOT)
+                        if fence is None:
+                            stop_automatic_retry(root, state)
+                        else:
+                            park_workload_renewal(root, value, state, fence)
+                        return state
                 restricted = automatic or wait is not None or retry.get('renewal_only') is True
                 state.pop('explicit_retry', None)
-                if approved or restricted:
-                    # Consume a manual approval before touching the interrupted step.
-                    state['phase'] = 'waiting'
-                    retry['automatic'] = False
-                    durable_json(root / 'state.json', state)
                 if restricted and not approved:
+                    stop_automatic_retry(root, state)
                     return state
             state['phase'] = retry['phase']
         elif state['phase'] == 'waiting':
@@ -908,7 +959,7 @@ def authorize_explicit_retry(job, expected_plan):
         p.require(value == expected_plan, 'The published product plan differs from the confirmed agreement.')
         now = int(time.time())
         if state['phase'] not in TERMINAL and retry_expired(state, now) and not explicit_retry_matches(state, value, now):
-            state['explicit_retry'] = {'plan_sha256': p.identity(value), 'retry_sha256': p.identity(state['retry']),
+            state['explicit_retry'] = {'plan_sha256': p.identity(value), 'retry_sha256': retry_identity(state['retry']),
                                        'until_unix': now + RETRY_SECONDS}
             durable_json(root / 'state.json', state)
 

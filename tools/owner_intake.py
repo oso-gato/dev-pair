@@ -576,10 +576,15 @@ class Intake:
         if saved['phase'] == 'submitted':
             state = self.published(job, saved['plan'])
             p.require(state is not None, 'The acknowledged product plan is unavailable.')
-            if state['phase'] in product.TERMINAL or product.retry_expired(state, int(time.time())):
+            if state['phase'] in product.TERMINAL:
+                return
+            now = int(time.time())
+            expired = product.retry_expired(state, now)
+            manual = expired and product.explicit_retry_matches(state, saved['plan'], now)
+            if expired and not manual:
                 return
             boot = boot_id()
-            if product.pending_renewal(state) is None and saved.get('scheduled_boot') == boot:
+            if not manual and product.pending_renewal(state) is None and saved.get('scheduled_boot') == boot:
                 return
             epoch = product.renewal_dispatch_epoch(self.root)
             if epoch is not None:
@@ -682,8 +687,10 @@ class Intake:
 
     def submit_product(self, path, job, plan, *, deadline=None, explicit=False):
         state = self.published(job, plan)
+        now = int(time.time())
         if state is not None and (state['phase'] in product.TERMINAL or
-                                  not explicit and product.retry_expired(state, int(time.time()))):
+                                  (not explicit and product.retry_expired(state, now) and
+                                   not product.explicit_retry_matches(state, plan, now))):
             return
         product.source_approval(plan)
         try:
