@@ -10,7 +10,8 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 
-import renewal as renewal
+import bootstrap
+import renewal
 import stable_renewal as stable
 import systemd_service_profile as profile
 
@@ -65,6 +66,7 @@ class BootHandoffTests(unittest.TestCase):
         self.enterContext(patch.object(stable, 'host_bundle', return_value=ROOT))
         self.enterContext(patch.object(stable, 'lease', nullcontext))
         self.boot = stable.BootHandoff(self.controller, self.grant)
+        self.boot.app = bootstrap.Bootstrap(self.root)
         self.manager = Manager(self.boot)
         self.boot.app.run = self.manager.run
         for unit in (stable.RECOVERY_UNIT, self.boot.template):

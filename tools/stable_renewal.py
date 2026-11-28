@@ -417,7 +417,7 @@ class BootHandoff:
         self.controller = controller
         self.grant = grant
         self.bundle = host_bundle(controller, grant)
-        self.app = Bootstrap(controller.root.parents[2])
+        self.app = Bootstrap()
         self.marker = controller.control / BOOT_HOLD.name
         self.unit_root = UNIT_ROOT + '/'
         self.template = 'dev-pair-renewal@.service'
@@ -504,12 +504,16 @@ class BootHandoff:
             r.require(r.read_json(self.marker) == approval and present == self.files,
                       'another protected stable boot handoff already exists')
             return
-        for name, raw in self.files.items():
-            self.app.atomic(name, raw.decode(), mode=0o644)
-            self.app.run('/usr/sbin/restorecon', '-F', name, timeout=10)
-        self.system('daemon-reload')
-        r.require(self.confirm_files() == self.files, 'stable boot handoff files differ')
-        self.check_units(self.files)
+        try:
+            for name, raw in self.files.items():
+                self.app.atomic(name, raw.decode(), mode=0o644)
+                self.app.run('/usr/sbin/restorecon', '-F', name, timeout=10)
+            self.system('daemon-reload')
+            r.require(self.confirm_files() == self.files, 'stable boot handoff files differ')
+            self.check_units(self.files)
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.SubprocessError):
+            self.cleanup()
+            raise
         r.replace_json(self.marker, approval)
 
     def cleanup(self, approval=None):
