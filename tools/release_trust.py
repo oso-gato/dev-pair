@@ -45,14 +45,15 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'))
 
 
-def protect(path):
+def protect(path, *, directory=False):
     path = Path(path)
     require(path.is_absolute() and path.resolve(strict=True) == path, 'release input requires a canonical absolute path')
     for entry in [path, *path.parents]:
         info = entry.lstat()
+        leaf = entry == path and not directory
         require(info.st_uid == 0 and not info.st_mode & 0o022 and
-                (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 if entry == path else stat.S_ISDIR(info.st_mode)),
-                'release input must be a unique root-owned file beneath protected directories')
+                (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 if leaf else stat.S_ISDIR(info.st_mode)),
+                'release input must have canonical root-owned custody')
     return path
 
 
@@ -93,6 +94,10 @@ class ReleaseTrust:
 
     def policy(self, component):
         value = json.loads(checked_file(protect(POLICY)).read_bytes(), object_pairs_hook=relay.unique)
+        return self.validate_policy(value, component)
+
+    @staticmethod
+    def validate_policy(value, component):
         require(type(value) is dict and set(value) == {'version', 'reviewer_ids', 'check', 'components', 'writer_app_id'}
                 and type(value.get('version')) is int and value['version'] == 1,
                 'unsupported independently provisioned release policy')
@@ -170,12 +175,16 @@ class ReleaseTrust:
                 'protected main no longer identifies the requested release revision')
         return branch
 
-    def workflow(self, path, revision, expected_hash):
+    def workflow_hash(self, path, revision):
         value = self.api(f'contents/{path}?ref={revision}')
         require(value['path'] == path and value['type'] == 'file' and value['encoding'] == 'base64'
                 and 0 < value['size'] <= 65536, 'independently pinned GitHub workflow is unavailable')
         data = base64.b64decode(''.join(value['content'].splitlines()), validate=True)
-        require(len(data) == value['size'] and hashlib.sha256(data).hexdigest() == expected_hash,
+        require(len(data) == value['size'], 'independently pinned GitHub workflow size differs')
+        return hashlib.sha256(data).hexdigest()
+
+    def workflow(self, path, revision, expected_hash):
+        require(self.workflow_hash(path, revision) == expected_hash,
                 'workflow bytes differ from independently held release policy')
 
     def checklist_environment(self, writer_app_id):

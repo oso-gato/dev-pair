@@ -72,9 +72,9 @@ class Spool:
         self.lease = self.control / 'lease.json'
 
     @contextmanager
-    def locked(self, *, create):
+    def locked(self, *, create, retain_owner=False):
         fd = os.open(self.control / 'owner.lock',
-                     os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
+                     os.O_CREAT | os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
         with os.fdopen(fd, 'rb') as lock:
             node = os.fstat(fd)
             p.require(stat.S_ISREG(node.st_mode) and node.st_uid == node.st_gid == 0 and node.st_nlink == 1
@@ -96,7 +96,7 @@ class Spool:
                 return
             try:
                 self.identity(fd)
-                yield fd
+                yield (fd, lock) if retain_owner else fd
             finally:
                 os.close(fd)
 

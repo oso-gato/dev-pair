@@ -954,6 +954,7 @@ class Live:
         return sorted(paths)
 
     def initial_platform(self, revision, *, acquire=False):
+        from release_setup import FIRST_TRUST, installed
         from release_trust import POLICY, ReleaseTrust
 
         intake = self.installer.intake
@@ -972,11 +973,13 @@ class Live:
                 candidates.append(identity)
         require(len(candidates) <= 1, 'more than one protected full release is eligible for this exact source')
         if not candidates or transfer_pending:
+            first_grant = (installed(revision, self.identity()['machine_id'], finish=acquire, policy=POLICY)
+                           if os.path.lexists(FIRST_TRUST) else None)
             if not os.path.lexists(POLICY):
                 raise Pending('release-trust', 'Independent protected release trust has not been provisioned.')
             for role in ('host', 'devbox', 'maintenance', 'development'):
                 ReleaseTrust(self.run).policy(role)
-            self.require_release_custody()
+            self.require_release_custody(grant=first_grant)
             if not hasattr(intake, 'acquire_initial'):
                 raise Pending('initial-full-release-selection', 'The trusted initial publisher selector is unavailable in this kit.',
                               source_gap=True)
@@ -1004,7 +1007,9 @@ class Live:
                     'initial publisher result does not bind the reviewed full release')
         return identity
 
-    def require_release_custody(self, *, config=None):
+    def require_release_custody(self, *, config=None, grant=None):
+        from bootstrap import Blocked as BootstrapBlocked
+
         intake = self.installer.intake
         if config is None:
             config = Path(intake.native_env().get('GH_CONFIG_DIR', str(GITHUB_CONFIG)))
@@ -1026,6 +1031,14 @@ class Live:
                 raise Pending('release-read-custody', 'The GitHub intake credential file is empty or outside root-private custody.')
         finally:
             os.close(descriptor)
+        if grant is not None:
+            from release_setup import registered_read
+
+            try:
+                require(config == GITHUB_CONFIG, 'new release read custody must use its fixed root scope')
+                registered_read(grant, path)
+            except (Blocked, BootstrapBlocked, OSError, ValueError, KeyError, TypeError, AttributeError):
+                raise Pending('release-read-custody', 'The installed GitHub credential differs from the approved first-host handoff.') from None
 
     def initial_site(self, hostname):
         candidates = []
@@ -1507,36 +1520,44 @@ class Live:
             require(reference == selected and set(slots) <= set(manifests), 'owner slots differ from the current release')
         except failures:
             raise Pending('owner-catalogue', 'Protected repository and slot authority is unavailable.') from None
-        if recorded is not None:
-            require(recorded['subject'] in slots, 'the approved provider slot was withdrawn')
-            return self.owner_slot_grant(intake, recorded['subject'])
-
-        for repository, row in sorted(repositories.items()):
+        if recorded is None:
+            for repository, row in sorted(repositories.items()):
+                if time.monotonic() >= end:
+                    break
+                try:
+                    intake.source(repository, row, checklist=CHECKLIST in row.get('workloads', [CHECKLIST]))
+                    break
+                except failures:
+                    continue
+            else:
+                raise Pending('owner-repository-inputs', 'The exact approved repository and startup corpus are unavailable.')
             if time.monotonic() >= end:
-                break
-            try:
-                intake.source(repository, row, checklist=CHECKLIST in row.get('workloads', [CHECKLIST]))
-                break
-            except failures:
-                continue
+                raise Pending('owner-repository-inputs', 'The bounded repository authority check did not finish.')
+            grant = None
+            for job in slots:
+                if time.monotonic() >= end:
+                    break
+                try:
+                    intake.slot(job, manifests[job])
+                    grant = self.owner_slot_grant(intake, job)
+                    break
+                except failures:
+                    continue
+            if grant is None:
+                raise Pending('provider-slot-authority', 'No approved provider slot has valid current custody and bounded pricing.')
         else:
-            raise Pending('owner-repository-inputs', 'The exact approved repository and startup corpus are unavailable.')
-        if time.monotonic() >= end:
-            raise Pending('owner-repository-inputs', 'The bounded repository authority check did not finish.')
+            require(recorded['subject'] in slots, 'the approved provider slot was withdrawn')
+            grant = self.owner_slot_grant(intake, recorded['subject'])
         if any(CHECKLIST in row.get('workloads', [CHECKLIST]) for row in repositories.values()):
+            from checklist_build_storage import StoragePressure
+
             try:
-                self.checklist_builder(prepare=False)
+                self.checklist_builder(prepare=recorded is None)
+            except StoragePressure:
+                raise Pending('checklist-build-base-capacity', 'The measured validation filesystem cannot hold the verified base and bounded build reserve.') from None
             except failures:
-                raise Pending('checklist-builder', 'The independently verified checklist base is not ready.') from None
-        for job in slots:
-            if time.monotonic() >= end:
-                break
-            try:
-                intake.slot(job, manifests[job])
-                return self.owner_slot_grant(intake, job)
-            except failures:
-                continue
-        raise Pending('provider-slot-authority', 'No approved provider slot has valid current custody and bounded pricing.')
+                raise Pending('checklist-build-base', 'The independently verified checklist base is not ready in the rootless builder store.') from None
+        return grant
 
     def verified_workload_bundle(self, selected):
         controller = self.renewal()
@@ -1657,25 +1678,28 @@ class Live:
                 self.checklist_builder()
 
     def checklist_builder(self, *, prepare=True):
-        from checklist_candidate import CONTAINERS, candidate_image
-        from destination_release import Destination
+        from checklist_candidate import checked_storage, preloaded_base
+        from host_handoff import host_runtime, tls_principal
+        from release_setup import FIRST_TRUST, GitHubRead
 
-        policy = self.checklist_builder_policy()
-        app = Destination()
-        uid = app.account()
-        base = '/var/lib/dev-pair/checklist-validation/builder'
+        runtime = host_runtime()
+        end = time.monotonic() + (180 if prepare else 15)
+        tls_principal(Path(CHECKLIST_CLIENT), maintenance=False)
         if prepare:
-            for path in (base, base + '/graph', base + '/tmp'):
-                self.role_directory(path, 'dp-checklist')
-            self.run('/usr/sbin/restorecon', '-RF', base, timeout=15)
-        # Match the conductor's store exactly. The digest and its independent
-        # verification receipt are installed beforehand under site custody.
-        raw = app.subprocess_role(uid, '/usr/bin/env', 'TMPDIR=' + base + '/tmp',
-                                  'CONTAINERS_CONF=' + str(CONTAINERS), '/usr/bin/podman',
-                                  '--root', base + '/graph',
-                                  '--runroot', f'/run/user/{uid}/dev-pair-checklist-builder',
-                                  'image', 'inspect', policy['image'], timeout=20)
-        candidate_image(parse(raw), policy['image'])
+            with runtime.dispatch_gate():
+                checked_storage(runtime, min(end, time.monotonic() + 10))
+                base = runtime.STORAGE / 'builder'
+                leaves = (base, base / 'graph', base / 'tmp')
+                account = pwd.getpwnam(runtime.ACCOUNT)
+                for path in leaves:
+                    if not os.path.lexists(path):
+                        self.role_directory(str(path), runtime.ACCOUNT)
+                    node = path.lstat()
+                    require(stat.S_ISDIR(node.st_mode) and (node.st_uid, node.st_gid) == (account.pw_uid, account.pw_gid),
+                            'checklist builder preparation encountered foreign storage')
+                self.run('/usr/sbin/restorecon', '-F', *map(str, leaves), timeout=15)
+        trust = GitHubRead(GITHUB_CONFIG, end, self.run).trust
+        return preloaded_base(runtime, trust, end, prepare=prepare, require_proof=os.path.lexists(FIRST_TRUST))
 
 
 def require_installed_workload(feature, *, owner_entry=False):

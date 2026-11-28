@@ -42,7 +42,7 @@ def remaining(end):
     return h.time_left(end)
 
 
-def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None, pass_fds=()):
+def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None, pass_fds=(), status=False):
     """Bound command output independently of pipe reader and child lifetime."""
     p.require(data is None or stdin is None, 'fixed command input has two sources')
     # The only input is a bounded trusted-controller JSON document or prompt.
@@ -79,6 +79,8 @@ def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None, 
                     pass
                 process.wait(timeout=1)
                 raise
+    if status:
+        return code, bytes(output)
     p.require(code == 0, 'protected fixed command failed')
     return bytes(output)
 
@@ -357,6 +359,141 @@ def input_proof(base, recipe, source):
                         'output_cache': 'clean', 'network': 'none', 'pull': 'never'}).encode()
 
 
+def builder_layout(runtime, end):
+    storage_dev = checked_storage(runtime, end)
+    account = pwd.getpwnam(runtime.ACCOUNT)
+    build = runtime.STORAGE / 'builder'
+    image_copy = runtime.STORAGE / 'image-copy'
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    volume = os.open(runtime.STORAGE, flags)
+    try:
+        mount = build_storage.mount_id(volume)
+        for leaf in (build, build / 'graph', build / 'tmp', image_copy, runtime.STORAGE / 'graph'):
+            fd = os.open(leaf, flags)
+            try:
+                info = os.fstat(fd)
+                p.require(leaf.resolve(strict=True) == leaf and (info.st_uid, info.st_gid) ==
+                          (account.pw_uid, account.pw_gid) and stat.S_IMODE(info.st_mode) == 0o700 and
+                          info.st_dev == storage_dev and build_storage.mount_id(fd) == mount,
+                          'builder storage must be private and bounded')
+            finally:
+                os.close(fd)
+    finally:
+        os.close(volume)
+    p.require(protected_file(CONTAINERS, 4096) == f'[engine]\nimage_copy_tmp_dir="{image_copy}"\n'.encode(),
+              'checklist build requires the declared bounded image-copy configuration')
+    run = Path('/run/user') / str(account.pw_uid)
+
+    def podman(graph, runroot, *args, cap=p.MAX_MESSAGE, stdin=None, stdout=None, status=False):
+        command = ('/usr/bin/podman', '--root', graph, '--runroot', runroot, *args)
+        if args[0] == 'pull':
+            # This watchdog and the inherited owner lock outlive an interrupted
+            # issuer until its fixed pull exits, including on issuer SIGKILL.
+            command = ('/usr/bin/timeout', '--kill-after=5s', '100s', *command)
+        return invoke(as_role(runtime.ACCOUNT, *command,
+                environment={'XDG_RUNTIME_DIR': str(run), 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(run / 'bus'),
+                             'CONTAINERS_CONF': str(CONTAINERS), 'TMPDIR': str(build / 'tmp')}),
+                      end, cap=cap, stdin=stdin, stdout=stdout, **({'status': True} if status else {}))
+
+    store = (build / 'graph', run / 'dev-pair-checklist-builder')
+    validation = (runtime.STORAGE / 'graph', run / 'dev-pair-checklist-runroot')
+    return storage_dev, account, store, validation, image_copy, podman
+
+
+def check_builder_store(podman, store, image_copy):
+    graph, runroot = store
+    info = podman(graph, runroot, 'info', '--format', '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} '
+                  '{{.Store.GraphRoot}} {{.Store.RunRoot}} {{.Store.ImageCopyTmpDir}}').decode().strip()
+    p.require(info == f'true true {graph} {runroot} {image_copy}', 'Podman build or import storage identity changed')
+
+
+def preloaded_base(runtime, trust, end, *, prepare, require_proof):
+    from release_setup import base_proof, encode, private_bytes, private_publish
+    from commission_host import Commission
+
+    p.require(os.getuid() == os.geteuid() == 0, 'protected checklist base provisioning requires root')
+    proof_path = BASE.with_name('build-base-proof.json')
+    with runtime.dispatch_gate():
+        storage_dev, _, store, _, image_copy, podman = builder_layout(runtime, end)
+        check_builder_store(podman, store, image_copy)
+        data = p.loads(protected_file(BASE, 4096)) if os.path.lexists(BASE) else None
+        if data is not None:
+            p.fields(data, 'version image verification_sha256')
+            p.number(data['version'], 1, 1)
+            p.digest(data['verification_sha256'])
+            p.require(re.fullmatch(runtime.IMAGE, data['image']), 'approved build base must be an exact OCI reference')
+            if not require_proof and not os.path.lexists(proof_path):
+                # Preserve the separately managed legacy policy and image.
+                candidate_image(p.loads(podman(*store, 'image', 'inspect', data['image'])), data['image'])
+                return data
+        base = trust.policy('checklist')['components']['checklist']['base']
+        image = base['image']
+        p.require(re.fullmatch(runtime.IMAGE, image) and '.' in image.split('/', 1)[0],
+                  'initial builder base requires an exact qualified public registry reference')
+        proof = None
+        if os.path.lexists(proof_path):
+            proof = private_bytes(proof_path, 4096)
+            p.require(proof == encode(base_proof(p.loads(proof), base)), 'retained checklist base proof is not canonical')
+
+        def binding(raw):
+            return {'version': 1, 'image': image, 'verification_sha256': p.sha256(raw)}
+
+        def resident():
+            code, _ = podman(*store, 'image', 'exists', image, status=True)
+            p.require(code in (0, 1), 'builder store could not determine exact base residency')
+            return code == 0
+
+        def inspect():
+            candidate_image(p.loads(podman(*store, 'image', 'inspect', image)), image)
+
+        if data is not None:
+            p.require(proof is not None and data == binding(proof), 'installed checklist base differs from its verified proof')
+            if not prepare or resident():
+                inspect()
+                return data
+        p.require(prepare, 'first checklist builder base is pending')
+        spool = transfer_spool(runtime, storage_dev, create=True)
+        with spool.locked(create=True, retain_owner=True) as (directory, owner):
+            intent_path = BASE.with_name('build-base-pull.json')
+            retained_intent = os.path.lexists(intent_path)
+            if retained_intent:
+                p.require(proof is not None and private_bytes(intent_path, 4096) ==
+                          encode({'schema': 1, 'base': binding(proof), 'volume': spool.identity(directory)}),
+                          'retained checklist preload intent differs from the approved storage or base')
+
+            def capacity(*, reclaim):
+                if build_storage.enough(build_storage.free_space(directory), MAX_ARCHIVE):
+                    return
+                if reclaim and resident():
+                    inspect()
+                    podman(*store, 'image', 'rm', '--no-prune', image)
+                raise build_storage.StoragePressure()
+
+            # Only an exact image whose absence preceded an owned pull can be
+            # retired here. A pre-existing base and every other image survive.
+            capacity(reclaim=retained_intent and data is None)
+            if proof is None:
+                proof = encode(base_proof(trust.verify_base(base), base))
+                private_publish(proof_path, proof)
+            if not resident():
+                private_publish(intent_path, encode({'schema': 1, 'base': binding(proof), 'volume': spool.identity(directory)}))
+                retained_intent = True
+                # The role receives only an explicit empty registry auth file.
+                anonymous = BASE.with_name('build-base-public-auth.json')
+                auth = b'{"auths":{}}\n'
+                if not os.path.lexists(anonymous):
+                    Commission.publish_file(anonymous, auth, 0o644)
+                p.require(protected_file(anonymous, 4096) == auth and
+                          stat.S_IMODE(anonymous.stat().st_mode) == 0o644, 'public checklist base auth file differs')
+                podman(*store, 'pull', '--quiet', '--retry=0', '--tls-verify=true', '--platform=linux/amd64',
+                       '--authfile', anonymous, 'docker://' + image, stdin=owner)
+            inspect()
+            capacity(reclaim=retained_intent)
+            data = binding(proof)
+            private_publish(BASE, encode(data))
+            return data
+
+
 def build(job, repository, agreement_sha, revision, end):
     p.require(os.geteuid() == 0, 'protected checklist build conductor required')
     runtime = h.host_runtime()
@@ -384,38 +521,7 @@ def build(job, repository, agreement_sha, revision, end):
     if retained:
         return retained_candidate(path, job, revision, end)
 
-    storage_dev = checked_storage(runtime, end)
-    account = pwd.getpwnam(runtime.ACCOUNT)
-    build = runtime.STORAGE / 'builder'
-    image_copy = runtime.STORAGE / 'image-copy'
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    volume = os.open(runtime.STORAGE, flags)
-    try:
-        mount = build_storage.mount_id(volume)
-        for leaf in (build, build / 'graph', build / 'tmp', image_copy, runtime.STORAGE / 'graph'):
-            fd = os.open(leaf, flags)
-            try:
-                info = os.fstat(fd)
-                p.require(leaf.resolve(strict=True) == leaf and (info.st_uid, info.st_gid) ==
-                          (account.pw_uid, account.pw_gid) and stat.S_IMODE(info.st_mode) == 0o700 and
-                          info.st_dev == storage_dev and build_storage.mount_id(fd) == mount,
-                          'builder storage must be private and bounded')
-            finally:
-                os.close(fd)
-    finally:
-        os.close(volume)
-    p.require(protected_file(CONTAINERS, 4096) == f'[engine]\nimage_copy_tmp_dir="{image_copy}"\n'.encode(),
-              'checklist build requires the declared bounded image-copy configuration')
-    run = Path('/run/user') / str(account.pw_uid)
-
-    def podman(graph, runroot, *args, cap=p.MAX_MESSAGE, stdin=None, stdout=None):
-        return invoke(as_role(runtime.ACCOUNT, '/usr/bin/podman', '--root', graph, '--runroot', runroot, *args,
-                environment={'XDG_RUNTIME_DIR': str(run), 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=' + str(run / 'bus'),
-                             'CONTAINERS_CONF': str(CONTAINERS), 'TMPDIR': str(build / 'tmp')}),
-                      end, cap=cap, stdin=stdin, stdout=stdout)
-
-    store = (build / 'graph', run / 'dev-pair-checklist-builder')
-    validation = (runtime.STORAGE / 'graph', run / 'dev-pair-checklist-runroot')
+    storage_dev, account, store, validation, image_copy, podman = builder_layout(runtime, end)
     spool = transfer_spool(runtime, storage_dev, create=True)
     tag = 'localhost/dev-pair-checklist:' + p.identity([job, revision, p.sha256(inputs)])
     with spool.locked(create=True) as directory:
@@ -443,10 +549,8 @@ def build_and_load(runtime, podman, store, validation, image_copy, account, base
         with build_storage.transfer_reader(archive) as lease:
             return podman(*args, stdin=lease, **options)
 
-    for graph, runroot in (store, validation):
-        info = engine(graph, runroot, 'info', '--format', '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}} '
-                      '{{.Store.GraphRoot}} {{.Store.RunRoot}} {{.Store.ImageCopyTmpDir}}').decode().strip()
-        p.require(info == f'true true {graph} {runroot} {image_copy}', 'Podman build or import storage identity changed')
+    for target in (store, validation):
+        check_builder_store(engine, target, image_copy)
     base_id, base_digest, checked_base = candidate_image(
         p.loads(engine(*store, 'image', 'inspect', base['image'])), base['image'])
     with build_context(runtime, account.pw_gid, recipe, source, end) as context:

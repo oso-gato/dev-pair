@@ -727,7 +727,30 @@ class DayZero:
         return os.path.lexists(OWNER_CATALOGUE)
 
     def commission_apply(self, revision, tty):
-        return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
+        def apply():
+            return self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800)
+
+        observed = apply()
+        if tty is None or observed.get('phase') != 'pending':
+            return observed
+        if observed.get('prerequisite') == 'release-trust':
+            handoff = answer(tty, 'Enter the absolute path to the release custodian’s handoff, or press Enter to wait.')
+            if not handoff:
+                return observed
+            digest = answer(tty, 'Enter the SHA-256 received separately from the independent release custodian, or press Enter to wait.')
+            if not digest:
+                return observed
+            self.call('release_setup.py', 'install', '--source-sha', revision,
+                      '--handoff', handoff, '--sha256', pin(digest), timeout=120)
+            observed = apply()
+        if observed.get('phase') == 'pending' and observed.get('prerequisite') == 'release-read-custody':
+            token = secret_answer(tty, 'Paste the approved read-only GitHub token, or press Enter to wait.')
+            if token:
+                with secret_file(token) as credential:
+                    self.call('release_setup.py', 'register-read', '--source-sha', revision,
+                              '--token-file', credential, timeout=400)
+                observed = apply()
+        return observed
 
     def commission(self, identity, revision, historical=None, tty=None):
         self.stage(identity, revision, 'host-bootstrap-complete',

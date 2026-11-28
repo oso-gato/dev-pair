@@ -39,6 +39,43 @@ class DayZeroTests(unittest.TestCase):
         self.entry = day.DayZero(self.directory / 'dev-pair', Mock())
         self.identity = {'machine_id': MACHINE, 'boot_id': BOOT, 'host': 'erebus', 'selinux': '1'}
 
+    def test_commission_imports_custodian_handoff_and_registers_the_exact_credential_once(self):
+        waiting_trust = {'phase': 'pending', 'prerequisite': 'release-trust'}
+        waiting_read = {'phase': 'pending', 'prerequisite': 'release-read-custody'}
+        awaiting_release = {'phase': 'pending', 'prerequisite': 'initial-full-release-selection'}
+        self.entry.call = Mock(side_effect=[waiting_trust, {}, waiting_read, {}, awaiting_release])
+        handoff = '/root/custodian-handoff.json'
+        approved_fingerprint = 'c' * 64
+        secret = 'fixture secret never passed in an invocation'
+        credential = self.directory / 'anonymous-token'
+
+        @contextmanager
+        def entered(value):
+            self.assertEqual(value, secret)
+            yield credential
+
+        with patch.object(day, 'answer', side_effect=[handoff, approved_fingerprint]), \
+                patch.object(day, 'secret_answer', return_value=secret), patch.object(day, 'secret_file', entered):
+            self.assertEqual(self.entry.commission_apply(SOURCE, object()), awaiting_release)
+        invocations = [call.args for call in self.entry.call.call_args_list]
+        apply = ('commission_host.py', 'apply', '--source-sha', SOURCE)
+        self.assertEqual(invocations, [apply,
+            ('release_setup.py', 'install', '--source-sha', SOURCE, '--handoff', handoff, '--sha256', approved_fingerprint),
+            apply, ('release_setup.py', 'register-read', '--source-sha', SOURCE, '--token-file', credential), apply])
+        self.assertNotIn(secret, repr(invocations))
+
+    def test_commission_waits_without_authority_or_an_attached_terminal(self):
+        pending = {'phase': 'pending', 'prerequisite': 'release-trust'}
+        self.entry.call = Mock(return_value=pending)
+        with patch.object(day, 'answer', side_effect=AssertionError('attempted unattended prompt')):
+            self.assertEqual(self.entry.commission_apply(SOURCE, None), pending)
+        self.entry.call.assert_called_once()
+        self.entry.call.reset_mock()
+        with patch.object(day, 'answer', return_value=''), patch.object(day, 'secret_answer',
+                                                                      side_effect=AssertionError('prompted for unapproved credential')):
+            self.assertEqual(self.entry.commission_apply(SOURCE, object()), pending)
+        self.entry.call.assert_called_once()
+
     def test_commission_reports_each_admitted_and_held_feature(self):
         tool = self.entry.repo / 'tools/commission_host.py'
         tool.parent.mkdir(parents=True)
