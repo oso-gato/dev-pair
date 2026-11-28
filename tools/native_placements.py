@@ -499,8 +499,13 @@ def idle_process(pid, comm, manager_pid, scope, pause, owner=None):
         status = (proc / 'status').read_text()
         return comm == '(sd-pam)' and re.search(rf'^PPid:\s+{manager_pid}$', status, re.M) is not None
     if program == str(SYSTEMD_EXECUTOR):
-        return (owner is not None and pid != manager_pid and comm == '(sd-pam)' and group == prefix + '/init.scope'
-                and idle_systemd_executor(proc, proc.with_name(str(manager_pid)), prefix, owner))
+        if owner is None or pid == manager_pid or comm != '(sd-pam)' or group != prefix + '/init.scope':
+            return False
+        try:
+            return idle_systemd_executor(proc, proc.with_name(str(manager_pid)), prefix, owner)
+        except FileNotFoundError:
+            # The manager may have disappeared while its child remains live.
+            return False
     if (program, comm) in (('/usr/bin/dbus-broker', 'dbus-broker'), ('/usr/bin/dbus-broker-launch', 'dbus-broker-lau')):
         return group in {prefix + '/session.slice/dbus-broker.service', prefix + '/session.slice/dbus.service'}
     if pid != pause:

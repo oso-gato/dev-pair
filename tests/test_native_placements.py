@@ -468,7 +468,7 @@ class TestManagedEntry(unittest.TestCase):
         }
         original = {'child_owner': owner, 'parent_owner': owner, 'argv': b'(sd-pam)\0', 'ppid': 101,
                     'child_group': group, 'parent_group': group, 'manager_comm': 'systemd\n', 'exe_inode': 41,
-                    'exe_mode': stat.S_IFREG | 0o755, 'exe_owner': 0}
+                    'exe_mode': stat.S_IFREG | 0o755, 'exe_owner': 0, 'parent_missing': False}
         state = dict(original)
 
         def readlink(path):
@@ -493,7 +493,12 @@ class TestManagedEntry(unittest.TestCase):
             uid, gid = state['child_owner' if fd == 105 else 'parent_owner']
             return SimpleNamespace(st_uid=uid, st_gid=gid)
 
-        with (patch.object(n, 'directory_fd', side_effect=lambda path: nullcontext(int(path.name))),
+        def pin(path):
+            if path.name == '101' and state['parent_missing']:
+                raise FileNotFoundError
+            return nullcontext(int(path.name))
+
+        with (patch.object(n, 'directory_fd', side_effect=pin),
               patch.object(n.os, 'readlink', side_effect=readlink), patch.object(n.os, 'fstat', side_effect=process_owner),
               patch.object(Path, 'read_text', autospec=True, side_effect=read_text),
               patch.object(Path, 'open', autospec=True, side_effect=open_proc),
@@ -505,7 +510,7 @@ class TestManagedEntry(unittest.TestCase):
             for key, value in (('child_owner', (1002, 1002)), ('parent_owner', (1001, 1002)), ('ppid', 212),
                                ('child_group', '0::' + scope + '\n'), ('parent_group', '0::/foreign/init.scope\n'),
                                ('manager_comm', 'other\n'), ('argv', b'(sd-pam)\0--foreign\0'), ('exe_inode', 42),
-                               ('exe_mode', stat.S_IFREG | 0o775), ('exe_owner', 1001)):
+                               ('exe_mode', stat.S_IFREG | 0o775), ('exe_owner', 1001), ('parent_missing', True)):
                 with self.subTest(key=key):
                     state[key] = value
                     self.assertFalse(n.idle_process(105, '(sd-pam)', 101, scope, None, owner))
