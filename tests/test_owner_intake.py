@@ -15,6 +15,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import owner_intake as intake
+import owner_source
 import job_protocol as p
 import product_job as product
 
@@ -38,7 +39,7 @@ class OwnerIntakeTests(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
         self.site = self.root / 'site'
-        self.site.mkdir()
+        self.site.mkdir(mode=0o700)
         for path in ('product-jobs', 'product-jobs/jobs', 'product-jobs/intake',
                      'product-jobs/profiles', 'provider-allowances', 'repository-approvals'):
             (self.root / path).mkdir(mode=0o700)
@@ -70,7 +71,12 @@ class OwnerIntakeTests(unittest.TestCase):
             self.git(repo, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-m', 'starting checklist')
             sha = self.git(repo, 'rev-parse', 'HEAD').strip().decode()
             self.settings[remote] = {'commit': sha, 'startup_revision': sha, 'destination': 'Private checklist review'}
-        (self.site / 'standards').mkdir()
+        cache = self.site / 'standards'
+        cache.mkdir(mode=0o700)
+        shared = {name: ('Synthetic document ' + name + '\n').encode() for name in owner_source.SHARED}
+        for name, body in shared.items():
+            intake.write_private(cache / name, body)
+        self.enterContext(mock.patch.object(owner_source, 'SHARED', {name: p.sha256(body) for name, body in shared.items()}))
         (self.site / 'repositories.json').write_text(p.canonical(
             {'schema': 1, 'repositories': self.settings, 'slots': list(MANIFESTS)}))
 

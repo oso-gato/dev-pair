@@ -336,6 +336,9 @@ class OwnerSourceTests(unittest.TestCase):
             self.provision()
         with self.assertRaisesRegex(ValueError, 'bounded Git bundle'):
             owner.first_source(self.intake, REPOSITORY, owner.CHECKLIST)
+        configured = dict(self.config, commit=revision)
+        with self.assertRaisesRegex(ValueError, 'bounded Git bundle'):
+            self.intake.source(REPOSITORY, configured)
         self.assertEqual(self.git(checkout, 'rev-parse', 'HEAD').strip().decode(), revision)
         self.assertEqual(len(self.selections), 3)
 

@@ -269,6 +269,12 @@ class FirstCatalogueTests(unittest.TestCase):
                             plan['roles']['maintenance']['layout']['selinux_label'])
         self.assertEqual(self.first.initialize(self.options)['phase'], 'configured')
         with mock.patch.object(owner, 'Intake', return_value=self.intake):
+            cache = self.site / 'standards'
+            cache.chmod(0o755)
+            with self.assertRaises(commission_host.Pending) as blocked:
+                live.owner_feature_authority(SELECTED, None)
+            self.assertEqual(blocked.exception.report['prerequisite'], 'owner-repository-inputs')
+            cache.chmod(0o700)
             authority = live.owner_feature_authority(SELECTED, None)
         self.assertEqual((authority['subject'], authority['expires_unix']), (JOB, self.options.expires_unix))
         live.checklist_builder.assert_called_once_with(prepare=True)
@@ -287,6 +293,7 @@ class FirstCatalogueTests(unittest.TestCase):
         self.assertEqual(draft['preview']['provider_microusd'], self.options.spend_microusd)
         checked = draft['preview']['plan']
         roles = []
+        bundles = []
 
         def approve(plan, checkout, startup, cache, revision, tree):
             approval = dict(schema=1, job=JOB, repository=REPOSITORY, standards_sha=STANDARDS,
@@ -310,6 +317,8 @@ class FirstCatalogueTests(unittest.TestCase):
             if argv[0] == owner.SYSTEMCTL:
                 self.assertIn(argv[-1], ('dev-pair-intake@job-1.service', 'dev-pair-product@job-1.service'))
                 return b''
+            if 'bundle' in argv and 'create' in argv:
+                bundles.append(argv)
             return normal_command(argv, end, **kwargs)
 
         for role in owner.ROLES:
@@ -320,9 +329,18 @@ class FirstCatalogueTests(unittest.TestCase):
                 mock.patch.object(self.intake, 'acquire_role', side_effect=acquire), \
                 mock.patch.object(product, 'source_approval', return_value=(b'fixture', {})):
             self.assertEqual(self.intake.confirm(JOB, draft['agreement_token'])['phase'], 'confirmed')
+            document = self.site / 'standards' / 'GOVERNANCE.md'
+            document.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, 'root-private documents'):
+                self.intake.stage(JOB, self.intake.record(JOB))
+            self.assertFalse((self.intake.queue / (JOB + '.plan')).exists())
+            self.assertFalse((self.root / 'repository-approvals' / (JOB + '.json')).exists())
+            self.assertFalse((self.root / 'provider-allowances' / JOB).exists())
+            document.chmod(0o600)
             self.assertEqual(self.intake.prepare(JOB), 0, self.intake.status(JOB)['diagnostics'])
         self.assertEqual(self.intake.status(JOB)['phase'], 'submitted')
         self.assertEqual(roles, list(owner.ROLES))
+        self.assertEqual(len(bundles), 1)
         allowance = loads((self.root / 'provider-allowances' / JOB / 'allowance.json').read_bytes())
         self.assertEqual(allowance['agreement_sha256'], product.agreement_sha(checked))
         self.assertEqual(allowance['models'][owner.MODEL]['observed_models'], [owner.MODEL])
@@ -491,17 +509,17 @@ class FirstCatalogueTests(unittest.TestCase):
 
     @unittest.skipUnless(os.environ.get('DEV_PAIR_TEST_STANDARDS_CACHE'), 'optional actual private cache was not selected')
     def test_preview_reads_actual_pinned_cache_without_staging_its_contents(self):
-        cache = Path(os.environ['DEV_PAIR_TEST_STANDARDS_CACHE'])
+        pinned = Path(os.environ['DEV_PAIR_TEST_STANDARDS_CACHE'])
+        cache = self.site / 'standards'
+        for name in startup_delivery.controller.SHARED:
+            (cache / name).write_bytes((pinned / name).read_bytes())
         for document in ('README.md', 'STANDARDS.md', 'REQUIREMENTS.md', 'ARCHITECTURE.md'):
             (self.startup / document).write_bytes((REPO_ROOT / document).read_bytes())
         self.git(self.startup, 'add', '--all')
         self.git(self.startup, '-c', 'user.name=Fixture', '-c', 'user.email=f@example.test', 'commit', '-m', 'Local startup proof')
 
-        def location(path):
-            return cache if path == self.site / 'standards' else self.protected(path, directory=True)
-
         with mock.patch.object(owner, 'load_private', wraps=startup_delivery.load_private) as loader, \
-                mock.patch.object(owner, 'protect_directory', side_effect=location):
+                mock.patch.object(owner_source, 'SHARED', startup_delivery.controller.SHARED):
             plan = self.preview()
         loader.assert_called_once()
         self.assertEqual(loader.call_args.args[1], cache)

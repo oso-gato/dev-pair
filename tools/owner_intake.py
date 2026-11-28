@@ -96,13 +96,16 @@ def fixed_git(checkout, *args, cap=8192, data=None):
                             time.monotonic() + 15, cap=cap, data=data)
 
 
-def verify_bundle(checkout):
+def verify_bundle(checkout, commit):
     p.require(fixed_git(checkout, 'rev-parse', '--is-shallow-repository') == b'false\n',
               'The approved acquisition requires its full Git history.')
     try:
-        fixed_git(checkout, 'bundle', 'create', '-', 'HEAD', cap=candidate.MAX_BUNDLE)
+        bundle = fixed_git(checkout, 'bundle', 'create', '--version=2', '-', 'HEAD', cap=candidate.MAX_BUNDLE)
     except (OSError, ValueError, subprocess.SubprocessError):
         raise ValueError('The acquisition cannot produce the bounded Git bundle used to initialize both roles.') from None
+    header = b'# v2 git bundle\n' + commit.encode('ascii') + b' HEAD\n\nPACK'
+    p.require(bundle.startswith(header), 'The Git bundle does not contain the exact approved acquisition.')
+    return bundle
 
 
 def verify_acquired_git(git, checkout, approval, *, checklist):
@@ -223,15 +226,23 @@ class Intake:
                       'The approved repository workload policy is invalid.')
         return repositories, slots
 
-    def source(self, repository, config, *, checklist=True):
+    def source(self, repository, config, *, checklist=True, include_bundle=False):
+        from owner_source import require_private_directory
+
+        require_private_directory(self.site)
         base = self.site / 'repositories' / repository
         checkout = protect_directory(base / 'acquired')
         startup = protect_directory(base / 'startup')
         cache = protect_directory(self.site / 'standards')
-        tree, startup_sha = self.verify_source(repository, config, checkout, startup, cache, checklist=checklist)
-        return checkout, startup, cache, tree, startup_sha
+        tree, startup_sha, bundle = self.verify_source(repository, config, checkout, startup, cache, checklist=checklist)
+        result = (checkout, startup, cache, tree, startup_sha)
+        return (*result, bundle) if include_bundle else result
 
     def verify_source(self, repository, config, checkout, startup, cache, *, checklist):
+        from owner_source import private_standards
+
+        if private_standards(cache):
+            raise FileNotFoundError('The exact private standards cache is incomplete.')
         checked_file(checkout / '.git/config', 8192)
         commit = config['commit']
         tree = fixed_git(checkout, 'rev-parse', '--verify', commit + '^{tree}').decode().strip()
@@ -240,7 +251,7 @@ class Intake:
                             {'repository': repository, 'acquired_commit': commit, 'acquired_tree': tree},
                             checklist=checklist)
         corpus = load_private(startup, cache, config['startup_revision'], time.monotonic() + 20)
-        return tree, p.sha256(manifest_bytes(corpus.manifest))
+        return tree, p.sha256(manifest_bytes(corpus.manifest)), verify_bundle(checkout, commit)
 
     def release_slots(self):
         import renewal
@@ -605,10 +616,10 @@ class Intake:
                   p.identity(preview) == record['agreement_token'] and plan['job_id'] == job,
                   'Confirmed agreement identity changed.')
         plan_path = self.queue / (job + '.plan')
-        exact_private(plan_path, p.canonical(plan).encode())
         if os.path.lexists(self.catalogue / 'jobs' / job):
             # A previous preparation got as far as J publication. The product
             # entry verifies the original plan and owns resumption from here.
+            exact_private(plan_path, p.canonical(plan).encode())
             self.submit_product(plan_path, job, plan)
             return
 
@@ -630,12 +641,13 @@ class Intake:
             settings, roles, proofs, seeds = self.slot(job, admitted[job])
             p.require(p.identity([settings, roles, seeds, config]) == preview['site_profile_sha256'],
                       'The site scope or limits have changed. A new agreement is required.')
-            checkout, startup, cache, tree, startup_sha = self.source(repository, config, checklist=workload == CHECKLIST)
+            checkout, startup, cache, tree, startup_sha, bundle = self.source(
+                repository, config, checklist=workload == CHECKLIST, include_bundle=True)
             p.require((tree, startup_sha) == (preview['source_tree'], plan['startup_sha256']),
                       'The verified source or startup documents have changed.')
+            exact_private(plan_path, p.canonical(plan).encode())
             approval = self.approve(plan, checkout, startup, cache, config['startup_revision'], tree)
             allowance = self.allowance(plan, settings, proofs)
-            bundle = fixed_git(checkout, 'bundle', 'create', '-', 'HEAD', cap=candidate.MAX_BUNDLE)
             for role, profile in roles.items():
                 selection = dict(job=job, repository=repository, agreement_sha256=product.agreement_sha(plan),
                                  model=MODEL, effort=billing.EFFORT)
@@ -1022,22 +1034,16 @@ def verify_startup_adoption(repository, startup, revision):
 
 
 def first_source(intake, repository, workload):
-    from owner_source import private_standards, require_private_directory
-
     tree = intake.site / 'repositories' / repository
     try:
-        require_private_directory(intake.site)
         acquired = protect_directory(tree / 'acquired')
         startup = protect_directory(tree / 'startup')
         config = {key: fixed_git(path, 'rev-parse', '--verify', 'HEAD').decode().strip()
                   for key, path in (('commit', acquired), ('startup_revision', startup))}
         for value in config.values():
             p.digest(value, 40)
-        if private_standards(intake.site / 'standards'):
-            raise FileNotFoundError()
         verify_startup_adoption(repository, startup, config['startup_revision'])
         _, _, _, source_tree, startup_sha = intake.source(repository, config, checklist=workload == CHECKLIST)
-        verify_bundle(acquired)
     except FileNotFoundError as exc:
         raise SitePending('owner-repository-inputs', 'Run the attended owner setup or source recovery to provision the approved checkout and pinned startup inputs.') from exc
     return config, source_tree, startup_sha

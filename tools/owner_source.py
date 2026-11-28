@@ -180,8 +180,6 @@ def checkout_exact(checkout, repository, revision, *, acquired, secret):
     owner.fixed_git(checkout, '-c', 'core.fsync=all', 'checkout', '--detach', '--no-recurse-submodules', revision)
     p.require(not owner.fixed_git(checkout, 'status', '--porcelain=v1', '--untracked-files=all'),
               'The provisioned checkout is not clean.')
-    if acquired:
-        owner.verify_bundle(checkout)
     for folder, _, names in os.walk(checkout, topdown=False):
         for name in names:
             path = Path(folder) / name
@@ -335,8 +333,6 @@ def provision(intake, repository, workload, ask, say, *, approved=None):
         paths, retained, cache, missing_standards = existing_inputs(intake.site, repository)
         p.require(all(config[key] == value for key, value in retained.items()),
                   'A retained checkout differs from the approved Git commit. Preserve it for review.')
-        if 'commit' in retained:
-            owner.verify_bundle(paths['acquired'])
         credentials = {}
         if len(retained) != len(CHECKOUTS):
             credentials[repository] = select_credential(repository, ask)
@@ -358,7 +354,6 @@ def provision(intake, repository, workload, ask, say, *, approved=None):
                 if replace:
                     store_credential(origin, secret)
             publish(stage, paths, retained, cache, missing_standards)
-        owner.first_source(intake, repository, workload)
     say('The approved source, startup documents and private standards are ready.')
     return True
 
