@@ -4,6 +4,9 @@ from contextlib import contextmanager
 import fcntl
 import os
 from pathlib import Path
+import pwd
+import re
+import runpy
 import stat
 import subprocess
 import time
@@ -428,6 +431,160 @@ def apply(controller, operation, *, kit_source=None):
     return controller.apply(SCOPE)
 
 
+def pending_review(observer):
+    recover = getattr(observer, 'recover_request', None)
+    return (recover() if recover is not None else None) or observer.request()
+
+
+def enroll_stable_reviewer(host, fingerprint, incoming):
+    from bootstrap import SIGNER_TRUST_LOCK
+    from destination_observation import STABLE_TRUST, bounded_file, stable_host_trust, stable_signer
+
+    p.require(re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', fingerprint) is not None,
+              'the separately supplied stable reviewer fingerprint is required')
+    line = incoming.readline(1025)
+    p.require(line.endswith('\n') and len(line) <= 1024, 'paste the authorized stable reviewer public key')
+    public = host.observer_public_key(line)
+    p.require(host.signer_fingerprint(public) == fingerprint, 'stable reviewer key differs from its authorized fingerprint')
+    material = public.split()[1].encode()
+    with host.lock(SIGNER_TRUST_LOCK):
+        p.require(material not in bounded_file(host.signer_trust_file(), 16384).split(),
+                  'stable reviewed authority must be outside all other host signing grants')
+        host.atomic(STABLE_TRUST, stable_signer(public).decode('ascii'), mode=0o600)
+        stable_host_trust(host)
+    return {'phase': 'stable-reviewer-enrolled', 'fingerprint': fingerprint}
+
+
+def broker_unit(request):
+    p.digest(request)
+    return 'dev-pair-stable-' + request
+
+
+def system_command(*args, allowed=(0,)):
+    completed = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                               timeout=15, env={'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C.UTF-8'}, check=False)
+    p.require(completed.returncode in allowed and len(completed.stdout) <= 16384,
+              'the exact stable access gateway operation was unavailable')
+    return completed.stdout.decode()
+
+
+def start_observer(bundle, request, pending, *, command=system_command):
+    from systemd_service_profile import exec_start_matches, manager_properties
+
+    directory = broker_unit(request)
+    unit = directory + '.service'
+    script = str(bundle / 'runtime/renewal/agent-observer')
+    argv = ('/usr/bin/python3', '-IB', script, 'stable-listen', request)
+    properties = ('LoadState', 'ActiveState', 'Type', 'User', 'Group', 'ExecStart', 'RuntimeDirectory')
+
+    def show():
+        raw = command('/usr/bin/systemctl', 'show', '--all', '--property=' + ','.join(properties), unit)
+        return manager_properties(raw, properties)
+
+    loaded = command('/usr/bin/systemctl', 'show', '--all', '--property=LoadState', '--value', unit,
+                     allowed=(0, 1, 4)).strip()
+    if loaded == 'not-found':
+        remaining = pending['candidate']['requested_at'] + 3600 - int(time.time())
+        p.require(0 < remaining <= 3600, 'the exact stable access window expired')
+        command('/usr/bin/systemd-run', '--quiet', '--collect', '--service-type=exec', '--unit=' + unit,
+                '--property=User=root', '--property=Group=root', '--property=UMask=0077',
+                '--property=RuntimeDirectory=' + directory, '--property=RuntimeDirectoryMode=0755',
+                '--property=RuntimeDirectoryPreserve=no', '--property=RuntimeMaxSec=' + str(remaining),
+                '--property=TimeoutStopSec=15s', '--property=KillMode=control-group',
+                '--property=MemoryMax=1G', '--property=TasksMax=384', *argv)
+    row = show()
+    p.require(row['LoadState'] == 'loaded' and row['ActiveState'] in ('active', 'activating') and row['Type'] == 'exec'
+              and (row['User'], row['Group'], row['RuntimeDirectory']) == ('root', 'root', directory)
+              and exec_start_matches(row['ExecStart'], ' '.join(argv)),
+              'the loaded stable access gateway differs from the exact allowed operation')
+    path = Path('/run') / directory / 'observer'
+    until = time.monotonic() + 5
+    while not os.path.lexists(path):
+        p.require(time.monotonic() < until, 'the exact stable access socket could not be observed')
+        time.sleep(.05)
+    parent, leaf = path.parent.lstat(), path.lstat()
+    p.require(stat.S_ISDIR(parent.st_mode) and parent.st_uid == 0 and not parent.st_mode & 0o022
+              and stat.S_ISSOCK(leaf.st_mode) and (leaf.st_uid, leaf.st_gid) == (0, pwd.getpwnam('core').pw_gid)
+              and stat.S_IMODE(leaf.st_mode) == 0o660,
+              'the stable access socket has different protected ownership')
+    return unit
+
+
+def poll_access(controller, *, kit_source=None):
+    from bootstrap import Blocked
+    from day0_access_exchange import ExchangeUnavailable, exchange
+    from destination_observation import encoding, stable_host_trust
+
+    with controller.lock():
+        observer = access(controller)
+        pending = pending_review(observer)
+        reference = pending['role_artifacts']['release_sha256']
+        grant = for_release(controller, reference)
+        match_kit_bundle(controller, grant, kit_source)
+        raw = encoding(pending)
+        request_id = r.sha(raw)
+        operation = pending['candidate']['operation']
+        result = {'phase': 'awaiting-independent-stable-access', 'operation': operation, 'request_id': request_id}
+        try:
+            stable_host_trust(observer.host)
+        except FileNotFoundError:
+            return {**result, 'access_state': 'stable-reviewer-trust-required'}
+        try:
+            observer.fresh(reference, pending['candidate']['previous_release_sha256'], operation, expected=pending)
+        except (Blocked, OSError, ValueError):
+            bundle = host_bundle(controller, grant)
+        else:
+            return {**result, 'phase': 'stable-access-preapproved'}
+    unit = start_observer(bundle, request_id, pending)
+    try:
+        response = exchange(raw)
+    except ExchangeUnavailable:
+        return {**result, 'access_state': 'station-unavailable'}
+    if response is None:
+        return {**result, 'access_state': 'waiting-for-independent-approval'}
+    with controller.lock():
+        observer.receive(response, pending)
+    # The confirmed proof is durable. Failure to stop the scoped broker leaves
+    # only a fixed deadline, local socket and already-spent challenge budget.
+    try:
+        system_command('/usr/bin/systemctl', 'stop', unit)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return {**result, 'phase': 'stable-access-preapproved'}
+
+
+def apply_with_access(controller, operation, *, kit_source=None):
+    with controller.lock():
+        attempt, state = controller.transition()
+        if state is not None and state['request']['operation'] == operation:
+            recover = getattr(access(controller), 'recover_request', None)
+            poll = (recover is not None and recover() is not None
+                    if state['phase'] not in r.TERMINAL or controller.unfinished_thaw(attempt, state) else
+                    state['phase'] == 'deferred')
+        else:
+            offer = s.offer_record(r.read_json(controller.control / OFFER), SCOPE)
+            r.require(offer['operation'] == operation, 'confirm the exact prepared stable maintenance window')
+            poll = True
+    if poll:
+        report = poll_access(controller, kit_source=kit_source)
+        if report['phase'] != 'stable-access-preapproved':
+            return report
+    return apply(controller, operation, kit_source=kit_source)
+
+
+def named_access_probe(controller, grant, pending, role):
+    from bootstrap import Bootstrap
+
+    host = Bootstrap()
+    # The SSH tuple remains in the authenticated command process. The gate
+    # checks sshd ancestry, an owned established socket, and its actual route.
+    driver = runpy.run_path(str(reviewed_driver(controller, grant).path))['access_probe']
+    with p.workload_access_lease(controller.root):
+        return driver({'role': role, 'source_sha': pending['source_sha'],
+                       'candidate': pending['role_artifacts']['release_sha256']}, candidate=True,
+                      stable=True, peer_reader=host.observed_ssh_peer)
+
+
 def main():
     import sys
 
@@ -446,8 +603,11 @@ def main():
     observation.add_argument('--role', required=True, choices=r.ROLES)
     activate = actions.add_parser('apply')
     activate.add_argument('--operation', required=True)
+    actions.add_parser('access-status', help='send or poll through the enrolled independent station')
+    trust = actions.add_parser('reviewer-trust', help='pin the independently supplied stable review key')
+    trust.add_argument('--fingerprint', required=True)
     args = parser.parse_args()
-    from bootstrap import Blocked
+    from bootstrap import Blocked, Bootstrap
     from commission_host import Blocked as CommissionBlocked
     from destination_observation import MAX_ACCESS_ENVELOPE
 
@@ -456,25 +616,28 @@ def main():
         os.umask(0o077)
         confirm_kit_source(args.kit_source_sha)
         controller = r.Renewal(r.DEFAULT_ROOT, r.SiteDriver(r.DEFAULT_DRIVER), ledger_user=r.LEDGER_USER)
-        if args.action in ('prepare', 'apply'):
+        if args.action == 'reviewer-trust':
+            result = enroll_stable_reviewer(Bootstrap(), args.fingerprint, sys.stdin)
+        elif args.action in ('prepare', 'apply'):
             with lease(controller):
                 if args.action == 'prepare':
                     result = prepare(controller, args.reason, source=args.source_sha, run=args.run_id,
                                      platform=args.platform_sha256, kit_source=args.kit_source_sha)
+                    result['access_review'] = poll_access(controller, kit_source=args.kit_source_sha)
                 else:
                     p.token(args.operation)
-                    result = apply(controller, args.operation, kit_source=args.kit_source_sha)
+                    result = apply_with_access(controller, args.operation, kit_source=args.kit_source_sha)
+        elif args.action == 'access-status':
+            result = poll_access(controller, kit_source=args.kit_source_sha)
         elif args.action == 'access-probe':
             pending = access(controller).request()
             grant = for_release(controller, pending['role_artifacts']['release_sha256'])
             match_kit_bundle(controller, grant, args.kit_source_sha)
-            controller.driver = reviewed_driver(controller, grant)
-            result = controller.driver.invoke('stable-access-probe', {'role': args.role, 'source_sha': pending['source_sha'],
-                                                                      'candidate': pending['role_artifacts']['release_sha256']})
+            result = named_access_probe(controller, grant, pending, args.role)
         else:
             with controller.lock():
                 observer = access(controller)
-                pending = observer.request()
+                pending = pending_review(observer)
                 match_kit_bundle(controller, for_release(controller, pending['role_artifacts']['release_sha256']),
                                  args.kit_source_sha)
                 if args.action == 'access-request':

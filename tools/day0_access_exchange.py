@@ -22,7 +22,7 @@ import time
 sys.path.insert(0, str(Path(__file__).absolute().parent))
 
 from bootstrap import Blocked, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, relay, validate_public_keys
-from destination_observation import (AGENT_CANDIDATE, CORE_BINDING, MAX_ACCESS_ENVELOPE, bounded_file, encoding,
+from destination_observation import (CANDIDATE_KINDS, CORE_BINDING, MAX_ACCESS_ENVELOPE, bounded_file, encoding,
                                      read_access_envelope, state_dir, verify_station_response)
 
 CONFIG = Path('/etc/dev-pair/day0/access-exchange.json')
@@ -31,7 +31,7 @@ IDENTITY = CONFIG.with_name('access-exchange-ed25519')
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'}
 ACCESS_PRINCIPAL = 'dev-pair-access-review'
 ACCESS_NAMESPACE = 'dev-pair-destination'
-KINDS = {CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, 'agent-workload-candidate'}
+KINDS = {CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, *CANDIDATE_KINDS}
 RANGES = (ipaddress.ip_network('100.64.0.0/10'), ipaddress.ip_network('fd7a:115c:a1e0::/48'))
 REQUEST_LIMIT = 16384
 MAILBOX_LIMIT = 64
@@ -286,7 +286,7 @@ def publish(mailbox, name, incoming, now):
         existing = current_response(target, request, now)
         require(existing is None or existing == response, 'An unexpired response already exists for this request.')
         if existing is None:
-            if request['kind'] == AGENT_CANDIDATE:
+            if request['kind'] in CANDIDATE_KINDS:
                 verify_station_response(response, request)
             store(target, response)
 

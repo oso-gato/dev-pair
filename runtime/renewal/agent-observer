@@ -4,6 +4,7 @@ import io
 import os
 from pathlib import Path
 import pwd
+import re
 import runpy
 import socket
 import struct
@@ -12,10 +13,12 @@ import sys
 import time
 
 INSTALL = Path('/usr/libexec/dev-pair')
-sys.path.insert(0, str(INSTALL / 'tools'))
+BUNDLE = Path(__file__).absolute().parents[2]
+SOURCE = BUNDLE if BUNDLE.parent == INSTALL / 'host-releases' and re.fullmatch('[0-9a-f]{64}', BUNDLE.name) else INSTALL
+sys.path.insert(0, str(SOURCE / 'tools'))
 from bootstrap import Blocked, Bootstrap
-from destination_observation import (MAX_ACCESS_ENVELOPE, agent_probe_challenge, encoding, keys,
-                                     read_access_envelope, require, verify_agent_observer)
+from destination_observation import (MAX_ACCESS_ENVELOPE, agent_probe_challenge, encoding, keys, read_access_envelope,
+                                     require, stable_approval, stable_challenge, stable_host_trust, verify_agent_observer)
 import renewal as r
 
 SOCKET = '/run/dev-pair-agent-observer.sock'
@@ -29,20 +32,26 @@ def read_bounded(stream, limit):
     return raw
 
 
-def client():
+def stable_socket(request):
+    r.digest(request)
+    return Path('/run') / ('dev-pair-stable-' + request) / 'observer'
+
+
+def client(path=SOCKET):
     envelope = read_bounded(sys.stdin.buffer, MAX_ACCESS_ENVELOPE)
     transport = {key: os.environ[key] for key in ('SSH_CONNECTION', 'SSH_CLIENT') if key in os.environ}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
         channel.settimeout(650)
-        channel.connect(SOCKET)
+        channel.connect(str(path))
         channel.sendall(encoding({'transport': transport, 'envelope': envelope.decode('ascii')}))
         channel.shutdown(socket.SHUT_WR)
         with channel.makefile('rb') as source:
             sys.stdout.buffer.write(read_bounded(source, MAX_RESULT))
 
 
-def reserve_attempt(root, pending, challenge):
-    path = root / 'renewal' / 'agent-observation-probes.json'
+def reserve_attempt(root, pending, challenge, *, stable=False):
+    scope = 'stable' if stable else 'agent'
+    path = root / 'renewal' / (scope + '-observation-probes.json')
     request_sha = r.identity(pending)
     row = r.read_json(path) if os.path.lexists(path) else {'request_sha256': None, 'attempts': {}}
     keys(row, {'request_sha256', 'attempts'})
@@ -57,7 +66,7 @@ def reserve_attempt(root, pending, challenge):
     r.replace_json(path, {'request_sha256': request_sha, 'attempts': attempts})
 
 
-def serve(channel):
+def serve(channel, *, stable_request=None):
     pid, uid, _ = struct.unpack('3i', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
     require(pid > 1 and uid == pwd.getpwnam('core').pw_uid, 'named core SSH client required')
     channel.settimeout(5)
@@ -71,12 +80,18 @@ def serve(channel):
     payload, signature = read_access_envelope(io.BytesIO(request['envelope'].encode('ascii')))
     host = Bootstrap()
     challenge, commitment = verify_agent_observer(payload, signature, host)
-    agent_probe_challenge(challenge)
+    if stable_request is None:
+        agent_probe_challenge(challenge)
+    else:
+        approval = stable_challenge(challenge)
+        require(challenge['request_sha256'] == stable_request,
+                'stable gateway grants probes for one exact maintenance window')
     require(int(time.time()) < challenge['expires_at'] <= int(time.time()) + 120,
             'signed probe challenge is outside its two-minute start window')
     from platform_release_intake import protected
 
-    driver = runpy.run_path(str(protected(INSTALL / 'renewal' / 'driver')))['access_probe']
+    driver_path = INSTALL / 'renewal' / 'driver' if stable_request is None else SOURCE / 'runtime/renewal/driver'
+    driver = runpy.run_path(str(protected(driver_path)))['access_probe']
 
     def peer():
         return host.observed_ssh_peer(client_pid=pid, transport=request['transport'])
@@ -86,23 +101,70 @@ def serve(channel):
                 observed_peer['local'] == pending['tailnet_addresses'][challenge['family']] and
                 int(time.time()) < challenge['expires_at'],
                 'signed challenge does not select this pending candidate or SSH family')
-        reserve_attempt(r.DEFAULT_ROOT, pending, challenge)
+        if stable_request is not None:
+            stable_approval(approval, pending, stable_host_trust(host), int(time.time()))
+        reserve_attempt(r.DEFAULT_ROOT, pending, challenge, **({'stable': True} if stable_request is not None else {}))
 
     with r.protocol.workload_access_lease(r.DEFAULT_ROOT):
         result = driver({key: challenge[key] for key in ('role', 'source_sha', 'candidate')},
-                        candidate=True, peer_reader=peer, challenge=admit)
+                        candidate=True, peer_reader=peer, challenge=admit,
+                        **({'stable': True} if stable_request is not None else {}))
     channel.sendall(encoding({**result, 'challenge_sha256': commitment}))
+
+
+def stable_listen(request):
+    from stable_renewal import access, for_release, host_bundle
+    from platform_release_intake import protected
+
+    require(SOURCE != INSTALL, 'stable gateway requires the exact signed versioned host entry')
+    controller = r.Renewal(r.DEFAULT_ROOT, None)
+    with controller.lock(shared=True):
+        pending = access(controller).request()
+        approval = for_release(controller, pending['role_artifacts']['release_sha256'])
+        require(r.sha(encoding(pending)) == request and host_bundle(controller, approval) == SOURCE,
+                'stable gateway differs from the approved operation or immutable host bundle')
+    path = stable_socket(request)
+    protected(path.parent, directory=True)
+    require(not os.path.lexists(path), 'stable socket path was already occupied')
+    uid = pwd.getpwnam('core')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(str(path))
+        os.chown(path, 0, uid.pw_gid, follow_symlinks=False)
+        path.chmod(0o660)
+        listener.listen(2)
+        deadline = pending['candidate']['requested_at'] + 3600
+        for _ in range(16):
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            listener.settimeout(left)
+            try:
+                channel, _ = listener.accept()
+            except TimeoutError:
+                break
+            with channel:
+                try:
+                    serve(channel, stable_request=request)
+                except (Blocked, OSError, ValueError, TypeError, KeyError, UnicodeError, subprocess.SubprocessError):
+                    print('Stable candidate probe withheld.', file=sys.stderr)
 
 
 def main():
     try:
-        require(len(sys.argv) == 2 and sys.argv[1] in ('client', 'serve'), 'fixed candidate observer invocation required')
+        require((len(sys.argv) == 2 and sys.argv[1] in ('client', 'serve')) or
+                (len(sys.argv) == 3 and sys.argv[1] in ('stable-client', 'stable-listen')),
+                'fixed candidate observer invocation required')
         if sys.argv[1] == 'client':
             client()
+        elif sys.argv[1] == 'stable-client':
+            client(stable_socket(sys.argv[2]))
         else:
             require(os.getuid() == os.geteuid() == 0, 'protected candidate observation broker required')
-            with socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                serve(channel)
+            if sys.argv[1] == 'stable-listen':
+                stable_listen(sys.argv[2])
+            else:
+                with socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                    serve(channel)
     except (Blocked, OSError, ValueError, TypeError, KeyError, UnicodeError, subprocess.SubprocessError):
         print('Candidate probe unavailable. Inspect the protected observation and route.', file=sys.stderr)
         return 2

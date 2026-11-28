@@ -423,7 +423,12 @@ class IndependentStableAccess(unittest.TestCase):
             self.assertEqual(hashlib.sha256(retained.read_bytes()).hexdigest(), before)
             self.assertEqual(r.read_json(observer.pending), origin)
 
-    def test_signed_agent_statement_cannot_authorize_an_exact_stable_candidate(self):
+    def test_daily_collector_cannot_approve_the_exact_stable_window(self):
+        from base64 import b64encode
+        from io import BytesIO
+
+        import day0_access_exchange as courier
+
         fixture = access_fixture.CandidateObservation()
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
@@ -433,31 +438,66 @@ class IndependentStableAccess(unittest.TestCase):
         fixture.releases[target]['components']['devbox']['artifact_sha256'] = '9' * 64
         observer = site.CandidateAccess(fixture.controller, fixture.host, kind=observation.STABLE_CANDIDATE)
         grant = {'previous_release_sha256': old, 'operation': operation}
-        with patch.object(stable, 'for_release', return_value=grant):
+        plan_key = fixture.gen_key('attended-plan')
+        stable_trust = observation.stable_signer(plan_key.with_suffix('.pub').read_text())
+        with patch.object(stable, 'for_release', return_value=grant), \
+                patch.object(observation, 'stable_host_trust', return_value=stable_trust):
             pending = observer.prepare(grant, target)
             now = int(time.time())
-            plan = bootstrap.Bootstrap.access_probe_plan(fixture.route['dns_name'], fixture.guard['provider_recovery'],
-                                                         fixture.guard['public_addresses'])
-            probes = [{'test': test, 'family': family, 'endpoint': endpoint, 'vantage': vantage,
-                       'client_id': 'client-' + vantage, 'outcome': outcome, 'observed_at': now, 'evidence_sha256': 'e' * 64}
-                      for (test, family), (endpoint, vantage, outcome) in plan.items()]
-            fixture.host.access_probe_plan.return_value = plan
-            fixture.host.verify_access_probes.side_effect = bootstrap.Bootstrap().verify_access_probes
+            raw = observation.encoding(pending)
+            request_id = r.sha(raw)
+            approval = {'kind': 'approve-stable-workload', 'version': 1, 'request_sha256': request_id,
+                        'machine_id': pending['machine_id'], 'boot_id': pending['boot_id'],
+                        'approved_at': now, 'expires_at': pending['candidate']['requested_at'] + 3600}
+
+            def sign(value, signer, namespace):
+                payload = observation.encoding(value)
+                return payload, subprocess.check_output(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(signer),
+                    '-n', namespace], input=payload, stderr=subprocess.DEVNULL, timeout=5)
+
+            probes = []
+            for role in observation.AGENT_ROLES:
+                for family in observation.FAMILIES:
+                    reading = observation.expected_role_probe(pending, role + '-authorized', family)
+                    reading.update(challenge_sha256=r.identity([role, family]), runtime_result_sha256='7' * 64)
+                    probes.append({'role': role, 'family': family, 'reading': reading, 'observed_at': now})
+            _, collector = sign({'request_sha256': request_id, 'readings': probes}, fixture.authorized,
+                                observation.NAMESPACE)
+            policy = {'method': 'tailscale-policy-api-v2', 'sha256': fixture.guard['acl_sha256'],
+                      'request_sha256': request_id, 'boot_id': pending['boot_id'], 'observed_at': now}
             body = {key: value for key, value in pending.items() if key != 'job_id'}
             body.update(issued_at=now, expires_at=now + 300, probes=probes, execution_route='tailnet-core',
                         acl_sha256=fixture.guard['acl_sha256'], provider_recovery=fixture.guard['provider_recovery'],
-                        public_addresses=fixture.guard['public_addresses'])
+                        public_addresses=fixture.guard['public_addresses'], observation='named-stable-challenges',
+                        collector_signature=b64encode(collector).decode(), policy_measurement=policy)
 
-            def wire(value):
-                payload = observation.encoding(value)
-                signature = subprocess.check_output(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(fixture.reviewer),
-                                                     '-n', observation.FINAL_NAMESPACE], input=payload,
-                                                    stderr=subprocess.DEVNULL, timeout=5)
-                return observation.access_envelope(payload, signature)
+            def wire(approver):
+                approval_wire = observation.access_envelope(*sign(approval, approver, observation.STABLE_NAMESPACE))
+                complete = {**body, 'stable_approval': b64encode(approval_wire).decode()}
+                return observation.access_envelope(*sign(complete, fixture.reviewer, observation.FINAL_NAMESPACE))
 
-            with self.assertRaisesRegex(ValueError, 'differs from the live site'):
-                observer.receive(wire({**body, 'kind': observation.AGENT_CANDIDATE}), pending)
-            observer.receive(wire(body), pending)
+            nightly = {**body, 'observation': 'named-candidate-challenges'}
+            with self.assertRaisesRegex(ValueError, 'distinct attended'):
+                observer.receive(observation.access_envelope(*sign(nightly, fixture.reviewer, observation.FINAL_NAMESPACE)), pending)
+            with self.assertRaisesRegex(bootstrap.Blocked, 'invalid independent signature'):
+                observer.receive(wire(fixture.reviewer), pending)
+            response = wire(plan_key)
+            mailbox = fixture.root / 'mailbox'
+            mailbox.mkdir(mode=0o700)
+            command = 'day0-access-v1 ' + request_id
+            waiting = BytesIO()
+            courier.receive(mailbox, command, BytesIO(raw), waiting, now)
+            self.assertEqual(waiting.getvalue(), b'')
+            with patch.object(observation, 'stable_station_trust', return_value=stable_trust), \
+                    patch.object(observation, 'station_signing', return_value={
+                        'reviewer_key': fixture.reviewer, 'collector_key': fixture.authorized}), \
+                    patch.object(observation, 'current_station_signer', side_effect=lambda key, namespace:
+                        ('dev-pair-access-review' if key == fixture.reviewer else 'dev-pair-observer-authorized',
+                         fixture.signers)):
+                courier.publish(mailbox, request_id, BytesIO(response), now)
+            received = BytesIO()
+            courier.receive(mailbox, command, BytesIO(raw), received, now)
+            observer.receive(received.getvalue(), pending)
             self.assertIsNone(observer.admitted(target, fixture.guard))
             self.assertFalse(fixture.access.proof_path(target).exists())
             fixture.journal = {'phase': 'applying', 'request': {'scope': 'stable', 'target_sha256': target,

@@ -720,7 +720,16 @@ def access_probe(payload, *, candidate=False, stable=False, peer_reader=None, ch
         if stable:
             from stable_renewal import for_release, host_bundle
 
-            live_host(controller.release(controller.live_release())['components']['host'])
+            recovery = getattr(observer, 'recovery_context', lambda: None)()
+            if recovery is None:
+                live_host(controller.release(controller.live_release())['components']['host'])
+            else:
+                _, journal, _ = recovery
+                current_host = r.read_json(CONTROL / 'host-selection.json')
+                allowed = [controller.release(journal['request'][name])['components']['host']
+                           for name in ('previous_sha256', 'target_sha256')]
+                r.require(current_host in allowed, 'stable recovery selected a foreign host artifact')
+                live_host(current_host)
             bundle = host_bundle(controller, for_release(controller, selection['release_sha256']))
         else:
             bundle, _ = live_host(release['components']['host'])

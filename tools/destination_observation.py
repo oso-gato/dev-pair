@@ -71,6 +71,10 @@ CORE_SITE = SITE | {'tailnet', 'acl_sha256', 'execution_route'}
 AGENT_CANDIDATE = 'agent-workload-candidate'
 STABLE_CANDIDATE = 'stable-workload-candidate'
 CANDIDATE_KINDS = {AGENT_CANDIDATE, STABLE_CANDIDATE}
+STABLE_REVIEWER = 'dev-pair-stable-review'
+STABLE_NAMESPACE = 'dev-pair-stable-workload'
+STABLE_TRUST = '/etc/dev-pair/stable-access-allowed-signers'
+STABLE_PREFIX = f'{STABLE_REVIEWER} namespaces="{STABLE_NAMESPACE}" '
 AGENT_ROLES = ('maintenance', 'development')
 AGENT_SITE_FIELDS = {'version', 'source_sha', 'machine_id', 'dns_name', 'tailnet', 'node_id', 'tailnet_addresses',
                      'keys_sha256', 'guard_sha256', 'acl_sha256', 'host_artifact_sha256', 'devbox_image',
@@ -193,6 +197,54 @@ def verify_agent_observer(payload, signature, host):
     scoped = host.agent_observer_signers()
     require(scoped, 'the independent agent collector key is unavailable or withdrawn')
     return verify_bytes(payload, signature, AGENT_OBSERVER_PRINCIPAL, scoped, AGENT_OBSERVER_NAMESPACE)
+
+
+def stable_signer(public):
+    return (STABLE_PREFIX + Bootstrap.observer_public_key(public) + '\n').encode()
+
+
+def stable_host_trust(host):
+    path = host.path(STABLE_TRUST)
+    raw = bounded_file(checked_file(path, secret=True), 4096)
+    fields = raw.decode('ascii').split()
+    require(len(fields) == 4 and raw == stable_signer(' '.join(fields[2:])),
+            'the independently pinned stable signer has changed')
+    ongoing = bounded_file(host.signer_trust_file(), 16384).split()
+    require(fields[3].encode() not in ongoing, 'stable review requires a key outside every normal or nightly signing grant')
+    return raw
+
+
+def stable_station_trust():
+    entries = bounded_file(configured_signers(), 16384).decode('utf-8').splitlines()
+    name = observer_principal('plan')
+    accepted = [line.split() for line in entries if line.split(None, 1)[:1] == [name]]
+    require(len(accepted) == 1 and len(accepted[0]) >= 4, 'stable review requires the enrolled independent plan signer')
+    trust = stable_signer(' '.join(accepted[0][2:4]))
+    profile = station_signing()
+    reviewer = approved_signer(profile['final_trust'], profile['reviewer_key'], 'dev-pair-access-review', FINAL_NAMESPACE)
+    require(trust.split()[3] not in reviewer.split(), 'the attended stable key is in the nightly final signing grant')
+    return trust
+
+
+def stable_approval(wire, binding, trust, now):
+    payload, signature = read_access_envelope(io.BytesIO(wire))
+    grant, proof = verify_bytes(payload, signature, STABLE_REVIEWER, trust, STABLE_NAMESPACE)
+    keys(grant, {'kind', 'version', 'request_sha256', 'machine_id', 'boot_id', 'approved_at', 'expires_at'})
+    require(binding['kind'] == STABLE_CANDIDATE and grant['kind'] == 'approve-stable-workload' and
+            type(grant['version']) is int and grant['version'] == 1 and grant['request_sha256'] == digest(encoding(binding)) and
+            (grant['machine_id'], grant['boot_id']) == (binding['machine_id'], binding['boot_id']) and
+            all(type(grant[key]) is int for key in ('approved_at', 'expires_at')) and
+            binding['candidate']['requested_at'] <= grant['approved_at'] <= now < grant['expires_at'] <=
+            binding['candidate']['requested_at'] + 3600,
+            'attended stable authorization does not select this exact operation, machine and boot')
+    return grant, proof
+
+
+def stable_challenge(value):
+    keys(value, {'kind', 'role', 'family', 'source_sha', 'candidate', 'request_sha256', 'challenge', 'expires_at', 'approval'})
+    require(value['kind'] == STABLE_CANDIDATE and type(value['approval']) is str, 'stable probe authorization is unavailable')
+    agent_probe_challenge({key: member for key, member in value.items() if key not in ('kind', 'approval')})
+    return base64.b64decode(value['approval'], validate=True)
 
 
 def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):
@@ -806,11 +858,12 @@ def read_access_envelope(stream):
     return payload, signature
 
 
-def candidate_site(binding, site, now):
+def candidate_site(binding, site, now, *, stable=False):
     keys(binding, CORE_BINDING | {'role_artifacts', 'candidate'})
     keys(site, AGENT_SITE_FIELDS)
-    validate_candidate(binding['candidate'])
-    require(binding['kind'] == AGENT_CANDIDATE and binding['job_id'] == 'host-access' and
+    kind = STABLE_CANDIDATE if stable else AGENT_CANDIDATE
+    validate_candidate(binding['candidate'], kind=kind)
+    require(binding['kind'] == kind and binding['job_id'] == 'host-access' and
             type(binding['version']) is int and binding['version'] == 1 and canonical_uuid(binding['boot_id']) and
             matches(DNS, binding['dns_name']) and 0 <= now - binding['candidate']['requested_at'] < 3600,
             'candidate request is unsupported, stale or for a different destination')
@@ -820,7 +873,10 @@ def candidate_site(binding, site, now):
             binding['role_artifacts']['release_sha256'] != binding['candidate']['previous_release_sha256'],
             'candidate request lacks a prospective exact role selection')
     measured = {**binding, **binding['candidate'], 'devbox_image': binding['role_artifacts']['devbox_image']}
-    require(all(measured[key] == site[key] for key in AGENT_SITE_FIELDS - {'provider_recovery', 'public_addresses'}),
+    fields = AGENT_SITE_FIELDS - {'provider_recovery', 'public_addresses'}
+    if stable:
+        fields -= {'host_artifact_sha256', 'devbox_image'}
+    require(all(measured[key] == site[key] for key in fields),
             'candidate changes an independently admitted ingress or stable runtime control')
     keys(site['public_addresses'], set(FAMILIES))
     for family in FAMILIES:
@@ -941,7 +997,13 @@ def ssh_candidate_probe(binding, family, payload, identity, known_hosts):
     command = ['/usr/bin/ssh', '-F', '/dev/null', '-4' if family == 'ipv4' else '-6', '-i', str(checked_file(identity))]
     for option in options:
         command.extend(('-o', option))
-    command.extend(('--', 'core@' + binding['tailnet_addresses'][family], AGENT_CLIENT_COMMAND))
+    remote = AGENT_CLIENT_COMMAND
+    if binding['kind'] == STABLE_CANDIDATE:
+        host = binding['candidate']['host_artifact_sha256']
+        require(matches(DIGEST, host), 'stable access probe requires the exact staged host artifact')
+        remote = (f'/usr/bin/python3 -IB /usr/libexec/dev-pair/host-releases/{host}/'
+                  f'runtime/renewal/agent-observer stable-client {digest(encoding(binding))}')
+    command.extend(('--', 'core@' + binding['tailnet_addresses'][family], remote))
     deadline = time.monotonic() + 660
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
         try:
@@ -986,8 +1048,11 @@ def checked_candidate_readings(binding, readings, now, *, complete=True):
     require(not complete or seen == expected, 'candidate observation requires both roles on both named routes')
 
 
-def collect_candidate(binding, site, directory, identity, known_hosts, signer):
-    candidate_site(binding, site, int(time.time()))
+def collect_candidate(binding, site, directory, identity, known_hosts, signer, *, approval=None):
+    now = int(time.time())
+    candidate_site(binding, site, now, stable=approval is not None)
+    if approval is not None:
+        stable_approval(approval, binding, stable_station_trust(), now)
     current_station_signer(signer, NAMESPACE)
     request_sha = digest(encoding(binding))
     directory = state_dir(directory)
@@ -1005,6 +1070,8 @@ def collect_candidate(binding, site, directory, identity, known_hosts, signer):
                 challenge = {'role': role, 'family': family, 'source_sha': binding['source_sha'],
                              'candidate': binding['role_artifacts']['release_sha256'], 'request_sha256': request_sha,
                              'challenge': str(uuid.uuid4()), 'expires_at': int(time.time()) + 120}
+                if approval is not None:
+                    challenge.update(kind=STABLE_CANDIDATE, approval=base64.b64encode(approval).decode('ascii'))
                 raw = encoding(challenge)
                 envelope = access_envelope(raw, sign_as_station(raw, signer, NAMESPACE))
                 reading = json.loads(ssh_candidate_probe(binding, family, envelope, identity, known_hosts),
@@ -1019,9 +1086,9 @@ def collect_candidate(binding, site, directory, identity, known_hosts, signer):
     return access_envelope(raw, sign_as_station(raw, signer, NAMESPACE))
 
 
-def assemble_candidate(binding, site, collection, signer, acl_oauth):
+def assemble_candidate(binding, site, collection, signer, acl_oauth, *, approval=None):
     now = int(time.time())
-    candidate_site(binding, site, now)
+    candidate_site(binding, site, now, stable=approval is not None)
     current_station_signer(signer, FINAL_NAMESPACE)
     collector = station_signing()['collector_key']
     principal, trust = current_station_signer(collector, NAMESPACE)
@@ -1034,7 +1101,7 @@ def assemble_candidate(binding, site, collection, signer, acl_oauth):
     policy_sha = measure_tailnet_policy(site['tailnet'], acl_oauth)
     require(policy_sha == site['acl_sha256'], 'Tailscale policy changed since the independent full workload review')
     now = int(time.time())
-    candidate_site(binding, site, now)
+    candidate_site(binding, site, now, stable=approval is not None)
     policy = {'method': 'tailscale-policy-api-v2', 'sha256': policy_sha, 'request_sha256': measured['request_sha256'],
               'boot_id': binding['boot_id'], 'observed_at': now}
     data = {key: value for key, value in binding.items() if key != 'job_id'}
@@ -1042,6 +1109,9 @@ def assemble_candidate(binding, site, collection, signer, acl_oauth):
                 provider_recovery=site['provider_recovery'], public_addresses=site['public_addresses'],
                 probes=measured['readings'], observation='named-candidate-challenges',
                 collector_signature=base64.b64encode(signature).decode('ascii'), policy_measurement=policy)
+    if approval is not None:
+        stable_approval(approval, binding, stable_station_trust(), now)
+        data.update(observation='named-stable-challenges', stable_approval=base64.b64encode(approval).decode('ascii'))
     payload = encoding(data)
     require(current_station_signer(collector, NAMESPACE) == (principal, trust),
             'independent collector trust changed during assembly')
@@ -1057,9 +1127,13 @@ def verify_station_response(wire, binding):
     collector = current_station_signer(profile['collector_key'], NAMESPACE)
     payload, signature = read_access_envelope(io.BytesIO(wire))
     result, _ = verify_bytes(payload, signature, *reviewer, FINAL_NAMESPACE)
-    require(result.get('kind') == AGENT_CANDIDATE and
+    require(binding['kind'] in CANDIDATE_KINDS and result.get('kind') == binding['kind'] and
             all(result.get(field) == value for field, value in binding.items() if field != 'job_id'),
             'signed station response differs from the exact queued candidate')
+    if binding['kind'] == STABLE_CANDIDATE:
+        require(result.get('observation') == 'named-stable-challenges', 'stable station approval requires attended evidence')
+        stable_approval(base64.b64decode(result['stable_approval'], validate=True), binding, stable_station_trust(),
+                        result['issued_at'])
     collected = encoding({'request_sha256': digest(encoding(binding)), 'readings': result['probes']})
     verify_bytes(collected, base64.b64decode(result['collector_signature'], validate=True), *collector, NAMESPACE)
     require(current_station_signer(profile['reviewer_key'], FINAL_NAMESPACE) == reviewer and
@@ -1150,6 +1224,7 @@ def arguments():
         candidate.add_argument('--binding', type=Path, required=True)
         candidate.add_argument('--site', type=Path, required=True)
         candidate.add_argument('--signer', type=Path, required=True)
+        candidate.add_argument('--stable-approval', type=Path)
     collect = stages.add_parser('collect', help='exercise the fixed browser or direct HTTPS check')
     external = stages.add_parser('record-access', help='record a separately authorized observed access transcript')
     for stage in (collect, external):
@@ -1187,11 +1262,14 @@ def main():
         if args.stage in ('collect-candidate', 'assemble-candidate'):
             binding = json.loads(bounded_file(args.binding), object_pairs_hook=relay.unique)
             site = json.loads(bounded_file(checked_file(args.site)), object_pairs_hook=relay.unique)
+            approval = bounded_file(args.stable_approval, MAX_ACCESS_ENVELOPE) if args.stable_approval else None
             if args.stage == 'collect-candidate':
                 require(args.directory is not None, 'select the private exact candidate observation directory')
-                answer = collect_candidate(binding, site, args.directory, args.core_key, args.known_hosts, args.signer)
+                answer = collect_candidate(binding, site, args.directory, args.core_key, args.known_hosts, args.signer,
+                                           **({'approval': approval} if approval is not None else {}))
             else:
-                answer = assemble_candidate(binding, site, args.collection, args.signer, args.acl_oauth)
+                answer = assemble_candidate(binding, site, args.collection, args.signer, args.acl_oauth,
+                                            **({'approval': approval} if approval is not None else {}))
             sys.stdout.buffer.write(answer)
             return 0
         require(args.directory is not None, 'select the private ceremony evidence directory')

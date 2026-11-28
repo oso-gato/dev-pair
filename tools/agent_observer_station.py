@@ -21,9 +21,11 @@ import time
 
 from bootstrap import Blocked, Bootstrap, WORKLOAD_ACCESS_CUTOVER, checked_file, relay
 from destination_observation import (AGENT_CANDIDATE, AGENT_ROLES, FAMILIES, FINAL_NAMESPACE, MAX_ACCESS_ENVELOPE,
-                                     MAX_ACCESS_PART, NAMESPACE, STATION_SIGNING, approved_signer, bounded_file,
+                                     MAX_ACCESS_PART, NAMESPACE, STABLE_CANDIDATE, STABLE_NAMESPACE, STATION_SIGNING,
+                                     access_envelope, approved_signer, bounded_file,
                                      candidate_site, configured_signers, current_station_signer, digest, encoding,
                                      keys, observer_principal, policy_credential, require, state_dir, station_signing,
+                                     sign_observation, stable_approval, stable_station_trust,
                                      verify_bytes, verify_file, verify_station_response, write_once)
 import systemd_service_profile
 
@@ -190,6 +192,10 @@ def reconcile(config, *, caller=call_named, scratch='/run'):
     selected = next_request(config, caller)
     if selected is None:
         return 'awaiting-candidate'
+    return observe_selected(config, selected, caller=caller, scratch=scratch)
+
+
+def observe_selected(config, selected, *, caller, scratch, approval=None):
     tool, request, raw = selected
     collector, reviewer, courier = (config[key] for key in ('collector', 'reviewer', 'courier'))
     observations = collector['observations'] / request
@@ -203,6 +209,11 @@ def reconcile(config, *, caller=call_named, scratch='/run'):
         binding.write_bytes(raw)
         binding.chmod(0o644)
         common = ('--binding', binding, '--site', config['site'])
+        if approval is not None:
+            authorization = directory / 'stable-approval.bundle'
+            authorization.write_bytes(approval)
+            authorization.chmod(0o644)
+            common += ('--stable-approval', authorization)
         collected = caller(
             collector, (*observer, '--directory', observations, 'collect-candidate', *common, '--core-key',
                         collector['core_key'], '--known-hosts', collector['known_hosts'], '--signer', collector['signer']),
@@ -215,6 +226,51 @@ def reconcile(config, *, caller=call_named, scratch='/run'):
     verify_station_response(verified, json.loads(raw, object_pairs_hook=relay.unique))
     caller(courier, (*tool, 'publish', request), data=verified, limit=1024, file_limit=len(verified))
     return 'candidate-observation-published'
+
+
+def approve_stable(config, request, signer, *, caller=call_named, scratch='/run'):
+    require(re.fullmatch(r'[0-9a-f]{64}', request), 'select the exact queued stable operation')
+    courier = config['courier']
+    tool = (PYTHON, '-EBs', TOOLS / 'day0_access_exchange.py', '--mailbox', courier['mailbox'])
+    raw = caller(courier, (*tool, 'export', request), limit=16384)
+    binding = json.loads(raw, object_pairs_hook=relay.unique)
+    site = json.loads(bounded_file(config['site']), object_pairs_hook=relay.unique)
+    now = int(time.time())
+    require(digest(raw) == request and raw == encoding(binding), 'queued stable request bytes changed')
+    candidate_site(binding, site, now, stable=True)
+    trust = stable_station_trust()
+    grant = {'version': 1, 'kind': 'approve-stable-workload', 'request_sha256': request,
+             'machine_id': binding['machine_id'], 'boot_id': binding['boot_id'], 'approved_at': now,
+             'expires_at': binding['candidate']['requested_at'] + 3600}
+    payload = encoding(grant)
+    authorization = access_envelope(payload, sign_observation(payload, checked_file(signer, secret=True), STABLE_NAMESPACE))
+    stable_approval(authorization, binding, trust, now)
+    return observe_selected(config, (tool, request, raw), caller=caller, scratch=scratch, approval=authorization)
+
+
+def stable_pending(config, *, caller=call_named):
+    courier = config['courier']
+    mailbox = courier['mailbox']
+    tool = (PYTHON, '-EBs', TOOLS / 'day0_access_exchange.py', '--mailbox', mailbox)
+    listing = caller(courier, (*tool, 'pending', '--kind', STABLE_CANDIDATE), limit=16384)
+    site = json.loads(bounded_file(config['site']), object_pairs_hook=relay.unique)
+    results = []
+    for entry in listing.decode('utf-8').splitlines():
+        path = Path(entry)
+        require(path.parent == mailbox and re.fullmatch(r'[0-9a-f]{64}\.request', path.name),
+                'stable station mailbox selected a foreign request')
+        raw = caller(courier, (*tool, 'export', path.stem), limit=16384)
+        require(digest(raw) == path.stem, 'stable mailbox request digest differs')
+        binding = json.loads(raw, object_pairs_hook=relay.unique)
+        try:
+            candidate_site(binding, site, int(time.time()), stable=True)
+        except (Blocked, ValueError, KeyError, TypeError):
+            continue
+        results.append({'request_id': path.stem, 'machine_id': binding['machine_id'], 'boot_id': binding['boot_id'],
+                        'operation': binding['candidate']['operation'], 'release': binding['role_artifacts'],
+                        'previous_release_sha256': binding['candidate']['previous_release_sha256'],
+                        'host_artifact_sha256': binding['candidate']['host_artifact_sha256']})
+    return results
 
 
 def cleanup(base):
@@ -236,9 +292,9 @@ def cleanup(base):
                 shutil.rmtree(path)
 
 
-def source_assets(sha):
+def source_assets(sha, *, root=None):
     require(type(sha) is str and re.fullmatch(r'[0-9a-f]{40}', sha), 'exact independently reviewed station source SHA required')
-    root = TOOLS.parent
+    root = TOOLS.parent if root is None else root
     for directory in (root, *root.parents, root / 'tools', root / 'runtime', root / 'runtime' / 'observer-station'):
         node = directory.lstat()
         require(node.st_uid == 0 and stat.S_ISDIR(node.st_mode) and not node.st_mode & 0o022,
@@ -264,6 +320,28 @@ def source_assets(sha):
         require(raw == path.read_bytes(), 'station asset differs from the reviewed tree')
         assets[target] = raw
     return assets
+
+
+def update_station_tools(args):
+    from day0_access_station import install_files, protected, setup_lock
+
+    prior = source_assets(args.previous_source_sha, root=protected(args.previous_kit, directory=True))
+    successor = source_assets(args.source_sha)
+    with setup_lock():
+        changed = {}
+        for path, new in successor.items():
+            if path.parent != STATION_TOOLS or prior[path] == new:
+                continue
+            current = bounded_file(checked_file(path), 512 * 1024)
+            require(current in (prior[path], new) and stat.S_IMODE(path.stat().st_mode) == 0o644,
+                    'station tool differs from both authorized releases')
+            if current != new:
+                changed[path] = (current, new)
+        app = Bootstrap()
+        # Keep the forced entry usable while the supporting modules converge.
+        for path, (old, new) in sorted(changed.items(), key=lambda item: item[0].name == 'day0_access_exchange.py'):
+            app.atomic(str(path), new.decode('utf-8'), mode=0o644, expected=old.decode('utf-8'))
+        install_files(app, {path: (raw, 0o644) for path, raw in successor.items() if path.parent == STATION_TOOLS})
 
 
 def station_site(receipt, guard, host):
@@ -464,6 +542,15 @@ def arguments():
     cleanup_args.add_argument('base', type=Path)
     enrollment = commands.add_parser('enroll-acl', help='store the acquired read-only OAuth credential in reviewer custody')
     enrollment.add_argument('file', type=Path)
+    stable = commands.add_parser('approve-stable', help='attended independent approval of one exact stable window')
+    stable.add_argument('request')
+    stable.add_argument('--signing-key', type=Path, required=True)
+    commands.add_parser('stable-pending', help='display stable windows awaiting a deliberate independent decision')
+    commands.add_parser('stable-public-key', help='display the separately enrolled stable plan public key')
+    upgrade = commands.add_parser('update-tools', help='reconcile exact prior and reviewed station scripts')
+    upgrade.add_argument('--source-sha', required=True)
+    upgrade.add_argument('--previous-source-sha', required=True)
+    upgrade.add_argument('--previous-kit', type=Path, required=True)
     setup = commands.add_parser('install', help='install reviewed station assets under enrolled independent identities')
     for key in ('source-sha', 'access-receipt', 'trusted-access-signers', 'guard-sha256', 'host-artifact-sha256',
                 'courier-user', 'mailbox', 'collector-user', 'observations', 'collector-agent', 'core-key',
@@ -483,7 +570,24 @@ def main():
             return 0
         require(os.getuid() == os.geteuid() == 0, 'protected station worker requires independent administrator custody')
         os.umask(0o077)
-        if args.command == 'install':
+        if args.command == 'stable-public-key':
+            trust = stable_station_trust()
+            public = ' '.join(trust.decode('ascii').split()[2:4])
+            print(public)
+            print(Bootstrap.signer_fingerprint(public))
+        elif args.command == 'stable-pending':
+            for result in stable_pending(configuration()):
+                print(f"{result['request_id']} {result['operation']} on {result['machine_id']}")
+                print(f"  Previous {result['previous_release_sha256']}")
+                print(f"  Target {result['release']['release_sha256']}")
+                print(f"  Host {result['host_artifact_sha256']} · DevBox {result['release']['devbox_image']}")
+        elif args.command == 'approve-stable':
+            require(sys.stderr.isatty(), 'approve the exact stable operation from the attended independent station terminal')
+            print(approve_stable(configuration(), args.request, args.signing_key))
+        elif args.command == 'update-tools':
+            update_station_tools(args)
+            print('Reconciled the exact approved station tools.')
+        elif args.command == 'install':
             install(args)
             print('Installed the reviewed independent candidate observer timer.')
         else:

@@ -634,18 +634,23 @@ class CandidateAccess:
         from bootstrap import TRUST_SIGNERS, checked_file
         from destination_observation import (ACCESS, CORE_BINDING, FINAL_NAMESPACE,
                                              checked_candidate_readings, encoding, read_access_envelope,
-                                             validate_candidate, verify_agent_observer, verify_bytes)
+                                             stable_approval, stable_host_trust, validate_candidate,
+                                             verify_agent_observer, verify_bytes)
 
         payload, signature = read_access_envelope(io.BytesIO(envelope.encode('ascii')))
         signers = checked_file(self.host.path(TRUST_SIGNERS))
         data, proof_sha = verify_bytes(payload, signature, 'dev-pair-access-review', signers, FINAL_NAMESPACE)
         r.require(type(data) is dict, 'signed candidate observation must contain a protected JSON object')
-        automatic = data.get('observation') == 'named-candidate-challenges'
-        r.require(self.scope == 'agent' or not automatic,
-                  'the scheduled collector cannot authorize a stable maintenance window')
+        observed = data.get('observation')
+        attended = observed == 'named-stable-challenges'
+        r.require((self.scope == 'agent' and not attended) or
+                  (self.scope == 'stable' and (attended or historical and observed is None)),
+                  'stable maintenance requires distinct attended independent authorization')
+        automatic = observed in ('named-candidate-challenges', 'named-stable-challenges')
         p.fields(data, 'version kind machine_id boot_id dns_name source_sha tailnet_addresses role_artifacts candidate '
                  'issued_at expires_at probes provider_recovery public_addresses ' + ' '.join(sorted(ACCESS)) +
-                 (' observation collector_signature policy_measurement' if automatic else ''))
+                 (' observation collector_signature policy_measurement' if automatic else '') +
+                 (' stable_approval' if attended else ''))
         p.number(data['version'], 1, 1)
         scope = data['candidate']
         validate_candidate(scope, kind=self.kind)
@@ -681,6 +686,9 @@ class CandidateAccess:
             request = {key: data[key] for key in (CORE_BINDING | {'role_artifacts', 'candidate'}) - {'job_id'}}
             request['job_id'] = 'host-access'
             request_sha = r.sha(encoding(request))
+            if attended:
+                stable_approval(base64.b64decode(data['stable_approval'], validate=True), request,
+                                stable_host_trust(self.host), data['issued_at'])
             policy = data['policy_measurement']
             p.fields(policy, 'method sha256 request_sha256 boot_id observed_at')
             r.require(policy['method'] == 'tailscale-policy-api-v2' and policy['sha256'] == guard['acl_sha256'] and
