@@ -84,10 +84,13 @@ workload. Follow the prompts for exact source and startup revisions, approved
 read access and pinned private standards. The same wizard selects or registers
 the OpenAI project key using a hidden prompt or a protected file. Enroll the
 independent billing custodian with their separately authenticated signing
-fingerprint. Send the wizard's VPS-bound request to that custodian and place
-the returned signed bundle at the protected path it displays. Resume to
-check the bundle and confirm the exact project, role settings, budget cap
-and UTC expiry. Day 0 can also reopen billing setup for a configured catalogue
+fingerprint and confirm the dedicated billing station's SSH identity. After
+station admission, the wizard submits the exact VPS-bound request and checks
+for the custodian's signed terms each time you resume. Choose the protected
+offline handoff if you need to transfer the request and signed bundle through
+a separately authenticated channel. Once the independent terms verify, confirm
+the exact project, role settings, budget cap and UTC expiry. Day 0 can also
+reopen billing setup for a configured catalogue
 whose unused slot needs signed reauthorization. Once activation completes,
 connect as `core` over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
 
