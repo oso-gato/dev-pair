@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Bounded, authenticated stock Fedora DNF construction cache."""
 import argparse
+import ctypes
 import hashlib
 import io
 import json
@@ -23,6 +24,8 @@ CONTROL_LIMIT = 256 * 1024
 FILES_LIMIT = 512
 METADATA_LIMIT = 2 * 1024 ** 2
 PRIMARY_LIMIT = 256 * 1024 ** 2
+PRIMARY_WINDOW_LIMIT = 16 * 1024 ** 2
+PRIMARY_NAMESPACE = b'http://linux.duke.edu/metadata/common'
 WORK_PEAK = 2 * LIMIT + PRIMARY_LIMIT
 REPOSITORIES = {'fedora-cff72538bc9825a4': {'primary', 'primary_zck', 'group'},
                 'updates-3cc07c89a20302f2': {'primary', 'primary_zck', 'group', 'updateinfo_zck'}}
@@ -182,6 +185,162 @@ def command(args, work, end, *, output=None):
     return result.stdout
 
 
+def primary_packages(stream, packages, end):
+    """Check the complete primary XML with the stock libxml2 streaming reader."""
+    library = ctypes.CDLL('libxml2.so.2')
+    integer, pointer, string = ctypes.c_int, ctypes.c_void_p, ctypes.c_char_p
+    input_reader = ctypes.CFUNCTYPE(integer, pointer, pointer, integer)
+    error_handler = ctypes.CFUNCTYPE(None, pointer, pointer, integer, pointer)
+
+    def api(name, result, *arguments):
+        function = getattr(library, name)
+        function.argtypes = arguments
+        function.restype = result
+        return function
+
+    create = api('xmlReaderForIO', pointer, input_reader, pointer, pointer, string, string, integer)
+    set_error_handler = api('xmlTextReaderSetErrorHandler', None, pointer, error_handler, pointer)
+    read = api('xmlTextReaderRead', integer, pointer)
+    next_sibling = api('xmlTextReaderNext', integer, pointer)
+    kind = api('xmlTextReaderNodeType', integer, pointer)
+    depth = api('xmlTextReaderDepth', integer, pointer)
+    name = api('xmlTextReaderConstLocalName', string, pointer)
+    namespace = api('xmlTextReaderConstNamespaceUri', string, pointer)
+    expand = api('xmlTextReaderExpand', pointer, pointer)
+    document = api('xmlTextReaderCurrentDoc', pointer, pointer)
+    free_reader = api('xmlFreeTextReader', None, pointer)
+    free_document = api('xmlFreeDoc', None, pointer)
+    xpath_context = api('xmlXPathNewContext', pointer, pointer)
+    set_context = api('xmlXPathSetContextNode', integer, pointer, pointer)
+    register = api('xmlXPathRegisterNs', integer, pointer, string, string)
+    compile_xpath = api('xmlXPathCompile', pointer, string)
+    evaluate = api('xmlXPathCompiledEval', pointer, pointer, pointer)
+    as_string = api('xmlXPathCastToString', pointer, pointer)
+    free_value = api('xmlXPathFreeObject', None, pointer)
+    free_xpath = api('xmlXPathFreeCompExpr', None, pointer)
+    free_context = api('xmlXPathFreeContext', None, pointer)
+    free_string = ctypes.CFUNCTYPE(None, pointer).in_dll(library, 'xmlFree')
+
+    window = 0
+    input_error = None
+
+    @input_reader
+    def read_data(_context, buffer, length):
+        nonlocal window, input_error
+        if time.monotonic() >= end:
+            input_error = 'RPM cache verification deadline exceeded'
+            return -1
+        try:
+            data = stream.read(length)
+        except OSError:
+            input_error = 'cannot read expanded Fedora primary metadata'
+            return -1
+        window += len(data)
+        if window > PRIMARY_WINDOW_LIMIT:
+            input_error = 'oversized Fedora primary metadata record'
+            return -1
+        ctypes.memmove(buffer, data, len(data))
+        return len(data)
+
+    @error_handler
+    def malformed(_context, _message, _severity, _locator):
+        nonlocal input_error
+        if input_error is None:
+            input_error = 'malformed Fedora primary metadata'
+
+    def advance(operation):
+        result = operation(reader)
+        require(input_error is None, input_error)
+        return result
+
+    def field(index):
+        result = evaluate(expressions[index], context)
+        require(result, 'cannot read Fedora primary metadata field')
+        try:
+            value = as_string(result)
+            require(value, 'cannot read Fedora primary metadata field')
+            try:
+                return ctypes.string_at(value)
+            finally:
+                free_string(value)
+        finally:
+            free_value(result)
+
+    # NONET, NOBLANKS and COMPACT. Keep DTD loading, entity substitution
+    # and HUGE disabled, and reject any DOCTYPE node.
+    options = 2048 | 256 | 65536
+    reader = create(read_data, None, None, None, b'UTF-8', options)
+    require(reader, input_error or 'cannot open Fedora primary metadata reader')
+    set_error_handler(reader, malformed, None)
+    context = doc = None
+    expressions = []
+    element, end_element = 1, 15
+    ignorable = (7, 8, 13, 14)  # Processing instruction, comment and whitespace.
+    expected = {key.encode('ascii'): value for key, value in packages.items()}
+    found = set()
+    try:
+        status = advance(read)
+        while status == 1 and kind(reader) in ignorable:
+            status = advance(read)
+        require(status == 1 and kind(reader) == element and depth(reader) == 0
+                and name(reader) == b'metadata' and namespace(reader) == PRIMARY_NAMESPACE,
+                'malformed Fedora primary metadata')
+        doc = document(reader)
+        require(doc, 'cannot open Fedora primary metadata document')
+        context = xpath_context(doc)
+        require(context and register(context, b'c', PRIMARY_NAMESPACE) == 0,
+                'cannot open Fedora primary metadata query')
+        for query in (
+            b"string(c:location[count(../*[local-name()='location'])=1 and not(*)"
+            b" and not(../descendant::*[local-name()='package'])]/@href)",
+            b"string(c:size[count(../*[local-name()='size'])=1 and not(*)]/@package)",
+            b"string(c:checksum[count(../*[local-name()='checksum'])=1 and not(*)]/@type)",
+            b'string(c:checksum)',
+        ):
+            expression = compile_xpath(query)
+            require(expression, 'cannot compile Fedora primary metadata query')
+            expressions.append(expression)
+
+        status = advance(read)
+        while status == 1 and kind(reader) != end_element:
+            remaining(end)
+            if kind(reader) in ignorable:
+                status = advance(read)
+                continue
+            require(kind(reader) == element and depth(reader) == 1 and name(reader) == b'package'
+                    and namespace(reader) == PRIMARY_NAMESPACE, 'malformed Fedora primary metadata package')
+            package = advance(expand)
+            require(package and set_context(package, context) == 0, 'malformed Fedora primary metadata package')
+            location = field(0)
+            require(location, 'invalid or duplicate Fedora primary package location')
+            basename = location.rsplit(b'/', 1)[-1]
+            if basename in expected:
+                length, algorithm, checksum = field(1), field(2), field(3)
+                require(re.fullmatch(rb'Packages/[0-9a-z]/' + re.escape(basename), location)
+                        and algorithm == b'sha256' and basename not in found
+                        and length.isdigit() and len(length) <= len(str(LIMIT))
+                        and expected[basename]['bytes'] == int(length)
+                        and expected[basename]['sha256'].encode('ascii') == checksum,
+                        'RPM bytes differ from Fedora primary metadata')
+                found.add(basename)
+            window = 0
+            status = advance(next_sibling)
+        require(status == 1 and depth(reader) == 0, 'malformed Fedora primary metadata')
+        while (status := advance(read)) == 1:
+            require(kind(reader) in ignorable, 'malformed Fedora primary metadata trailer')
+        require(status == 0, 'malformed Fedora primary metadata trailer')
+        remaining(end)
+        require(found == set(expected), 'RPM missing from Fedora primary metadata')
+    finally:
+        for expression in expressions:
+            free_xpath(expression)
+        if context:
+            free_context(context)
+        free_reader(reader)
+        if doc:
+            free_document(doc)
+
+
 def validate_primary(path, sizes, packages, end):
     with path.with_name('primary.xml').open('x+b') as stream:
         try:
@@ -193,26 +352,7 @@ def validate_primary(path, sizes, packages, end):
             value = hashlib.file_digest(stream, 'sha256').hexdigest()
             require(stream.tell() == size and value == sizes[1], 'expanded primary metadata differs from Fedora repomd')
             stream.seek(0)
-            context = ET.iterparse(stream, events=('end', 'start'))
-            _, root = next(context)
-            found = set()
-            for event, entry in context:
-                if event != 'end' or not entry.tag.endswith('}package'):
-                    continue
-                remaining(end)
-                location = xml_child(entry, 'location').get('href', '')
-                name = location.rsplit('/', 1)[-1]
-                if name in packages:
-                    checksum = xml_child(entry, 'checksum')
-                    require(re.fullmatch(r'Packages/[0-9a-z]/' + re.escape(name), location)
-                            and checksum.get('type') == 'sha256' and name not in found
-                            and packages[name] == {'bytes': int(xml_child(entry, 'size').get('package')),
-                                                   'sha256': checksum.text}, 'RPM bytes differ from Fedora primary metadata')
-                    found.add(name)
-                root.clear()
-            require(found == set(packages), 'RPM missing from Fedora primary metadata')
-        except ET.ParseError:
-            raise ValueError('malformed Fedora primary metadata') from None
+            primary_packages(stream, packages, end)
         finally:
             Path(stream.name).unlink()
 

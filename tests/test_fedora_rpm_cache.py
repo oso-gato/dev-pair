@@ -86,6 +86,48 @@ class CacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'source, recipe'):
             self.capture(expected, {**combined, 'outer_recipe_sha256': '1' * 64})
 
+    def test_primary_matches_selected_packages_and_checks_all_xml(self):
+        location = '<c:location href="Packages/e/example-1-1.fc44.x86_64.rpm"/>'
+        checksum = '<c:checksum type="sha256">' + 'a' * 64 + '</c:checksum>'
+        size = '<c:size package="42"/>'
+        entry = f'<c:package>{checksum}{size}{location}<r:format>ignored</r:format></c:package>'
+        unselected = '<c:package><c:location href="Packages/o/other.rpm"/></c:package>'
+        wanted = {'example-1-1.fc44.x86_64.rpm': {'bytes': 42, 'sha256': 'a' * 64}}
+
+        def document(body):
+            return ('<c:metadata xmlns:c="http://linux.duke.edu/metadata/common"'
+                    ' xmlns:r="http://linux.duke.edu/metadata/rpm">' + body + '</c:metadata>')
+
+        def check(raw):
+            cache.primary_packages(io.BytesIO(raw.encode()), wanted, time.monotonic() + 5)
+
+        check(document(unselected + entry))
+        for description, raw in (
+            ('duplicate selected RPM', document(entry + entry)),
+            ('missing selected RPM', document(unselected)),
+            ('inconsistent selected checksum', document(entry.replace('a' * 64, 'b' * 64))),
+            ('inconsistent selected size', document(entry.replace('package="42"', 'package="41"'))),
+            ('inconsistent selected location', document(entry.replace('Packages/e/', 'elsewhere/'))),
+            ('duplicate location', document(entry.replace(location, location * 2))),
+            ('duplicate selected checksum', document(entry.replace(checksum, checksum * 2))),
+            ('missing unselected location', document('<c:package/>' + entry)),
+            ('nested package', document(entry.replace('ignored', '<r:package/>'))),
+            ('malformed unselected descendant', document(unselected.replace('</c:package>', '<a></c:package>') + entry)),
+            ('unbound prefix in unselected descendant', document(unselected.replace('</c:package>', '<p:new/></c:package>') + entry)),
+            ('malformed trailer', document(entry) + '<p/>'),
+            ('DTD', '<!DOCTYPE c:metadata []>' + document(entry)),
+        ):
+            with self.subTest(description=description), self.assertRaises(ValueError):
+                check(raw)
+
+    def test_primary_refuses_expired_or_oversized_input(self):
+        prefix = b'<metadata xmlns="' + cache.PRIMARY_NAMESPACE + b'"><package>'
+        record = b'<location href="other.rpm"/><format>' + b'x' * 10000 + b'</format></package></metadata>'
+        for end, limit, message in ((time.monotonic() - 1, cache.PRIMARY_WINDOW_LIMIT, 'deadline exceeded'),
+                                    (time.monotonic() + 5, 4096, 'oversized Fedora primary metadata record')):
+            with patch.object(cache, 'PRIMARY_WINDOW_LIMIT', limit), self.assertRaisesRegex(ValueError, message):
+                cache.primary_packages(io.BytesIO(prefix + record), {}, end)
+
     def test_assembly_handoff_uses_readonly_role_group_modes_under_umask_077(self):
         previous = os.umask(0o077)
         try:
