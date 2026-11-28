@@ -76,6 +76,20 @@ class DayZeroTests(unittest.TestCase):
             self.assertEqual(self.entry.commission_apply(SOURCE, object()), pending)
         self.entry.call.assert_called_once()
 
+    def test_legacy_finalize_accepts_staged_receipt_and_waits_without_a_terminal(self):
+        self.entry.app.status.return_value = {'phase': 'temporary-bootstrap'}
+        self.entry.receiving_access = Mock()
+        with patch.object(day, 'HANDOFF', self.directory), redirect_stdout(io.StringIO()) as message:
+            self.assertFalse(self.entry.finalize())
+            self.assertIn('./day0.sh access-request', message.getvalue())
+            with self.assertRaisesRegex(bootstrap.Blocked, 'complete pinned SHA'):
+                self.entry.finalize(SOURCE, tty=object())
+            admitted = self.directory / 'cutover.json'
+            admitted.touch()
+            self.assertTrue(self.entry.finalize())
+        self.entry.receiving_access.assert_not_called()
+        self.entry.app.finalize.assert_called_once_with(str(admitted))
+
     def test_commission_reports_each_admitted_and_held_feature(self):
         tool = self.entry.repo / 'tools/commission_host.py'
         tool.parent.mkdir(parents=True)

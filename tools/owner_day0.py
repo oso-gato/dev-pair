@@ -578,7 +578,7 @@ class DayZero:
         print(f'Independent {scope} access review accepted.', flush=True)
         return True
 
-    def finalize(self, revision, historical, tty):
+    def finalize(self, revision=None, historical=None, tty=None):
         if self.app.status()['phase'] == 'tailnet-only':
             self.app.refresh_workload_gate()
             return True
@@ -586,7 +586,11 @@ class DayZero:
         if os.path.lexists(admitted):
             self.app.finalize(str(admitted))
             return True
-        return self.receiving_access(revision, historical, tty)
+        if tty is None:
+            print('Independent access review still needs named tailnet and provider vantage points.')
+            print('Use ./day0.sh access-request to export the live host selection to the independent verifier.')
+            return False
+        return self.receiving_access(pin(revision, 40), pin(historical, 40), tty)
 
     @contextmanager
     def owner_lock(self):
