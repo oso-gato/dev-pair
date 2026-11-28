@@ -67,7 +67,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(run._adapter_image_binding)
         build = operations['build']
         offline = (*build[:5], '--network=none', *build[6:8],
-                   *g.fedora_rpm_cache.mount_args(Path(work) / 'image-copy'), *build[8:])
+                   *g.fedora_rpm_cache.mount_args(Path(work) / 'verification-work/rpm-build'), *build[8:])
         with run.adapter_image_launcher(CONTEXT, app.uid):
             self.assertIsNone(run.adapter_image_selection(prefix + offline, None))
         with run.adapter_image_launcher(CONTEXT, app.uid, rpm_cache=True):

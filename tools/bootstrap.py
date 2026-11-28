@@ -452,7 +452,7 @@ class Commands:
             mounts = ()
             if self._adapter_rpm_cache:
                 from fedora_rpm_cache import mount_args
-                network, mounts = '--network=none', mount_args(Path(work) / 'image-copy')
+                network, mounts = '--network=none', mount_args(Path(work) / 'verification-work/rpm-build')
             build = '/var/lib/dev-pair/artifacts/gptbox-adapter/' + context + '/build'
             if operation == ('build', '--quiet', network, '--pull=never', '--http-proxy=false', *mounts,
                              '--file', build + '/Containerfile', build):

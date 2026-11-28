@@ -46,11 +46,15 @@ def canonical(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
-def binding(source, standards, recipe):
+def binding(source, standards, recipe, *, outer_recipe=None):
     require(GIT.fullmatch(source) and GIT.fullmatch(standards) and HEX.fullmatch(recipe),
             'invalid RPM cache source or recipe identity')
-    return {'schema': 1, 'kind': 'fedora44-stock-dnf-cache', 'source_sha': source, 'standards_sha': standards,
-            'recipe_sha256': recipe, 'base_image': fedora_oci.IMAGE}
+    pinned = {'schema': 1, 'kind': 'fedora44-stock-dnf-cache', 'source_sha': source, 'standards_sha': standards,
+              'recipe_sha256': recipe, 'base_image': fedora_oci.IMAGE}
+    if outer_recipe is not None:
+        require(HEX.fullmatch(outer_recipe), 'invalid outer RPM cache recipe identity')
+        pinned['outer_recipe_sha256'] = outer_recipe
+    return pinned
 
 
 def member_name(name):
@@ -80,9 +84,13 @@ def validate_manifest(raw, expected_sha, wanted):
     require(HEX.fullmatch(expected_sha) and hashlib.sha256(raw).hexdigest() == expected_sha,
             'RPM cache manifest differs from separately supplied digest')
     manifest = json.loads(raw, object_pairs_hook=fedora_oci.unique)
-    require(type(manifest) is dict and set(manifest) == set(wanted) | {'files'} and raw == canonical(manifest)
+    keys = set(wanted) | {'files'}
+    require(type(manifest) is dict and keys <= set(manifest) <= keys | {'outer_recipe_sha256'} and raw == canonical(manifest)
             and type(manifest['schema']) is int and all(manifest[key] == value for key, value in wanted.items()),
             'RPM cache manifest differs from source, recipe or Fedora base')
+    if 'outer_recipe_sha256' in manifest:
+        require(type(manifest['outer_recipe_sha256']) is str and HEX.fullmatch(manifest['outer_recipe_sha256']),
+                'invalid RPM cache outer recipe binding')
     files = manifest['files']
     require(type(files) is dict and 0 < len(files) <= FILES_LIMIT, 'invalid RPM cache inventory')
     total = 0
@@ -107,7 +115,7 @@ def read_header(stream):
     return item
 
 
-def unpack(archive, expected_sha, wanted, destination, key, end):
+def unpack(archive, expected_sha, wanted, destination, key, end, *, signature_check=None):
     fd = os.open(archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
         info = os.fstat(stream.fileno())
@@ -143,7 +151,10 @@ def unpack(archive, expected_sha, wanted, destination, key, end):
         padding = stream.read(tarfile.RECORDSIZE + 1)
         require(seen == set(files) and 512 <= len(padding) <= tarfile.RECORDSIZE and padding == bytes(len(padding))
                 and stream.tell() == info.st_size, 'RPM cache transport is incomplete or has trailing data')
-    validate_repositories(destination, files, key, end)
+    if signature_check is None:
+        validate_repositories(destination, files, key, end)
+    else:
+        validate_repositories(destination, files, key, end, signature_check=signature_check)
     return destination
 
 
@@ -206,7 +217,7 @@ def validate_primary(path, sizes, packages, end):
             Path(stream.name).unlink()
 
 
-def validate_repositories(destination, files, key, end):
+def validate_repositories(destination, files, key, end, *, signature_check=None):
     all_rpms = []
     for repo, kinds in REPOSITORIES.items():
         root = destination / repo
@@ -241,11 +252,11 @@ def validate_repositories(destination, files, key, end):
                 'incomplete or unexpected Fedora cache metadata')
         validate_primary(root / selected['primary'], primary, packages, end)
         all_rpms.extend(root / 'packages' / name for name in sorted(packages))
-    verify_signatures(destination, key, all_rpms, end)
+    require(digest(key, end) == fedora_oci.KEY_SHA, 'Fedora RPM signing key differs from the pinned key')
+    (signature_check or verify_signatures)(destination, key, all_rpms, end)
 
 
 def verify_signatures(destination, key, packages, end):
-    require(digest(key, end) == fedora_oci.KEY_SHA, 'Fedora RPM signing key differs from the pinned key')
     database = destination.parent / 'rpm-signature-db'
     database.mkdir(mode=0o700)
     argv = ['/usr/bin/rpmkeys', '--dbpath', str(database), '--define', f'_keyringpath {database}/keys']
@@ -254,20 +265,24 @@ def verify_signatures(destination, key, packages, end):
     require(len(keys) == 1 and keys[0].partition(' ')[0] == SIGNER, 'unexpected RPM signature keyring')
     for start in range(0, len(packages), 32):
         batch = packages[start:start + 32]
-        expected = set(map(str, batch))
         rows = command([*argv, '--checksig', '--verbose', *map(str, batch)], database, end).decode().splitlines()
-        verified = {}
-        current = None
-        for row in rows:
-            if not row.startswith(' '):
-                current = row.removesuffix(':')
-                require(current in expected and current not in verified, 'unexpected RPM signature output')
-                verified[current] = []
-            elif 'signature, key fingerprint:' in row:
-                require(current in verified, 'RPM signature output lacks its package')
-                verified[current].append(row.split('signature, key fingerprint: ', 1)[-1])
-        require(set(verified) == expected and all(items == [SIGNER + ': OK'] for items in verified.values()),
-                'missing or unexpected Fedora RPM signature')
+        verify_signature_output(batch, rows)
+
+
+def verify_signature_output(packages, rows):
+    expected = set(map(str, packages))
+    verified = {}
+    current = None
+    for row in rows:
+        if not row.startswith(' '):
+            current = row.removesuffix(':')
+            require(current in expected and current not in verified, 'unexpected RPM signature output')
+            verified[current] = []
+        elif 'signature, key fingerprint:' in row:
+            require(current in verified, 'RPM signature output lacks its package')
+            verified[current].append(row.split('signature, key fingerprint: ', 1)[-1])
+    require(set(verified) == expected and all(items == [SIGNER + ': OK'] for items in verified.values()),
+            'missing or unexpected Fedora RPM signature')
 
 
 def mount_args(work):
@@ -276,17 +291,34 @@ def mount_args(work):
 
 
 def build_mounts(work, canonical_cache, uid, gid):
+    require(work.resolve(strict=True) == work and work.stat().st_uid == os.getuid()
+            and not work.stat().st_mode & 0o022, 'RPM build copy requires a protected staging directory')
     cache = work / 'rpm-cache'
     shutil.copytree(canonical_cache, cache)
     dropin = work / DROPIN_NAME
     with dropin.open('xb') as stream:
         stream.write(DROPIN)
         os.fchmod(stream.fileno(), 0o444)
-    for path in [cache, *cache.rglob('*'), dropin]:
-        os.chown(path, uid, gid)
+    # Release ownership only after each subtree has been populated. The bound
+    # mount leaves remain anchored in the controller-owned staging directory.
+    paths = sorted(cache.rglob('*'), key=lambda path: len(path.parts), reverse=True)
+    for path in [*paths, cache, dropin]:
         if path.is_dir():
             path.chmod(0o755)
+        os.chown(path, uid, gid)
     return mount_args(work)
+
+
+def assembly_handoff(work, canonical_cache, gid):
+    work.mkdir(mode=0o700)
+    cache = work / 'rpm-cache'
+    shutil.copytree(canonical_cache, cache)
+    dropin = work / DROPIN_NAME
+    dropin.write_bytes(DROPIN)
+    for path in [cache, *cache.rglob('*'), dropin, work]:
+        os.chown(path, -1, gid)
+        path.chmod(0o750 if path.is_dir() else 0o440)
+    return cache, dropin
 
 
 def cache_member(name):
@@ -297,28 +329,85 @@ def cache_member(name):
 
 
 def audit_layer(stream, maximum, end):
-    class BoundedReader:
-        size = 0
-        hash = hashlib.sha256()
+    checksum = hashlib.sha256()
+    expanded = 0
 
-        def read(self, size):
-            remaining(end)
-            data = stream.read(min(size, maximum - self.size + 1))
-            self.size += len(data)
-            require(self.size <= maximum, 'OCI cache history expansion limit exceeded')
-            self.hash.update(data)
-            return data
+    def read(size, exact=True):
+        nonlocal expanded
+        remaining(end)
+        data = stream.read(min(size, maximum - expanded + 1))
+        expanded += len(data)
+        require(expanded <= maximum and (not exact or len(data) == size),
+                'OCI cache history layer truncated or above its expansion limit')
+        checksum.update(data)
+        return data
 
-    reader = BoundedReader()
-    with tarfile.open(fileobj=reader, mode='r|') as entries:
-        for entry in entries:
-            require(not cache_member(entry.name) or entry.isdir(), 'construction RPM cache entered OCI history')
-            if entry.islnk() or entry.issym():
-                target = entry.linkname if entry.islnk() else posixpath.join(posixpath.dirname(entry.name), entry.linkname)
-                require(not cache_member(target), 'construction RPM cache link entered OCI history')
-    while reader.read(1024 * 1024):
-        pass
-    return 'sha256:' + reader.hash.hexdigest(), reader.size
+    zero = bytes(512)
+    extensions = {}
+    for _ in range(150000):
+        header = read(512)
+        if header == zero:
+            require(not extensions and read(512) == zero, 'malformed OCI cache history terminator')
+            while trailer := read(1024 * 1024, exact=False):
+                require(not any(trailer), 'nonzero data trails the OCI cache history layer')
+            return 'sha256:' + checksum.hexdigest(), expanded
+        entry = tarfile.TarInfo.frombuf(header, 'utf-8', 'strict')
+        if entry.type in (tarfile.XHDTYPE, tarfile.XGLTYPE, tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+            require(0 < entry.size <= 65536 and len(extensions) <= 3, 'oversized OCI archive metadata')
+            body = read(entry.size)
+            if entry.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+                key = 'path' if entry.type == tarfile.GNUTYPE_LONGNAME else 'linkpath'
+                require(key not in extensions and b'\0' in body, 'invalid OCI archive long path')
+                name, padding = body.split(b'\0', 1)
+                require(not any(padding), 'invalid OCI archive long path padding')
+                extensions[key] = name.decode('utf-8')
+            else:
+                selected = pax_identity(body)
+                require(not selected if entry.type == tarfile.XGLTYPE else not selected.keys() & extensions.keys(),
+                        'ambiguous OCI archive extended identity')
+                extensions.update(selected)
+            require(read(-entry.size % 512) == bytes(-entry.size % 512), 'invalid OCI archive metadata padding')
+            continue
+        require(entry.type in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE, tarfile.SYMTYPE,
+                               tarfile.LNKTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE, tarfile.FIFOTYPE),
+                'unsupported OCI archive layer member')
+        name = extensions.get('path', entry.name)
+        require(name and '\0' not in name and '..' not in PurePosixPath(name).parts,
+                'unsafe OCI archive layer path')
+        require(not cache_member(name) or entry.isdir(), 'construction RPM cache entered OCI history')
+        if entry.islnk() or entry.issym():
+            link = extensions.get('linkpath', entry.linkname)
+            target = link if entry.islnk() else posixpath.join(posixpath.dirname(name), link)
+            require(not cache_member(target), 'construction RPM cache link entered OCI history')
+        size = int(extensions.get('size', entry.size))
+        extensions.clear()
+        require(0 <= size <= maximum - expanded and (entry.isreg() or size == 0), 'invalid OCI layer member size')
+        for offset in range(0, size, 1024 * 1024):
+            read(min(size - offset, 1024 * 1024))
+        require(read(-size % 512) == bytes(-size % 512), 'invalid OCI archive file padding')
+    raise ValueError('OCI cache history layer entry limit exceeded')
+
+
+def pax_identity(body):
+    selected = {}
+    offset = 0
+    for _ in range(128):
+        if offset == len(body):
+            return selected
+        separator = body.find(b' ', offset, offset + 8)
+        require(separator >= 0 and body[offset:separator].isdigit(), 'invalid OCI PAX record size')
+        finish = offset + int(body[offset:separator])
+        require(separator + 2 < finish <= len(body) and body[finish - 1] == 10, 'invalid OCI PAX record')
+        key, sep, value = body[separator + 1:finish - 1].partition(b'=')
+        require(key and sep and not key.startswith(b'GNU.sparse'), 'unsupported OCI PAX record')
+        if key in (b'path', b'linkpath', b'size'):
+            key = key.decode('ascii')
+            require(key not in selected and value and b'\0' not in value
+                    and (key != 'size' or len(value) <= 16 and value.isdigit()),
+                    'invalid OCI PAX member identity')
+            selected[key] = value.decode('utf-8')
+        offset = finish
+    raise ValueError('OCI PAX record limit exceeded')
 
 
 def build_transport(source, output, wanted):
@@ -369,5 +458,7 @@ if __name__ == '__main__':
     parser.add_argument('--source-sha', required=True)
     parser.add_argument('--standards-sha', required=True)
     parser.add_argument('--recipe-sha256', required=True)
+    parser.add_argument('--outer-recipe-sha256')
     args = parser.parse_args()
-    print(build_transport(args.cache, args.output, binding(args.source_sha, args.standards_sha, args.recipe_sha256)))
+    exact = binding(args.source_sha, args.standards_sha, args.recipe_sha256, outer_recipe=args.outer_recipe_sha256)
+    print(build_transport(args.cache, args.output, exact))

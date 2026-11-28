@@ -273,13 +273,14 @@ def publication_evidence(image, proof):
                 'DevBox layers do not extend its verified tooling')
 
 
-def image_archive(path, image, end, tooling=None):
+def image_archive(path, image, end, tooling=None, *, layer_audit=None):
     image_record(image)
     require(file_hash(path, ARCHIVE_LIMIT, end) == (image['archive_sha256'], image['archive_bytes']),
             'exact OCI archive digest or size mismatch')
     require(image['diff_ids'][0] == 'sha256:' + fedora_oci.DIFF, 'OCI image lacks the signed Fedora root layer')
     try:
-        db.check_archive_image(path, image, EXPANSION_LIMIT, end)
+        audit = {'layer_audit': layer_audit} if layer_audit else {}
+        db.check_archive_image(path, image, EXPANSION_LIMIT, end, **audit)
     except db.Blocked as error:
         raise Blocked('platform OCI graph verification failed: ' + str(error)) from None
     with tarfile.open(path, 'r:') as archive:
@@ -307,10 +308,11 @@ def tooling_row(tooling):
             'codex_sha256': tooling['binary']['sha256']}
 
 
-def write_image_part(directory, image, proof, end, tooling=None):
+def write_image_part(directory, image, proof, end, tooling=None, *, layer_audit=None):
     image_record(image)
     publication_evidence(image, proof)
-    manifest = image_archive(directory / archive_name(image['role']), image, end, tooling)
+    audit = {'layer_audit': layer_audit} if layer_audit else {}
+    manifest = image_archive(directory / archive_name(image['role']), image, end, tooling, **audit)
     data = {'schema': 1, 'image': image, 'oci_manifest_sha256': manifest, 'producer': proof}
     write_json(directory / PART_FILE, data)
     return data

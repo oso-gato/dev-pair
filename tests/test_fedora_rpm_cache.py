@@ -3,14 +3,20 @@ import hashlib
 import io
 import os
 from pathlib import Path
+import shlex
+import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from test_gptbox import g
 import bootstrap
+import native_placements
+import platform_release_ci
 
 
 cache = g.fedora_rpm_cache
@@ -72,6 +78,26 @@ class CacheTests(unittest.TestCase):
             self.capture(expected)
         verify.assert_not_called()
 
+    def test_combined_manifest_keeps_exact_inner_and_outer_recipe_identity(self):
+        combined = native_placements.tooling_cache_binding('1' * 40)
+        expected = cache.build_transport(self.inputs, self.archive, combined)
+        with patch.object(cache, 'validate_repositories'):
+            self.capture(expected)
+        with self.assertRaisesRegex(ValueError, 'source, recipe'):
+            self.capture(expected, {**combined, 'outer_recipe_sha256': '1' * 64})
+
+    def test_assembly_handoff_uses_readonly_role_group_modes_under_umask_077(self):
+        previous = os.umask(0o077)
+        try:
+            handoff, dropin = cache.assembly_handoff(self.root / 'assembly', self.inputs, os.getgid())
+        finally:
+            os.umask(previous)
+        for directory in (handoff.parent, handoff, (handoff / self.member).parent):
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o750)
+        for file in (handoff / self.member, dropin):
+            self.assertEqual(file.stat().st_mode & 0o777, 0o440)
+            self.assertEqual((file.stat().st_uid, file.stat().st_gid), (os.getuid(), os.getgid()))
+
     def test_cache_paths_and_symlinks_cannot_enter_oci_history(self):
         def layer(name, link=None):
             content = io.BytesIO()
@@ -93,6 +119,87 @@ class CacheTests(unittest.TestCase):
             polluted = layer(name, link)
             with self.assertRaisesRegex(ValueError, 'entered OCI history'):
                 cache.audit_layer(io.BytesIO(polluted), len(polluted), time.monotonic() + 5)
+        with self.assertRaisesRegex(ValueError, 'nonzero data trails'):
+            cache.audit_layer(io.BytesIO(clean + b'concealed content'), len(clean) + 40, time.monotonic() + 5)
+
+    def test_layer_audit_accepts_bounded_pax_paths_and_xattrs(self):
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode='w', format=tarfile.PAX_FORMAT) as output:
+            entry = tarfile.TarInfo('usr/share/' + 'a' * 120)
+            entry.pax_headers = {'SCHILY.xattr.user.fixture': 'signed RPM installed file'}
+            entry.size = 1
+            output.addfile(entry, io.BytesIO(b'x'))
+        data = archive.getvalue()
+        self.assertEqual(cache.audit_layer(io.BytesIO(data), len(data), time.monotonic() + 5)[1], len(data))
+        excessive = tarfile.TarInfo('pax')
+        excessive.type, excessive.size = tarfile.XHDTYPE, 65537
+        with self.assertRaisesRegex(ValueError, 'oversized OCI archive metadata'):
+            cache.audit_layer(io.BytesIO(excessive.tobuf()), 1 << 20, time.monotonic() + 5)
+
+    def test_exact_maintenance_history_save_keeps_generic_base_limit(self):
+        app = g.Gptbox(self.root)
+        app.uid = str(os.getuid())
+        context, image = '4' * 64, '5' * 64
+        app.target = g.ROOT + '/' + context
+        app.rpm_cache = (self.archive, '6' * 64)
+        leaf = app.path(f'{g.ARTIFACTS}/{context}/assembly-cache/image-copy/sealed.oci.tar')
+        leaf.parent.mkdir(parents=True)
+        emitter = self.root / 'emit.py'
+        length = g.fedora_oci.SAVE_FILE_LIMIT + 4096
+        emitter.write_text('import sys\nfrom pathlib import Path\n'
+                           'with Path(sys.argv[sys.argv.index("--output") + 1]).open("xb") as output:\n'
+                           f'    output.seek({length - 1})\n    output.write(b"x")\n')
+        engine = (sys.executable, str(emitter))
+        args = ('save', '--format=oci-archive', '--output', str(leaf), 'sha256:' + image)
+        wrapper = self.root / 'podman'
+        wrapper.write_text(g.podman_wrapper_script(g.podman_wrapper_tail(shlex.join(engine))))
+        with patch.object(app, 'maintenance_engine', return_value=engine):
+            ordinary = subprocess.run(['/bin/sh', str(wrapper), *args], capture_output=True, timeout=6)
+            self.assertNotEqual(ordinary.returncode, 0)
+            self.assertLessEqual(leaf.stat().st_size, g.fedora_oci.SAVE_FILE_LIMIT)
+            leaf.unlink()
+            command = app.maintenance_history_save_argv(image, leaf)
+            subprocess.run(command, capture_output=True, check=True, timeout=6)
+            self.assertEqual(leaf.stat().st_size, length)
+            with leaf.open('rb') as output:
+                self.assertEqual(output.read(1), b'\0')
+            with self.assertRaisesRegex(g.Blocked, 'owned verification workspace'):
+                app.maintenance_history_save_argv(image, self.root / 'alternate.tar')
+
+    def test_native_outer_tooling_limits_the_cache_to_its_exact_build(self):
+        from contextlib import nullcontext
+
+        request = {'source_sha': '1' * 40, 'rpm_cache_manifest_sha256': '2' * 64}
+        workspace = self.root / 'verification'
+        workspace.mkdir()
+        placement = SimpleNamespace(rpm_cache=self.archive, cache=self.inputs,
+                                    verification_work=lambda: nullcontext(workspace),
+                                    engine=Mock(return_value=b''), producer=SimpleNamespace(protected=lambda value: value),
+                                    account=SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()))
+        prefix = ('build', '--quiet', '--pull=never', '--http-proxy=false', '--format=oci')
+        with patch.object(cache, 'unpack') as open_cache:
+            native_placements.Placement.build_tooling(placement, prefix, self.inputs, request)
+        binding = open_cache.call_args.args[2]
+        self.assertEqual(binding, native_placements.tooling_cache_binding(request['source_sha']))
+        build = placement.engine.call_args.args
+        self.assertEqual(build[:len(prefix) + 2], (*prefix, '--network=none', '--no-cache'))
+        self.assertIn('--label=dev-pair.rpm-cache=' + request['rpm_cache_manifest_sha256'], build)
+        self.assertEqual(placement.engine.call_args.kwargs, {'timeout': 600})
+
+    def test_protected_ci_verifies_with_pinned_fedora_and_no_outbound(self):
+        key = self.root / 'vendor-key'
+        key.write_bytes(b'fixture material already checked by intake')
+        package = '/run/dev-pair-rpm-verification/input/' + self.member
+        stdout = (f'{cache.SIGNER} Fedora public key\n{package}:\n'
+                  f'    Header OpenPGP signature, key fingerprint: {cache.SIGNER}: OK\n').encode()
+        with patch.object(platform_release_ci, 'engine_copy', return_value=stdout) as run:
+            platform_release_ci.verify_cache_signatures(object(), self.root, self.inputs, key, [self.source],
+                                                       time.monotonic() + 5)
+        args = run.call_args.args[2:]
+        self.assertEqual(args[:5], ('run', '--rm', '--pull=never', '--network=none', '--http-proxy=false'))
+        self.assertIn(g.FEDORA, args)
+        self.assertIn('--cap-drop=ALL', args)
+        self.assertIn(f'{self.root}:/run/dev-pair-rpm-verification:ro,nosuid,nodev,noexec', args)
 
     def test_initialize_forwards_the_independent_cache_reference(self):
         class ExecRequested(BaseException):

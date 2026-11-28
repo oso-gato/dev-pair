@@ -492,6 +492,10 @@ class Gptbox(Bootstrap):
     def engine(self, *args, timeout=120, ok=(0,)):
         return self.execute(self.wrapper, *args, timeout=timeout, ok=ok)
 
+    def maintenance_engine(self, uid):
+        return ('/usr/bin/podman', '--root', str(self.path(MAINTENANCE_STORE)), '--runroot',
+                f'/run/user/{uid}/dev-pair-gptbox', '--storage-driver=vfs', '--events-backend=file')
+
     def setup_executor(self, retry=False, *, verified=None):
         if self.role == 'development':
             if type(verified) is not _RoleIdentity or verified.name != BUILDER_ACCOUNT:
@@ -536,7 +540,7 @@ class Gptbox(Bootstrap):
                        f'[ "$3" = --output ] && [ "$4" = {shlex.quote(str(destination))} ]; then '
                        f'exec /usr/bin/prlimit --fsize={limit}:{limit} {engine} "$@"; fi\n')
         else:
-            engine = f'/usr/bin/podman --root {self.path(storage)} --runroot {runroot} --storage-driver=vfs --events-backend=file'
+            engine = shlex.join(self.maintenance_engine(uid))
         script += podman_wrapper_tail(engine)
         self.wrapper = str(self.path(control + '/bin/podman'))
         self.atomic(control + '/bin/podman', podman_wrapper_script(script), mode=0o555, expected='#!/bin/sh\n' + script)
@@ -592,8 +596,7 @@ class Gptbox(Bootstrap):
                 raise Blocked('managed maintenance account required')
             uid, gid = str(identity.uid), str(identity.gid)
         self.uid, self.gid = uid, gid
-        engine = (f'/usr/bin/podman --root {self.path(MAINTENANCE_STORE)} --runroot /run/user/{uid}/dev-pair-gptbox'
-                  ' --storage-driver=vfs --events-backend=file')
+        engine = shlex.join(self.maintenance_engine(uid))
         files = {
             'bin/podman': (0o555, sha(podman_wrapper_script(podman_wrapper_tail(engine)).encode())),
             'distrobox-enter': (0o555, ENTER_SHA256),
@@ -1236,7 +1239,7 @@ class Gptbox(Bootstrap):
         if isinstance(self.run, Commands):
             deadline = min(deadline, self.run.execution_deadline() or deadline)
         cache = workspace / 'rpm-cache'
-        cache.mkdir(mode=0o755)
+        cache.mkdir(mode=0o700)
         return fedora_rpm_cache.unpack(self.protected(archive), digest, self.rpm_cache_binding, cache,
                                       self.rpm_cache_key, deadline)
 
@@ -1251,10 +1254,8 @@ class Gptbox(Bootstrap):
         with fedora_oci.copy_workspace(self.path(work), verification=True,
                                        reserve=8 * 1024 ** 3 + fedora_rpm_cache.WORK_PEAK,
                                        reconcile=self.reconcile_rpm_executor) as private:
-            cache = self.unpack_rpm_cache(private)
-            config = private / fedora_rpm_cache.DROPIN_NAME
-            config.write_bytes(fedora_rpm_cache.DROPIN)
-            config.chmod(0o444)
+            canonical_cache = self.unpack_rpm_cache(private)
+            cache, config = fedora_rpm_cache.assembly_handoff(private / 'rpm-handoff', canonical_cache, int(self.gid))
             self.engine('cp', '--archive=false', str(cache) + '/.', stage + ':' + fedora_rpm_cache.ROOT, timeout=120)
             self.engine('cp', '--archive=false', str(config), stage + ':' + fedora_rpm_cache.DROPIN_PATH, timeout=30)
 
@@ -1264,18 +1265,35 @@ class Gptbox(Bootstrap):
             deadline = min(deadline, self.run.execution_deadline() or deadline)
         return deadline
 
+    def maintenance_history_save_argv(self, image, output):
+        if self.role != 'maintenance' or self.rpm_cache is None:
+            raise Blocked('large cache history save requires an exact maintenance cache build')
+        target = self.target.rsplit('/', 1)[-1]
+        raw_digest(target)
+        sealed = raw_digest(image)
+        wanted = self.path(f'{self.artifact_root}/{target}/assembly-cache/image-copy/sealed.oci.tar')
+        if output != wanted:
+            raise Blocked('maintenance cache history output differs from the owned verification workspace')
+        return ('/usr/bin/env', 'TMPDIR=' + str(wanted.parent), '/usr/bin/prlimit',
+                f'--fsize={DEVELOPMENT_ARCHIVE_LIMIT}:{DEVELOPMENT_ARCHIVE_LIMIT}', '--',
+                *self.maintenance_engine(self.uid), 'save', '--format=oci-archive', '--output', str(wanted),
+                'sha256:' + sealed)
+
     def verify_maintenance_cache_history(self, image, expected):
         work = self.artifact_root + '/' + expected + '/assembly-cache'
         rows = json.loads(self.engine('image', 'inspect', image), object_pairs_hook=fedora_oci.unique)
         if type(rows) is not list or len(rows) != 1 or image_id(rows[0]['Id']) != image:
             raise Blocked('maintenance cache-history image identity differs')
+        labels = rows[0].get('Labels') or rows[0].get('Config', {}).get('Labels', {})
+        if labels.get('dev-pair.context') != expected or labels.get('dev-pair.rpm-cache') != self.rpm_cache[1]:
+            raise Blocked('maintenance cache-history manifest binding differs')
         diff_ids = image_diff_ids(rows[0]['RootFS']['Layers'])
         with fedora_oci.image_workspaces(self.path(work), uid=int(self.uid), reconcile=self.reconcile_rpm_executor,
                                          reserve=8 * 1024 ** 3 + 2 * DEVELOPMENT_ARCHIVE_LIMIT) as (private, verification):
             raw = private / 'sealed.oci.tar'
-            self.execute('/usr/bin/env', 'TMPDIR=' + str(private), '/usr/bin/prlimit',
-                         f'--fsize={DEVELOPMENT_ARCHIVE_LIMIT}:{DEVELOPMENT_ARCHIVE_LIMIT}', '--', self.wrapper,
-                         'save', '--format=oci-archive', '--output', str(raw), 'sha256:' + image, timeout=240)
+            # The gateway wrapper keeps its 192 MiB signed Fedora base save cap.
+            # This construction-only command has an exact image and output leaf.
+            self.execute(*self.maintenance_history_save_argv(image, raw), timeout=240)
             archive = verification / raw.name
             with archive.open('xb') as output:
                 os.fchmod(output.fileno(), 0o400)
@@ -1604,6 +1622,9 @@ class Gptbox(Bootstrap):
         else:
             lines[1] = ('RUN /bin/sh -ec ' + shlex.quote(candidate.OCI_TIMEOUT) +
                         ' maintenance-build 540s /bin/sh -ec ' + package_script)
+        if self.rpm_cache:
+            # `$0` carries the authenticated cache digest into Buildah's RUN key.
+            lines[1] += ' rpm-cache-' + self.rpm_cache[1]
         recipe = '\n'.join(lines) + '\n'
         for name, data in {**files, 'inputs.json': input_bytes, 'Containerfile': recipe.encode()}.items():
             # Binary-safe atomic creation in a protected new build directory.
@@ -1665,7 +1686,10 @@ class Gptbox(Bootstrap):
                         network = '--network=slirp4netns:allow_host_loopback=false'
                         mounts = ()
                         if canonical_cache is not None:
-                            mounts = fedora_rpm_cache.build_mounts(copy_tmp, canonical_cache, int(self.uid), int(self.gid))
+                            staging = verification_root / 'rpm-build'
+                            staging.mkdir(mode=0o755)
+                            staging.chmod(0o755)
+                            mounts = fedora_rpm_cache.build_mounts(staging, canonical_cache, int(self.uid), int(self.gid))
                             network = '--network=none'
                         end = self.development_oci_end()
                         build_args = ('--pid=private', '--build-arg=DP_OCI_END=' + str(end)) if end is not None else ()

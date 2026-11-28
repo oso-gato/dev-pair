@@ -1342,14 +1342,21 @@ def main():
     parser.add_argument('--github-event', type=pathlib.Path)
     parser.add_argument('--namespace-parent', help=argparse.SUPPRESS)
     parser.add_argument('--platform-release-role', choices=(*SCENARIOS, 'devbox'), help=argparse.SUPPRESS)
+    parser.add_argument('--rpm-cache', type=pathlib.Path, help=argparse.SUPPRESS)
+    parser.add_argument('--expected-rpm-cache-manifest-sha256', help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.platform_release_role is not None:
         from platform_release_ci import entered, ci as platform_ci
         try:
+            if args.rpm_cache is not None or args.expected_rpm_cache_manifest_sha256 is not None:
+                return entered(args.expected_source, args.platform_release_role, args.namespace_parent,
+                               rpm_cache=(args.rpm_cache, args.expected_rpm_cache_manifest_sha256))
             return entered(args.expected_source, args.platform_release_role, args.namespace_parent)
         except (platform_ci.Blocked, OSError, ValueError, KeyError, TypeError, ImportError, subprocess.SubprocessError) as exc:
             emit_text('PLATFORM_RELEASE_BLOCKED ', str(exc), 1500)
             return 2
+    require(args.rpm_cache is None and args.expected_rpm_cache_manifest_sha256 is None,
+            'outer-tooling cache requires the protected DevBox producer')
     event = actions_native_event(args.github_event)
     require(read_pull_request(event, args.expected_source, actions_event=True) == args.scenario,
             'Fedora scenario is outside the exact pull request label event')

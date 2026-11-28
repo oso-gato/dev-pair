@@ -84,9 +84,16 @@ To package an acquired cache, use the stock Fedora 44 `fedora` and `updates`
 cache directory IDs. Include each official metalink, `repomd.xml`, the
 referenced primary zstd and zchunk metadata and group metadata, the updates
 zchunk update information, and the Fedora-signed RPMs needed for the exact
-recipe. Leave generated solv files and repository configuration outside the
-archive. The consumer checks the upstream metadata hashes and every RPM
-against the pinned Fedora key in an isolated keyring.
+recipe. Retrieve the two metalinks over verified HTTPS from Fedora's fixed
+Fedora 44 x86_64 endpoints. Have the independent cache custodian compare
+their SHA-256 and SHA-512 values to the exact `repomd.xml` documents and verify
+the source, base and recipe binding before conveying the manifest digest.
+Leave generated solv files and repository configuration outside the archive.
+The consumer checks the metadata hash chain and every RPM against the pinned
+Fedora key in an isolated keyring. An approved snapshot supplies fixed
+construction inputs. Nightly upstream freshness remains a separate check.
+[Fedora metalink](https://mirrors.fedoraproject.org/metalink?repo=fedora-44&arch=x86_64)
+· [Fedora updates metalink](https://mirrors.fedoraproject.org/metalink?repo=updates-released-f44&arch=x86_64)
 
 ```sh
 recipe_sha=$(PYTHONPATH="$MAINT/dev-pair/tools" /usr/bin/python3 -B -c \
@@ -102,8 +109,8 @@ The builder uses the verified snapshot with networking disabled for the
 inner package build and genuine Distrobox assembly. The assembly remains
 free of host binds. The finalizer removes the staged cache and configuration,
 and the builder checks the exported image layer history before completing
-the role. Host prerequisite provisioning and the outer DevBox tooling below
-continue to use their existing online paths. Cold VFS builds on QEMU TCG can
+the role. Host prerequisite provisioning continues to use its existing online
+path. Cold VFS builds on QEMU TCG can
 hit the existing 600-second image budget while committing the new layer.
 
 ## Prepare and exercise the nested placement
@@ -154,9 +161,20 @@ disposable rootless builder uses a separate capability profile for signed Fedora
 package setup. It dependency-checks and erases the inherited sudo RPM inside
 the disposable root. The exact outer recipe sets the two namespace helper file
 capabilities.
-Package setup needs public access through the isolated builder network. The outer
-DevBox build uses the exact verified tooling image and pinned Distrobox entry,
-with networking disabled and local images only. The receipt retains the
+By default, package setup needs public access through the isolated builder
+network. To opt in to the verified stock cache for tooling, append the same
+paired `--rpm-cache` and `--expected-rpm-cache-manifest-sha256` arguments to
+`native_placements.py run`. Include the tooling dependencies in the acquired
+cache and add `--outer-recipe-sha256` when packing it. Compute that digest
+from the exact `native_placements.TOOLING_RECIPE` bytes at the reviewed source.
+A combined snapshot can serve the two inner roles and the outer tooling
+build. The protected DevBox platform producer also accepts these arguments
+for its `devbox` role and retains its existing source and workflow admission.
+
+The outer DevBox build uses the exact verified tooling image and pinned
+Distrobox entry, with networking disabled and local images only. A cached
+tooling build verifies the exported DevBox history before recording the
+image. The receipt retains the
 base, tooling and outer image identities and distinguishes the outer OCI image
 manifest digest from its config ID, the inner archive digest and the nested
 placement manifest SHA-256.

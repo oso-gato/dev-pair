@@ -19,6 +19,7 @@ import fedora_ci as ci
 import fedora_ci_guest as guest
 import fedora_ci_storage as kernel
 import fedora_oci
+import fedora_rpm_cache
 import platform_release as release
 from platform_release_protocol import ARCHIVE_LIMIT, GIB, ROLES, Blocked, canonical, file_hash, hex_id, require, seconds, receive_frame
 
@@ -223,7 +224,32 @@ def engine_copy(probe, temporary, *args, timeout):
     return output
 
 
-def build_devbox(probe):
+def verify_cache_signatures(probe, temporary, destination, key, packages, end):
+    # Protected CI hosts use the exact imported Fedora verifier. There is no
+    # dependency on host RPM packages, ambient keyrings or outbound transport.
+    workspace = destination.parent
+    key_copy = workspace / 'fedora-key'
+    shutil.copyfile(key, key_copy)
+    key_copy.chmod(0o444)
+    inside = Path('/run/dev-pair-rpm-verification')
+    files = [str(inside / package.relative_to(workspace)) for package in packages]
+    script = ('set -eu; mkdir -m 0700 /tmp/keyring; '
+              'rpm_verify() { /usr/bin/rpmkeys --dbpath /tmp/keyring --define "_keyringpath /tmp/keyring/keys" "$@"; }; '
+              'rpm_verify --import /run/dev-pair-rpm-verification/fedora-key; rpm_verify --list; '
+              'rpm_verify --checksig --verbose "$@"')
+    output = engine_copy(probe, temporary, 'run', '--rm', '--pull=never', '--network=none', '--http-proxy=false',
+                         '--read-only', '--read-only-tmpfs=false', '--user=0:0', '--cap-drop=ALL',
+                         '--security-opt=no-new-privileges', '--no-hosts', '--no-hostname',
+                         '--pid=private', '--ipc=private', '--uts=private', '--memory=1g', '--pids-limit=64', '--cpus=1',
+                         '--tmpfs=/tmp:rw,nosuid,nodev,noexec,mode=0700,size=16m',
+                         '--volume', f'{workspace}:{inside}:ro,nosuid,nodev,noexec', fedora_oci.IMAGE,
+                         '/bin/sh', '-ec', script, 'rpm-verification', *files, timeout=fedora_rpm_cache.remaining(end))
+    keys, *rows = output.decode().splitlines()
+    require(keys.partition(' ')[0] == fedora_rpm_cache.SIGNER, 'unexpected Fedora RPM verification keyring')
+    fedora_rpm_cache.verify_signature_output(files, rows)
+
+
+def build_devbox(probe, *, rpm_cache=None):
     import native_placements as native
 
     cache = probe.root / 'public-cache'
@@ -249,8 +275,27 @@ def build_devbox(probe):
     context_sha = hashlib.sha256(canonical({p.name: ci.file_hash(p) for p in sorted(context.iterdir())})).hexdigest()
     common = ('build', '--quiet', '--pull=never', '--http-proxy=false', '--format=oci', '--force-rm',
               '--memory=2g', '--cpu-quota=200000', '--ulimit=fsize=2147483648:2147483648')
-    tool_id = native.db.engine_id(engine_copy(probe, temporary, *common, '--network=slirp4netns:allow_host_loopback=false',
-                                              '--file', str(tooling / 'Containerfile'), str(tooling), timeout=600).decode().strip())
+    tool_recipe = ('--file', str(tooling / 'Containerfile'), str(tooling))
+    if rpm_cache is None:
+        tool_id = native.db.engine_id(engine_copy(probe, temporary, *common, '--network=slirp4netns:allow_host_loopback=false',
+                                                  *tool_recipe, timeout=600).decode().strip())
+    else:
+        archive_path, manifest_digest = rpm_cache
+        # The existing owned overhead lease is reconciled with the Podman graph
+        # before any residual files are cleaned, including a timed-out build.
+        workspace = temporary / 'outer-rpm-cache'
+        workspace.mkdir(mode=0o700)
+        downloaded = workspace / 'stock-cache'
+        downloaded.mkdir(mode=0o700)
+        end = min(probe.phase_end, time.monotonic() + 120)
+        fedora_rpm_cache.unpack(archive_path, manifest_digest, native.tooling_cache_binding(probe.source),
+                                downloaded, cache / 'fedora-key', end,
+                                signature_check=lambda destination, key, rpms, cutoff:
+                                    verify_cache_signatures(probe, temporary, destination, key, rpms, cutoff))
+        mounts = fedora_rpm_cache.build_mounts(workspace, downloaded, os.getuid(), os.getgid())
+        tool_id = native.db.engine_id(engine_copy(probe, temporary, *common, '--network=none', '--no-cache', *mounts,
+                                                  '--label=dev-pair.rpm-cache=' + manifest_digest, *tool_recipe,
+                                                  timeout=600).decode().strip())
     outer_id = native.db.engine_id(engine_copy(probe, temporary, *common, '--network=none',
                                                '--build-arg', 'TOOLING_IMAGE=sha256:' + tool_id,
                                                '--build-arg', 'SOURCE_SHA=' + probe.source,
@@ -261,6 +306,9 @@ def build_devbox(probe):
     require(tool_shape['config_id'] == tool_id and shape['config_id'] == outer_id and
             shape['diff_ids'][:len(tool_shape['diff_ids'])] == tool_shape['diff_ids'] and
             len(shape['diff_ids']) > len(tool_shape['diff_ids']), 'DevBox image does not extend its exact tooling image')
+    if rpm_cache:
+        labels = tool.get('Labels') or tool.get('Config', {}).get('Labels', {})
+        require(labels.get('dev-pair.rpm-cache') == rpm_cache[1], 'outer tooling RPM cache receipt differs')
     archive = row.volume.path / release.archive_name('devbox')
     engine_copy(probe, temporary, 'save', '--format=oci-archive', '--output', str(archive), 'sha256:' + outer_id, timeout=240)
     probe.privileged('/usr/bin/chown', f'{os.getuid()}:{os.getgid()}', '--', str(archive))
@@ -270,14 +318,16 @@ def build_devbox(probe):
             digest, size = file_hash(archive, ARCHIVE_LIMIT, end, owner=os.getuid(), output=output)
         image = {'role': 'devbox', 'source_sha': probe.source, 'context_sha256': context_sha,
                  'image_id': outer_id, 'archive_sha256': digest, 'archive_bytes': size, 'diff_ids': shape['diff_ids']}
+        audit = {'layer_audit': fedora_rpm_cache.audit_layer} if rpm_cache else {}
         part = release.write_image_part(stage, image,
                                         {'tooling_image_id': tool_id, 'tooling_diff_ids': tool_shape['diff_ids'],
-                                         'tooling_recipe_sha256': ci.file_hash(tooling / 'Containerfile'), 'signed_base': proof}, end)
+                                         'tooling_recipe_sha256': ci.file_hash(tooling / 'Containerfile'), 'signed_base': proof},
+                                        end, **audit)
     probe.storage.parent_free()
     probe.report['platform_export'] = {**image, 'oci_manifest_sha256': part['oci_manifest_sha256']}
 
 
-def execute_devbox(probe):
+def execute_devbox(probe, *, rpm_cache=None):
     start = time.monotonic()
     phase = 'runner-preflight'
     try:
@@ -286,7 +336,10 @@ def execute_devbox(probe):
         with ci.deadline(OUTER_SECONDS):
             probe.preflight()
             phase = 'outer-devbox'
-            build_devbox(probe)
+            if rpm_cache is None:
+                build_devbox(probe)
+            else:
+                build_devbox(probe, rpm_cache=rpm_cache)
             probe.phase(phase, 'pass', 'Signed Fedora tooling and exact outer OCI export verified')
     except (Blocked, ci.Blocked, OSError, ValueError, ImportError, subprocess.SubprocessError) as error:
         probe.phase(phase, 'blocked', str(error))
@@ -301,7 +354,7 @@ def execute_devbox(probe):
     return 0 if all(row['status'] == 'pass' for row in probe.report['phases'].values()) else 2
 
 
-def namespace(source, role):
+def namespace(source, role, *, rpm_cache=None):
     for tool in ci.NAMESPACE_TOOLS:
         require(Path(tool).is_file(), f'required preinstalled production namespace tool unavailable: {tool}')
     ancestor = os.readlink('/proc/self/ns/mnt')
@@ -311,10 +364,24 @@ def namespace(source, role):
             '/usr/bin/setpriv', '--reuid', str(os.getuid()), '--regid', str(os.getgid()), '--init-groups', '--pdeathsig=keep',
             '/usr/bin/env', '-i', *(f'{k}={v}' for k, v in values.items()), '/usr/bin/python3', '-B', str(REPO / 'tools/fedora_ci.py'),
             '--expected-source', source, '--platform-release-role', role, '--namespace-parent', ancestor]
+    if rpm_cache is not None:
+        args.extend(('--rpm-cache', str(rpm_cache[0]), '--expected-rpm-cache-manifest-sha256', rpm_cache[1]))
     return subprocess.run(args, env=ci.SAFE_ENV, timeout=ci.CONTROLLER_SECONDS + 5).returncode
 
 
-def entered(source, role, parent):
+def checked_cache(role, archive, digest):
+    require((archive is None) == (digest is None), 'construction cache and independently supplied manifest digest required')
+    if archive is None:
+        return None
+    require(role == 'devbox' and archive.is_absolute() and archive.resolve(strict=True) == archive,
+            'protected outer-tooling cache path required')
+    for path in (archive, *archive.parents):
+        node = path.lstat()
+        require(node.st_uid in (0, os.getuid()) and not node.st_mode & 0o022, 'outer-tooling cache ancestry is mutable')
+    return archive, hex_id(digest)
+
+
+def entered(source, role, parent, *, rpm_cache=None):
     refresh = admitted_source(source, role, os.environ)
     require(parent is not None and os.getuid() != 0 and os.getpid() == 1 and
             re.fullmatch(r'mnt:\[\d+\]', parent) and os.readlink('/proc/self/ns/mnt') != parent,
@@ -332,7 +399,10 @@ def entered(source, role, parent):
     probe = ci.Probe(source, root, role if role in ci.SCENARIOS else 'maintenance', release=export)
     if role == 'devbox':
         probe.storage = OuterStorage(root, probe.privileged)
+        if rpm_cache is not None:
+            return execute_devbox(probe, rpm_cache=checked_cache(role, *rpm_cache))
         return execute_devbox(probe)
+    require(rpm_cache is None, 'outer-tooling cache is limited to the DevBox release build')
     return probe.execute()
 
 
@@ -340,9 +410,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('role', choices=ROLES)
     parser.add_argument('--source', required=True)
+    parser.add_argument('--rpm-cache', type=Path)
+    parser.add_argument('--expected-rpm-cache-manifest-sha256')
     args = parser.parse_args()
     admitted_source(args.source, args.role, os.environ)
-    return namespace(args.source, args.role)
+    selected = checked_cache(args.role, args.rpm_cache, args.expected_rpm_cache_manifest_sha256)
+    return namespace(args.source, args.role, rpm_cache=selected) if selected else namespace(args.source, args.role)
 
 
 if __name__ == '__main__':

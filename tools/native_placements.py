@@ -20,8 +20,9 @@ import uuid
 
 import devbox
 import fedora_oci
+import fedora_rpm_cache
 from bootstrap import Blocked as BootstrapBlocked, SUDO_PACKAGE_QUERY, role_subordinate_range
-from gptbox import (DEVELOPMENT_ARTIFACTS, DEVELOPMENT_ROOT, RELEASE_ARCHIVE, DevelopmentGptbox,
+from gptbox import (DEVELOPMENT_ARTIFACTS, DEVELOPMENT_ROOT, PACKAGE_SCRIPT, RELEASE_ARCHIVE, DevelopmentGptbox,
                     capture_release_file, image_diff_ids, image_inputs_bytes, sync_directory)
 from native_io import verify_inactive_cgroup
 from storage import GUEST_RESERVE, MANAGED_CEILING
@@ -40,6 +41,7 @@ ENTRY_FILES = ('tools/devbox.py', 'tools/managed_backing.py', 'tools/storage.py'
 INODE_CEILING = 524288
 JOB_LIMIT = 48
 SCRATCH_BYTES = db.GIB
+OUTER_AUDIT_LIMIT = 384 * 1024 ** 2
 HOST_METADATA_BYTES = 256 * 1024 ** 2
 HOST_INODE_HEADROOM = devbox.HOST_INODE_RESERVE
 BUILD_CONF = b"""[containers]
@@ -85,6 +87,11 @@ RUN dnf -y --refresh --setopt=gpgcheck=1 --setopt=localpkg_gpgcheck=1 \\
 RUN rpm -qa --qf '%{{NAME}}-%{{VERSION}}-%{{RELEASE}}.%{{ARCH}}\\n' > /tmp/tool-rpms && \\
     sort /tmp/tool-rpms > /usr/lib/dev-pair-tooling-rpms.txt && rm /tmp/tool-rpms
 """.encode()
+
+
+def tooling_cache_binding(revision):
+    return fedora_rpm_cache.binding(revision, db.STANDARDS, hashlib.sha256(PACKAGE_SCRIPT.encode()).hexdigest(),
+                                    outer_recipe=hashlib.sha256(TOOLING_RECIPE).hexdigest())
 
 
 def require(ok, reason):
@@ -747,10 +754,11 @@ def image_shape(row):
 
 
 class Placement:
-    def __init__(self, producer, account, request, files, inner, archive, cache):
+    def __init__(self, producer, account, request, files, inner, archive, cache, *, rpm_cache=None):
         self.producer, self.account = producer, account
         self.entry_files, self.files = files
         self.inner, self.archive, self.cache = inner, archive, cache
+        self.rpm_cache = rpm_cache
         self.job = request['job']
         self.boot = current_boot()
         self.stage = 'previous activity'
@@ -1111,7 +1119,8 @@ class Placement:
         volume.mount(self.initialize_scratch)
         self.cleanup_verification()
 
-    def import_fedora_base(self):
+    @contextmanager
+    def verification_work(self):
         self.cleanup_verification()
         self.validate_scratch()
         with directory_fd(self.scratch_path) as parent:
@@ -1120,10 +1129,7 @@ class Placement:
                 self.state['verification'] = volume_inode(os.fstat(fd))
                 self.save()
         try:
-            with fedora_oci.verified(self.cache, temporary_parent=self.scratch_path / 'verification',
-                                     leased=True) as (plain, signature):
-                proof = fedora_oci.import_image(lambda *args, timeout: self.engine(*args, timeout=timeout),
-                                                plain, uid=self.account.pw_uid)
+            yield self.scratch_path / 'verification'
         except BaseException as primary:
             try:
                 self.cleanup_verification()
@@ -1132,7 +1138,47 @@ class Placement:
             raise
         else:
             self.cleanup_verification()
-            return proof, signature
+
+    def import_fedora_base(self):
+        with self.verification_work() as verification:
+            with fedora_oci.verified(self.cache, temporary_parent=verification, leased=True) as (plain, signature):
+                proof = fedora_oci.import_image(lambda *args, timeout: self.engine(*args, timeout=timeout),
+                                                plain, uid=self.account.pw_uid)
+        return proof, signature
+
+    def build_tooling(self, prefix, tooling, request):
+        arguments = ('--file', str(tooling / 'Containerfile'), str(tooling))
+        if self.rpm_cache is None:
+            return self.engine(*prefix, '--network=slirp4netns:allow_host_loopback=false', *arguments, timeout=600)
+        with self.verification_work() as verification:
+            cache = verification / 'stock-cache'
+            cache.mkdir(mode=0o700)
+            fedora_rpm_cache.unpack(self.producer.protected(self.rpm_cache), request['rpm_cache_manifest_sha256'],
+                                    tooling_cache_binding(request['source_sha']), cache, self.cache / 'fedora-key',
+                                    time.monotonic() + 120)
+            staging = verification / 'rpm-build'
+            staging.mkdir(mode=0o755)
+            staging.chmod(0o755)
+            mounts = fedora_rpm_cache.build_mounts(staging, cache, self.account.pw_uid, self.account.pw_gid)
+            return self.engine(*prefix, '--network=none', '--no-cache', *mounts,
+                               '--label=dev-pair.rpm-cache=' + request['rpm_cache_manifest_sha256'], *arguments, timeout=600)
+
+    def audit_outer_cache_history(self, outer, images):
+        with self.verification_work() as verification:
+            with directory_fd(verification) as parent:
+                with private_child(parent, 'export', self.account.pw_uid, self.account.pw_gid):
+                    pass
+            output = verification / 'export' / 'devbox.oci.tar'
+            bound = f'{OUTER_AUDIT_LIMIT}:{OUTER_AUDIT_LIMIT}'
+            self.managed('/usr/bin/prlimit', '--fsize=' + bound, '--', *PODMAN, 'save', '--format=oci-archive',
+                         '--output', str(output), 'sha256:' + outer, seconds=240, copy=True)
+            archive = verification / 'devbox.oci.tar'
+            with archive.open('xb') as stream:
+                os.fchmod(stream.fileno(), 0o400)
+                _, size, _ = capture_release_file(output, OUTER_AUDIT_LIMIT, self.account.pw_uid, output=stream)
+            db.check_archive_image(archive, {'archive_bytes': size, 'image_id': outer, 'diff_ids': images['diff_ids']},
+                                   self.state['request']['outer_bytes'], time.monotonic() + 120,
+                                   layer_audit=fedora_rpm_cache.audit_layer)
 
     def prepare_images(self, retry):
         request = self.state['request']
@@ -1152,17 +1198,18 @@ class Placement:
                 self.recipe(outer, name, data)
             base, signature = self.import_fedora_base()
             prefix = ('build', '--quiet', '--pull=never', '--http-proxy=false', '--format=oci')
-            tool_id = db.engine_id(self.engine(*prefix, '--network=slirp4netns:allow_host_loopback=false',
-                                               '--file', str(tooling / 'Containerfile'), str(tooling),
-                                               timeout=600).decode('ascii').strip())
+            tool_id = db.engine_id(self.build_tooling(prefix, tooling, request).decode('ascii').strip())
             outer_id = db.engine_id(self.engine(*prefix, '--network=none',
                                                 '--build-arg', 'TOOLING_IMAGE=sha256:' + tool_id,
                                                 '--build-arg', 'SOURCE_SHA=' + request['source_sha'],
                                                 '--file', str(outer / 'Containerfile'), str(outer),
                                                 timeout=600).decode('ascii').strip())
+            tooling_shape = image_shape(self.inspect('image', tool_id))
+            outer_shape = image_shape(self.inspect('image', outer_id))
+            if self.rpm_cache:
+                self.audit_outer_cache_history(outer_id, outer_shape)
             self.state['images'] = {'base': base, 'signature': signature,
-                                    'tooling': image_shape(self.inspect('image', tool_id)),
-                                    'outer': image_shape(self.inspect('image', outer_id)),
+                                    'tooling': tooling_shape, 'outer': outer_shape,
                                     'build_context_sha256': hashlib.sha256(json_bytes(
                                         {key: hashlib.sha256(data).hexdigest() for key, data in self.files.items()}
                                     )).hexdigest(),
@@ -1185,6 +1232,9 @@ class Placement:
                 require(labels.get('dev-pair.role') == 'devbox-tooling'
                         and labels.get('dev-pair.tooling.base-config') == fedora_oci.CONFIG,
                         'tooling image lacks its signed Fedora input binding')
+                if self.rpm_cache:
+                    require(labels.get('dev-pair.rpm-cache') == request['rpm_cache_manifest_sha256'],
+                            'tooling image lacks its authenticated RPM cache binding')
         db.immutable_image(self, {'outer': {'source_sha': request['source_sha'],
                                            'image_id': images['outer']['config_id']}}, 'outer')
         return store
@@ -1263,11 +1313,15 @@ def main():
     parser.add_argument('--context-sha256', required=True)
     parser.add_argument('--distrobox-source', required=True, type=Path)
     parser.add_argument('--fedora-cache', required=True, type=Path)
+    parser.add_argument('--rpm-cache', type=Path)
+    parser.add_argument('--expected-rpm-cache-manifest-sha256')
     parser.add_argument('--job', required=True)
     parser.add_argument('--storage-gib', type=int, default=8, choices=range(8, 17))
     parser.add_argument('--outer-storage-gib', type=int, default=4, choices=range(4, 9))
     parser.add_argument('--retry', action='store_true')
     args = parser.parse_args()
+    if (args.rpm_cache is None) != (args.expected_rpm_cache_manifest_sha256 is None):
+        parser.error('construction cache and independently supplied manifest digest are both required')
     os.umask(0o077)
     for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGALRM):
         signal.signal(sig, db.interrupt)
@@ -1293,12 +1347,16 @@ def main():
                     'pinned Fedora base inputs are absent from the protected cache')
         request = {'job': args.job, 'source_sha': args.source_sha, 'context_sha256': args.context_sha256,
                    'build_bytes': args.storage_gib * db.GIB, 'outer_bytes': args.outer_storage_gib * db.GIB}
+        if args.rpm_cache is not None:
+            producer.protected(args.rpm_cache)
+            request['rpm_cache_manifest_sha256'] = db.hex_id(args.expected_rpm_cache_manifest_sha256)
         with producer.lock():
             managed_snapshot()
             producer.verify_host_readiness(args.source_sha, args.context_sha256)
             account = role_account(producer)
             inner, archive = protected_publication(producer, args.source_sha, args.context_sha256)
-            placement = Placement(producer, account, request, files, inner, archive, args.fedora_cache)
+            placement = Placement(producer, account, request, files, inner, archive, args.fedora_cache,
+                                  rpm_cache=args.rpm_cache)
             try:
                 report = placement.run(retry=args.retry)
             except (db.Blocked, BootstrapBlocked, OSError, ValueError, KeyError, TypeError,
