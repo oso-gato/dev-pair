@@ -19,6 +19,7 @@ import host_handoff
 import owner_intake
 import platform_release_intake
 import platform_release_install
+import provider_billing
 import release_trust
 import renewal
 import session_controller
@@ -151,6 +152,8 @@ class SignedWorkloadAuthority(unittest.TestCase):
         gh.chmod(0o700)
         catalogue = app.directory('/etc/dev-pair/product-intake', 0o700)
         credentials = app.directory('/etc/dev-pair/provider-credentials', 0o700)
+        billing_root = app.directory('/etc/dev-pair/provider-evidence', 0o700)
+        app.file('/etc/machine-id', (machine['machine_id'] + '\n').encode(), 0o444)
         release_policy = root / 'release-trust.json'
         intake = owner_intake.Intake(root=app.path(c.STATE), site=catalogue)
         stable = {'components': {'host': {'bundle_manifest_sha256': bundle_sha, 'source_sha': fixture.SOURCE}}}
@@ -177,6 +180,8 @@ class SignedWorkloadAuthority(unittest.TestCase):
               patch.object(c, 'Commission', return_value=app), patch.object(c, 'Live', return_value=services),
               patch.object(d, 'Destination', return_value=managed),
               patch.object(owner_intake, 'Intake', return_value=intake), patch.object(owner_intake, 'CREDENTIALS', credentials),
+              patch.multiple(provider_billing, CREDENTIALS=credentials, EVIDENCE=billing_root, SIGNERS=signers,
+                             MACHINE_ID=app.path('/etc/machine-id')),
               patch.object(c, 'GITHUB_CONFIG', archive), patch.object(platform_release_intake, 'GITHUB', str(gh)),
               patch.object(platform_release_install, 'HOST_RELEASES', host_bundles),
               patch.object(platform_release_intake, 'retained_index', return_value=(root, stable, '1' * 64)),
@@ -205,7 +210,7 @@ class SignedWorkloadAuthority(unittest.TestCase):
                                                          'owner-intake': 'owner-catalogue-selection'})
             app.require_runtime_feature('checklist-spool')
             if with_grants:
-                self.approved_owner(app, catalogue, credentials, job, dev_sha, dev_manifest)
+                self.approved_owner(app, catalogue, credentials, job, dev_sha, dev_manifest, billing_root, signers)
                 archive.mkdir(mode=0o700)
                 (archive / 'hosts.yml').write_text('Fixture read-only authorization. No token.\n')
                 (archive / 'hosts.yml').chmod(0o600)
@@ -243,7 +248,7 @@ class SignedWorkloadAuthority(unittest.TestCase):
                     self.assertIn(c.AGENT_BRIDGE[0], cli()['timers'])
                 self.assertEqual(reads, [expected_reads[0], *expected_reads, expected_reads[0], *expected_reads])
                 self.assertFalse(app.path(c.STATE + '/provider-allowances/' + job).exists())
-                (credentials / 'maintenance').unlink()
+                (credentials / 'local-fixture').unlink()
                 with self.assertRaisesRegex(c.Pending, 'provider-slot-authority'):
                     app.require_runtime_feature('owner-intake', owner_entry=True)
                 result = cli()
@@ -256,7 +261,7 @@ class SignedWorkloadAuthority(unittest.TestCase):
             self.assertNotIn(c.TIMERS['checklist-spool'][0], setup.manager.active)
 
     @staticmethod
-    def approved_owner(app, catalogue, credentials, job, dev_sha, dev_manifest):
+    def approved_owner(app, catalogue, credentials, job, dev_sha, dev_manifest, billing_root, signers):
         standards = Path(os.environ['DEV_PAIR_TEST_STANDARDS'])
         cache = catalogue / 'standards'
         cache.mkdir(mode=0o700)
@@ -285,21 +290,37 @@ class SignedWorkloadAuthority(unittest.TestCase):
         slot.mkdir(parents=True, mode=0o700)
         pricing = {'max_context_tokens': 2048, 'input_microusd_per_million': 1000, 'output_microusd_per_million': 2000,
                    'observed_models': ['gpt-6.2-sol']}
-        for kind in ('context', 'tariff'):
-            proof = ('Genuine fixture authority for ' + kind + '. No live provider use.\n').encode()
+        key = signers.with_name('separate-provider-billing-custodian')
+        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True, timeout=5)
+        with signers.open('a') as trust:
+            trust.write('provider-billing ' + key.with_suffix('.pub').read_text())
+        ref = 'local-fixture'
+        secret = 'sk-proj-historical-fixture-never-sent'
+        owner_intake.write_private(credentials / ref, secret.encode())
+        now = int(time.time())
+        review = {**pricing, 'request': provider_billing.request_record(ref, secret),
+                  'organization': 'org-fixture', 'project': 'proj_fixture', 'issued_unix': now,
+                  'expires_unix': now + 1800, 'sources': {kind: {'source': 'record:fixture-authority',
+                      'sha256': c.digest(b'separate custody fixture'), 'bytes': 24} for kind in provider_billing.SOURCE_KINDS}}
+        signature = provider_billing.openssh('sign', '-f', str(key), '-n', provider_billing.NAMESPACE,
+                                            data=provider_billing.canonical(review)).decode()
+        reference_dir = billing_root / ref
+        reference_dir.mkdir(mode=0o700)
+        digest = provider_billing.review_digest(review)
+        owner_intake.write_private(reference_dir / provider_billing.ACTIVE, (digest + '\n').encode())
+        for kind, proof in provider_billing.normalized(review, signature).items():
             (slot / (owner_intake.MODEL + '.' + kind)).write_bytes(proof)
             pricing[kind + '_evidence_sha256'] = c.digest(proof)
         (slot / 'profile.json').write_bytes(c.encoded({'schema': 1, 'host_seconds': 25, 'build_seconds': 20, 'turn_seconds': 10,
-                                                     'allowance_ref': 'local-fixture', 'spend_microusd': 3000,
-                                                     'expires_unix': int(time.time()) + 900, 'pricing': pricing}))
+                                                     'allowance_ref': ref, 'spend_microusd': 3000,
+                                                     'expires_unix': now + 900, 'pricing': pricing,
+                                                     'billing_scope': provider_billing.ALLOWANCE_KIND}))
         for role in owner_intake.ROLES:
             role_root = slot / role
             seed = role_root / 'seed'
             seed.mkdir(parents=True, mode=0o700)
             (seed / 'config.toml').write_text('model = "gpt-6.2-sol"\n')
-            (credentials / role).write_text('placeholder fixture credential\n')
-            (credentials / role).chmod(0o600)
             (role_root / 'profile.json').write_bytes(c.encoded({'runtime_sha256': '5' * 64, 'binary_sha256': '6' * 64,
-                'layout_sha256': '7' * 64, 'credential_ref': role, 'grant': {'spend_microusd': 1000, 'seconds': 30,
+                'layout_sha256': '7' * 64, 'credential_ref': ref, 'grant': {'spend_microusd': 1000, 'seconds': 30,
                     'max_requests': 1, 'max_request_bytes': 1024, 'max_output_tokens': 128}}))
         app.file(c.STATE + '/development/builds/' + job + '/inputs/' + dev_sha + '/manifest.json', dev_manifest, 0o444)

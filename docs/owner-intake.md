@@ -124,33 +124,31 @@ custody. Use `--restore-source` to recover approved inputs and
 `--rotate-source-credential` to replace a stored Git read credential after its
 exact read check. Both use the same protected terminal and installed entry.
 
-Use the hidden provider credential-reference prompt to select a registered
-OpenAI project credential with signed billing terms. The protected provider
-custodian gets the scoped credential from the authorized OpenAI project.
-The independent billing reviewer measures the actual credential assignment,
-full billable input ceiling, worst applicable input and output prices, and
-allowed response model identities. Billing approval and the owner's job
-budget cover separate decisions.
+Choose a provider credential reference at the hidden prompt. For a new
+reference, enter the scoped OpenAI project or service-account key at the hidden
+prompt, or give the wizard the path of the key in a root-private file. The
+provider credential custodian obtains the key from the authorized OpenAI
+project. Billing approval and the owner's job budget cover separate decisions.
 
 ### Provider billing handoff
 
-Use `tools/provider_billing.py` in the exact reviewed checkout, or the same tool
-under `/usr/libexec/dev-pair/tools/` after installation. In the protected root
-terminal, `register --credential-ref` takes the custodian's root-private
-`--secret-file`. Then `request --credential-ref` writes the protected request
-using `--output`. Send the request on the authenticated custody path to the
-independent billing reviewer. That reviewer uses `review --help` for the full
-set of reviewed inputs and signs the account, project and terms outside the
-host and roles. The independent signing public key must be admitted in the
-protected `/etc/dev-pair/trust/allowed_signers` under principal
-`provider-billing` and namespace `dev-pair-provider-billing`.
+The wizard enrolls the separate billing custodian's OpenSSH Ed25519 public
+key after you enter its SHA256 fingerprint from a separately authenticated
+channel and confirm that exact identity. The custodian keeps the private
+signing key. Use the billing custodian's own approved identity.
 
-In the protected root terminal, `receive --credential-ref` takes the review
-bundle through `--bundle` or standard input. It checks the signature and live
-project and model availability, then issues the protected records the broker
-reads. Keep the API key in protected file custody and the reviewer signing key
-with the independent reviewer. A missing, expired or rejected review keeps
-first owner intake pending.
+Send the wizard's protected request to that custodian over the authenticated
+handoff channel. The wizard displays the request and expected return paths
+under `/root/dev-pair-provider-billing`. The request binds the VPS, credential,
+reviewer enrollment and selected model. The custodian checks the actual
+OpenAI organization and project, credential assignment, full billable input
+ceiling, highest applicable input and output rates, and exact response model
+identities. Use `tools/provider_billing.py review --help` at the exact reviewed
+source to produce the signed bundle from the evidence. Return it as a
+root-owned mode-0600 file at the displayed path. On reopening, the wizard verifies
+the bundle and checks model availability through a read-only OpenAI request
+using the reviewed project and credential. Enter a different protected bundle
+path if needed.
 
 Enter the approved total USD cap and UTC expiry. Before confirming, check the
 exact checkout, startup revision, verified private destination, role limits
@@ -159,6 +157,28 @@ catalogue and role profiles. It can join an interrupted publication and retains
 existing catalogue and job history. Resume Day 0 to finish activation. The
 normal owner command has its own approval for each later product job before
 issuing its job-bound provider allowance.
+
+For a configured catalogue, reopen the same wizard to reauthorize an unused
+slot with fresh signed terms and explicit budget consent. The catalogue,
+original slot profiles and prior receipts are retained. A retained draft or
+job reserves its existing slot. Older unscoped allowances remain available
+for historical inspection and carry zero spendable balance. Their jobs need
+freshly approved authority on another eligible slot before any further paid
+work.
+
+The same wizard can withdraw the selected credential's current terms,
+withdraw the billing reviewer, or enroll the replacement reviewer. Enter
+`billing` at the repository prompt to reach these actions before a catalogue
+has been configured. Use
+fresh signed terms for the resulting credential and enrollment. The broker
+checks the current terms, signature and enrollment immediately before each
+paid request. Withdrawal and send admission share a lock. If a send is
+already entering the provider, retry the withdrawal once it releases that
+lock. A request accepted before withdrawal can still incur a charge and its
+reserved effect stays recorded. When upgrading from an earlier broker,
+drain or stop any old process under the approved maintenance scope before
+relying on the new send check. An already submitted request retains its
+existing accounting and the platform does not replay it to change billing.
 
 Protected automation can inspect the exact plan through `--inspect-site --help`
 and confirm it through `--initialize-site`. These entries read the same signed

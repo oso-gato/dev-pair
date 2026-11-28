@@ -57,13 +57,17 @@ class FirstCatalogueTests(unittest.TestCase):
             folder.chmod(0o700)
         self.intake = owner.Intake(self.site, self.root)
         self.first = owner.FirstCatalogue(self.intake)
+        evidence.chmod(0o700)
         owner.write_private(self.intake.catalogue / 'intake.lock', b'')
+        machine = self.path / 'machine-id'
+        owner.write_private(machine, b'c' * 32 + b'\n')
+        self.use(mock.patch.object(provider_billing, 'MACHINE_ID', machine))
         secret = 'sk-proj-offline-test-key-never-sent'
         owner.write_private(self.credential, secret.encode())
-        key = self.path / 'reviewer'
+        key = self.billing_key = self.path / 'reviewer'
         subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)],
                        check=True, timeout=5)
-        signers = self.path / 'allowed_signers'
+        signers = self.billing_signers = self.path / 'allowed_signers'
         owner.write_private(signers, b'provider-billing ' + key.with_suffix('.pub').read_bytes())
         issued = int(time.time())
         review = {'request': provider_billing.request_record(self.credential.name, secret),
@@ -86,9 +90,10 @@ class FirstCatalogueTests(unittest.TestCase):
             {'review': review, 'signature': signature,
              'evidence': {kind: 'Zml4dHVyZQ==' for kind in provider_billing.SOURCE_KINDS}}))
         self.use(mock.patch.multiple(provider_billing, CREDENTIALS=self.credential.parent, EVIDENCE=evidence,
-                                     SIGNERS=signers))
+                                     SIGNERS=signers, HANDOFF=self.path / 'billing-handoff'))
         self.use(mock.patch.object(provider_billing, 'protected', side_effect=lambda path, *, directory=False, private=False:
             self.protected(path, directory=directory, mode=(0o700 if directory else 0o600) if private else None)))
+        self.use(mock.patch.object(provider_billing, 'trust_lock', side_effect=contextlib.nullcontext))
         self.source = self.site / 'repositories' / REPOSITORY / 'acquired'
         self.startup = self.site / 'repositories' / REPOSITORY / 'startup'
         for repository in (self.source, self.startup):
@@ -444,12 +449,87 @@ class FirstCatalogueTests(unittest.TestCase):
             self.assertIn('Setup remains pending.', printed.getvalue())
             (self.billing / (owner.MODEL + '.tariff')).write_text('Previously reviewed opaque notes')
             printed = io.StringIO()
-            owner.setup_site(self.first, io.StringIO(REPOSITORY + '\n1\n'), printed)
-        self.assertIn('provider custodian must supply', printed.getvalue())
+            owner.setup_site(self.first, io.StringIO(REPOSITORY + '\n1\n\n'), printed)
+        self.assertIn('waiting for the independent signed bundle', printed.getvalue())
         self.assertNotIn('Approved total job budget', printed.getvalue())
         self.assertNotIn('Confirm this exact owner setup?', printed.getvalue())
         self.assertFalse(self.first.catalogue.exists())
         self.assertFalse((self.site / 'slots').exists())
+
+    def test_fresh_wizard_registers_hidden_key_enrolls_and_imports_independent_terms(self):
+        self.billing_signers.write_text('# no billing custodian enrolled\n')
+        reference = 'fresh-api'
+        secret = 'sk-proj-fresh-fixture-never-sent'
+        public = self.billing_key.with_suffix('.pub').read_text().strip()
+        _, fingerprint = provider_billing.reviewer_key(public)
+        answers = '\n'.join((REPOSITORY, '1', '', public, fingerprint, 'yes', '', ''))
+        with mock.patch.object(owner.getpass, 'getpass', side_effect=(reference, secret)):
+            printed = io.StringIO()
+            owner.setup_site(self.first, io.StringIO(answers), printed)
+        self.assertIn('waiting for the independent signed bundle', printed.getvalue())
+        self.assertNotIn(secret, printed.getvalue())
+        handoff = provider_billing.HANDOFF
+        request, expected_bundle = handoff / (reference + '.request.json'), handoff / (reference + '.review.bundle')
+        self.assertEqual(stat.S_IMODE(request.stat().st_mode), 0o600)
+        record = loads(request.read_bytes())
+        self.assertEqual(record['machine_sha256'], provider_billing.machine_binding())
+        self.assertEqual(record['reviewer_epoch'], provider_billing.reviewer_state()['epoch'])
+        review = loads(self.bill['context'])['review']
+        review['request'] = record
+        signature = provider_billing.openssh('sign', '-f', str(self.billing_key),
+            '-n', provider_billing.NAMESPACE, data=provider_billing.canonical(review)).decode()
+        owner.write_private(expected_bundle, provider_billing.canonical(
+            {'review': review, 'signature': signature,
+             'evidence': {kind: 'Zml4dHVyZQ==' for kind in provider_billing.SOURCE_KINDS}}))
+        expires = datetime.fromtimestamp(self.options.expires_unix, timezone.utc).strftime('%Y-%m-%d %H:%M')
+        answers = '\n'.join((REPOSITORY, '1', '0.09', expires, 'yes', ''))
+        with mock.patch.object(owner.getpass, 'getpass', return_value=reference), \
+                mock.patch.object(provider_billing, 'available') as available:
+            printed = io.StringIO()
+            owner.setup_site(self.first, io.StringIO(answers), printed)
+        available.assert_called_once_with(secret, review)
+        self.assertIn('Owner catalogue configured', printed.getvalue())
+        self.assertNotIn(secret, printed.getvalue())
+        self.assertEqual(self.intake.slot(JOB, self.manifest)[0]['allowance_ref'], reference)
+
+    def test_legacy_catalogue_requires_new_consent_and_preserves_original_slot(self):
+        self.preview()
+        self.first.initialize(self.options)
+        slot = self.site / 'slots' / JOB
+        profile = slot / 'profile.json'
+        legacy = loads(profile.read_bytes())
+        legacy.pop('billing_scope')
+        for kind in ('context', 'tariff'):
+            opaque = (slot / (owner.MODEL + '.' + kind))
+            opaque.write_bytes(('historical ' + kind).encode())
+            legacy['pricing'][kind + '_evidence_sha256'] = sha256(opaque.read_bytes())
+        old_profile = canonical(legacy).encode()
+        profile.write_bytes(old_profile)
+        requested = dict(action='draft', repository=REPOSITORY, workload=owner.CHECKLIST,
+                         brief='Repair restart persistence.', audience='Existing checklist owners.',
+                         access='Retain private group access.', acceptance='A completed item survives restart.',
+                         constraints='', external_validation='')
+        with self.assertRaisesRegex(ValueError, 'signed provider billing reauthorization'):
+            self.intake.draft(requested)
+        self.assertFalse((self.root / 'provider-allowances' / JOB).exists())
+        with self.assertRaisesRegex(ValueError, 'New provider allowances require'):
+            self.intake.allowance({'job_id': JOB}, legacy, {})
+        live = object.__new__(commission_host.Live)
+        live.checklist_builder = mock.Mock()
+        with mock.patch.object(owner, 'Intake', return_value=self.intake), self.assertRaises(commission_host.Pending):
+            live.owner_feature_authority(SELECTED, None)
+        expiry = datetime.fromtimestamp(self.options.expires_unix, timezone.utc).strftime('%Y-%m-%d %H:%M')
+        with mock.patch.object(owner.getpass, 'getpass', return_value=self.credential.name):
+            printed = io.StringIO()
+            owner.setup_site(self.first, io.StringIO(f'reauthorize\n0.09\n{expiry}\nyes\n'), printed)
+        self.assertIn('Signed billing reauthorization is active', printed.getvalue())
+        self.assertEqual(profile.read_bytes(), old_profile)
+        self.assertEqual((slot / (owner.MODEL + '.tariff')).read_bytes(), b'historical tariff')
+        self.assertEqual(self.intake.draft(requested)['phase'], 'awaiting-confirmation')
+        self.assertEqual(self.first.available_billing_slots(), [])
+        with mock.patch.object(owner, 'Intake', return_value=self.intake):
+            approved = live.owner_feature_authority(SELECTED, None)
+            self.assertEqual(live.owner_feature_authority(SELECTED, approved), approved)
 
     def test_wrong_git_origin_and_mismatched_verified_seed_runtime_are_refused(self):
         self.git(self.source, 'config', 'remote.origin.url', 'https://github.com/foreign/source')

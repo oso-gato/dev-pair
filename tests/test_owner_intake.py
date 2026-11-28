@@ -98,7 +98,8 @@ class OwnerIntakeTests(unittest.TestCase):
         profile = {'grant': {'spend_microusd': 20000, 'seconds': 60, 'max_requests': 2, 'max_request_bytes': 8192,
                              'max_context_tokens': 2000, 'max_output_tokens': 256}}
         return ({'host_seconds': 30, 'build_seconds': 60, 'turn_seconds': 30, 'allowance_ref': 'site-plan',
-                 'spend_microusd': 45000, 'expires_unix': 2_000_000_000, 'pricing': {}},
+                 'spend_microusd': 45000, 'expires_unix': 2_000_000_000, 'pricing': {},
+                 'billing_scope': intake.billing.ALLOWANCE_KIND},
                 {role: {'grant': dict(profile['grant'])} for role in intake.ROLES},
                 {'context': b'fixture billable context', 'tariff': b'fixture price'}, {role: 'e' * 64 for role in intake.ROLES})
 

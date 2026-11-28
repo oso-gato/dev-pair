@@ -449,6 +449,8 @@ def preflight_resume(payload):
 
 
 def preflight_allowance(payload):
+    from provider_billing import require_broker_release
+
     release, _ = admit_release(payload['release_sha256'])
     component = release['components']['host']
     directory = INSTALL / 'host-releases' / component['artifact_sha256']
@@ -456,6 +458,7 @@ def preflight_allowance(payload):
     r.require(r.sha(manifest) == component['artifact_sha256'] and
               r.sha(owned_file(directory / 'tools' / 'provider_broker.py', 1 << 20)) ==
               r.loads(manifest)['files']['tools/provider_broker.py'], 'fallback provider authority source differs')
+    require_broker_release(INSTALL / 'tools', directory / 'tools')
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(directory / 'tools'))
     from provider_broker import remaining_allowance

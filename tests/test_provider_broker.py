@@ -380,7 +380,7 @@ class SharedAllowanceTests(unittest.TestCase):
             data = ('offline-fixture-' + suffix).encode()
             (self.job / (MODEL + '.' + suffix)).write_bytes(data)
             proof[suffix + '_evidence_sha256'] = hashlib.sha256(data).hexdigest()
-        self.policy = {'schema': 1, 'kind': 'verified-full-billable-context', 'job': 'sample',
+        self.policy = {'schema': 1, 'kind': broker.billing.ALLOWANCE_KIND, 'job': 'sample',
                        'auth_profile': broker.PROFILE, 'allowance_ref': self.grant['allowance_ref'],
                        'spend_microusd': 1900, 'expires_unix': self.grant['expires_unix'],
                        'repository': self.selection['repository'], 'agreement_sha256': self.selection['agreement_sha256'],
@@ -416,8 +416,15 @@ class SharedAllowanceTests(unittest.TestCase):
 
     def test_held_cost_is_shared_across_role_and_grant_and_survives_reopen(self):
         allowance = broker.load_allowance('sample', self.digest)
-        allowance.validate_grant(self.selection, self.grant)
-        self.assertEqual(broker.remaining_allowance('sample', self.digest)['remaining_microusd'], 1900)
+        pricing = {key: self.grant[key] for key in broker.TARIFF_FIELDS}
+        review = {'request': {'model': MODEL, 'effort': 'high', 'credential_ref': self.grant['allowance_ref']},
+                  'expires_unix': self.grant['expires_unix']}
+        with patch.object(broker.billing, 'validate_proofs', return_value=(pricing, review)), \
+                patch.object(broker.billing, 'assert_current'), \
+                patch.object(broker.billing, 'credential_from', return_value='fixture-signed-key'), \
+                patch.object(broker.billing, 'matches_request', return_value=True):
+            allowance.validate_grant(self.selection, self.grant)
+            self.assertEqual(broker.remaining_allowance('sample', self.digest)['remaining_microusd'], 1900)
         self.assertFalse((self.job / 'usage.sqlite').exists())
         self.assertTrue(allowance.reserve(self.selection, self.grant, 1, 1088, 'c' * 64))
         other = {**self.selection, 'role': 'maintenance', 'operation': 'second'}
@@ -508,6 +515,18 @@ class SharedAllowanceTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             broker.remaining_allowance('sample', 'f' * 64)
 
+    def test_legacy_allowance_is_readable_for_history_but_cannot_authorize_a_send(self):
+        self.policy['kind'] = 'verified-full-billable-context'
+        raw = broker.canonical(self.policy)
+        (self.job / 'allowance.json').write_bytes(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        allowance = broker.load_allowance('sample', digest)
+        self.assertEqual(allowance.remaining()['spend_microusd'], 1900)
+        self.assertEqual(allowance.remaining()['remaining_microusd'], 0)
+        self.assertEqual(allowance.remaining()['status'], 'historical-unscoped')
+        with self.assertRaisesRegex(RuntimeError, 'Historical unscoped'):
+            allowance.validate_grant(self.selection, self.grant)
+
 
 class BrokerLifecycleTests(unittest.TestCase):
     def invoke(self, available):
@@ -526,13 +545,16 @@ class BrokerLifecycleTests(unittest.TestCase):
             destination.chmod(0o700)
             receipt = destination / (inputs['operation'] + '.json')
             approved = Mock()
-            approved.validate_grant.return_value = None
+            approved.validate_grant.return_value = {'request': {}, 'organization': 'org-fixture', 'project': 'proj_fixture'}
             approved.remaining.return_value = {'remaining_microusd': 3000}
             api = Mock()
             api.discover.return_value = 'available'
             args = ['provider_broker.py', '--grant', str(root / 'grant'), '--request', str(root / 'request'),
-                    '--credential-file', str(root / 'key'), '--socket', str(path), '--receipt', str(receipt)]
+                    '--credential-file', str(root / template['allowance_ref']), '--socket', str(path), '--receipt', str(receipt)]
             with patch.object(sys, 'argv', args), patch.object(broker, 'EVIDENCE', root), \
+                    patch.object(broker.billing, 'CREDENTIALS', root), \
+                    patch.object(broker.billing, 'credential_from', return_value='offline-fixture-key-never-sent'), \
+                    patch.object(broker.billing, 'matches_request', return_value=True), \
                     patch.object(broker, 'provider_host_path', return_value=directory), \
                     patch.object(broker, 'protected_file', side_effect=[broker.canonical(template), raw, b'fixture-key']), \
                     patch.object(broker, 'host_repository_approval'), \

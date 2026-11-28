@@ -14,11 +14,13 @@ import os
 from pathlib import Path
 import re
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import job_protocol as p
@@ -27,6 +29,8 @@ from ledger_recovery import sync_directory, write_private
 CREDENTIALS = Path('/etc/dev-pair/provider-credentials')
 EVIDENCE = Path('/etc/dev-pair/provider-evidence')
 SIGNERS = Path('/etc/dev-pair/trust/allowed_signers')
+MACHINE_ID = Path('/etc/machine-id')
+HANDOFF = Path('/root/dev-pair-provider-billing')
 MODEL = 'gpt-6.2-sol'
 EFFORT = 'high'
 PROFILE = 'openai-api-key'
@@ -44,6 +48,8 @@ SIGNATURE_LIMIT = 8192
 SECRET_LIMIT = 513
 SSH_KEYGEN = '/usr/bin/ssh-keygen'
 ACTIVE = 'active.sha256'
+REVIEWER = 'reviewer.json'
+WITHDRAWAL = 'withdrawal.json'
 PRICING = ('max_context_tokens', 'input_microusd_per_million', 'output_microusd_per_million', 'observed_models')
 
 
@@ -77,6 +83,13 @@ def bounded_file(path, limit, *, owner=None, mode=None):
     return raw
 
 
+def require_broker_release(installed, selected):
+    for name in ('provider_billing.py', 'provider_broker.py'):
+        baseline = bounded_file(protected(installed / name), 256 * 1024, owner=0)
+        candidate = bounded_file(protected(selected / name), 256 * 1024, owner=0)
+        p.require(candidate == baseline, 'The selected host broker lacks the installed provider billing controls.')
+
+
 def credential(raw):
     try:
         value = raw.decode('ascii').removesuffix('\n')
@@ -95,20 +108,72 @@ def fingerprint(secret):
     return hashlib.sha256(secret.encode('ascii')).hexdigest()
 
 
+def machine_binding():
+    raw = bounded_file(MACHINE_ID, 33)
+    p.require(re.fullmatch(rb'[0-9a-f]{32}\n?', raw), 'The VPS machine identity is unavailable.')
+    return p.sha256(raw.rstrip(b'\n'))
+
+
+def reviewer_state():
+    path = EVIDENCE / REVIEWER
+    if not os.path.lexists(path):
+        return None
+    state = p.loads(bounded_file(protected(path, private=True), REVIEW_LIMIT, owner=0, mode=0o600))
+    p.fields(state, 'schema epoch key fingerprint')
+    p.number(state['schema'], 1, 1)
+    p.digest(state['epoch'], 32)
+    if state['key'] is None:
+        p.require(state['fingerprint'] is None, 'Invalid billing signer withdrawal.')
+    else:
+        p.require(reviewer_key(state['key']) == (state['key'], state['fingerprint']), 'Invalid enrolled billing reviewer.')
+    return state
+
+
 def request_record(reference, secret):
     p.token(reference)
-    return {'schema': 1, 'credential_ref': reference, 'credential_sha256': fingerprint(secret),
+    signer = reviewer_state()
+    p.require(signer is None or signer['key'] is not None, 'Independent billing reviewer enrollment was withdrawn.')
+    return {'schema': 2, 'machine_sha256': machine_binding(), 'reviewer_epoch': signer['epoch'] if signer else None,
+            'credential_ref': reference, 'credential_sha256': fingerprint(secret),
             'profile': PROFILE, 'contract': CONTRACT, 'model': MODEL, 'effort': EFFORT}
 
 
 def validate_request(row):
-    p.fields(row, 'schema credential_ref credential_sha256 profile contract model effort')
-    p.number(row['schema'], 1, 1)
+    p.require(type(row) is dict, 'Invalid provider billing request.')
+    schema = row.get('schema')
+    p.number(schema, 1, 2)
+    p.fields(row, 'schema credential_ref credential_sha256 profile contract model effort'
+             + (' machine_sha256 reviewer_epoch' if schema == 2 else ''))
+    if schema == 2:
+        p.digest(row['machine_sha256'])
+        if row['reviewer_epoch'] is not None:
+            p.digest(row['reviewer_epoch'], 32)
     p.token(row['credential_ref'])
     p.digest(row['credential_sha256'])
     p.require((row['profile'], row['contract'], row['model'], row['effort']) == (PROFILE, CONTRACT, MODEL, EFFORT),
               'Billing review targets a different provider contract.')
     return row
+
+
+def matches_request(row, reference, secret):
+    expected = request_record(reference, secret)
+    if row['schema'] == 1 and expected['reviewer_epoch'] is None:
+        expected.pop('machine_sha256')
+        expected.pop('reviewer_epoch')
+        expected['schema'] = 1
+    return row == expected
+
+
+def reviewer_key(value):
+    p.require(type(value) is str and value.isascii() and len(value) <= 512,
+              'Use the independent custodian’s OpenSSH Ed25519 public key.')
+    fields = value.split()
+    p.require(len(fields) >= 2 and fields[0] == 'ssh-ed25519', 'Use an OpenSSH Ed25519 public key.')
+    raw = base64.b64decode(fields[1], validate=True)
+    p.require(len(raw) == 51 and raw.startswith(struct.pack('!I', 11) + b'ssh-ed25519' + struct.pack('!I', 32))
+              and base64.b64encode(raw).decode() == fields[1], 'The supplied Ed25519 public key is invalid.')
+    key_id = base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip('=')
+    return ' '.join(fields[:2]), 'SHA256:' + key_id
 
 
 def check_attachment(raw):
@@ -182,14 +247,60 @@ def openssh(*args, data):
     return outcome.stdout
 
 
+def signer_rows():
+    if not os.path.lexists(SIGNERS):
+        return []
+    raw = bounded_file(protected(SIGNERS), REVIEW_LIMIT, owner=0)
+    return [line for line in raw.splitlines() if line.split() and not line.lstrip().startswith(b'#')]
+
+
+def other_signer_keys(rows):
+    keys = set()
+    for row in rows:
+        fields = row.split()
+        if fields[0] != PRINCIPAL.encode():
+            keys.update(right for left, right in zip(fields, fields[1:]) if left == b'ssh-ed25519')
+    return keys
+
+
+def require_distinct_reviewer(key):
+    p.require(key.split()[1].encode() not in other_signer_keys(signer_rows()),
+              'The provider billing reviewer needs a key separate from other independent authorities.')
+
+
+def legacy_signers():
+    rows = signer_rows()
+    used_elsewhere = other_signer_keys(rows)
+    # Other OpenSSH principals may use patterns. Only a dedicated, exact
+    # previously enrolled billing principal is eligible for this authority.
+    return b''.join(line + b'\n' for line in rows if line.split(None, 1)[0] == PRINCIPAL.encode()
+                    and not used_elsewhere.intersection(line.split()))
+
+
+def has_reviewer():
+    state = reviewer_state()
+    return bool(legacy_signers()) if state is None else state['key'] is not None
+
+
 def verify_signature(review, signature):
     p.require(type(signature) is str and 0 < len(signature) <= SIGNATURE_LIMIT and signature.isascii() and
               signature.startswith('-----BEGIN SSH SIGNATURE-----\n'), 'Billing review signature is invalid.')
     try:
-        signers = protected(SIGNERS)
+        state = reviewer_state()
         with tempfile.TemporaryDirectory(prefix='provider-billing-') as directory:
             path = Path(directory) / 'review.sig'
             path.write_text(signature, encoding='ascii')
+            signers = Path(directory) / 'allowed_signers'
+            if state is None:
+                p.require(review['request'].get('reviewer_epoch') is None, 'The enrolled billing reviewer was removed.')
+                records = legacy_signers()
+                p.require(records, 'The independently enrolled provider billing reviewer is unavailable.')
+            else:
+                p.require(state['key'] is not None and review['request'].get('reviewer_epoch') == state['epoch'],
+                          'The signed terms target a withdrawn or superseded billing reviewer.')
+                require_distinct_reviewer(state['key'])
+                records = f'{PRINCIPAL} namespaces="{NAMESPACE}" {state["key"]}\n'.encode('ascii')
+            write_private(signers, records)
             openssh('verify', '-f', str(signers), '-I', PRINCIPAL, '-n', NAMESPACE, '-s', str(path),
                     data=canonical(review))
     except (OSError, subprocess.SubprocessError) as exc:
@@ -237,8 +348,18 @@ def proofs_at(root):
 
 def assert_current(review):
     reference = review['request']['credential_ref']
-    p.require(review['expires_unix'] > time.time() and current_digest(reference_directory(reference)) ==
-              review_digest(review), 'The signed billing review expired or was superseded.')
+    root = reference_directory(reference)
+    p.require(review['expires_unix'] > time.time() and current_digest(root) == review_digest(review),
+              'The signed billing review expired or was superseded.')
+    require_not_withdrawn(root, review)
+
+
+def validate_send(review, secret):
+    assert_current(review)
+    reference = review['request']['credential_ref']
+    _, retained = validate_proofs(proofs_at(reference_directory(reference) / review_digest(review)), reference)
+    p.require(retained == review and matches_request(review['request'], reference, secret),
+              'Provider billing authority changed after admission.')
 
 
 def authority(reference):
@@ -246,6 +367,7 @@ def authority(reference):
     active = current_digest(root)
     secret = credential_from(CREDENTIALS / reference)
     review, proofs = authorize_bundle(retained_bundle(root / active), reference, secret)
+    assert_current(review)
     p.require(review_digest(review) == active and proofs_at(root / active) == proofs,
               'The active billing evidence no longer matches independent review.')
     return {key: review[key] for key in PRICING}, proofs, review
@@ -268,7 +390,7 @@ def authorize_bundle(raw, reference, secret):
         raise ValueError('Billing review bundle exceeds its nesting bound.') from exc
     p.fields(bundle, 'review signature evidence')
     review = validate_review(bundle['review'], time.time())
-    p.require(review['request'] == request_record(reference, secret), 'The review belongs to another credential.')
+    p.require(matches_request(review['request'], reference, secret), 'The review belongs to another credential or host.')
     verify_signature(review, bundle['signature'])
     p.fields(bundle['evidence'], ' '.join(SOURCE_KINDS))
     for key, body in bundle['evidence'].items():
@@ -295,6 +417,78 @@ def private_folder(path):
     return protected(path, directory=True, private=True)
 
 
+def evidence_directory():
+    protected(EVIDENCE.parent, directory=True)
+    return private_folder(EVIDENCE)
+
+
+def replace_record(path, value):
+    with tempfile.TemporaryDirectory(prefix='.billing-record-', dir=path.parent) as temporary:
+        staged = Path(temporary) / 'record'
+        write_private(staged, canonical(value))
+        staged.replace(path)
+        sync_directory(path.parent)
+
+
+@contextmanager
+def trust_lock():
+    from bootstrap import Blocked, Bootstrap
+
+    try:
+        with Bootstrap().lock('signer-trust.lock'):
+            yield
+    except Blocked as exc:
+        raise ValueError('Protected signer custody is unavailable or an update is in progress.') from exc
+
+
+def set_reviewer(public, expected_fingerprint, expected_state):
+    state = {'schema': 1, 'epoch': uuid.uuid4().hex, 'key': None, 'fingerprint': None}
+    if public is not None:
+        public, actual = reviewer_key(public)
+        p.require(actual == expected_fingerprint, 'The key differs from the independently authenticated billing fingerprint.')
+        state.update(key=public, fingerprint=actual)
+    root = evidence_directory()
+    with trust_lock(), lock(root):
+        if public is not None:
+            require_distinct_reviewer(public)
+        prior = reviewer_state()
+        p.require(prior == expected_state, 'Billing reviewer custody changed. Reinspect the independent fingerprint.')
+        if prior is not None and (prior['key'], prior['fingerprint']) == (state['key'], state['fingerprint']):
+            return prior
+        replace_record(root / REVIEWER, state)
+    return state
+
+
+def withdrawal(root):
+    path = root / WITHDRAWAL
+    if not os.path.lexists(path):
+        return 0, None
+    data = p.loads(bounded_file(protected(path, private=True), 256, owner=0, mode=0o600))
+    p.fields(data, 'schema withdrawn_unix review_sha256')
+    p.number(data['schema'], 1, 1)
+    p.number(data['withdrawn_unix'], 1, 2**63 - 1)
+    if data['review_sha256'] is not None:
+        p.digest(data['review_sha256'])
+    return data['withdrawn_unix'], data['review_sha256']
+
+
+def require_not_withdrawn(root, review):
+    cutoff, digest = withdrawal(root)
+    p.require(review['issued_unix'] > cutoff and review_digest(review) != digest,
+              'The signed billing review was withdrawn.')
+
+
+def withdraw_reference(reference):
+    root = evidence_directory()
+    with lock(root):
+        folder = reference_directory(reference)
+        previous, old_digest = withdrawal(folder)
+        when = max(int(time.time()), previous)
+        current = current_digest(folder) if os.path.lexists(folder / ACTIVE) else old_digest
+        replace_record(folder / WITHDRAWAL, {'schema': 1, 'withdrawn_unix': when, 'review_sha256': current})
+        return when
+
+
 @contextmanager
 def lock(root, *, shared=False):
     path = root / '.billing.lock'
@@ -306,13 +500,21 @@ def lock(root, *, shared=False):
         p.require(stat.S_ISREG(info.st_mode) and (info.st_uid, info.st_gid, info.st_nlink,
                                                  stat.S_IMODE(info.st_mode)) == (0, 0, 1, 0o600),
                   'Provider billing lock is outside its protected custody.')
-        fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(stream, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError('A protected billing update or provider admission is in progress. Retry this action.') from exc
         yield
 
 
 def register(reference, path):
+    register_secret(reference, credential_from(path))
+
+
+def register_secret(reference, secret):
     p.token(reference)
-    secret = credential_from(path)
+    p.require(type(secret) is str and secret.isascii(), 'A scoped OpenAI project or service-account API key is required.')
+    credential(secret.encode('ascii'))
     protected(CREDENTIALS.parent, directory=True)
     directory = private_folder(CREDENTIALS)
     with lock(directory):
@@ -343,11 +545,11 @@ def available(secret, review):
 def receive(reference, raw):
     p.token(reference)
     secret = credential_from(CREDENTIALS / reference)
-    review, proofs = authorize_bundle(raw, reference, secret)
-    protected(EVIDENCE.parent, directory=True)
-    root = private_folder(EVIDENCE)
+    root = evidence_directory()
     with lock(root):
+        review, proofs = authorize_bundle(raw, reference, secret)
         folder = private_folder(root / reference)
+        require_not_withdrawn(folder, review)
         digest = review_digest(review)
         destination = folder / digest
         if os.path.lexists(folder / ACTIVE):
@@ -359,7 +561,8 @@ def receive(reference, raw):
                 return
             prior = p.loads(prior_proofs['context'])['review']
             p.require(review['issued_unix'] > prior['issued_unix'] and
-                      all(review[key] == prior[key] for key in ('request', 'organization', 'project')),
+                      all(review[key] == prior[key] for key in ('organization', 'project')) and
+                      all(review['request'][key] == prior['request'][key] for key in ('credential_ref', 'credential_sha256')),
                       'Supply a newer independent review for the same credential and project.')
         if not os.path.lexists(destination):
             with os.scandir(folder) as children:
@@ -387,6 +590,20 @@ def receive(reference, raw):
             write_private(marker, (digest + '\n').encode('ascii'))
             marker.replace(folder / ACTIVE)
             sync_directory(folder)
+
+
+def setup_handoff(reference):
+    secret = credential_from(CREDENTIALS / reference)
+    protected(HANDOFF.parent, directory=True)
+    root = private_folder(HANDOFF)
+    output = root / (reference + '.request.json')
+    bundle = root / (reference + '.review.bundle')
+    with lock(root):
+        request = request_record(reference, secret)
+        if not os.path.lexists(output) or p.loads(bounded_file(protected(output, private=True), REVIEW_LIMIT,
+                                                               owner=0, mode=0o600)) != request:
+            replace_record(output, request)
+    return output, bundle
 
 
 def review_bundle(options):

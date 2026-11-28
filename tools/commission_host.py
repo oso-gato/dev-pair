@@ -1493,21 +1493,21 @@ class Live:
             os.close(fd)
 
     def owner_slot_grant(self, intake, job):
-        from owner_intake import CREDENTIALS, MODEL, ROLES, checked_file
+        from owner_intake import CREDENTIALS, checked_file, verify_slot_billing
 
-        root = intake.site / 'slots' / job
-        profile = checked_file(root / 'profile.json')
-        expires = parse(profile)['expires_unix']
+        profile, roles, proofs = intake.slot_documents(job)
+        settings = parse(profile)
+        expires = settings['expires_unix']
         require(type(expires) is int and expires > time.time(), 'owner provider approval expired')
+        verify_slot_billing(settings, proofs)
         inputs = {'catalogue': digest(checked_file(intake.site / 'repositories.json')), 'slot': digest(profile)}
-        for role in ROLES:
-            raw = checked_file(root / role / 'profile.json')
+        for role, raw in roles.items():
             credential = parse(raw)['credential_ref']
             require(type(credential) is str and re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,127}', credential) and
                     credential not in ('.', '..'), 'invalid protected provider credential reference')
             inputs[role] = [digest(raw), self.credential_stamp(CREDENTIALS / credential)]
-        for kind in ('context', 'tariff'):
-            inputs[kind] = digest(checked_file(root / (MODEL + '.' + kind), 1024 * 1024))
+        for kind, proof in proofs.items():
+            inputs[kind] = digest(proof)
         return {'subject': job, 'expires_unix': expires, 'sha256': digest(encoded(inputs))}
 
     def owner_feature_authority(self, selected, recorded):

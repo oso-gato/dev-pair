@@ -81,11 +81,15 @@ agent replacement also needs independently signed prospective observations.
 
 At the first owner setup prompt, select the approved project repository and
 workload. Follow the prompts for exact source and startup revisions, approved
-read access and pinned private standards. Use a registered OpenAI project
-credential reference with independently signed billing terms in protected custody.
-Check the displayed revisions, destination, role settings, budget cap and UTC
-expiry before confirming. Resume to finish activation, then connect as `core`
-over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
+read access and pinned private standards. The same wizard selects or registers
+the OpenAI project key using a hidden prompt or a protected file. Enroll the
+independent billing custodian with their separately authenticated signing
+fingerprint. Send the wizard's VPS-bound request to that custodian and place
+the returned signed bundle at the protected path it displays. Resume to
+check the bundle and confirm the exact project, role settings, budget cap
+and UTC expiry. Day 0 can also reopen billing setup for a configured catalogue
+whose unused slot needs signed reauthorization. Once activation completes,
+connect as `core` over the verified route. [Owner setup and terminal command](owner-intake.md#repository-and-slot-inputs)
 
 When the named owner terminal is available, `resume` can offer optional
 checklist promotion. Enroll only after the independent release authorities

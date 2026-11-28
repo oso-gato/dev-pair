@@ -169,6 +169,23 @@ class DayZeroTests(unittest.TestCase):
         self.assertEqual(self.entry.commission_apply.call_count, 3)
         self.assertIn('Checklist promotion is scheduled.', self.entry.stage.call_args.args[3])
 
+    def test_day0_reopens_billing_setup_when_the_configured_slot_is_held(self):
+        tty = object()
+        tool = self.entry.repo / 'tools/commission_host.py'
+        tool.parent.mkdir(parents=True)
+        tool.touch()
+        self.entry.stage = Mock()
+        self.entry.setup_owner = Mock(return_value=True)
+        ready = {'phase': 'ready', 'selected_release': '1' * 64}
+        self.entry.commission_apply = Mock(side_effect=[
+            {**ready, 'pending_features': {'owner-intake': 'provider-slot-authority'}},
+            {**ready, 'owner_terminal': '/usr/local/bin/dev-pair'},
+        ])
+        self.entry.commission(self.identity, SOURCE, tty=tty)
+        self.entry.setup_owner.assert_called_once_with(tty)
+        self.assertEqual(self.entry.commission_apply.call_count, 2)
+        self.assertEqual(self.entry.stage.call_args.args[2], 'owner-terminal-ready')
+
     def test_station_response_may_resume_checked_recovery_but_cannot_select_another_scope(self):
         from destination_observation import access_envelope
 

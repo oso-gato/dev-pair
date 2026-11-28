@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -32,6 +33,8 @@ class ProviderBillingTests(unittest.TestCase):
         self.credentials = root / 'credentials'
         self.evidence = root / 'evidence'
         self.signers = root / 'allowed_signers'
+        machine = root / 'machine-id'
+        write_private(machine, b'7' * 32 + b'\n')
         self.key = root / 'reviewer'
         subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(self.key)],
                        timeout=5, check=True)
@@ -40,8 +43,9 @@ class ProviderBillingTests(unittest.TestCase):
         self.secret = root / 'external-key'
         write_private(self.secret, SECRET.encode())
         self.enterContext(mock.patch.multiple(billing, CREDENTIALS=self.credentials, EVIDENCE=self.evidence,
-                                              SIGNERS=self.signers))
+                                              SIGNERS=self.signers, MACHINE_ID=machine))
         self.enterContext(mock.patch.object(billing, 'protected', side_effect=self.protected))
+        self.enterContext(mock.patch.object(billing, 'trust_lock', side_effect=contextlib.nullcontext))
         self.enterContext(mock.patch.dict(os.environ, SUDO_USER=''))
         self.now = int(time.time())
         self.clock = self.enterContext(mock.patch.object(billing.time, 'time', return_value=self.now))
@@ -134,6 +138,11 @@ class ProviderBillingTests(unittest.TestCase):
         changed['evidence']['context'] = ('A' if attachment[0] == 'B' else 'B') + attachment[1:]
         self.assertEqual(self.receive(billing.canonical(changed))[0], 2)
         self.assertEqual(self.cli('receive', '--credential-ref', 'unknown', data=raw)[0], 2)
+        request = json.loads(raw)['review']['request']
+        request['machine_sha256'] = 'a' * 64
+        wrong_host = self.directory / 'wrong-host-request'
+        write_private(wrong_host, billing.canonical(request))
+        self.assertEqual(self.receive(self.reviewed('--request', str(wrong_host)))[0], 2)
         self.connection.assert_not_called()
         self.response.status = 404
         code, _, errors = self.receive(raw)
@@ -202,6 +211,74 @@ class ProviderBillingTests(unittest.TestCase):
         self.assertEqual(self.receive(signed)[0], 2)
         with self.assertRaisesRegex(RuntimeError, 'changed'):
             scoped.responses(b'fixture', time.monotonic() + 10)
+        self.connection.assert_not_called()
+
+    def test_already_admitted_provider_blocks_after_signer_removed(self):
+        self.assertEqual(self.receive(self.reviewed())[0], 0)
+        _, _, review = billing.authority(REF)
+        provider = broker.Provider(SECRET, organization=ORG, project=PROJECT, review=review)
+        self.signers.write_text('# independent billing signer removed\n')
+        self.connection.reset_mock()
+        with self.assertRaisesRegex(ValueError, 'reviewer is unavailable'):
+            provider.responses(b'fixture', time.monotonic() + 10)
+        self.connection.assert_not_called()
+
+    def test_older_selected_broker_cannot_restart_after_the_installed_billing_fence(self):
+        installed, selected = self.directory / 'installed', self.directory / 'selected'
+        installed.mkdir(mode=0o700)
+        selected.mkdir(mode=0o700)
+        for name in ('provider_billing.py', 'provider_broker.py'):
+            write_private(installed / name, b'current installed billing controls')
+            write_private(selected / name, b'current installed billing controls')
+        billing.require_broker_release(installed, selected)
+        (selected / 'provider_broker.py').write_bytes(b'prior broker with cached reviewer state')
+        with self.assertRaisesRegex(ValueError, 'lacks the installed provider billing controls'):
+            billing.require_broker_release(installed, selected)
+
+    def test_durable_reference_withdrawal_fences_replay_and_permits_new_review(self):
+        signed = self.reviewed()
+        self.assertEqual(self.receive(signed)[0], 0)
+        _, _, review = billing.authority(REF)
+        provider = broker.Provider(SECRET, organization=ORG, project=PROJECT, review=review)
+        self.assertEqual(billing.withdraw_reference(REF), self.now)
+        self.connection.reset_mock()
+        with self.assertRaisesRegex(ValueError, 'was withdrawn'):
+            provider.responses(b'fixture', time.monotonic() + 10)
+        self.assertEqual(self.receive(signed)[0], 2)
+        self.connection.assert_not_called()
+        self.clock.return_value += 1
+        self.assertEqual(self.receive(self.reviewed())[0], 0)
+        billing.authority(REF)
+        with self.assertRaisesRegex(ValueError, 'superseded'):
+            provider.responses(b'fixture', time.monotonic() + 10)
+
+    def test_enrollment_requires_independent_fingerprint_and_withdrawal_fences_old_epoch(self):
+        public = self.key.with_suffix('.pub').read_text()
+        _, fingerprint = billing.reviewer_key(public)
+        with self.assertRaisesRegex(ValueError, 'authenticated billing fingerprint'):
+            billing.set_reviewer(public, 'SHA256:' + 'x' * 43, None)
+        self.assertIsNone(billing.reviewer_state())
+        prior = self.signers.read_bytes()
+        self.signers.write_bytes(prior + ('dev-pair-access-review ' + public).encode())
+        with self.assertRaisesRegex(ValueError, 'separate from other independent authorities'):
+            billing.set_reviewer(public, fingerprint, None)
+        self.signers.write_bytes(prior)
+        current = billing.set_reviewer(public, fingerprint, None)
+        request_file = self.directory / 'epoch-request'
+        record = billing.request_record(REF, SECRET)
+        self.assertEqual(record['reviewer_epoch'], current['epoch'])
+        self.assertEqual(record['machine_sha256'], billing.machine_binding())
+        write_private(request_file, billing.canonical(record))
+        signed = self.reviewed('--request', str(request_file))
+        self.assertEqual(self.receive(signed)[0], 0)
+        _, _, review = billing.authority(REF)
+        old = broker.Provider(SECRET, organization=ORG, project=PROJECT, review=review)
+        state = billing.set_reviewer(None, None, current)
+        self.assertNotEqual(billing.set_reviewer(public, fingerprint, state)['epoch'], record['reviewer_epoch'])
+        self.connection.reset_mock()
+        with self.assertRaisesRegex(ValueError, 'superseded billing reviewer'):
+            old.responses(b'fixture', time.monotonic() + 10)
+        self.assertEqual(self.receive(signed)[0], 2)
         self.connection.assert_not_called()
 
 

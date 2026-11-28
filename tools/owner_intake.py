@@ -31,6 +31,7 @@ from startup_delivery import IDS, load_private
 
 SITE = Path('/etc/dev-pair/product-intake')
 CREDENTIALS = billing.CREDENTIALS
+SLOT_BILLING = '.billing-reauthorization.json'
 ROOT = candidate.ROOT
 CATALOGUE = ROOT / 'product-jobs'
 SYSTEMCTL = '/usr/bin/systemctl'
@@ -87,6 +88,23 @@ class DispatchDeferred(Exception):
 
 def checked_file(path, limit=p.MAX_MESSAGE):
     return candidate.protected_file(path, limit)
+
+
+def verify_slot_billing(settings, proofs):
+    pricing = settings['pricing']
+    p.fields(pricing, 'max_context_tokens input_microusd_per_million output_microusd_per_million observed_models '
+             'context_evidence_sha256 tariff_evidence_sha256')
+    for kind, raw in proofs.items():
+        p.require(p.sha256(raw) == pricing[kind + '_evidence_sha256'], 'The approved provider pricing evidence has changed.')
+    reference = settings['allowance_ref']
+    approved, review = billing.validate_proofs(proofs, reference)
+    billing.assert_current(review)
+    secret = billing.credential_from(CREDENTIALS / reference)
+    p.require(settings['billing_scope'] == billing.ALLOWANCE_KIND and
+              approved == {key: pricing[key] for key in billing.PRICING} and
+              settings['expires_unix'] <= review['expires_unix'] and billing.matches_request(review['request'], reference, secret),
+              'The slot exceeds the reviewed provider billing scope.')
+    return pricing
 
 
 def fixed_git(checkout, *args, cap=8192, data=None):
@@ -268,16 +286,46 @@ class Intake:
         p.require(type(plan['development_manifests']) is dict, 'The approved job layout is unavailable.')
         return controller, selected, plan['development_manifests']
 
-    def slot(self, job, dev_manifest, *, staging=None):
+    def slot_documents(self, job, *, staging=None, replacement=None):
+        job_id(job)
+        slot = self.site / 'slots' / job if staging is None else staging
+        profile = checked_file(slot / 'profile.json')
+        roles = {name: checked_file(slot / name / 'profile.json', MAX_INPUT) for name in ROLES}
+        overlay = slot / SLOT_BILLING
+        if replacement is None and os.path.lexists(overlay):
+            replacement = p.loads(checked_file(overlay))
+        if replacement is None:
+            settings = p.loads(profile)
+            p.require(type(settings) is dict and settings.get('billing_scope') == billing.ALLOWANCE_KIND,
+                      'This unused slot needs explicit signed provider billing reauthorization.')
+            proofs = {kind: checked_file(slot / (MODEL + '.' + kind), 1024 * 1024) for kind in ('context', 'tariff')}
+            return profile, roles, proofs
+        p.fields(replacement, 'schema binding settings grant proofs consent_sha256')
+        p.number(replacement['schema'], 1, 1)
+        p.digest(replacement['consent_sha256'])
+        p.require(staging is None and replacement['binding'] == self.slot_billing_binding(job, profile, roles),
+                  'The existing catalogue or slot changed after billing reauthorization.')
+        settings = replacement['settings']
+        p.fields(replacement['proofs'], 'context tariff')
+        proofs = {kind: raw.encode() for kind, raw in replacement['proofs'].items()}
+        roles = {role: p.canonical(dict(p.loads(raw), credential_ref=settings['allowance_ref'],
+                                       grant=replacement['grant'])).encode() for role, raw in roles.items()}
+        return p.canonical(settings).encode(), roles, proofs
+
+    def slot_billing_binding(self, job, profile, roles):
+        return p.identity({'job': job, 'catalogue': p.sha256(checked_file(self.site / 'repositories.json')),
+                           'profile': p.sha256(profile), 'roles': {name: p.sha256(raw) for name, raw in roles.items()}})
+
+    def slot(self, job, dev_manifest, *, staging=None, replacement=None):
         from gptbox import capture_release_file
         from provider_broker import grant_document, reserved_cost
 
         slot = self.site / 'slots' / job if staging is None else staging
-        settings = p.loads(checked_file(slot / 'profile.json'))
-        scoped = 'billing_scope' in settings
+        profile, documents, proofs = self.slot_documents(job, staging=staging, replacement=replacement)
+        settings = p.loads(profile)
         p.fields(settings, 'schema host_seconds build_seconds turn_seconds allowance_ref spend_microusd expires_unix pricing'
-                 + (' billing_scope' if scoped else ''))
-        p.require(not scoped or settings['billing_scope'] == billing.ALLOWANCE_KIND, 'Unknown owner billing scope.')
+                 ' billing_scope')
+        p.require(settings['billing_scope'] == billing.ALLOWANCE_KIND, 'Unknown owner billing scope.')
         p.number(settings['schema'], 1, 1)
         p.number(settings['host_seconds'], 25, 60)
         p.number(settings['build_seconds'], 20, 240)
@@ -287,32 +335,16 @@ class Intake:
         p.require(settings['expires_unix'] > time.time() + 2 * (settings['host_seconds'] + settings['build_seconds']
                                                                 + settings['turn_seconds']) + 60,
                   'The approved provider allowance expires before this job can finish.')
-        pricing = settings['pricing']
-        p.fields(pricing, 'max_context_tokens input_microusd_per_million output_microusd_per_million observed_models '
-                 'context_evidence_sha256 tariff_evidence_sha256')
-        proofs = {}
-        for kind in ('context', 'tariff'):
-            p.digest(pricing[kind + '_evidence_sha256'])
-            proofs[kind] = checked_file(slot / (MODEL + '.' + kind), 1024 * 1024)
-            p.require(p.sha256(proofs[kind]) == pricing[kind + '_evidence_sha256'],
-                      'The approved provider pricing evidence has changed.')
-        if scoped:
-            approved, review = billing.validate_proofs(proofs, settings['allowance_ref'])
-            billing.assert_current(review)
-            secret = billing.credential_from(CREDENTIALS / settings['allowance_ref'])
-            p.require(approved == {key: pricing[key] for key in billing.PRICING} and
-                      settings['expires_unix'] <= review['expires_unix'] and
-                      review['request'] == billing.request_record(settings['allowance_ref'], secret),
-                      'The slot exceeds the reviewed provider billing scope.')
+        pricing = verify_slot_billing(settings, proofs)
         roles, seeds = {}, {}
         reserve = 0
         for role in ROLES:
-            profile = p.loads(checked_file(slot / role / 'profile.json', MAX_INPUT))
+            profile = p.loads(documents[role])
             p.fields(profile, 'runtime_sha256 binary_sha256 layout_sha256 credential_ref grant')
             for key in ('runtime_sha256', 'binary_sha256', 'layout_sha256'):
                 p.digest(profile[key])
             p.token(profile['credential_ref'])
-            p.require(not scoped or profile['credential_ref'] == settings['allowance_ref'],
+            p.require(profile['credential_ref'] == settings['allowance_ref'],
                       'The role credential differs from the reviewed provider account.')
             credential = CREDENTIALS / profile['credential_ref']
             # Check custody without loading the credential into the intake process.
@@ -678,9 +710,11 @@ class Intake:
         return approval
 
     def allowance(self, plan, settings, proofs):
+        p.require(settings.get('billing_scope') == billing.ALLOWANCE_KIND,
+                  'New provider allowances require independently signed project billing.')
         job = plan['job_id']
         root = private_leaf(self.root / 'provider-allowances' / job)
-        approval = {'schema': 1, 'kind': settings.get('billing_scope', 'verified-full-billable-context'),
+        approval = {'schema': 1, 'kind': billing.ALLOWANCE_KIND,
                     'auth_profile': 'openai-api-key', 'job': job, 'repository': plan['agreement']['repository'],
                     'agreement_sha256': product.agreement_sha(plan),
                     'models': {MODEL: settings['pricing']},
@@ -825,10 +859,7 @@ def selected_site(intake):
         host = controller.release(selected)['components']['host']['artifact_sha256']
         p.digest(host)
         tools = live.installer.HOST_RELEASES / host / 'tools'
-        for name in ('provider_billing.py', 'provider_broker.py'):
-            p.require(checked_file(tools / name, 256 * 1024) ==
-                      checked_file(Path(__file__).resolve().parent / name, 256 * 1024),
-                      'The selected release and owner setup have different provider billing code.')
+        billing.require_broker_release(Path(__file__).resolve().parent, tools)
     except (KeyError, TypeError, OSError, ValueError) as exc:
         raise SitePending('provider-billing-runtime',
                           'Select the independently verified host release with matching scoped provider billing.') from exc
@@ -999,7 +1030,7 @@ def owner_provider(options):
     if None in limits.values() or options.spend_microusd is None or options.expires_unix is None:
         raise SitePending('provider-allowance', 'Supply the actual approved cap, expiry and request bounds from your provider authority.')
     for value, low, high in ((options.host_seconds, 25, 60), (options.build_seconds, 20, 240),
-                             (options.turn_seconds, 10, 120), (options.expires_unix, 1, 2**63 - 1),
+                             (options.turn_seconds, 5, 120), (options.expires_unix, 1, 2**63 - 1),
                              (limits['max_output_tokens'], 16, 65536)):
         p.number(value, low, high)
     if options.expires_unix <= time.time() + 2 * (options.host_seconds + options.build_seconds + options.turn_seconds) + 60:
@@ -1111,6 +1142,54 @@ class FirstCatalogue:
                       'The existing owner catalogue belongs to another approval.')
         return {'phase': 'configured', 'repositories': sorted(repositories), 'slots': slots}
 
+    def available_billing_slots(self):
+        _, jobs = self.intake.catalogue_settings()
+        return [job for job in jobs if self.intake.slot_unused(job) and
+                not os.path.lexists(self.intake.queue / (job + '.json'))]
+
+    def billing_limits(self, job):
+        slot = self.site / 'slots' / job_id(job)
+        settings = p.loads(checked_file(slot / 'profile.json'))
+        limits = {key: settings[key] for key in ('host_seconds', 'build_seconds', 'turn_seconds')}
+        grants = [p.loads(checked_file(slot / role / 'profile.json', MAX_INPUT))['grant'] for role in ROLES]
+        for key, field in (('requests', 'max_requests'), ('request_bytes', 'max_request_bytes'),
+                           ('output_tokens', 'max_output_tokens')):
+            limits[key] = min(grant[field] for grant in grants)
+        return limits
+
+    def reauthorization(self, job, options):
+        p.require(job_id(job) in self.available_billing_slots(),
+                  'Billing reauthorization requires an unused configured slot without a retained draft or job.')
+        _, release, manifests, _, _, _ = selected_site(self.intake)
+        p.require(job in manifests, 'The selected release does not admit this owner slot.')
+        limits = self.billing_limits(job)
+        p.require(all(getattr(options, key) == limits[key] for key in ('host_seconds', 'build_seconds', 'turn_seconds')) and
+                  all(getattr(options, key) <= limits[key] for key in ('requests', 'request_bytes', 'output_tokens')),
+                  'Billing reauthorization must preserve the existing slot’s nonbilling bounds.')
+        settings, grant, proofs, credential = owner_provider(options)
+        slot = self.site / 'slots' / job
+        base = checked_file(slot / 'profile.json')
+        roles = {role: checked_file(slot / role / 'profile.json', MAX_INPUT) for role in ROLES}
+        selection = {'schema': 1, 'binding': self.intake.slot_billing_binding(job, base, roles),
+                     'settings': settings, 'grant': grant, 'proofs': {kind: raw.decode() for kind, raw in proofs.items()}}
+        approval = p.identity({'selection': selection, 'credential_stamp': credential,
+                               'release': release, 'development_manifest': manifests[job]})
+        scope = dict(selection, consent_sha256=approval)
+        self.intake.slot(job, manifests[job], replacement=scope)
+        return scope
+
+    def replace_billing(self, job, options, approval):
+        from renewal import Renewal
+
+        p.digest(approval)
+        with self.lock(), self.intake.lock(), Renewal(self.intake.root, None).lock(shared=True):
+            scope = self.reauthorization(job, options)
+            p.require(scope['consent_sha256'] == approval, 'The signed provider scope changed. Review the exact new selection.')
+            path = protect_directory(self.site / 'slots' / job) / SLOT_BILLING
+            if os.path.lexists(path) and p.loads(checked_file(path)) == scope:
+                return
+            billing.replace_record(path, scope)
+
     def preview(self, options):
         from bootstrap import Blocked
         from provider_broker import grant_document
@@ -1220,6 +1299,76 @@ def setup_answer(incoming, outgoing, prompt):
     return value.strip()
 
 
+def setup_secret(outgoing, prompt):
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt, stream=outgoing).strip()
+        except getpass.GetPassWarning as exc:
+            raise ValueError('Credential input requires a private controlling terminal.') from exc
+
+
+def enroll_billing_reviewer(ask, say):
+    existing = billing.reviewer_state()
+    key = ask('OpenSSH public key supplied by the independent billing custodian, or Enter to wait.')
+    if not key:
+        return False
+    public, actual = billing.reviewer_key(key)
+    fingerprint = ask('SHA256 fingerprint separately authenticated with the independent billing custodian.')
+    p.require(fingerprint == actual, 'The key differs from the independently authenticated billing fingerprint.')
+    say(f'Billing signature authority for this VPS and the provider-billing principal: {actual}')
+    if ask('Enroll this exact independent billing custodian? [y/N]').lower() not in ('y', 'yes'):
+        return False
+    billing.set_reviewer(public, fingerprint, existing)
+    return True
+
+
+def setup_provider(ask, say, outgoing):
+    reference = setup_secret(outgoing, 'Protected credential reference: ')
+    p.token(reference)
+    if not os.path.lexists(CREDENTIALS / reference):
+        path = ask('Absolute path to a root-private scoped API key file, or Enter to use a hidden prompt.')
+        if path:
+            billing.register(reference, Path(path))
+        else:
+            secret = setup_secret(outgoing, 'Scoped OpenAI project API key, or Enter to wait: ')
+            if not secret:
+                raise SitePending('provider-credential', 'Provider credential setup is pending.')
+            billing.register_secret(reference, secret)
+            del secret
+    provider_custody(reference)
+    try:
+        return reference, billing_authority(reference)
+    except SitePending:
+        if not billing.has_reviewer() and not enroll_billing_reviewer(ask, say):
+            raise SitePending('provider-billing-reviewer', 'Enrollment of the independent billing custodian is pending.') from None
+    request, target = billing.setup_handoff(reference)
+    say(f'Send the protected VPS-bound billing request {request} to the independently enrolled billing custodian.')
+    say(f'Return the custodian’s signed bundle as a root-private mode 0600 file at {target}, then reopen this setup.')
+
+    def accept(path):
+        try:
+            raw = billing.bounded_file(billing.protected(path, private=True), billing.BUNDLE_LIMIT,
+                                       owner=0, mode=0o600)
+            billing.receive(reference, raw)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            reason = str(exc) if type(exc) is ValueError else 'Verify the root-private bundle path and retry.'
+            raise SitePending('provider-billing-authority', 'The signed billing bundle was rejected. ' + reason) from exc
+
+    if os.path.lexists(target):
+        try:
+            accept(target)
+        except SitePending as wait:
+            say(wait.observation['message'])
+        else:
+            return reference, billing_authority(reference)
+    supplied = ask('Absolute path to the returned signed billing bundle, or Enter to wait.')
+    if not supplied:
+        raise SitePending('provider-billing-evidence', 'First owner billing is waiting for the independent signed bundle.')
+    accept(Path(supplied))
+    return reference, billing_authority(reference)
+
+
 def setup_site(first, incoming, outgoing):
     from gptbox_runtime import PROVIDER_BODY_MAX
     from owner_source import provision
@@ -1231,28 +1380,55 @@ def setup_site(first, incoming, outgoing):
     def ask(prompt):
         return setup_answer(incoming, outgoing, prompt)
 
-    if first.configured() is not None:
-        say('An owner catalogue is already configured. Run ./day0.sh resume.')
-        return
     try:
-        say('Choose the approved repository and workload for the first owner job.')
-        repository = repository_id(ask('Repository (owner/name)'))
-        say('1 Checklist persistence   2 General development   3 General development with an external check')
-        choice = ask('Workload [1/2/3]')
-        p.require(choice in ('1', '2', '3'), 'Choose one of the listed workloads.')
-        workload = tuple(WORKLOADS)[int(choice) - 1]
-        if not provision(first.intake, repository, workload, ask, say):
-            return
+        existing = first.configured()
+        job = None
+        repository = workload = None
+        manage = existing is not None
+        if existing is None:
+            say('Choose the approved repository and workload for the first owner job.')
+            choice = ask('Repository (owner/name), or enter billing to manage provider authority.')
+            manage = choice == 'billing'
+            if not manage:
+                repository = repository_id(choice)
+                say('1 Checklist persistence   2 General development   3 General development with an external check')
+                choice = ask('Workload [1/2/3]')
+                p.require(choice in ('1', '2', '3'), 'Choose one of the listed workloads.')
+                workload = tuple(WORKLOADS)[int(choice) - 1]
+                if not provision(first.intake, repository, workload, ask, say):
+                    return
+        if manage:
+            action = ask('Billing action [reauthorize/withdraw-key/rotate-reviewer/withdraw-reviewer/Enter]')
+            if not action:
+                return
+            if action == 'rotate-reviewer':
+                if enroll_billing_reviewer(ask, say):
+                    say('Billing reviewer rotated. Reopen setup to obtain fresh terms for an unused slot.')
+                return
+            if action == 'withdraw-reviewer':
+                prior = billing.reviewer_state()
+                if ask('Withdraw billing authority and hold future sends? [y/N]').lower() in ('y', 'yes'):
+                    billing.set_reviewer(None, None, prior)
+                    say('Independent billing reviewer authority was withdrawn.')
+                return
+            if action == 'withdraw-key':
+                reference = setup_secret(outgoing, 'Credential reference to withdraw: ')
+                p.token(reference)
+                if ask('Withdraw this exact credential’s billing terms? [y/N]').lower() in ('y', 'yes'):
+                    billing.withdraw_reference(reference)
+                    say('The selected credential’s billing terms were withdrawn.')
+                return
+            p.require(action == 'reauthorize', 'Choose one of the billing actions.')
+            p.require(existing is not None, 'An unused configured catalogue slot is required for reauthorization.')
+            slots = first.available_billing_slots()
+            if not slots:
+                raise SitePending('unused-provider-slot', 'No configured slot is unused and free of retained drafts or jobs.')
+            job = slots[0] if len(slots) == 1 else job_id(ask('Unused slot (' + ', '.join(slots) + ')'))
+            p.require(job in slots, 'Choose a currently unused configured slot.')
         say('Choose a registered OpenAI project credential with independently issued billing terms.')
-        with warnings.catch_warnings():
-            warnings.simplefilter('error', getpass.GetPassWarning)
-            try:
-                reference = getpass.getpass('Protected credential reference: ', stream=outgoing).strip()
-            except getpass.GetPassWarning as exc:
-                raise ValueError('Credential reference input requires a private controlling terminal.') from exc
-        provider_custody(reference)
-        values, proofs, review = billing_authority(reference)
+        reference, (values, proofs, review) = setup_provider(ask, say, outgoing)
         terms_expiry = datetime.fromtimestamp(review['expires_unix'], timezone.utc)
+        say(f'OpenAI organization {review["organization"]} and project {review["project"]}.')
         say(f'The signed provider terms are valid until {terms_expiry:%Y-%m-%d %H:%M} UTC.')
         text = ask('Approved total job budget in USD')
         p.require(re.fullmatch(r'(?:0|[1-9][0-9]{0,2})(?:\.[0-9]{1,6})?', text),
@@ -1262,15 +1438,29 @@ def setup_site(first, incoming, outgoing):
             expiry = datetime.strptime(ask('Approved expiry in UTC (YYYY-MM-DD HH:MM)'), '%Y-%m-%d %H:%M')
         except ValueError as exc:
             raise ValueError('Enter the approved expiry in UTC as YYYY-MM-DD HH:MM.') from exc
-        output_tokens = 4096
+        limits = first.billing_limits(job) if job is not None else {
+            'requests': 4, 'request_bytes': PROVIDER_BODY_MAX, 'output_tokens': 4096,
+            'host_seconds': 45, 'build_seconds': 120, 'turn_seconds': 90}
+        output_tokens = limits['output_tokens']
         cost = reserved_cost(dict(values, max_output_tokens=output_tokens))
-        requests = min(4, spend // (2 * cost))
-        p.require(requests >= 2, 'The approved total does not cover two bounded requests per role.')
+        requests = min(limits['requests'], spend // (2 * cost))
+        minimum = 1 if job is not None else 2
+        p.require(requests >= minimum, f'The approved total does not cover {minimum} bounded requests per role.')
         options = argparse.Namespace(repository=repository, workload=workload, destination=None, profile=PROFILE,
             credential_ref=reference, spend_microusd=spend, expires_unix=int(expiry.replace(tzinfo=timezone.utc).timestamp()),
             context_tokens=None, input_rate=None, output_rate=None, observed_model=None,
-            requests=requests, request_bytes=PROVIDER_BODY_MAX, output_tokens=output_tokens,
-            host_seconds=45, build_seconds=120, turn_seconds=90, confirm_sha256=None)
+            **dict(limits, requests=requests), confirm_sha256=None)
+        if job is not None:
+            scope = first.reauthorization(job, options)
+            p.require({kind: raw.encode() for kind, raw in scope['proofs'].items()} == proofs,
+                      'The protected billing evidence changed. Start setup again.')
+            say(f'Unused slot {job}, GPT-6.2 Sol High, up to {requests} requests per role, '
+                f'{output_tokens} output tokens each and {options.turn_seconds}s per turn.')
+            say(f'Shared API ceiling USD {Decimal(spend) / 1000000:.6f} until {expiry:%Y-%m-%d %H:%M} UTC.')
+            if ask('Confirm this exact signed billing reauthorization? [y/N]').lower() in ('y', 'yes'):
+                first.replace_billing(job, options, scope['consent_sha256'])
+                say('Signed billing reauthorization is active for the unused slot. Resume Day 0.')
+            return
         plan, selected_proofs = first.preview(options)
         p.require(proofs == selected_proofs, 'The protected billing evidence changed. Start setup again.')
         config = plan['catalogue']['repositories'][repository]

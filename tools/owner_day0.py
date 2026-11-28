@@ -728,7 +728,9 @@ class DayZero:
             self.stage(identity, revision, 'access-cutover-complete', message + ' Run ./day0.sh resume to continue.')
 
     def setup_owner(self, tty):
-        if answer(tty, 'Set up the first owner job now? [Y/n]').lower() not in ('', 'y', 'yes'):
+        prompt = ('Repair the configured owner slot’s signed billing authority now? [Y/n]'
+                  if os.path.lexists(OWNER_CATALOGUE) else 'Set up the first owner job now? [Y/n]')
+        if answer(tty, prompt).lower() not in ('', 'y', 'yes'):
             return False
         script = local_file(OWNER_SETUP)
         print('Preparing the first owner setup in this terminal.', flush=True)
@@ -787,7 +789,8 @@ class DayZero:
                 if (proof.get('role_artifacts', {}).get('release_sha256') != observed['selected_release'] and
                         self.receiving_access(revision, historical, tty, workload=True)):
                     observed = self.commission_apply(revision, tty)
-            if (observed.get('pending_features', {}).get('owner-intake') == 'owner-catalogue-selection' and
+            if (observed.get('pending_features', {}).get('owner-intake') in
+                    ('owner-catalogue-selection', 'provider-slot-authority') and
                     self.setup_owner(tty)):
                 observed = self.commission_apply(revision, tty)
             if (observed.get('owner_terminal') == '/usr/local/bin/dev-pair' and
@@ -810,7 +813,7 @@ class DayZero:
             pending = observed.get('pending_features', {})
             for name, reason in sorted(pending.items()):
                 lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
-                if name == 'owner-intake' and reason == 'owner-catalogue-selection':
+                if name == 'owner-intake' and reason in ('owner-catalogue-selection', 'provider-slot-authority'):
                     lines.append('Run ./day0.sh resume to continue first owner setup.')
             if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
                 lines.append('Owner jobs remain held.')
