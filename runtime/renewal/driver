@@ -32,7 +32,8 @@ RUNUSER = '/usr/sbin/runuser'
 SYSTEMD_RUN = '/usr/bin/systemd-run'
 GIT = ('/usr/bin/git', '--no-optional-locks', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null')
 STATUS = (*GIT, 'status', '--porcelain=v1', '--untracked-files=all')
-CHECK = (*GIT, 'diff', '--check', '--no-ext-diff', '--no-textconv', 'HEAD')
+# Git diff can refresh the live index even when optional locks are disabled.
+CHECK = (*GIT, '-c', 'diff.autoRefreshIndex=false', 'diff', '--check', '--no-ext-diff', '--no-textconv', 'HEAD')
 APP = 'examples/checklist/checklist.py'
 SOURCE = '''import hashlib, json
 from pathlib import Path
