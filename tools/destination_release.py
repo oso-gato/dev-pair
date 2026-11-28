@@ -40,6 +40,7 @@ MANAGED_INTENT = '/var/lib/dev-pair-managed-storage.json'
 MANAGED_IMAGE = '/var/lib/dev-pair-managed.ext4'
 MANAGED_INODES = 1310720
 MANAGED_READY = ROOT + '/.managed-storage-ready'
+MANAGED_LOOP_SERVICE = 'dev-pair-managed-loop.service'
 TRANSITION = ROOT + '/selinux-bootstrap'
 PRESERVED_TRANSITION = '/var/lib/dev-pair-selinux-preserved'
 TRANSITION_FILES = {'boots.json', 'complete.json', 'config-original', 'intent.json', 'journal.jsonl', 'lock',
@@ -157,31 +158,50 @@ class Destination(Bootstrap):
                 'checklist mount does not enforce the private data boundary')
         source = mounted[0]['source']
         device = Path(path).stat().st_dev
+        number = f'{os.major(device)}:{os.minor(device)}'
         require(re.fullmatch(r'/dev/loop[0-9]+', source) and device != Path(path).parent.stat().st_dev,
                 'checklist mount does not have its own reserved backing device')
         if 'loop' in spec:
             require(source == spec['loop'], 'managed storage did not recover its enrolled loop device')
-        backing = Path(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}/loop/backing_file').read_text().strip()
+        loop = Path(f'/sys/dev/block/{number}/loop')
+        backing = (loop / 'backing_file').read_text().strip()
         image = protect(backing)
         info = image.stat()
         require(str(image) == spec['image'] and info.st_size == spec['mib'] * MIB
                 and info.st_blocks * 512 >= spec['mib'] * MIB and info.st_uid == info.st_gid == 0
                 and stat.S_IMODE(info.st_mode) == 0o600,
                 'checklist mount does not use its fully reserved owned backing file')
-        managed_backing.verify_backing(image, info, Blocked)
+        stable = managed_backing.verify_backing(image, info, Blocked)
+        if stable is not None:
+            self.observe_btrfs_loop(image, info, source, number)
+            expected = {'image': str(image), 'inode': info.st_ino, 'size': info.st_size, 'fs_uuid': spec['uuid'],
+                        'btrfs': stable, 'state': 'formatted'}
+            require(self.record(MANAGED_INTENT + '.backing') == expected,
+                    'mounted Btrfs backing differs from the protected record')
         geometry = os.statvfs(path)
         require(0 < geometry.f_blocks * geometry.f_frsize <= spec['mib'] * MIB
                 and 0 < geometry.f_files <= max_inodes
                 and geometry.f_files <= spec['inodes'] + (4096 if max_inodes == MANAGED_INODES else 512),
                 'checklist mount exceeds declared geometry')
         matches = [line for line in Path('/proc/self/mountinfo').read_text().splitlines()
-                   if line.split()[2] == f'{os.major(device)}:{os.minor(device)}']
+                   if line.split()[2] == number]
         require(len(matches) == 1 and matches[0].split()[3:5] == ['/', path],
                 'checklist storage is not the unique dedicated filesystem root')
 
     def physical_reserve(self, reserve_inodes):
         return managed_backing.observe(Path(MANAGED_IMAGE).parent, Blocked).check(
             8192 * MIB, reserve_inodes, Blocked, 'physical storage reserve is no longer available')
+
+    def observe_btrfs_loop(self, image, node, source, number):
+        value = json.loads(self.run('/usr/sbin/losetup', '--list', '--json', '--associated', str(image),
+                                   '--output', 'NAME,MAJ:MIN,BACK-MAJ:MIN,BACK-INO,OFFSET,SIZELIMIT,RO', timeout=10))
+        rows = value.get('loopdevices')
+        require(type(rows) is list and len(rows) == 1, 'Btrfs backing loop ownership is ambiguous')
+        row = rows[0]
+        backing_dev = f'{os.major(node.st_dev)}:{os.minor(node.st_dev)}'
+        require(row['name'] == source and row['maj:min'] == number and row['back-maj:min'] == backing_dev
+                and str(row['back-ino']) == str(node.st_ino) and str(row['offset']) == str(row['sizelimit']) == '0'
+                and row['ro'] is False, 'mounted loop does not match the protected Btrfs backing')
 
     def allocate(self, spec, receipt, reserve_mib, reserve_inodes):
         image = Path(spec['image'])
@@ -198,20 +218,33 @@ class Destination(Bootstrap):
             if not previous:
                 os.fchown(descriptor, 0, 0)
                 os.fchmod(descriptor, 0o600)
-            protect(image)
+            saved = protect(image).stat()
             old = os.fstat(descriptor)
-            identity = {'image': str(image), 'device': old.st_dev, 'inode': old.st_ino,
-                        'size': size, 'fs_uuid': spec['uuid']}
             require(stat.S_ISREG(old.st_mode) and stat.S_IMODE(old.st_mode) == 0o600 and old.st_uid == old.st_gid == 0
-                    and old.st_size in (0, size) and old.st_nlink == 1, 'unexpected dedicated backing file')
+                    and old.st_size in (0, size) and old.st_nlink == 1
+                    and (old.st_dev, old.st_ino) == (saved.st_dev, saved.st_ino), 'unexpected dedicated backing file')
+            base = {'image': str(image), 'inode': old.st_ino, 'size': size, 'fs_uuid': spec['uuid']}
+            legacy = {**base, 'device': old.st_dev}
+            space = managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes)
+            identity = ({**base, 'btrfs': managed_backing.btrfs_identity(descriptor, Blocked)}
+                        if space.kind == 'btrfs' else legacy)
             if previous:
-                require(previous == {**identity, 'state': previous.get('state')}
-                        and previous.get('state') in ('created', 'formatting', 'formatted'), 'protected backing object identity changed')
+                state = previous.get('state')
+                require(state in ('created', 'formatting', 'formatted'), 'unexpected protected backing state')
+                if previous not in ({**identity, 'state': state}, {**legacy, 'state': state}):
+                    # V1 stored Btrfs's anonymous device number. After it changes,
+                    # migrate only a fully formatted, older inode matching the protected
+                    # record. The allocation and exact ext4 UUID are verified below.
+                    legacy_device = previous.get('device')
+                    require(space.kind == 'btrfs' and state == 'formatted' and type(legacy_device) is int
+                            and 0 < legacy_device < 2**32 and os.major(legacy_device) == 0
+                            and previous == {**legacy, 'device': legacy_device, 'state': state}
+                            and managed_backing.birth_ns(descriptor, Blocked) <= protect(receipt).stat().st_mtime_ns,
+                            'protected backing object identity changed')
             else:
                 previous = {**identity, 'state': 'created'}
                 self.atomic(receipt, record_text(previous))
             remaining = max(size - old.st_blocks * 512, 0)
-            space = managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes)
             space.check(reserve + remaining, reserve_inodes, Blocked, reserve_message)
             if space.kind == 'btrfs':
                 require(not remaining or previous['state'] == 'created', 'recorded Btrfs backing allocation changed')
@@ -240,10 +273,29 @@ class Destination(Bootstrap):
         fields = dict(line.split('=', 1) for line in observed.splitlines())
         require(all(fields.get(key) == value for key, value in expected.items()), 'foreign checklist backing filesystem')
         if space.kind == 'btrfs':
-            managed_backing.verify_backing(image, current, Blocked)
+            require(managed_backing.verify_backing(image, current, Blocked) == identity['btrfs'],
+                    'Btrfs backing changed before protected publication')
             managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes).check(
                 reserve, reserve_inodes, Blocked, 'filesystem reserve was not preserved after formatting')
         self.atomic(receipt, record_text({**identity, 'state': 'formatted'}), expected=record_text(previous))
+
+    def managed_loop_unit(self, source):
+        index = int(source.removeprefix('/dev/loop'))
+        # Fedora may load the loop module with no pre-created slots. Create
+        # the exact enrolled slot without attaching, detaching or probing others.
+        command = ('import errno, fcntl, os\n'
+                   'fd = os.open("/dev/loop-control", os.O_RDWR | os.O_NOFOLLOW)\n'
+                   f'try: fcntl.ioctl(fd, 0x4C80, {index})\n'
+                   'except OSError as error:\n'
+                   ' if error.errno != errno.EEXIST: raise\n')
+        self.atomic('/etc/systemd/system/' + MANAGED_LOOP_SERVICE,
+                    '[Unit]\nDescription=Prepare the enrolled Dev-pair loop device\n'
+                    'DefaultDependencies=no\nAfter=systemd-udevd.service\nBefore=local-fs.target\n'
+                    '[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=30s\n'
+                    'ExecStart=/usr/sbin/modprobe loop\n'
+                    'ExecStart=/usr/bin/udevadm wait --timeout=10 /dev/loop-control\n'
+                    f'ExecStart=/usr/bin/python3 -IB -c {json.dumps(command)}\n'
+                    f'ExecStart=/usr/bin/udevadm wait --timeout=10 {source}\n', mode=0o644)
 
     def mount(self, path, spec, *, max_inodes=65536):
         image = spec['image']
@@ -255,8 +307,13 @@ class Destination(Bootstrap):
         if not Path(path).exists():
             self.directory(path, mode=0o755)
         loop = 'loop=' + spec['loop'] if 'loop' in spec else 'loop'
+        dependencies = ''
+        if 'loop' in spec:
+            self.managed_loop_unit(spec['loop'])
+            dependencies = f'Requires={MANAGED_LOOP_SERVICE}\nAfter={MANAGED_LOOP_SERVICE}\n'
         self.atomic('/etc/systemd/system/' + unit,
                     '[Unit]\nDescription=Dedicated Dev-pair checklist storage\n'
+                    f'{dependencies}'
                     f'[Mount]\nWhat={image}\nWhere={path}\nType=ext4\nOptions={loop},nodiscard,nodev,nosuid\n'
                     '[Install]\nWantedBy=local-fs.target\n', mode=0o644)
         self.run(SYSTEMCTL, 'daemon-reload', timeout=15)

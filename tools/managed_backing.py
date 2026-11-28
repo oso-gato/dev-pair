@@ -1,5 +1,6 @@
 """Physical reserve and fixed loop backing checks for the managed ext4 store."""
 from dataclasses import dataclass
+import ctypes
 import fcntl
 import os
 from pathlib import Path
@@ -13,9 +14,11 @@ from storage import StorageBlocked, filesystem_type, mount_id, root_fd
 MIB = 1024 ** 2
 BTRFS_SYSFS = Path('/sys/fs/btrfs')
 BTRFS_IOC_FS_INFO = 0x8400941F
+BTRFS_IOC_GET_SUBVOL_INFO = 0x81F8943C
 BTRFS_BLOCK_GROUP_METADATA = 4
 FS_IOC_GETFLAGS = 0x80086601
 FS_IOC_SETFLAGS = 0x40086602
+FS_IOC_GETVERSION = 0x80087601
 FS_COMPR_FL = 0x00000004
 FS_NOCOW_FL = 0x00800000
 FIEMAP = 0xC020660B
@@ -24,6 +27,8 @@ FIEMAP_EXTENT = struct.Struct('=QQQQQIIII')
 FIEMAP_LAST = 0x1
 FIEMAP_UNWRITTEN = 0x800
 EXTENTS_PER_QUERY = 128
+AT_EMPTY_PATH = 0x1000
+STATX_BTIME = 0x800
 
 
 @dataclass(frozen=True)
@@ -61,13 +66,49 @@ def read_counter(path):
     return int(raw)
 
 
-def btrfs_metadata(fd):
+def btrfs_filesystem(fd):
     info = bytearray(1024)
     fcntl.ioctl(fd, BTRFS_IOC_FS_INFO, info)
     _, devices, fsid, nodesize = struct.unpack_from('=QQ16sI', info)
     if devices != 1 or not any(fsid) or nodesize not in (4096, 8192, 16384, 32768, 65536):
         raise ValueError('unsupported Btrfs physical geometry')
-    metadata = BTRFS_SYSFS / str(uuid.UUID(bytes=fsid)) / 'allocation/metadata'
+    return str(uuid.UUID(bytes=fsid)), nodesize
+
+
+def btrfs_identity(fd, error):
+    try:
+        filesystem, _ = btrfs_filesystem(fd)
+        subvolume = bytearray(504)
+        fcntl.ioctl(fd, BTRFS_IOC_GET_SUBVOL_INFO, subvolume)
+        (tree,) = struct.unpack_from('=Q', subvolume)
+        subvol_uuid = bytes(subvolume[296:312])
+        generation = bytearray(8)
+        fcntl.ioctl(fd, FS_IOC_GETVERSION, generation)
+        (generation,) = struct.unpack_from('=I', generation)
+        if not tree or (tree != 5 and not any(subvol_uuid)):
+            raise ValueError('invalid Btrfs subvolume identity')
+        return {'filesystem_uuid': filesystem, 'subvolume_id': tree,
+                'subvolume_uuid': str(uuid.UUID(bytes=subvol_uuid)), 'inode_generation': generation}
+    except (OSError, ValueError) as exc:
+        raise error('stable Btrfs backing filesystem or inode identity unavailable') from exc
+
+
+def birth_ns(fd, error):
+    # Use statx on the held file, with the Linux UAPI mask and timestamp layout.
+    record = ctypes.create_string_buffer(256)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.statx(fd, b'', AT_EMPTY_PATH, STATX_BTIME, ctypes.byref(record)) != 0:
+        raise error('legacy Btrfs backing creation time unavailable')
+    (mask,) = struct.unpack_from('=I', record)
+    seconds, nanoseconds = struct.unpack_from('=qI', record, 80)
+    if not mask & STATX_BTIME or seconds <= 0 or nanoseconds >= 10**9:
+        raise error('legacy Btrfs backing creation time unavailable')
+    return seconds * 10**9 + nanoseconds
+
+
+def btrfs_metadata(fd):
+    filesystem, nodesize = btrfs_filesystem(fd)
+    metadata = BTRFS_SYSFS / filesystem / 'allocation/metadata'
     if read_counter(metadata / 'flags') != BTRFS_BLOCK_GROUP_METADATA:
         raise ValueError('Btrfs requires dedicated metadata allocation')
     total = read_counter(metadata / 'total_bytes')
@@ -168,6 +209,7 @@ def verify_backing(path, node, error):
             raise error('protected backing identity changed')
         if filesystem_type(mount_id(fd)) == 'btrfs':
             verify_btrfs(fd, node.st_size, error)
+            return btrfs_identity(fd, error)
     except StorageBlocked as exc:
         raise error('protected backing filesystem identity unavailable') from exc
     finally:
