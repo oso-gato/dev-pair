@@ -492,7 +492,15 @@ class Intake:
                           'Review a new draft with the intended users, access and observable acceptance before confirming.')
                 saved['phase'] = 'confirmed'
                 self.save(job, saved)
-            self.schedule(job, saved, time.monotonic() + 10)
+            deadline = time.monotonic() + 10
+            state = self.published(job, saved['plan']) if saved['phase'] == 'submitted' else None
+            if state is not None and state['phase'] not in product.TERMINAL and product.retry_expired(state, int(time.time())):
+                try:
+                    self.submit_product(self.queue / (job + '.plan'), job, saved['plan'], deadline=deadline, explicit=True)
+                except DispatchDeferred as exc:
+                    raise ValueError(str(exc)) from exc
+            else:
+                self.schedule(job, saved, deadline)
         return self.status(job)
 
     def published(self, job, plan, *, progress=False):
@@ -568,7 +576,7 @@ class Intake:
         if saved['phase'] == 'submitted':
             state = self.published(job, saved['plan'])
             p.require(state is not None, 'The acknowledged product plan is unavailable.')
-            if state['phase'] in product.TERMINAL or (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic')):
+            if state['phase'] in product.TERMINAL or product.retry_expired(state, int(time.time())):
                 return
             boot = boot_id()
             if product.pending_renewal(state) is None and saved.get('scheduled_boot') == boot:
@@ -672,14 +680,14 @@ class Intake:
             self.save(job, record)
         return 0
 
-    def submit_product(self, path, job, plan, *, deadline=None):
+    def submit_product(self, path, job, plan, *, deadline=None, explicit=False):
         state = self.published(job, plan)
         if state is not None and (state['phase'] in product.TERMINAL or
-                                  (state['phase'] == 'waiting' and not state.get('retry', {}).get('automatic'))):
+                                  not explicit and product.retry_expired(state, int(time.time()))):
             return
         product.source_approval(plan)
         try:
-            product.submit(path, expected_plan=plan, deadline=deadline)
+            product.submit(path, expected_plan=plan, deadline=deadline, explicit=explicit)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             if (not isinstance(exc, ValueError) or str(exc) == 'protected fixed command failed') and self.published(job, plan):
                 product.source_approval(plan)

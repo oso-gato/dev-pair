@@ -87,10 +87,14 @@ Install the companion [tmpfiles entry](../runtime/product-job/dev-pair-product.c
 after provisioning the checklist account. The service limits each worker to
 25 minutes. A temporary fence or lost host reply is saved as a waiting state.
 Automatic observations have a three-minute and 18-observation limit for
-each unfinished step. If the limit is reached, the same submission can
-continue when the environment is ready. Status and reattach read the protected
-job record. An identical submission can also restart the worker after a host
-reboot. Protected registry reservations and the host effect ledger determine
+each unfinished step. The installed worker checks the recorded deadline before
+dispatch, including when a queued invocation starts late or after reboot.
+When the limit is reached, explicitly submit the same approved plan again to
+authorize one attempt when the environment is ready. The named owner can use
+the same job ID and agreement digest with `dev-pair submit`. The authorization
+expires after three minutes and is consumed before work starts. The original
+automatic retry budget remains in force. Status and reattach read the protected
+job record. Protected registry reservations and the host effect ledger determine
 which steps can proceed.
 
 Provision both role workspaces at the approved starting commit and canonical

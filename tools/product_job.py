@@ -702,7 +702,24 @@ def record_pause(state, reason, now):
 
 
 def retry_available(retry, now):
-    return retry is None or (retry['automatic'] and now < retry['until_unix'])
+    return retry is None or (retry['automatic'] and now < retry['until_unix'] and
+                             retry['observations'] < RETRY_OBSERVATIONS)
+
+
+def retry_expired(state, now):
+    return not retry_available(state.get('retry'), now)
+
+
+def explicit_retry_matches(state, value, now):
+    approval = state.get('explicit_retry')
+    if approval is None:
+        return False
+    p.fields(approval, 'plan_sha256 retry_sha256 until_unix')
+    p.digest(approval['plan_sha256'])
+    p.digest(approval['retry_sha256'])
+    p.number(approval['until_unix'], 1, 2**63 - 1)
+    return (now < approval['until_unix'] and approval['plan_sha256'] == p.identity(value) and
+            approval['retry_sha256'] == p.identity(state['retry']))
 
 
 def protected_renewal_fence(root):
@@ -822,7 +839,8 @@ def observe_workload_renewal(job, expected_plan, expected_fence):
             park_workload_renewal(root, state, fence)
 
 
-def work(job):
+def work(job, *, automatic=False):
+    """Run a trusted direct attempt. The installed worker uses automatic admission."""
     with locked_job_state(job) as (root, value, state):
         if state['phase'] in TERMINAL:
             return state
@@ -839,19 +857,24 @@ def work(job):
                 return state
             del state['renewal_wait']
             state['phase'] = wait['phase']
-            retry = state.get('retry')
-            if not retry_available(retry, int(time.time())):
-                state['phase'] = 'waiting'
-                retry['automatic'] = False
-                durable_json(root / 'state.json', state)
-                return state
-        elif state['phase'] == 'waiting':
-            retry = state['retry']
-            if retry.get('renewal_only') is True and not retry_available(retry, int(time.time())):
-                retry['automatic'] = False
-                durable_json(root / 'state.json', state)
-                return state
+        retry = state.get('retry')
+        if retry is not None:
+            p.require(state['phase'] in ('waiting', retry['phase']), 'Durable product retry no longer matches its step.')
+            now = int(time.time())
+            if retry_expired(state, now):
+                approved = explicit_retry_matches(state, value, now)
+                restricted = automatic or wait is not None or retry.get('renewal_only') is True
+                state.pop('explicit_retry', None)
+                if approved or restricted:
+                    # Consume a manual approval before touching the interrupted step.
+                    state['phase'] = 'waiting'
+                    retry['automatic'] = False
+                    durable_json(root / 'state.json', state)
+                if restricted and not approved:
+                    return state
             state['phase'] = retry['phase']
+        elif state['phase'] == 'waiting':
+            p.require(False, 'Durable product retry is unavailable.')
         try:
             backend = FedoraJob(value)
             backend.ledger('job', registered_contract(value))
@@ -880,7 +903,17 @@ def require_product_scheduling_access():
         raise DispatchDeferred('Product scheduling is held by renewal.')
 
 
-def submit(path, *, expected_plan=None, deadline=None):
+def authorize_explicit_retry(job, expected_plan):
+    with locked_job_state(job) as (root, value, state):
+        p.require(value == expected_plan, 'The published product plan differs from the confirmed agreement.')
+        now = int(time.time())
+        if state['phase'] not in TERMINAL and retry_expired(state, now) and not explicit_retry_matches(state, value, now):
+            state['explicit_retry'] = {'plan_sha256': p.identity(value), 'retry_sha256': p.identity(state['retry']),
+                                       'until_unix': now + RETRY_SECONDS}
+            durable_json(root / 'state.json', state)
+
+
+def submit(path, *, expected_plan=None, deadline=None, explicit=True):
     require_product_scheduling_access()
     raw = candidate.protected_file(path)
     value = plan(raw)
@@ -905,6 +938,10 @@ def submit(path, *, expected_plan=None, deadline=None):
     target = trusted_directory(target)
     p.require(plan(read_private(target / 'plan.json', p.MAX_MESSAGE)) == value, 'job ID is already bound to another brief')
     require_product_scheduling_access()
+    state = read_state(target)
+    if explicit and state['phase'] not in TERMINAL and retry_expired(state, int(time.time())):
+        authorize_explicit_retry(value['job_id'], value)
+        require_product_scheduling_access()
     end = time.monotonic() + 10
     candidate.invoke([SYSTEMCTL, 'start', '--no-block', 'dev-pair-product@' + value['job_id'] + '.service'],
                      end if deadline is None else min(end, deadline))
@@ -928,11 +965,11 @@ def main(argv=None):
         if args.action == 'submit':
             result = submit(args.approved_plan)
         elif args.action == 'work':
-            result = work(args.job)
+            result = work(args.job, automatic=True)
             while result['phase'] == 'waiting' and result['retry']['automatic']:
                 print(p.canonical(result), flush=True)
                 time.sleep(RETRY_INTERVAL)
-                result = work(args.job)
+                result = work(args.job, automatic=True)
         else:
             root = trusted_directory(job_path(args.job))
             previous = None

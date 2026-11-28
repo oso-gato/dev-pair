@@ -304,3 +304,68 @@ class WorkloadHoldTests(unittest.TestCase):
             self.scheduled.reset_mock()
             self.assert_resumed_once()
             self.assertIsNone(self.intake.record(self.job)['diagnostics'])
+
+    def expired_retry(self, *, phase='waiting'):
+        retry = {'phase': 'maintenance-turn', 'reason': 'host-reply-interrupted', 'until_unix': 1180,
+                 'observations': 1, 'automatic': True}
+        product.durable_json(self.state_path, dict(self.state, phase=phase, retry=retry))
+        return retry
+
+    def test_next_boot_timer_does_not_schedule_a_legacy_retry_after_its_deadline(self):
+        self.expired_retry()
+        self.clock.return_value = 3400
+        with mock.patch.object(intake, 'boot_id', return_value='00000000-0000-4000-8000-000000000005'):
+            self.assertEqual(self.intake.reconcile(), 0)
+        self.scheduled.assert_not_called()
+        self.backend.assert_not_called()
+
+    def test_delayed_or_interrupted_automatic_worker_rechecks_the_old_retry_deadline(self):
+        retry = self.expired_retry()
+        self.clock.return_value = 1179
+        with mock.patch.object(intake, 'boot_id', return_value='00000000-0000-4000-8000-000000000005'):
+            self.assertEqual(self.intake.reconcile(), 0)
+        self.scheduled.assert_called_once()
+        unit = Path(__file__).resolve().parents[1] / 'runtime/product-job/dev-pair-product@.service'
+        self.assertIn('product_job.py work %i\n', unit.read_text())
+        self.clock.return_value = 3400
+        for phase in ('waiting', 'maintenance-turn'):
+            with self.subTest(phase=phase):
+                self.expired_retry(phase=phase)
+                self.assertEqual(product.main(['work', self.job]), 76)
+                self.backend.assert_not_called()
+                retained = p.loads(self.state_path.read_bytes())
+                self.assertEqual(retained['phase'], 'waiting')
+                self.assertEqual(retained['retry'], dict(retry, automatic=False))
+
+    def test_exact_owner_retry_authorizes_one_attempt_without_extending_the_earlier_budget(self):
+        retry = self.expired_retry()
+        self.clock.return_value = 3400
+        saved = self.intake.record(self.job)
+        with self.assertRaisesRegex(ValueError, 'draft has changed'):
+            self.intake.confirm(self.job, 'f' * 64)
+        self.scheduled.assert_not_called()
+        self.intake.confirm(self.job, saved['agreement_token'])
+        self.scheduled.assert_called_once()
+        self.worker.turn.side_effect = product.HostReplyLost('execute')
+        self.assertEqual(product.main(['work', self.job]), 76)
+        self.worker.turn.assert_called_once_with('maintenance', self.initial)
+        self.worker.host_test.assert_not_called()
+        self.assertEqual(product.main(['work', self.job]), 76)
+        self.worker.turn.assert_called_once()
+        retained = p.loads(self.state_path.read_bytes())
+        self.assertEqual(retained['retry'], dict(retry, observations=2, automatic=False))
+
+    def test_explicit_root_retry_expires_if_the_worker_never_admits_it(self):
+        self.expired_retry()
+        self.clock.return_value = 3400
+        self.assertEqual(product.main(['submit', str(self.staged)]), 0)
+        self.scheduled.assert_called_once()
+        self.clock.return_value += product.RETRY_SECONDS
+        self.assertEqual(product.main(['work', self.job]), 76)
+        self.backend.assert_not_called()
+
+        self.clock.return_value += 1
+        self.assertEqual(product.main(['submit', str(self.staged)]), 0)
+        self.assertEqual(product.main(['work', self.job]), 0)
+        self.assertEqual(product.main(['work', self.job]), 0)
+        self.worker.host_test.assert_called_once_with(1, self.initial)
