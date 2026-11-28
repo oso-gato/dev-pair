@@ -91,7 +91,9 @@ class Systemd:
         guard = ''
         for drop in drops:
             command = next((line[10:] for line in drop.read_text().splitlines() if line.startswith('ExecStart=/')), command)
-            guard = next((line[14:] for line in drop.read_text().splitlines() if line.startswith('ExecCondition=')), guard)
+            for line in drop.read_text().splitlines():
+                if line.startswith('ExecCondition='):
+                    guard = line[14:]
         if unit == self.bad_exec:
             command = '/usr/bin/false'
         user = 'dp-checklist' if unit.startswith('dev-pair-checklist-executor@') else 'root'

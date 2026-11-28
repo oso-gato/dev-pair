@@ -187,6 +187,13 @@ If the exact pending input can no longer be used, reopen owner setup and
 choose `discard-pending` after confirming the decision. Any custody already
 committed is retained.
 
+A signed stable platform renewal closes provider starts before changing the
+fixed billing executables. It waits for the earlier service to finish and
+keeps its accounting and the original site approval. The pending migration
+names both signed file sets. After interruption, resume the same approved
+stable renewal so it can finish the exact forward selection. An incompatible
+predecessor keeps provider starts held.
+
 Protected automation can inspect the exact plan through `--inspect-site --help`
 and confirm it through `--initialize-site`. These entries read the same signed
 billing authority. Keep source, catalogue and role profiles in the protected

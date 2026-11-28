@@ -19,6 +19,8 @@ from systemd_service_profile import VENDOR, exec_start_matches, manager_properti
 STATE = '/var/lib/dev-pair/provider-transition'
 RUNTIME = '/run/dev-pair-provider-transition'
 READY = RUNTIME + '/ready.json'
+FIXED_PENDING = 'fixed-pending.json'
+FIXED_BLOCKED = 'fixed-blocked.json'
 TEMPLATE = '/etc/systemd/system/dev-pair-provider@.service'
 DROP_IN = TEMPLATE + '.d/50-dev-pair-provider-fence.conf'
 LAUNCHER = '/usr/libexec/dev-pair/renewal/provider-run'
@@ -98,7 +100,11 @@ class Fence:
             self.ready.unlink()
             sync_directory(self.runtime)
 
+    def fixed_hold(self):
+        return any(os.path.lexists(self.state / name) for name in (FIXED_PENDING, FIXED_BLOCKED))
+
     def require_ready(self):
+        p.require(not self.fixed_hold(), 'The fixed billing release migration remains held.')
         p.require(not os.path.lexists(self.pending), 'Provider billing changes are waiting for old broker instances to drain.')
         try:
             saved = p.loads(self.read(self.ready, 4096))
@@ -116,16 +122,16 @@ class Fence:
                   'The provider invocation identity is unavailable.')
         return row
 
-    def guarded(self, row):
+    def guarded(self, row, *, drops=(DROP_IN,), condition=CONDITION):
         request, = INSTANCE.fullmatch(row['Id']).groups()
-        expected = [DROP_IN]
+        expected = list(drops)
         if os.path.lexists(self.path(VENDOR)):
             expected.insert(0, VENDOR)
         p.require(row['DropInPaths'].split() == expected and row['FragmentPath'] == TEMPLATE and
                   row['NeedDaemonReload'] == 'no' and row['Type'] == 'exec' and row['User'] == 'root' and
                   row['Group'] in ('root', '') and row['KillMode'] == 'control-group' and row['SendSIGKILL'] == 'yes' and
                   exec_start_matches(row['ExecStart'], LAUNCHER + ' ' + request) and
-                  exec_start_matches(row['ExecCondition'], CONDITION.replace('%i', request)),
+                  exec_start_matches(row['ExecCondition'], condition.replace('%i', request)),
                   'The running systemd manager has not loaded the exact provider start fence.')
 
     def inventory(self):
@@ -212,10 +218,10 @@ class Fence:
                         return False
         return True
 
-    def idle(self, deadline):
+    def idle(self, deadline, *, drops=(DROP_IN,), condition=CONDITION):
         p.require(not os.path.lexists(self.ready), 'The broker start fence is open during the idle check.')
         self.unique_template()
-        self.guarded(self.unit(PROBE))
+        self.guarded(self.unit(PROBE), drops=drops, condition=condition)
         names, queued = self.inventory()
         for name in sorted(names):
             if time.monotonic() >= deadline:
@@ -227,8 +233,8 @@ class Fence:
                     row['Job'] not in ('0', '') or row['MainPID'] != '0' or row['ControlPID'] != '0' or
                     not self.cgroup_idle(row)):
                 return False
-            self.guarded(row)
-        self.guarded(self.unit(PROBE))
+            self.guarded(row, drops=drops, condition=condition)
+        self.guarded(self.unit(PROBE), drops=drops, condition=condition)
         # A job whose condition had already completed remains loaded until it
         # settles. With starts fenced, new entries cannot advance to ExecStart.
         # Reobserve the inventory before admitting custody or readiness.
@@ -275,6 +281,9 @@ class Fence:
     def converge(self, *, resume_custody=True):
         self.mkdir()
         with billing.lock(self.state):
+            if self.fixed_hold():
+                self.hold()
+                raise Deferred('The fixed provider release still needs protected activation readback.')
             intent = self.intent()
             if intent is not None and not resume_custody:
                 self.hold()
@@ -293,6 +302,7 @@ class Fence:
         self.mkdir()
         proposed = {'schema': 1, 'kind': kind, 'payload': payload}
         with billing.lock(self.state):
+            p.require(not self.fixed_hold(), 'Finish the fixed billing release migration first.')
             current = self.intent()
             if current is None:
                 billing.replace_record(self.pending, proposed)
@@ -303,6 +313,7 @@ class Fence:
     def discard(self, expected):
         self.mkdir()
         with billing.lock(self.state):
+            p.require(not self.fixed_hold(), 'Finish the fixed billing release migration first.')
             p.require(expected is not None and self.intent() == expected, 'The pending billing operation changed.')
             self.hold()
             if not self.idle(time.monotonic() + 18):

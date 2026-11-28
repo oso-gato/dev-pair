@@ -10,7 +10,12 @@ import tempfile
 import time
 
 INSTALL = Path('/usr/libexec/dev-pair')
-sys.path.insert(0, str(INSTALL / 'tools'))
+EXECUTED = Path(__file__).resolve()
+VERSIONED = EXECUTED.parents[2]
+if VERSIONED.parent == INSTALL / 'host-releases':
+    sys.path.insert(0, str(VERSIONED / 'tools'))
+else:
+    sys.path.insert(0, str(INSTALL / 'tools'))
 import renewal as r
 from renewal import protocol as p
 
@@ -207,7 +212,7 @@ def selected_component(controller, control, action):
     r.require(desired['release_sha256'] == journal['request'][source] and
               desired['component'] == controller.release(desired['release_sha256'])['components']['host'],
               'host desired release differs from reviewed transition')
-    r.require(journal['request']['scope'] == 'host' or
+    r.require(journal['request']['scope'] in ('host', 'stable') or
               (source == 'previous_sha256' and desired['component'] ==
                controller.release(journal['request']['target_sha256'])['components']['host']),
               'non-host recovery selected a different host bundle')
@@ -234,18 +239,44 @@ def main():
     component = selected_component(controller, CONTROL, sys.argv[1])
     directory, config = release_dirs(STORE, component, CONFIGS)
     receipt = measure_release(component, directory, config, host_measurement())
+    migration = None
     if sys.argv[1] == 'apply':
         from bootstrap import Bootstrap
 
         desired = r.read_json(CONTROL / 'host-desired.json')
         r.require(desired['component'] == component and selected_component(controller, CONTROL, 'apply') == component,
                   'host desired release changed before activation')
+        _, journal = controller.transition()
+        authority = None
+        if journal['request']['scope'] == 'stable':
+            from host_fixed_migration import authorized, refuse_incompatible_rollback
+            from stable_renewal import verify_transition
+
+            authority = verify_transition(controller, desired)
+            candidate = controller.release(authority['target_release_sha256'])['components']['host']
+            r.require(VERSIONED == STORE / candidate['artifact_sha256'] and
+                      EXECUTED == VERSIONED / 'runtime/renewal/host-release',
+                      'Stable host activation requires the exact successor executable.')
         Bootstrap().hold_changed_workload_access(desired['release_sha256'], acquire_lease=True)
         r.require(r.read_json(CONTROL / 'host-desired.json') == desired, 'host desired release changed after workload hold')
+        if authority is not None:
+            r.require(verify_transition(controller, desired) == authority, 'Stable authority changed after workload hold.')
+            if journal['phase'] == 'rolling-back':
+                refuse_incompatible_rollback(Bootstrap(), authority)
+            else:
+                migration = authorized(Bootstrap(), controller, authority)
+                migration.prepare(end=time.monotonic() + 208)
+                r.require(verify_transition(controller, desired) == authority,
+                          'Stable provider migration authorization changed before host selection.')
     publish_selector(component)
     receipt['handoff'] = handoff_runtime(directory, restart=True)
     r.replace_json(CONTROL / 'host-selection.json', component)
     r.replace_json(CONTROL / 'host-observed.json', receipt)
+    if migration is not None:
+        r.require(r.read_json(CONTROL / 'host-selection.json') == component and
+                  selected_component(controller, CONTROL, 'apply') == component,
+                  'The fixed provider closure could not confirm the selected stable host.')
+        migration.finish(end=time.monotonic() + 20)
     print(r.canonical({'boot_id': receipt['boot_id'], 'artifact_sha256': component['artifact_sha256']}))
 
 

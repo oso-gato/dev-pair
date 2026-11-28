@@ -71,6 +71,7 @@
     {"source": "tools/gptbox.py", "target": "/usr/libexec/dev-pair/tools/gptbox.py", "mode": "0644", "feature": "base"},
     {"source": "tools/gptbox_runtime.py", "target": "/usr/libexec/dev-pair/tools/gptbox_runtime.py", "mode": "0644", "feature": "base"},
     {"source": "tools/host_handoff.py", "target": "/usr/libexec/dev-pair/tools/host_handoff.py", "mode": "0644", "feature": "base"},
+    {"source": "tools/host_fixed_migration.py", "target": "/usr/libexec/dev-pair/tools/host_fixed_migration.py", "mode": "0644", "feature": "base"},
     {"source": "tools/job_protocol.py", "target": "/usr/libexec/dev-pair/tools/job_protocol.py", "mode": "0644", "feature": "base"},
     {"source": "tools/jobs.py", "target": "/usr/libexec/dev-pair/tools/jobs.py", "mode": "0644", "feature": "base"},
     {"source": "tools/ledger_recovery.py", "target": "/usr/libexec/dev-pair/tools/ledger_recovery.py", "mode": "0644", "feature": "base"},
