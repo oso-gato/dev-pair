@@ -4,6 +4,7 @@ import fcntl
 import os
 from pathlib import Path
 import struct
+import subprocess
 import time
 import uuid
 
@@ -33,13 +34,15 @@ class ParentSpace:
     metadata_bytes: int | None = None
     nodesize: int | None = None
 
+    def metadata_needed(self, requested_inodes):
+        # Budget two allocated metadata nodes per requested recovery inode.
+        return 2 * requested_inodes * self.nodesize
+
     def check(self, required_bytes, required_inodes, error, message):
         if self.available_bytes < required_bytes:
             raise error(message)
         if self.kind == 'btrfs':
-            # Budget two metadata nodes per requested recovery inode. Keep
-            # allocated metadata space available independently of data space.
-            if self.metadata_bytes < 2 * required_inodes * self.nodesize:
+            if self.metadata_bytes < self.metadata_needed(required_inodes):
                 raise error(message + ' (Btrfs metadata reserve is too low)')
         elif self.available_inodes < required_inodes:
             raise error(message)
@@ -102,6 +105,19 @@ def observe(path, error):
             os.close(parent)
     except (OSError, ValueError) as exc:
         raise error('physical storage byte or finite inode geometry is unavailable') from exc
+
+
+def provisioning_space(path, error, reserve_inodes):
+    """Settle pending filesystem writes once before rejecting recovery capacity."""
+    space = observe(path, error)
+    if space.kind == 'btrfs' and space.metadata_bytes < space.metadata_needed(reserve_inodes):
+        try:
+            subprocess.run(('/usr/bin/sync', '-f', '--', path), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, check=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise error('Btrfs metadata could not settle before storage provisioning') from exc
+        space = observe(path, error)
+    return space
 
 
 def prepare_btrfs(fd, *, empty, error):

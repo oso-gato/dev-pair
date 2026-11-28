@@ -485,7 +485,7 @@ class DayZeroTests(unittest.TestCase):
     def test_physical_free_inodes_are_distinct_from_future_inner_capacity(self):
         from managed_backing import ParentSpace
 
-        with (patch.object(day, 'record', return_value=None), patch.object(day, 'physical_space') as volume,
+        with (patch.object(day, 'record', return_value=None), patch.object(day.managed_backing, 'provisioning_space') as volume,
               redirect_stdout(io.StringIO())):
             volume.return_value = ParentSpace('ext4', 30 * 1024 * day.MIB, 6000)
             self.assertEqual(self.entry.storage_geometry(), (20480, 262144, 4096))

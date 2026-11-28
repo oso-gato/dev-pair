@@ -22,7 +22,7 @@ import warnings
 
 from bootstrap import (ATTENDED_ACCESS, ATTENDED_RECEIPT, Blocked, Bootstrap, CORE_ACCESS_CUTOVER, CUTOVER,
                        STATE as BOOTSTRAP, TRUST_SIGNERS, WORKLOAD_ACCESS_CUTOVER)
-from managed_backing import observe as physical_space
+import managed_backing
 
 REPO = Path(__file__).resolve().parents[1]
 STATE = Path('/var/lib/dev-pair-day0')
@@ -194,7 +194,7 @@ class DayZero:
         protected = record(STATE / 'continuation-progress.json') or record(self.progress)
         report = self.app.status()
         print(f"Host {item['host']} | Fedora 44 | SELinux { {'1': 'enforcing', '0': 'permissive'}.get(item['selinux'], item['selinux'])}")
-        physical = physical_space('/var/lib', Blocked)
+        physical = managed_backing.observe('/var/lib', Blocked)
         print(f'Physical /var/lib free {physical.available_bytes // MIB} MiB | {physical.display()}')
         print('Source ' + (protected['source_sha'] if protected else source or 'awaiting the verified owner kit'))
         print('Day 0 phase ' + (protected['phase'] if protected else 'ready for inspection'))
@@ -319,15 +319,16 @@ class DayZero:
 
     def storage_geometry(self):
         existing = record(Path('/var/lib/dev-pair-managed-storage.json'))
-        observed = physical_space('/var/lib', Blocked)
+        reserve = existing['reserve_inodes'] if existing else 4096 + 16
+        observed = managed_backing.provisioning_space('/var/lib', Blocked, reserve)
         free = observed.available_bytes // MIB
         print(f'Physical /var/lib free {free} MiB | {observed.display()}.', flush=True)
         if existing:
-            observed.check(8192 * MIB, existing['reserve_inodes'], Blocked,
+            observed.check(8192 * MIB, reserve, Blocked,
                            'The enrolled host lacks its physical recovery reserve.')
             return existing['filesystem']['mib'], existing['filesystem']['inodes'], existing['reserve_inodes']
         size = min(20480, ((free - 9216) // 256) * 256)
-        observed.check((16384 + 9216) * MIB, 4096 + 16, Blocked,
+        observed.check((16384 + 9216) * MIB, reserve, Blocked,
                        'The inspected /var/lib filesystem lacks managed capacity plus the required 8 GiB physical reserve.')
         print(f'This host can reserve a {size} MiB managed filesystem for the pair.', flush=True)
         return size, 262144, 4096

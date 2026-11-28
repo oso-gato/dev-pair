@@ -194,8 +194,7 @@ def verified_source(producer, revision, upstream):
             'upstream Distrobox checkout does not identify the pinned commit')
     enter = exact(upstream, db.DISTROBOX, 'distrobox-enter')
     require(hashlib.sha256(enter).hexdigest() == db.ENTER_SHA256, 'pinned Distrobox entry hash differs')
-    for name in ('tools/native_placements.py', 'tools/storage.py'):
-        exact(SOURCE, revision, name)
+    exact(SOURCE, revision, 'tools/native_placements.py')
     entry_files = {name: exact(SOURCE, revision, name) for name in ENTRY_FILES}
     outer_files = {name: exact(SOURCE, revision, 'runtime/devbox/' + name) for name in OUTER_FILES}
     return entry_files, {'distrobox-enter': enter, **outer_files}

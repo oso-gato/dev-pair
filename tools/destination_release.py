@@ -190,7 +190,8 @@ class Destination(Bootstrap):
         reserve = reserve_mib * MIB
         reserve_message = 'selected VPS cannot preserve the declared free reserve'
         if not previous and not os.path.lexists(image):
-            managed_backing.observe(image.parent, Blocked).check(reserve + size, reserve_inodes, Blocked, reserve_message)
+            managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes).check(
+                reserve + size, reserve_inodes, Blocked, reserve_message)
         open_type = 0 if previous else os.O_CREAT | os.O_EXCL
         descriptor = os.open(image, open_type | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600)
         try:
@@ -210,7 +211,7 @@ class Destination(Bootstrap):
                 previous = {**identity, 'state': 'created'}
                 self.atomic(receipt, record_text(previous))
             remaining = max(size - old.st_blocks * 512, 0)
-            space = managed_backing.observe(image.parent, Blocked)
+            space = managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes)
             space.check(reserve + remaining, reserve_inodes, Blocked, reserve_message)
             if space.kind == 'btrfs':
                 require(not remaining or previous['state'] == 'created', 'recorded Btrfs backing allocation changed')
@@ -224,7 +225,7 @@ class Destination(Bootstrap):
                 managed_backing.verify_btrfs(descriptor, size, Blocked)
         finally:
             os.close(descriptor)
-        managed_backing.observe(image.parent, Blocked).check(
+        managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes).check(
             reserve, reserve_inodes, Blocked, 'filesystem reserve was not preserved after allocation')
         observed = self.run('/usr/sbin/blkid', '-p', '-o', 'export', str(image), ok=(0, 2), timeout=10)
         expected = {'UUID': spec['uuid'], 'TYPE': 'ext4'}
@@ -240,7 +241,7 @@ class Destination(Bootstrap):
         require(all(fields.get(key) == value for key, value in expected.items()), 'foreign checklist backing filesystem')
         if space.kind == 'btrfs':
             managed_backing.verify_backing(image, current, Blocked)
-            managed_backing.observe(image.parent, Blocked).check(
+            managed_backing.provisioning_space(image.parent, Blocked, reserve_inodes).check(
                 reserve, reserve_inodes, Blocked, 'filesystem reserve was not preserved after formatting')
         self.atomic(receipt, record_text({**identity, 'state': 'formatted'}), expected=record_text(previous))
 
