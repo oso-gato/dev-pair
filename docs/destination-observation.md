@@ -171,7 +171,9 @@ checks the same binding again against the live checklist and records
 confirmation on the same job. Resume Day 0 after a reboot if the schedule is
 held for the new boot. `dev-pair status JOB` shows when a proof is missing or
 expired. Return a fresh proof for an expired receipt or a changed publisher
-attempt. Existing confirmed delivery records remain valid.
+attempt. An unfinished observation also needs fresh proof after a host source
+or boot change. Export the current binding again. Confirmed delivery records
+remain valid historical evidence.
 
 The assembler also accepts separately measured pre-cutover access records against D's existing `Bootstrap.access_probe_plan`. Use a protected `kind: access-cutover` site profile with the same common site fields plus `node_id`, `tailnet`, `keys_sha256`, `acl_sha256`, and `execution_route`. Its independently checked binding carries the common exact job, platform source, machine, boot, DNS, recovery and provider addresses. Use `record-access TEST FAMILY --observed-at EPOCH --transcript FILE` for each actual typed access observation and `assemble` for the cutover schema. Confirm the initial operator scope and independently verified provider recovery through the [existing destination commissioning entry](destination-release.md). Generating initial access observations remains a native commissioning task.
 

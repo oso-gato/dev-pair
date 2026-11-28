@@ -115,6 +115,11 @@ The controller reserves the rollout, closes the exact private proxy and stops th
 
 If the first release passes its local data checks and later fails independent destination verification, the independent verifier signs a fresh rejection receipt with the same base fields, `release_source`, `image`, `dns_name`, `failed_check` and `observation_sha256`. The failed check identifies the actual failed browser, public-denial, unauthorized-denial, tailnet-loss, restart, reboot, clean-restore or remote-root observation. Quarantine that exact locally promoted digest through the protected entry.
 
+For a checklist promotion, include the signed `job_id`, `publisher_run_id`,
+`publisher_run_attempt` and `guard_sha256` from the current observation export.
+After a managed host renewal or rollback, use the current export's source and
+boot for both positive and rejection proof.
+
 ```sh
 /usr/bin/python3 -EBs tools/destination_release.py reject --apply --evidence "$rejection_receipt"
 ```

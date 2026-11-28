@@ -182,6 +182,7 @@ class ReceiptTests(unittest.TestCase):
 
         destination = SimpleNamespace(
             release_gate=release_gate,
+            current_proof_source=lambda provision: provision['platform_sha'],
             initial_activation=lambda: {'active': live, 'pending': None, 'route_pending': False, 'previous': None},
             serve_config=lambda dns: dns == DNS,
             destination_identity=lambda: {'machine_id': MACHINE, 'boot_id': BOOT},

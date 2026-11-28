@@ -73,6 +73,10 @@ The independently held reviewer approves the actual current candidate in GitHub 
 
 The normal observer advances the release through the existing destination controller and observes its active, pending, and confirmed records. It can resume the same pending deployment and recover a lost reply from the exact active record. A different pending or unconfirmed activation remains held. After independent quarantine of a failed first release, the controller can admit an independently reviewed correction with a different verified digest.
 
+An exact release already running from standalone deployment can stay in place
+while the owner job awaits its own signed proof. Confirmation records the
+independently observed receipt for that job without redeploying the image.
+
 The independent verifier exercises the named private URL and the required
 access, persistence, restart, reboot and restore checks. The verifier returns a
 fresh signed envelope for the same job through the protected proof importer.
@@ -80,8 +84,11 @@ The D verifier checks the signature, owner job, publisher run and attempt,
 current boot and guard, exact source, OCI and DNS, live item and required
 observations before recording confirmation. The importer and installed D
 controller authenticate their source through the current boot observation and
-retained signed host bundle. The resolved image and DNS remain visible while
-the signed proof is pending or expired. Keep the independent signing authority
-and probe access outside the host, proposer and provider roles. [Independent destination observations](destination-observation.md)
+retained signed host bundle. The installed entry selects the verified current
+implementation after a host renewal or rollback. The original provisioning
+record retains its first source. The resolved image and DNS remain visible
+while the signed proof is pending, expired, or displaced by a host change.
+Keep the independent signing authority and probe access outside the host,
+proposer and provider roles. [Independent destination observations](destination-observation.md)
 
 The implementation can be exercised locally with an isolated Git fork, synthetic GitHub API and a fixture activation journal. The protected GitHub permissions, workflow App, independent reviewer, registry publication, actual Fedora destination and independent probe producer require commissioned authority and real observations.

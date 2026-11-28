@@ -208,15 +208,17 @@ class StationSite(unittest.TestCase):
             def confirm(self, path, *, job_id):
                 return self.release_proof(path, {**binding, 'job_id': job_id})
 
+        observed = {**binding, 'image': 'another subject'}
         with (patch.object(release, 'EVIDENCE', storage), patch.object(release.product, 'job_path', return_value=job),
-              patch.object(station, 'export_release', return_value={**binding, 'image': 'another subject'}) as export,
+              patch.object(station, 'release_observation',
+                           side_effect=lambda job, *, confirmed_receipt, destination: nullcontext((destination, observed))),
               patch.object(setup, 'Destination', IndependentPrimitives),
               patch.object(release, 'record', return_value={'phase': 'awaiting-independent-destination'})):
             with self.assertRaisesRegex(release.Blocked, 'exact release, job or publisher attempt'):
                 setup.import_evidence(JOB, io.BytesIO(envelope))
             target = setup.evidence_envelope(JOB)
             self.assertFalse(target.exists())
-            export.return_value = binding
+            observed = binding
             with self.assertRaisesRegex(release.Blocked, 'invalid independent signature'):
                 setup.import_evidence(JOB, io.BytesIO(station.access_envelope(receipt.read_bytes(), b'not a signature')))
             setup.import_evidence(JOB, io.BytesIO(envelope))
@@ -226,10 +228,10 @@ class StationSite(unittest.TestCase):
                 with self.assertRaisesRegex(release.Wait, 'signed-destination-evidence-expired'):
                     setup.stored_proof(target)
             before = target.stat().st_ino
-            export.return_value = {**binding, 'publisher_run_attempt': 3}
+            observed = {**binding, 'publisher_run_attempt': 3}
             with self.assertRaisesRegex(release.Blocked, 'exact release, job or publisher attempt'):
                 setup.import_evidence(JOB, io.BytesIO(envelope))
-            export.return_value = binding
+            observed = binding
             setup.import_evidence(JOB, io.BytesIO(envelope))
             self.assertEqual(target.stat().st_ino, before)
             self.assertEqual(list(storage.iterdir()), [target])

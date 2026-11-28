@@ -1,8 +1,10 @@
 """Exercise the installed promotion entry in a disposable, network-isolated root."""
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 # Load standard-library extensions and their dynamic dependencies before entering the private root.
 import ctypes
+import fcntl
 import hashlib
+import importlib
 import io
 import json
 import os
@@ -24,7 +26,6 @@ REPO = Path(__file__).resolve().parents[1]
 INSTALL = Path('/usr/libexec/dev-pair')
 START = '/var/lib/dev-pair'
 BOOT = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
-MATCH = 'a' * 40
 JOB = 'first-checklist'
 DNS = 'erebus.example.ts.net'
 ITEM = 'Observed checklist item'
@@ -35,9 +36,12 @@ def materialize_root(root):
     library = Path(sysconfig.get_path('stdlib'))
     shutil.copytree(library, root / library.relative_to('/'),
                     ignore=shutil.ignore_patterns('site-packages', 'dist-packages', '__pycache__', 'test', 'tests'))
-    dependencies = subprocess.run(['ldd', '/usr/bin/ssh-keygen'], capture_output=True, text=True,
+    executables = ['/usr/bin/ssh-keygen', '/usr/bin/python3']
+    extensions = [module.__file__ for name, module in sys.modules.copy().items()
+                  if name in ('_ctypes', '_ssl', '_bz2', '_lzma', '_hashlib', '_sqlite3')]
+    dependencies = subprocess.run(['ldd', *executables, *extensions], capture_output=True, text=True,
                                   check=True, timeout=10).stdout.splitlines()
-    for value in ('/usr/bin/ssh-keygen', *(word for line in dependencies for word in line.split() if word.startswith('/'))):
+    for value in sorted({*executables, *(word for line in dependencies for word in line.split() if word.startswith('/') and ':' not in word)}):
         source = Path(value)
         target = root / source.relative_to('/')
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -55,6 +59,37 @@ def materialize_root(root):
         target.chmod(int(row['mode'], 8))
 
 
+def reviewed_pair(root):
+    """Record two exact disposable Git revisions with changed destination verifier bytes."""
+    files = {str(path.relative_to(root / INSTALL.relative_to('/'))): path.read_bytes()
+             for area in ('tools', 'runtime') for path in (root / INSTALL.relative_to('/') / area).rglob('*')
+             if path.is_file()}
+    with tempfile.TemporaryDirectory() as location:
+        source = Path(location)
+        for name, raw in files.items():
+            write(source / name, raw)
+        git = ['/usr/bin/git', '-C', location, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid']
+        subprocess.run([*git, 'init', '-q'], check=True, capture_output=True, timeout=10)
+        subprocess.run([*git, 'add', '.'], check=True, capture_output=True, timeout=10)
+        subprocess.run([*git, 'commit', '-qm', 'Original approved host'], check=True, capture_output=True, timeout=10)
+        initial = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True, timeout=10).strip()
+        name = 'tools/destination_release.py'
+        observation = 'tools/destination_observation.py'
+        entry = b"\nif __name__ == '__main__':\n"
+        witness = entry + b"    print('Selected host launched', file=sys.stderr)\n"
+        newer = {**files, name: files[name] + b'\n# Second independently selected fixture host.\n',
+                 observation: files[observation].replace(entry, witness)}
+        for item in (name, observation):
+            write(source / item, newer[item])
+        subprocess.run([*git, 'commit', '-qam', 'Renew approved host code'], check=True, capture_output=True, timeout=10)
+        renewed = subprocess.check_output([*git, 'rev-parse', 'HEAD'], text=True, timeout=10).strip()
+        assert initial != renewed
+        for revision, bundle in ((initial, files), (renewed, newer)):
+            assert all(subprocess.check_output([*git, 'show', f'{revision}:{item}'], timeout=10) == bundle[item]
+                       for item in ('tools/bootstrap.py', name, observation))
+    return initial, files, renewed, newer
+
+
 def write(path, data, mode=0o600):
     path = Path(path)
     path.parent.mkdir(mode=0o700, exist_ok=True, parents=True)
@@ -65,48 +100,50 @@ def write(path, data, mode=0o600):
     return path
 
 
-def exact_state(renewal, protocol, publication):
-    bundle = {'schema': 1, 'source_revision': MATCH, 'state_contract': 1, 'files': {}}
-    for module in sorted((INSTALL / 'tools').iterdir()):
-        bundle['files']['tools/' + module.name] = hashlib.sha256(module.read_bytes()).hexdigest()
+def exact_state(renewal, protocol, publication, revision, contents, *, original=False):
+    bundle = {'schema': 1, 'source_revision': revision, 'state_contract': 1,
+              'files': {name: hashlib.sha256(raw).hexdigest() for name, raw in contents.items()}}
     manifest = publication.canonical(bundle)
     artifact = publication.digest(manifest)
     store = INSTALL / 'host-releases' / artifact
     write(store / 'manifest.json', manifest, 0o444)
-    for name in bundle['files']:
-        write(store / name, (INSTALL / name).read_bytes(), 0o444)
-    (store / 'tools').chmod(0o555)
+    if not (store / 'tools').exists():
+        for name, raw in contents.items():
+            write(store / name, raw, 0o444)
+    for directory in reversed(sorted(path for path in store.rglob('*') if path.is_dir())):
+        directory.chmod(0o555)
     store.chmod(0o555)
     components, files = {}, {}
     for role in protocol.ROLES:
         row = {**dict.fromkeys(('context_sha256', 'oci_config_sha256', 'oci_manifest_sha256', 'archive_sha256'), 'b' * 64),
-               'source_sha': MATCH, 'archive_bytes': 1}
+               'source_sha': revision, 'archive_bytes': 1}
         if role != 'devbox':
             row.update(codex_version='0.169.0', codex_source_sha='c' * 40, codex_sha256='d' * 64)
         components[protocol.COMPONENT[role]] = row
-        files[role] = {'name': f'platform-{role}-{MATCH}', 'files': {
+        files[role] = {'name': f'platform-{role}-{revision}', 'files': {
             'part.json': {'sha256': 'e' * 64, 'bytes': 1},
             role + '.oci.tar': {'sha256': row['archive_sha256'], 'bytes': row['archive_bytes']}}}
-    components['host'] = {'source_sha': MATCH, 'bundle_manifest_sha256': artifact}
-    files['host'] = {'name': f'platform-host-{MATCH}', 'files': {
+    components['host'] = {'source_sha': revision, 'bundle_manifest_sha256': artifact}
+    files['host'] = {'name': f'platform-host-{revision}', 'files': {
         'host.tar': {'sha256': 'a' * 64, 'bytes': 1},
         'host-manifest.json': {'sha256': artifact, 'bytes': len(manifest)}}}
     index = {'schema': 2, 'kind': 'dev-pair-platform-release', 'repository': 'oso-gato/dev-pair',
-             'source_sha': MATCH, 'publisher_run': 81, 'standards_sha': protocol.STANDARDS,
+             'source_sha': revision, 'publisher_run': 81, 'standards_sha': protocol.STANDARDS,
              'contracts': {'ledger': 1, 'state': 1, 'release_policy': 1}, 'previous_platform_sha256': None,
              'base_platform_sha256': None, 'components': components, 'transports': files}
     raw = publication.canonical(index)
     platform = publication.digest(raw)
-    intake = publication.canonical({'schema': 2, 'platform_sha256': platform, 'source_sha': MATCH,
+    intake = publication.canonical({'schema': 2, 'platform_sha256': platform, 'source_sha': revision,
                                    'publisher_run': 81, 'kind': index['kind']})
     write(f'{START}/platform-releases/{platform}/platform.json', raw, 0o444)
     write(f'{START}/platform-releases/{platform}/intake.json', intake)
-    host = {'source_revision': MATCH, 'config_sha256': '9' * 64, 'artifact_sha256': artifact}
+    host = {'source_revision': revision, 'config_sha256': '9' * 64, 'artifact_sha256': artifact}
     entry = {'schema': 1, 'components': {'host': host}}
     raw = renewal.json_bytes(entry)
     site = hashlib.sha256(raw).hexdigest()
     control = Path(START) / 'renewal'
     write(control / 'site-current.json', renewal.json_bytes(site))
+    write(control / 'current.json', renewal.json_bytes(site))
     write(control / 'releases' / (site + '.json'), raw)
     write(control / 'platform-bindings' / (site + '.json'), renewal.json_bytes({
         'schema': 1, 'release_sha256': site, 'base_platform_sha256': platform,
@@ -117,11 +154,46 @@ def exact_state(renewal, protocol, publication):
           'launch_root': str(store), 'role_launch_seconds': 100, 'hostname': 'erebus', 'platform': 'fedora-44',
           'selinux': 'enforcing', 'handoff': {}}))
     write(f'{START}/renewal-fence/selected-host.json', renewal.json_bytes({'schema': 1, 'artifact_sha256': artifact}), 0o644)
+    if original:
+        write(f'{START}/renewal-fence/owner.lock', b'', 0o644)
+        write(f'{START}/bootstrap/host-commissioning/intent.json', renewal.json_bytes({
+            'schema': 1, 'source_sha': revision, 'platform_sha256': platform, 'machine_id': '1' * 32}))
     return store
+
+
+def select_agent_attempt(renewal, protocol, publication, source):
+    control = Path(START) / 'renewal'
+    previous = renewal.read_json(control / 'site-current.json')
+    binding = renewal.read_json(control / 'platform-bindings' / (previous + '.json'))
+    base = binding['base_platform_sha256']
+    base_index = json.loads((Path(START) / 'platform-releases' / base / 'platform.json').read_bytes())
+    roles = ('maintenance', 'development')
+    publication_index = {**base_index, 'kind': 'dev-pair-agent-release', 'source_sha': source, 'publisher_run': 84,
+                         'previous_platform_sha256': base, 'base_platform_sha256': base,
+                         'components': {protocol.COMPONENT[role]: {**base_index['components'][protocol.COMPONENT[role]],
+                                                                 'source_sha': source} for role in roles},
+                         'transports': {role: {**base_index['transports'][role], 'name': f'platform-{role}-{source}'}
+                                        for role in roles}}
+    raw = publication.canonical(publication_index)
+    platform = publication.digest(raw)
+    receipt = publication.canonical({'schema': 2, 'platform_sha256': platform, 'source_sha': source,
+                                     'publisher_run': 84, 'kind': publication_index['kind']})
+    write(f'{START}/platform-releases/{platform}/platform.json', raw, 0o444)
+    write(f'{START}/platform-releases/{platform}/intake.json', receipt)
+    stable = renewal.read_json(control / 'releases' / (previous + '.json'))
+    raw = renewal.json_bytes({**stable, 'fixture_agent_source': source})
+    selected = publication.digest(raw)
+    write(control / 'releases' / (selected + '.json'), raw)
+    write(control / 'platform-bindings' / (selected + '.json'), renewal.json_bytes({**binding, 'release_sha256': selected,
+          'platform_sha256': platform, 'intake_sha256': publication.digest(receipt)}))
+    for name in ('current', 'site-current'):
+        write(control / (name + '.json'), renewal.json_bytes(selected))
+    return selected
 
 
 def projection(root):
     materialize_root(root)
+    match, initial_code, successor, renewed_code = reviewed_pair(root)
     os.chroot(root)
     os.chdir('/')
     sys.path.insert(0, str(INSTALL / 'tools'))
@@ -143,7 +215,8 @@ def projection(root):
     write('/etc/passwd', 'root:x:0:0:root:/root:/bin/sh\n', 0o644)
     write('/proc/sys/kernel/random/boot_id', BOOT + '\n')
     write('/proc/sys/kernel/hostname', 'erebus\n')
-    store = exact_state(renewal, protocol, publication)
+    store = exact_state(renewal, protocol, publication, match, initial_code, original=True)
+    Path(START).chmod(0o755)
     fixture = Path('/run/fixture')
     fixture.mkdir(mode=0o700, parents=True)
     release.EVIDENCE.mkdir(mode=0o700)
@@ -167,20 +240,55 @@ def projection(root):
     write(storage / 'promotion.json', renewal.json_bytes(saved))
     activation = {'version': 2, 'active': current, 'previous': None, 'pending': None, 'confirmed': None, 'route_pending': False}
     write(destination.ACTIVATION, renewal.json_bytes(activation))
+    ready = {'platform_sha': match, 'machine_id': '1' * 32, 'uid': 2200}
+    write(destination.PROVISION, renewal.json_bytes(ready))
+    write(destination.CONTROL + '/ready.json', renewal.json_bytes(ready))
+    write(destination.MANAGED_INTENT, renewal.json_bytes({'filesystem': 'fixture', 'reserve_inodes': 4096}))
+    old_site = renewal.read_json(Path(START) / 'renewal/site-current.json')
+    listener = {'version': 2, 'site': old_site, 'boot': BOOT, 'phase': 'ready', 'recovery_after': 1}
+    write(destination.MANAGED_LISTENER, renewal.json_bytes(listener))
 
     def run(*args, input_text=None, **kw):
+        if args == ('/usr/sbin/getenforce',):
+            return 'Enforcing\n'
         assert args[:3] == ('/usr/bin/ssh-keygen', '-Y', 'verify')
         return subprocess.run(args, input=input_text, text=True, capture_output=True, check=True,
                               timeout=kw['timeout']).stdout
 
-    class NativeDestinationProjection(destination.Destination):
+    class DestinationObservation:
         def __init__(self):
             super().__init__(run=run)
 
-        @contextmanager
-        def release_gate(self, *, require_cutover=True):
-            assert require_cutover
-            yield {'platform_sha': MATCH}, 2200, DNS
+        def account(self):
+            return 2200
+
+        def mount_observation(self, path, filesystem, *, max_inodes):
+            assert (path, filesystem) == (START, 'fixture') and max_inodes >= 4096
+
+        def physical_reserve(self, reserve):
+            assert reserve == 4096
+
+        def verify_managed_executor(self, site, uid):
+            assert self.runtime_selected_host(self.destination_identity()['boot_id'])[0] == site and uid == 2200
+
+        def manager_job(self, name):
+            assert name == destination.U_RECOVERY
+            return False, 'success'
+
+        def recovery_start(self):
+            return 2
+
+        def require_recovery_enabled(self):
+            return
+
+        def verify_workload_access(self):
+            return {'target': {'dns_name': DNS}}
+
+        def tailscale_state(self):
+            return None, DNS
+
+        def storage_ready(self, path, uid):
+            assert (path, uid) == (destination.LIVE, 2200)
 
         def verify_final_guard(self):
             return {'guard_sha256': guard, 'public_addresses': public, 'provider_recovery': provider}
@@ -195,11 +303,14 @@ def projection(root):
         def serve_config(self, dns):
             return dns == DNS
 
-    key = fixture / 'reviewer'
-    generated = subprocess.run(['/usr/bin/ssh-keygen', '-q', '-N', '', '-t', 'ed25519', '-f', str(key)],
+    class NativeDestinationProjection(DestinationObservation, destination.Destination):
+        pass
+
+    signing_key = fixture / 'reviewer'
+    generated = subprocess.run(['/usr/bin/ssh-keygen', '-q', '-N', '', '-t', 'ed25519', '-f', str(signing_key)],
                                input=b'', capture_output=True, timeout=10)
     assert generated.returncode == 0, generated.stderr.decode()
-    write(bootstrap.TRUST_SIGNERS, 'dev-pair-access-review namespaces="dev-pair-destination" ' + key.with_suffix('.pub').read_text())
+    write(bootstrap.TRUST_SIGNERS, 'dev-pair-access-review namespaces="dev-pair-destination" ' + signing_key.with_suffix('.pub').read_text())
     observed = NativeDestinationProjection()
     identity = observed.destination_identity()
     now = int(time.time())
@@ -208,7 +319,7 @@ def projection(root):
     probes = [{**dict(zip(('endpoint', 'vantage', 'outcome'), values)), 'test': action, 'family': family,
                'client_id': values[1] + '-fixture', 'observed_at': now - 40, 'evidence_sha256': '1' * 64}
               for (action, family), values in station.probe_plan(plan).items()]
-    proof = {'version': 1, **identity, 'source_sha': MATCH, 'release_source': source, 'image': image,
+    proof = {'version': 1, **identity, 'source_sha': match, 'release_source': source, 'image': image,
              'dns_name': DNS, 'guard_sha256': guard, 'job_id': JOB, 'publisher_run_id': 179, 'publisher_run_attempt': 3,
              'issued_at': now - 30, 'expires_at': now + 120,
              'item_id': 1, 'item_title_sha256': hashlib.sha256(ITEM.encode()).hexdigest(), 'probes': probes}
@@ -217,17 +328,17 @@ def projection(root):
     def signed(value):
         raw = station.encoding(value)
         write(receipt, raw)
-        signature = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-n', station.FINAL_NAMESPACE, '-f', str(key)],
+        signature = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-n', station.FINAL_NAMESPACE, '-f', str(signing_key)],
                                    input=raw, capture_output=True, check=True, timeout=10).stdout
         write(receipt.with_suffix('.json.sig'), signature)
         return station.access_envelope(raw, signature)
 
-    def run_import(data, expected):
-        with (patch.object(destination, 'Destination', NativeDestinationProjection),
-              patch.object(setup, 'Destination', NativeDestinationProjection),
+    def run_import(data, expected, processor=setup, target_module=destination, boundary=NativeDestinationProjection):
+        with (patch.object(target_module, 'Destination', boundary),
+              patch.object(processor, 'Destination', boundary),
               patch.object(sys, 'stdin', SimpleNamespace(buffer=io.BytesIO(data))),
               redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as error):
-            result = setup.main(['import-proof', JOB])
+            result = processor.main(['import-proof', JOB])
             assert result == expected, (result, error.getvalue())
             return error.getvalue()
 
@@ -301,12 +412,149 @@ def projection(root):
     assert not (INSTALL / '.git').exists() and (store / 'manifest.json').exists()
     print('Separately scoped standalone confirmation retains its legacy signed receipt contract.')
 
+    control = Path(START) / 'renewal'
+    fence = Path(START) / 'renewal-fence/owner.lock'
+    selection = [control / f'{name}.json' for name in ('current', 'site-current', 'host-selection', 'host-observed')]
+    selection.append(fence.with_name('selected-host.json'))
+    before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in selection}
+    historical = {Path(path): Path(path).read_bytes() for path in (destination.PROVISION, destination.CONTROL + '/ready.json')}
+    write(active_path, renewal.json_bytes(activation))
+    write(storage / 'promotion.json', renewal.json_bytes(saved))
+    assert not run_import(good, 0)
+    changed = exact_state(renewal, protocol, publication, successor, renewed_code)
+    assert changed != store and (changed / 'tools/destination_release.py').read_bytes() != original
+
+    class SelectedCommand(Exception):
+        pass
+
+    with patch.object(os, 'execve', side_effect=SelectedCommand) as shell:
+        try:
+            setup.main(['import-proof', JOB])
+        except SelectedCommand:
+            pass
+        else:
+            raise AssertionError('fixed ingress failed to launch signed changed host code')
+        assert shell.call_args.args[0] == '/usr/bin/python3'
+        assert shell.call_args.args[1] == ['/usr/bin/python3', '-EBs', str(changed / 'tools/promotion_setup.py'), 'import-proof', JOB]
+    launched = subprocess.run(['/usr/bin/python3', '-EBs', str(INSTALL / 'tools/destination_observation.py'), 'export-release', JOB],
+                              capture_output=True, text=True, timeout=15)
+    assert 'Selected host launched' in launched.stderr, launched.stderr
+    print('The fixed export command executed changed code from the selected immutable bundle.')
+
+    original_modules = {key: module for key, module in sys.modules.copy().items()
+                        if str(getattr(module, '__file__', '')).startswith(str(INSTALL) + '/')}
+    for key in original_modules:
+        del sys.modules[key]
+    sys.path.insert(0, str(changed / 'tools'))
+    try:
+        chosen_d = importlib.import_module('destination_release')
+        chosen_station = importlib.import_module('destination_observation')
+        chosen_setup = importlib.import_module('promotion_setup')
+        chosen_release = importlib.import_module('product_release')
+        chosen_bootstrap = importlib.import_module('bootstrap')
+        assert Path(chosen_d.__file__) == changed / 'tools/destination_release.py'
+
+        class SelectedDestination(DestinationObservation, chosen_d.Destination):
+            pass
+
+        chosen = SelectedDestination()
+
+        def export_current():
+            with patch.object(chosen_d, 'Destination', SelectedDestination):
+                return chosen_station.export_release(JOB)
+
+        def imported(data, expected):
+            return run_import(data, expected, chosen_setup, chosen_d, SelectedDestination)
+
+        def denied(action, expectation):
+            try:
+                action()
+            except (chosen_bootstrap.Blocked, ValueError) as error:
+                assert expectation in str(error), str(error)
+            else:
+                raise AssertionError('outdated or unsettled authority was accepted')
+
+        assert export_current()['source_sha'] == successor
+        assert 'differs from the selected host release' in imported(good, 2)
+        selected_live = object.__new__(chosen_release.Live)
+        selected_live.job, selected_live.destination = JOB, chosen
+        try:
+            selected_live.evidence()
+        except chosen_release.Wait as error:
+            assert error.reason == 'signed-destination-evidence-displaced'
+        else:
+            raise AssertionError('previous host proof remained eligible after renewal')
+
+        with fence.open('rb') as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            denied(export_current, 'frozen by renewal')
+        transition = control / 'transition.json'
+        write(transition, renewal.json_bytes('fixture-renewal'))
+        write(control / 'attempts/fixture-renewal/journal.json', renewal.json_bytes({'phase': 'rolling-back'}))
+        denied(export_current, 'frozen by renewal')
+        transition.unlink()
+        write(destination.MANAGED_LISTENER, renewal.json_bytes({**listener, 'phase': 'observe'}))
+        denied(export_current, 'completed managed listener')
+        write(destination.MANAGED_LISTENER, renewal.json_bytes(listener))
+        write(control / 'current.json', renewal.json_bytes(old_site))
+        denied(export_current, 'frozen by renewal')
+        write(control / 'current.json', (control / 'site-current.json').read_bytes())
+
+        reboot = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        host_observation = control / 'host-observed.json'
+        write('/proc/sys/kernel/random/boot_id', reboot + '\n')
+        denied(export_current, 'site or boot observation')
+        write(host_observation, renewal.json_bytes({**json.loads(host_observation.read_bytes()), 'boot_id': reboot}))
+        renewed = {**proof, 'source_sha': successor, 'boot_id': reboot}
+        assert export_current()['boot_id'] == reboot
+        assert not imported(signed(renewed), 0)
+        selected_live.confirm(chosen_setup.evidence_envelope(JOB))
+        assert chosen.initial_activation()['active']['promotion_job_id'] == JOB
+        assert all(path.read_bytes() == original for path, original in historical.items())
+
+        write(active_path, renewal.json_bytes(activation))
+        rejected = {key: value for key, value in renewed.items()
+                    if key not in {'item_id', 'item_title_sha256', 'probes'}}
+        rejected.update(failed_check='authorized-browser', observation_sha256='7' * 64)
+        signed({**rejected, 'publisher_run_attempt': 2})
+        denied(lambda: chosen.reject(str(receipt)), 'does not bind this first release')
+        signed(rejected)
+        with (patch.object(chosen, 'data_snapshot', return_value='8' * 64),
+              patch.object(chosen, 'quarantine', return_value={'quarantined': True})):
+            assert chosen.reject(str(receipt))['quarantined'] is True
+        assert chosen.initial_activation()['pending']['operation'] == 'reject'
+        print(f'Current selected host {successor} accepted signed release and failure evidence after renewal; retained provision {match}.')
+    finally:
+        sys.path.pop(0)
+        for key, module in list(sys.modules.items()):
+            if str(getattr(module, '__file__', '')).startswith(str(changed) + '/'):
+                del sys.modules[key]
+        sys.modules.update(original_modules)
+
+    write(active_path, renewal.json_bytes(activation))
+    for path, (raw, mode) in before.items():
+        write(path, raw, mode)
+    write(control / 'host-observed.json', renewal.json_bytes({**json.loads(before[control / 'host-observed.json'][0]), 'boot_id': reboot}))
+    with patch.object(destination, 'Destination', NativeDestinationProjection):
+        assert station.export_release(JOB)['source_sha'] == match
+    assert 'differs from the selected host release' in run_import(signed(renewed), 2)
+    assert not run_import(signed({**proof, 'boot_id': reboot}), 0)
+    live.confirm(setup.evidence_envelope(JOB))
+    assert all(path.read_bytes() == original for path, original in historical.items())
+    print('Current boot rollback selected the original signed source without rewriting provisioning history.')
+    agent_site = select_agent_attempt(renewal, protocol, publication, successor)
+    assert agent_site != old_site
+    with patch.object(destination, 'Destination', NativeDestinationProjection):
+        assert station.export_release(JOB)['source_sha'] == match
+    assert live.evidence() == setup.evidence_envelope(JOB)
+    print('An independently selected agent-only index retained the steady checklist proof source on the same boot.')
+
 
 class InstalledPromotionProof(unittest.TestCase):
     def test_fixed_installed_entry_without_git_and_job_publication_binding(self):
         program = Path('/usr/bin/python3')
         unshare = shutil.which('unshare')
-        if not unshare or not program.is_file() or not shutil.which('ssh-keygen') or not shutil.which('ldd'):
+        if not unshare or not program.is_file() or not all(shutil.which(name) for name in ('ssh-keygen', 'ldd', 'git')):
             self.skipTest('private Linux user/network namespace, stock Python or OpenSSH unavailable')
         with tempfile.TemporaryDirectory() as location:
             result = subprocess.run([unshare, '--user', '--map-root-user', '--net', '--', str(program), '-B',

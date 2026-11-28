@@ -12,7 +12,7 @@ import stat
 import subprocess
 import time
 
-from bootstrap import Blocked, Commands
+from bootstrap import Blocked, Bootstrap, Commands
 import checklist_candidate as candidate
 import checklist_proposal as proposal
 from checklist_review_gate import main_protection, policy_identity
@@ -260,11 +260,13 @@ class Live:
         from promotion_setup import installed_scratch
 
         with dispatch_gate():
+            if Bootstrap().destination_program_kind(Path(__file__).absolute()):
+                self.destination.current_proof_source({})
             self.protection(request)
             with installed_scratch():
                 stage(self.job, request, bundle)
                 args = candidate.as_role(proposal.DEVELOPER, product.PYTHON, '-EBs',
-                                         product.KIT / 'tools/checklist_proposal.py', self.job)
+                                         Path(__file__).absolute().with_name('checklist_proposal.py'), self.job)
                 try:
                     proposal.capture(args, self.end, timeout=112)
                 except proposal.CommandFailed as exc:
@@ -339,7 +341,14 @@ class Live:
         envelope = evidence_envelope(self.job)
         if os.path.lexists(envelope):
             candidate.protected_file(envelope, p.MAX_MESSAGE)
-            stored_proof(envelope)
+            raw, _ = stored_proof(envelope)
+            if self.destination.managed_proof_context():
+                proof = p.loads(raw)
+                with self.destination.release_gate() as (provision, _, _):
+                    current = {**self.destination.destination_identity(),
+                               'source_sha': self.destination.current_proof_source(provision)}
+                    if any(proof[key] != value for key, value in current.items()):
+                        raise Wait('signed-destination-evidence-displaced')
             return envelope
         path = EVIDENCE / (self.job + '.json')
         if not os.path.lexists(path) or not os.path.lexists(str(path) + '.sig'):
@@ -586,6 +595,7 @@ def main():
     os.umask(0o077)
     try:
         p.require(os.geteuid() == 0, 'installed protected product controller required')
+        Bootstrap().dispatch_destination_program(__file__, args.command, sys.argv[1:])
         if args.command == 'status':
             print(p.canonical(record(trusted_directory(product.job_path(args.job)))))
             return

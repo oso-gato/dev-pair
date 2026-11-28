@@ -896,46 +896,57 @@ class Destination(Bootstrap):
 
     @contextlib.contextmanager
     def release_gate(self, *, require_cutover=True):
-        with self.lock('checklist-release.lock'):
-            fence = protect(FENCE + '/owner.lock')
-            with fence.open('rb') as stream:
-                try:
-                    fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                except BlockingIOError as exc:
-                    raise Blocked('checklist release is frozen by renewal') from exc
-                require(not os.path.lexists(FENCE + '/frozen'), 'checklist release is frozen by renewal')
-                ready = self.record(CONTROL + '/ready.json')
-                require(ready == self.record(PROVISION) and ready['machine_id'] == self.destination_identity()['machine_id'],
-                        'checklist destination lacks same-machine protected provisioning')
-                uid = self.account()
-                require(uid == ready['uid'] and self.run('/usr/sbin/getenforce', timeout=10).strip() == 'Enforcing',
-                        'release requires the isolated checklist account and enforcing SELinux')
-                managed = self.record(MANAGED_INTENT)
-                self.mount_observation(ROOT, managed['filesystem'], max_inodes=MANAGED_INODES)
-                self.physical_reserve(managed['reserve_inodes'])
-                dns = None
-                if require_cutover:
-                    listener = self.record(MANAGED_LISTENER)
-                    site = self.record(RENEWAL + '/site-current.json')
-                    require(listener['version'] == 2 and listener['phase'] == 'ready' and listener['site'] == site,
-                            'production release requires current completed managed listener readback')
-                    self.verify_managed_executor(site, uid)
-                    recovery_running, recovery_result = self.manager_job(U_RECOVERY)
-                    same_boot = listener['boot'] == self.destination_identity()['boot_id']
-                    minimum_start = listener['recovery_after'] if same_boot else 0
-                    require(not recovery_running and recovery_result == 'success' and self.recovery_start() > minimum_start,
-                            'production release requires current boot renewal recovery')
-                    self.require_recovery_enabled()
-                    guard = self.verify_workload_access()
-                    _, dns = self.tailscale_state()
-                    require(guard['target']['dns_name'] == dns, 'checklist proxy differs from independently verified cutover')
-                    self.storage_ready(LIVE, uid)
-                else:
-                    self.guard_hash()
-                    self.run(SYSTEMCTL, 'is-active', 'dev-pair-bootstrap-guard.service', timeout=10)
-                    self.storage_ready(VALIDATION, uid)
-                    self.executor_ready(f'dev-pair-checklist-executor@{uid}.service', uid)
-                yield ready, uid, dns
+        with self.lock('checklist-release.lock'), self.destination_dispatch_gate():
+            ready = self.record(CONTROL + '/ready.json')
+            require(ready == self.record(PROVISION) and ready['machine_id'] == self.destination_identity()['machine_id'],
+                    'checklist destination lacks same-machine protected provisioning')
+            uid = self.account()
+            require(uid == ready['uid'] and self.run('/usr/sbin/getenforce', timeout=10).strip() == 'Enforcing',
+                    'release requires the isolated checklist account and enforcing SELinux')
+            managed = self.record(MANAGED_INTENT)
+            self.mount_observation(ROOT, managed['filesystem'], max_inodes=MANAGED_INODES)
+            self.physical_reserve(managed['reserve_inodes'])
+            dns = None
+            if require_cutover:
+                listener = self.record(MANAGED_LISTENER)
+                site = self.record(RENEWAL + '/site-current.json')
+                require(listener['version'] == 2 and listener['phase'] == 'ready' and
+                        type(listener['site']) is str and re.fullmatch(DIGEST, listener['site']) and
+                        (listener['site'] == site or self.managed_proof_context()),
+                        'production release requires current completed managed listener readback')
+                self.current_proof_source(ready)
+                self.verify_managed_executor(site, uid)
+                recovery_running, recovery_result = self.manager_job(U_RECOVERY)
+                same_boot = listener['boot'] == self.destination_identity()['boot_id']
+                minimum_start = listener['recovery_after'] if same_boot else 0
+                require(not recovery_running and recovery_result == 'success' and self.recovery_start() > minimum_start,
+                        'production release requires current boot renewal recovery')
+                self.require_recovery_enabled()
+                guard = self.verify_workload_access()
+                _, dns = self.tailscale_state()
+                require(guard['target']['dns_name'] == dns, 'checklist proxy differs from independently verified cutover')
+                self.storage_ready(LIVE, uid)
+            else:
+                self.guard_hash()
+                self.run(SYSTEMCTL, 'is-active', 'dev-pair-bootstrap-guard.service', timeout=10)
+                self.storage_ready(VALIDATION, uid)
+                self.executor_ready(f'dev-pair-checklist-executor@{uid}.service', uid)
+            yield ready, uid, dns
+
+    def managed_proof_context(self):
+        return (self.destination_program_kind(Path(__file__).absolute()) is not None or
+                os.path.lexists(self.path('/var/lib/dev-pair/bootstrap/host-commissioning/intent.json')))
+
+    def current_proof_source(self, provision):
+        """Use the guarded current host source while retaining the original provision record."""
+        script = Path(__file__).absolute().with_name('bootstrap.py')
+        install = self.path('/usr/libexec/dev-pair')
+        if self.destination_program_kind(script):
+            return self.installed_destination_source(None, script, install)
+        if self.managed_proof_context():
+            _, source, _, _ = self.selected_destination_host()
+            return self.destination_source(source)
+        return provision['platform_sha']
 
     def pull(self, uid, role, image, secret):
         auth = []
@@ -1325,12 +1336,18 @@ class Destination(Bootstrap):
             state = self.initial_activation()
             active = state['active']
             require(active and not active.get('quarantined') and not state['confirmed'] and not state['previous']
-                    and not state['pending'], 'rejection requires a first release awaiting external confirmation')
+                    and not state['pending'] and not state['route_pending'],
+                    'rejection requires a first release awaiting external confirmation')
+            scoped = {}
+            if active.get('promotion_job_id') is not None:
+                scoped = {'job_id': active['promotion_job_id'], 'publisher_run_id': active['run_id'],
+                          'publisher_run_attempt': active['run_attempt'], 'guard_sha256': self.verify_final_guard()['guard_sha256']}
             data = self.recent_destination_evidence(evidence, 'dev-pair-access-review',
-                                                    {'release_source', 'image', 'dns_name', 'failed_check', 'observation_sha256'},
+                                                    {'release_source', 'image', 'dns_name', 'failed_check', 'observation_sha256', *scoped},
                                                     lifetime=1800)
-            require(data['source_sha'] == setup['platform_sha'] and data['release_source'] == active['source_sha']
+            require(data['source_sha'] == self.current_proof_source(setup) and data['release_source'] == active['source_sha']
                     and data['image'] == active['subject'] and data['dns_name'] == dns
+                    and all(type(data[key]) is type(value) and data[key] == value for key, value in scoped.items())
                     and data['failed_check'] in ('authorized-browser', 'public-denial', 'unauthorized-denial',
                                                  'tailnet-loss', 'restart', 'reboot', 'clean-restore', 'remote-root')
                     and type(data['observation_sha256']) is str and re.fullmatch(DIGEST, data['observation_sha256']),
@@ -1383,7 +1400,7 @@ class Destination(Bootstrap):
             owner_job = release.get('promotion_job_id')
             require(not job_id or not owner_job or job_id == owner_job,
                     'settled destination rollout is owned by a different promotion job')
-            binding = {'source_sha': setup['platform_sha'], 'release_source': release['source_sha'],
+            binding = {'source_sha': self.current_proof_source(setup), 'release_source': release['source_sha'],
                        'image': release['subject'], 'dns_name': dns, 'guard_sha256': cutover['guard_sha256']}
             job_id = owner_job or job_id
             if job_id is not None:
@@ -1458,6 +1475,7 @@ def main():
     try:
         require(os.geteuid() == 0, 'use the authorized root destination controller')
         app = Destination()
+        app.dispatch_destination_program(__file__, args.stage, sys.argv[1:])
         if args.stage == 'managed-storage':
             result = app.managed_storage(args)
         elif args.stage == 'provision':

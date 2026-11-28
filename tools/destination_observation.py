@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from contextlib import contextmanager
 from contextlib import nullcontext
 import hashlib
 import http.client
@@ -314,13 +315,14 @@ def probe_plan(plan):
     return expected
 
 
-def export_release(job, *, confirmed_receipt=None):
+@contextmanager
+def release_observation(job, *, confirmed_receipt=None, destination=None):
     """Read the normal J/D records on the destination under D's release lock."""
     from destination_release import Destination
     from product_release import eligible_rollout, record, trusted_directory, product
 
     require(os.geteuid() == 0 and matches(JOB, job), 'use the admitted destination controller and exact job ID')
-    destination = Destination()
+    destination = destination or Destination()
     with destination.release_gate() as (setup, _, dns):
         promotion = record(trusted_directory(product.job_path(job)))
         activation = destination.initial_activation()
@@ -337,12 +339,18 @@ def export_release(job, *, confirmed_receipt=None):
                 'selected exact release is not awaiting independent destination checks')
         previous = activation['previous']
         cutover = destination.verify_final_guard()
-        return {'version': 1, 'kind': 'checklist-release', 'job_id': job, 'source_sha': setup['platform_sha'],
+        yield destination, {'version': 1, 'kind': 'checklist-release', 'job_id': job,
+                'source_sha': destination.current_proof_source(setup),
                 **destination.destination_identity(), 'dns_name': dns, 'provider_recovery': cutover['provider_recovery'],
                 'public_addresses': cutover['public_addresses'], 'guard_sha256': cutover['guard_sha256'],
                 'release_source': live['source_sha'], 'image': live['subject'], 'publisher_run_id': live['run_id'],
                 'publisher_run_attempt': live['run_attempt'],
                 'rollback_image': previous['subject'] if previous and previous.get('verified_destination') else None}
+
+
+def export_release(job, *, confirmed_receipt=None):
+    with release_observation(job, confirmed_receipt=confirmed_receipt) as (_, binding):
+        return binding
 
 
 def prepare_plan(binding, site, now, previous):
@@ -1086,6 +1094,7 @@ def main():
             print(install_release_site(*prepare_release_site(args)))
             return 0
         if args.stage == 'export-release':
+            Bootstrap().dispatch_destination_program(__file__, args.stage, sys.argv[1:])
             sys.stdout.buffer.write(encoding(export_release(args.job)))
             return 0
         if args.stage in ('bundle-access', 'bundle-release'):

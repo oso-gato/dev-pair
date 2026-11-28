@@ -19,7 +19,7 @@ import time
 from types import SimpleNamespace
 import warnings
 
-from bootstrap import Blocked, Commands
+from bootstrap import Blocked, Bootstrap, Commands
 import checklist_proposal as proposal
 import commission_host as commission
 from destination_release import Destination
@@ -38,7 +38,7 @@ EXTERNAL_ERRORS = (Blocked, OSError, ValueError, KeyError, TypeError, IndexError
 
 
 def installed():
-    return Path(__file__).absolute() == Path(commission.INSTALL) / 'tools/promotion_setup.py'
+    return Bootstrap().destination_program_kind(Path(__file__).absolute()) is not None
 
 
 def exact_node(path, uid, gid, mode, *, directory=False):
@@ -329,7 +329,11 @@ def installed_scratch():
 def execution():
     if installed():
         with lock('.custody.lock', shared=True):
-            commission.require_installed_workload(FEATURE)
+            if Bootstrap().destination_program_kind(Path(__file__).absolute()) == 'selected':
+                guard = commission.protected(Path(commission.INSTALL) / 'tools/commission_host.py', 0)
+                Commands()('/usr/bin/python3', '-IB', str(guard), 'guard', FEATURE, timeout=45)
+            else:
+                commission.require_installed_workload(FEATURE)
             yield
     else:
         yield
@@ -482,7 +486,7 @@ def proof_files(payload, signature):
 
 
 def import_evidence(job, stream):
-    from destination_observation import access_envelope, export_release, read_access_envelope
+    from destination_observation import access_envelope, read_access_envelope, release_observation
 
     payload, signature = read_access_envelope(stream)
     p.require(len(signature) <= 8192, 'destination signature exceeds its protected bound')
@@ -492,13 +496,14 @@ def import_evidence(job, stream):
     with release.job_lock(root):
         existing = p.loads(read_private(target, p.MAX_MESSAGE)) if os.path.lexists(target) else None
         replay = existing == envelope
-        binding = export_release(job, confirmed_receipt=p.sha256(payload) if replay else None)
-        if replay and release.record(root)['phase'] == 'confirmed':
-            return  # The current settled J/D records already bind these exact independently verified bytes.
-        with proof_files(payload, signature) as receipt:
-            Destination().release_proof(str(receipt), binding)
-        if not replay:
-            replace_json(target, envelope)
+        with release_observation(job, confirmed_receipt=p.sha256(payload) if replay else None,
+                                 destination=Destination()) as (destination, binding):
+            if replay and release.record(root)['phase'] == 'confirmed':
+                return  # The current settled J/D records already bind these exact independently verified bytes.
+            with proof_files(payload, signature) as receipt:
+                destination.release_proof(str(receipt), binding)
+            if not replay:
+                replace_json(target, envelope)
 
 
 def stored_proof(path):
@@ -525,11 +530,13 @@ def main(argv=None):
     actions.add_parser('enroll', help='attended setup with independently approved scoped inputs')
     actions.add_parser('withdraw', help='remove enrolled local credentials and hold future promotions')
     actions.add_parser('import-proof', help='accept the bounded, independently signed proof envelope from standard input').add_argument('job')
+    argv = sys.argv[1:] if argv is None else argv
     args = parser.parse_args(argv)
     os.umask(0o077)
     try:
         p.require(installed() and os.getuid() == os.geteuid() == 0, 'use the exact installed root promotion command')
         commission.protected(Path(__file__).absolute(), 0)
+        Bootstrap().dispatch_destination_program(__file__, args.operation, argv)
         if args.operation == 'enroll':
             return 0 if attended() else 3
         if args.operation == 'withdraw':

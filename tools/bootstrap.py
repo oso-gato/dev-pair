@@ -1318,8 +1318,7 @@ class Bootstrap:
             raise Blocked('exact independently admitted full source SHA required')
         script = Path(__file__).absolute()
         install = self.path('/usr/libexec/dev-pair')
-        if checkout is None and (script.parent == install / 'tools' or
-                                 script.parent.parent.parent == install / 'host-releases'):
+        if checkout is None and self.destination_program_kind(script):
             try:
                 return self.installed_destination_source(expected, script, install)
             except (OSError, ValueError, KeyError, TypeError) as error:
@@ -1430,20 +1429,54 @@ class Bootstrap:
                 raise Blocked('the protected signer trust file would exceed its bound')
             self.atomic(TRUST_SIGNERS, updated, mode=stat.S_IMODE(path.lstat().st_mode), expected=raw)
 
-    def installed_destination_source(self, expected, script, install):
+    def destination_program_kind(self, path):
+        install = self.path('/usr/libexec/dev-pair')
+        if path.parent == install / 'tools':
+            return 'fixed'
+        if (path.parent.name == 'tools' and path.parent.parent.parent == install / 'host-releases'
+                and re.fullmatch(r'[0-9a-f]{64}', path.parent.parent.name)):
+            return 'selected'
+        return None
+
+    @contextlib.contextmanager
+    def destination_dispatch_gate(self):
+        path = self.path('/var/lib/dev-pair/renewal-fence/owner.lock')
+        self.runtime_protected_file(path)
+        with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), 'rb') as stream:
+            node = os.fstat(stream.fileno())
+            if (node.st_uid != 0 or node.st_nlink != 1 or stat.S_IMODE(node.st_mode) != 0o644 or
+                    not stat.S_ISREG(node.st_mode)):
+                raise Blocked('checklist release lacks its protected host effect lock')
+            try:
+                fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise Blocked('checklist release is frozen by renewal') from error
+            current = path.lstat()
+            if (node.st_dev, node.st_ino) != (current.st_dev, current.st_ino):
+                raise Blocked('checklist release host effect lock changed')
+            if os.path.lexists(path.with_name('frozen')):
+                raise Blocked('checklist release is frozen by renewal')
+            yield
+
+    def selected_destination_host(self):
+        """Resolve settled, locally admitted current host authority under the shared effect fence."""
         import platform_release_install as platform_release
-        from systemd_service_profile import protected
+        import renewal
 
         boot = self.destination_identity()['boot_id']
         site, host, _ = self.runtime_selected_host(boot)
+        controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
+        _, transition = controller.transition()
+        if ((transition is not None and transition['phase'] not in renewal.TERMINAL)
+                or self.runtime_record('/var/lib/dev-pair/renewal/current.json') != site):
+            raise Blocked('checklist release is frozen by renewal')
         binding = self.runtime_record('/var/lib/dev-pair/renewal/platform-bindings/' + site + '.json')
         base = binding['base_platform_sha256']
         selected = binding['platform_sha256']
         if (set(binding) != {'schema', 'release_sha256', 'platform_sha256', 'base_platform_sha256', 'site_config_sha256',
                              'plan_sha256', 'intake_sha256'}
                 or type(binding['schema']) is not int or binding['schema'] != 1 or binding['release_sha256'] != site
-                or any(type(value) is not str or not re.fullmatch(r'[0-9a-f]{64}', value) for value in (base, selected))
-                or host['source_revision'] != expected):
+                or any(type(value) is not str or not re.fullmatch(r'[0-9a-f]{64}', value) for value in (base, selected))):
             raise Blocked('installed destination source differs from the selected host release')
         _, selected_index, intake = platform_release.intake.retained_index(selected)
         if (binding['intake_sha256'] != intake or (selected_index['base_platform_sha256'] or selected) != base):
@@ -1451,20 +1484,68 @@ class Bootstrap:
         initial = selected_index if selected == base else platform_release.intake.retained_index(base)[1]
         component = initial['components']['host']
         if (initial['source_sha'], component['source_sha'], component['bundle_manifest_sha256']) != (
-                expected, expected, host['artifact_sha256']):
+                host['source_revision'], host['source_revision'], host['artifact_sha256']):
             raise Blocked('installed destination source differs from independently admitted portable host code')
-        store = install / 'host-releases' / host['artifact_sha256']
-        if script not in (install / 'tools/bootstrap.py', store / 'tools/bootstrap.py'):
-            raise Blocked('installed destination verifier is outside the selected host release')
+        store = self.path('/usr/libexec/dev-pair/host-releases') / host['artifact_sha256']
         platform_release.check_host_bundle(store, component, time.monotonic() + 15)
         manifest, _ = platform_release.protected_json(store / 'manifest.json', host['artifact_sha256'])
+        if self.runtime_selected_host(boot)[:2] != (site, host):
+            raise Blocked('destination host selection changed during source verification')
+        return site, host['source_revision'], store, manifest
+
+    def installed_destination_source(self, expected, script, install):
+        from systemd_service_profile import protected
+
+        _, source, store, manifest = self.selected_destination_host()
+        if expected is not None and source != expected:
+            raise Blocked('installed destination source differs from the selected host release')
+        if script not in (install / 'tools/bootstrap.py', store / 'tools/bootstrap.py'):
+            raise Blocked('installed destination verifier is outside the selected host release')
         for name in ('bootstrap.py', 'destination_release.py'):
             raw = protected(script.with_name(name), 0, 4 * 1024**2)
             if manifest['files'].get('tools/' + name) != hashlib.sha256(raw).hexdigest():
                 raise Blocked('installed destination verifier differs from the selected signed host bundle')
-        if self.runtime_selected_host(boot)[:2] != (site, host):
-            raise Blocked('destination host selection changed during source verification')
-        return expected
+        return source
+
+    def dispatch_destination_program(self, script, operation, argv):
+        """An immutable commissioning entry can hand fixed operations to the selected host bundle."""
+        program = Path(script).absolute()
+        operations = {'destination_observation.py': ('export-release',),
+                      'destination_release.py': ('deploy', 'confirm', 'reject', 'rollback'),
+                      'promotion_setup.py': ('enroll', 'import-proof'), 'product_release.py': ('advance', 'scan')}
+        if self.destination_program_kind(program) != 'fixed' or operation not in operations.get(program.name, ()):
+            return
+        import platform_release_install as platform_release
+        from systemd_service_profile import protected
+
+        if os.getuid() != 0 or os.geteuid() != 0:
+            raise Blocked('checklist dispatch requires the protected installed root entry')
+        with self.destination_dispatch_gate():
+            _, _, store, selected = self.selected_destination_host()
+            intent = self.runtime_record('/var/lib/dev-pair/bootstrap/host-commissioning/intent.json')
+            if type(intent['schema']) is not int or intent['schema'] != 1 or intent['machine_id'] != self.destination_identity()['machine_id']:
+                raise Blocked('fixed checklist ingress lacks its same-machine commissioning authority')
+            if not re.fullmatch(r'[0-9a-f]{64}', intent['platform_sha256']):
+                raise Blocked('fixed checklist ingress lacks its exact installed package')
+            _, platform, _ = platform_release.intake.retained_index(intent['platform_sha256'])
+            fixed = platform['components']['host']
+            if fixed['source_sha'] != intent['source_sha']:
+                raise Blocked('fixed checklist ingress differs from its commissioned source')
+            original = store.parent / fixed['bundle_manifest_sha256']
+            manifest, _ = platform_release.protected_json(original / 'manifest.json', original.name)
+            if manifest['source_revision'] != intent['source_sha']:
+                raise Blocked('fixed checklist ingress manifest changes the approved commissioning source')
+            for name in ('bootstrap.py', program.name):
+                if hashlib.sha256(protected(program.with_name(name), 0, 4 << 20)).hexdigest() != manifest['files'].get('tools/' + name):
+                    raise Blocked('fixed checklist ingress differs from its commissioned signed bundle')
+            if original == store:
+                return
+            relative = 'tools/' + program.name
+            target = store / relative
+            if hashlib.sha256(protected(target, 0, 4 << 20, mode=0o444)).hexdigest() != selected['files'].get(relative):
+                raise Blocked('selected checklist entry is missing or differs from its signed bundle')
+        python = '/usr/bin/python3'
+        os.execve(python, [python, '-EBs', str(target), *argv], {'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C.UTF-8'})
 
     def signed_evidence(self, path, principal, namespace):
         if not path:
