@@ -15,7 +15,9 @@ import time
 import uuid
 
 INSTALL = Path('/usr/libexec/dev-pair')
-sys.path.insert(0, str(INSTALL / 'tools'))
+BUNDLE = Path(__file__).absolute().parents[2]
+source = BUNDLE if BUNDLE.parent == INSTALL / 'host-releases' and re.fullmatch('[0-9a-f]{64}', BUNDLE.name) else INSTALL
+sys.path.insert(0, str(source / 'tools'))
 import gptbox_runtime as gptbox
 import renewal as r
 from renewal import protocol as p
@@ -212,25 +214,41 @@ def release_action(action, payload):
         bootstrap = Bootstrap()
         forward_agent = (payload['scope'] == 'agent' and os.path.lexists(CONTROL / 'platform-bindings' / (reference + '.json'))
                          and not bootstrap.own_workload_rollback(reference))
+        stable = payload['scope'] == 'stable'
+        forward_stable = stable and not bootstrap.own_workload_rollback(reference)
         if forward_agent:
             CandidateAccess(r.Renewal(ROOT, None), bootstrap).accept(reference, operation)
+        if forward_stable:
+            from destination_observation import STABLE_CANDIDATE
+
+            CandidateAccess(r.Renewal(ROOT, None), bootstrap, kind=STABLE_CANDIDATE).accept(reference, operation)
         bootstrap.hold_changed_workload_access(reference)
-        try:
-            observe_host(reference, release['components']['host'])
-        except (OSError, ValueError, subprocess.SubprocessError):
+        if stable:
+            from stable_renewal import host_bundle, verify_transition
+
             controller = r.Renewal(ROOT, None)
-            _, journal = controller.transition()
-            r.require(payload['scope'] == 'host' or (journal is not None and journal['phase'] == 'rolling-back' and
-                      journal['request']['operation'] == operation and journal['request']['previous_sha256'] == reference and
-                      controller.release(journal['request']['target_sha256'])['components']['host'] ==
-                      release['components']['host']), 'host change outside approved scope')
-            r.replace_json(CONTROL / 'host-desired.json', {'operation': operation, 'release_sha256': reference,
-                                                            'component': release['components']['host']})
-            unit('start', 'dev-pair-managed-host-release.service', timeout=105)
+            desired = {'operation': operation, 'release_sha256': reference, 'component': release['components']['host']}
+            approval = verify_transition(controller, desired)
+            bundle = host_bundle(controller, approval)
+            r.replace_json(CONTROL / 'host-desired.json', desired)
+            run([PYTHON, '-IB', str(bundle / 'runtime/renewal/host-release'), 'apply'], timeout=330)
+        else:
+            try:
+                observe_host(reference, release['components']['host'])
+            except (OSError, ValueError, subprocess.SubprocessError):
+                controller = r.Renewal(ROOT, None)
+                _, journal = controller.transition()
+                r.require(payload['scope'] == 'host' or (journal is not None and journal['phase'] == 'rolling-back' and
+                          journal['request']['operation'] == operation and journal['request']['previous_sha256'] == reference and
+                          controller.release(journal['request']['target_sha256'])['components']['host'] ==
+                          release['components']['host']), 'host change outside approved scope')
+                r.replace_json(CONTROL / 'host-desired.json', {'operation': operation, 'release_sha256': reference,
+                                                                'component': release['components']['host']})
+                unit('start', 'dev-pair-managed-host-release.service', timeout=105)
         observe_host(reference, release['components']['host'])
         r.replace_json(selector, reference)
         bootstrap.restore_retained_workload_gate(reference)
-        if forward_agent:
+        if forward_agent or forward_stable:
             p.require_workload_access(ROOT, release=reference)
     if action == 'quiesce':
         owned = sorted((CONTROL / 'owned-turns').iterdir())
@@ -666,7 +684,7 @@ def private_devbox_probe(manifest_path, admission):
             os.fsync(parent)
 
 
-def access_probe(payload, *, candidate=False, peer_reader=None, challenge=None):
+def access_probe(payload, *, candidate=False, stable=False, peer_reader=None, challenge=None):
     from bootstrap import Bootstrap
     from renewal_site import CandidateAccess
 
@@ -685,7 +703,12 @@ def access_probe(payload, *, candidate=False, peer_reader=None, challenge=None):
     controller = r.Renewal(ROOT, None)
     with controller.lock():
         if candidate:
-            pending = CandidateAccess(controller, host).request(payload['candidate'])
+            if stable:
+                from destination_observation import STABLE_CANDIDATE
+                observer = CandidateAccess(controller, host, kind=STABLE_CANDIDATE)
+            else:
+                observer = CandidateAccess(controller, host)
+            pending = observer.request(payload['candidate'])
             r.require(pending['source_sha'] == source and all(pending[key] == val for key, val in identity.items()),
                       'named route differs from the pending candidate observation')
             selection = pending['role_artifacts']
@@ -694,7 +717,13 @@ def access_probe(payload, *, candidate=False, peer_reader=None, challenge=None):
         else:
             selection = host.access_workload_selection()
         release, plan = admit_release(selection['release_sha256'])
-        bundle, _ = live_host(release['components']['host'])
+        if stable:
+            from stable_renewal import for_release, host_bundle
+
+            live_host(controller.release(controller.live_release())['components']['host'])
+            bundle = host_bundle(controller, for_release(controller, selection['release_sha256']))
+        else:
+            bundle, _ = live_host(release['components']['host'])
         if role == 'maintenance':
             context = plan['maintenance_context_sha256']
             imported = retained_maintenance(controller, release['components']['maintenance-agent'], context)
@@ -727,7 +756,7 @@ def access_probe(payload, *, candidate=False, peer_reader=None, challenge=None):
                   host.destination_identity() == identity and read_peer() == peer,
                   'live named route or probe changed before observation completed')
         if candidate:
-            r.require(CandidateAccess(controller, host).request(payload['candidate']) == pending,
+            r.require(observer.request(payload['candidate']) == pending,
                       'candidate access binding changed during the confined role probe')
     evidence = {'role': role, 'source_sha': source, **identity, 'address': peer['local'],
                 'role_artifacts': selection, 'probe_cycles': cycles, 'job_admission': False}
@@ -1005,6 +1034,8 @@ def main():
             result = access_probe(payload)
         elif action == 'candidate-access-probe':
             result = access_probe(payload, candidate=True)
+        elif action == 'stable-access-probe':
+            result = access_probe(payload, candidate=True, stable=True)
         else:
             r.require(action in ('validate', 'observe', 'activate', 'quiesce'), 'unsupported renewal action')
             result = release_action(action, payload)

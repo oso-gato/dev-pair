@@ -477,7 +477,7 @@ def retirement_scope(controller, catalog, expected_previous, base, end):
     if journal is not None and journal['phase'] in ('rejected', 'rolled-back'):
         request = journal['request']
         settled = renewal.checked_request(request, request['scope'])
-    for scope in ('initial', 'agent'):
+    for scope in ('initial', 'agent', 'stable'):
         path = controller.control / 'offers' / (scope + '.json')
         if os.path.lexists(path):
             offer = offer_record(renewal.read_json(path), scope)
@@ -493,7 +493,7 @@ def retirement_scope(controller, catalog, expected_previous, base, end):
         path = controller.control / 'requests' / (scope + '.json')
         if os.path.lexists(path):
             raw = renewal.read_json(path)
-            request = renewal.checked_request(raw['request'] if scope == 'agent' else raw, scope)
+            request = renewal.checked_request(raw['request'] if scope in ('agent', 'stable') else raw, scope)
             keep.add(bound_local_platform(controller, request['previous_sha256'], catalog))
             if request != settled:
                 keep.add(bound_local_platform(controller, request['target_sha256'], catalog))
@@ -681,6 +681,19 @@ def acquire_initial(source, end):
         verify_local_parts(directory, index, end)
         return release.readonly_json(protected(directory / 'intake.json'), 0)[1]
 
+    source, run, identity = discover_full(source, None, end)
+    unselected_site()
+    return acquire(source, run, identity, None, end)
+
+
+def discover_full(source, previous, end):
+    """Select only protected full publications for the requested signed predecessor."""
+    if source is None:
+        branch = read_api('branches/main', end)
+        require(branch.get('protected') is True, 'stable release discovery requires protected main')
+        source = hex_id(branch['commit']['sha'], 40)
+    if previous is not None:
+        hex_id(previous)
     require(Path(GITHUB).is_file() and protected(TRUST).is_file(), 'protected read-only release tooling unavailable')
     intake_limit(ROOT, [META_LIMIT, 2 * CONTROL_LIMIT], ZIP_OVERHEAD)
     selected = None
@@ -703,7 +716,7 @@ def acquire_initial(source, end):
             portable_index(index, source, run)
             require(raw == canonical(index) and index['kind'] == 'dev-pair-platform-release',
                     'protected push did not publish a canonical full platform subject')
-            if index['previous_platform_sha256'] is not None:
+            if index['previous_platform_sha256'] != previous:
                 continue
             identity = hashlib.sha256(raw).hexdigest()
             for role in (*ROLES, 'host'):
@@ -712,16 +725,18 @@ def acquire_initial(source, end):
             if selected is None:
                 selected = run, identity, payloads
             else:
-                require(selected[2] == payloads, 'protected initial full publications disagree on deployed artifact identities')
+                require(selected[2] == payloads, 'protected full publications disagree on deployed artifact identities')
     if selected is None:
+        if previous is not None:
+            raise InitialReleaseUnavailable('stable-full-release-selection',
+                                            'no complete unexpired full publication binds the retained stable predecessor')
         if missing_assets:
             raise InitialReleaseUnavailable('initial-release-artifacts-expired',
                                             'no eligible initial full publication has a complete unexpired artifact set')
         raise InitialReleaseUnavailable('initial-full-release-selection',
                                         'no successful initial full publication exists for the exact reviewed source')
     run, identity, _ = selected
-    unselected_site()
-    return acquire(source, run, identity, None, end)
+    return source, run, identity
 
 
 def acquire(source, run, expected, previous, end, *, agent=False):
@@ -761,6 +776,9 @@ def acquire(source, run, expected, previous, end, *, agent=False):
             verify_subject(stage / 'platform.json', expected, source, run, role, end)
         if previous is not None:
             prior = previous_release(previous, end)
+            if not agent:
+                require(prior['kind'] == 'dev-pair-platform-release' and prior['schema'] == 2,
+                        'full stable publication requires a verified full predecessor')
             if agent:
                 base = prior['base_platform_sha256'] or previous
                 require(value['base_platform_sha256'] == base, 'agent refresh changes the retained host and DevBox base')

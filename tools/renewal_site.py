@@ -77,7 +77,7 @@ def closed_site(raw):
 def offer_record(value, scope):
     p.fields(value, 'schema scope operation platform_sha256 previous_release_sha256 site_config_sha256 affected_jobs reason')
     p.number(value['schema'], 2, 2)
-    r.require(value['scope'] == scope and scope in ('initial', 'agent'), 'unsupported portable site selection')
+    r.require(value['scope'] == scope and scope in ('initial', 'agent', 'stable'), 'unsupported portable site selection')
     p.token(value['operation'])
     p.digest(value['platform_sha256'])
     p.digest(value['site_config_sha256'])
@@ -362,10 +362,20 @@ class Resolver:
         r.require(set(offer['affected_jobs']) <= set(site['jobs']), 'site update names a foreign product job')
         directory, index, intake_sha = self.index(platform)
         predecessor, previous = None, None
+        stable_admission = None
         if scope == 'initial':
             r.require(index['kind'] == FULL and index['previous_platform_sha256'] is None and
                       not os.path.lexists(self.control / 'current.json') and not os.path.lexists(self.control / 'site-current.json'),
                       'initial site selection requires a fresh full portable release')
+            base_sha, stable = platform, index
+        elif scope == 'stable':
+            import stable_renewal
+
+            prior = stable_renewal.settled(self, site_hash)
+            r.require(offer['previous_release_sha256'] == prior['release_sha256']
+                      and offer['affected_jobs'] == sorted(site['jobs']),
+                      'stable offer does not cover the exact live predecessor and all affected jobs')
+            stable_admission = prior, stable_renewal.validate_successor(self, prior, index, platform, site)
             base_sha, stable = platform, index
         else:
             r.require(index['kind'] == AGENT, 'agent site selection requires a distinct portable agent package')
@@ -423,6 +433,8 @@ class Resolver:
         binding = {'schema': 1, 'release_sha256': reference, 'platform_sha256': platform, 'base_platform_sha256': base_sha,
                    'site_config_sha256': site_hash, 'plan_sha256': selection['plan_sha256'], 'intake_sha256': intake_sha}
         self.store(self.control / 'platform-bindings' / (reference + '.json'), binding)
+        if stable_admission is not None:
+            stable_renewal.store(self, offer, binding, *stable_admission)
         # The observation can refresh on another boot. It cannot change the immutable selection binding.
         observation = {'schema': 1, **binding, 'boot_id': boot, 'installed_sha256': r.sha(receipt)}
         r.replace_json(self.control / 'platform-observations' / (reference + '.json'), observation)
@@ -444,12 +456,17 @@ def role_artifacts(controller, reference):
 
 
 class CandidateAccess:
-    """Exchange independent access evidence for one staged exact agent placement."""
+    """Exchange independent access evidence for one staged exact placement."""
 
-    def __init__(self, controller, host):
+    def __init__(self, controller, host, *, kind=None):
+        from destination_observation import AGENT_CANDIDATE, STABLE_CANDIDATE
+
         self.controller, self.host = controller, host
         self.control = controller.control
-        self.pending = self.control / 'agent-observation-pending.json'
+        self.kind = AGENT_CANDIDATE if kind is None else kind
+        r.require(self.kind in (AGENT_CANDIDATE, STABLE_CANDIDATE), 'unknown prospective placement authority')
+        self.scope = 'stable' if self.kind == STABLE_CANDIDATE else 'agent'
+        self.pending = self.control / (self.scope + '-observation-pending.json')
 
     def selection(self, reference, previous, operation):
         r.digest(reference)
@@ -458,6 +475,14 @@ class CandidateAccess:
         target = self.controller.release(reference)
         retained = self.controller.release(previous)
         changed = {key for key in r.COMPONENTS if target['components'][key] != retained['components'][key]}
+        if self.scope == 'stable':
+            from stable_renewal import for_release
+
+            approval = for_release(self.controller, reference)
+            r.require(changed == r.COMPONENTS and target['config_sha256'] == retained['config_sha256'] and
+                      approval['previous_release_sha256'] == previous and approval['operation'] == operation,
+                      'prospective stable observation differs from the authorized complete successor')
+            return r.read_json(self.control / 'platform-bindings' / (reference + '.json'))
         r.require(changed and changed <= r.SCOPE_COMPONENTS['agent'] and
                   target['config_sha256'] == retained['config_sha256'],
                   'prospective observation requires an agent-only replacement')
@@ -472,7 +497,7 @@ class CandidateAccess:
         return binding
 
     def binding(self, reference, previous, operation, requested_at):
-        from destination_observation import AGENT_CANDIDATE, validate_candidate
+        from destination_observation import validate_candidate
 
         binding = self.selection(reference, previous, operation)
         identity = self.host.destination_identity()
@@ -496,8 +521,8 @@ class CandidateAccess:
                      'operation': operation, 'guard_sha256': guard['guard_sha256'], 'requested_at': requested_at,
                      'acl_sha256': guard['acl_sha256'],
                      'host_artifact_sha256': self.controller.release(reference)['components']['host']['artifact_sha256']}
-        validate_candidate(candidate)
-        return {'version': 1, 'kind': AGENT_CANDIDATE, 'job_id': 'host-access',
+        validate_candidate(candidate, kind=self.kind)
+        return {'version': 1, 'kind': self.kind, 'job_id': 'host-access',
                 'source_sha': guard['target']['source_sha'], **identity, 'dns_name': dns,
                 'tailnet': tailnet, 'node_id': node, 'tailnet_addresses': self.host.access_addresses(live),
                 'keys_sha256': keys_sha, 'role_artifacts': role_artifacts(self.controller, reference),
@@ -530,11 +555,12 @@ class CandidateAccess:
 
     def proof_path(self, reference):
         r.digest(reference)
-        return self.control / 'platform-observations' / (reference + '.access.json')
+        suffix = '.stable-access.json' if self.scope == 'stable' else '.access.json'
+        return self.control / 'platform-observations' / (reference + suffix)
 
     def verify(self, envelope, reference, guard, *, expected=None, checked_at=None):
         from bootstrap import TRUST_SIGNERS, checked_file
-        from destination_observation import (ACCESS, AGENT_CANDIDATE, CORE_BINDING, FINAL_NAMESPACE,
+        from destination_observation import (ACCESS, CORE_BINDING, FINAL_NAMESPACE,
                                              checked_candidate_readings, encoding, read_access_envelope,
                                              validate_candidate, verify_agent_observer, verify_bytes)
 
@@ -543,17 +569,19 @@ class CandidateAccess:
         data, proof_sha = verify_bytes(payload, signature, 'dev-pair-access-review', signers, FINAL_NAMESPACE)
         r.require(type(data) is dict, 'signed candidate observation must contain a protected JSON object')
         automatic = data.get('observation') == 'named-candidate-challenges'
+        r.require(self.scope == 'agent' or not automatic,
+                  'the scheduled collector cannot authorize a stable maintenance window')
         p.fields(data, 'version kind machine_id boot_id dns_name source_sha tailnet_addresses role_artifacts candidate '
                  'issued_at expires_at probes provider_recovery public_addresses ' + ' '.join(sorted(ACCESS)) +
                  (' observation collector_signature policy_measurement' if automatic else ''))
         p.number(data['version'], 1, 1)
         scope = data['candidate']
-        validate_candidate(scope)
+        validate_candidate(scope, kind=self.kind)
         binding = self.selection(reference, scope['previous_release_sha256'], scope['operation'])
         identity = self.host.destination_identity()
         live, dns = self.host.tailscale_state()
         tailnet, node = self.host.identity_fields(live)
-        r.require(data['kind'] == AGENT_CANDIDATE and data['machine_id'] == identity['machine_id'] and
+        r.require(data['kind'] == self.kind and data['machine_id'] == identity['machine_id'] and
                   data['source_sha'] == guard['target']['source_sha'] and data['dns_name'] == dns and
                   (data['tailnet'], data['node_id']) == (tailnet, node) and
                   data['tailnet_addresses'] == self.host.access_addresses(live) and
@@ -624,18 +652,21 @@ class CandidateAccess:
         from bootstrap import SIGNER_TRUST_LOCK
 
         attempt, state = self.controller.transition()
-        r.require(state is not None and state['phase'] == 'applying' and state['request']['scope'] == 'agent' and
+        r.require(state is not None and state['phase'] == 'applying' and state['request']['scope'] == self.scope and
                   state['request']['target_sha256'] == reference and state['request']['operation'] == operation and
                   r.read_json(self.controller.root / 'renewal-fence/frozen') == attempt.name,
                   'candidate admission requires the exact fenced activation')
         previous = state['request']['previous_sha256']
-        r.require(self.controller.live_release() == previous == r.read_json(self.control / 'site-current.json'),
-                  'candidate activation changed its retained predecessor')
         guard = self.host.verify_final_guard()
         self.host.verify_final_ssh()
         now = int(time.time())
         with self.host.lock(SIGNER_TRUST_LOCK):
-            proof = self.fresh(reference, previous, operation, guard=guard, checked_at=now)
+            approved = r.read_json(self.proof_path(reference)) if self.scope == 'stable' else None
+            stamp = approved['accepted_at'] if approved and approved['accepted_at'] is not None else now
+            actual = {self.controller.live_release(), r.read_json(self.control / 'site-current.json')}
+            allowed = {previous, reference} if approved and approved['accepted_at'] is not None else {previous}
+            r.require(actual <= allowed, 'candidate activation changed its retained predecessor')
+            proof = self.fresh(reference, previous, operation, guard=guard, checked_at=stamp)
             if proof['accepted_at'] is None:
                 r.replace_json(self.proof_path(reference), {**proof, 'accepted_at': now})
 

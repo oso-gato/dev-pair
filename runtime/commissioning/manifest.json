@@ -102,6 +102,7 @@
     {"source": "tools/selected_payload.py", "target": "/usr/libexec/dev-pair/tools/selected_payload.py", "mode": "0644", "feature": "base"},
     {"source": "tools/selinux_bootstrap.py", "target": "/usr/libexec/dev-pair/tools/selinux_bootstrap.py", "mode": "0644", "feature": "base"},
     {"source": "tools/session_controller.py", "target": "/usr/libexec/dev-pair/tools/session_controller.py", "mode": "0644", "feature": "base"},
+    {"source": "tools/stable_renewal.py", "target": "/usr/libexec/dev-pair/tools/stable_renewal.py", "mode": "0644", "feature": "base"},
     {"source": "tools/startup_delivery.py", "target": "/usr/libexec/dev-pair/tools/startup_delivery.py", "mode": "0644", "feature": "base"},
     {"source": "tools/storage.py", "target": "/usr/libexec/dev-pair/tools/storage.py", "mode": "0644", "feature": "base"},
     {"source": "tools/storage_measure.py", "target": "/usr/libexec/dev-pair/tools/storage_measure.py", "mode": "0644", "feature": "base"},

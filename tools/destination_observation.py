@@ -69,6 +69,8 @@ BINDING_RELEASE = RELEASE - SITE_RELEASE
 CORE_BINDING = (BINDING - {'provider_recovery', 'public_addresses'}) | {'node_id', 'tailnet', 'keys_sha256', 'tailnet_addresses'}
 CORE_SITE = SITE | {'tailnet', 'acl_sha256', 'execution_route'}
 AGENT_CANDIDATE = 'agent-workload-candidate'
+STABLE_CANDIDATE = 'stable-workload-candidate'
+CANDIDATE_KINDS = {AGENT_CANDIDATE, STABLE_CANDIDATE}
 AGENT_ROLES = ('maintenance', 'development')
 AGENT_SITE_FIELDS = {'version', 'source_sha', 'machine_id', 'dns_name', 'tailnet', 'node_id', 'tailnet_addresses',
                      'keys_sha256', 'guard_sha256', 'acl_sha256', 'host_artifact_sha256', 'devbox_image',
@@ -77,7 +79,7 @@ AGENT_CLIENT_COMMAND = '/usr/libexec/dev-pair/renewal/agent-observer client'
 TAILSCALE_API = 'api.tailscale.com'
 TAILSCALE_POLICY_SCOPES = {'policy_file:read', 'devices:core:read', 'devices:posture_attributes:read'}
 TAILSCALE_POLICY_LIMIT = 1024 * 1024
-WORKLOAD_KINDS = {WORKLOAD_ACCESS_CUTOVER, AGENT_CANDIDATE}
+WORKLOAD_KINDS = {WORKLOAD_ACCESS_CUTOVER, *CANDIDATE_KINDS}
 SCOPED_ACCESS = {CORE_ACCESS_CUTOVER, *WORKLOAD_KINDS}
 ACCESS_KINDS = {'access-cutover', *SCOPED_ACCESS}
 ROLE_ARTIFACTS = {'release_sha256', 'job', 'development_manifest', 'maintenance_image', 'development_image', 'devbox_image'}
@@ -198,12 +200,14 @@ def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):
                         principal, signers, namespace)
 
 
-def validate_candidate(value):
+def validate_candidate(value, *, kind=AGENT_CANDIDATE):
     fields = {'previous_release_sha256', 'platform_sha256', 'guard_sha256', 'acl_sha256', 'host_artifact_sha256'}
     keys(value, fields | {'operation', 'requested_at'})
+    operation = value['operation']
     require(all(matches(DIGEST, value[key]) for key in fields)
-            and matches(r'agent-ci-[1-9][0-9]{0,18}-[0-9a-f]{24}', value['operation'])
-            and value['operation'].endswith('-' + value['platform_sha256'][:24])
+            and (kind == STABLE_CANDIDATE and matches(r'stable-[0-9a-f]{48}', operation)
+                 or kind == AGENT_CANDIDATE and matches(r'agent-ci-[1-9][0-9]{0,18}-[0-9a-f]{24}', operation)
+                 and operation.endswith('-' + value['platform_sha256'][:24]))
             and type(value['requested_at']) is int and 0 < value['requested_at'] < 2**63,
             'candidate observation lacks its exact protected renewal scope')
 
@@ -259,7 +263,7 @@ def validate_plan(plan, now):
         fields |= {'tailnet_addresses'}
     if workload:
         fields |= {'role_artifacts'}
-    if plan['kind'] == AGENT_CANDIDATE:
+    if plan['kind'] in CANDIDATE_KINDS:
         fields |= {'candidate'}
     keys(plan, PLAN | fields)
     require(type(plan['version']) is int and plan['version'] == 1
@@ -285,8 +289,8 @@ def validate_plan(plan, now):
             keys(roles, ROLE_ARTIFACTS)
             require(matches(JOB, roles['job']) and all(matches(DIGEST, roles[key]) for key in ROLE_ARTIFACTS - {'job'}),
                     'workload review lacks the exact selected local role and DevBox artifacts')
-        if plan['kind'] == AGENT_CANDIDATE:
-            validate_candidate(plan['candidate'])
+        if plan['kind'] in CANDIDATE_KINDS:
+            validate_candidate(plan['candidate'], kind=plan['kind'])
             require(plan['candidate']['requested_at'] <= plan['issued_at']
                     and plan['candidate']['previous_release_sha256'] != plan['role_artifacts']['release_sha256'],
                     'candidate plan does not observe a prospective role placement')
@@ -365,7 +369,7 @@ def prepare_plan(binding, site, now, previous):
     keys(site, CORE_SITE if scoped else SITE | (SITE_RELEASE if checklist else ACCESS))
     fields = CORE_BINDING if scoped else BINDING | (BINDING_RELEASE if checklist else set())
     keys(binding, fields | ({'role_artifacts'} if workload else set()) |
-         ({'candidate'} if binding['kind'] == AGENT_CANDIDATE else set()))
+         ({'candidate'} if binding['kind'] in CANDIDATE_KINDS else set()))
     if workload:
         require(site['kind'] == CORE_ACCESS_CUTOVER, 'use the previously admitted independent access site')
         site = {**site, 'kind': binding['kind']}
@@ -595,7 +599,7 @@ def expected_role_probe(plan, test, family):
         proof = {'role': test.split('-', 1)[0], 'source_sha': plan['source_sha'], 'boot_id': plan['boot_id'],
                  'machine_id': plan['machine_id'], 'address': plan['tailnet_addresses'][family],
                  'role_artifacts': plan['role_artifacts'], 'probe_cycles': 2, 'job_admission': False}
-        if plan['kind'] == AGENT_CANDIDATE:
+        if plan['kind'] in CANDIDATE_KINDS:
             proof['candidate'] = plan['candidate']
         return proof
     return None
@@ -764,7 +768,7 @@ def assembled_receipt(plan, plan_sha, directory, *, now, verify):
             data.update(kind=plan['kind'], tailnet_addresses=plan['tailnet_addresses'])
         if plan['kind'] in WORKLOAD_KINDS:
             data['role_artifacts'] = plan['role_artifacts']
-        if plan['kind'] == AGENT_CANDIDATE:
+        if plan['kind'] in CANDIDATE_KINDS:
             data['candidate'] = plan['candidate']
     else:
         events = {}

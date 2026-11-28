@@ -41,6 +41,61 @@ The trusted job coordinator enrolls each role/job with `renewal.py register <bin
 
 ## Scheduled and on-demand operation
 
+### Deliberate stable maintenance window
+
+The stable publisher builds one complete signed package for protected main. Its
+release environment identifies the exact preceding full package and the
+approved artifact allocation. A live nightly agent pair can use that preceding
+full package as its base. Stable preparation preserves that exact live pair as
+the local recovery selection.
+
+From the authorized root maintenance terminal, prepare the independently
+reviewed release and inspect the displayed operation, affected jobs and four
+component changes.
+
+```sh
+python3 -EBs /usr/libexec/dev-pair/tools/stable_renewal.py prepare \
+  --reason 'Apply the reviewed stable platform repair'
+```
+
+The controller finds the protected-main run and subject through the existing
+read credential, checks all four release proofs, and stages the exact native
+artifacts under the original machine and site commitment. For an installation
+that predates this entry point, open the separately approved successor checkout
+using the [reviewed source procedure](../README.md#set-up-the-fedora-host). Run
+each command below with `python3 -EBs tools/stable_renewal.py --kit-source-sha
+<reviewed-successor-commit>` in that checkout. The controller checks the clean
+exact checkout, its signed host bundle and the versioned driver before
+activation. The existing fixed services stay available for recovery until the
+fenced host step.
+
+Export `stable_renewal.py access-request` to the existing independent access
+reviewer. Use the [named-route observation procedure](destination-observation.md#review-the-named-ssh-and-workload-routes)
+with the exported stable binding. For each required role observation the
+authorized named tailnet client runs `stable_renewal.py access-probe --role
+maintenance` or `--role development` through the protected root route. The
+returned transcript identifies the staged exact components and current host
+route. Import the reviewer’s signed bundle with `stable_renewal.py
+access-response <protected-receipt-file>`. The dedicated nightly collector
+continues to handle agent-only observations.
+
+Apply the operation printed by preparation from the same root command prefix.
+
+```sh
+python3 -EBs /usr/libexec/dev-pair/tools/stable_renewal.py apply \
+  --operation '<printed-operation>'
+```
+
+The existing controller checkpoints every affected role, verifies native
+readback and resumes the exact sessions. Reuse the same operation after
+interruption. A compatible predecessor remains available for rollback. If a
+protected fixed billing migration has already changed the launch chain, the
+controller uses its recorded bounded forward recovery while keeping dispatch
+fenced. Ordinary Day 0 recheck preserves the initial site record and tests
+previously granted features against the signed current placement.
+
+### Nightly and scoped manual operation
+
 The engineering schedule is `04:00 Asia/Tokyo`, with persistent missed-run handling. Enable `dev-pair-renewal-agent.timer` and `dev-pair-renewal-recovery.service` after the installation gates pass. The timer and operator use the same service, including candidate resolution. For an on-demand check, start `dev-pair-renewal@agent.service`. The separate deliberate release windows use `dev-pair-renewal@devbox.service` and `dev-pair-renewal@host.service`. These commands consume only approved requests and accept no executable input. The boot recovery service uses the same reconciliation logic and exact interrupted operation.
 
 Before activation, the controller publishes a private `attempts/<attempt>/inventory.json` and pins its digest in the journal. It reconciles both physical workspace and state roots against the protected role registries and job ledger. The maintenance assembly probe is accepted as infrastructure only when the completed current image assembly receipt and all three exact owned empty probe leaves agree. It independently reads the native Codex SQLite and rollout catalogues. Archived threads and their rollouts stay in the backup, while current UUIDs each require a protected logical-session binding. The inventory includes checkpoint hashes, complete uncommitted source and session tree digests, target and credential references, and host request and effect identities. Activation also requires a verified clean restore, both releases' actual locally inspectable artifacts, and usable broker grants. Active turns drain under their original ownership. The workload's cache stays in its separately managed durable mount.

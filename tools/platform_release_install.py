@@ -145,8 +145,8 @@ def stage_identity(identity, end):
     return intake.protected(intake.ROOT / identity, directory=True), value
 
 
-def approved_placement(identity, base, site, config, phase, end):
-    executable = intake.protected(G_ENTRY)
+def approved_placement(identity, base, site, config, phase, end, *, program=None):
+    executable = intake.protected(G_ENTRY if program is None else program)
     boot = current_boot()
     outer = None
     jobs = {}
@@ -507,9 +507,9 @@ def maintenance_bindings(stage, index):
             'image_id': row['oci_config_sha256'], 'oci_manifest_sha256': row['oci_manifest_sha256']}
 
 
-def maintenance_probe(stage, index, phase, end):
+def maintenance_probe(stage, index, phase, end, *, program=None):
     bindings = maintenance_bindings(stage, index)
-    executable = intake.protected(P_ENTRY)
+    executable = intake.protected(P_ENTRY if program is None else program)
     argv = ['/usr/bin/python3', '-B', str(executable), 'verify-installed-maintenance', '--phase', phase,
             '--platform-sha256', bindings['platform_sha256'], '--source-sha', bindings['source_sha'],
             '--context-sha256', bindings['context_sha256'], '--image', bindings['image_id'],
@@ -588,11 +588,11 @@ def observe_maintenance_engine(stage, index, account, runtime, end, *, allow_loa
             lease.finish()
 
 
-def install_maintenance(stage, index, account, runtime, end):
+def install_maintenance(stage, index, account, runtime, end, **program):
     observe_maintenance_engine(stage, index, account, runtime, end, allow_load=True)
     evidence = maintenance_import_record(stage, index, runtime, current_boot())
     publish_observation(stage / 'maintenance-import.json', evidence)
-    return maintenance_probe(stage, index, 'verify', end)
+    return maintenance_probe(stage, index, 'verify', end, **program)
 
 
 def stage_budget(stage, capacity):
@@ -684,6 +684,22 @@ def exact_local_programs(base_stage, end, *, expected=None, programs=None):
         expected = hex_id(manifest['files']['tools/' + program.name])
         require(file_hash(intake.protected(program), 4 * 1024**2, end, owner=0)[0] == expected,
                 f'installed {program.name} differs from the approved stable host release')
+
+
+def stable_programs(index, identity, site, end):
+    if not os.path.lexists(ROOT / 'renewal/stable-bindings' / (identity + '.json')):
+        return {}
+    import renewal
+    import stable_renewal
+
+    controller = renewal.Renewal(ROOT, None)
+    approved = stable_renewal.binding(controller, identity)
+    require(approved['site_config_sha256'] == site, 'stable placement helper is outside the approved site')
+    host = index['components']['host']
+    directory = HOST_RELEASES / host['bundle_manifest_sha256']
+    check_host_bundle(directory, host, end)
+    return {'development': {'program': directory / 'tools' / G_ENTRY.name},
+            'maintenance': {'program': directory / 'tools' / P_ENTRY.name}}
 
 
 def development_request(stage, index, base, base_index, site_sha):
@@ -814,8 +830,11 @@ def reobserve_maintenance(identity, site_sha, end):
     else:
         base, base_stage, base_index = identity, stage, index
     reference = approved_maintenance_selection(stage, index, base, intake_sha, site_sha, site)
-    exact_local_programs(base_stage, end, expected=base_index['components']['host']['bundle_manifest_sha256'],
-                         programs=(P_ENTRY,))
+    programs = stable_programs(base_index, base, site_sha, end)
+    maintenance_program = programs.get('maintenance', {})
+    if not maintenance_program:
+        exact_local_programs(base_stage, end, expected=base_index['components']['host']['bundle_manifest_sha256'],
+                             programs=(P_ENTRY,))
     part_path = intake.protected(stage / 'maintenance/part.json')
     part = index['transports']['maintenance']['files']['part.json']
     require(file_hash(part_path, CONTROL_LIMIT, end, owner=0) == (part['sha256'], part['bytes']),
@@ -846,15 +865,15 @@ def reobserve_maintenance(identity, site_sha, end):
     recover_maintenance(account, end)
     volume = bounded_volume(MAINTENANCE, need_import=False)
     stage_budget(stage, volume)
-    maintenance_probe(stage, index, 'preflight', end)
+    maintenance_probe(stage, index, 'preflight', end, **maintenance_program)
     observe_maintenance_engine(stage, index, account, runtime, end, allow_load=False)
     require(current_boot() == boot and approved_maintenance_selection(stage, index, base, intake_sha, site_sha, site) == reference,
             'boot or local release selection changed across maintenance readback')
     publish_observation(import_path, maintenance_import_record(stage, index, runtime, boot))
-    return maintenance_probe(stage, index, 'verify', end)
+    return maintenance_probe(stage, index, 'verify', end, **maintenance_program)
 
 
-def install(identity, site_sha, end):
+def install(identity, site_sha, end, *, stable_previous=None):
     identity, site_sha = hex_id(identity), hex_id(site_sha)
     config = site_configuration(SITE_CONFIGS / (site_sha + '.json'), site_sha)
     boot = machine(config, end)
@@ -866,7 +885,30 @@ def install(identity, site_sha, end):
         require(base_index['kind'] == 'dev-pair-platform-release', 'stable agent refresh base lacks a complete platform')
     else:
         base_stage, base_index = stage, index
-    exact_local_programs(base_stage, end)
+    host_row = base_index['components']['host']
+    if stable_previous is not None:
+        import renewal
+        from renewal_site import Resolver
+        from stable_renewal import settled, validate_successor
+
+        controller = renewal.Renewal(ROOT, None)
+        resolver = Resolver(controller, portable=intake.ROOT, configs=SITE_CONFIGS, hosts=HOST_RELEASES,
+                            host_configs=HOST_CONFIGS)
+        with controller.lock():
+            prior = settled(resolver, site_sha)
+            require(prior['release_sha256'] == stable_previous, 'stable staging changed the local predecessor')
+            validate_successor(resolver, prior, index, identity, config)
+        require(not agent, 'stable staging requires the complete full package')
+        host = install_host(base_stage, host_row, end)
+        directory = HOST_RELEASES / host_row['bundle_manifest_sha256'] / 'tools'
+        programs = {'development': {'program': directory / G_ENTRY.name},
+                    'maintenance': {'program': directory / P_ENTRY.name}}
+    else:
+        require(agent or index.get('previous_platform_sha256') is None,
+                'a stable full successor requires the deliberate protected staging path')
+        programs = stable_programs(base_index, base, site_sha, end) if agent else {}
+        if not programs:
+            exact_local_programs(base_stage, end)
     account, runtime = maintenance_identity()
     recover_maintenance(account, end)
     volume = bounded_volume(MAINTENANCE, need_import=False)
@@ -874,22 +916,22 @@ def install(identity, site_sha, end):
     if agent:
         stage_budget(base_stage, volume)
         # Agent update may only keep the actual installed host bundle.
-        host_row = base_index['components']['host']
         check_host_bundle(HOST_RELEASES / host_row['bundle_manifest_sha256'], host_row, end)
     try:
-        maintenance_probe(stage, index, 'preflight', end)
+        maintenance_probe(stage, index, 'preflight', end, **programs.get('maintenance', {}))
     except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         raise Blocked('accepted-import P entry or prepared maintenance gateway did not pass preflight') from None
     outer = development_request(stage, index, base, base_index, site_sha)
     try:
-        planned = approved_placement(identity, base, site_sha, config, 'preflight', end)
+        planned = approved_placement(identity, base, site_sha, config, 'preflight', end, **programs.get('development', {}))
         require(planned['outer'] == outer, 'prepared G scope selected a different stable DevBox')
     except (Blocked, devbox.db.Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         raise Blocked('prebuilt G deployment entry or its prepared scopes did not pass preflight') from None
 
-    maintenance = install_maintenance(stage, index, account, runtime, end)
-    host = install_host(base_stage, base_index['components']['host'], end, reuse_only=agent)
-    installed = approved_placement(identity, base, site_sha, config, 'stage', end)
+    maintenance = install_maintenance(stage, index, account, runtime, end, **programs.get('maintenance', {}))
+    if stable_previous is None:
+        host = install_host(base_stage, host_row, end, reuse_only=agent)
+    installed = approved_placement(identity, base, site_sha, config, 'stage', end, **programs.get('development', {}))
     devbox_row, development = check_development(stage, index, base_index, config, installed, end)
     bounded_volume(MAINTENANCE, need_import=False)
     require(current_boot() == boot, 'native host rebooted across installation readback')

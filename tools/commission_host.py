@@ -401,10 +401,14 @@ class Commission:
         checked_parts = False
         if prepared:
             raw = self.read(AUTOMATIC_POLICY)
-            policy = read_policy(raw, revision)
+            policy = read_policy(raw, hex_id(parse(raw)['source_sha'], 40))
             require(raw == encoded(policy), 'recorded automatic commissioning policy bytes differ')
             require(policy['machine_id'] == observed['machine_id'] and not policy['timers'],
                     'automatic commissioning policy belongs to another machine or admission scope')
+            stable = self.selected_stable(policy, observed, revision, action)
+            if stable is not None:
+                return stable
+            require(policy['source_sha'] == revision, 'automatic commissioning policy names another reviewed source')
             host_profile = None
         else:
             acquire = action in ('prepare', 'apply')
@@ -482,6 +486,80 @@ class Commission:
             return {**core, 'held_features': list(CORE_HELD_FEATURES)}
         return self.advance_workloads(policy, policy_sha, observed, site, bundle, core)
 
+    def selected_stable(self, policy, observed, revision, action):
+        from renewal import TERMINAL
+
+        paths = tuple(CONTROL + '/' + name + '.json' for name in ('current', 'site-current'))
+        if not all(os.path.lexists(self.path(path)) for path in paths):
+            return None
+        reference = hex_id(parse(self.read(paths[0])))
+        path = CONTROL + '/platform-bindings/' + reference + '.json'
+        if not os.path.lexists(self.path(path)):
+            return None
+        before = parse(self.read(path))
+        has_stable_base = before['base_platform_sha256'] != policy['platform_sha256']
+        if not has_stable_base and not os.path.lexists(self.path(CONTROL + '/transition.json')):
+            return None
+        controller = self.services.renewal()
+        with self.lock(), controller.lock(shared=True), controller.host_fence(shared=True):
+            _, journal = controller.transition()
+            if not has_stable_base and (journal is None or journal['request']['scope'] != 'stable'):
+                return None
+            if (journal is not None and journal['phase'] not in TERMINAL or
+                    os.path.lexists(self.path(FENCE + '/frozen'))):
+                raise Pending('stable-release-recovery', 'The protected stable operation must finish recovery before commissioning can resume.')
+            if not has_stable_base:
+                return None
+            require(reference == controller.live_release() == parse(self.read(paths[1])),
+                    'stable commissioning does not identify the settled release')
+            self.require_first_site(policy['machine_id'], policy['site_config_sha256'])
+            binding = self.services.verify_selection(controller, reference, policy)
+            require(binding == before and revision in (policy['source_sha'], controller.release(reference)['components']['host']['source_revision']),
+                    'use the first commissioning checkout or the selected signed stable host checkout')
+            report = {'phase': 'prepared' if action in ('prepare', 'discover', 'status') else 'ready',
+                      'selected_release': reference, 'platform_sha256': binding['platform_sha256'],
+                      'site_config_sha256': binding['site_config_sha256'], 'held_features': list(CORE_HELD_FEATURES)}
+            raw = self.read(AUTOMATIC_POLICY)
+            saved = self.activation_record(digest(raw), observed['machine_id'])
+        if action != 'apply':
+            return report
+        try:
+            self.services.workload_scope(self, policy, reference, observed['boot_id'])
+        except Pending as waiting:
+            return {**report, 'timers': {}, 'pending_features': dict.fromkeys(TIMERS, waiting.report['prerequisite']),
+                    'owner_terminal': None}
+        timers, pending = {}, {}
+        for feature in CORE_HELD_FEATURES:
+            row = (saved['features'] if saved else {}).get(feature)
+            if row is None or row['phase'] != 'armed':
+                pending[feature] = 'protected-feature-activation'
+                continue
+            try:
+                self.require_runtime_feature(feature, owner_entry=feature == 'owner-intake')
+            except Pending as waiting:
+                pending[feature] = waiting.report['prerequisite']
+                continue
+            except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                pending[feature] = 'protected-feature-requalification'
+                continue
+            timer, service = AGENT_BRIDGE if feature == 'agent-renewal' else TIMERS[feature]
+            observed_timer = self.run(SYSTEMCTL, 'show', '--all',
+                                      '--property=LoadState,ActiveState,UnitFileState,Unit,NextElapseUSecRealtime,NextElapseUSecMonotonic',
+                                      timer, timeout=10)
+            properties = dict(line.split('=', 1) for line in observed_timer.splitlines() if '=' in line)
+            upcoming = [properties.get(name) for name in ('NextElapseUSecRealtime', 'NextElapseUSecMonotonic')
+                        if properties.get(name) not in (None, '', 'n/a', '0', 'infinity')]
+            if (properties.get('LoadState'), properties.get('ActiveState'), properties.get('UnitFileState'),
+                properties.get('Unit')) != ('loaded', 'active', 'enabled', service) or not upcoming:
+                pending[feature] = 'protected-timer-requalification'
+                continue
+            timers[timer] = {'service': service, 'next': upcoming}
+        result = {**report, 'timers': timers, 'pending_features': pending, 'held_features': sorted(pending),
+                  'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' not in pending else None}
+        if AGENT_BRIDGE[0] in timers:
+            result['agent_publication'] = self.services.agent_publication_status(reference)
+        return result
+
     def activation_record(self, policy_sha, machine):
         if not os.path.lexists(self.path(ACTIVATION)):
             return None
@@ -547,15 +625,23 @@ class Commission:
                     'automatic workload is frozen until renewal settles')
             prior = row.get('runtime') or workload_scope_fields(saved)
             changed = (selected, boot) != (prior['release_sha256'], prior['boot_id'])
+            placement = None
             if changed:
                 # This verifies the committed portable/base/site contract. A new
-                # full host or DevBox scope needs its own approved policy.
-                self.services.verify_selection(controller, selected, policy)
+                # full successor must have the deliberate stable lineage.
+                placement = self.services.verify_selection(controller, selected, policy)
             proof = self.services.workload_scope(self, policy, selected, boot, ssh=changed)
             require(changed or proof == prior['proof_sha256'], 'automatic workload authorization changed')
             # Promotion's digest embeds the originally approved local release.
             # Re-measure its present enrolled material in that same digest scope.
-            authority_release = saved['release_sha256'] if feature == 'checklist-promotion' else selected
+            if placement is None:
+                path = CONTROL + '/platform-bindings/' + selected + '.json'
+                placement = parse(self.read(path)) if os.path.lexists(self.path(path)) else None
+            stable = placement is not None and placement['base_platform_sha256'] != policy['platform_sha256']
+            authority_release = (saved['release_sha256'] if feature == 'checklist-promotion' or
+                                 stable and feature in ('checklist-spool', 'agent-renewal') else selected)
+            if stable and feature == 'agent-renewal':
+                self.services.agent_bridge_authority(selected, confirm_read=False)
             require(self.services.feature_authority(feature, authority_release, recorded=grant) == grant,
                     'automatic workload authorization changed')
             require(self.services.identity() == identity and (grant['expires_unix'] is None or grant['expires_unix'] > time.time()),
@@ -1490,12 +1576,18 @@ class Live:
         exact_fields(binding, ('schema', 'release_sha256', 'platform_sha256', 'base_platform_sha256',
                               'site_config_sha256', 'plan_sha256', 'intake_sha256'),
                      'protected current selection has an unknown portable binding')
-        base = policy['platform_sha256']
+        origin = policy['platform_sha256']
+        base = hex_id(binding['base_platform_sha256'])
         require(type(binding['schema']) is int and binding['schema'] == 1 and
-                binding['release_sha256'] == selected and binding['base_platform_sha256'] == base and
+                binding['release_sha256'] == selected and
                 binding['site_config_sha256'] == policy['site_config_sha256'] and
                 binding['plan_sha256'] == release['plan_sha256'],
                 'current release or rollback base differs from the site commitment')
+        if base != origin:
+            from stable_renewal import lineage
+
+            lineage(self.resolver.Resolver(controller), base, origin, policy['site_config_sha256'], policy['machine_id'],
+                    policy['source_sha'])
         _, selected_index, intake = self.installer.intake.retained_index(hex_id(binding['platform_sha256']))
         require(intake == binding['intake_sha256'] and
                 (selected_index['base_platform_sha256'] or binding['platform_sha256']) == base,
@@ -1515,7 +1607,9 @@ class Live:
         site_sha = policy['site_config_sha256']
         site = self.installer.site_configuration(self.installer.SITE_CONFIGS / (site_sha + '.json'), site_sha)
         require(host['artifact_sha256'] == index['components']['host']['bundle_manifest_sha256'] and
-                host['source_revision'] == policy['source_sha'] and host['config_sha256'] == site['host_config_sha256'],
+                host['source_revision'] == index['source_sha'] and
+                (base != origin or host['source_revision'] == policy['source_sha']) and
+                host['config_sha256'] == site['host_config_sha256'],
                 'selected host bundle differs from the explicitly approved stable installation')
         self.installer.check_host_bundle(self.installer.HOST_RELEASES / host['artifact_sha256'], index['components']['host'],
                                          time.monotonic() + 20)

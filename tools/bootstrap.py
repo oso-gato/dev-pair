@@ -3241,13 +3241,13 @@ class Bootstrap:
         roles = self.retained_workload_roles(state)
         if roles:
             fenced = recovery_release is not None and (self.own_workload_rollback(recovery_release) or
-                                                       self.own_agent_workload_activation(recovery_release))
+                                                       self.own_candidate_workload_activation(recovery_release))
             if fenced:
                 selected = self.fenced_workload_placement(recovery_release)
             else:
                 selected = self.access_workload_selection()
             if selected != roles:
-                approved = self.admitted_agent_workload(selected['release_sha256'], state)
+                approved = self.admitted_candidate_workload(selected['release_sha256'], state)
                 if approved is None or approved['role_artifacts'] != selected:
                     raise Blocked('independent workload access checks are required for the current role placement')
                 state = {**state, **approved}
@@ -3334,7 +3334,7 @@ class Bootstrap:
                         self.publish_workload_gate('admitted' if 'role_artifacts' in state else 'legacy', roles)
                     else:
                         try:
-                            approved = self.admitted_agent_workload(live['release_sha256'], state)
+                            approved = self.admitted_candidate_workload(live['release_sha256'], state)
                         except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                             self.publish_workload_gate('held')
                             raise
@@ -3409,14 +3409,14 @@ class Bootstrap:
                 and state['request']['previous_sha256'] == release and os.path.lexists(marker)
                 and renewal.read_json(marker) == attempt.name)
 
-    def own_agent_workload_activation(self, release):
+    def own_candidate_workload_activation(self, release):
         import renewal
 
         controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
         attempt, state = controller.transition()
         marker = controller.root / 'renewal-fence/frozen'
         return (state is not None and state['phase'] in ('applying', 'verifying', 'accepted') and
-                state['request']['scope'] == 'agent' and state['request']['target_sha256'] == release and
+                state['request']['scope'] in ('agent', 'stable') and state['request']['target_sha256'] == release and
                 os.path.lexists(marker) and renewal.read_json(marker) == attempt.name)
 
     def fenced_workload_placement(self, reference):
@@ -3436,24 +3436,27 @@ class Bootstrap:
             raise Blocked('the fenced private placement has not been selected by its recovery executor')
         return role_artifacts(controller, reference)
 
-    def admitted_agent_workload(self, reference, state):
+    def admitted_candidate_workload(self, reference, state):
         import renewal
+        from destination_observation import STABLE_CANDIDATE
         from renewal_site import CandidateAccess
 
         controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
-        return CandidateAccess(controller, self).admitted(reference, state)
+        stable = CandidateAccess(controller, self, kind=STABLE_CANDIDATE)
+        observer = stable if os.path.lexists(stable.proof_path(reference)) else CandidateAccess(controller, self)
+        return observer.admitted(reference, state)
 
     def restore_retained_workload_gate(self, reference):
         state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
         roles = self.retained_workload_roles(state)
-        if roles is None or not (self.own_workload_rollback(reference) or self.own_agent_workload_activation(reference)):
+        if roles is None or not (self.own_workload_rollback(reference) or self.own_candidate_workload_activation(reference)):
             return
         state = self.verify_final_guard()
         selected = self.fenced_workload_placement(reference)
         if selected == roles:
             phase = 'admitted' if 'role_artifacts' in state else 'legacy'
         else:
-            approved = self.admitted_agent_workload(reference, state)
+            approved = self.admitted_candidate_workload(reference, state)
             if approved is None or approved['role_artifacts'] != selected:
                 return
             phase = 'admitted'

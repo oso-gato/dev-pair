@@ -24,6 +24,7 @@ from session_controller import Observer, Registry, ROLES, STANDARDS, canonical, 
 SCOPE_COMPONENTS = {'agent': {'maintenance-agent', 'development-agent'},
                     'devbox': {'devbox'}, 'host': {'host'}}
 COMPONENTS = set.union(*SCOPE_COMPONENTS.values())
+SCOPE_COMPONENTS['stable'] = COMPONENTS.copy()
 TERMINAL = {'completed', 'rolled-back', 'deferred', 'rejected'}
 MAX_CONTROL = 8 * 1024 * 1024
 MAX_JOBS = 64
@@ -160,6 +161,10 @@ class SiteDriver:
         # Adapter output is bounded. A timed-out or broken adapter is never proof of cleanup.
         native_observe = action == 'observe' or action == 'preflight-runtime' and payload['role'] == 'maintenance'
         timeout = self.timeout + 400 if native_observe else self.timeout
+        if action == 'activate' and payload['scope'] == 'stable':
+            timeout = max(timeout, 385)
+        if action == 'stable-access-probe':
+            timeout = max(timeout, 670)
         with tempfile.TemporaryFile() as output:
             completed = subprocess.run([str(self.path), action], input=json_bytes(payload), stdout=output,
                                        stderr=subprocess.DEVNULL, timeout=timeout, check=False,
@@ -637,6 +642,10 @@ class Renewal:
         if not request_path.exists() and not request_path.is_symlink():
             return None
         value = read_json(request_path)
+        if scope == 'stable':
+            from stable_renewal import active_request
+
+            return active_request(self, value)
         if scope == 'agent':
             protocol.fields(value, 'schema offer_sha256 request')
             require(type(value['schema']) is int and value['schema'] == 1, 'unsupported intake approval')
@@ -1089,17 +1098,39 @@ class Renewal:
             self.mark_host_fence(attempt.name, frozen=False)
         return state
 
-    def verify_prospective_agent(self, request):
-        if request['scope'] != 'agent' or not request['operation'].startswith('agent-ci-'):
+    def verify_prospective_placement(self, request):
+        scope = request['scope']
+        if scope != 'stable' and (scope != 'agent' or not request['operation'].startswith('agent-ci-')):
             return
         from bootstrap import Blocked, Bootstrap
         from renewal_site import CandidateAccess
 
         try:
-            CandidateAccess(self, Bootstrap()).fresh(request['target_sha256'], request['previous_sha256'],
-                                                     request['operation'])
+            if scope == 'stable':
+                from stable_renewal import access
+
+                observer = access(self)
+            else:
+                observer = CandidateAccess(self, Bootstrap())
+            observer.fresh(request['target_sha256'], request['previous_sha256'], request['operation'])
         except (OSError, Blocked, ValueError, subprocess.SubprocessError) as error:
             raise ValueError('fresh independent candidate observation required') from error
+
+    def verify_prospective_agent(self, request):
+        # The separately installed nightly selector keeps its existing entry.
+        if request['scope'] == 'agent':
+            self.verify_prospective_placement(request)
+
+    def finish_forward(self, attempt, state, inventory, *, pristine):
+        replacement = state['request']['target_sha256']
+        self.verify_driver('activate', state, replacement)
+        self.confirm_tree(inventory, state_unchanged=pristine)
+        with contextlib.ExitStack() as stack:
+            registries = self.confirm_registries(attempt, inventory, stack)
+            self.prove(attempt, state, replacement, inventory, registries)
+            self.phase(attempt, state, 'accepted')
+            replace_json(self.control / 'current.json', replacement)
+            return self.thaw(attempt, state, 'completed', registries)
 
     def run(self, attempt, state):
         request = state['request']
@@ -1115,16 +1146,9 @@ class Renewal:
                 inventory = self.capture(attempt, state, registries)
                 self.readiness(attempt, state, inventory, registries)
             self.verify_pending(inventory)
-            self.verify_prospective_agent(request)
+            self.verify_prospective_placement(request)
             self.phase(attempt, state, 'applying')
-            self.verify_driver('activate', state, replacement)
-            self.confirm_tree(inventory, state_unchanged=True)
-            with contextlib.ExitStack() as stack:
-                registries = self.confirm_registries(attempt, inventory, stack)
-                self.prove(attempt, state, replacement, inventory, registries)
-                self.phase(attempt, state, 'accepted')
-                replace_json(self.control / 'current.json', replacement)
-                return self.thaw(attempt, state, 'completed', registries)
+            return self.finish_forward(attempt, state, inventory, pristine=True)
         except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
             # Keep cause text out of user-visible records. The external adapter owns its diagnostics.
             self.phase(attempt, state, state['phase'], failure=diagnostic(error))
@@ -1160,6 +1184,31 @@ class Renewal:
                 sync_directory(live.parent)
         self.confirm_tree(inventory, state_unchanged=True)
 
+    def stable_forward_recovery(self, attempt, state):
+        from stable_renewal import forward_started
+
+        try:
+            required = forward_started(self, state['request'])
+        except (ImportError, OSError, ValueError, KeyError, TypeError) as error:
+            self.phase(attempt, state, 'blocked', forward_failure=diagnostic(error))
+            return state
+        if not required:
+            return None
+        number = state.get('forward_attempts', 0)
+        if number >= 2:
+            self.phase(attempt, state, 'blocked')
+            return state
+        self.phase(attempt, state, 'applying', forward_attempts=number + 1)
+        try:
+            inventory = self.checked_inventory(attempt, state)
+            self.verify_pending(inventory)
+            return self.finish_forward(attempt, state, inventory, pristine=False)
+        except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+            # The exact effect fence stays closed. Boot recovery can repeat the
+            # same bounded operation without selecting the obsolete fixed bytes.
+            self.phase(attempt, state, 'verifying' if number == 0 else 'blocked', forward_failure=diagnostic(error))
+            return state
+
     def recover(self, attempt, state):
         phase = state['phase']
         if self.unfinished_thaw(attempt, state):
@@ -1174,6 +1223,10 @@ class Renewal:
                 self.verify_pending(inventory)
                 self.observe_accepted_progress(attempt, state, target, inventory)
             except (OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
+                if state['request']['scope'] == 'stable':
+                    continued = self.stable_forward_recovery(attempt, state)
+                    if continued is not None:
+                        return continued
                 self.phase(attempt, state, 'rolling-back', accepted_failure=diagnostic(error))
                 phase = 'rolling-back'
             else:
@@ -1210,6 +1263,10 @@ class Renewal:
                 self.phase(attempt, state, 'blocked', rollback_failure=diagnostic(error))
                 return state
         require(phase in ('applying', 'verifying', 'rolling-back'), 'unknown renewal transition phase')
+        if state['request']['scope'] == 'stable':
+            continued = self.stable_forward_recovery(attempt, state)
+            if continued is not None:
+                return continued
         previous = state['request']['previous_sha256']
         inventory = self.checked_inventory(attempt, state)
         attempts = state.get('rollback_attempts', 0)
