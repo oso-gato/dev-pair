@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / 'tools'))
 import gptbox
 import gptbox_runtime
+import billing_courier
 import owner_intake as owner
 import owner_source
 import platform_release_intake
@@ -64,6 +65,7 @@ class FirstCatalogueTests(unittest.TestCase):
         machine = self.path / 'machine-id'
         owner.write_private(machine, b'c' * 32 + b'\n')
         self.use(mock.patch.object(provider_billing, 'MACHINE_ID', machine))
+        self.use(mock.patch.object(billing_courier, 'CLIENT', self.path / 'billing-exchange'))
         secret = 'sk-proj-offline-test-key-never-sent'
         owner.write_private(self.credential, secret.encode())
         key = self.billing_key = self.path / 'reviewer'
@@ -453,7 +455,7 @@ class FirstCatalogueTests(unittest.TestCase):
             self.assertIn('Setup remains pending.', printed.getvalue())
             (self.billing / (owner.MODEL + '.tariff')).write_text('Previously reviewed opaque notes')
             printed = io.StringIO()
-            owner.setup_site(self.first, io.StringIO(REPOSITORY + '\n1\n\n'), printed)
+            owner.setup_site(self.first, io.StringIO(REPOSITORY + '\n1\noffline\n\n'), printed)
         self.assertIn('waiting for the independent signed bundle', printed.getvalue())
         self.assertNotIn('Approved total job budget', printed.getvalue())
         self.assertNotIn('Confirm this exact owner setup?', printed.getvalue())
@@ -466,7 +468,7 @@ class FirstCatalogueTests(unittest.TestCase):
         secret = 'sk-proj-fresh-fixture-never-sent'
         public = self.billing_key.with_suffix('.pub').read_text().strip()
         _, fingerprint = provider_billing.reviewer_key(public)
-        answers = '\n'.join((REPOSITORY, '1', '', public, fingerprint, 'yes', '', ''))
+        answers = '\n'.join((REPOSITORY, '1', '', public, fingerprint, 'yes', 'offline', '', ''))
         with mock.patch.object(owner.getpass, 'getpass', side_effect=(reference, secret)):
             printed = io.StringIO()
             owner.setup_site(self.first, io.StringIO(answers), printed)
@@ -486,7 +488,7 @@ class FirstCatalogueTests(unittest.TestCase):
             {'review': review, 'signature': signature,
              'evidence': {kind: 'Zml4dHVyZQ==' for kind in provider_billing.SOURCE_KINDS}}))
         expires = datetime.fromtimestamp(self.options.expires_unix, timezone.utc).strftime('%Y-%m-%d %H:%M')
-        answers = '\n'.join((REPOSITORY, '1', '0.09', expires, 'yes', ''))
+        answers = '\n'.join((REPOSITORY, '1', 'offline', '0.09', expires, 'yes', ''))
         with mock.patch.object(owner.getpass, 'getpass', return_value=reference), \
                 mock.patch.object(provider_billing, 'available') as available:
             printed = io.StringIO()

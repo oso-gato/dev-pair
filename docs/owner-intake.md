@@ -137,18 +137,77 @@ key after you enter its SHA256 fingerprint from a separately authenticated
 channel and confirm that exact identity. The custodian keeps the private
 signing key. Use the billing custodian's own approved identity.
 
-Send the wizard's protected request to that custodian over the authenticated
-handoff channel. The wizard displays the request and expected return paths
-under `/root/dev-pair-provider-billing`. The request binds the VPS, credential,
-reviewer enrollment and selected model. The custodian checks the actual
+Choose `station` to enroll a dedicated billing courier. Verify the station's
+numeric Tailscale address, dedicated SSH account and Ed25519 SSH host key with
+its operator. Authenticate the SSH host fingerprint separately before confirming
+the route. The wizard displays a newly generated courier public key and
+fingerprint, machine binding and billing reviewer enrollment to admit on the
+station. Once admitted, reopening setup sends or checks the exact request.
+The courier sends the credential reference and its hash, machine binding,
+reviewer enrollment and selected provider contract. The API key stays on the VPS.
+
+The custodian checks the actual
 OpenAI organization and project, credential assignment, full billable input
 ceiling, highest applicable input and output rates, and exact response model
-identities. Use `tools/provider_billing.py review --help` at the exact reviewed
-source to produce the signed bundle from the evidence. Return it as a
-root-owned mode-0600 file at the displayed path. On reopening, the wizard verifies
-the bundle and checks model availability through a read-only OpenAI request
-using the reviewed project and credential. Enter a different protected bundle
-path if needed.
+identities. After the station publishes the signed bundle, reopening setup
+verifies the signed request binding and checks model availability through a
+read-only OpenAI request using the reviewed project and credential. The
+independent billing signature and the owner's budget confirmation still apply.
+
+Choose `offline` or confirm the offline option to use the separately
+authenticated file handoff. The wizard displays the request and expected
+root-private mode-0600 return paths under `/root/dev-pair-provider-billing`.
+Enter a different root-private return path if needed. Press Enter to defer
+handoff when no approved route is available.
+
+#### Prepare the independent billing station
+
+The station operator uses a separate approved Tailnet device and a root-owned
+clean checkout of the exact reviewed source, such as an immutable checkout
+under `/opt`. Both ordinary station identities must be able to traverse the
+checkout and read the tools. Keep the station’s SSH service key, billing
+reviewer signing key and VPS courier key separate. Reserve a dedicated
+unprivileged key-only SSH account with a shell and its station-managed home
+`/var/lib/ACCOUNT`. Select a different ordinary billing reviewer account and
+a dedicated mailbox Unix group containing exactly those two accounts. The
+station checks the actual SSH policy, local Tailnet address, accounts and
+ownership. The reviewer keeps the private signing key in their own custody.
+
+From the protected station terminal, use the independently authenticated
+bindings supplied by the VPS and billing custodian. `station-init --help`
+lists the named inputs. The key arguments take public keys only.
+
+```sh
+python3 -IB tools/billing_courier.py station-init \
+  --source-sha "$approved_source" --machine-sha256 "$vps_binding" \
+  --reviewer-epoch "$billing_enrollment" --station-address "$station_tailnet_ip" \
+  --vps-address "$vps_tailnet_ip" --tailnet "$approved_tailnet" \
+  --courier-user "$courier_account" --reviewer-user "$reviewer_account" \
+  --group "$billing_mail_group" --host-fingerprint "$station_ssh_fingerprint" \
+  --courier-key "$vps_courier_public_key" --courier-fingerprint "$vps_courier_fingerprint" \
+  --reviewer-key "$billing_signer_public_key" --reviewer-fingerprint "$billing_signer_fingerprint"
+```
+
+The station prints the approved scope. As the ordinary reviewer, list the
+exact pending identifiers, retrieve one to an unused private file, then use
+the existing billing review command to produce its signed bundle. Use
+`review --help` to supply the verified evidence and billing terms.
+
+```sh
+python3 -IB tools/billing_courier.py --scope "$scope" pending
+python3 -IB tools/billing_courier.py --scope "$scope" retrieve "$request" --output review-request.json
+python3 -IB tools/provider_billing.py review --help
+python3 -IB tools/billing_courier.py --scope "$scope" publish "$request" < signed-billing.bundle
+```
+
+Retrying the same request or publishing the same signed bundle is idempotent.
+Keep independent review evidence in the reviewer’s protected storage. To
+rotate the courier key or endpoint, use the installed `billing_courier.py
+enroll` command on the VPS and independently readmit the new public key.
+The station requires `--replace-courier-fingerprint` with the previous exact
+courier fingerprint to replace its sole authorization line. A changed billing
+reviewer enrollment requires a fresh station scope. Prior scoped evidence
+stays in its original custody.
 
 Enter the approved total USD cap and UTC expiry. Before confirming, check the
 exact checkout, startup revision, verified private destination, role limits

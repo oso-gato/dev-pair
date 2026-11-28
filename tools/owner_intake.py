@@ -1328,6 +1328,7 @@ def enroll_billing_reviewer(ask, say):
 
 
 def setup_provider(ask, say, outgoing):
+    from billing_courier import setup_route
     from provider_transition import Deferred
 
     reference = setup_secret(outgoing, 'Protected credential reference: ')
@@ -1348,14 +1349,9 @@ def setup_provider(ask, say, outgoing):
     except SitePending:
         if not billing.has_reviewer() and not enroll_billing_reviewer(ask, say):
             raise SitePending('provider-billing-reviewer', 'Enrollment of the independent billing custodian is pending.') from None
-    request, target = billing.setup_handoff(reference)
-    say(f'Send the protected VPS-bound billing request {request} to the independently enrolled billing custodian.')
-    say(f'Return the custodian’s signed bundle as a root-private mode 0600 file at {target}, then reopen this setup.')
 
-    def accept(path):
+    def accept(raw):
         try:
-            raw = billing.bounded_file(billing.protected(path, private=True), billing.BUNDLE_LIMIT,
-                                       owner=0, mode=0o600)
             billing.receive(reference, raw)
         except Deferred:
             raise
@@ -1363,9 +1359,27 @@ def setup_provider(ask, say, outgoing):
             reason = str(exc) if type(exc) is ValueError else 'Verify the root-private bundle path and retry.'
             raise SitePending('provider-billing-authority', 'The signed billing bundle was rejected. ' + reason) from exc
 
+    offline, response = setup_route(reference, ask, say)
+    if response is not None:
+        accept(response)
+        return reference, billing_authority(reference)
+    if not offline:
+        raise SitePending('provider-billing-evidence', 'Independent billing review is pending. Reopen this setup to check the approved route.')
+    request, target = billing.setup_handoff(reference)
+    say(f'Send the protected VPS-bound billing request {request} to the independently enrolled billing custodian.')
+    say(f'Return the custodian’s signed bundle as a root-private mode 0600 file at {target}, then reopen this setup.')
+
+    def accept_file(path):
+        try:
+            raw = billing.bounded_file(billing.protected(path, private=True), billing.BUNDLE_LIMIT,
+                                       owner=0, mode=0o600)
+        except (OSError, ValueError) as exc:
+            raise SitePending('provider-billing-authority', 'Verify the root-private billing bundle path and retry.') from exc
+        accept(raw)
+
     if os.path.lexists(target):
         try:
-            accept(target)
+            accept_file(target)
         except SitePending as wait:
             say(wait.observation['message'])
         else:
@@ -1373,7 +1387,7 @@ def setup_provider(ask, say, outgoing):
     supplied = ask('Absolute path to the returned signed billing bundle, or Enter to wait.')
     if not supplied:
         raise SitePending('provider-billing-evidence', 'First owner billing is waiting for the independent signed bundle.')
-    accept(Path(supplied))
+    accept_file(Path(supplied))
     return reference, billing_authority(reference)
 
 

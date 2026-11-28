@@ -51,6 +51,7 @@
     {"source": "runtime/renewal/provider-run", "target": "/usr/libexec/dev-pair/renewal/provider-run", "mode": "0755", "feature": "base"},
     {"source": "runtime/renewal/provider-start-fence.conf", "target": "/etc/systemd/system/dev-pair-provider@.service.d/50-dev-pair-provider-fence.conf", "mode": "0644", "feature": "base"},
     {"source": "runtime/renewal/role-preflight", "target": "/usr/libexec/dev-pair/renewal/role-preflight", "mode": "0755", "feature": "base"},
+    {"source": "tools/billing_courier.py", "target": "/usr/libexec/dev-pair/tools/billing_courier.py", "mode": "0755", "feature": "base"},
     {"source": "tools/bootstrap.py", "target": "/usr/libexec/dev-pair/tools/bootstrap.py", "mode": "0644", "feature": "base"},
     {"source": "tools/agent_release_bridge.py", "target": "/usr/libexec/dev-pair/tools/agent_release_bridge.py", "mode": "0644", "feature": "base"},
     {"source": "tools/candidate.py", "target": "/usr/libexec/dev-pair/tools/candidate.py", "mode": "0644", "feature": "base"},
