@@ -363,7 +363,11 @@ def matches(activation, release, binding, *, job=None):
             all(activation.get(key) == release[key] for key in
                 ('source_sha', 'subject', 'run_id', 'artifact_sha256', 'source_tree', 'pull_request', 'review_head')) and
             activation.get('dns_name') == binding['dns_name'] and not activation.get('quarantined') and
-            (job is None or activation.get('promotion_job_id', job) == job))
+            (job is None or activation.get('promotion_job_id') == job))
+
+
+def eligible_rollout(activation, release, binding, job):
+    return matches(activation, release, binding) and activation.get('promotion_job_id') in (None, job)
 
 
 def advance(state, binding, bundle, result, site, backend, save):
@@ -418,24 +422,25 @@ def advance(state, binding, bundle, result, site, backend, save):
                   pull['merged_by']['id'] == site['merge_actor_id'], 'previously attested publication changed')
     activation = backend.activation()
     active = activation['active']
-    if not matches(active, release, binding, job=job) or activation['route_pending']:
+    if not eligible_rollout(active, release, binding, job) or activation['route_pending']:
         pending = activation['pending']
-        p.require(pending is None or pending['operation'] == 'deploy' and matches(pending['release'], release, binding, job=job),
+        p.require(pending is None or pending['operation'] == 'deploy' and eligible_rollout(pending['release'], release, binding, job),
                   'another deployment requires independent resolution')
         if active and active.get('quarantined'):
             p.require(active['artifact_sha256'] != release['artifact_sha256'],
                       'correction requires an independently verified different digest')
         else:
-            p.require(not active or matches(active, release, binding, job=job) or
+            p.require(not active or eligible_rollout(active, release, binding, job) or
                       activation['confirmed'] == active['artifact_sha256'],
                       'an earlier deployment requires independent confirmation')
         transition('deploying')
         backend.deploy(release)
         activation = backend.activation()
-    p.require(matches(activation['active'], release, binding, job=job) and not activation['pending'] and not activation['route_pending'],
+    p.require(eligible_rollout(activation['active'], release, binding, job) and not activation['pending'] and not activation['route_pending'],
               'exact tailnet release is yet to be observed')
     active = activation['active']
-    if activation['confirmed'] != release['artifact_sha256'] or active.get('verified_destination') is not True:
+    if (activation['confirmed'] != release['artifact_sha256'] or active.get('verified_destination') is not True
+            or active.get('promotion_job_id') != job):
         transition('awaiting-independent-destination', destination='https://' + binding['dns_name'] + '/')
         evidence = backend.evidence()
         transition('confirming-destination')

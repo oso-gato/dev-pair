@@ -317,7 +317,7 @@ def probe_plan(plan):
 def export_release(job, *, confirmed_receipt=None):
     """Read the normal J/D records on the destination under D's release lock."""
     from destination_release import Destination
-    from product_release import matches as matching_release, record, trusted_directory, product
+    from product_release import eligible_rollout, record, trusted_directory, product
 
     require(os.geteuid() == 0 and matches(JOB, job), 'use the admitted destination controller and exact job ID')
     destination = Destination()
@@ -326,7 +326,7 @@ def export_release(job, *, confirmed_receipt=None):
         activation = destination.initial_activation()
         live = activation['active']
         require(promotion and promotion['job_id'] == job and
-                matching_release(live, promotion['release'], promotion['binding'], job=job)
+                eligible_rollout(live, promotion['release'], promotion['binding'], job)
                 and not activation['pending'] and not activation['route_pending']
                 and destination.serve_config(dns), 'selected exact release is not awaiting independent destination checks')
         already_confirmed = (confirmed_receipt is not None and promotion['phase'] == 'confirmed'

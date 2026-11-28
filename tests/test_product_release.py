@@ -305,7 +305,7 @@ class PipelineFixture:
 
     def deploy(self, release):
         self.calls.append('native deployment adapter')
-        self.deployed['active'] = dict(release, dns_name=DNS)
+        self.deployed['active'] = dict(release, dns_name=DNS, promotion_job_id=JOB)
         if self.interrupted:
             raise proposal.Unavailable('fixture response ended after durable activation')
 
@@ -317,7 +317,7 @@ class PipelineFixture:
     def confirm(self, evidence):
         self.calls.append('independent destination confirmation')
         active = self.deployed['active']
-        active.update(verified_destination=True, destination_receipt_sha256='4'*64)
+        active.update(verified_destination=True, destination_receipt_sha256='4'*64, promotion_job_id=JOB)
         self.deployed['confirmed'] = active['artifact_sha256']
         if self.interrupted:
             raise proposal.Unavailable('fixture response ended after authentication')
@@ -418,6 +418,26 @@ class PromotionPipelineTests(unittest.TestCase):
         active['run_attempt'] = 1
         self.assertEqual(self.advance()['phase'], 'confirmed')
         self.assertEqual(self.backend.calls.count('native deployment adapter'), 1)
+
+    def test_already_verified_standalone_release_waits_for_fresh_job_proof_without_redeployment(self):
+        proposed = self.advance()
+        self.backend.pull = pull(proposed['proposal'], merged=True)
+        self.backend.interrupted = False
+        production = self.backend.published(D, {'pull_request': 7, 'review_head': B, 'source_tree': C})
+        active = dict(production, dns_name=DNS, verified_destination=True, destination_receipt_sha256='7'*64)
+        self.backend.deployed.update(active=active, confirmed=active['artifact_sha256'])
+        with self.assertRaisesRegex(delivery.Wait, 'signed-destination-evidence'):
+            self.advance()
+        self.assertEqual(p.loads(read_private(self.state, 16384))['phase'], 'awaiting-independent-destination')
+        self.assertNotIn('promotion_job_id', active)
+        self.assertNotIn('native deployment adapter', self.backend.calls)
+        self.backend.proof = True
+        final = self.advance()
+        self.assertEqual(final['phase'], 'confirmed')
+        self.assertEqual(final['destination_receipt_sha256'], '4'*64)
+        self.assertEqual(active['promotion_job_id'], JOB)
+        self.assertEqual(self.backend.calls.count('independent destination confirmation'), 1)
+        self.assertNotIn('native deployment adapter', self.backend.calls)
 
     def test_protected_host_recovers_typed_role_exit_without_reading_diagnostics(self):
         live = object.__new__(delivery.Live)

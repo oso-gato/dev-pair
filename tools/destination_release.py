@@ -1234,14 +1234,15 @@ class Destination(Bootstrap):
                 require(type(job_id) is str and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,47}', job_id) and
                         type(run_attempt) is int and run_attempt > 0 and release['run_attempt'] == run_attempt,
                         'promotion deployment differs from the checked job or publisher attempt')
-                release['promotion_job_id'] = job_id
             active, pending = state['active'], state['pending']
             if active and job_id is not None and all(active.get(key) == release[key] for key in
                                                        ('source_sha', 'subject', 'run_id', 'run_attempt')):
                 require(active.get('promotion_job_id', job_id) == job_id,
                         'exact destination rollout is already owned by another promotion job')
             if pending:
-                require(pending['operation'] == 'deploy' and all(pending['release'].get(key) == value for key, value in release.items()),
+                retained = pending['release']
+                require(pending['operation'] == 'deploy' and all(retained.get(key) == value for key, value in release.items())
+                        and retained.get('promotion_job_id') in (None, job_id),
                         'an interrupted different release requires rollback before further deployment')
             elif active and all(active.get(key) == value for key, value in release.items()):
                 require(not active.get('quarantined'), 'a rejected digest requires an independently approved correction')
@@ -1254,6 +1255,8 @@ class Destination(Bootstrap):
             self.pull(uid, 'live', image, secret)
             release.update(image_id=self.image_identity(uid, 'live', image, source, production=True, base=release.get('base')), dns_name=dns,
                            compatibility=COMPATIBILITY)
+            if job_id is not None and (pending is None or pending['release'].get('promotion_job_id') is not None):
+                release['promotion_job_id'] = job_id
             release['unit_sha256'] = hashlib.sha256(self.render_unit(uid, dns, release).encode()).hexdigest()
             ReleaseTrust(self.run).main(source)
             return self.activate(uid, dns, state, release, 'deploy')
