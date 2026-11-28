@@ -720,7 +720,7 @@ def access_probe(payload, *, candidate=False, stable=False, peer_reader=None, ch
         if stable:
             from stable_renewal import for_release, host_bundle
 
-            recovery = getattr(observer, 'recovery_context', lambda: None)()
+            recovery = observer.recovery_context()
             if recovery is None:
                 live_host(controller.release(controller.live_release())['components']['host'])
             else:

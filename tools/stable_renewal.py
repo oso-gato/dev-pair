@@ -432,8 +432,7 @@ def apply(controller, operation, *, kit_source=None):
 
 
 def pending_review(observer):
-    recover = getattr(observer, 'recover_request', None)
-    return (recover() if recover is not None else None) or observer.request()
+    return observer.recover_request() or observer.request()
 
 
 def enroll_stable_reviewer(host, fingerprint, incoming):
@@ -460,26 +459,27 @@ def broker_unit(request):
     return 'dev-pair-stable-' + request
 
 
-def system_command(*args, allowed=(0,)):
+def system_command(*args, allowed=(0,), timeout=15, limit=16384):
     completed = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                               timeout=15, env={'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C.UTF-8'}, check=False)
-    p.require(completed.returncode in allowed and len(completed.stdout) <= 16384,
+                               timeout=timeout, env={'PATH': '/usr/bin:/usr/sbin', 'LC_ALL': 'C.UTF-8'}, check=False)
+    p.require(completed.returncode in allowed and len(completed.stdout) <= limit,
               'the exact stable access gateway operation was unavailable')
     return completed.stdout.decode()
 
 
 def start_observer(bundle, request, pending, *, command=system_command):
-    from systemd_service_profile import exec_start_matches, manager_properties
+    import systemd_service_profile as profile
 
     directory = broker_unit(request)
     unit = directory + '.service'
     script = str(bundle / 'runtime/renewal/agent-observer')
     argv = ('/usr/bin/python3', '-IB', script, 'stable-listen', request)
-    properties = ('LoadState', 'ActiveState', 'Type', 'User', 'Group', 'ExecStart', 'RuntimeDirectory')
+    properties = ('Id', 'LoadState', 'ActiveState', 'FragmentPath', 'DropInPaths', 'Transient', 'Type', 'User',
+                  'Group', 'ExecStart', 'RuntimeDirectory', 'RuntimeDirectoryPreserve', *profile.PROPERTIES)
 
     def show():
         raw = command('/usr/bin/systemctl', 'show', '--all', '--property=' + ','.join(properties), unit)
-        return manager_properties(raw, properties)
+        return profile.manager_properties(raw, properties)
 
     loaded = command('/usr/bin/systemctl', 'show', '--all', '--property=LoadState', '--value', unit,
                      allowed=(0, 1, 4)).strip()
@@ -493,10 +493,22 @@ def start_observer(bundle, request, pending, *, command=system_command):
                 '--property=TimeoutStopSec=15s', '--property=KillMode=control-group',
                 '--property=MemoryMax=1G', '--property=TasksMax=384', *argv)
     row = show()
-    p.require(row['LoadState'] == 'loaded' and row['ActiveState'] in ('active', 'activating') and row['Type'] == 'exec'
+    p.require(row['Id'] == unit and row['LoadState'] == 'loaded' and row['ActiveState'] in ('active', 'activating')
+              and row['FragmentPath'] == '/run/systemd/transient/' + unit and row['Transient'] == 'yes'
+              and row['Type'] == 'exec' and row['RuntimeDirectoryPreserve'] == 'no'
               and (row['User'], row['Group'], row['RuntimeDirectory']) == ('root', 'root', directory)
-              and exec_start_matches(row['ExecStart'], ' '.join(argv)),
+              and profile.exec_start_matches(row['ExecStart'], ' '.join(argv)),
               'the loaded stable access gateway differs from the exact allowed operation')
+    def vendor_query(*args, timeout):
+        return command(*args, timeout=timeout, limit=1024**2)
+
+    profile.observe(row, (), Path, vendor_query)
+    manager = 'org.freedesktop.systemd1'
+    bus_path = '/org/freedesktop/systemd1/unit/' + unit.replace('-', '_2d').replace('.', '_2e')
+    runtime = command('/usr/bin/busctl', 'get-property', manager, bus_path, manager + '.Service', 'RuntimeMaxUSec')
+    measured = re.fullmatch(r't ([1-9][0-9]{0,9})\n', runtime)
+    p.require(measured is not None and int(measured[1]) <= 3600_000_000,
+              'the effective stable access gateway lifetime exceeds its bound')
     path = Path('/run') / directory / 'observer'
     until = time.monotonic() + 5
     while not os.path.lexists(path):
@@ -556,11 +568,12 @@ def poll_access(controller, *, kit_source=None):
 def apply_with_access(controller, operation, *, kit_source=None):
     with controller.lock():
         attempt, state = controller.transition()
-        if state is not None and state['request']['operation'] == operation:
-            recover = getattr(access(controller), 'recover_request', None)
-            poll = (recover is not None and recover() is not None
-                    if state['phase'] not in r.TERMINAL or controller.unfinished_thaw(attempt, state) else
-                    state['phase'] == 'deferred')
+        if state is not None and (state['phase'] not in r.TERMINAL or controller.unfinished_thaw(attempt, state)):
+            r.require((state['request']['scope'], state['request']['operation']) == (SCOPE, operation),
+                      'a different protected operation requires recovery')
+            poll = access(controller).recover_request() is not None
+        elif state is not None and state['request']['operation'] == operation:
+            poll = state['phase'] == 'deferred'
         else:
             offer = s.offer_record(r.read_json(controller.control / OFFER), SCOPE)
             r.require(offer['operation'] == operation, 'confirm the exact prepared stable maintenance window')

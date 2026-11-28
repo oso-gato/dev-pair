@@ -69,15 +69,46 @@ exact checkout, its signed host bundle and the versioned driver before
 activation. The existing fixed services stay available for recovery until the
 fenced host step.
 
-Export `stable_renewal.py access-request` to the existing independent access
-reviewer. Use the [named-route observation procedure](destination-observation.md#review-the-named-ssh-and-workload-routes)
-with the exported stable binding. For each required role observation the
-authorized named tailnet client runs `stable_renewal.py access-probe --role
-maintenance` or `--role development` through the protected root route. The
-returned transcript identifies the staged exact components and current host
-route. Import the reviewer’s signed bundle with `stable_renewal.py
-access-response <protected-receipt-file>`. The dedicated nightly collector
-continues to handle agent-only observations.
+Preparation queues the exact window with the enrolled independent station.
+Run `stable_renewal.py access-status` with the same command prefix to send
+again if the station was unavailable or check for its decision. When the
+command reports `stable-reviewer-trust-required`, ask the independent station
+administrator to run `agent_observer_station.py stable-public-key`. Use the
+public key and independently confirmed fingerprint for the one-time
+`stable_renewal.py reviewer-trust --fingerprint <confirmed-fingerprint>`
+enrollment. Paste the public key as a single line, then run `access-status`.
+
+From the independent station's attended administration terminal, inspect the
+queued window and approve the exact request using the enrolled access-plan
+signer. Use its protected public key file when signing through its agent.
+
+```sh
+python3 -EBs /usr/libexec/dev-pair-observer/tools/agent_observer_station.py stable-pending
+python3 -EBs /usr/libexec/dev-pair-observer/tools/agent_observer_station.py approve-stable \
+  '<request-id>' --signing-key '<enrolled-access-plan-key>'
+```
+
+The station uses its existing named SSH route for each role and address
+family, reads back the Tailscale policy under its independent reviewer
+account, and returns the signed result through the same courier. Stable
+approval uses the separately pinned access-plan key. The unattended nightly
+job continues to process agent-only observations.
+
+If the enrolled station predates the stable courier, its independent
+administrator can update from the clean, separately approved successor
+checkout.
+
+```sh
+python3 -EBs tools/agent_observer_station.py update-tools \
+  --source-sha '<reviewed-successor-commit>' \
+  --previous-kit '<protected-predecessor-checkout>' \
+  --previous-source-sha '<installed-predecessor-commit>'
+```
+
+The update checks both source trees and the installed bytes. Existing station
+accounts, approvals and mailbox remain in place. The destination uses the
+exact signed host bundle to start a bounded observer for this request on
+older hosts.
 
 Apply the operation printed by preparation from the same root command prefix.
 
@@ -86,16 +117,17 @@ python3 -EBs /usr/libexec/dev-pair/tools/stable_renewal.py apply \
   --operation '<printed-operation>'
 ```
 
-The existing controller checkpoints every affected role, verifies native
-readback and resumes the exact sessions. Reuse the same operation after
+Apply polls the courier before entering the protected window. The controller
+checkpoints every affected role, verifies native readback and resumes the
+exact sessions. Reuse the same operation after
 interruption. A compatible predecessor remains available for rollback. If a
 protected fixed billing migration has already changed the launch chain, the
 controller uses its recorded bounded forward recovery while keeping dispatch
-fenced. After a reboot in that window, reuse the same operation. The controller
-keeps the original signed approval and requests a new independent observation
-for the current boot of the exact fenced placement. Waiting for it keeps the
-operation and its recovery allowance intact. Once the fresh proof is accepted,
-rerun the same apply command to finish the recorded transition.
+fenced. After a reboot in that window, reuse the same operation. Apply keeps
+the original signed approval and queues a fresh observation request for the
+current boot of the exact fenced placement. Waiting for the station keeps the
+operation and its recovery allowance intact. Reuse apply to collect the new
+proof and finish the recorded transition.
 
 Use the selected signed stable checkout for ordinary Day 0 status and resume.
 These recheck the current placement and preserve the initial commissioning

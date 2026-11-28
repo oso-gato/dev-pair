@@ -243,7 +243,17 @@ def approve_stable(config, request, signer, *, caller=call_named, scratch='/run'
              'machine_id': binding['machine_id'], 'boot_id': binding['boot_id'], 'approved_at': now,
              'expires_at': binding['candidate']['requested_at'] + 3600}
     payload = encoding(grant)
-    authorization = access_envelope(payload, sign_observation(payload, checked_file(signer, secret=True), STABLE_NAMESPACE))
+    if signer.suffix == '.pub':
+        public = bounded_file(checked_file(signer), 8192).decode('ascii')
+        require(Bootstrap.observer_public_key(public).encode() == b' '.join(trust.split()[2:4]),
+                'attended signing input differs from the enrolled stable authority')
+        with tempfile.TemporaryDirectory(prefix='stable-public-key-', dir=scratch) as temporary:
+            key = Path(temporary) / 'approved.pub'
+            key.write_bytes(b' '.join(trust.split()[2:4]) + b'\n')
+            signature = sign_observation(payload, key, STABLE_NAMESPACE)
+    else:
+        signature = sign_observation(payload, checked_file(signer, secret=True), STABLE_NAMESPACE)
+    authorization = access_envelope(payload, signature)
     stable_approval(authorization, binding, trust, now)
     return observe_selected(config, (tool, request, raw), caller=caller, scratch=scratch, approval=authorization)
 
@@ -330,16 +340,17 @@ def update_station_tools(args):
     with setup_lock():
         changed = {}
         for path, new in successor.items():
-            if path.parent != STATION_TOOLS or prior[path] == new:
+            if path.parent != STATION_TOOLS:
                 continue
-            current = bounded_file(checked_file(path), 512 * 1024)
+            current = bounded_file(protected(path), 512 * 1024)
             require(current in (prior[path], new) and stat.S_IMODE(path.stat().st_mode) == 0o644,
                     'station tool differs from both authorized releases')
             if current != new:
                 changed[path] = (current, new)
         app = Bootstrap()
-        # Keep the forced entry usable while the supporting modules converge.
-        for path, (old, new) in sorted(changed.items(), key=lambda item: item[0].name == 'day0_access_exchange.py'):
+        # Publish dependencies before the unattended and forced entry points.
+        priority = {'destination_observation.py': 1, 'agent_observer_station.py': 2, 'day0_access_exchange.py': 3}
+        for path, (old, new) in sorted(changed.items(), key=lambda item: priority.get(item[0].name, 0)):
             app.atomic(str(path), new.decode('utf-8'), mode=0o644, expected=old.decode('utf-8'))
         install_files(app, {path: (raw, 0o644) for path, raw in successor.items() if path.parent == STATION_TOOLS})
 
