@@ -29,8 +29,10 @@ def root_directory(path, mode=0o700):
 
 def launch(sha):
     from provider_billing import require_broker_release
+    from provider_transition import Fence
 
     r.digest(sha)
+    Fence().require_ready()
     spec = r.read_json(CONTROL / 'broker-requests' / (sha + '.json'))
     p.fields(spec, 'role job operation credential_ref host_artifact_sha256')
     role, job, operation = (spec[key] for key in ('role', 'job', 'operation'))
@@ -81,6 +83,7 @@ def launch(sha):
     command = ['/usr/bin/python3', '-I', '-B', str(script), '--grant', str(grant_path), '--request', str(request),
                '--credential-file', str(secret), '--socket', str(socket_dir / 'responses.sock'),
                '--receipt', str(evidence / role / job / (operation + '.json'))]
+    Fence().require_ready()
     os.execve(command[0], command, {'PATH': '/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8'})
 
 

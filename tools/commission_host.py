@@ -519,6 +519,11 @@ class Commission:
                 'automatic workload feature is held')
         require(row['grant']['expires_unix'] is None or row['grant']['expires_unix'] > time.time(),
                 'automatic workload grant expired')
+        if feature == 'owner-intake':
+            try:
+                self.provider_fence().require_ready()
+            except (OSError, ValueError) as exc:
+                raise Pending('provider-transition', 'Provider starts are held for the current broker transition.') from exc
         release = saved['release_sha256']
         require(self.services.workload_scope(self, policy, release, identity['boot_id'], ssh=False) == saved['proof_sha256'] and
                 self.services.feature_authority(feature, release, recorded=row['grant']) == row['grant'],
@@ -549,6 +554,8 @@ class Commission:
                 try:
                     if proof is None:
                         raise Pending(pending, 'Current independent workload access is pending.')
+                    if feature == 'owner-intake' and core.get('provider_start_pending'):
+                        raise Pending('provider-transition', core['provider_start_pending'])
                     grant = self.services.feature_authority(feature, selected)
                 except Pending as wait:
                     holds[feature] = wait.report['prerequisite']
@@ -778,6 +785,7 @@ class Commission:
             return intent
 
     def unit(self, unit, files, *, uid=None, timer=False):
+        import provider_transition
         import systemd_service_profile as profile
 
         template = re.sub(r'@[^.]+\.service$', '@.service', unit)
@@ -800,9 +808,10 @@ class Commission:
             try:
                 service = row
                 guards = [files[name][0].decode().split('ExecCondition=', 1)[1].strip() for name in drops
-                          if name.endswith('/81-dev-pair-workload-guard.conf')]
+                          if name == provider_transition.DROP_IN or name.endswith('/81-dev-pair-workload-guard.conf')]
                 if guards:
-                    require(len(guards) == 1 and profile.exec_start_matches(row['ExecCondition'], guards[0]),
+                    start_guard = guards[0].replace('%i', unit.partition('@')[2].removesuffix('.service'))
+                    require(len(guards) == 1 and profile.exec_start_matches(row['ExecCondition'], start_guard),
                             'systemd workload guard differs for ' + unit)
                     service = {**row, 'ExecCondition': ''}
                 profile.observe(service, drops, self.path, self.run, owner=self.owner)
@@ -866,6 +875,22 @@ class Commission:
                      f'dev-pair-intake@{sample}.service', f'dev-pair-product@{sample}.service'):
             self.unit(unit, files)
 
+    def provider_fence(self):
+        from provider_transition import Fence
+
+        return Fence(self.root, self.run)
+
+    def provider_transition(self):
+        from provider_transition import Deferred
+
+        try:
+            self.provider_fence().converge()
+        except Deferred as exc:
+            return str(exc)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            return 'Provider starts are held until the exact installed manager and pending billing authority can be verified.'
+        return None
+
     def apply(self, policy, policy_sha, boot, site, files, *, retained=()):
         # Check targets, credentials and protected site policy before installing anything.
         self.require_first_site(policy['machine_id'], policy['site_config_sha256'])
@@ -923,11 +948,19 @@ class Commission:
                     recovery['UnitFileState'] == 'enabled' and not os.path.lexists(self.path(FENCE + '/frozen')),
                     'managed checklist listener or recovery gate is still pending')
             self.services.post_provision(policy, selected)
-            armed = self.timers(policy, files, retained=retained)
-            if 'owner-intake' in policy['timers']:
+            provider_pending = self.provider_transition()
+            allowed = policy if provider_pending is None else {
+                **policy, 'timers': [item for item in policy['timers'] if item != 'owner-intake']}
+            if provider_pending is not None and 'owner-intake' in policy['timers']:
+                retained = (*retained, 'owner-intake')
+            armed = self.timers(allowed, files, retained=retained)
+            if 'owner-intake' in allowed['timers']:
                 self.publish_owner_entry(files)
-            return {'phase': 'ready', 'selected_release': selected, 'timers': armed,
-                    'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' in policy['timers'] else None}
+            result = {'phase': 'ready', 'selected_release': selected, 'timers': armed,
+                      'owner_terminal': '/usr/local/bin/dev-pair' if 'owner-intake' in allowed['timers'] else None}
+            if provider_pending is not None:
+                result['provider_start_pending'] = provider_pending
+            return result
 
 
 class Live:

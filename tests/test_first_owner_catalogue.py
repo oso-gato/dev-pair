@@ -24,10 +24,12 @@ import platform_release_intake
 import product_job as product
 import provider_billing
 import provider_broker
+import provider_transition
 import renewal
 import commission_host
 import startup_delivery
 from job_protocol import STANDARDS, canonical, identity, loads, sha256
+from test_provider_transition import fixture_fence
 
 REPOSITORY = 'fixture/owner-checklist'
 JOB = 'job-1'
@@ -94,6 +96,8 @@ class FirstCatalogueTests(unittest.TestCase):
         self.use(mock.patch.object(provider_billing, 'protected', side_effect=lambda path, *, directory=False, private=False:
             self.protected(path, directory=directory, mode=(0o700 if directory else 0o600) if private else None)))
         self.use(mock.patch.object(provider_billing, 'trust_lock', side_effect=contextlib.nullcontext))
+        fence, self.provider_manager = fixture_fence(self.path)
+        self.use(mock.patch.object(provider_transition, 'Fence', return_value=fence))
         self.source = self.site / 'repositories' / REPOSITORY / 'acquired'
         self.startup = self.site / 'repositories' / REPOSITORY / 'startup'
         for repository in (self.source, self.startup):

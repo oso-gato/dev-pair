@@ -377,17 +377,21 @@ def retained_bundle(directory):
     return bounded_file(protected(directory / 'review.bundle', private=True), BUNDLE_LIMIT, owner=0, mode=0o600)
 
 
-def authorize_bundle(raw, reference, secret):
+def json_bundle(raw):
     def reject_pairs(pairs):
         value = dict(pairs)
         p.require(len(value) == len(pairs), 'Duplicate fields in billing review bundle.')
         return value
 
-    p.require(0 < len(raw) <= BUNDLE_LIMIT, 'Billing review bundle is missing or exceeds its bound.')
     try:
-        bundle = json.loads(raw, object_pairs_hook=reject_pairs)
+        return json.loads(raw, object_pairs_hook=reject_pairs)
     except RecursionError as exc:
         raise ValueError('Billing review bundle exceeds its nesting bound.') from exc
+
+
+def authorize_bundle(raw, reference, secret):
+    p.require(0 < len(raw) <= BUNDLE_LIMIT, 'Billing review bundle is missing or exceeds its bound.')
+    bundle = json_bundle(raw)
     p.fields(bundle, 'review signature evidence')
     review = validate_review(bundle['review'], time.time())
     p.require(matches_request(review['request'], reference, secret), 'The review belongs to another credential or host.')
@@ -442,6 +446,20 @@ def trust_lock():
 
 
 def set_reviewer(public, expected_fingerprint, expected_state):
+    from provider_transition import Fence
+
+    if public is not None:
+        public, actual = reviewer_key(public)
+        p.require(actual == expected_fingerprint, 'The key differs from the independently authenticated billing fingerprint.')
+        require_distinct_reviewer(public)
+    prior = reviewer_state()
+    p.require(prior == expected_state or prior is not None and
+              (prior['key'], prior['fingerprint']) == (public, expected_fingerprint),
+              'Billing reviewer custody changed. Reinspect the independent fingerprint.')
+    return Fence().change('reviewer', {'public': public, 'fingerprint': expected_fingerprint, 'expected': expected_state})
+
+
+def _set_reviewer(public, expected_fingerprint, expected_state):
     state = {'schema': 1, 'epoch': uuid.uuid4().hex, 'key': None, 'fingerprint': None}
     if public is not None:
         public, actual = reviewer_key(public)
@@ -452,9 +470,9 @@ def set_reviewer(public, expected_fingerprint, expected_state):
         if public is not None:
             require_distinct_reviewer(public)
         prior = reviewer_state()
-        p.require(prior == expected_state, 'Billing reviewer custody changed. Reinspect the independent fingerprint.')
         if prior is not None and (prior['key'], prior['fingerprint']) == (state['key'], state['fingerprint']):
             return prior
+        p.require(prior == expected_state, 'Billing reviewer custody changed. Reinspect the independent fingerprint.')
         replace_record(root / REVIEWER, state)
     return state
 
@@ -479,6 +497,13 @@ def require_not_withdrawn(root, review):
 
 
 def withdraw_reference(reference):
+    from provider_transition import Fence
+
+    reference_directory(reference)
+    return Fence().change('withdraw-reference', {'reference': reference})
+
+
+def _withdraw_reference(reference):
     root = evidence_directory()
     with lock(root):
         folder = reference_directory(reference)
@@ -543,22 +568,28 @@ def available(secret, review):
 
 
 def receive(reference, raw):
+    from provider_transition import Fence
+
     p.token(reference)
     secret = credential_from(CREDENTIALS / reference)
-    root = evidence_directory()
-    with lock(root):
-        review, proofs = authorize_bundle(raw, reference, secret)
-        folder = private_folder(root / reference)
+    receive_candidate(reference, secret, raw, EVIDENCE / reference)
+    return Fence().change('receive', {'reference': reference, 'data': base64.b64encode(raw).decode('ascii')})
+
+
+def receive_candidate(reference, secret, raw, folder):
+    review, proofs = authorize_bundle(raw, reference, secret)
+    digest = review_digest(review)
+    destination = folder / digest
+    if os.path.lexists(folder):
+        protected(folder, directory=True, private=True)
         require_not_withdrawn(folder, review)
-        digest = review_digest(review)
-        destination = folder / digest
         if os.path.lexists(folder / ACTIVE):
             previous = current_digest(folder)
             prior_proofs = proofs_at(folder / previous)
             if previous == digest:
                 _, issued = authorize_bundle(retained_bundle(destination), reference, secret)
                 p.require(prior_proofs == issued == proofs, 'The issued billing terms changed.')
-                return
+                return review, proofs, destination, True
             prior = p.loads(prior_proofs['context'])['review']
             p.require(review['issued_unix'] > prior['issued_unix'] and
                       all(review[key] == prior[key] for key in ('organization', 'project')) and
@@ -568,6 +599,19 @@ def receive(reference, raw):
             with os.scandir(folder) as children:
                 p.require(sum(1 for _ in islice(children, MAX_REVIEWS + 1)) < MAX_REVIEWS + 1,
                           'The credential evidence directory reached its retention bound.')
+    return review, proofs, destination, False
+
+
+def _receive(reference, raw):
+    p.token(reference)
+    secret = credential_from(CREDENTIALS / reference)
+    root = evidence_directory()
+    with lock(root):
+        folder = private_folder(root / reference)
+        review, proofs, destination, issued = receive_candidate(reference, secret, raw, folder)
+        if issued:
+            return
+        digest = destination.name
         available(secret, review)
         p.require(credential_from(CREDENTIALS / reference) == secret,
                   'The protected credential changed during issuance. Start again.')

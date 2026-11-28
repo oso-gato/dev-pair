@@ -1303,7 +1303,12 @@ def main():
                 else:
                     controller.observe_then_clear_fence(attempt, result)
         elif args.command == 'boot-fence':
+            from provider_transition import reprove_boot
+
+            deadline = time.monotonic() + 7
             controller.boot_fence()
+            if not reprove_boot(deadline):
+                print('Provider starts remain held pending exact readback. Resume Day 0.', file=sys.stderr)
             result = {'phase': 'boot-fenced'}
         elif args.command == 'register':
             result = controller.register(read_json(args.input))

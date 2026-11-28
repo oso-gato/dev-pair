@@ -450,7 +450,9 @@ def preflight_resume(payload):
 
 def preflight_allowance(payload):
     from provider_billing import require_broker_release
+    from provider_transition import Fence
 
+    Fence().require_ready()
     release, _ = admit_release(payload['release_sha256'])
     component = release['components']['host']
     directory = INSTALL / 'host-releases' / component['artifact_sha256']

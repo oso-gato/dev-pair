@@ -866,6 +866,8 @@ class DayZero:
                 lines.append(f"{labels[name]} is held pending {reason.replace('-', ' ')}.")
                 if name == 'owner-intake' and reason in ('owner-catalogue-selection', 'provider-slot-authority'):
                     lines.append('Run ./day0.sh resume to continue first owner setup.')
+            if observed.get('provider_start_pending'):
+                lines.append(observed['provider_start_pending'])
             if 'owner-intake' in observed.get('held_features', ()) and 'owner-intake' not in pending:
                 lines.append('Owner jobs remain held.')
             for units in observed.get('retained_services', {}).values():

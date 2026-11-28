@@ -839,6 +839,7 @@ class SitePending(Exception):
 def selected_site(intake):
     from bootstrap import Blocked, Bootstrap
     from commission_host import AUTOMATIC_POLICY, Blocked as CommissionBlocked, Live, read_policy
+    from provider_transition import Deferred, Fence
 
     if not os.path.lexists(AUTOMATIC_POLICY):
         raise SitePending('core-commissioning', 'Finish the protected core installation with ./day0.sh resume.')
@@ -856,10 +857,13 @@ def selected_site(intake):
     except (Blocked, CommissionBlocked, OSError, ValueError, KeyError, TypeError) as exc:
         raise SitePending('core-commissioning', 'Verify the selected core release and private tailnet cutover.') from exc
     try:
+        Fence().require_ready()
         host = controller.release(selected)['components']['host']['artifact_sha256']
         p.digest(host)
         tools = live.installer.HOST_RELEASES / host / 'tools'
         billing.require_broker_release(Path(__file__).resolve().parent, tools)
+    except Deferred as exc:
+        raise SitePending('provider-transition', str(exc)) from exc
     except (KeyError, TypeError, OSError, ValueError) as exc:
         raise SitePending('provider-billing-runtime',
                           'Select the independently verified host release with matching scoped provider billing.') from exc
@@ -1324,6 +1328,8 @@ def enroll_billing_reviewer(ask, say):
 
 
 def setup_provider(ask, say, outgoing):
+    from provider_transition import Deferred
+
     reference = setup_secret(outgoing, 'Protected credential reference: ')
     p.token(reference)
     if not os.path.lexists(CREDENTIALS / reference):
@@ -1351,6 +1357,8 @@ def setup_provider(ask, say, outgoing):
             raw = billing.bounded_file(billing.protected(path, private=True), billing.BUNDLE_LIMIT,
                                        owner=0, mode=0o600)
             billing.receive(reference, raw)
+        except Deferred:
+            raise
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             reason = str(exc) if type(exc) is ValueError else 'Verify the root-private bundle path and retry.'
             raise SitePending('provider-billing-authority', 'The signed billing bundle was rejected. ' + reason) from exc
@@ -1373,6 +1381,7 @@ def setup_site(first, incoming, outgoing):
     from gptbox_runtime import PROVIDER_BODY_MAX
     from owner_source import provision
     from provider_broker import PROFILE, reserved_cost
+    from provider_transition import Deferred, Fence
 
     def say(message):
         print(message, file=outgoing, flush=True)
@@ -1398,7 +1407,7 @@ def setup_site(first, incoming, outgoing):
                 if not provision(first.intake, repository, workload, ask, say):
                     return
         if manage:
-            action = ask('Billing action [reauthorize/withdraw-key/rotate-reviewer/withdraw-reviewer/Enter]')
+            action = ask('Billing action [reauthorize/withdraw-key/rotate-reviewer/withdraw-reviewer/discard-pending/Enter]')
             if not action:
                 return
             if action == 'rotate-reviewer':
@@ -1417,6 +1426,15 @@ def setup_site(first, incoming, outgoing):
                 if ask('Withdraw this exact credential’s billing terms? [y/N]').lower() in ('y', 'yes'):
                     billing.withdraw_reference(reference)
                     say('The selected credential’s billing terms were withdrawn.')
+                return
+            if action == 'discard-pending':
+                fence = Fence()
+                intended = fence.intent()
+                if intended is None:
+                    say('There is no pending billing operation.')
+                elif ask('Discard the pending billing operation and retain any custody already committed? [y/N]').lower() in ('y', 'yes'):
+                    fence.discard(intended)
+                    say('The pending billing operation was discarded.')
                 return
             p.require(action == 'reauthorize', 'Choose one of the billing actions.')
             p.require(existing is not None, 'An unused configured catalogue slot is required for reauthorization.')
@@ -1477,6 +1495,8 @@ def setup_site(first, incoming, outgoing):
         say('Owner catalogue configured. The protected activation checks can now continue.')
     except SitePending as wait:
         say(wait.observation['message'])
+    except Deferred as wait:
+        say(str(wait))
     except (EOFError, KeyboardInterrupt):
         say('Setup was interrupted. Run the same setup command to inspect the retained state.')
 

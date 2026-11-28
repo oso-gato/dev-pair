@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 import provider_billing as billing
 import provider_broker as broker
+import provider_transition
 from ledger_recovery import write_private
+from test_provider_transition import fixture_fence
 
 REF = 'first-project'
 SECRET = 'sk-proj-offline-fixture-never-sent'
@@ -45,6 +47,8 @@ class ProviderBillingTests(unittest.TestCase):
         self.enterContext(mock.patch.multiple(billing, CREDENTIALS=self.credentials, EVIDENCE=self.evidence,
                                               SIGNERS=self.signers, MACHINE_ID=machine))
         self.enterContext(mock.patch.object(billing, 'protected', side_effect=self.protected))
+        fence, _ = fixture_fence(root)
+        self.enterContext(mock.patch.object(provider_transition, 'Fence', return_value=fence))
         self.enterContext(mock.patch.object(billing, 'trust_lock', side_effect=contextlib.nullcontext))
         self.enterContext(mock.patch.dict(os.environ, SUDO_USER=''))
         self.now = int(time.time())
@@ -162,7 +166,14 @@ class ProviderBillingTests(unittest.TestCase):
         review = json.loads(raw)['review']
         reference = self.evidence / REF
         version = reference / billing.review_digest(review)
-        with mock.patch.object(Path, 'replace', side_effect=OSError('interrupted active pointer')):
+        replace = Path.replace
+
+        def interrupt(path, target):
+            if target == reference / billing.ACTIVE:
+                raise OSError('interrupted active pointer')
+            return replace(path, target)
+
+        with mock.patch.object(Path, 'replace', interrupt):
             self.assertEqual(self.receive(raw)[0], 2)
         self.assertTrue(version.is_dir())
         self.assertFalse((reference / billing.ACTIVE).exists())

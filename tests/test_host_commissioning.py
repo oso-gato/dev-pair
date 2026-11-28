@@ -9,12 +9,14 @@ import re
 import sys
 from tempfile import TemporaryDirectory
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import commission_host as c
 import systemd_service_profile as profile
+import provider_transition
 
 SOURCE = '1' * 40
 PLATFORM = '2' * 64
@@ -41,6 +43,8 @@ class Systemd:
         self.vendor_payload = b'# Fedora test payload\n[Service]\nTimeoutStopFailureMode=abort\n'
         self.vendor_facts = {}
         self.missing_properties = set()
+        self.queued = set()
+        self.pids = {}
 
     def __call__(self, binary, command, *args, **unused):
         if binary == '/usr/bin/rpm':
@@ -62,6 +66,13 @@ class Systemd:
                 self.enabled.discard(args[-1])
                 self.active.discard(args[-1])
             return ''
+        if command == 'list-units':
+            return ''.join(name + ' loaded active running\n' for name in sorted(self.active)
+                           if name.startswith(provider_transition.PREFIX))
+        if command == 'list-jobs':
+            return ''.join('1 ' + name + ' start running\n' for name in sorted(self.queued))
+        if command == 'show' and args == ('--property=UnitPath', '--value'):
+            return c.UNIT_ROOT + '\n'
         if command != 'show':
             raise AssertionError('unexpected manager command')
         unit = args[-1]
@@ -100,8 +111,12 @@ class Systemd:
         row.update(dict.fromkeys(profile.PROPERTIES, ''), NeedDaemonReload='no', KillMode='control-group',
                    SendSIGKILL='yes', FinalKillSignal='9', TimeoutStartFailureMode='terminate',
                    TimeoutStopFailureMode='abort' if vendor.exists() else 'terminate')
+        row.update(Id=unit, Names=unit, Type='exec', MainPID=str(self.pids.get(unit, 1)) if active else '0', ControlPID='0',
+                   Job='1' if unit in self.queued else '0', InvocationID='1' * 32 if active else '',
+                   ControlGroup='')
         if guard:
-            row['ExecCondition'] = '{ path=' + guard.split()[0] + ' ; argv[]=' + guard + ' ; }'
+            row['ExecCondition'] = '{ path=' + guard.split()[0] + ' ; argv[]=' + \
+                guard.replace('%i', unit.partition('@')[2].removesuffix('.service')) + ' ; }'
         row.update(self.vendor_facts)
         return ''.join(f'{key}={row[key]}\n' for key in fields if key not in self.missing_properties
                        and (key not in profile.COMMAND_HOOKS or row[key]))
@@ -179,6 +194,10 @@ class HostCommissioning(unittest.TestCase):
         self.app = c.Commission(self.root, self.root, self.manager, os.getuid(), None)
         self.services = ExistingPaths(self.app, self.manager)
         self.app.services = self.services
+        self.app.directory('/run', 0o755)
+        self.app.file('/proc/sys/kernel/random/boot_id', (BOOT + '\n').encode(), 0o644)
+        if os.getuid():
+            self.app.provider_fence = lambda: SimpleNamespace(converge=lambda: None, require_ready=lambda: None)
 
     def files(self, timers=None):
         selected = set(c.TIMERS if timers is None else timers)
@@ -197,6 +216,12 @@ class HostCommissioning(unittest.TestCase):
                     'dev-pair-intake-recovery.service': 'owner-intake',
                     'dev-pair-checklist-spool.service': 'checklist-spool'}
         files = {'/etc/tmpfiles.d/dev-pair-renewal.conf': (b'# fixture tmpfiles\n', 0o644, 'base')}
+        files[provider_transition.DROP_IN] = (
+            ('[Service]\nExecCondition=' + provider_transition.CONDITION + '\n').encode(), 0o644, 'base')
+        files[provider_transition.GATE] = (Path(provider_transition.__file__).read_bytes(), 0o644, 'base')
+        for name in provider_transition.BILLING_TOOLS:
+            files[name] = (b'# fixed billing tool fixture\n', 0o644, 'base')
+        files[provider_transition.LAUNCHER] = (b'# fixed provider launcher fixture\n', 0o755, 'base')
         for feature in selected:
             timer, service = c.TIMERS[feature]
             service = re.sub(r'@[^.]+\.service$', '@.service', service)

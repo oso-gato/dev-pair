@@ -172,13 +172,20 @@ withdraw the billing reviewer, or enroll the replacement reviewer. Enter
 has been configured. Use
 fresh signed terms for the resulting credential and enrollment. The broker
 checks the current terms, signature and enrollment immediately before each
-paid request. Withdrawal and send admission share a lock. If a send is
-already entering the provider, retry the withdrawal once it releases that
-lock. A request accepted before withdrawal can still incur a charge and its
-reserved effect stays recorded. When upgrading from an earlier broker,
-drain or stop any old process under the approved maintenance scope before
-relying on the new send check. An already submitted request retains its
-existing accounting and the platform does not replay it to change billing.
+paid request. Before continuing a billing change, Day 0 holds new provider
+starts and verifies the installed systemd fence. An earlier provider
+instance or queued start can finish within its existing service limit.
+Day 0 retains the exact pending change and applies it after verified idle
+readback. Use the usual resume command while the transition is pending.
+A request accepted before withdrawal can still incur a charge. Its reserved
+effect stays recorded through the transition.
+
+At reboot the start fence defaults to closed. The installed boot fence can
+restore provider readiness from the current systemd and kernel readback.
+An interrupted attended billing change stays pending for Day 0 to finish.
+If the exact pending input can no longer be used, reopen owner setup and
+choose `discard-pending` after confirming the decision. Any custody already
+committed is retained.
 
 Protected automation can inspect the exact plan through `--inspect-site --help`
 and confirm it through `--initialize-site`. These entries read the same signed
