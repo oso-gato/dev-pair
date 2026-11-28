@@ -31,6 +31,8 @@ ROOT = Path('/var/lib/dev-pair/native-placements')
 ENV = db.local_env()
 SOURCE = Path(__file__).resolve().parent.parent
 SYS = '/usr/bin/systemctl'
+SYSTEMD_EXE = Path('/usr/lib/systemd/systemd')
+SYSTEMD_EXECUTOR = Path('/usr/lib/systemd/systemd-executor')
 PODMAN = (db.PODMAN, '--remote=false', '--runtime=' + db.CRUN, '--cgroup-manager=systemd')
 OUTER_FILES = ('Containerfile', 'controller.py', 'containers.conf', 'enter-podman')
 ENTRY_FILES = ('tools/devbox.py', 'tools/managed_backing.py', 'tools/storage.py',
@@ -446,17 +448,59 @@ def user_manager(account):
     return int(values['MainPID']), scope
 
 
-def idle_process(pid, comm, manager_pid, scope, pause):
+def protected_process_exe(proc, expected):
+    if os.readlink(proc / 'exe') != str(expected):
+        return False
+    try:
+        installed = expected.lstat()
+    except FileNotFoundError:
+        return False
+    live = (proc / 'exe').stat()
+    return (stat.S_ISREG(installed.st_mode) and installed.st_uid == installed.st_gid == 0
+            and stat.S_IMODE(installed.st_mode) == 0o755
+            and (installed.st_dev, installed.st_ino) == (live.st_dev, live.st_ino))
+
+
+def idle_systemd_executor(proc, manager, prefix, owner):
+    # Pin both proc directories so PID reuse cannot splice a different manager
+    # or executable into the PAM worker's identity check.
+    with directory_fd(proc) as child_fd, directory_fd(manager) as manager_fd:
+        for fd in (child_fd, manager_fd):
+            node = os.fstat(fd)
+            if (node.st_uid, node.st_gid) != owner:
+                return False
+        fds = Path('/proc/self/fd')
+        child, parent = fds / str(child_fd), fds / str(manager_fd)
+        scope = prefix + '/init.scope'
+        if ((child / 'cgroup').read_text().strip() != scope
+                or (parent / 'cgroup').read_text().strip() not in (prefix, scope)
+                or (parent / 'comm').read_text() != 'systemd\n'
+                or not protected_process_exe(child, SYSTEMD_EXECUTOR)
+                or not protected_process_exe(parent, SYSTEMD_EXE)):
+            return False
+        with (child / 'cmdline').open('rb') as stream:
+            if stream.read(32) != b'(sd-pam)\0':
+                return False
+        with (child / 'status').open('r', encoding='ascii') as stream:
+            status = stream.read(4097)
+        # Confirm the parent relationship after checking both executable and
+        # process ownership. A reparented or exited worker is no longer idle.
+        return len(status) <= 4096 and re.findall(r'^PPid:[ \t]+([0-9]+)$', status, re.M) == [manager.name]
+
+
+def idle_process(pid, comm, manager_pid, scope, pause, owner=None):
     proc = Path('/proc') / str(pid)
     program = os.readlink(proc / 'exe')
     group = (proc / 'cgroup').read_text().strip()
     prefix = '0::' + scope
-    systemd = '/usr/lib/systemd/systemd'
-    if program == systemd and group in (prefix, prefix + '/init.scope'):
+    if program == str(SYSTEMD_EXE) and group in (prefix, prefix + '/init.scope'):
         if pid == manager_pid and comm == 'systemd':
             return True
         status = (proc / 'status').read_text()
         return comm == '(sd-pam)' and re.search(rf'^PPid:\s+{manager_pid}$', status, re.M) is not None
+    if program == str(SYSTEMD_EXECUTOR):
+        return (owner is not None and pid != manager_pid and comm == '(sd-pam)' and group == prefix + '/init.scope'
+                and idle_systemd_executor(proc, proc.with_name(str(manager_pid)), prefix, owner))
     if (program, comm) in (('/usr/bin/dbus-broker', 'dbus-broker'), ('/usr/bin/dbus-broker-launch', 'dbus-broker-lau')):
         return group in {prefix + '/session.slice/dbus-broker.service', prefix + '/session.slice/dbus.service'}
     if pid != pause:
@@ -494,7 +538,7 @@ def require_idle_roles(dev, maint):
         else:
             require(re.fullmatch(rb'[1-9][0-9]{0,8}', raw), 'rootless pause process reference is invalid')
             pause_pid = int(raw)
-        observed[account.pw_uid] = manager_pid, scope, pause_pid
+        observed[account.pw_uid] = manager_pid, scope, pause_pid, (account.pw_uid, account.pw_gid)
     _, raw = command('/usr/bin/ps', '-e', '-ww', '-o', 'pid=,euid=,comm=')
     prefixes = tuple(str(root) + '/' for root in (devbox.ROOT.parent, Path(dev.pw_dir), Path(maint.pw_dir)))
     for line in raw.decode('utf-8', errors='replace').splitlines():

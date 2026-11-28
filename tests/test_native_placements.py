@@ -1,6 +1,6 @@
 """Local storage ownership, release custody and managed-entry checks for the native bridge."""
 
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 import hashlib
 import io
 import os
@@ -456,6 +456,60 @@ class TestManagedEntry(unittest.TestCase):
             cgroup.return_value = group
             argv.side_effect = lambda *args: io.BytesIO(b'catatonit\0/usr/bin/sleep\x00100\0')
             self.assertFalse(n.idle_process(105, 'catatonit', 101, scope, 105))
+
+    def test_fedora_systemd_pam_child_requires_exact_manager_account_and_executable(self):
+        scope = '/user.slice/user-1001.slice/user@1001.service'
+        group = '0::' + scope + '/init.scope\n'
+        owner = (1001, 1001)
+        child, parent = '/proc/self/fd/105', '/proc/self/fd/101'
+        installed = {
+            n.SYSTEMD_EXECUTOR: SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0, st_gid=0, st_dev=8, st_ino=41),
+            n.SYSTEMD_EXE: SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0, st_gid=0, st_dev=8, st_ino=42),
+        }
+        original = {'child_owner': owner, 'parent_owner': owner, 'argv': b'(sd-pam)\0', 'ppid': 101,
+                    'child_group': group, 'parent_group': group, 'manager_comm': 'systemd\n', 'exe_inode': 41,
+                    'exe_mode': stat.S_IFREG | 0o755, 'exe_owner': 0}
+        state = dict(original)
+
+        def readlink(path):
+            return str(n.SYSTEMD_EXE if str(path) == parent + '/exe' else n.SYSTEMD_EXECUTOR)
+
+        def read_text(path):
+            return {child + '/cgroup': state['child_group'], parent + '/cgroup': state['parent_group'],
+                    parent + '/comm': state['manager_comm'], '/proc/105/cgroup': state['child_group']}[str(path)]
+
+        def open_proc(path, mode, **_):
+            self.assertIn(str(path), (child + '/cmdline', child + '/status'))
+            if mode == 'rb':
+                return io.BytesIO(state['argv'])
+            return io.StringIO(f'Name:\t(sd-pam)\nPPid:\t{state["ppid"]}\n')
+
+        def file_info(path):
+            if path == n.SYSTEMD_EXECUTOR:
+                return SimpleNamespace(**{**vars(installed[path]), 'st_mode': state['exe_mode'], 'st_uid': state['exe_owner']})
+            return installed[path]
+
+        def process_owner(fd):
+            uid, gid = state['child_owner' if fd == 105 else 'parent_owner']
+            return SimpleNamespace(st_uid=uid, st_gid=gid)
+
+        with (patch.object(n, 'directory_fd', side_effect=lambda path: nullcontext(int(path.name))),
+              patch.object(n.os, 'readlink', side_effect=readlink), patch.object(n.os, 'fstat', side_effect=process_owner),
+              patch.object(Path, 'read_text', autospec=True, side_effect=read_text),
+              patch.object(Path, 'open', autospec=True, side_effect=open_proc),
+              patch.object(Path, 'lstat', autospec=True, side_effect=file_info),
+              patch.object(Path, 'stat', autospec=True, side_effect=lambda path: SimpleNamespace(
+                  st_dev=8, st_ino=42 if str(path) == parent + '/exe' else state['exe_inode']))):
+            self.assertTrue(n.idle_process(105, '(sd-pam)', 101, scope, None, owner))
+            self.assertFalse(n.idle_process(105, 'systemd-executor', 101, scope, None, owner))
+            for key, value in (('child_owner', (1002, 1002)), ('parent_owner', (1001, 1002)), ('ppid', 212),
+                               ('child_group', '0::' + scope + '\n'), ('parent_group', '0::/foreign/init.scope\n'),
+                               ('manager_comm', 'other\n'), ('argv', b'(sd-pam)\0--foreign\0'), ('exe_inode', 42),
+                               ('exe_mode', stat.S_IFREG | 0o775), ('exe_owner', 1001)):
+                with self.subTest(key=key):
+                    state[key] = value
+                    self.assertFalse(n.idle_process(105, '(sd-pam)', 101, scope, None, owner))
+                    state.update(original)
 
     def test_uncertain_signed_base_import_keeps_its_spool_on_bounded_storage(self):
         candidate = self.placement()

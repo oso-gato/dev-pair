@@ -56,6 +56,11 @@ class ProducerEngine(Engine):
         pos = args.index(self.app.wrapper)
         command = args[pos + 1:]
         operation = command[0]
+        if command == ('unshare', '/usr/bin/cat', '/proc/self/uid_map', '/proc/self/gid_map'):
+            self.calls.append((args, kwargs))
+            assert {'--uid=dp-maint', 'USER=dp-maint', 'LOGNAME=dp-maint'} <= set(args[:pos])
+            return ''.join(f'{0:10d} {account:10d} {1:10d}\n{1:10d} {1000000:10d} {65536:10d}\n'
+                           for account in (self.account_uid, self.account_gid))
         if operation == 'start' and '--attach' in command:
             log = super().__call__(*args, **kwargs)
             attestation = json.loads(log.splitlines()[-1])

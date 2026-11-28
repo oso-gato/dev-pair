@@ -339,9 +339,9 @@ class ProfileFiles(unittest.TestCase):
             return original(argv,**kwargs)
         app=g.Gptbox(Path(self.temp.name),g.ProbeCommands())
         app.target=g.ROOT+'/'+'a'*64;app.directory(app.target,mode=0o700)
-        app.executor=['/usr/bin/systemd-run','--unit='+UNIT,'--description=dev-pair-owned-'+UNIT,'--property=RuntimeMaxSec=3']
+        app.unit=UNIT;app.configure_executor('1000',g.CONTROL)
         with patch.object(b.subprocess,'Popen',side_effect=manager(gate_process,calls)),self.assertRaises(b.Blocked):
-            app.execute(sys.executable,'-c','print("must not run")')
+            app.execute(sys.executable,'-c','print("must not run")',timeout=3)
         evidence=guest.public_diagnostics(app.path(b.STATE),{'context_sha256':'a'*64})
         self.assertEqual(evidence['adapter']['records'][-1]['relay_failure']['property'],'RuntimeMaxUSec')
         self.assertIn('elapsed_seconds',evidence['adapter']['records'][-1])
