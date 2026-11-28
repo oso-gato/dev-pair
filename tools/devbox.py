@@ -349,7 +349,7 @@ def launch(engine, manifest, admission, account, owner, hooks, mounts, job_turn=
                       for dest, (src, rw) in mounts.items()]
         _, result = engine('create confined DevBox', 'create',
                            *db.container_args(name, owner, manifest, 'outer', hooks), *mount_args,
-                           '--entrypoint=/usr/bin/sleep', image, str(db.OUTER_SECONDS))
+                           *db.container_command('outer', image))
         identity = db.engine_id(result.decode('ascii').strip())
 
         def inspect():

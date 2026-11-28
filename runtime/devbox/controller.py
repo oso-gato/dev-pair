@@ -36,6 +36,11 @@ OCI_HISTORY_FIELDS = 'created created_by author comment empty_layer'
 OUTPUT_LIMIT = 1024 * 1024
 OUTER_SECONDS = 600
 INNER_SECONDS = 180
+CONTAINER_COMMANDS = {
+    'outer': ('/usr/bin/sleep', str(OUTER_SECONDS)),
+    'inner': ('/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt',
+              '--init', '0', '--pre-init-hooks', 'exec /usr/bin/python3 -I ' + GPTBOX + '/runtime.py frozen'),
+}
 OUTER_SCRATCH_MIB = 64
 INNER_SCRATCH_MIB = 16
 CLEANUP_SECONDS = 45
@@ -489,12 +494,22 @@ def container_args(name, owner, manifest, side, hooks):
                    '--env=HOME=/home/gpt', '--env=PATH=/opt/dev-pair/bin:/usr/bin:/bin']
 
 
+def container_command(side, image):
+    path, *args = CONTAINER_COMMANDS[side]
+    return (f'--entrypoint={path}', image, *args)
+
+
 def inspect_policy(row, identity, owner, manifest, side, mounts):
     outer = side == 'outer'
-    config, host = row['Config'], row['HostConfig']
+    config, host = row.get('Config'), row['HostConfig']
+    require(type(config) is dict, f'{side} configured command metadata is missing')
     require(engine_id(row.get('Id')) == identity and engine_id(row.get('Image')) == manifest[side]['image_id']
             and config.get('Labels', {}).get('dev-pair.devbox-owner') == owner,
             f'{side} container identity/image/ownership mismatch')
+    path, *args = CONTAINER_COMMANDS[side]
+    require(row.get('Path') == path and row.get('Args') == args and
+            config.get('Entrypoint') == [path] and config.get('Cmd') == args,
+            f'{side} configured command differs from launch contract')
     require(host.get('ReadonlyRootfs') is True and host.get('Privileged') is False
             and config.get('User') == '1000:1000' and host.get('NetworkMode') == 'none'
             and all(host.get(key) == 'private' for key in ('PidMode', 'IpcMode', 'UTSMode'))
@@ -826,13 +841,11 @@ def controller(expected, owner, seconds, operation=None, request_sha=None, *, pr
     with owned_container(engine, name, owner, release['image_id']):
         _, created = engine('create nested development gptbox', 'create',
                             *container_args(name, owner, manifest, 'inner', BASE / 'empty-hooks'), *mounts,
-                            '--entrypoint=/usr/bin/distrobox-init', release['image_id'], '--name', 'gpt', '--user',
-                            '1000', '--group', '1000', '--home', '/home/gpt', '--init', '0', '--pre-init-hooks',
-                            'exec /usr/bin/python3 -I ' + GPTBOX + '/runtime.py frozen')
+                            *container_command('inner', release['image_id']))
         identity = engine_id(created.decode('ascii').strip())
-        check(engine.inspect('container', identity))
         previous = None
         for _ in range(1 if job else 2):
+            check(engine.inspect('container', identity))
             engine('start nested development gptbox', 'start', identity)
             state = ready(engine, identity, check, previous)['State']
             previous = state['StartedAt']

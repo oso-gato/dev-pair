@@ -1,7 +1,7 @@
 """Local DevBox contract tests. Fedora confinement needs the native runner."""
 
 from copy import deepcopy
-from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 import gzip
 import hashlib
 import io
@@ -40,6 +40,35 @@ def manifest():
                       'inputs_sha256': '7' * 64, 'sealed_sha256': '8' * 64, 'archive_sha256': '9' * 64,
                       'archive_bytes': 800, 'diff_ids': ['sha256:' + 'a' * 64]},
             'categories': {'outer': [10, 11, 12], 'inner': [10, 11]}}
+
+
+def configured_command(side):
+    if side == 'outer':
+        return ['/usr/bin/sleep', '600']
+    return ['/usr/bin/distrobox-init', '--name', 'gpt', '--user', '1000', '--group', '1000', '--home', '/home/gpt',
+            '--init', '0', '--pre-init-hooks', 'exec /usr/bin/python3 -I /usr/lib/dev-pair/gptbox/runtime.py frozen']
+
+
+def configured_container(side, mounts):
+    value = manifest()
+    path, *args = configured_command(side)
+    outer = side == 'outer'
+    labels = {'dev-pair.devbox-owner': OWNER}
+    host = {'ReadonlyRootfs': True, 'Privileged': False, 'NetworkMode': 'none', 'PidMode': 'private',
+            'IpcMode': 'private', 'UTSMode': 'private', 'UsernsMode': 'keep-id'}
+    if outer:
+        host.update(CgroupMode='private', Memory=2 * db.GIB, PidsLimit=512, NanoCpus=1000000000)
+    else:
+        host['Cgroups'] = 'disabled'
+        labels['manager'] = 'distrobox'
+    host['Tmpfs'] = dict.fromkeys(('/run', '/tmp'), f'rw,nosuid,nodev,noexec,U,mode=0700,size={64 if outer else 16}m,rprivate')
+    return {'Id': CHILD, 'Image': value[side]['image_id'], 'Name': ('dp-devbox-' if outer else 'dp-nested-') + OWNER[:24],
+            'Path': path, 'Args': args, 'EffectiveCaps': [], 'BoundingCaps': sorted(db.OUTER_BOUNDING) if outer else [],
+            'ProcessLabel': db.process_label(value, side), 'MountLabel': db.file_label(value, side),
+            'Config': {'Labels': labels, 'Timeout': 600 if outer else 180, 'User': '1000:1000',
+                       'Entrypoint': [path], 'Cmd': args.copy()}, 'HostConfig': host,
+            'Mounts': [{'Type': 'bind', 'Destination': target, 'Source': source, 'RW': writable}
+                       for target, (source, writable) in mounts.items()]}
 
 
 def admission(content):
@@ -377,6 +406,9 @@ class TestConfinementContract(unittest.TestCase):
                               'Tmpfs': dict.fromkeys(('/run', '/tmp'), 'rw,nosuid,nodev,noexec,U,mode=0700,size=16m,rprivate')},
                'Mounts': [{'Type': 'bind', 'Source': '/devbox/job/workspaces', 'Destination': '/work/job',
                            'RW': True}]}
+        path, *args = configured_command('inner')
+        row.update(Path=path, Args=args)
+        row['Config'].update(Entrypoint=[path], Cmd=args.copy())
         db.inspect_policy(row, CHILD, OWNER, value, 'inner', mounts)
         db.inspect_policy({**row, 'EffectiveCaps': None, 'BoundingCaps': None}, CHILD, OWNER, value, 'inner', mounts)
         running = deepcopy(row)
@@ -407,6 +439,34 @@ class TestConfinementContract(unittest.TestCase):
                 db.inspect_policy(altered, CHILD, OWNER, value, 'inner', mounts)
         with self.assertRaisesRegex(db.Blocked, 'engine-managed resolver'):
             db.inspect_policy({**row, 'ResolvConfPath': '/unexpected/resolver'}, CHILD, OWNER, value, 'inner', mounts)
+
+    def test_configured_command_requires_all_four_exact_inspect_fields(self):
+        for side in ('outer', 'inner'):
+            row = configured_container(side, {})
+            db.inspect_policy(row, CHILD, OWNER, manifest(), side, {})
+            for field, wrong in (('Path', '/usr/bin/false'), ('Args', ['unexpected']),
+                                 ('Entrypoint', ['/usr/bin/false']), ('Cmd', ['unexpected'])):
+                for substitution in ('missing', 'value', 'type'):
+                    with self.subTest(side=side, field=field, substitution=substitution):
+                        altered = deepcopy(row)
+                        parent = altered if field in ('Path', 'Args') else altered['Config']
+                        if substitution == 'missing':
+                            del parent[field]
+                        else:
+                            parent[field] = wrong if substitution == 'value' else {'unexpected': field}
+                        with self.assertRaisesRegex(db.Blocked, side + ' configured command'):
+                            db.inspect_policy(altered, CHILD, OWNER, manifest(), side, {})
+
+            alternate = deepcopy(row)
+            alternate.update(Path='/usr/bin/false', Args=[])
+            alternate['Config'].update(Entrypoint=['/usr/bin/false'], Cmd=[])
+            with self.assertRaisesRegex(db.Blocked, side + ' configured command'):
+                db.inspect_policy(alternate, CHILD, OWNER, manifest(), side, {})
+
+        outer = configured_container('outer', {})
+        outer['Mounts'].append({'Type': 'bind', 'Source': '/sys/fs/selinux', 'Destination': '/sys/fs/selinux', 'RW': True})
+        with self.assertRaisesRegex(db.Blocked, 'outer bind allowlist mismatch'):
+            db.inspect_policy(outer, CHILD, OWNER, manifest(), 'outer', {})
 
     def test_effective_mount_flags_detect_writable_root_or_cgroup(self):
         content = '''28 1 0:11 / / ro,relatime - vfs root rw
@@ -510,7 +570,117 @@ class FakeEngine:
         return self.row
 
 
+class ConfiguredEngine(FakeEngine):
+    def __init__(self, configured):
+        super().__init__()
+        self.configured = configured
+        self.created = None
+        self.starts = []
+        self.inspections = []
+
+    def __call__(self, stage, *args, **options):
+        if args[0] == 'info':
+            return 0, b'{}'
+        if args[0] == 'unshare':
+            return 0, b'0 1000 1\n1 1 999\n1000 1001 64536\n' * 2
+        if args[0] == 'create':
+            self.created = args
+            self.row = deepcopy(self.configured)
+            return 0, CHILD.encode()
+        if args[0] == 'start':
+            self.starts.append(args[-1])
+            raise db.Blocked('fixture reached the start boundary')
+        return super().__call__(stage, *args, **options)
+
+    def inspect(self, kind, identity):
+        self.inspections.append((kind, identity))
+        return super().inspect(kind, identity)
+
+
 class TestOwnedLifecycle(unittest.TestCase):
+    def project_inner_environment(self, context):
+        context.enter_context(patch.multiple(db, read_manifest=lambda *_: manifest(),
+            proc_snapshot=lambda *_: {}, offline_interfaces=lambda *_: None, observed_mounts=lambda *_, **__: None,
+            probe_parent_writes=lambda: None, helper_caps=lambda: None, check_engine_info=lambda *_: None,
+            load_development_archive=lambda *_, **__: '0.169.1',
+            file_hash=lambda path, *_, **__: (db.ENTER_SHA256 if path.name == 'distrobox-enter' else INNER, 0, None)))
+        context.enter_context(patch.multiple(db.os, getuid=lambda: 1000, getgid=lambda: 1000, getgroups=lambda: [1000]))
+        context.enter_context(patch.object(Path, 'mkdir'))
+        context.enter_context(patch.object(Path, 'exists', return_value=False))
+
+    def assert_configured_launch(self, engine, side, invoke, *, accepted):
+        with patch.object(db, 'Engine', return_value=engine):
+            reason = 'fixture reached the start boundary' if accepted else side + ' configured command'
+            with self.assertRaisesRegex(db.Blocked, reason):
+                invoke()
+        path, *arguments = configured_command(side)
+        expected = (f'--entrypoint={path}', manifest()[side]['image_id'], *arguments)
+        self.assertEqual(engine.created[-len(expected):], expected)
+        self.assertEqual(engine.inspections[0], ('container', CHILD))
+        self.assertEqual(engine.starts, [CHILD] if accepted else [])
+        self.assertEqual(engine.removals, [CHILD])
+        self.assertIsNone(engine.row)
+
+    def test_outer_launcher_checks_realized_command_before_start_in_all_modes(self):
+        for options in ({}, {'probe_version': '0.169.1'}, {'job_turn': (OWNER, 'operation', INNER)}):
+            for accepted in (True, False):
+                with self.subTest(options=options, accepted=accepted):
+                    row = configured_container('outer', {})
+                    if not accepted:
+                        row['Args'] = ['599']
+                    engine = ConfiguredEngine(row)
+                    self.assert_configured_launch(engine, 'outer', lambda: devbox.launch(
+                        engine, manifest(), INNER, None, OWNER, '/empty', {}, **options), accepted=accepted)
+
+    def test_inner_launcher_checks_the_literal_hook_before_start_in_all_modes(self):
+        for options in ({}, {'probe_version': '0.169.1'}, {'operation': 'operation', 'request_sha': INNER}):
+            for accepted in (True, False):
+                with self.subTest(options=options, accepted=accepted), ExitStack() as context:
+                    mounts = {target: (f'{db.PARENT_JOB}/{key}', True) for key, target in db.JOB_TARGETS.items()}
+                    if 'operation' in options:
+                        mounts.update({db.JOB_BUILD: (db.PARENT_BUILD, True),
+                                       **{target: (source, False) for target, source in db.ADMISSION_ROLE.items()}})
+                    row = configured_container('inner', mounts)
+                    if not accepted:
+                        row['Config']['Cmd'][-1] = 'fixture hook'
+                    engine = ConfiguredEngine(row)
+                    self.project_inner_environment(context)
+                    self.assert_configured_launch(engine, 'inner', lambda: db.controller(INNER, OWNER, 180, **options),
+                                                  accepted=accepted)
+
+    def test_second_nested_probe_start_checks_the_stopped_container_again(self):
+        class ChangedAfterStop(ConfiguredEngine):
+            def __call__(self, stage, *args, **options):
+                if args[0] == 'start' and not self.starts:
+                    self.starts.append(args[-1])
+                    return 0, b''
+                if args[0] == 'stop':
+                    self.row['Args'][-1] = 'fixture change after stop'
+                    return 0, b''
+                return super().__call__(stage, *args, **options)
+
+        mounts = {target: (f'{db.PARENT_JOB}/{key}', True) for key, target in db.JOB_TARGETS.items()}
+        engine = ChangedAfterStop(configured_container('inner', mounts))
+        label = db.process_label(manifest(), 'inner')
+
+        def process(proc, *_):
+            return {'cgroup': 'retained', 'namespaces': dict.fromkeys(db.NS_NAMES, proc.name), 'label': label}
+
+        def entry(_engine, _identity, operation, *_):
+            if operation == 'probe':
+                return json.dumps({'uid': 1000, 'boundary_probe': 'passed', 'selinux_label': label}).encode()
+            return f'codex-cli {db.CODEX_VERSION}'.encode()
+
+        with ExitStack() as context:
+            self.project_inner_environment(context)
+            context.enter_context(patch.object(Path, 'read_text', return_value='0 1 999\n999 1001 1\n1000 1000 1\n1001 1002 64535\n'))
+            context.enter_context(patch.multiple(db, proc_snapshot=process, check_inner_inputs=lambda *_: None,
+                ready=lambda *_: {'State': {'StartedAt': START, 'Pid': 2}}, fixed_entry=entry, Engine=lambda *_: engine))
+            with self.assertRaisesRegex(db.Blocked, 'inner configured command'):
+                db.controller(INNER, OWNER, 180)
+        self.assertEqual(engine.starts, [CHILD])
+        self.assertEqual(engine.removals, [CHILD])
+
     def test_failed_create_reconciles_only_exact_ID(self):
         engine = FakeEngine()
         with patch.object(db, 'Engine', return_value=engine):
