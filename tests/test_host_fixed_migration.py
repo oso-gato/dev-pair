@@ -189,6 +189,19 @@ class FixedMigrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'changes a fixed activation path'):
                 migration.fixed_inputs(home, host)
 
+    def test_historical_omissions_are_allowed_only_for_the_signed_predecessor(self):
+        home, host = self.signed_host(skip=migration.OLD_OPTIONAL)
+        with mock.patch.object(migration.installer.intake, 'protected', side_effect=self.protected):
+            accepted = migration.fixed_inputs(home, host, previous=True)
+            expected = {'owner_source': 0o644, 'day0_access_exchange': 0o755, 'destination_observation': 0o644,
+                        'managed_backing': 0o644}
+            for name, mode in expected.items():
+                path = f'{migration.INSTALL}/tools/{name}.py'
+                self.assertIsNone(accepted[path])
+                self.assertEqual(migration.CHAIN[path], (f'tools/{name}.py', mode))
+            with self.assertRaisesRegex(ValueError, 'missing a required fixed billing path'):
+                migration.fixed_inputs(home, host)
+
     def test_successor_follows_the_signed_optional_billing_courier(self):
         self.assertIsNone(self.old[migration.COURIER])
         self.upgrade.prepare(end=time.monotonic() + 6)

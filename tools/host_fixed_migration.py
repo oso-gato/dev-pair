@@ -27,16 +27,20 @@ CHAIN = {
     transition.TEMPLATE: ('runtime/renewal/dev-pair-provider@.service', 0o644),
     transition.DROP_IN: ('runtime/renewal/provider-start-fence.conf', 0o644),
     COURIER: ('tools/billing_courier.py', 0o755),
+    f'{INSTALL}/tools/day0_access_exchange.py': ('tools/day0_access_exchange.py', 0o755),
     **{f'{INSTALL}/renewal/{name}': (f'runtime/renewal/{name}', 0o755)
        for name in ('provider-run', 'driver', 'host-release')},
     **{f'{INSTALL}/tools/{name}.py': (f'tools/{name}.py', 0o755 if name == 'owner_intake' else 0o644)
        for name in ('provider_billing', 'provider_broker', 'provider_transition', 'host_fixed_migration',
-                    'commission_host', 'owner_intake', 'renewal', 'renewal_site', 'stable_renewal',
-                    'bootstrap', 'destination_observation', 'platform_release_install', 'platform_release_intake')},
+                    'commission_host', 'owner_intake', 'owner_source', 'renewal', 'renewal_site', 'stable_renewal',
+                    'bootstrap', 'destination_observation', 'destination_release', 'managed_backing', 'devbox',
+                    'platform_release_install', 'platform_release_intake')},
 }
-OLD_OPTIONAL = {transition.DROP_IN, transition.GATE, COURIER,
-                f'{INSTALL}/tools/host_fixed_migration.py', f'{INSTALL}/tools/provider_billing.py',
-                f'{INSTALL}/tools/stable_renewal.py'}
+# Old bundles may contain a source without having installed a fixed copy.
+# Its absence must agree with both the signed inventory and the live path.
+OLD_OPTIONAL = {transition.DROP_IN, COURIER, *(
+    f'{INSTALL}/tools/{name}.py' for name in ('provider_transition', 'host_fixed_migration', 'provider_billing',
+        'stable_renewal', 'owner_source', 'day0_access_exchange', 'destination_observation', 'managed_backing'))}
 
 
 def fixed_inputs(directory, host, *, previous=False):
