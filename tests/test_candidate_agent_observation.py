@@ -81,6 +81,9 @@ class CandidateObservation(unittest.TestCase):
         self.signers.write_text(
             'dev-pair-observer-authorized namespaces="' + d.NAMESPACE + '" ' + self.authorized.with_suffix('.pub').read_text() +
             'dev-pair-access-review namespaces="' + d.FINAL_NAMESPACE + '" ' + self.reviewer.with_suffix('.pub').read_text())
+        collector = bootstrap.Bootstrap.observer_public_key(self.authorized.with_suffix('.pub').read_text())
+        self.host.agent_observer_signers.return_value = (bootstrap.AGENT_OBSERVER_PREFIX + collector + '\n').encode()
+        self.host.lock.return_value = nullcontext()
         self.enterContext(patch.object(d, 'checked_file', side_effect=lambda path: Path(path)))
         self.enterContext(patch.object(bootstrap, 'checked_file', side_effect=lambda path: Path(path)))
         self.enterContext(patch.object(d, 'configured_signers', return_value=self.signers))
@@ -187,6 +190,53 @@ class CandidateObservation(unittest.TestCase):
             self.access.receive(wire, self.binding)
         self.assertFalse(self.access.proof_path(self.reference).exists())
 
+    def test_collector_enrollment_distinguishes_keys_and_withdraws_only_its_exact_scope(self):
+        host = bootstrap.Bootstrap(self.root)
+        collector = host.observer_public_key(self.authorized.with_suffix('.pub').read_text())
+        reviewer = host.observer_public_key(self.reviewer.with_suffix('.pub').read_text())
+        old = (f'# Independently maintained trust\n'
+               f'dev-pair-access-review namespaces="{d.FINAL_NAMESPACE}" {reviewer}\n'
+               f'* namespaces="{d.NAMESPACE}" {reviewer}\n')
+        host.atomic(bootstrap.TRUST_SIGNERS, old, mode=0o640)
+        path = host.signer_trust_file()
+        payload = d.encoding({'challenge': 'isolated collector scope'})
+        accepted = d.sign_observation(payload, self.authorized, d.NAMESPACE)
+        other = d.sign_observation(payload, self.reviewer, d.NAMESPACE)
+        with self.assertRaisesRegex(bootstrap.Blocked, 'unavailable or withdrawn'):
+            d.verify_agent_observer(payload, other, host)
+        with self.assertRaisesRegex(bootstrap.Blocked, 'shared with another'):
+            host.update_agent_observer(host.signer_fingerprint(reviewer), public=reviewer)
+        with self.assertRaisesRegex(bootstrap.Blocked, 'fingerprint does not match'):
+            host.update_agent_observer(host.signer_fingerprint(reviewer), public=collector)
+        fingerprint = host.signer_fingerprint(collector)
+        stock = subprocess.check_output(['/usr/bin/ssh-keygen', '-lf', str(self.authorized.with_suffix('.pub'))], text=True)
+        self.assertEqual(fingerprint, stock.split()[1])
+        host.atomic('/etc/ssh/dev-pair-keys/core', collector + '\n')
+        with self.assertRaisesRegex(bootstrap.Blocked, 'named SSH or station transport require distinct keys'):
+            host.update_agent_observer(fingerprint, public=collector)
+        host.path('/etc/ssh/dev-pair-keys/core').unlink()
+        import provider_billing
+
+        host.atomic('/etc/dev-pair/provider-evidence/reviewer.json', '{}\n')
+        with (patch.object(provider_billing, 'reviewer_state', return_value={'key': collector}, create=True),
+              self.assertRaisesRegex(bootstrap.Blocked, 'collector and billing reviewers require distinct keys')):
+            host.update_agent_observer(fingerprint, public=collector)
+        host.path('/etc/dev-pair/provider-evidence/reviewer.json').unlink()
+        host.update_agent_observer(fingerprint, public=collector)
+        enrolled = path.read_bytes()
+        host.update_agent_observer(fingerprint, public=collector)
+        self.assertEqual(path.read_bytes(), enrolled)
+        self.assertEqual(d.verify_agent_observer(payload, accepted, host)[0], json.loads(payload))
+        with self.assertRaisesRegex(bootstrap.Blocked, 'invalid independent signature'):
+            d.verify_agent_observer(payload, other, host)
+        with self.assertRaisesRegex(bootstrap.Blocked, 'differs from the withdrawal'):
+            host.update_agent_observer(host.signer_fingerprint(reviewer))
+        host.update_agent_observer(fingerprint)
+        self.assertEqual(path.read_text(), old)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        with self.assertRaisesRegex(bootstrap.Blocked, 'unavailable or withdrawn'):
+            d.verify_agent_observer(payload, accepted, host)
+
     def test_broker_receives_real_unix_peer_and_denies_wrong_route_and_replay(self):
         import platform_release_intake
 
@@ -215,7 +265,7 @@ class CandidateObservation(unittest.TestCase):
                 serve(right)
                 return json.loads(left.recv(8192))
 
-        with (patch.dict(serve.__globals__, {'Bootstrap': lambda: self.host, 'checked_file': Path}),
+        with (patch.dict(serve.__globals__, {'Bootstrap': lambda: self.host}),
               patch.object(r, 'DEFAULT_ROOT', self.root),
               patch.object(r.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=os.getuid())),
               patch.object(runpy, 'run_path', return_value={'access_probe': driver}),

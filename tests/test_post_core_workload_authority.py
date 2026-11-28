@@ -207,6 +207,7 @@ class SignedWorkloadAuthority(unittest.TestCase):
             result = cli()
             self.assertEqual(set(result['timers']), {c.TIMERS['checklist-spool'][0]}, result)
             self.assertEqual(result['pending_features'], {'agent-renewal': 'release-read-custody',
+                                                         'checklist-promotion': 'promotion-enrollment',
                                                          'owner-intake': 'owner-catalogue-selection'})
             app.require_runtime_feature('checklist-spool')
             if with_grants:
@@ -221,8 +222,18 @@ class SignedWorkloadAuthority(unittest.TestCase):
                     'components': {role: role_policy for role in ('maintenance', 'development')}}))
                 release_policy.chmod(0o600)
                 with patch.object(owner_intake.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=2200, pw_gid=2200)):
+                    withheld = cli()
+                    self.assertEqual(withheld['pending_features'], {'agent-renewal': 'agent-observer-key',
+                                                                   'checklist-promotion': 'promotion-enrollment'})
+                    self.assertNotIn(c.AGENT_BRIDGE[0], withheld['timers'])
+                    self.assertFalse(reads)
+                    collector = root / 'agent-collector'
+                    subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(collector)], check=True)
+                    public = bootstrap.observer_public_key(collector.with_suffix('.pub').read_text())
+                    bootstrap.update_agent_observer(bootstrap.signer_fingerprint(public), public=public)
                     refused = cli()
-                    self.assertEqual(refused['pending_features'], {'agent-renewal': 'agent-publication-read'})
+                    self.assertEqual(refused['pending_features'], {'agent-renewal': 'agent-publication-read',
+                                                                  'checklist-promotion': 'promotion-enrollment'})
                     self.assertNotIn(c.AGENT_BRIDGE[0], refused['timers'])
                     self.assertNotIn('agent_publication', refused)
                     self.assertEqual(reads, [expected_reads[0]])
@@ -240,7 +251,8 @@ class SignedWorkloadAuthority(unittest.TestCase):
                 permission['allowed'] = False
                 with patch.object(owner_intake.pwd, 'getpwnam', return_value=SimpleNamespace(pw_uid=2200, pw_gid=2200)):
                     lost = cli()
-                    self.assertEqual(lost['pending_features'], {'agent-renewal': 'agent-publication-read'})
+                    self.assertEqual(lost['pending_features'], {'agent-renewal': 'agent-publication-read',
+                                                               'checklist-promotion': 'promotion-enrollment'})
                     self.assertNotIn(c.AGENT_BRIDGE[0], lost['timers'])
                     self.assertNotIn(c.AGENT_BRIDGE[0], setup.manager.active)
                     self.assertEqual((archive / 'hosts.yml').stat().st_ino, saved_custody.st_ino)
@@ -253,7 +265,8 @@ class SignedWorkloadAuthority(unittest.TestCase):
                     app.require_runtime_feature('owner-intake', owner_entry=True)
                 result = cli()
                 self.assertEqual(set(result['timers']), {c.AGENT_BRIDGE[0], c.TIMERS['checklist-spool'][0]})
-                self.assertEqual(result['pending_features'], {'owner-intake': 'provider-slot-authority'})
+                self.assertEqual(result['pending_features'], {'owner-intake': 'provider-slot-authority',
+                                                             'checklist-promotion': 'promotion-enrollment'})
                 self.assertFalse(app.path('/etc/sudoers.d/60-dev-pair-owner').exists())
             access = app.path('/var/lib/dev-pair/workload-access.json')
             access.unlink()

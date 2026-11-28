@@ -4,9 +4,9 @@ umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export GIT_OPTIONAL_LOCKS=0
 case "${1:-}" in
-    start|resume) interactive=1 ;;
+    start|resume|observer-trust) interactive=1 ;;
     status|access-request|access-response|access-probe) interactive=0 ;;
-    *) printf 'Usage: ./day0.sh {start|status|resume|access-request|access-response|access-probe} [options]\n' >&2; exit 2 ;;
+    *) printf 'Usage: ./day0.sh {start|status|resume|access-request|access-response|access-probe|observer-trust} [options]\n' >&2; exit 2 ;;
 esac
 if (( EUID != 0 )); then
     printf 'Open the selected VPS root terminal in hPanel, then run this command there.\n' >&2

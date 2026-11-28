@@ -505,6 +505,12 @@ class DayZero:
         return True
 
     def access_trust(self, tty):
+        from bootstrap import SIGNER_TRUST_LOCK
+
+        with self.app.lock(SIGNER_TRUST_LOCK):
+            return self.enroll_access_trust(tty)
+
+    def enroll_access_trust(self, tty):
         from day0_access_exchange import ACCESS_NAMESPACE, ACCESS_PRINCIPAL, key
 
         path = Path(TRUST_SIGNERS)
@@ -532,6 +538,39 @@ class DayZero:
         self.app.atomic(str(path), before + entry, mode=stat.S_IMODE(info.st_mode) if current is not None else 0o600,
                         expected=current)
         return True
+
+    def setup_agent_observer(self, tty, *, revoke=False):
+        enrolled = self.app.agent_observer_signers()
+        if revoke:
+            require(enrolled, 'No independently approved agent collector is enrolled.')
+            fingerprint = answer(tty, 'Enter the enrolled collector’s exact OpenSSH SHA256 fingerprint to withdraw it.')
+            self.app.update_agent_observer(fingerprint)
+            print('Independent collector approval withdrawn. New automatic agent observations are held.', flush=True)
+            return True
+        if enrolled:
+            return True
+        public = answer(tty, 'Paste the independent agent collector’s signing public key, or press Enter to wait.')
+        if not public:
+            return False
+        fingerprint = answer(tty, 'Enter the collector’s OpenSSH SHA256 fingerprint from the separate verified handoff.')
+        if not fingerprint:
+            return False
+        self.app.update_agent_observer(fingerprint, public=public)
+        print('Independent agent collector enrolled for confined role observations.', flush=True)
+        return True
+
+    def observer_trust(self, source, tty, *, revoke=False):
+        revision, archive = kit_source(self.repo, source)
+        identity = self.original()
+        with self.owner_lock():
+            previous = record(STATE / 'progress.json')
+            require(previous and previous['machine_id'] == identity['machine_id'] and identity['selinux'] == '1' and
+                    not os.path.lexists('/.autorelabel'), 'Complete checked Day 0 setup on the selected host first.')
+            self.ensure_git(revision, archive)
+            self.select_source(identity, revision, previous)
+            if not revoke:
+                self.app.verify_final_guard()
+            self.setup_agent_observer(tty, revoke=revoke)
 
     def access_station(self, tty):
         from day0_access_exchange import configuration, configure, identity_public, key
@@ -797,6 +836,9 @@ class DayZero:
                     observed.get('pending_features', {}).get('checklist-promotion') == 'promotion-enrollment' and
                     self.setup_promotion(tty)):
                 observed = self.commission_apply(revision, tty)
+            if (observed.get('pending_features', {}).get('agent-renewal') == 'agent-observer-key' and
+                    self.setup_agent_observer(tty)):
+                observed = self.commission_apply(revision, tty)
         phase = observed.get('phase', 'unknown')
         if phase in ('pending', 'source-gap'):
             self.stage(identity, revision, 'host-bootstrap-complete', observed['message'])
@@ -888,12 +930,14 @@ class DayZero:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('stage', choices=('start', 'status', 'resume', 'access-request', 'access-response', 'access-probe'))
+    parser.add_argument('stage', choices=('start', 'status', 'resume', 'access-request', 'access-response', 'access-probe',
+                                         'observer-trust'))
     parser.add_argument('role', nargs='?', choices=('maintenance', 'development'))
     parser.add_argument('--source-sha')
     parser.add_argument('--confirm-recovery', action='store_true')
     parser.add_argument('--workloads', action='store_true')
     parser.add_argument('--recover-cutover', action='store_true')
+    parser.add_argument('--revoke', action='store_true', help='withdraw the independently enrolled agent collector')
     args = parser.parse_args()
 
     def interrupted(_signal, _frame):
@@ -904,7 +948,8 @@ def main():
         require(os.getuid() == os.geteuid() == 0, 'Open the selected VPS root terminal in hPanel.')
         require((args.role is not None) == (args.stage == 'access-probe') and
                 (not args.workloads or args.stage == 'access-request') and
-                (not args.recover_cutover or args.stage == 'access-response'),
+                (not args.recover_cutover or args.stage == 'access-response') and
+                (not args.revoke or args.stage == 'observer-trust'),
                 'Select the exact access request, response or fixed role probe.')
         os.umask(0o077)
         day0 = DayZero()
@@ -914,6 +959,9 @@ def main():
                 day0.confirm_recovery(tty, args.source_sha)
         elif args.stage == 'status':
             day0.status(args.source_sha)
+        elif args.stage == 'observer-trust':
+            with tty_open() as tty:
+                day0.observer_trust(args.source_sha, tty, revoke=args.revoke)
         elif args.stage in ('access-request', 'access-response', 'access-probe'):
             day0.access_exchange(args.source_sha, sys.stdin.buffer if args.stage == 'access-response' else None,
                                  workload=args.workloads, role=args.role, recover=args.recover_cutover)

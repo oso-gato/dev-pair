@@ -1582,6 +1582,9 @@ class Live:
         from release_trust import POLICY, ReleaseTrust
 
         self.require_release_custody(config=GITHUB_CONFIG)
+        collector = self.bootstrap.agent_observer_signers()
+        if collector is None:
+            raise Pending('agent-observer-key', 'Enroll the independent agent observation collector key to enable unattended renewal.')
         trust = ReleaseTrust(self.run)
         refresh = [trust.policy(role)['components'][role]['agent_refresh'] for role in ('maintenance', 'development')]
         require(refresh[0] == refresh[1] and refresh[0]['workflow'] == '.github/workflows/agent-refresh.yml',
@@ -1594,7 +1597,7 @@ class Live:
         intake.portable_volume()
         intake.intake_limit(intake.ROOT, [intake.META_LIMIT, 2 * intake.CONTROL_LIMIT], intake.ZIP_OVERHEAD)
         authority = [verified.name, digest(capture(Path(POLICY), 0, maximum=65536)),
-                     self.credential_stamp(GITHUB_CONFIG / 'hosts.yml')]
+                     self.credential_stamp(GITHUB_CONFIG / 'hosts.yml'), digest(collector)]
         if confirm_read:
             try:
                 config = intake.native_env().get('GH_CONFIG_DIR', str(GITHUB_CONFIG))

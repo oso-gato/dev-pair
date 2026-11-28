@@ -8,7 +8,10 @@ from pathlib import Path
 import runpy
 import shutil
 import signal
+import stat
+import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from unittest import TestCase
@@ -18,6 +21,9 @@ import zipfile
 import test_renewal_portable as local
 import test_agent_release_bridge as scheduled
 import agent_release_bridge as bridge
+import bootstrap as host_bootstrap
+import day0_access_exchange as access_exchange
+import destination_observation as observation
 import platform_release as publish
 import platform_release_intake as intake
 import platform_release_install as installer
@@ -28,6 +34,21 @@ import test_native_placement_release as native_fixture
 import platform_release_protocol as protocol
 import renewal as renewal
 import renewal_site as site
+
+
+class RootNode:
+    st_uid = 0
+
+    def __init__(self, node):
+        self.node = node
+
+    def __getattr__(self, key):
+        return getattr(self.node, key)
+
+
+class RootPath(type(Path())):
+    def lstat(self):
+        return RootNode(super().lstat())
 
 
 class FixtureOwner:
@@ -48,14 +69,130 @@ class FixtureOwner:
         return SimpleNamespace(nodename='erebus', machine='x86_64')
 
     def fstat(self, fd):
-        info = os.fstat(fd)
-        class FileIdentity:
-            st_uid = 0
+        return RootNode(os.fstat(fd))
 
-            def __getattr__(self, key):
-                return getattr(info, key)
 
-        return FileIdentity()
+class ObservationFixture:
+    """Actual site selectors, narrowed trust, queue and signatures with local kernel/provider projections."""
+    def __init__(self, case, destination):
+        self.case, self.destination = case, destination
+        self.root = destination.root
+        self.mailbox = self.root / 'station-mailbox'
+        self.mailbox.mkdir(mode=0o700)
+        self.dns = 'erebus.fixture.ts.net'
+        self.addresses = {'ipv4': '100.64.0.40', 'ipv6': 'fd7a:115c:a1e0::40'}
+
+        class FixtureHost(host_bootstrap.Bootstrap):
+            def path(host, value):
+                relative = Path(value).relative_to('/')
+                platform = Path('var/lib/dev-pair')
+                return (host.root / relative.relative_to(platform)) if relative.is_relative_to(platform) else host.root / relative
+
+            def directory(host, value, mode=0o700, owner=None):
+                projected = '/' + str(host.path(value).relative_to(host.root))
+                return super().directory(projected, mode=mode, owner=owner)
+
+        self.host = FixtureHost(self.root, self.system)
+        self.host.atomic('/etc/machine-id', '1' * 32 + '\n')
+        self.host.atomic('/proc/sys/kernel/random/boot_id', destination.boot + '\n')
+        self.host.atomic(host_bootstrap.STATE + '/node.json', '{"node_id":"fixture-node","tailnet":"fixture"}\n')
+        self.host.atomic(host_bootstrap.GUARD_PATH, self.host.guard_rules([], tailnet_only=True))
+        self.host.atomic(host_bootstrap.SSH_CUTOVER, host_bootstrap.SSH_CUTOVER_CONFIG)
+        keys = {}
+        for name in ('core', 'collector', 'reviewer'):
+            key = self.root / (name + '-key')
+            subprocess.run(['/usr/bin/ssh-keygen', '-q', '-N', '', '-t', 'ed25519', '-f', str(key)], check=True, timeout=5)
+            keys[name] = self.host.observer_public_key(key.with_suffix('.pub').read_text())
+        self.host.atomic('/etc/ssh/dev-pair-keys/core', keys['core'] + '\n')
+        self.host.atomic(host_bootstrap.TRUST_SIGNERS,
+                         f'dev-pair-access-review namespaces="{observation.FINAL_NAMESPACE}" {keys["reviewer"]}\n')
+        self.host.update_agent_observer(self.host.signer_fingerprint(keys['collector']), public=keys['collector'])
+        self.signers = self.host.signer_trust_file()
+
+    def system(self, *args, **options):
+        if args[0] == '/usr/sbin/nft':
+            return '{"nftables":[{"table":{"family":"inet","name":"dev_pair_bootstrap"}}]}\n'
+        if args[0] == '/usr/bin/tailscale':
+            return json.dumps({'CurrentTailnet': {'Name': 'fixture'}, 'BackendState': 'Running',
+                               'Self': {'ID': 'fixture-node', 'DNSName': self.dns, 'Online': True},
+                               'TailscaleIPs': list(self.addresses.values())})
+        if args[:2] == ('/usr/sbin/sshd', '-t'):
+            return ''
+        if args[:2] == ('/usr/sbin/sshd', '-T'):
+            return ('permitrootlogin no\nallowusers core\nauthenticationmethods publickey\n'
+                    'passwordauthentication no\nkbdinteractiveauthentication no\n'
+                    'authorizedkeysfile /etc/ssh/dev-pair-keys/core\n')
+        raise AssertionError('Unexpected host observation command ' + repr(args))
+
+    def initialize(self, reference):
+        release = site.role_artifacts(self.destination.controller, reference)
+        self.guard = {'phase': 'complete', 'target': {'source_sha': 'a' * 40, 'tailnet': 'fixture',
+                                                        'node_id': 'fixture-node', 'dns_name': self.dns},
+                      'guard_sha256': self.host.guard_hash(), 'core_keys_sha256': self.host.access_keys_digest(),
+                      'acl_sha256': 'e' * 64, 'role_artifacts': release,
+                      'provider_recovery': 'hostinger://fixture/recovery', 'public_addresses': {'ipv4': '8.8.4.4', 'ipv6': None}}
+        self.host.atomic(host_bootstrap.CUTOVER, observation.encoding(self.guard).decode())
+        self.host.publish_workload_gate('admitted', release)
+
+    def transport(self, request):
+        raw = observation.encoding(request)
+        result = io.BytesIO()
+        access_exchange.receive(self.mailbox, access_exchange.COMMAND + ' ' + observation.digest(raw),
+                                io.BytesIO(raw), result, int(time.time()))
+        return result.getvalue() or None
+
+    def independent_observation(self, request, native):
+        reference = request['role_artifacts']['release_sha256']
+        plan = {key: value for key, value in request.items() if key in observation.AGENT_SITE_FIELDS}
+        plan.update({key: request['candidate'][key] for key in ('guard_sha256', 'acl_sha256', 'host_artifact_sha256')})
+        plan.update(devbox_image=request['role_artifacts']['devbox_image'], provider_recovery=self.guard['provider_recovery'],
+                    public_addresses=self.guard['public_addresses'])
+        directory = self.root / ('station-' + reference[:24])
+        directory.mkdir(mode=0o700)
+
+        def challenge(binding, family, wire, *_):
+            raw, signature = observation.read_access_envelope(io.BytesIO(wire))
+            proof, fingerprint = observation.verify_agent_observer(raw, signature, self.host)
+            observation.agent_probe_challenge(proof)
+            self.case.assertEqual(proof['request_sha256'], observation.digest(observation.encoding(binding)))
+            self.case.assertEqual((proof['candidate'], proof['family']), (reference, family))
+            self.case.assertEqual(self.destination.controller.live_release(), request['candidate']['previous_release_sha256'])
+            platform = request['candidate']['platform_sha256']
+            if proof['role'] == 'maintenance':
+                outcome = next(call for call in native['calls'] if call[:2] == ('maintenance-observed', platform))
+            else:
+                outcome = next(call for call in native['calls'] if call == ('placement', 'stage', platform))
+            role_result = observation.expected_role_probe(binding, proof['role'] + '-authorized', family)
+            return observation.encoding({**role_result, 'challenge_sha256': fingerprint,
+                                         'runtime_result_sha256': renewal.identity(list(outcome))})
+
+        with (patch.object(observation, 'ssh_candidate_probe', side_effect=challenge),
+              patch.object(observation, 'configured_signers', return_value=self.signers),
+              patch.object(observation, 'measure_tailnet_policy', return_value=self.guard['acl_sha256'])):
+            collection = directory / 'collection.bundle'
+            collection.write_bytes(observation.collect_candidate(request, plan, directory, None, None, self.root / 'collector-key'))
+            response = observation.assemble_candidate(request, plan, collection, self.root / 'reviewer-key', None)
+        access_exchange.publish(self.mailbox, observation.digest(observation.encoding(request)), io.BytesIO(response), int(time.time()))
+
+    def select(self, candidate_access, request):
+        control = self.destination.controller.control
+        fence = self.root / 'renewal-fence' / 'frozen'
+        attempt_id = request['operation']
+        directory = control / 'attempts' / attempt_id
+        directory.mkdir(mode=0o700, parents=True)
+        path = directory / 'journal.json'
+        journal = {'phase': 'applying', 'request': request}
+        renewal.replace_json(path, journal)
+        renewal.replace_json(control / 'transition.json', attempt_id)
+        renewal.replace_json(fence, attempt_id)
+        target = request['target_sha256']
+        candidate_access.accept(target, attempt_id)
+        renewal.replace_json(control / 'site-current.json', target)
+        self.host.restore_retained_workload_gate(target)
+        renewal.replace_json(control / 'current.json', target)
+        renewal.replace_json(path, {**journal, 'phase': 'completed'})
+        fence.unlink()
+        self.case.assertEqual(self.host.verify_workload_access()['role_artifacts']['release_sha256'], target)
 
 
 class NightlyComposition(TestCase):
@@ -72,7 +209,9 @@ class NightlyComposition(TestCase):
 
     def run_composition(self, events):
         destination = local.PortableSiteTests()
-        destination.setUp()
+        temporary = tempfile.TemporaryDirectory
+        with patch.object(local.tempfile, 'TemporaryDirectory', side_effect=lambda: temporary(dir=Path(__file__).resolve().parents[2])):
+            destination.setUp()
         self.addCleanup(destination.doCleanups)
         store = destination.root / 'platform-releases'
         control = destination.controller.control
@@ -245,6 +384,26 @@ class NightlyComposition(TestCase):
         adapter = {'resolver': destination.resolve.resolve}
         fixture_resolver = destination.resolve
         ordinary_json = publish.readonly_json
+        original_checked_file = host_bootstrap.checked_file
+        original_workload_gate = renewal.protocol.require_workload_access
+
+        def checked_fixture_file(path, *, secret=False):
+            path = Path(path)
+            if not path.is_relative_to(destination.root):
+                return original_checked_file(path, secret=secret)
+            for leaf in (path, *path.parents):
+                info = leaf.lstat()
+                self.assertIn(info.st_uid, (0, os.getuid()))
+                self.assertFalse(info.st_mode & 0o022)
+                self.assertTrue(stat.S_ISREG(info.st_mode) if leaf == path else stat.S_ISDIR(info.st_mode))
+            self.assertLessEqual(path.stat().st_size, 16384)
+            return path
+
+        def fixture_workload_gate(root, **scope):
+            self.assertEqual(root, destination.root)
+            with patch.object(renewal.protocol, 'os', FixtureOwner()):
+                return original_workload_gate(RootPath(root), **scope)
+
         with ExitStack() as stack:
             stack.enter_context(patch.object(bridge, 'os', FixtureOwner(os.geteuid())))
             stack.enter_context(patch.object(intake, 'os', FixtureOwner()))
@@ -297,13 +456,20 @@ class NightlyComposition(TestCase):
             factory.import_admission.side_effect = maint.import_admission
             stack.enter_context(patch.object(maint, 'prove_installed_maintenance', side_effect=observe_maintenance))
             stack.enter_context(patch.object(publish, 'source_checkout'))
+            stack.enter_context(patch.object(host_bootstrap, 'checked_file', side_effect=checked_fixture_file))
+            stack.enter_context(patch.object(observation, 'checked_file', side_effect=checked_fixture_file))
+            stack.enter_context(patch.object(renewal.protocol, 'require_workload_access', side_effect=fixture_workload_gate))
+            observers = ObservationFixture(self, destination)
+            stack.enter_context(patch.object(host_bootstrap, 'Bootstrap', return_value=observers.host))
             controller = bridge.Site(renewal, site, intake, protocol)
             stack.enter_context(patch.object(controller, 'run_tool', side_effect=native_runner))
             stack.enter_context(patch.object(controller, 'dispatch', side_effect=lambda: native['calls'].append(('dispatched',))))
+            stack.enter_context(patch.object(controller, 'exchange_observation', side_effect=observers.transport))
             installer.install(first, destination.config_sha, time.monotonic() + 30)
             initial = resolve(destination.offer(first))
             for name in ('current.json', 'site-current.json'):
                 renewal.replace_json(control / name, initial['release_sha256'])
+            observers.initialize(initial['release_sha256'])
             prior = first
             for (day, run_id, letter, version), event_name in zip(((26, 22, 'b', '2.0.0'), (27, 23, 'c', '3.0.0')), events):
                 source = letter * 40
@@ -366,7 +532,19 @@ class NightlyComposition(TestCase):
                 native['artifacts'][run_id] = {'artifacts': rows, 'total_count': len(rows)}
                 shutil.rmtree(store / staged)
                 native['occupied'] = True
-                self.assertEqual(controller.cycle(bridge.selection_window(stamp(day, 22, 30), on_demand))['status'], 'queued')
+                window = bridge.selection_window(stamp(day, 22, 30), on_demand)
+                selected_old = destination.controller.live_release()
+                previous_offer = controller.offer.read_bytes() if controller.offer.exists() else None
+                previous_dispatches = native['calls'].count(('dispatched',))
+                self.assertEqual(controller.cycle(window)['status'], 'awaiting-independent-observation')
+                self.assertEqual(destination.controller.live_release(), selected_old)
+                self.assertEqual(native['calls'].count(('dispatched',)), previous_dispatches)
+                self.assertEqual(controller.offer.read_bytes() if controller.offer.exists() else None, previous_offer)
+                request_binding = controller.observation.request()
+                self.assertEqual(request_binding['candidate']['platform_sha256'], staged)
+                self.assertEqual(request_binding['candidate']['previous_release_sha256'], selected_old)
+                observers.independent_observation(request_binding, native)
+                self.assertEqual(controller.cycle(window)['status'], 'queued')
                 self.assertIn(('retained-predecessor', staged, prior), native['calls'])
                 self.assertIn(('observed-install', staged), native['calls'])
                 self.assertIn(('placement', 'preflight', staged), native['calls'])
@@ -394,7 +572,6 @@ class NightlyComposition(TestCase):
                 request = destination.controller.active_request('agent')
                 self.assertEqual(request['target_sha256'], result['release_sha256'])
                 self.assertEqual(request['previous_sha256'], renewal.read_json(control / 'current.json'))
-                for selector_name in ('current.json', 'site-current.json'):
-                    renewal.replace_json(control / selector_name, result['release_sha256'])
+                observers.select(controller.observation, request)
                 prior = staged
         self.assertEqual(len([leaf for leaf in store.iterdir() if len(leaf.name) == 64]), 3)

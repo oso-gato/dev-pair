@@ -74,6 +74,16 @@ policy against the independently signed workload receipt before enabling its
 station timer. The restricted courier mailbox uses the existing Day 0 SSH
 transport. [Access station setup](owner-day0.md#independent-access-station-setup)
 
+On the destination, `./day0.sh resume` offers to enroll the collector when
+agent renewal is waiting for that approval. Supply the collector's public
+key and its `SHA256:` OpenSSH fingerprint from a separate verified handoff.
+Use `./day0.sh observer-trust` to enroll it directly. The collector's key is
+separate from named SSH, station transport, billing and final access signing.
+To withdraw the collector, run `./day0.sh observer-trust --revoke` and enter
+its exact enrolled fingerprint. Pending automatic observations from that key
+lose authorization. The selected release may need a fresh workload review
+if its current approval used the withdrawn key.
+
 The collector connects as the admitted named operator over Tailnet SSH and
 uses the destination observer gateway for the exact candidate on both role
 paths. The independent reviewer checks the observations and current policy

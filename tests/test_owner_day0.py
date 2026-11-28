@@ -219,6 +219,7 @@ class DayZeroTests(unittest.TestCase):
             target.write_text(content)
 
         self.entry.app.atomic.side_effect = write
+        self.entry.app.lock.return_value = nullcontext()
         with patch.object(day, 'TRUST_SIGNERS', str(target)), patch.object(day, 'answer', return_value=public) as prompt:
             self.assertTrue(self.entry.access_trust(None))
             self.assertTrue(self.entry.access_trust(None))
@@ -226,6 +227,21 @@ class DayZeroTests(unittest.TestCase):
         self.entry.app.atomic.assert_called_once()
         self.assertEqual(target.read_text(), old + 'dev-pair-access-review namespaces="dev-pair-destination" ' +
                          ' '.join(public.split()[:2]) + '\n')
+
+    def test_collector_setup_requires_independent_fingerprint_and_withdraws_by_identity(self):
+        public = 'independent public key from the station'
+        fingerprint = 'SHA256:' + 'x' * 43
+        self.entry.app.agent_observer_signers.return_value = None
+        with patch.object(day, 'answer', side_effect=[public, '']):
+            self.assertFalse(self.entry.setup_agent_observer(None))
+        self.entry.app.update_agent_observer.assert_not_called()
+        with patch.object(day, 'answer', side_effect=[public, fingerprint]):
+            self.assertTrue(self.entry.setup_agent_observer(None))
+        self.entry.app.update_agent_observer.assert_called_once_with(fingerprint, public=public)
+        self.entry.app.agent_observer_signers.return_value = b'enrolled collector'
+        with patch.object(day, 'answer', return_value=fingerprint):
+            self.assertTrue(self.entry.setup_agent_observer(None, revoke=True))
+        self.entry.app.update_agent_observer.assert_called_with(fingerprint)
 
     def test_gitless_kit_verification_and_signed_prerequisite(self):
         repo = self.entry.repo

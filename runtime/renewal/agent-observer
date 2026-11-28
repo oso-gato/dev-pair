@@ -13,9 +13,9 @@ import time
 
 INSTALL = Path('/usr/libexec/dev-pair')
 sys.path.insert(0, str(INSTALL / 'tools'))
-from bootstrap import Blocked, Bootstrap, TRUST_SIGNERS, checked_file
-from destination_observation import (MAX_ACCESS_ENVELOPE, NAMESPACE, agent_probe_challenge, encoding, keys,
-                                     observer_principal, read_access_envelope, require, verify_bytes)
+from bootstrap import Blocked, Bootstrap
+from destination_observation import (MAX_ACCESS_ENVELOPE, agent_probe_challenge, encoding, keys,
+                                     read_access_envelope, require, verify_agent_observer)
 import renewal as r
 
 SOCKET = '/run/dev-pair-agent-observer.sock'
@@ -70,8 +70,7 @@ def serve(channel):
             'invalid candidate probe transport')
     payload, signature = read_access_envelope(io.BytesIO(request['envelope'].encode('ascii')))
     host = Bootstrap()
-    signers = checked_file(host.path(TRUST_SIGNERS))
-    challenge, commitment = verify_bytes(payload, signature, observer_principal('authorized'), signers, NAMESPACE)
+    challenge, commitment = verify_agent_observer(payload, signature, host)
     agent_probe_challenge(challenge)
     require(int(time.time()) < challenge['expires_at'] <= int(time.time()) + 120,
             'signed probe challenge is outside its two-minute start window')

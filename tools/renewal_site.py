@@ -534,9 +534,9 @@ class CandidateAccess:
 
     def verify(self, envelope, reference, guard, *, expected=None, checked_at=None):
         from bootstrap import TRUST_SIGNERS, checked_file
-        from destination_observation import (ACCESS, AGENT_CANDIDATE, CORE_BINDING, FINAL_NAMESPACE, NAMESPACE,
-                                             checked_candidate_readings, encoding, observer_principal,
-                                             read_access_envelope, validate_candidate, verify_bytes)
+        from destination_observation import (ACCESS, AGENT_CANDIDATE, CORE_BINDING, FINAL_NAMESPACE,
+                                             checked_candidate_readings, encoding, read_access_envelope,
+                                             validate_candidate, verify_agent_observer, verify_bytes)
 
         payload, signature = read_access_envelope(io.BytesIO(envelope.encode('ascii')))
         signers = checked_file(self.host.path(TRUST_SIGNERS))
@@ -590,8 +590,7 @@ class CandidateAccess:
                       'independent Tailscale policy measurement is stale or for a different candidate')
             collection = {'request_sha256': request_sha, 'readings': data['probes']}
             collector_signature = base64.b64decode(data['collector_signature'], validate=True)
-            measured, _ = verify_bytes(encoding(collection), collector_signature, observer_principal('authorized'),
-                                       signers, NAMESPACE)
+            measured, _ = verify_agent_observer(encoding(collection), collector_signature, self.host)
             r.require(measured == collection, 'independent collector signature differs from final candidate observations')
         else:
             plan = self.host.access_probe_plan(dns, data['provider_recovery'], data['public_addresses'])
@@ -622,6 +621,8 @@ class CandidateAccess:
         return proof
 
     def accept(self, reference, operation):
+        from bootstrap import SIGNER_TRUST_LOCK
+
         attempt, state = self.controller.transition()
         r.require(state is not None and state['phase'] == 'applying' and state['request']['scope'] == 'agent' and
                   state['request']['target_sha256'] == reference and state['request']['operation'] == operation and
@@ -633,9 +634,10 @@ class CandidateAccess:
         guard = self.host.verify_final_guard()
         self.host.verify_final_ssh()
         now = int(time.time())
-        proof = self.fresh(reference, previous, operation, guard=guard, checked_at=now)
-        if proof['accepted_at'] is None:
-            r.replace_json(self.proof_path(reference), {**proof, 'accepted_at': now})
+        with self.host.lock(SIGNER_TRUST_LOCK):
+            proof = self.fresh(reference, previous, operation, guard=guard, checked_at=now)
+            if proof['accepted_at'] is None:
+                r.replace_json(self.proof_path(reference), {**proof, 'accepted_at': now})
 
     def admitted(self, reference, guard):
         path = self.proof_path(reference)

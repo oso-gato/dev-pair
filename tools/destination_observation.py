@@ -3,6 +3,7 @@
 
 import argparse
 import base64
+from contextlib import nullcontext
 import hashlib
 import http.client
 import ipaddress
@@ -21,13 +22,13 @@ import time
 from urllib.parse import quote, urlencode, urlsplit
 import uuid
 
-from bootstrap import (Blocked, Bootstrap, CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER, checked_file, relay,
-                       validate_public_keys)
+from bootstrap import (AGENT_OBSERVER_NAMESPACE, AGENT_OBSERVER_PRINCIPAL, Blocked, Bootstrap, CORE_ACCESS_CUTOVER,
+                       WORKLOAD_ACCESS_CUTOVER, checked_file, relay, validate_public_keys)
 from release_trust import DIGEST, SHA, require
 
 SIGNERS = '/etc/dev-pair/destination-observer/allowed_signers'
 RELEASE_SITE = '/etc/dev-pair/destination-observer/release-site.json'
-NAMESPACE = 'dev-pair-destination-observation'
+NAMESPACE = AGENT_OBSERVER_NAMESPACE
 FINAL_NAMESPACE = 'dev-pair-destination'
 FAMILIES = {'ipv4': socket.AF_INET, 'ipv6': socket.AF_INET6}
 TAILNETS = {4: ipaddress.ip_network('100.64.0.0/10'), 6: ipaddress.ip_network('fd7a:115c:a1e0::/48')}
@@ -163,16 +164,29 @@ def record_name(test, family):
 
 
 def verify_bytes(payload, signature, principal, signers, namespace):
-    with tempfile.TemporaryFile() as original:
+    scoped = type(signers) is bytes
+    with tempfile.TemporaryFile() as original, (tempfile.TemporaryFile() if scoped else nullcontext()) as allowed:
         original.write(signature)
         original.flush()
+        descriptors = [original.fileno()]
+        if scoped:
+            allowed.write(signers)
+            allowed.flush()
+            descriptors.append(allowed.fileno())
+            signers = f'/proc/self/fd/{allowed.fileno()}'
         result = subprocess.run(
             ['/usr/bin/ssh-keygen', '-Y', 'verify', '-f', str(signers), '-I', principal,
              '-n', namespace, '-s', f'/proc/self/fd/{original.fileno()}'],
-            input=payload, capture_output=True, pass_fds=(original.fileno(),), timeout=10,
+            input=payload, capture_output=True, pass_fds=tuple(descriptors), timeout=10,
             env={'PATH': '/usr/bin', 'LC_ALL': 'C'}, check=False)
     require(result.returncode == 0, 'invalid independent signature for ' + principal)
     return json.loads(payload, object_pairs_hook=relay.unique), digest(payload)
+
+
+def verify_agent_observer(payload, signature, host):
+    scoped = host.agent_observer_signers()
+    require(scoped, 'the independent agent collector key is unavailable or withdrawn')
+    return verify_bytes(payload, signature, AGENT_OBSERVER_PRINCIPAL, scoped, AGENT_OBSERVER_NAMESPACE)
 
 
 def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):

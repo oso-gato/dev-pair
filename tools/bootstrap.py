@@ -58,6 +58,10 @@ CUTOVER = STATE + '/access-cutover.json'
 CORE_ACCESS_CUTOVER = 'core-access-cutover'
 WORKLOAD_ACCESS_CUTOVER = 'workload-access-cutover'
 TRUST_SIGNERS = '/etc/dev-pair/trust/allowed_signers'
+SIGNER_TRUST_LOCK = 'signer-trust.lock'
+AGENT_OBSERVER_PRINCIPAL = 'dev-pair-observer-authorized'
+AGENT_OBSERVER_NAMESPACE = 'dev-pair-destination-observation'
+AGENT_OBSERVER_PREFIX = f'{AGENT_OBSERVER_PRINCIPAL} namespaces="{AGENT_OBSERVER_NAMESPACE}" '
 CHECKLIST_OWNER = 'dp-checklist'
 CHECKLIST_HOME = '/var/lib/dev-pair/checklist-executor'
 CHECKLIST_CONTROL = '/var/lib/dev-pair/checklist-release'
@@ -1326,6 +1330,96 @@ class Bootstrap:
                 or recorded_script.read_bytes() != script.read_bytes()):
             raise Blocked('destination source checkout differs from independent admission')
         return expected
+
+    def signer_trust_file(self):
+        path = checked_file(self.path(TRUST_SIGNERS))
+        if path.lstat().st_nlink != 1:
+            raise Blocked('the protected signer trust file must be singly linked')
+        return path
+
+    @staticmethod
+    def observer_public_key(public):
+        parts = public.split()
+        if (not public.isascii() or len(public) > 1024 or len(parts) < 2 or
+                parts[0] not in ('ssh-ed25519', 'sk-ssh-ed25519@openssh.com')):
+            raise Blocked('enter the independent collector’s OpenSSH Ed25519 public key')
+        return validate_public_keys((' '.join(parts[:2]) + '\n').encode()).strip()
+
+    @staticmethod
+    def signer_fingerprint(public):
+        material = base64.b64decode(public.split()[1], validate=True)
+        return 'SHA256:' + base64.b64encode(hashlib.sha256(material).digest()).decode().rstrip('=')
+
+    @classmethod
+    def agent_observer_entry(cls, raw):
+        lines = raw.splitlines(keepends=True)
+        entries = [line for line in lines if AGENT_OBSERVER_PRINCIPAL in line.split(None, 1)[:1]]
+        if not entries:
+            return None
+        if len(entries) != 1 or not entries[0].startswith(AGENT_OBSERVER_PREFIX):
+            raise Blocked('conflicting independent agent collector scope')
+        line = entries[0]
+        public = cls.observer_public_key(line.removeprefix(AGENT_OBSERVER_PREFIX))
+        if line != AGENT_OBSERVER_PREFIX + public + '\n':
+            raise Blocked('collector approval must name one exact principal and namespace')
+        if any(public.split()[1] in other.split() for other in lines if other != line and not other.lstrip().startswith('#')):
+            raise Blocked('the collector key is shared with another signing authority')
+        return line, public
+
+    def agent_observer_signers(self):
+        """Select only the explicit collector approval, even if other entries use wildcard principals."""
+        try:
+            entry = self.agent_observer_entry(self.signer_trust_file().read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return None
+        return entry[0].encode() if entry else None
+
+    def update_agent_observer(self, fingerprint, *, public=None):
+        """Enroll an independently confirmed collector, or withdraw its exact fingerprint."""
+        if not re.fullmatch(r'SHA256:[A-Za-z0-9+/]{43}', fingerprint):
+            raise Blocked('the collector’s separate OpenSSH SHA256 fingerprint is required')
+        with self.lock(SIGNER_TRUST_LOCK):
+            path = self.signer_trust_file()
+            raw = path.read_bytes().decode('utf-8')
+            previous = self.agent_observer_entry(raw)
+            if public is None:
+                if previous is None:
+                    raise Blocked('no independent collector is enrolled')
+                line, recorded = previous
+                if self.signer_fingerprint(recorded) != fingerprint:
+                    raise Blocked('the enrolled collector fingerprint differs from the withdrawal')
+                updated = ''.join(record for record in raw.splitlines(keepends=True) if record != line)
+            else:
+                public = self.observer_public_key(public)
+                if self.signer_fingerprint(public) != fingerprint:
+                    raise Blocked('the collector fingerprint does not match the independently supplied key')
+                if previous is not None:
+                    if previous[1] == public:
+                        return
+                    raise Blocked('withdraw the existing collector fingerprint before enrolling another key')
+                material = public.split()[1]
+                for route in ('/etc/ssh/dev-pair-keys/core', '/etc/dev-pair/day0/access-exchange-known-hosts'):
+                    route_keys = self.path(route)
+                    if os.path.lexists(route_keys) and material in checked_file(route_keys).read_text().split():
+                        raise Blocked('collector and named SSH or station transport require distinct keys')
+                transport = self.path('/etc/dev-pair/day0/access-exchange-ed25519')
+                if os.path.lexists(transport):
+                    transport = checked_file(transport, secret=True)
+                    public_transport = self.run('/usr/bin/ssh-keygen', '-y', '-P', '', '-f', str(transport), timeout=10)
+                    if self.observer_public_key(public_transport).split()[1] == material:
+                        raise Blocked('collector and destination-held transport require distinct keys')
+                # Independent billing uses a separate active record on new sites.
+                if os.path.lexists(self.path('/etc/dev-pair/provider-evidence/reviewer.json')):
+                    from provider_billing import reviewer_state
+
+                    billing = reviewer_state()
+                    if billing and billing['key'] and billing['key'].split()[1] == material:
+                        raise Blocked('collector and billing reviewers require distinct keys')
+                updated = raw + ('\n' if raw and not raw.endswith('\n') else '') + AGENT_OBSERVER_PREFIX + public + '\n'
+                self.agent_observer_entry(updated)  # Refuse materials already used by another principal.
+            if len(updated.encode()) > 16384:
+                raise Blocked('the protected signer trust file would exceed its bound')
+            self.atomic(TRUST_SIGNERS, updated, mode=stat.S_IMODE(path.lstat().st_mode), expected=raw)
 
     def signed_evidence(self, path, principal, namespace):
         if not path:
