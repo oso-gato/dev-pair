@@ -1184,8 +1184,9 @@ class Renewal:
                 sync_directory(live.parent)
         self.confirm_tree(inventory, state_unchanged=True)
 
-    def stable_forward_recovery(self, attempt, state):
-        from stable_renewal import forward_started
+    def stable_forward_recovery(self, attempt, state, *, only_new_boot=False):
+        from bootstrap import Blocked
+        from stable_renewal import access, bound_request, forward_started, reviewed_driver
 
         try:
             required = forward_started(self, state['request'])
@@ -1194,10 +1195,33 @@ class Renewal:
             return state
         if not required:
             return None
+        request = state['request']
+        observer = access(self)
+        try:
+            pending = observer.recover_request()
+        except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            self.phase(attempt, state, 'blocked', forward_failure=diagnostic(error))
+            return state
+        if only_new_boot and pending is None:
+            return None
         number = state.get('forward_attempts', 0)
         if number >= 2:
             self.phase(attempt, state, 'blocked')
             return state
+        if pending is not None:
+            try:
+                observer.fresh(request['target_sha256'], request['previous_sha256'], request['operation'],
+                               expected=pending)
+            except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                self.phase(attempt, state, 'verifying', forward_access_pending={
+                    'boot_id': pending['boot_id'], 'request_sha256': identity(pending)})
+                return state
+            try:
+                self.driver = reviewed_driver(self, bound_request(self, request))
+            except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                self.phase(attempt, state, 'blocked', forward_failure=diagnostic(error))
+                return state
+        state.pop('forward_access_pending', None)
         self.phase(attempt, state, 'applying', forward_attempts=number + 1)
         try:
             inventory = self.checked_inventory(attempt, state)
@@ -1216,6 +1240,10 @@ class Renewal:
             self.phase(attempt, state, phase)
         if phase == 'accepted':
             target = state['request']['target_sha256']
+            if state['request']['scope'] == 'stable':
+                continued = self.stable_forward_recovery(attempt, state, only_new_boot=True)
+                if continued is not None:
+                    return continued
             try:
                 self.verify_driver('observe', state, target)
                 inventory = self.checked_inventory(attempt, state)

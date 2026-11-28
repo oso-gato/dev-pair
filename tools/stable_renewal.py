@@ -207,7 +207,7 @@ def verify_transition(controller, desired):
     return grant
 
 
-def active_request(controller, approval):
+def approved_request(controller, approval):
     p.fields(approval, 'schema offer_sha256 request')
     r.require(type(approval['schema']) is int and approval['schema'] == 1,
               'unsupported stable approval schema')
@@ -221,16 +221,43 @@ def active_request(controller, approval):
               offer['previous_release_sha256'] == request['previous_sha256'] and
               all(offer[key] == request[key] for key in ('operation', 'affected_jobs', 'reason')),
               'protected stable offer and scoped request differ')
+    return request, offer
+
+
+def native_observation(controller, request, offer, boots):
     observation = r.read_json(controller.control / 'platform-observations' / (request['target_sha256'] + '.json'))
     resolver = s.Resolver(controller, portable=controller.root / 'platform-releases')
     native = local_binding(resolver, request['target_sha256'], offer['site_config_sha256'])
     directory, _, _ = resolver.index(offer['platform_sha256'])
     p.fields(observation, 'schema release_sha256 platform_sha256 base_platform_sha256 site_config_sha256 '
                           'plan_sha256 intake_sha256 boot_id installed_sha256')
-    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
-    r.require(all(observation[key] == value for key, value in native.items()) and observation['boot_id'] == boot and
+    r.require(all(observation[key] == value for key, value in native.items()) and observation['boot_id'] in boots and
               observation['installed_sha256'] == r.sha(s.protected_bytes(directory / 'installed.json', 65536)),
-              'stable release lacks its exact native installed readback on this boot')
+              'stable release lacks its exact authorized native installed readback')
+
+
+def active_request(controller, approval):
+    request, offer = approved_request(controller, approval)
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    native_observation(controller, request, offer, {boot})
+    return request
+
+
+def frozen_request(controller, attempt, state, original_boot, current_boot):
+    request, offer = approved_request(controller, r.read_json(controller.control / REQUEST))
+    r.require(attempt is not None and state['phase'] in ('applying', 'verifying', 'accepted') and
+              type(state['schema']) is int and state['schema'] == 1 and state['attempt_id'] == attempt.name and
+              r.checked_request(state['request'], SCOPE) == request and
+              r.read_json(controller.root / 'renewal-fence/frozen') == attempt.name and
+              forward_started(controller, request), 'stable recovery lacks its exact approved forward-only transition')
+    previous, target = request['previous_sha256'], request['target_sha256']
+    r.require({controller.live_release(), r.read_json(controller.control / 'site-current.json')} <= {previous, target},
+              'stable recovery selectors escaped the approved participants')
+    native_observation(controller, request, offer, {original_boot, current_boot})
+    commitment = site_commitment(controller)
+    lineage(s.Resolver(controller, portable=controller.root / 'platform-releases'), offer['platform_sha256'],
+            commitment['platform_sha256'], commitment['site_config_sha256'],
+            commitment['machine_id'], commitment['source_sha'])
     return request
 
 

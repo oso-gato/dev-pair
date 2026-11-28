@@ -91,8 +91,18 @@ readback and resumes the exact sessions. Reuse the same operation after
 interruption. A compatible predecessor remains available for rollback. If a
 protected fixed billing migration has already changed the launch chain, the
 controller uses its recorded bounded forward recovery while keeping dispatch
-fenced. Ordinary Day 0 recheck preserves the initial site record and tests
-previously granted features against the signed current placement.
+fenced. After a reboot in that window, reuse the same operation. The controller
+keeps the original signed approval and requests a new independent observation
+for the current boot of the exact fenced placement. Waiting for it keeps the
+operation and its recovery allowance intact. Once the fresh proof is accepted,
+rerun the same apply command to finish the recorded transition.
+
+Use the selected signed stable checkout for ordinary Day 0 status and resume.
+These recheck the current placement and preserve the initial commissioning
+policy, maintenance journal and source kit. A checkout with stable routing can
+also find an already staged selected successor using its original Day 0 entry.
+For an earlier immutable kit without stable routing, keep it for the
+enrollment record and run the ordinary commands from the reviewed successor.
 
 ### Nightly and scoped manual operation
 

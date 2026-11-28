@@ -191,13 +191,25 @@ class DayZero:
 
     def status(self, source=None):
         item = self.original()
-        protected = record(STATE / 'continuation-progress.json') or record(self.progress)
+        original = record(STATE / 'progress.json')
+        stable = self.stable_site(item, original)
+        if stable and stable.get('pending'):
+            print('Stable maintenance is fenced for its recorded recovery operation.')
+            print('Next Resume the exact stable maintenance operation in the reviewed successor checkout.')
+            return
+        protected = (record(STATE / 'stable-progress.json') if stable else
+                     record(STATE / 'continuation-progress.json') or original)
+        if stable and protected and (protected['source_sha'], protected['machine_id']) != (
+                stable['source_sha'], item['machine_id']):
+            protected = None
         report = self.app.status()
         print(f"Host {item['host']} | Fedora 44 | SELinux { {'1': 'enforcing', '0': 'permissive'}.get(item['selinux'], item['selinux'])}")
         physical = managed_backing.observe('/var/lib', Blocked)
         print(f'Physical /var/lib free {physical.available_bytes // MIB} MiB | {physical.display()}')
-        print('Source ' + (protected['source_sha'] if protected else source or 'awaiting the verified owner kit'))
-        print('Day 0 phase ' + (protected['phase'] if protected else 'ready for inspection'))
+        print('Source ' + (stable['source_sha'] if stable else
+                           protected['source_sha'] if protected else source or 'awaiting the verified owner kit'))
+        print('Day 0 phase ' + (protected['phase'] if protected else
+                               'stable release verified' if stable else 'ready for inspection'))
         desired = record(Path(BOOTSTRAP) / 'desired.json') if report['prepared'] else None
         probe = Path(BOOTSTRAP) / 'gptbox-adapter' / pin(desired['gptbox_context_sha256']) / 'result.json' if desired else None
         maintenance = 'probe completion recorded' if probe and record(probe) else 'build and probes pending'
@@ -208,7 +220,9 @@ class DayZero:
         print('Tailnet enrollment ' + ('recorded' if report['enrollment_recorded'] else 'pending'))
         access = report.get('access_scope')
         print('SSH access ' + report['phase'] + (' | workload access pending' if access == 'core' else ''))
-        print('Next ' + (protected['next'] if protected else 'Run ./day0.sh start in the selected hPanel root terminal.'))
+        print('Next ' + (protected['next'] if protected else
+                         'Run ./day0.sh resume in the selected signed stable checkout.' if stable else
+                         'Run ./day0.sh start in the selected hPanel root terminal.'))
 
     def stage(self, identity, revision, phase, next_step):
         save(self.app, self.progress, {'schema': 1, 'machine_id': identity['machine_id'], 'source_sha': revision,
@@ -680,6 +694,95 @@ class DayZero:
             return sha256(b'\0'.join(production)).hexdigest() == INITIAL_MAINTENANCE_PRODUCTION_TREE
         return False
 
+    def stable_site(self, identity, original):
+        """Observe the signed stable host without rebasing the original installation."""
+        if original is None:
+            return None
+        import renewal as r
+        import stable_renewal as stable
+        from renewal_site import Resolver
+
+        if not all(os.path.lexists(path) for path in (ROOT / stable.POLICY, ROOT / 'renewal/current.json')):
+            return None
+        controller = r.Renewal(ROOT, None)
+        with controller.lock(shared=True), controller.host_fence(shared=True):
+            policy = stable.site_commitment(controller)
+            require(original['machine_id'] == identity['machine_id'] == policy['machine_id'],
+                    'The original Day 0 enrollment belongs to a different machine.')
+            reference = controller.live_release()
+            binding = r.read_json(controller.control / 'platform-bindings' / (reference + '.json'))
+            base = pin(binding['base_platform_sha256'])
+            _, state = controller.transition()
+            active_stable = state is not None and state['request']['scope'] == 'stable' and state['phase'] not in r.TERMINAL
+            if base == policy['platform_sha256'] and not active_stable:
+                return None
+            if active_stable:
+                stable.bound_request(controller, state['request'])
+                return {'pending': True}
+            if os.path.lexists(controller.root / 'renewal-fence/frozen'):
+                return {'pending': True}
+            resolver = Resolver(controller, portable=ROOT / 'platform-releases')
+            require(stable.settled(resolver, policy['site_config_sha256']) == binding,
+                    'The stable release selectors do not match their protected placement.')
+            stable.lineage(resolver, base, policy['platform_sha256'], policy['site_config_sha256'],
+                           identity['machine_id'], policy['source_sha'])
+            grant = stable.binding(controller, base, resolver=resolver, machine=identity['machine_id'])
+            selected, host, _ = self.app.runtime_selected_host(identity['boot_id'])
+            original_source = self.stable_origin(identity, original, policy['source_sha'])
+            require(selected == reference and host == controller.release(reference)['components']['host'] ==
+                    controller.release(grant['target_release_sha256'])['components']['host'],
+                    'The stable host is not the exact authorized and observed full publisher.')
+            return {'source_sha': host['source_revision'], 'original_source_sha': original_source,
+                    'commissioning_source_sha': policy['source_sha'], 'bundle': stable.host_bundle(controller, grant)}
+
+    def stable_origin(self, identity, original, commissioning_source):
+        historical = pin(original['source_sha'], 40)
+        journal_path = Path(BOOTSTRAP) / 'initialize.json'
+        desired_path = Path(BOOTSTRAP) / 'desired.json'
+        journal, desired = record(journal_path), record(desired_path)
+        ready = record(Path(BOOTSTRAP) / 'host-ready.json')
+        require(journal and desired and ready and journal.get('phase') == journal.get('maintenance_gptbox') == 'complete'
+                and ready.get('source_sha') == historical, 'The original Day 0 maintenance proof is incomplete.')
+        context = pin(desired['gptbox_context_sha256'])
+        image = self.probes(journal['result'], historical, context)
+        require(journal['target']['source_sha'] == historical and journal['target']['context_sha256'] == context,
+                'The original Day 0 maintenance journal no longer matches its source.')
+        continuation = record(STATE / 'continuation.json')
+        if historical != commissioning_source or continuation is not None:
+            require(continuation == {
+                'schema': 1, 'machine_id': identity['machine_id'], 'controller_source_sha': commissioning_source,
+                'maintenance_source_sha': historical, 'image_id': image, 'context_sha256': context,
+                'initializer_sha256': checksum(journal_path), 'desired_sha256': checksum(desired_path),
+            }, 'The initial commissioning source differs from the retained Day 0 continuation.')
+        return historical
+
+    def stable_checkout(self, authority, revision):
+        from commission_host import Blocked as CommissionBlocked, verify_checkout
+
+        source = pin(authority['source_sha'], 40)
+        if revision == source:
+            checkout = self.repo
+        else:
+            require(revision in (authority['original_source_sha'], authority['commissioning_source_sha']),
+                    'Use the original or the selected signed stable Day 0 checkout.')
+            checkout = None
+            for name in (source, source[:12]):
+                parent = OWNER_KITS / ('dev-pair-day0-' + name)
+                marker = parent / 'SOURCE'
+                if os.path.lexists(marker):
+                    require(local_file(marker).read_text() == source + '\n', 'The selected stable checkout pin differs.')
+                    checkout = parent / 'dev-pair'
+                    break
+            require(checkout is not None, f'Open the exact reviewed stable checkout {source} and run ./day0.sh resume.')
+        try:
+            verify_checkout(checkout, source, 0)
+        except CommissionBlocked as error:
+            raise Blocked(str(error)) from error
+        for name in ('commission_host.py', 'bootstrap.py'):
+            require(checksum(checkout / 'tools' / name) == checksum(authority['bundle'] / 'tools' / name),
+                    'The stable Day 0 controller differs from its independently approved host bundle.')
+        return checkout
+
     def select_source(self, identity, revision, previous):
         if previous is None or previous['source_sha'] == revision:
             require(record(STATE / 'continuation.json') is None,
@@ -821,12 +924,13 @@ class DayZero:
                 observed = apply()
         return observed
 
-    def commission(self, identity, revision, historical=None, tty=None):
+    def commission(self, identity, revision, historical=None, tty=None, *, stable_checkout=None):
         self.stage(identity, revision, 'host-bootstrap-complete',
                    'Checking the independently approved release and private site.')
-        if not (self.repo / 'tools/commission_host.py').is_file():
+        if not ((stable_checkout or self.repo) / 'tools/commission_host.py').is_file():
             return
-        observed = self.commission_apply(revision, tty)
+        observed = (self.call('commission_host.py', 'apply', '--source-sha', revision, timeout=1800,
+                              checkout=stable_checkout) if stable_checkout else self.commission_apply(revision, tty))
         if tty is not None and observed.get('phase') == 'ready':
             pending = observed.get('pending_features', {}).get('owner-intake')
             if pending == 'workload-access':
@@ -900,6 +1004,15 @@ class DayZero:
                     return
                 self.stage(identity, revision, 'host-identified', 'Checking the pinned source and signed Fedora prerequisites.')
             self.ensure_git(revision, archive)
+            stable = self.stable_site(identity, prior)
+            if stable:
+                if stable.get('pending'):
+                    print('Stable maintenance is fenced. Resume the exact recorded operation in the reviewed successor checkout.')
+                    return
+                checkout = self.stable_checkout(stable, revision)
+                self.progress = STATE / 'stable-progress.json'
+                self.commission(identity, stable['source_sha'], stable['original_source_sha'], stable_checkout=checkout)
+                return
             historical, image = self.select_source(identity, revision, prior)
             report = self.app.status()
             if not report['prepared']:

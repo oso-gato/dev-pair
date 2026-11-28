@@ -496,20 +496,27 @@ class CandidateAccess:
         r.digest(binding['platform_sha256'])
         return binding
 
-    def binding(self, reference, previous, operation, requested_at):
+    def binding(self, reference, previous, operation, requested_at, *, recovery=None):
         from destination_observation import validate_candidate
 
         binding = self.selection(reference, previous, operation)
         identity = self.host.destination_identity()
         observed = r.read_json(self.control / 'platform-observations' / (reference + '.json'))
-        r.require(all(observed.get(key) == value for key, value in binding.items()) and
-                  observed['boot_id'] == identity['boot_id'], 'candidate needs installed observation on the current boot')
-        _, state = self.controller.transition()
-        r.require(self.controller.live_release() == previous == r.read_json(self.control / 'site-current.json') and
-                  (state is None or state['phase'] in r.TERMINAL) and
-                  not os.path.lexists(self.controller.root / 'renewal-fence/frozen'),
-                  'the candidate predecessor is no longer settled')
-        guard = self.host.verify_workload_access()
+        if recovery is None:
+            r.require(all(observed.get(key) == value for key, value in binding.items()) and
+                      observed['boot_id'] == identity['boot_id'], 'candidate needs installed observation on the current boot')
+            _, state = self.controller.transition()
+            r.require(self.controller.live_release() == previous == r.read_json(self.control / 'site-current.json') and
+                      (state is None or state['phase'] in r.TERMINAL) and
+                      not os.path.lexists(self.controller.root / 'renewal-fence/frozen'),
+                      'the candidate predecessor is no longer settled')
+            guard = self.host.verify_workload_access()
+        else:
+            request = recovery[1]['request']
+            r.require((reference, previous, operation) == tuple(request[key] for key in
+                      ('target_sha256', 'previous_sha256', 'operation')),
+                      'recovery observation differs from the exact forward-only attempt')
+            guard = self.host.verify_final_guard()
         self.host.verify_final_ssh()
         live, dns = self.host.tailscale_state()
         tailnet, node = self.host.identity_fields(live)
@@ -529,12 +536,19 @@ class CandidateAccess:
                 'candidate': candidate}
 
     def request(self, reference=None):
-        saved = r.read_json(self.pending)
+        recovery = self.recovery_context()
+        path = self.pending if recovery is None else recovery[0] / 'stable-recovery-request.json'
+        saved = r.read_json(path)
         expected = saved['role_artifacts']['release_sha256']
         r.require(reference is None or reference == expected, 'request does not select the pending candidate')
         scope = saved['candidate']
-        measured = self.binding(expected, scope['previous_release_sha256'], scope['operation'], scope['requested_at'])
-        r.require(saved == measured and 0 <= time.time() - scope['requested_at'] < 3600,
+        measured = self.binding(expected, scope['previous_release_sha256'], scope['operation'], scope['requested_at'],
+                                recovery=recovery)
+        within_window = 0 <= time.time() - scope['requested_at'] < 3600
+        if recovery is not None and not within_window:
+            proof_path = self.recovery_proof_path(recovery)
+            within_window = os.path.lexists(proof_path) and r.read_json(proof_path)['accepted_at'] is not None
+        r.require(saved == measured and within_window,
                   'candidate observation request expired or its exact selection changed')
         return saved
 
@@ -553,12 +567,70 @@ class CandidateAccess:
             r.replace_json(self.pending, binding)
         return binding
 
+    def recovery_context(self):
+        """Permit fresh observations only after this exact stable effect was committed."""
+        if self.scope != 'stable':
+            return None
+        from stable_renewal import forward_started, frozen_request
+
+        attempt, state = self.controller.transition()
+        if state is None or state['request']['scope'] != 'stable' or state['phase'] not in ('applying', 'verifying', 'accepted'):
+            return None
+        request = state['request']
+        if not forward_started(self.controller, request):
+            return None
+        reference = request['target_sha256']
+        original = r.read_json(self.proof_path(reference))
+        p.fields(original, 'envelope accepted_at')
+        r.require(type(original['accepted_at']) is int, 'stable recovery needs the independently admitted original access proof')
+        original_data, _ = self.verify(original['envelope'], reference, self.host.verify_final_guard(),
+                                       checked_at=original['accepted_at'], historical=True)
+        now_boot = self.host.destination_identity()['boot_id']
+        if original_data['boot_id'] == now_boot:
+            return None
+        reference_scope = original_data['candidate']
+        r.require((reference_scope['previous_release_sha256'], reference_scope['operation']) ==
+                  (request['previous_sha256'], request['operation']),
+                  'original independent access proof belongs to another stable attempt')
+        frozen_request(self.controller, attempt, state, original_data['boot_id'], now_boot)
+        return attempt, state, original_data
+
+    def recovery_proof_path(self, recovery):
+        from destination_observation import canonical_uuid
+
+        boot = self.host.destination_identity()['boot_id']
+        r.require(canonical_uuid(boot), 'the stable recovery boot identity is invalid')
+        return recovery[0] / ('stable-recovery-access-' + boot + '.json')
+
+    def recover_request(self):
+        """Create or reuse the distinct boot-bound request handed to the independent station."""
+        recovery = self.recovery_context()
+        if recovery is None:
+            return None
+        attempt, state, _ = recovery
+        request = state['request']
+        path = attempt / 'stable-recovery-request.json'
+        saved = r.read_json(path) if os.path.lexists(path) else None
+        now = int(time.time())
+        identity = self.host.destination_identity()
+        stamp = saved['candidate']['requested_at'] if saved and saved['boot_id'] == identity['boot_id'] else now
+        proof_path = self.recovery_proof_path(recovery)
+        proof = r.read_json(proof_path) if os.path.lexists(proof_path) else None
+        if not 0 <= now - stamp < 3600 and not (proof and proof['accepted_at'] is not None):
+            stamp = now
+        binding = self.binding(request['target_sha256'], request['previous_sha256'], request['operation'], stamp,
+                               recovery=recovery)
+        if binding != saved:
+            r.require(proof is None or proof['accepted_at'] is None, 'the admitted stable recovery request changed')
+            r.replace_json(path, binding)
+        return binding
+
     def proof_path(self, reference):
         r.digest(reference)
         suffix = '.stable-access.json' if self.scope == 'stable' else '.access.json'
         return self.control / 'platform-observations' / (reference + suffix)
 
-    def verify(self, envelope, reference, guard, *, expected=None, checked_at=None):
+    def verify(self, envelope, reference, guard, *, expected=None, checked_at=None, historical=False):
         from bootstrap import TRUST_SIGNERS, checked_file
         from destination_observation import (ACCESS, CORE_BINDING, FINAL_NAMESPACE,
                                              checked_candidate_readings, encoding, read_access_envelope,
@@ -632,17 +704,30 @@ class CandidateAccess:
         r.require(self.request(reference) == expected, 'candidate request changed during independent transport')
         wire = envelope.decode('ascii')
         self.verify(wire, reference, self.host.verify_final_guard(), expected=expected)
-        path = self.proof_path(reference)
+        recovery = self.recovery_context()
+        path = self.proof_path(reference) if recovery is None else self.recovery_proof_path(recovery)
         prior = r.read_json(path) if os.path.lexists(path) else None
+        if recovery is not None and prior is None:
+            r.require(sum(1 for _ in recovery[0].glob('stable-recovery-access-*.json')) < r.MAX_ATTEMPTS,
+                      'the bounded stable recovery proof inventory is full')
         r.require(prior is None or prior['accepted_at'] is None or prior['envelope'] == wire,
                   'a new observation cannot replace admitted rollback evidence')
         if prior is None or prior['envelope'] != wire:
             r.replace_json(path, {'envelope': wire, 'accepted_at': None})
 
     def fresh(self, reference, previous, operation, *, expected=None, guard=None, checked_at=None):
-        proof = r.read_json(self.proof_path(reference))
+        recovery = self.recovery_context()
+        path = self.proof_path(reference) if recovery is None else self.recovery_proof_path(recovery)
+        proof = r.read_json(path)
+        p.fields(proof, 'envelope accepted_at')
+        if recovery is not None:
+            r.require(recovery[1]['request']['target_sha256'] == reference,
+                      'stable recovery proof is for a different protected target')
+            if proof['accepted_at'] is not None:
+                checked_at = proof['accepted_at']
         data, _ = self.verify(proof['envelope'], reference, guard or self.host.verify_final_guard(),
-                              expected=expected, checked_at=checked_at)
+                              expected=expected, checked_at=checked_at,
+                              historical=self.scope == 'stable' and proof['accepted_at'] is not None)
         r.require(data['boot_id'] == self.host.destination_identity()['boot_id'] and
                   (data['candidate']['previous_release_sha256'], data['candidate']['operation']) == (previous, operation),
                   'signed candidate observation does not authorize this renewal attempt on this boot')
@@ -661,14 +746,18 @@ class CandidateAccess:
         self.host.verify_final_ssh()
         now = int(time.time())
         with self.host.lock(SIGNER_TRUST_LOCK):
-            approved = r.read_json(self.proof_path(reference)) if self.scope == 'stable' else None
+            original = self.proof_path(reference)
+            approved = r.read_json(original) if self.scope == 'stable' else None
+            recovery = self.recovery_context()
+            path = original if recovery is None else self.recovery_proof_path(recovery)
             stamp = approved['accepted_at'] if approved and approved['accepted_at'] is not None else now
             actual = {self.controller.live_release(), r.read_json(self.control / 'site-current.json')}
             allowed = {previous, reference} if approved and approved['accepted_at'] is not None else {previous}
             r.require(actual <= allowed, 'candidate activation changed its retained predecessor')
-            proof = self.fresh(reference, previous, operation, guard=guard, checked_at=stamp)
+            proof = self.fresh(reference, previous, operation, guard=guard,
+                               checked_at=stamp if recovery is None else None)
             if proof['accepted_at'] is None:
-                r.replace_json(self.proof_path(reference), {**proof, 'accepted_at': now})
+                r.replace_json(path, {**proof, 'accepted_at': now})
 
     def admitted(self, reference, guard):
         path = self.proof_path(reference)
@@ -678,7 +767,8 @@ class CandidateAccess:
         p.fields(proof, 'envelope accepted_at')
         if proof['accepted_at'] is None:
             return None
-        data, proof_sha = self.verify(proof['envelope'], reference, guard, checked_at=proof['accepted_at'])
+        data, proof_sha = self.verify(proof['envelope'], reference, guard, checked_at=proof['accepted_at'],
+                                      historical=self.scope == 'stable')
         return {'role_artifacts': data['role_artifacts'], 'access_receipt_sha256': proof_sha}
 
 

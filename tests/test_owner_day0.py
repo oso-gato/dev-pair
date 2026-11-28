@@ -323,6 +323,57 @@ class DayZeroTests(unittest.TestCase):
         with self.assertRaisesRegex(bootstrap.Blocked, 'differs'):
             day.kit_source(self.entry.repo, 'c' * 40)
 
+    def test_ordinary_resume_rechecks_signed_stable_checkout_without_touching_enrollment(self):
+        old, new = SOURCE, 'd' * 40
+        state = self.directory / 'day0'
+        state.mkdir()
+        original = state / 'progress.json'
+        old_state = {'source_sha': old, 'machine_id': MACHINE, 'phase': 'owner-terminal-ready', 'next': 'retained'}
+        original.write_text(json.dumps(old_state))
+        original.chmod(0o600)
+        output = self.directory / 'successor'
+        (output / 'tools').mkdir(parents=True)
+        (output / 'tools/commission_host.py').touch()
+        self.entry.original = Mock(return_value=self.identity)
+        self.entry.ensure_git = Mock()
+        self.entry.owner_lock = nullcontext
+        self.entry.stable_site = Mock(return_value={'source_sha': new, 'original_source_sha': old})
+        self.entry.stable_checkout = Mock(return_value=output)
+        self.entry.call = Mock(return_value={'phase': 'ready', 'held_features': ['owner-intake']})
+        self.entry.stage = Mock()
+        self.entry.enroll = Mock(side_effect=AssertionError('enrollment ran during a settled recheck'))
+        self.entry.select_source = Mock(side_effect=AssertionError('old source selection ran during a stable recheck'))
+        self.entry.maintenance_receipt = Mock(side_effect=AssertionError('old runtime probed during a stable recheck'))
+        with (patch.object(day, 'STATE', state), patch.object(day, 'kit_source', return_value=(old, True))):
+            self.entry.start(None, object())
+        self.entry.stable_checkout.assert_called_once_with(self.entry.stable_site.return_value, old)
+        self.entry.call.assert_called_once_with('commission_host.py', 'apply', '--source-sha', new, timeout=1800, checkout=output)
+        self.assertEqual(self.entry.progress, state / 'stable-progress.json')
+        self.assertEqual(json.loads(original.read_text()), old_state)
+
+    def test_archived_source_can_only_route_to_exact_signed_stable_controller(self):
+        import commission_host
+
+        old, new = SOURCE, 'd' * 40
+        package = self.directory / ('dev-pair-day0-' + new)
+        checkout = package / 'dev-pair'
+        bundle = self.directory / 'bundle'
+        for folder in (checkout, bundle):
+            (folder / 'tools').mkdir(parents=True)
+            for name in ('bootstrap.py', 'commission_host.py'):
+                (folder / 'tools' / name).write_text(name)
+        (package / 'SOURCE').write_text(new + '\n')
+        authority = {'source_sha': new, 'original_source_sha': old, 'commissioning_source_sha': old, 'bundle': bundle}
+        with (patch.object(day, 'OWNER_KITS', self.directory),
+              patch.object(commission_host, 'verify_checkout') as exact):
+            self.assertEqual(self.entry.stable_checkout(authority, old), checkout)
+            exact.assert_called_once_with(checkout, new, 0)
+            with self.assertRaisesRegex(bootstrap.Blocked, 'original or the selected'):
+                self.entry.stable_checkout(authority, 'a' * 39 + 'b')
+            (checkout / 'tools/bootstrap.py').write_text('foreign executable')
+            with self.assertRaisesRegex(bootstrap.Blocked, 'differs from its independently approved host bundle'):
+                self.entry.stable_checkout(authority, old)
+
     def test_continuation_retains_the_original_completed_maintenance_evidence(self):
         state = self.directory / 'day0'
         bootstrap_state = self.directory / 'bootstrap'

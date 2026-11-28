@@ -1,6 +1,7 @@
 """Exercise deliberate stable intake, local approval and durable role continuity."""
 import copy
 from contextlib import nullcontext
+import hashlib
 from pathlib import Path
 import socket
 import subprocess
@@ -231,6 +232,30 @@ class NativeAuthority(unittest.TestCase):
         self.assertEqual(policy_path.read_bytes(), original)
         self.assertEqual(driver.read_bytes(), b'exact previous fixed bytes')
 
+    def test_frozen_readback_requires_the_original_offer_and_only_its_exact_participants(self):
+        successor = self.package('c', 43, previous=self.origin)
+        offer = self.offer('stable', successor, self.initial)
+        target = self.resolver.resolve(offer, boot=BOOT)['release_sha256']
+        request = {'schema': 1, 'scope': 'stable', 'operation': offer['operation'], 'previous_sha256': self.initial,
+                   'target_sha256': target, 'affected_jobs': offer['affected_jobs'], 'reason': offer['reason']}
+        r.replace_json(self.control / stable.OFFER, offer)
+        r.replace_json(self.control / stable.REQUEST, {'schema': 1, 'offer_sha256': r.identity(offer), 'request': request})
+        attempt = self.control / 'attempts' / offer['operation']
+        attempt.mkdir(mode=0o700)
+        state = {'schema': 1, 'phase': 'verifying', 'attempt_id': attempt.name, 'request': request}
+        (self.root / 'renewal-fence').mkdir()
+        r.replace_json(self.root / 'renewal-fence/frozen', attempt.name)
+        newer_boot = '12345678-1234-4234-8123-123456789abd'
+        with patch.object(stable, 'forward_started', return_value=True):
+            self.assertEqual(stable.frozen_request(self.controller, attempt, state, BOOT, newer_boot), request)
+            r.replace_json(self.control / 'site-current.json', 'f' * 64)
+            with self.assertRaisesRegex(ValueError, 'selectors escaped'):
+                stable.frozen_request(self.controller, attempt, state, BOOT, newer_boot)
+            r.replace_json(self.control / 'site-current.json', self.initial)
+            r.replace_json(self.control / stable.OFFER, {**offer, 'reason': 'unapproved different purpose'})
+            with self.assertRaisesRegex(ValueError, 'changed or was withdrawn'):
+                stable.frozen_request(self.controller, attempt, state, BOOT, newer_boot)
+
 
 class StableContinuity(unittest.TestCase):
     def setUp(self):
@@ -249,7 +274,9 @@ class StableContinuity(unittest.TestCase):
         self.enterContext(patch.object(stable, 'binding', return_value=grant))
         self.enterContext(patch.object(stable, 'bound_request', return_value=grant))
         self.enterContext(patch.object(stable, 'active_request', side_effect=lambda _, approval: approval['request']))
-        self.enterContext(patch.object(stable, 'access', return_value=Mock()))
+        self.observer = Mock()
+        self.observer.recover_request.return_value = None
+        self.enterContext(patch.object(stable, 'access', return_value=self.observer))
         self.install = self.enterContext(patch.object(stable, 'reviewed_driver', return_value=self.controller.driver))
 
     def target_release(self):
@@ -301,6 +328,32 @@ class StableContinuity(unittest.TestCase):
         self.assertEqual(attempts, [self.target, self.target])
         self.fx.assert_sessions_preserved(state, self.target)
 
+    def test_current_boot_access_wait_does_not_spend_a_forward_effect_attempt(self):
+        original = self.controller.verify_driver
+        pending = {'boot_id': '12345678-1234-4234-8123-123456789abc', 'scope': 'fixture recovery'}
+        self.observer.recover_request.return_value = pending
+        self.observer.fresh.side_effect = [None, None, FileNotFoundError('fresh proof'), None]
+        attempted = []
+
+        def fail_once(action, state, release):
+            if action == 'activate':
+                attempted.append(release)
+                if len(attempted) == 1:
+                    raise ValueError('fixture interruption after published fixed state')
+            return original(action, state, release)
+
+        with (patch.object(stable, 'forward_started', return_value=True),
+              patch.object(self.controller, 'verify_driver', side_effect=fail_once)):
+            paused = stable.apply(self.controller, self.operation)
+            self.assertEqual(paused['phase'], 'verifying')
+            self.assertEqual(paused['forward_access_pending']['request_sha256'], r.identity(pending))
+            self.assertNotIn('forward_attempts', paused)
+            self.assertEqual(r.read_json(self.fx.root / 'renewal-fence/frozen'), paused['attempt_id'])
+            state = stable.apply(self.controller, self.operation)
+        self.assertEqual((state['phase'], state['forward_attempts']), ('completed', 1))
+        self.assertEqual(attempted, [self.target, self.target])
+        self.fx.assert_sessions_preserved(state, self.target)
+
     def test_nightly_request_cannot_select_a_stable_target(self):
         self.fx.request(self.target, scope='agent', operation='agent-approved')
         with self.assertRaisesRegex(ValueError, 'outside approved scope'):
@@ -309,6 +362,67 @@ class StableContinuity(unittest.TestCase):
 
 
 class IndependentStableAccess(unittest.TestCase):
+    def test_original_signature_is_retained_but_a_new_boot_requires_its_own_signed_recovery(self):
+        fixture = access_fixture.CandidateObservation()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        old, target = fixture.previous, fixture.reference
+        operation = 'stable-' + 'a' * 48
+        new_boot = '12345678-1234-4234-8123-123456789abd'
+        fixture.releases[target]['components']['host']['artifact_sha256'] = '8' * 64
+        fixture.releases[target]['components']['devbox']['artifact_sha256'] = '9' * 64
+        observer = site.CandidateAccess(fixture.controller, fixture.host, kind=observation.STABLE_CANDIDATE)
+        grant = {'previous_release_sha256': old, 'operation': operation}
+        plan = bootstrap.Bootstrap.access_probe_plan(fixture.route['dns_name'], fixture.guard['provider_recovery'],
+                                                     fixture.guard['public_addresses'])
+        fixture.host.access_probe_plan.return_value = plan
+        fixture.host.verify_access_probes.side_effect = bootstrap.Bootstrap().verify_access_probes
+
+        def signed(binding):
+            now = int(time.time())
+            body = {key: value for key, value in binding.items() if key != 'job_id'}
+            probes = [{'test': test, 'family': family, 'endpoint': endpoint, 'vantage': vantage,
+                       'client_id': 'client-' + vantage, 'outcome': outcome, 'observed_at': now, 'evidence_sha256': 'e' * 64}
+                      for (test, family), (endpoint, vantage, outcome) in plan.items()]
+            body.update(issued_at=now, expires_at=now + 300, probes=probes, execution_route='tailnet-core',
+                        acl_sha256=fixture.guard['acl_sha256'], provider_recovery=fixture.guard['provider_recovery'],
+                        public_addresses=fixture.guard['public_addresses'])
+            payload = observation.encoding(body)
+            signature = subprocess.check_output(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(fixture.reviewer),
+                                                 '-n', observation.FINAL_NAMESPACE], input=payload,
+                                                stderr=subprocess.DEVNULL, timeout=5)
+            return observation.access_envelope(payload, signature)
+
+        with (patch.object(stable, 'for_release', return_value=grant),
+              patch.object(stable, 'forward_started', return_value=True),
+              patch.object(stable, 'frozen_request') as checked):
+            origin = observer.prepare(grant, target)
+            old_wire = signed(origin)
+            retained = observer.proof_path(target)
+            r.replace_json(retained, {'envelope': old_wire.decode('ascii'), 'accepted_at': int(time.time())})
+            before = hashlib.sha256(retained.read_bytes()).hexdigest()
+            fixture.attempt = fixture.root / 'attempt'
+            fixture.attempt.mkdir(mode=0o700)
+            fixture.journal = {'schema': 1, 'phase': 'applying', 'attempt_id': fixture.attempt.name,
+                               'request': {'scope': 'stable', 'target_sha256': target,
+                                           'previous_sha256': old, 'operation': operation}}
+            (fixture.root / 'renewal-fence').mkdir()
+            r.replace_json(fixture.root / 'renewal-fence/frozen', fixture.attempt.name)
+            self.assertIsNone(observer.recover_request())
+            fixture.identity['boot_id'] = new_boot
+            recovery = observer.recover_request()
+            checked.assert_called_once_with(fixture.controller, fixture.attempt, fixture.journal, origin['boot_id'], new_boot)
+            self.assertEqual(recovery['boot_id'], new_boot)
+            self.assertEqual(recovery['role_artifacts'], origin['role_artifacts'])
+            self.assertEqual(recovery['candidate']['operation'], operation)
+            with self.assertRaisesRegex(ValueError, 'different request or boot'):
+                observer.receive(old_wire, recovery)
+            observer.receive(signed(recovery), recovery)
+            observer.accept(target, operation)
+            self.assertIsNotNone(r.read_json(observer.recovery_proof_path(observer.recovery_context()))['accepted_at'])
+            self.assertEqual(hashlib.sha256(retained.read_bytes()).hexdigest(), before)
+            self.assertEqual(r.read_json(observer.pending), origin)
+
     def test_signed_agent_statement_cannot_authorize_an_exact_stable_candidate(self):
         fixture = access_fixture.CandidateObservation()
         fixture.setUp()
