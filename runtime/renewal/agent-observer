@@ -1,0 +1,114 @@
+#!/usr/bin/python3 -I
+"""Carry one independently signed confined candidate probe across a named SSH session."""
+import io
+import os
+from pathlib import Path
+import pwd
+import runpy
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+INSTALL = Path('/usr/libexec/dev-pair')
+sys.path.insert(0, str(INSTALL / 'tools'))
+from bootstrap import Blocked, Bootstrap, TRUST_SIGNERS, checked_file
+from destination_observation import (MAX_ACCESS_ENVELOPE, NAMESPACE, agent_probe_challenge, encoding, keys,
+                                     observer_principal, read_access_envelope, require, verify_bytes)
+import renewal as r
+
+SOCKET = '/run/dev-pair-agent-observer.sock'
+MAX_REQUEST = MAX_ACCESS_ENVELOPE + 1024
+MAX_RESULT = 8192
+
+
+def read_bounded(stream, limit):
+    raw = stream.read(limit + 1)
+    require(0 < len(raw) <= limit, 'candidate probe transfer exceeds its bound')
+    return raw
+
+
+def client():
+    envelope = read_bounded(sys.stdin.buffer, MAX_ACCESS_ENVELOPE)
+    transport = {key: os.environ[key] for key in ('SSH_CONNECTION', 'SSH_CLIENT') if key in os.environ}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+        channel.settimeout(650)
+        channel.connect(SOCKET)
+        channel.sendall(encoding({'transport': transport, 'envelope': envelope.decode('ascii')}))
+        channel.shutdown(socket.SHUT_WR)
+        with channel.makefile('rb') as source:
+            sys.stdout.buffer.write(read_bounded(source, MAX_RESULT))
+
+
+def reserve_attempt(root, pending, challenge):
+    path = root / 'renewal' / 'agent-observation-probes.json'
+    request_sha = r.identity(pending)
+    row = r.read_json(path) if os.path.lexists(path) else {'request_sha256': None, 'attempts': {}}
+    keys(row, {'request_sha256', 'attempts'})
+    attempts = row['attempts'] if row['request_sha256'] == request_sha else {}
+    allowed = {role + '-' + family for role in r.ROLES for family in ('ipv4', 'ipv6')}
+    require(type(attempts) is dict and set(attempts) <= allowed, 'invalid protected candidate probe ledger')
+    key = challenge['role'] + '-' + challenge['family']
+    prior = attempts.get(key, [])
+    require(type(prior) is list and len(prior) < 2 and challenge['challenge'] not in prior,
+            'candidate probe challenge was spent or its retry was exhausted')
+    attempts[key] = [*prior, challenge['challenge']]
+    r.replace_json(path, {'request_sha256': request_sha, 'attempts': attempts})
+
+
+def serve(channel):
+    pid, uid, _ = struct.unpack('3i', channel.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+    require(pid > 1 and uid == pwd.getpwnam('core').pw_uid, 'named core SSH client required')
+    channel.settimeout(5)
+    with channel.makefile('rb') as source:
+        raw = read_bounded(source, MAX_REQUEST)
+    request = r.loads(raw)
+    keys(request, {'transport', 'envelope'})
+    require(type(request['transport']) is dict and set(request['transport']) <= {'SSH_CONNECTION', 'SSH_CLIENT'} and
+            all(type(item) is str and 0 < len(item) <= 512 for item in request['transport'].values()),
+            'invalid candidate probe transport')
+    payload, signature = read_access_envelope(io.BytesIO(request['envelope'].encode('ascii')))
+    host = Bootstrap()
+    signers = checked_file(host.path(TRUST_SIGNERS))
+    challenge, commitment = verify_bytes(payload, signature, observer_principal('authorized'), signers, NAMESPACE)
+    agent_probe_challenge(challenge)
+    require(int(time.time()) < challenge['expires_at'] <= int(time.time()) + 120,
+            'signed probe challenge is outside its two-minute start window')
+    from platform_release_intake import protected
+
+    driver = runpy.run_path(str(protected(INSTALL / 'renewal' / 'driver')))['access_probe']
+
+    def peer():
+        return host.observed_ssh_peer(client_pid=pid, transport=request['transport'])
+
+    def admit(pending, observed_peer):
+        require(challenge['request_sha256'] == r.sha(encoding(pending)) and
+                observed_peer['local'] == pending['tailnet_addresses'][challenge['family']] and
+                int(time.time()) < challenge['expires_at'],
+                'signed challenge does not select this pending candidate or SSH family')
+        reserve_attempt(r.DEFAULT_ROOT, pending, challenge)
+
+    with r.protocol.workload_access_lease(r.DEFAULT_ROOT):
+        result = driver({key: challenge[key] for key in ('role', 'source_sha', 'candidate')},
+                        candidate=True, peer_reader=peer, challenge=admit)
+    channel.sendall(encoding({**result, 'challenge_sha256': commitment}))
+
+
+def main():
+    try:
+        require(len(sys.argv) == 2 and sys.argv[1] in ('client', 'serve'), 'fixed candidate observer invocation required')
+        if sys.argv[1] == 'client':
+            client()
+        else:
+            require(os.getuid() == os.geteuid() == 0, 'protected candidate observation broker required')
+            with socket.fromfd(0, socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                serve(channel)
+    except (Blocked, OSError, ValueError, TypeError, KeyError, UnicodeError, subprocess.SubprocessError):
+        print('Candidate probe unavailable. Inspect the protected observation and route.', file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

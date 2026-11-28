@@ -62,6 +62,10 @@ class LocalSite(bridge.Site):
                                        MAX_ATTEMPTS=32, trusted_directory=lambda path: path,
                                        replace_json=lambda path, value: path.write_text(json.dumps(value)))
         self.resolver = SimpleNamespace(resolve=self.resolve, index=lambda value: (None, self.known[value], None))
+        self.observation = SimpleNamespace(prepare=self.prepare_observation, fresh=self.fresh_observation,
+                                           receive=self.receive_observation)
+        self.observations = set()
+        self.answer = b'fixture signed station response'
         self.trace = []
         self.locked = False
         self.race = None
@@ -110,6 +114,26 @@ class LocalSite(bridge.Site):
     def resolve(self, offer):
         assert self.locked
         self.trace.append(('resolve', offer['previous_release_sha256']))
+        return self.binding_for(self.candidate)
+
+    def prepare_observation(self, offer, reference):
+        assert self.locked
+        return {'role_artifacts': {'release_sha256': reference}, 'candidate': offer['platform_sha256']}
+
+    def exchange_observation(self, request):
+        assert not self.locked
+        self.trace.append(('exchange', request['candidate']))
+        return self.answer
+
+    def fresh_observation(self, reference, _previous, _operation, *, expected):
+        assert self.locked
+        if reference not in self.observations:
+            raise FileNotFoundError()
+
+    def receive_observation(self, response, request):
+        assert self.locked and response == self.answer
+        self.trace.append(('receive', request['candidate']))
+        self.observations.add(request['role_artifacts']['release_sha256'])
 
     def dispatch(self):
         assert not self.locked and self.offer.is_file()
@@ -233,6 +257,21 @@ class AgentBridgeTests(unittest.TestCase):
                 self.assertEqual(site.trace[-1], ('reconcile', candidate.digest))
                 site.accept()
                 self.assertEqual(site.cycle(later_window)['status'], 'no-new-image')
+
+    def test_pending_observation_preserves_selected_release_and_withholds_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            current = release(1, '0.169.0', '4', '5')
+            site = LocalSite(Path(directory), current)
+            site.candidate = release(2, '0.170.0', '6', '7')
+            site.answer = None
+            window = bridge.selection_window(timestamp(26, 22), False)
+            self.assertEqual(site.cycle(window)['status'], 'awaiting-independent-observation')
+            self.assertIs(site.current, current)
+            self.assertFalse(site.offer.exists())
+            self.assertNotIn('reconcile', [step[0] for step in site.trace])
+            site.answer = b'signed response using the same exact binding'
+            self.assertEqual(site.cycle(window)['status'], 'queued')
+            self.assertEqual([step[0] for step in site.trace[-3:]], ['exchange', 'receive', 'reconcile'])
 
     def test_failed_and_missed_nights_bind_retained_exact_site_selection(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -685,11 +685,11 @@ class Renewal:
     def apply(self, scope):
         require(scope in SCOPE_COMPONENTS, 'unknown renewal scope')
         with self.lock():
-            protocol.require_workload_access(self.root)
             attempt, state = self.transition()
             if state is not None:
                 if state['phase'] not in TERMINAL or self.unfinished_thaw(attempt, state):
                     return self.resume(attempt, state)
+            protocol.require_workload_access(self.root)
             self.observe_then_clear_fence(attempt, state)
             request = self.active_request(scope)
             if request is None:
@@ -746,10 +746,10 @@ class Renewal:
 
     def refresh_agent_target(self):
         """Ask only the independently configured candidate service for an approval."""
-        protocol.require_workload_access(self.root)
         attempt, state = self.transition()
         if state is not None and (state['phase'] not in TERMINAL or self.unfinished_thaw(attempt, state)):
             return True
+        protocol.require_workload_access(self.root)
         try:
             process = subprocess.run(['/usr/bin/systemctl', 'start', 'dev-pair-approved-agent-candidate.service'],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -1086,6 +1086,18 @@ class Renewal:
             self.mark_host_fence(attempt.name, frozen=False)
         return state
 
+    def verify_prospective_agent(self, request):
+        if request['scope'] != 'agent' or not request['operation'].startswith('agent-ci-'):
+            return
+        from bootstrap import Blocked, Bootstrap
+        from renewal_site import CandidateAccess
+
+        try:
+            CandidateAccess(self, Bootstrap()).fresh(request['target_sha256'], request['previous_sha256'],
+                                                     request['operation'])
+        except (OSError, Blocked, ValueError, subprocess.SubprocessError) as error:
+            raise ValueError('fresh independent candidate observation required') from error
+
     def run(self, attempt, state):
         request = state['request']
         previous, replacement = request['previous_sha256'], request['target_sha256']
@@ -1100,6 +1112,7 @@ class Renewal:
                 inventory = self.capture(attempt, state, registries)
                 self.readiness(attempt, state, inventory, registries)
             self.verify_pending(inventory)
+            self.verify_prospective_agent(request)
             self.phase(attempt, state, 'applying')
             self.verify_driver('activate', state, replacement)
             self.confirm_tree(inventory, state_unchanged=True)

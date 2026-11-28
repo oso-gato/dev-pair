@@ -174,6 +174,9 @@ class Site:
         self.renewal, self.site, self.intake, self.protocol = renewal, site, intake, protocol
         self.controller = renewal.Renewal(renewal.DEFAULT_ROOT, None)
         self.resolver = site.Resolver(self.controller)
+        from bootstrap import Bootstrap
+
+        self.observation = site.CandidateAccess(self.controller, Bootstrap())
         self.control = self.controller.control
         self.offer = renewal.trusted_directory(self.control / 'offers') / 'agent.json'
         self.nightly_status = self.control / 'agent-nightly.json'
@@ -407,6 +410,25 @@ class Site:
         subprocess.run(['/usr/bin/systemctl', 'start', '--no-block', UNIT], env=self.intake.ENV,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, timeout=15, check=True)
 
+    def exchange_observation(self, request):
+        from day0_access_exchange import ExchangeUnavailable, exchange
+        from destination_observation import encoding
+
+        try:
+            return exchange(encoding(request))
+        except ExchangeUnavailable:
+            return None
+
+    def observed(self, request, offer):
+        from bootstrap import Blocked
+
+        reference = request['role_artifacts']['release_sha256']
+        try:
+            self.observation.fresh(reference, offer['previous_release_sha256'], offer['operation'], expected=request)
+        except (OSError, Blocked, ValueError, subprocess.SubprocessError):
+            return False
+        return True
+
     def cycle(self, window):
         with self.lease():
             with self.controller.lock():
@@ -439,16 +461,28 @@ class Site:
                 version = candidate.index['components']['maintenance-agent']['codex_version']
                 require(self.intake.release.official_version() == version, 'replacement is not the current official stable')
             with self.controller.lock():
+                status, _ = self.transition()
+                if status != 'ready' or self.live()[0] != binding:
+                    return {'status': 'predecessor-changed'}
+                target = self.resolver.resolve(offer)
+                request = self.observation.prepare(offer, target['release_sha256'])
+                witnessed = self.observed(request, offer)
+            answer = None if witnessed else self.exchange_observation(request)
+            with self.controller.lock():
                 status, state = self.transition()
                 if status != 'ready' or self.live()[0] != binding:
                     return {'status': 'predecessor-changed'}
+                if answer is not None:
+                    self.observation.receive(answer, request)
+                if not self.observed(request, offer):
+                    return {'status': 'awaiting-independent-observation', 'run': candidate.run,
+                            'platform_sha256': candidate.digest}
                 final_pending = self.pending(offer, binding, state, candidate)
                 if final_pending and (final_pending not in ('queued', 'supersede-owned') or
                                       final_pending == 'supersede-owned' and
                                       self.renewal.identity(self.renewal.read_json(self.offer)) != old_offer):
                     return {'status': 'other-offer' if final_pending == 'supersede-owned' else final_pending,
                             'run': candidate.run}
-                self.resolver.resolve(offer)
                 if final_pending != 'queued':
                     self.publish_offer(offer)
             self.dispatch()
@@ -461,6 +495,8 @@ def main():
     trigger.add_argument('--nightly', action='store_true')
     trigger.add_argument('--poll', action='store_true', help='poll scheduled and recent on-demand publishers')
     trigger.add_argument('--on-demand', action='store_true', help='select a recent protected manual workflow run')
+    trigger.add_argument('--observation-request', action='store_true', help='export the exact staged candidate for independent observation')
+    trigger.add_argument('--observation-response', action='store_true', help='import a bounded independently signed candidate observation')
     args = parser.parse_args()
     require(os.getuid() == os.geteuid() == 0, 'protected agent bridge operator required')
     os.umask(0o077)
@@ -472,11 +508,22 @@ def main():
     import renewal_site
 
     site = Site(renewal, renewal_site, intake, protocol)
-    if args.on_demand:
+    if args.observation_request or args.observation_response:
+        from destination_observation import MAX_ACCESS_ENVELOPE, encoding
+
+        answer = sys.stdin.buffer.read(MAX_ACCESS_ENVELOPE + 1) if args.observation_response else None
+        with site.controller.lock():
+            request = site.observation.request()
+            if answer is None:
+                sys.stdout.buffer.write(encoding(request))
+                return
+            site.observation.receive(answer, request)
+        result = {'status': 'observation-retained'}
+    elif args.on_demand:
         result = site.cycle(selection_window(now, True))
     else:
         result = site.nightly(now)
-        if args.poll and result['status'] not in ('queued', 'renewal-busy'):
+        if args.poll and result['status'] not in ('queued', 'renewal-busy', 'awaiting-independent-observation'):
             manual = site.cycle(selection_window(now, True))
             if manual['status'] != 'awaiting-publication':
                 result = manual
@@ -484,8 +531,11 @@ def main():
 
 
 if __name__ == '__main__':
+    sys.path.insert(0, str(INSTALL))
+    from bootstrap import Blocked
+
     try:
         main()
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
+    except (OSError, Blocked, ValueError, KeyError, TypeError, AttributeError, zipfile.BadZipFile, subprocess.SubprocessError) as error:
         print(f'Agent release bridge stopped: {error}', file=sys.stderr)
         sys.exit(2)

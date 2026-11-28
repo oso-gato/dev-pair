@@ -1,0 +1,10 @@
+[Unit]
+Description=Reconcile the protected dev-pair observer station mailbox
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import socket
 import ssl
 import stat
@@ -61,7 +62,14 @@ BINDING = {'version', 'kind', 'job_id', 'source_sha', 'machine_id', 'boot_id', '
 BINDING_RELEASE = RELEASE - SITE_RELEASE
 CORE_BINDING = (BINDING - {'provider_recovery', 'public_addresses'}) | {'node_id', 'tailnet', 'keys_sha256', 'tailnet_addresses'}
 CORE_SITE = SITE | {'tailnet', 'acl_sha256', 'execution_route'}
-SCOPED_ACCESS = {CORE_ACCESS_CUTOVER, WORKLOAD_ACCESS_CUTOVER}
+AGENT_CANDIDATE = 'agent-workload-candidate'
+AGENT_ROLES = ('maintenance', 'development')
+AGENT_SITE_FIELDS = {'version', 'source_sha', 'machine_id', 'dns_name', 'tailnet', 'node_id', 'tailnet_addresses',
+                     'keys_sha256', 'guard_sha256', 'acl_sha256', 'host_artifact_sha256', 'devbox_image',
+                     'provider_recovery', 'public_addresses'}
+AGENT_CLIENT_COMMAND = '/usr/libexec/dev-pair/renewal/agent-observer client'
+WORKLOAD_KINDS = {WORKLOAD_ACCESS_CUTOVER, AGENT_CANDIDATE}
+SCOPED_ACCESS = {CORE_ACCESS_CUTOVER, *WORKLOAD_KINDS}
 ACCESS_KINDS = {'access-cutover', *SCOPED_ACCESS}
 ROLE_ARTIFACTS = {'release_sha256', 'job', 'development_manifest', 'maintenance_image', 'development_image', 'devbox_image'}
 MAX_ACCESS_PART = 16384
@@ -148,9 +156,7 @@ def record_name(test, family):
     return test + '--' + family + '.json'
 
 
-def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):
-    payload = bounded_file(path)
-    signature = bounded_file(path.with_name(path.name + '.sig'), 16384)
+def verify_bytes(payload, signature, principal, signers, namespace):
     with tempfile.TemporaryFile() as original:
         original.write(signature)
         original.flush()
@@ -163,17 +169,42 @@ def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):
     return json.loads(payload, object_pairs_hook=relay.unique), digest(payload)
 
 
+def verify_file(path, principal, signers=SIGNERS, namespace=NAMESPACE):
+    return verify_bytes(bounded_file(path), bounded_file(path.with_name(path.name + '.sig'), 16384),
+                        principal, signers, namespace)
+
+
+def validate_candidate(value):
+    fields = {'previous_release_sha256', 'platform_sha256', 'guard_sha256', 'acl_sha256', 'host_artifact_sha256'}
+    keys(value, fields | {'operation', 'requested_at'})
+    require(all(matches(DIGEST, value[key]) for key in fields)
+            and matches(r'agent-ci-[1-9][0-9]{0,18}-[0-9a-f]{24}', value['operation'])
+            and value['operation'].endswith('-' + value['platform_sha256'][:24])
+            and type(value['requested_at']) is int and 0 < value['requested_at'] < 2**63,
+            'candidate observation lacks its exact protected renewal scope')
+
+
+def agent_probe_challenge(value):
+    keys(value, {'role', 'family', 'source_sha', 'candidate', 'request_sha256', 'challenge', 'expires_at'})
+    require(value['role'] in AGENT_ROLES and value['family'] in FAMILIES and matches(SHA, value['source_sha']) and
+            matches(DIGEST, value['candidate']) and matches(DIGEST, value['request_sha256']) and
+            canonical_uuid(value['challenge']) and type(value['expires_at']) is int,
+            'invalid independently issued candidate probe challenge')
+
+
 def validate_plan(plan, now):
     require(type(plan) is dict and plan.get('kind') in {'checklist-release', *ACCESS_KINDS},
             'unsupported destination observation plan')
     checklist = plan['kind'] == 'checklist-release'
     scoped = plan['kind'] in SCOPED_ACCESS
-    workload = plan['kind'] == WORKLOAD_ACCESS_CUTOVER
+    workload = plan['kind'] in WORKLOAD_KINDS
     fields = set(RELEASE if checklist else ACCESS)
     if scoped:
         fields |= {'tailnet_addresses'}
     if workload:
         fields |= {'role_artifacts'}
+    if plan['kind'] == AGENT_CANDIDATE:
+        fields |= {'candidate'}
     keys(plan, PLAN | fields)
     require(type(plan['version']) is int and plan['version'] == 1
             and matches(SHA, plan['source_sha']) and matches(r'[0-9a-f]{32}', plan['machine_id'])
@@ -205,6 +236,11 @@ def validate_plan(plan, now):
             keys(roles, ROLE_ARTIFACTS)
             require(matches(JOB, roles['job']) and all(matches(DIGEST, roles[key]) for key in ROLE_ARTIFACTS - {'job'}),
                     'workload review lacks the exact selected local role and DevBox artifacts')
+        if plan['kind'] == AGENT_CANDIDATE:
+            validate_candidate(plan['candidate'])
+            require(plan['candidate']['requested_at'] <= plan['issued_at']
+                    and plan['candidate']['previous_release_sha256'] != plan['role_artifacts']['release_sha256'],
+                    'candidate plan does not observe a prospective role placement')
         return
     require(matches(SHA, plan['release_source']) and matches(IMAGE, plan['image'])
             and matches(DIGEST, plan['guard_sha256'])
@@ -282,13 +318,14 @@ def prepare_plan(binding, site, now, previous):
             'unsupported protected destination binding')
     checklist = binding['kind'] == 'checklist-release'
     scoped = binding['kind'] in SCOPED_ACCESS
-    workload = binding['kind'] == WORKLOAD_ACCESS_CUTOVER
+    workload = binding['kind'] in WORKLOAD_KINDS
     keys(site, CORE_SITE if scoped else SITE | (SITE_RELEASE if checklist else ACCESS))
     fields = CORE_BINDING if scoped else BINDING | (BINDING_RELEASE if checklist else set())
-    keys(binding, fields | ({'role_artifacts'} if workload else set()))
+    keys(binding, fields | ({'role_artifacts'} if workload else set()) |
+         ({'candidate'} if binding['kind'] == AGENT_CANDIDATE else set()))
     if workload:
         require(site['kind'] == CORE_ACCESS_CUTOVER, 'use the previously admitted independent access site')
-        site = {**site, 'kind': WORKLOAD_ACCESS_CUTOVER}
+        site = {**site, 'kind': binding['kind']}
     require(all(binding[key] == site[key] for key in binding.keys() & site.keys()),
             'destination binding differs from independently admitted site endpoints')
     clocks = {key: previous[key] for key in ('issued_at', 'expires_at', 'ceremony_id')} if previous else {
@@ -510,11 +547,14 @@ def external_method(plan, test, family):
 
 
 def expected_role_probe(plan, test, family):
-    if plan['kind'] == WORKLOAD_ACCESS_CUTOVER and test in (
+    if plan['kind'] in WORKLOAD_KINDS and test in (
             'maintenance-authorized', 'maintenance-restored', 'development-authorized', 'development-restored'):
-        return {'role': test.split('-', 1)[0], 'source_sha': plan['source_sha'], 'boot_id': plan['boot_id'],
-                'machine_id': plan['machine_id'], 'address': plan['tailnet_addresses'][family],
-                'role_artifacts': plan['role_artifacts'], 'probe_cycles': 2, 'job_admission': False}
+        proof = {'role': test.split('-', 1)[0], 'source_sha': plan['source_sha'], 'boot_id': plan['boot_id'],
+                 'machine_id': plan['machine_id'], 'address': plan['tailnet_addresses'][family],
+                 'role_artifacts': plan['role_artifacts'], 'probe_cycles': 2, 'job_admission': False}
+        if plan['kind'] == AGENT_CANDIDATE:
+            proof['candidate'] = plan['candidate']
+        return proof
     return None
 
 
@@ -679,8 +719,10 @@ def assembled_receipt(plan, plan_sha, directory, *, now, verify):
         data.update({key: plan[key] for key in ACCESS | {'provider_recovery', 'public_addresses'}})
         if plan['kind'] in SCOPED_ACCESS:
             data.update(kind=plan['kind'], tailnet_addresses=plan['tailnet_addresses'])
-        if plan['kind'] == WORKLOAD_ACCESS_CUTOVER:
+        if plan['kind'] in WORKLOAD_KINDS:
             data['role_artifacts'] = plan['role_artifacts']
+        if plan['kind'] == AGENT_CANDIDATE:
+            data['candidate'] = plan['candidate']
     else:
         events = {}
         for event, vantage in EVENTS.items():
@@ -715,6 +757,139 @@ def read_access_envelope(stream):
     return payload, signature
 
 
+def candidate_site(binding, site, now):
+    keys(binding, CORE_BINDING | {'role_artifacts', 'candidate'})
+    keys(site, AGENT_SITE_FIELDS)
+    validate_candidate(binding['candidate'])
+    require(binding['kind'] == AGENT_CANDIDATE and binding['job_id'] == 'host-access' and
+            type(binding['version']) is int and binding['version'] == 1 and canonical_uuid(binding['boot_id']) and
+            matches(DNS, binding['dns_name']) and 0 <= now - binding['candidate']['requested_at'] < 3600,
+            'candidate request is unsupported, stale or for a different destination')
+    keys(binding['role_artifacts'], ROLE_ARTIFACTS)
+    require(matches(JOB, binding['role_artifacts']['job']) and
+            all(matches(DIGEST, binding['role_artifacts'][key]) for key in ROLE_ARTIFACTS - {'job'}) and
+            binding['role_artifacts']['release_sha256'] != binding['candidate']['previous_release_sha256'],
+            'candidate request lacks a prospective exact role selection')
+    measured = {**binding, **binding['candidate'], 'devbox_image': binding['role_artifacts']['devbox_image']}
+    require(all(measured[key] == site[key] for key in AGENT_SITE_FIELDS - {'provider_recovery', 'public_addresses'}),
+            'candidate changes an independently admitted ingress or stable runtime control')
+    keys(site['public_addresses'], set(FAMILIES))
+    for family in FAMILIES:
+        Bootstrap.public_probe_host(site['public_addresses'][family], family, site['provider_recovery'])
+    require(Bootstrap.access_addresses({'TailscaleIPs': list(binding['tailnet_addresses'].values())}) == binding['tailnet_addresses']
+            and matches(r'hostinger://[A-Za-z0-9_-]{1,100}/recovery', site['provider_recovery']),
+            'candidate site lacks both private routes and the independently approved recovery route')
+
+
+def sign_observation(payload, key, namespace):
+    signed = subprocess.run(['/usr/bin/ssh-keygen', '-Y', 'sign', '-f', str(checked_file(key)), '-n', namespace],
+                            input=payload, capture_output=True, timeout=12, check=True)
+    require(0 < len(signed.stdout) <= MAX_ACCESS_PART, 'independent signing output exceeds its bound')
+    return signed.stdout
+
+
+def ssh_candidate_probe(binding, family, payload, identity, known_hosts):
+    options = ('BatchMode=yes', 'IdentitiesOnly=yes', 'StrictHostKeyChecking=yes', 'GlobalKnownHostsFile=/dev/null',
+               'ConnectTimeout=8', 'ConnectionAttempts=1', 'RequestTTY=no', 'ClearAllForwardings=yes',
+               'HostKeyAlias=' + binding['dns_name'], 'UserKnownHostsFile=' + str(checked_file(known_hosts)))
+    command = ['/usr/bin/ssh', '-F', '/dev/null', '-4' if family == 'ipv4' else '-6', '-i', str(checked_file(identity))]
+    for option in options:
+        command.extend(('-o', option))
+    command.extend(('--', 'core@' + binding['tailnet_addresses'][family], AGENT_CLIENT_COMMAND))
+    deadline = time.monotonic() + 660
+    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+        try:
+            process.stdin.write(payload)
+            process.stdin.close()
+            output = bytearray()
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.select(max(0, deadline - time.monotonic())):
+                    chunk = os.read(process.stdout.fileno(), 8192 + 1 - len(output))
+                    if not chunk:
+                        break
+                    output.extend(chunk)
+                    require(len(output) <= 8192, 'candidate SSH result exceeds the authorized byte limit')
+                else:
+                    raise Blocked('candidate SSH observation timed out')
+            require(process.wait(timeout=max(1, deadline - time.monotonic())) == 0 and output,
+                    'candidate SSH probe failed on an admitted route')
+        finally:
+            if process.poll() is None:
+                process.kill()
+    return bytes(output)
+
+
+def checked_candidate_readings(binding, readings, now, *, complete=True):
+    expected = {(role, family) for role in AGENT_ROLES for family in FAMILIES}
+    require(type(readings) is list and len(readings) <= len(expected), 'candidate role observations exceed their bound')
+    seen, challenges = set(), set()
+    for item in readings:
+        keys(item, {'role', 'family', 'observed_at', 'reading'})
+        role, family, reading = item['role'], item['family'], item['reading']
+        require((role, family) in expected - seen and type(item['observed_at']) is int and
+                binding['candidate']['requested_at'] <= item['observed_at'] <= now,
+                'candidate observation reused a placement or predates its request')
+        proof = expected_role_probe(binding, role + '-authorized', family)
+        keys(reading, set(proof) | {'challenge_sha256', 'runtime_result_sha256'})
+        require(all(reading[key] == value for key, value in proof.items()) and type(reading['probe_cycles']) is int and
+                matches(DIGEST, reading['runtime_result_sha256']) and matches(DIGEST, reading['challenge_sha256']) and
+                reading['challenge_sha256'] not in challenges, 'candidate SSH response differs from its confined challenge')
+        challenges.add(reading['challenge_sha256'])
+        seen.add((role, family))
+    require(not complete or seen == expected, 'candidate observation requires both roles on both named routes')
+
+
+def collect_candidate(binding, site, directory, identity, known_hosts, signer):
+    candidate_site(binding, site, int(time.time()))
+    request_sha = digest(encoding(binding))
+    directory = state_dir(directory)
+    readings = []
+    for role in AGENT_ROLES:
+        for family in FAMILIES:
+            path = directory / (role + '-' + family + '.json')
+            if os.path.lexists(path):
+                entry = json.loads(bounded_file(path), object_pairs_hook=relay.unique)
+                keys(entry, {'request_sha256', 'item'})
+                require(entry['request_sha256'] == request_sha, 'protected observation directory is for another request')
+                item = entry['item']
+                require((item['role'], item['family']) == (role, family), 'protected observation identity changed')
+            else:
+                challenge = {'role': role, 'family': family, 'source_sha': binding['source_sha'],
+                             'candidate': binding['role_artifacts']['release_sha256'], 'request_sha256': request_sha,
+                             'challenge': str(uuid.uuid4()), 'expires_at': int(time.time()) + 120}
+                raw = encoding(challenge)
+                envelope = access_envelope(raw, sign_observation(raw, signer, NAMESPACE))
+                reading = json.loads(ssh_candidate_probe(binding, family, envelope, identity, known_hosts),
+                                     object_pairs_hook=relay.unique)
+                require(reading.get('challenge_sha256') == digest(raw), 'candidate SSH response does not prove the fresh challenge')
+                item = {'role': role, 'family': family, 'observed_at': int(time.time()), 'reading': reading}
+                checked_candidate_readings(binding, [item], int(time.time()), complete=False)
+                write_once(path, encoding({'request_sha256': request_sha, 'item': item}))
+            readings.append(item)
+    checked_candidate_readings(binding, readings, int(time.time()))
+    raw = encoding({'request_sha256': request_sha, 'readings': readings})
+    return access_envelope(raw, sign_observation(raw, signer, NAMESPACE))
+
+
+def assemble_candidate(binding, site, collection, signer):
+    now = int(time.time())
+    candidate_site(binding, site, now)
+    with open_regular(collection) as stream:
+        raw, signature = read_access_envelope(stream)
+    measured, _ = verify_bytes(raw, signature, observer_principal('authorized'), configured_signers(), NAMESPACE)
+    keys(measured, {'request_sha256', 'readings'})
+    require(measured['request_sha256'] == digest(encoding(binding)), 'collector signature does not select this candidate request')
+    checked_candidate_readings(binding, measured['readings'], now)
+    data = {key: value for key, value in binding.items() if key != 'job_id'}
+    data.update(issued_at=now, expires_at=now + LIFETIME, acl_sha256=site['acl_sha256'], execution_route='tailnet-core',
+                provider_recovery=site['provider_recovery'], public_addresses=site['public_addresses'],
+                probes=measured['readings'], observation='named-candidate-challenges',
+                collector_signature=base64.b64encode(signature).decode('ascii'))
+    payload = encoding(data)
+    return access_envelope(payload, sign_observation(payload, signer, FINAL_NAMESPACE))
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--plan', type=Path, help='independently signed observation plan')
@@ -727,6 +902,15 @@ def arguments():
     begin = stages.add_parser('begin', help='prepare a plan from the admitted site profile and observed destination binding')
     begin.add_argument('--binding', type=Path, required=True)
     begin.add_argument('--site', type=Path, required=True)
+    candidate_collect = stages.add_parser('collect-candidate', help='challenge both confined roles over both named SSH routes')
+    candidate_collect.add_argument('--core-key', type=Path, required=True)
+    candidate_collect.add_argument('--known-hosts', type=Path, required=True)
+    candidate_assemble = stages.add_parser('assemble-candidate', help='independently verify and sign a prospective renewal receipt')
+    candidate_assemble.add_argument('--collection', type=Path, required=True)
+    for candidate in (candidate_collect, candidate_assemble):
+        candidate.add_argument('--binding', type=Path, required=True)
+        candidate.add_argument('--site', type=Path, required=True)
+        candidate.add_argument('--signer', type=Path, required=True)
     collect = stages.add_parser('collect', help='exercise the fixed browser or direct HTTPS check')
     external = stages.add_parser('record-access', help='record a separately authorized observed access transcript')
     for stage in (collect, external):
@@ -753,6 +937,16 @@ def main():
             path = args.receipt
             sys.stdout.buffer.write(access_envelope(bounded_file(path, MAX_ACCESS_PART),
                                     bounded_file(path.with_name(path.name + '.sig'), MAX_ACCESS_PART)))
+            return 0
+        if args.stage in ('collect-candidate', 'assemble-candidate'):
+            binding = json.loads(bounded_file(args.binding), object_pairs_hook=relay.unique)
+            site = json.loads(bounded_file(checked_file(args.site)), object_pairs_hook=relay.unique)
+            if args.stage == 'collect-candidate':
+                require(args.directory is not None, 'select the private exact candidate observation directory')
+                answer = collect_candidate(binding, site, args.directory, args.core_key, args.known_hosts, args.signer)
+            else:
+                answer = assemble_candidate(binding, site, args.collection, args.signer)
+            sys.stdout.buffer.write(answer)
             return 0
         require(args.directory is not None, 'select the private ceremony evidence directory')
         directory = state_dir(args.directory)

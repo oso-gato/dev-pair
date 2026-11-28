@@ -207,8 +207,13 @@ def release_action(action, payload):
     if action == 'activate':
         r.require(not any((CONTROL / 'owned-turns').iterdir()), 'role cleanup evidence required before activation')
         from bootstrap import Bootstrap
+        from renewal_site import CandidateAccess
 
         bootstrap = Bootstrap()
+        forward_agent = (payload['scope'] == 'agent' and os.path.lexists(CONTROL / 'platform-bindings' / (reference + '.json'))
+                         and not bootstrap.own_workload_rollback(reference))
+        if forward_agent:
+            CandidateAccess(r.Renewal(ROOT, None), bootstrap).accept(reference, operation)
         bootstrap.hold_changed_workload_access(reference)
         try:
             observe_host(reference, release['components']['host'])
@@ -225,6 +230,8 @@ def release_action(action, payload):
         observe_host(reference, release['components']['host'])
         r.replace_json(selector, reference)
         bootstrap.restore_retained_workload_gate(reference)
+        if forward_agent:
+            p.require_workload_access(ROOT, release=reference)
     if action == 'quiesce':
         owned = sorted((CONTROL / 'owned-turns').iterdir())
         if owned:
@@ -654,27 +661,38 @@ def private_devbox_probe(manifest_path, admission):
             os.fsync(parent)
 
 
-def access_probe(payload):
+def access_probe(payload, *, candidate=False, peer_reader=None, challenge=None):
     from bootstrap import Bootstrap
+    from renewal_site import CandidateAccess
 
-    p.fields(payload, 'role source_sha')
+    p.fields(payload, 'role source_sha candidate' if candidate else 'role source_sha')
     role, source = payload['role'], payload['source_sha']
     r.require(role in r.ROLES, 'unknown private access probe')
     host = Bootstrap()
-    peer = host.observed_ssh_peer()
+    read_peer = peer_reader or host.observed_ssh_peer
+    peer = read_peer()
     live, _ = host.tailscale_state()
     host.named_tailnet_peer(live, peer)
     guard = host.verify_final_guard()
     host.access_control_source(source, guard)
     host.verify_final_ssh()
     identity = host.destination_identity()
-    with r.Renewal(ROOT, None).lock():
-        selection = host.access_workload_selection()
+    controller = r.Renewal(ROOT, None)
+    with controller.lock():
+        if candidate:
+            pending = CandidateAccess(controller, host).request(payload['candidate'])
+            r.require(pending['source_sha'] == source and all(pending[key] == val for key, val in identity.items()),
+                      'named route differs from the pending candidate observation')
+            selection = pending['role_artifacts']
+            if challenge is not None:
+                challenge(pending, peer)
+        else:
+            selection = host.access_workload_selection()
         release, plan = admit_release(selection['release_sha256'])
         bundle, _ = live_host(release['components']['host'])
         if role == 'maintenance':
             context = plan['maintenance_context_sha256']
-            imported = retained_maintenance(r.Renewal(ROOT, None), release['components']['maintenance-agent'], context)
+            imported = retained_maintenance(controller, release['components']['maintenance-agent'], context)
             r.require(imported is not None, 'private maintenance probe requires an exact installed platform image')
             claim, _, _ = imported
             command = [PYTHON, '-EBs', str(bundle / 'tools/gptbox.py'), 'verify-installed-maintenance', '--phase', 'verify',
@@ -701,10 +719,18 @@ def access_probe(payload):
                 r.require(cycles == 2 and result['job_admission'] is False,
                           'private development diagnostic did not complete both confined probe cycles')
         r.require(type(cycles) is int and cycles == 2 and result['job_admission'] is False and
-                  host.destination_identity() == identity and host.observed_ssh_peer() == peer,
+                  host.destination_identity() == identity and read_peer() == peer,
                   'live named route or probe changed before observation completed')
-    return {'role': role, 'source_sha': source, **identity, 'address': peer['local'],
-            'role_artifacts': selection, 'probe_cycles': cycles, 'job_admission': False}
+        if candidate:
+            r.require(CandidateAccess(controller, host).request(payload['candidate']) == pending,
+                      'candidate access binding changed during the confined role probe')
+    evidence = {'role': role, 'source_sha': source, **identity, 'address': peer['local'],
+                'role_artifacts': selection, 'probe_cycles': cycles, 'job_admission': False}
+    if candidate:
+        evidence['candidate'] = pending['candidate']
+        if challenge is not None:
+            evidence['runtime_result_sha256'] = r.identity(result)
+    return evidence
 
 
 def turn(action, payload):
@@ -972,6 +998,8 @@ def main():
             result = verify_managed_probe(payload)
         elif action == 'access-probe':
             result = access_probe(payload)
+        elif action == 'candidate-access-probe':
+            result = access_probe(payload, candidate=True)
         else:
             r.require(action in ('validate', 'observe', 'activate', 'quiesce'), 'unsupported renewal action')
             result = release_action(action, payload)

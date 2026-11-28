@@ -1397,8 +1397,8 @@ class Bootstrap:
         self.destination_source(data['source_sha'], checkout=data['owner_checkout'])
         return data
 
-    def ssh_ancestors(self):
-        pid = os.getppid()
+    def ssh_ancestors(self, *, client_pid=None):
+        pid = os.getppid() if client_pid is None else client_pid
         processes = []
         for _ in range(64):
             if pid < 2:
@@ -1418,11 +1418,12 @@ class Bootstrap:
     def ssh_ancestor(self):
         return self.ssh_ancestors() != []  # Unavailable ancestry is unresolved.
 
-    def observed_ssh_peer(self):
-        connection = os.environ.get('SSH_CONNECTION')
-        legacy = os.environ.get('SSH_CLIENT')
+    def observed_ssh_peer(self, *, client_pid=None, transport=None):
+        environment = os.environ if transport is None else transport
+        connection = environment.get('SSH_CONNECTION')
+        legacy = environment.get('SSH_CLIENT')
         if not connection:
-            if legacy or self.ssh_ancestor():
+            if legacy or client_pid is not None or self.ssh_ancestor():
                 raise Blocked('SSH transport observed or unresolved; preserve full SSH_CONNECTION and retry')
             return None
         try:
@@ -1434,7 +1435,7 @@ class Bootstrap:
                 raise ValueError()
         except ValueError:
             raise Blocked('current SSH connection metadata is incomplete or inconsistent') from None
-        ancestors = self.ssh_ancestors()
+        ancestors = self.ssh_ancestors() if client_pid is None else self.ssh_ancestors(client_pid=client_pid)
         if not ancestors:
             raise Blocked('SSH connection is missing a verified live daemon ancestry')
         found = False
@@ -3018,9 +3019,19 @@ class Bootstrap:
         if state.get('scope') is not None:
             raise Blocked('independent workload access checks have not been admitted')
         roles = self.retained_workload_roles(state)
-        recovering = recovery_release is not None and self.own_workload_rollback(recovery_release)
-        if roles and self.access_workload_selection(allow_fenced=recovering) != roles:
-            raise Blocked('independent workload access checks are required for the current role placement')
+        if roles:
+            fenced = recovery_release is not None and (self.own_workload_rollback(recovery_release) or
+                                                       self.own_agent_workload_activation(recovery_release))
+            if fenced:
+                selected = self.fenced_workload_placement(recovery_release)
+            else:
+                selected = self.access_workload_selection()
+            if selected != roles:
+                approved = self.admitted_agent_workload(selected['release_sha256'], state)
+                if approved is None or approved['role_artifacts'] != selected:
+                    raise Blocked('independent workload access checks are required for the current role placement')
+                state = {**state, **approved}
+                roles = selected
         reference = roles['release_sha256'] if roles else None
         require_workload_access(self.path('/var/lib/dev-pair'), release=reference)
         return state
@@ -3102,7 +3113,15 @@ class Bootstrap:
                     if live == roles:
                         self.publish_workload_gate('admitted' if 'role_artifacts' in state else 'legacy', roles)
                     else:
-                        self.publish_workload_gate('held')
+                        try:
+                            approved = self.admitted_agent_workload(live['release_sha256'], state)
+                        except (Blocked, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                            self.publish_workload_gate('held')
+                            raise
+                        if approved and approved['role_artifacts'] == live:
+                            self.publish_workload_gate('admitted', live)
+                        else:
+                            self.publish_workload_gate('held')
 
     def hold_changed_workload_access(self, release, *, acquire_lease=False):
         from job_protocol import WORKLOAD_ACCESS, workload_access_lease
@@ -3170,13 +3189,56 @@ class Bootstrap:
                 and state['request']['previous_sha256'] == release and os.path.lexists(marker)
                 and renewal.read_json(marker) == attempt.name)
 
+    def own_agent_workload_activation(self, release):
+        import renewal
+
+        controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
+        attempt, state = controller.transition()
+        marker = controller.root / 'renewal-fence/frozen'
+        return (state is not None and state['phase'] in ('applying', 'verifying', 'accepted') and
+                state['request']['scope'] == 'agent' and state['request']['target_sha256'] == release and
+                os.path.lexists(marker) and renewal.read_json(marker) == attempt.name)
+
+    def fenced_workload_placement(self, reference):
+        import renewal
+        from renewal_site import role_artifacts
+
+        controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
+        try:
+            settled = self.access_workload_selection(allow_fenced=True)
+        except Blocked:
+            pass  # During a switch the execution selector advances before the committed selector.
+        else:
+            if settled['release_sha256'] != reference:
+                raise Blocked('the fenced private placement selected another release')
+            return settled
+        if renewal.read_json(controller.control / 'site-current.json') != reference:
+            raise Blocked('the fenced private placement has not been selected by its recovery executor')
+        return role_artifacts(controller, reference)
+
+    def admitted_agent_workload(self, reference, state):
+        import renewal
+        from renewal_site import CandidateAccess
+
+        controller = renewal.Renewal(self.path('/var/lib/dev-pair'), None)
+        return CandidateAccess(controller, self).admitted(reference, state)
+
     def restore_retained_workload_gate(self, reference):
         state = json.loads(self.text(CUTOVER, '{}'), object_pairs_hook=relay.unique)
         roles = self.retained_workload_roles(state)
-        if (roles is not None and roles['release_sha256'] == reference and self.own_workload_rollback(reference)
-                and self.access_workload_selection(allow_fenced=True) == roles):
-            self.verify_final_ssh()
-            self.publish_workload_gate('admitted' if 'role_artifacts' in state else 'legacy', roles)
+        if roles is None or not (self.own_workload_rollback(reference) or self.own_agent_workload_activation(reference)):
+            return
+        state = self.verify_final_guard()
+        selected = self.fenced_workload_placement(reference)
+        if selected == roles:
+            phase = 'admitted' if 'role_artifacts' in state else 'legacy'
+        else:
+            approved = self.admitted_agent_workload(reference, state)
+            if approved is None or approved['role_artifacts'] != selected:
+                return
+            phase = 'admitted'
+        self.verify_final_ssh()
+        self.publish_workload_gate(phase, selected)
 
     def verify_final_ssh(self):
         self.run('/usr/sbin/sshd', '-t')
@@ -3276,25 +3338,17 @@ class Bootstrap:
 
     def selected_workload_placement(self, *, allow_fenced=False):
         import renewal
+        from renewal_site import role_artifacts
 
         control = self.path('/var/lib/dev-pair/renewal')
         chosen = renewal.read_json(control / 'current.json')
         if chosen != renewal.read_json(control / 'site-current.json') or not allow_fenced and os.path.lexists(
                 self.path('/var/lib/dev-pair/renewal-fence/frozen')):
             raise Blocked('the selected private role placement is not settled')
-        release = renewal.Renewal(self.path('/var/lib/dev-pair'), None).release(chosen)
-        raw = renewal.read_private(control / 'plans' / (release['plan_sha256'] + '.json'), renewal.MAX_CONTROL)
-        if renewal.sha(raw) != release['plan_sha256']:
-            raise Blocked('private role launch plan digest differs')
-        plan = renewal.loads(raw)['development_manifests']
-        if type(plan) is not dict or not plan:
-            raise Blocked('the selected private role placement has no approved development manifest')
-        job = sorted(plan)[0]
-        renewal.token(job)
-        renewal.digest(plan[job])
-        return {'release_sha256': chosen, 'job': job, 'development_manifest': plan[job],
-                **{role + '_image': release['components'][component]['artifact_sha256'] for role, component in
-                   (('maintenance', 'maintenance-agent'), ('development', 'development-agent'), ('devbox', 'devbox'))}}
+        try:
+            return role_artifacts(renewal.Renewal(self.path('/var/lib/dev-pair'), None), chosen)
+        except ValueError as error:
+            raise Blocked(str(error)) from error
 
     def access_cutover_binding(self, source, *, workload=False):
         self.destination_source(source)

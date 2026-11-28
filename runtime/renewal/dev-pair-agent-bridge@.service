@@ -1,7 +1,7 @@
 [Unit]
 Description=Discover protected dev-pair agent release (%i)
-After=network-online.target dev-pair-renewal-recovery.service
-Wants=network-online.target
+After=network-online.target dev-pair-renewal-recovery.service dev-pair-agent-observer.socket
+Wants=network-online.target dev-pair-agent-observer.socket
 RequiresMountsFor=/var/lib/dev-pair
 
 [Service]
