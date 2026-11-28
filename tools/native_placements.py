@@ -459,9 +459,16 @@ def idle_process(pid, comm, manager_pid, scope, pause):
         return comm == '(sd-pam)' and re.search(rf'^PPid:\s+{manager_pid}$', status, re.M) is not None
     if (program, comm) in (('/usr/bin/dbus-broker', 'dbus-broker'), ('/usr/bin/dbus-broker-launch', 'dbus-broker-lau')):
         return group in {prefix + '/session.slice/dbus-broker.service', prefix + '/session.slice/dbus.service'}
-    return (pid == pause and program == db.PODMAN
-            and re.fullmatch(re.escape(prefix) + r'/(?:[a-zA-Z0-9_.-]+\.slice/)*libpod-pause-[a-zA-Z0-9_.-]+\.scope',
-                             group) is not None)
+    if pid != pause:
+        return False
+    child_scope = re.escape(prefix) + r'/(?:[a-zA-Z0-9_.-]+\.slice/)*'
+    if program == db.PODMAN:
+        return re.fullmatch(child_scope + r'libpod-pause-[a-zA-Z0-9_.-]+\.scope', group) is not None
+    if ((program, comm) != ('/usr/libexec/catatonit/catatonit', 'catatonit') or
+            re.fullmatch(child_scope + r'podman-pause-[0-9a-f]{8}\.scope', group) is None):
+        return False
+    with (proc / 'cmdline').open('rb') as stream:
+        return stream.read(32) == b'catatonit\0-P\0'
 
 
 def require_idle_roles(dev, maint):

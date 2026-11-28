@@ -107,6 +107,13 @@ After two failed builds, up to two explicit cleanup-only reconciliations can
 still remove exact owned resources, even below the free-space build threshold.
 Neither cleanup allowance resets the execution budget.
 
+Before image work, Podman must report the managed builder's full UID and GID
+maps. If the installer reports cached single-ID maps during initial setup,
+keep the provider recovery console available and reboot the host when
+authorized. Reopen the recovery route and run `./day0.sh resume` from the same
+verified checkout. The pause preserves the existing setup journal and does not
+consume another build attempt.
+
 Protected root records live under `/var/lib/dev-pair/bootstrap/gptbox-adapter`;
 public immutable build bytes live separately under `/var/lib/dev-pair/artifacts`
 so the rootless engine can read them without access to control state. Diagnostics

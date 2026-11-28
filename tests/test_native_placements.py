@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager, ExitStack
 import hashlib
+import io
 import os
 from pathlib import Path
 import stat
@@ -440,6 +441,21 @@ class TestManagedEntry(unittest.TestCase):
         with patch.object(n.os, 'readlink', return_value='/usr/bin/python3'), \
                 patch.object(Path, 'read_text', return_value='0::' + scope + '/session.slice/dbus-broker.service'):
             self.assertFalse(n.idle_process(105, 'dbus-broker', 101, scope, 105))
+
+    def test_fedora_catatonit_is_idle_only_in_its_recorded_pause_mode_and_scope(self):
+        scope = '/user.slice/user-1001.slice/user@1001.service'
+        group = '0::' + scope + '/user.slice/podman-pause-a838e7fe.scope\n'
+        with (patch.object(n.os, 'readlink', return_value='/usr/libexec/catatonit/catatonit'),
+              patch.object(Path, 'read_text', return_value=group) as cgroup,
+              patch.object(Path, 'open', side_effect=lambda *args: io.BytesIO(b'catatonit\0-P\0')) as argv):
+            self.assertTrue(n.idle_process(105, 'catatonit', 101, scope, 105))
+            self.assertFalse(n.idle_process(105, 'catatonit', 101, scope, 106))
+            self.assertFalse(n.idle_process(105, 'podman', 101, scope, 105))
+            cgroup.return_value = '0::/system.slice/container.service\n'
+            self.assertFalse(n.idle_process(105, 'catatonit', 101, scope, 105))
+            cgroup.return_value = group
+            argv.side_effect = lambda *args: io.BytesIO(b'catatonit\0/usr/bin/sleep\x00100\0')
+            self.assertFalse(n.idle_process(105, 'catatonit', 101, scope, 105))
 
     def test_uncertain_signed_base_import_keeps_its_spool_on_bounded_storage(self):
         candidate = self.placement()

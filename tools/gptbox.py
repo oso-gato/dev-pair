@@ -2244,6 +2244,8 @@ class DevelopmentGptbox(Gptbox):
         self.image_stage('executor-setup', revision, expected)
         self.setup_executor(retry=bool(count), verified=builder)
         if count:
+            if count < 2:
+                self.verify_builder_mapping()
             self.reconcile_development_work(expected, export_work)
             if pending_exists:
                 for node in self.pending_members(pending, publication):
@@ -2259,7 +2261,8 @@ class DevelopmentGptbox(Gptbox):
         reserve = 8 * 1024 ** 3 + 2 * DEVELOPMENT_ARCHIVE_LIMIT
         if shutil.disk_usage(pending.parent).free < reserve:
             raise Blocked('insufficient capacity for the bounded development export and eight GiB reserve')
-        self.verify_builder_mapping()
+        if not count:
+            self.verify_builder_mapping()
         attempt = {**attempt, 'count': count + 1}
         self.record('attempt', attempt)
         base, _, inputs = self._full_candidate(context, expected, revision, manifest)
