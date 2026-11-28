@@ -701,18 +701,21 @@ def unique_object(items):
     return value
 
 
-def read_bytes(path, maximum=262144):
+def read_bytes(path, maximum=262144, *, protected=False):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, 'rb') as stream:
         info = os.fstat(stream.fileno())
         require(stat.S_ISREG(info.st_mode) and info.st_size <= maximum, 'nonregular or excessive evidence input')
+        if protected:
+            require(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1,
+                    'protected evidence ownership differs')
         data = stream.read(maximum + 1)
         require(len(data) == info.st_size and len(data) <= maximum, 'evidence size changed')
     return data
 
 
-def read_json(path, maximum=262144, expected_sha=None):
-    data = read_bytes(path, maximum)
+def read_json(path, maximum=262144, expected_sha=None, *, protected=False):
+    data = read_bytes(path, maximum, protected=protected)
     if expected_sha is not None:
         require(hashlib.sha256(data).hexdigest() == expected_sha, 'Evidence snapshot digest mismatch')
     return json.loads(data, object_pairs_hook=unique_object)
@@ -1555,8 +1558,51 @@ def native_failure_projection(entry,expected,phase=None):
     except (ValueError,KeyError,TypeError,AttributeError):return unavailable
 
 
+def maintenance_host_staging_projection(receipt, intent, expected):
+    unavailable = {'availability': 'unavailable'}
+    try:
+        require(type(receipt) is dict and set(receipt) == {'schema', 'source_sha', 'context_sha256', 'attempt', 'unit', 'failure'}
+                and type(receipt['schema']) is int and receipt['schema'] == 1, 'Host staging receipt shape')
+        require(type(intent) is dict and set(intent) == {'schema', 'target', 'phase', 'phase_prefixes', 'native_units'}
+                and type(intent['schema']) is int and intent['schema'] == 1 and intent['phase'] in ('preparing', 'complete'),
+                'Host staging intent shape')
+        identity = {key: expected[key] for key in ('source_sha', 'context_sha256')}
+        require(all(receipt[key] == value == intent['target'][key] for key, value in identity.items()), 'Host staging identity differs')
+        attempts, units = intent['phase_prefixes'], intent['native_units']
+        require(type(attempts) is list and 1 <= len(attempts) <= 2 and len(set(attempts)) == len(attempts)
+                and all(re.fullmatch(r'(?:dev-pair-initialize-prepare|dev-pair-maint-host)-[0-9a-f]{8}', item) for item in attempts),
+                'Host staging attempt history differs')
+        require(type(units) is list and 1 <= len(units) <= 512 and len(set(units)) == len(units)
+                and all(re.fullmatch(r'dev-pair-initialize-prepare-[0-9a-f]{8}-[0-9a-f]{8}', unit)
+                        and unit.rsplit('-', 1)[0] in attempts for unit in units), 'Host staging ownership differs')
+        attempt = receipt['attempt']
+        latest = next((unit for unit in reversed(units) if unit.rsplit('-', 1)[0] == attempt), None)
+        require(latest is not None and receipt['unit'] == latest, 'Host staging unit differs')
+        failure = receipt['failure']
+        require('cache_comparison' in failure and failure['point'] == 'not-reached'
+                and failure['category'] == 'blocked-or-interrupted', 'Host staging failure differs')
+        entry = {'diagnostic_identity': {**identity, 'phase': 'prepare'}, 'native_failure': failure,
+                 'admission_stage': 'cache-recheck', 'admission_reason': 'cache-staging-comparison'}
+        witness = native_failure_projection(entry, expected, 'prepare')
+        require(witness['availability'] == 'observed', 'Host staging comparison unavailable')
+        current = intent['phase'] == 'preparing' and attempt == attempts[-1]
+        return {**witness, 'attempt': attempt, 'unit': latest, 'status': 'current' if current else 'historical'}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return unavailable
+
+
 def public_diagnostics(state_root, expected, source=None):
     selected = {'storage_observations':storage_public_projection(state_root,expected,source)}
+    try:
+        intent_path = state_root / 'prepare-maintenance-host.json'
+        before = read_bytes(intent_path, 65536, protected=True)
+        receipt = read_json(state_root / 'prepare-maintenance-host-diagnostics.json', 2048, protected=True)
+        after = read_bytes(intent_path, 65536, protected=True)
+        require(before == after, 'Host staging intent changed during readback')
+        intent = json.loads(before, object_pairs_hook=unique_object)
+        selected['maintenance_host_staging'] = maintenance_host_staging_projection(receipt, intent, expected)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
     selected['image_progress']={'availability':'unavailable'}
     try:
         stage=read_json(state_root/'gptbox-adapter'/expected['context_sha256']/'image-progress.json',2048)

@@ -393,6 +393,7 @@ class Commands:
     native_prefix = None
     diagnostic = None
     metadata_diagnostic = None
+    mask_staging_diagnostic = None
     native_register = None
     _cleanup_deadline = None
     current_step = 'unscoped'
@@ -1141,6 +1142,9 @@ class Commands:
             if probe and self.diagnostic:
                 actual = process.returncode if process is not None else None
                 notify(self.diagnostic,buffers,actual if actual is not None and actual not in ok else status)
+            if (self.mask_staging_diagnostic and register_root_wrapper and admission_reason == 'cache-staging-comparison'
+                    and failure_witness is not None and cache_comparison is not None):
+                notify(self.mask_staging_diagnostic, unit, failure_witness)
             if (not probe and self.diagnostic) or self.metadata_diagnostic:
                 record = {'operation': public or 'withheld', 'operation_id': self.operation_id(original),
                           'step': self.current_step, 'outcome': 'accepted' if completed else 'rejected',

@@ -1844,7 +1844,38 @@ class Gptbox(Bootstrap):
         def prove_source():
             _, self.scripts = self.inputs(context, expected, upstream, revision)
 
-        with preparation.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE):
+        staging_failure = None
+        def capture_mask_staging_failure(unit, failure):
+            nonlocal staging_failure
+            if not record['native_units'] or unit != record['native_units'][-1]:
+                return
+            attempt = record['phase_prefixes'][-1]
+            if unit.rsplit('-', 1)[0] != attempt:
+                return
+            fields = ('point', 'category', 'launcher_handle_observed', 'status_sampled_before_interrupt',
+                      'launcher_status_before_interrupt', 'decoder', 'cache_comparison')
+            staging_failure = {'schema': 1, 'source_sha': revision, 'context_sha256': expected,
+                               'attempt': attempt, 'unit': unit,
+                               'failure': {key: failure[key] for key in fields}}
+
+        @contextlib.contextmanager
+        def observe_mask_staging():
+            previous = getattr(preparation.run, 'mask_staging_diagnostic', None)
+            preparation.run.mask_staging_diagnostic = capture_mask_staging_failure
+            try:
+                yield
+            except Blocked:
+                if staging_failure is not None:
+                    # Persist after the native execution phase and keep its primary failure.
+                    with contextlib.suppress(Exception):
+                        path = self.path(MAINTENANCE_HOST_DIAGNOSTIC)
+                        prior = self.protected_bytes(path, 2048, 0o600).decode() if os.path.lexists(path) else None
+                        self.atomic(MAINTENANCE_HOST_DIAGNOSTIC, image_inputs_bytes(staging_failure).decode(), expected=prior)
+                raise
+            finally:
+                preparation.run.mask_staging_diagnostic = previous
+
+        with observe_mask_staging(), preparation.run.phase(PREPARE_EXECUTION, PREPARE_NATIVE):
             prefix = preparation.run.native_prefix
             if not re.fullmatch(PREPARE_NATIVE + r'-[0-9a-f]{8}', prefix or '') or prefix in record['phase_prefixes']:
                 raise Blocked('maintenance host native phase identity collision')
@@ -1858,25 +1889,7 @@ class Gptbox(Bootstrap):
                 record['native_units'].append(unit)
                 save()
 
-            def retain_mask_staging_failure(entry):
-                unit = entry.get('native', {}).get('unit')
-                if (entry.get('admission_reason') != 'cache-staging-comparison' or not record['native_units']
-                        or unit != record['native_units'][-1]):
-                    return
-                failure = entry['native_failure']
-                fields = ('point', 'category', 'launcher_handle_observed', 'status_sampled_before_interrupt',
-                          'launcher_status_before_interrupt', 'decoder', 'cache_comparison')
-                receipt = {'schema': 1, 'unit': unit,
-                           'diagnostic_identity': {'source_sha': revision, 'context_sha256': expected, 'phase': 'prepare'},
-                           'admission_stage': entry['admission_stage'], 'admission_reason': entry['admission_reason'],
-                           'native_failure': {key: failure[key] for key in fields}}
-                path = self.path(MAINTENANCE_HOST_DIAGNOSTIC)
-                previous = self.protected_bytes(path, 2048, 0o600).decode() if os.path.lexists(path) else None
-                self.atomic(MAINTENANCE_HOST_DIAGNOSTIC, image_inputs_bytes(receipt).decode(), expected=previous)
-
             preparation.run.native_register = register
-            previous_metadata = getattr(preparation.run, 'metadata_diagnostic', None)
-            preparation.run.metadata_diagnostic = retain_mask_staging_failure
             arguments = {'password': password, 'source_check': prove_source}
             if console_receipt is not None:
                 arguments['console_receipt'] = console_receipt
@@ -1885,7 +1898,6 @@ class Gptbox(Bootstrap):
                                                         context, expected, **arguments)
             finally:
                 preparation.run.native_register = None
-                preparation.run.metadata_diagnostic = previous_metadata
         self._validate_host_ready(ready, revision, expected)
         self.directory(self.target, mode=0o755)
         self.setup_executor()

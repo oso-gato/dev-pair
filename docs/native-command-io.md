@@ -310,7 +310,8 @@ The host-only `prepare-maintenance-host` command retains the most recent
 mask-staging comparison failure in the root-only
 `/var/lib/dev-pair/bootstrap/prepare-maintenance-host-diagnostics.json`. The
 receipt is bound to the source, context and enrolled unit and carries no
-execution or retry authority.
+execution or retry authority. Protected readback pairs it with the exact
+host intent and labels it historical once a new attempt is recorded.
 
 
 Canonical /lib and /usr/lib aliases can produce duplicate snapshot path rows.

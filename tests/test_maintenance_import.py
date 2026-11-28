@@ -334,18 +334,20 @@ class MaintenanceImportTests(unittest.TestCase):
             self.assertEqual(self.prepare_cli('--bootstrap-source', '192.0.2.1/32', '--apply')[0], 2)
 
         self.assertFalse(any(row[0] == '/usr/bin/systemd-run' for row in calls))
+        self.assertEqual(len(calls), 3)
         self.assertEqual(list((root / 'records').iterdir()), [])
         self.assertEqual(list((root / 'system').iterdir()), [])
         self.assertFalse(self.app.path(g.STATE + '/host-ready.json').exists())
         self.assertIsNone(runner.metadata_diagnostic)
+        self.assertIsNone(runner.mask_staging_diagnostic)
         _, intent = self.app.read_config_record(g.MAINTENANCE_HOST_INTENT)
         path = g.STATE + '/prepare-maintenance-host-diagnostics.json'
         _, receipt = self.app.read_config_record(path)
         self.assertEqual(self.app.path(path).stat().st_mode & 0o777, 0o600)
         self.assertEqual(receipt['unit'], intent['native_units'][0])
-        self.assertEqual(receipt['diagnostic_identity'], {'source_sha': SOURCE, 'context_sha256': EXPECTED, 'phase': 'prepare'})
-        self.assertFalse(receipt['native_failure']['launcher_handle_observed'])
-        witness = receipt['native_failure']['cache_comparison']
+        self.assertEqual(receipt['attempt'], intent['phase_prefixes'][0])
+        self.assertFalse(receipt['failure']['launcher_handle_observed'])
+        witness = receipt['failure']['cache_comparison']
         self.assertEqual(witness['stage'], 'cache-staging-comparison')
         self.assertEqual(witness['path_class'], 'lookup-directory')
         self.assertEqual(witness['row_index'], 1)
@@ -355,12 +357,39 @@ class MaintenanceImportTests(unittest.TestCase):
         self.assertNotIn(str(root), json.dumps(receipt))
         self.assertNotIn('must never launch', json.dumps(receipt))
         expected = {'source_sha': SOURCE, 'context_sha256': EXPECTED}
-        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare')['cache_comparison'], witness)
-        receipt['native_failure']['launcher_handle_observed'] = True
-        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare'), {'availability': 'unavailable'})
-        receipt['native_failure']['launcher_handle_observed'] = False
-        receipt['native_failure']['cache_comparison']['stage'] = 'cache-final-comparison'
-        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare'), {'availability': 'unavailable'})
+        projection = guest.maintenance_host_staging_projection
+        current = guest.public_diagnostics(self.app.path(g.STATE), expected)['maintenance_host_staging']
+        self.assertEqual(current['cache_comparison'], witness)
+        self.assertEqual(current['status'], 'current')
+        unavailable = {'availability': 'unavailable'}
+        for field, mismatch in (('unit', receipt['attempt'] + '-00000000'), ('source_sha', '0' * 40),
+                                ('context_sha256', '0' * 64), ('attempt', 'dev-pair-initialize-prepare-00000000')):
+            self.assertEqual(projection({**receipt, field: mismatch}, intent, expected), unavailable)
+        self.assertEqual(projection({key: val for key, val in receipt.items() if key != 'unit'}, intent, expected), unavailable)
+        self.assertEqual(guest.native_failure_projection(receipt, expected, 'prepare'), unavailable)
+        retry = {**intent, 'phase_prefixes': [*intent['phase_prefixes'], 'dev-pair-initialize-prepare-00000000']}
+        self.assertEqual(projection(receipt, retry, expected)['status'], 'historical')
+        receipt['failure']['launcher_handle_observed'] = True
+        self.assertEqual(projection(receipt, intent, expected), unavailable)
+        receipt['failure']['launcher_handle_observed'] = False
+        receipt['failure']['cache_comparison']['stage'] = 'cache-final-comparison'
+        self.assertEqual(projection(receipt, intent, expected), unavailable)
+
+    def test_accepted_nonzero_wrapper_does_not_start_a_diagnostic_query(self):
+        install(self, self.app.root)
+        runner, calls = g.Commands(), []
+
+        def prerequisite(*args, **kwargs):
+            runner(sys.executable, '-c', 'raise SystemExit(3)', ok=(0, 3), timeout=10)
+            raise g.Blocked('fixture stops after accepted wrapper')
+
+        prep = SimpleNamespace(run=runner, _host_prerequisites=prerequisite, _host_desired=self.app.desired)
+        with patch.object(self.app, 'preparation', return_value=prep), \
+                patch.object(subprocess, 'Popen', side_effect=manager(subprocess.Popen, calls)):
+            self.assertEqual(self.prepare_cli('--bootstrap-source', '192.0.2.1/32', '--apply')[0], 2)
+        self.assertEqual(len(calls), 5)
+        self.assertFalse(any('--property=StatusErrno' in call for call in calls))
+        self.assertFalse(self.app.path(g.MAINTENANCE_HOST_DIAGNOSTIC).exists())
 
     def test_preflight_uses_signed_scope_before_any_oci_effect(self):
         self.prepare()
