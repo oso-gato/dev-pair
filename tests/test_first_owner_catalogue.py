@@ -110,6 +110,7 @@ class FirstCatalogueTests(unittest.TestCase):
                         {'id': name, 'sha256': sha256(self.documents[name + '.txt']),
                          'bytes': len(self.documents[name + '.txt'])} for name in owner.IDS]}
         self.documents['manifest.json'] = owner.manifest_bytes(manifest)
+        self.site.chmod(0o700)
         shared = {name: ('Synthetic standards ' + name + '\n').encode() for name in owner_source.SHARED}
         for name, body in shared.items():
             owner.write_private(self.site / 'standards' / name, body)

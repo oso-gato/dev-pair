@@ -6,6 +6,7 @@ import io
 import os
 from pathlib import Path
 import pty
+import random
 import select
 import signal
 import stat
@@ -66,6 +67,8 @@ class OwnerSourceTests(unittest.TestCase):
         self.credential = source.CREDENTIALS / source.STANDARD_REPOSITORY
         self.credential.parent.mkdir(mode=0o700, parents=True)
         owner.write_private(self.credential, b'fixture_github_contents_read\n')
+        self.real_read_token = source.read_token
+        self.use(mock.patch.object(source, 'read_token', side_effect=self.fixture_token))
         self.invoke = owner.candidate.invoke
         self.use(mock.patch.object(owner.candidate, 'invoke', side_effect=self.fixture_transport))
 
@@ -93,6 +96,11 @@ class OwnerSourceTests(unittest.TestCase):
         self.protect(path, directory=False)
         return owner.p.read_data(path, limit)
 
+    def fixture_token(self, repository, *, required):
+        if required:
+            raise source.pending(f'An authorized read credential is required for {repository}.')
+        return None
+
     def fixture_transport(self, argv, end, **kwargs):
         if 'fetch' in argv and argv[-2].startswith('https://github.com/'):
             url = argv[-2]
@@ -102,6 +110,19 @@ class OwnerSourceTests(unittest.TestCase):
             self.assertIn('http.followRedirects=false', argv)
             self.assertIn('credential.useHttpPath=true', argv)
             self.assertNotIn('fixture_github_contents_read', ' '.join(argv))
+            descriptor = kwargs['pass_fds']
+            if descriptor:
+                self.assertIn('http.proactiveAuth=basic', argv)
+                helper, = (argument for argument in argv if argument.startswith('credential.helper=!exec '))
+                credentials = subprocess.run(['/usr/bin/git', '-c', 'credential.useHttpPath=true', '-c', helper,
+                    'credential', 'fill'], input=(f'protocol=https\nhost=github.com\npath={url.removeprefix("https://github.com/")}\n\n').encode(),
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=descriptor, check=True, timeout=5).stdout
+                secret = os.pread(descriptor[0], 1025, 0)
+                self.assertTrue(b'password=' + secret + b'\n' in credentials)
+                if secret == b'fixture_rejected_credential':
+                    raise ValueError('Synthetic transport denied the replacement')
+            else:
+                self.assertNotIn('http.proactiveAuth=basic', argv)
             self.selections.append((url, argv[-1], '--depth=1' in argv))
             argv = list(argv)
             argv[argv.index('protocol.https.allow=always')] = 'protocol.file.allow=always'
@@ -124,10 +145,11 @@ class OwnerSourceTests(unittest.TestCase):
 
     def provision(self, *answers):
         responses = iter(answers)
-        return source.provision(self.intake, REPOSITORY, owner.CHECKLIST, lambda _: next(responses), lambda _: None)
+        return source.provision(self.intake, REPOSITORY, owner.CHECKLIST,
+            lambda prompt: '' if prompt.startswith('Replace the retained') else next(responses), lambda _: None)
 
     def test_attended_source_provisions_exact_commits_and_real_role_bundle(self):
-        answers = io.StringIO('\n'.join((REPOSITORY, '1', self.acquired, self.startup, 'yes', '')))
+        answers = io.StringIO('\n'.join((REPOSITORY, '1', self.acquired, self.startup, 'yes', '', '')))
         output = io.StringIO()
         with mock.patch.object(owner.getpass, 'getpass', return_value='fixture'), mock.patch.object(
                 owner, 'provider_custody', side_effect=owner.SitePending('provider', 'Billing custody still pending.')):
@@ -167,12 +189,13 @@ class OwnerSourceTests(unittest.TestCase):
         self.credential.unlink()
         with self.assertRaises(owner.SitePending) as failure:
             self.provision(self.acquired, self.startup, 'yes')
-        self.assertIn('standards read credential', failure.exception.observation['message'])
+        self.assertIn('authorized read credential is required', failure.exception.observation['message'])
         self.assertFalse((self.site / 'repositories').exists())
         self.assertFalse((self.site / 'standards').exists())
         self.assertEqual(list(self.site.glob(source.STAGE_PREFIX + '*')), [])
 
     def test_installed_cli_command_accepts_source_in_controlling_terminal(self):
+        self.credential.unlink()
         child, terminal = pty.fork()
         if child == 0:
             try:
@@ -180,6 +203,7 @@ class OwnerSourceTests(unittest.TestCase):
                 sys.argv = ['owner_intake.py', '--setup-site']
                 with mock.patch.object(owner, 'Intake', return_value=self.intake), mock.patch.object(
                         owner.getpass, 'getpass', return_value='fixture'), mock.patch.object(
+                        source, 'read_token', side_effect=self.real_read_token), mock.patch.object(
                         owner, 'provider_custody', side_effect=owner.SitePending('provider', 'Billing custody still pending.')):
                     os._exit(owner.main())
             except BaseException:
@@ -189,6 +213,9 @@ class OwnerSourceTests(unittest.TestCase):
         output = bytearray()
         deadline = time.monotonic() + 10
         finished = False
+        project_prompt = False
+        standards_prompt = False
+        enrolled = b'fixture_new_pinned_read_token'
         try:
             os.write(terminal, '\n'.join((REPOSITORY, '1', self.acquired, '', 'yes', '')).encode())
             while select.select([terminal], [], [], max(0, deadline - time.monotonic()))[0]:
@@ -202,6 +229,12 @@ class OwnerSourceTests(unittest.TestCase):
                     break
                 output.extend(chunk)
                 self.assertLess(len(output), 8192)
+                if not project_prompt and b'token for fixture/project (Enter for public access) ' in output:
+                    project_prompt = True
+                    os.write(terminal, b'\n')
+                if not standards_prompt and b'token for oso-gato/standards ' in output:
+                    standards_prompt = True
+                    os.write(terminal, enrolled + b'\n')
             else:
                 self.fail('Attended source setup exceeded the terminal deadline.')
             finished = True
@@ -214,6 +247,11 @@ class OwnerSourceTests(unittest.TestCase):
         transcript = output.decode()
         self.assertTrue(os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, transcript)
         self.assertIn('Billing custody still pending.', transcript)
+        self.assertTrue(project_prompt and standards_prompt)
+        self.assertFalse(enrolled in output)
+        self.assertEqual(self.credential.read_bytes(), enrolled + b'\n')
+        self.assertEqual(stat.S_IMODE(self.credential.stat().st_mode), 0o600)
+        self.assertFalse((source.CREDENTIALS / REPOSITORY).exists())
         config, _, _ = owner.first_source(self.intake, REPOSITORY, owner.CHECKLIST)
         self.assertEqual(config, {'commit': self.acquired, 'startup_revision': self.acquired})
 
@@ -237,7 +275,7 @@ class OwnerSourceTests(unittest.TestCase):
         owner.write_private(self.first.catalogue, owner.p.canonical({'schema': 1, 'repositories': {
             REPOSITORY: self.config}, 'slots': ['job-1']}).encode())
         output = io.StringIO()
-        source.restore(self.first, io.StringIO('yes\n'), output)
+        source.restore(self.first, io.StringIO('yes\n\n'), output)
         self.assertIn('exact approved revisions', output.getvalue())
         self.assertEqual(checkout.lstat().st_ino, original_inode)
         self.assertEqual(retained.lstat().st_ino, retained_inode)
@@ -253,15 +291,72 @@ class OwnerSourceTests(unittest.TestCase):
         repository = source.STANDARD_REPOSITORY
         request = f'protocol=https\nhost=github.com\npath={repository}.git\n'.encode()
         output = io.BytesIO()
-        source.credential_exchange(repository, 'get', io.BytesIO(request), output)
-        self.assertIn(b'username=x-access-token\npassword=', output.getvalue())
-        for wrong in (request.replace(b'github.com', b'elsewhere.test'), request.replace(b'https', b'http'),
-                      request.replace(b'standards.git', b'other.git'), request + b'host=github.com\n'):
-            with self.subTest(scope=wrong), self.assertRaisesRegex(ValueError, 'scope mismatch'):
-                source.credential_exchange(repository, 'get', io.BytesIO(wrong), io.BytesIO())
-        before = self.credential.read_bytes()
-        source.credential_exchange(repository, 'store', io.BytesIO(request + b'password=replacement\n'), io.BytesIO())
-        self.assertEqual(self.credential.read_bytes(), before)
+        with source.credential_fd(b'fixture_github_contents_read') as descriptor:
+            source.credential_exchange(repository, descriptor, 'get', io.BytesIO(request), output)
+            self.assertIn(b'username=x-access-token\npassword=', output.getvalue())
+            for wrong in (request.replace(b'github.com', b'elsewhere.test'), request.replace(b'https', b'http'),
+                          request.replace(b'standards.git', b'other.git'), request + b'host=github.com\n'):
+                with self.subTest(scope=wrong), self.assertRaisesRegex(ValueError, 'scope mismatch'):
+                    source.credential_exchange(repository, descriptor, 'get', io.BytesIO(wrong), io.BytesIO())
+            before = self.credential.read_bytes()
+            source.credential_exchange(repository, descriptor, 'store', io.BytesIO(request + b'password=replacement\n'), io.BytesIO())
+            self.assertEqual(self.credential.read_bytes(), before)
+
+    def test_rotation_checks_exact_scope_before_atomic_replacement(self):
+        self.assertTrue(self.provision(self.acquired, self.startup, 'yes'))
+        records = {'schema': 1, 'repositories': {REPOSITORY: self.config}, 'slots': ['job-1']}
+        owner.write_private(self.first.catalogue, owner.p.canonical(records).encode())
+        answers = f'{source.STANDARD_REPOSITORY}\nyes\n'
+        previous = self.credential.stat().st_ino
+        old = self.credential.read_bytes()
+        output = io.StringIO()
+        with mock.patch.object(source, 'read_token', return_value=b'fixture_rejected_credential'):
+            source.rotate(self.first, io.StringIO(answers), output)
+        self.assertIn('Could not fetch the approved exact commit', output.getvalue())
+        self.assertEqual(self.credential.stat().st_ino, previous)
+        self.assertEqual(self.credential.read_bytes(), old)
+        replacement = b'fixture_accepted_replacement'
+        with mock.patch.object(source, 'read_token', return_value=replacement):
+            source.rotate(self.first, io.StringIO(answers), output)
+        self.assertIn('verified repository read credential', output.getvalue())
+        self.assertFalse(replacement in output.getvalue().encode())
+        self.assertNotEqual(self.credential.stat().st_ino, previous)
+        self.assertEqual(self.credential.read_bytes(), replacement + b'\n')
+        self.assertEqual(self.selections[-1], (source.https_origin(source.STANDARD_REPOSITORY), self.standard_pin, True))
+
+    def test_retained_acquisition_reproves_bounded_full_history(self):
+        self.assertTrue(self.provision(self.acquired, self.startup, 'yes'))
+        checkout = self.site / 'repositories' / REPOSITORY / 'acquired'
+        ancestor = checkout / 'removed-binary'
+        ancestor.write_bytes(random.Random(317).randbytes(owner.candidate.MAX_BUNDLE + 1024 * 1024))
+        self.commit(checkout, 'Oversized older ancestor')
+        ancestor.unlink()
+        revision = self.commit(checkout, 'Small tip with unexportable ancestry')
+        with self.assertRaisesRegex(ValueError, 'bounded Git bundle'):
+            self.provision()
+        with self.assertRaisesRegex(ValueError, 'bounded Git bundle'):
+            owner.first_source(self.intake, REPOSITORY, owner.CHECKLIST)
+        self.assertEqual(self.git(checkout, 'rev-parse', 'HEAD').strip().decode(), revision)
+        self.assertEqual(len(self.selections), 3)
+
+    def test_retained_standards_directory_and_partial_cache_require_privacy(self):
+        self.assertTrue(self.provision(self.acquired, self.startup, 'yes'))
+        cache = self.site / 'standards'
+        name, missing, _ = source.SHARED
+        for directory in (self.site, cache):
+            directory.chmod(0o755)
+            with self.assertRaisesRegex(ValueError, 'root-private directories'):
+                self.provision()
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
+            directory.chmod(0o700)
+        original = (cache / name).read_bytes()
+        (cache / missing).unlink()
+        (cache / name).chmod(0o644)
+        with self.assertRaisesRegex(ValueError, 'root-private documents'):
+            self.provision()
+        self.assertEqual((cache / name).read_bytes(), original)
+        self.assertFalse((cache / missing).exists())
+        self.assertEqual(len(self.selections), 3)
 
 
 if __name__ == '__main__':

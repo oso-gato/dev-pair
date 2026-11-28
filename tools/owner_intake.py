@@ -96,6 +96,15 @@ def fixed_git(checkout, *args, cap=8192, data=None):
                             time.monotonic() + 15, cap=cap, data=data)
 
 
+def verify_bundle(checkout):
+    p.require(fixed_git(checkout, 'rev-parse', '--is-shallow-repository') == b'false\n',
+              'The approved acquisition requires its full Git history.')
+    try:
+        fixed_git(checkout, 'bundle', 'create', '-', 'HEAD', cap=candidate.MAX_BUNDLE)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise ValueError('The acquisition cannot produce the bounded Git bundle used to initialize both roles.') from None
+
+
 def verify_acquired_git(git, checkout, approval, *, checklist):
     repo, commit, tree = (approval[key] for key in ('repository', 'acquired_commit', 'acquired_tree'))
     if checklist:
@@ -1013,16 +1022,22 @@ def verify_startup_adoption(repository, startup, revision):
 
 
 def first_source(intake, repository, workload):
+    from owner_source import private_standards, require_private_directory
+
     tree = intake.site / 'repositories' / repository
     try:
+        require_private_directory(intake.site)
         acquired = protect_directory(tree / 'acquired')
         startup = protect_directory(tree / 'startup')
         config = {key: fixed_git(path, 'rev-parse', '--verify', 'HEAD').decode().strip()
                   for key, path in (('commit', acquired), ('startup_revision', startup))}
         for value in config.values():
             p.digest(value, 40)
+        if private_standards(intake.site / 'standards'):
+            raise FileNotFoundError()
         verify_startup_adoption(repository, startup, config['startup_revision'])
         _, _, _, source_tree, startup_sha = intake.source(repository, config, checklist=workload == CHECKLIST)
+        verify_bundle(acquired)
     except FileNotFoundError as exc:
         raise SitePending('owner-repository-inputs', 'Run the attended owner setup or source recovery to provision the approved checkout and pinned startup inputs.') from exc
     return config, source_tree, startup_sha
@@ -1274,7 +1289,7 @@ def catalogue_command(intake, argv):
     p.require(os.getuid() == os.geteuid() == 0 and not os.environ.get('SUDO_USER'),
               'Use the protected root commissioning terminal for first owner setup.')
     first = FirstCatalogue(intake)
-    if argv[:1] in (['--setup-site'], ['--restore-source']):
+    if argv[:1] in (['--setup-site'], ['--restore-source'], ['--rotate-source-credential']):
         p.require(len(argv) == 1, 'Run the attended command without additional arguments.')
         try:
             with open('/dev/tty', encoding='utf-8') as incoming, open('/dev/tty', 'w', encoding='utf-8') as outgoing:
@@ -1282,8 +1297,9 @@ def catalogue_command(intake, argv):
                 if argv[0] == '--setup-site':
                     setup_site(first, incoming, outgoing)
                 else:
-                    from owner_source import restore
-                    restore(first, incoming, outgoing)
+                    from owner_source import restore, rotate
+                    action = restore if argv[0] == '--restore-source' else rotate
+                    action(first, incoming, outgoing)
         except OSError as exc:
             if exc.errno in (errno.ENXIO, errno.ENOTTY):
                 raise ValueError('Open the protected root terminal to run first owner setup.') from exc
@@ -1353,7 +1369,8 @@ def main():
     try:
         p.require(os.geteuid() == 0, 'The installed intake service requires its protected account.')
         intake = Intake()
-        if sys.argv[1:2] and sys.argv[1] in ('--setup-site', '--restore-source', '--inspect-site', '--initialize-site'):
+        if sys.argv[1:2] and sys.argv[1] in ('--setup-site', '--restore-source', '--rotate-source-credential',
+                                              '--inspect-site', '--initialize-site'):
             return catalogue_command(intake, sys.argv[1:])
         if sys.argv[1:] == ['--reconcile'] and not os.environ.get('SUDO_USER'):
             return intake.reconcile()

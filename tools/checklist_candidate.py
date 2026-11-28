@@ -42,7 +42,7 @@ def remaining(end):
     return h.time_left(end)
 
 
-def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None):
+def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None, pass_fds=()):
     """Bound command output independently of pipe reader and child lifetime."""
     p.require(data is None or stdin is None, 'fixed command input has two sources')
     # The only input is a bounded trusted-controller JSON document or prompt.
@@ -54,7 +54,7 @@ def invoke(argv, end, *, cap=p.MAX_MESSAGE, data=None, stdin=None, stdout=None):
         remaining(end)
         with subprocess.Popen(argv, stdin=incoming if stdin is None else stdin,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                              env=ENV, start_new_session=True) as process:
+                              env=ENV, start_new_session=True, pass_fds=pass_fds) as process:
             output = bytearray()
             copied = 0
             try:
