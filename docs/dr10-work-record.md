@@ -2,6 +2,61 @@
 
 ## Latest continuation checkpoint
 
+### November 28, 2026 — integrated job and signed Fedora checkpoints
+
+The original development window closes November 28 at 22:39:32 UTC
+(November 29 at 07:39:32 JST). API selections remain GPT-6.2 Astra High for
+coordination and fresh independent review, GPT-6.2 Sol High for implementation
+and native validation, and GPT-6.2 Sol Medium for mechanical work. Model
+selection is recorded at launch. Independent backend and root-session model
+attestation are unavailable. Development continues from draft PR 13 under
+the adopted standards. The owner separately performs installation on the
+selected VPS and validates real account consent and independent access.
+[Development workflow](../ARCHITECTURE.md#a12) · [Fresh setup](owner-day0.md)
+
+Exact candidate `1b3d078058cb93fe40fd91147a7afd8ec507da2b` completed all 1,283
+local cases across the ordinary suite and supplemental replays. The ordinary
+run passed 1,201 in 210.962 seconds and skipped 82. All 82 passed in protected,
+distinct-UID or browser supplements. The combined suite covers that exact
+candidate. Ordinary log SHA-256 is
+`abe2b684dc5dda858d69336ca7583260ec11c7abef47b88d05eb41a137349e66`.
+
+The integrated first-owner rehearsal at `a353b590432f8e7a6e93d073a6388da5bd21730e`
+retained one durable job ID from a controlling terminal through reattach.
+The first real mTLS persistence check lost the completed SQLite item. The
+repaired Git candidate passed a fresh check, and the controller consumed its
+exact retest. A disposable fork received one proposal. OpenSSH verification
+rejected a signed wrong publisher attempt and accepted the matching attempt.
+The owner command reported confirmed delivery for that same job after a real
+application replacement and clean SQLite backup and restore. Proof replay
+repeated no effects. The signed fixture receipt digest is
+`5a7ab94bb7e6a9ad6ab7405d7d12b09a950fe9502170a9b04dd559cf0788ad62`.
+Model turns, publication, systemd deployment and independent network vantage
+results were projected. Live renewal of this same job remains unverified.
+
+Native storage repair `06f85a5cf2cc086e99af38337014b701870e4b18` subsequently
+recovered the earlier failed storage boot, automatically remounted the 20 GiB
+ext4 store on a fresh reboot and preserved the enrolled UUID, backing inode and
+receipts. The development route at `ea6a3420f953b425c24996090ee3618be26bbac0`
+and a separate stock Fedora maintenance guest at
+`c93c82584c81fb29b481bbe4aea9b031f15ef86a` passed host preparation, full
+rootless UID/GID mappings and signed Fedora base import. Both full candidate
+builds stopped at the package step with native status 125. Separate native
+Fedora Podman probes verified a corrected read-only offline container profile
+with loopback-only networking and empty resolver settings. These platform
+checks leave both complete Distrobox placements and authenticated role use
+open. Native exact-source verification of the integrated profile is separate.
+
+The historical fixed-file repair integrated at `1b3d078` used production
+host archives from `2109f57` and `69f4bf2` in local migration fixtures. The exact
+installed owner intake and billing courier reached the signed billing request
+path after migration. The fresh review of stable renewal
+`3ea50b8fe0203dc84af53a1144860ca596dbb87c` still requires three corrections.
+These cover the named SSH probe's peer context, Day 0 selecting the current
+approved handler after full replacement, and recovery of a forward-only
+transition after reboot. Production commissioning still requires a separately
+authorized signed publication from protected `main`. [Commissioning](host-commissioning.md)
+
 ### November 28, 2026 — integrated fresh install development
 
 The owner’s 36-hour development window runs from November 27 at 10:39:32 UTC

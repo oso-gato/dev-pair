@@ -57,8 +57,8 @@ Use the full reviewed commit provided with the delivery in place of
 ```
 
 <a id="dr11-3"></a>
-**DR11.3** From that checkout, run `./day0.sh status` to inspect progress or `./day0.sh resume`
-to continue initial maintenance setup after a pause or reboot. On a disabled or unverified
+**DR11.3** From the same checkout, run `./day0.sh status` to inspect progress or `./day0.sh resume`
+to continue after a pause, reboot or independent handoff. On a disabled or unverified
 permissive host, setup performs a checked relabel before enforcing SELinux and
 holds workloads while the transition is incomplete. For Tailscale, press Enter
 at the auth-key prompt to use browser sign-in. You can defer enrollment by
@@ -72,6 +72,7 @@ protected commissioning and first owner setup. Source is delivered as a draft. F
 commissioning requires a separately authorized signed publication from protected `main`
 for the exact source. The complete native owner journey and independent observations on
 the selected VPS still require verification. [Day-zero operations](docs/owner-day0.md)
+· [Compatibility for an existing November 27 installation](docs/owner-day0.md#previously-installed-november-27-bootstrap)
 
 <a id="dr0"></a>
 ## DR0 — Overview
